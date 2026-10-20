@@ -249,7 +249,7 @@ pub(super) fn collect_devices(
                 )));
             }
             validate_carrier_mtu(&device)?;
-            device.id = format!("server-{}", validated.wireguard_endpoints.len());
+            device.id = protocol.server_id();
             validated.wireguard_endpoints.push(device);
         } else {
             listeners.push(config);
@@ -294,6 +294,287 @@ mod tests {
             },
             "rules": "block-all",
         })
+    }
+
+    #[test]
+    fn servers_keep_inbound_sniff_setting() {
+        for sniff in [false, true] {
+            let mut config = server();
+            config["sniff"] = json!(sniff);
+            let validated = validate(json!([config])).unwrap();
+            let inbound = validated.wireguard_endpoints[0].inbound.as_ref().unwrap();
+            assert_eq!(inbound.sniff, sniff);
+        }
+    }
+
+    #[test]
+    fn server_names_and_public_keys_have_separate_stable_identities() {
+        let original = validate(json!([server()]))
+            .unwrap()
+            .wireguard_endpoints
+            .remove(0)
+            .id;
+        assert!(original.starts_with("server:key:"));
+        let mut unnamed = server();
+        unnamed["protocol"]["wireguard_name"] = json!("");
+        let mut equivalent_key = [41; 32];
+        equivalent_key[0] ^= 7;
+        equivalent_key[31] ^= 128;
+        use base64::Engine;
+        unnamed["protocol"]["private_key"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(equivalent_key));
+        assert_eq!(
+            validate(json!([unnamed])).unwrap().wireguard_endpoints[0].id,
+            original
+        );
+        let mut blank = server();
+        blank["protocol"]["wireguard_name"] = Value::Null;
+        assert_eq!(
+            validate(json!([blank])).unwrap().wireguard_endpoints[0].id,
+            original
+        );
+
+        let mut named = server();
+        named["address"] = json!("[::]:51821");
+        named["protocol"]["wireguard_name"] = json!(original.strip_prefix("server:key:").unwrap());
+        let validated = validate(json!([server(), named.clone()])).unwrap();
+        assert_ne!(
+            validated.wireguard_endpoints[0].id,
+            validated.wireguard_endpoints[1].id
+        );
+        let expected = validated.wireguard_endpoints[1].id.clone();
+        named["protocol"]["private_key"] = json!(key(44));
+        let protocol: ServerProxyConfig =
+            serde_yaml::from_str(&named["protocol"].to_string()).unwrap();
+        let roundtrip = serde_yaml::to_string(&protocol).unwrap();
+        let ServerProxyConfig::Wireguard(protocol) = serde_yaml::from_str(&roundtrip).unwrap()
+        else {
+            panic!("expected WireGuard protocol");
+        };
+        assert_eq!(protocol.server_id(), expected);
+        let validated = validate(json!([named])).unwrap();
+        assert_eq!(validated.wireguard_endpoints[0].id, expected);
+    }
+
+    #[test]
+    fn server_identities_cannot_turn_private_dns_references_into_urls() {
+        let mut identities = HashSet::new();
+        for name in [
+            "region://gateway",
+            "//edge",
+            "/",
+            "%2F",
+            "gateway",
+            "Gateway",
+        ] {
+            for fake_ip in [false, true] {
+                let mut config = server();
+                config["protocol"]["wireguard_name"] = json!(name);
+                config["dns"] = json!({"fake_ip": fake_ip});
+                let validated = validate(json!([config])).unwrap();
+                let device = &validated.wireguard_endpoints[0];
+                assert!(!device.id.contains('/'));
+                if fake_ip {
+                    assert!(identities.insert(device.id.clone()));
+                }
+                assert_eq!(
+                    device
+                        .inbound
+                        .as_ref()
+                        .unwrap()
+                        .dns
+                        .as_ref()
+                        .unwrap()
+                        .resolved_group(),
+                    Some(format!("__inline_fake_dns:wireguard:{}", device.id).as_str())
+                );
+            }
+        }
+        for fake_ip in [false, true] {
+            let mut config = server();
+            config["protocol"]["private_key"] =
+                json!("CCUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+            config["dns"] = json!({"fake_ip": fake_ip});
+            let validated = validate(json!([config])).unwrap();
+            let device = &validated.wireguard_endpoints[0];
+            assert_eq!(
+                device.id,
+                "server:key:__326N9SoT-V7q8es5GvY-Pop9oC_6MG7LMYJCNWgTs"
+            );
+            assert_eq!(
+                device
+                    .inbound
+                    .as_ref()
+                    .unwrap()
+                    .dns
+                    .as_ref()
+                    .unwrap()
+                    .resolved_group(),
+                Some(format!("__inline_fake_dns:wireguard:{}", device.id).as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_server_identities_reject_with_or_without_fake_dns() {
+        for name in [None, Some(""), Some("gateway")] {
+            for fake_ip in [None, Some(false), Some(true)] {
+                let mut first = server();
+                if let Some(name) = name {
+                    first["protocol"]["wireguard_name"] = json!(name);
+                }
+                if let Some(fake_ip) = fake_ip {
+                    first["dns"] = json!({"fake_ip":fake_ip});
+                }
+                let mut second = first.clone();
+                second["address"] = json!("[::]:51821");
+                if name == Some("gateway") {
+                    second["protocol"]["private_key"] = json!(key(44));
+                }
+                let error = validate(json!([first, second])).err().unwrap();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("duplicate WireGuard server identity"),
+                    "{error}"
+                );
+                assert!(!error.to_string().contains(&key(41)));
+            }
+        }
+        let mut second = server();
+        second["protocol"]["wireguard_name"] = json!("other");
+        let error = validate(json!([server(), second])).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate WireGuard server listen address"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_private_dns_ownership_survives_reordering_clients_and_key_rotation() {
+        use crate::dns::{build_dns_registry, build_dns_registry_reusing};
+
+        let mut first = server();
+        first["protocol"]["wireguard_name"] = json!("first");
+        first["dns"] = json!({"fake_ip":true});
+        let mut second = first.clone();
+        second["address"] = json!("[::]:51821");
+        second["protocol"]["wireguard_name"] = json!("second");
+        let initial = validate(json!([first.clone(), second.clone()])).unwrap();
+        let group_names: Vec<_> = initial
+            .wireguard_endpoints
+            .iter()
+            .map(|device| {
+                let group = device
+                    .inbound
+                    .as_ref()
+                    .unwrap()
+                    .dns
+                    .as_ref()
+                    .unwrap()
+                    .resolved_group()
+                    .unwrap();
+                assert_eq!(group, format!("__inline_fake_dns:wireguard:{}", device.id));
+                group.to_owned()
+            })
+            .collect();
+        let mut registry = build_dns_registry(initial.dns_groups).await.unwrap();
+        let mut mappings = Vec::new();
+        for (group, hostname) in group_names.iter().zip(["first.example", "second.example"]) {
+            let context = registry
+                .get_by_name(group)
+                .unwrap()
+                .fake_dns_context()
+                .unwrap();
+            mappings.push((
+                group.clone(),
+                hostname,
+                context.allocate(hostname, false).unwrap(),
+            ));
+        }
+        first["protocol"]["private_key"] = json!(key(44));
+        for enabled in [true, false, true] {
+            first["dns"]["fake_ip"] = json!(enabled);
+            second["dns"]["fake_ip"] = json!(enabled);
+            let mut configs = copies(client());
+            configs
+                .as_array_mut()
+                .unwrap()
+                .extend([second.clone(), first.clone()]);
+            let validated = validate(configs).unwrap();
+            assert!(
+                validated
+                    .wireguard_endpoints
+                    .iter()
+                    .any(|device| device.inbound.is_none())
+            );
+            for device in validated
+                .wireguard_endpoints
+                .iter()
+                .filter(|device| device.inbound.is_some())
+            {
+                let group = device
+                    .inbound
+                    .as_ref()
+                    .unwrap()
+                    .dns
+                    .as_ref()
+                    .unwrap()
+                    .resolved_group()
+                    .unwrap();
+                let index = match device.listen.unwrap().port() {
+                    51820 => 0,
+                    51821 => 1,
+                    port => panic!("unexpected server port {port}"),
+                };
+                assert_eq!(group, group_names[index]);
+                assert_eq!(group, format!("__inline_fake_dns:wireguard:{}", device.id));
+            }
+            let next = build_dns_registry_reusing(
+                validated.dns_groups,
+                crate::resources::limits(),
+                Some(&registry),
+            )
+            .await
+            .unwrap();
+            for (group, hostname, ip) in &mappings {
+                let context = next.get_by_name(group).unwrap().fake_dns_context();
+                if enabled {
+                    assert_eq!(
+                        context.unwrap().restore(*ip).unwrap().as_deref(),
+                        Some(*hostname)
+                    );
+                } else {
+                    assert!(context.is_none());
+                }
+            }
+            registry = next;
+        }
+    }
+
+    #[test]
+    fn proxied_servers_with_shared_keys_require_distinct_names() {
+        let mut first = server();
+        first.as_object_mut().unwrap().remove("address");
+        first["protocol"]["peer_client_chain"] = json!("direct");
+        first["protocol"]["peers"][0]["endpoint"] = json!("peer.example:51820");
+        first["protocol"]["peers"][0]["persistent_keepalive"] = json!(25);
+        let mut second = first.clone();
+        assert!(
+            validate(json!([first, second]))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("duplicate WireGuard server identity")
+        );
+        first["protocol"]["wireguard_name"] = json!("first");
+        second["protocol"]["wireguard_name"] = json!("second");
+        let validated = validate(json!([first, second])).unwrap();
+        assert_eq!(validated.wireguard_endpoints[0].id, "server:name:Zmlyc3Q");
+        assert_eq!(validated.wireguard_endpoints[1].id, "server:name:c2Vjb25k");
     }
 
     #[test]
@@ -448,6 +729,26 @@ mod tests {
         let mut configs = copies(client);
         configs.as_array_mut().unwrap().push(server);
         assert_eq!(validate(configs).unwrap().wireguard_endpoints.len(), 2);
+    }
+
+    #[test]
+    fn server_overrides_reject_other_active_and_retained_fake_ranges() {
+        let mut inbound = server();
+        inbound["rules"] = json!([{
+            "masks":"0.0.0.0/0", "action":"allow", "override_address":"198.18.0.5:443"
+        }]);
+        let mut config = json!([
+            {"dns_group":"fake", "dns_servers":"system", "fake_ip":true},
+            inbound,
+        ]);
+        let error = validate(config.clone()).err().unwrap();
+        assert!(error.to_string().contains("rule override"), "{error}");
+        config[0]["fake_ip"] = false.into();
+        let mut validated = validate(config).unwrap();
+        let error = validated
+            .validate_network_endpoints(&["198.18.0.0/15".parse().unwrap()])
+            .unwrap_err();
+        assert!(error.to_string().contains("rule override"), "{error}");
     }
 
     fn validate(values: Value) -> io::Result<ValidatedConfigs> {

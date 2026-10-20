@@ -187,6 +187,7 @@ struct PreparedEndpoint {
     peers: Vec<PreparedPeer>,
     connector: Arc<Connector>,
     global_limits: crate::config::GlobalLimits,
+    outer_resolver: Arc<dyn Resolver>,
 }
 
 #[derive(Default)]
@@ -196,9 +197,32 @@ pub(crate) struct Prepared {
 
 impl Prepared {
     pub async fn new(validated: &mut ValidatedConfigs) -> stdio::Result<Self> {
+        Self::with_forbidden(validated, &[]).await
+    }
+
+    pub async fn with_forbidden(
+        validated: &mut ValidatedConfigs,
+        inherited: &[IpNetwork],
+    ) -> stdio::Result<Self> {
         let mut pending = Vec::new();
         let mut connectors = HashMap::new();
-        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let ranges: Result<Vec<IpNetwork>, _> = validated
+            .dns_groups
+            .iter()
+            .filter_map(|group| group.fake_ip.as_ref())
+            .flat_map(|options| options.ipv4_range.iter().chain(options.ipv6_range.iter()))
+            .map(|range| range.parse())
+            .collect();
+        let mut ranges = ranges.map_err(stdio::Error::other)?;
+        ranges.extend_from_slice(inherited);
+        if !ranges.is_empty() {
+            ranges.extend(
+                crate::config::tun_endpoint_ips(&validated.configs)
+                    .map(|ip| IpNetwork::from(ip.to_canonical())),
+            );
+            validated.validate_network_endpoints(&ranges)?;
+        }
+        let resolver = crate::dns::real_only(Arc::new(NativeResolver::new()), ranges.into());
         for config in &validated.wireguard_endpoints {
             config.validate()?;
             let mut peers = Vec::new();
@@ -247,8 +271,9 @@ impl Prepared {
                 peers,
                 connector,
                 global_limits: validated.global_limits,
+                outer_resolver: resolver.clone(),
             };
-            endpoint.build_outer_chain(&resolver)?;
+            endpoint.build_outer_chain()?;
             endpoints.push(endpoint);
         }
         Ok(Self { endpoints })
@@ -318,14 +343,13 @@ impl PreparedEndpoint {
 
     fn build_outer_chain(
         &self,
-        resolver: &Arc<dyn Resolver>,
     ) -> stdio::Result<Option<Arc<crate::client_proxy_chain::ClientProxyChain>>> {
         let Some(config) = &self.config.peer_client_chain else {
             return Ok(None);
         };
         let chain = crate::tcp::chain_builder::build_client_proxy_chain_with_limits(
             config.hops.clone(),
-            resolver.clone(),
+            self.outer_resolver.clone(),
             self.global_limits,
         )?;
         if !chain.supports_udp() {
@@ -350,7 +374,8 @@ impl PreparedEndpoint {
                 crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
                     rules,
                     resolver.clone(),
-                )?,
+                )?
+                .with_sniff(inbound.sniff),
             );
             Some((selector, resolver))
         } else {
@@ -363,9 +388,9 @@ impl PreparedEndpoint {
             inbound.is_some(),
             limits.clone(),
         )?;
-        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let resolver = self.outer_resolver.clone();
         // Rebuilding after preflight gives each start fresh pool indices and handler lifetimes.
-        let (udp, released, peers) = if let Some(chain) = self.build_outer_chain(&resolver)? {
+        let (udp, released, peers) = if let Some(chain) = self.build_outer_chain()? {
             let peers = self.peers_for_socket(None)?;
             let (sender, receiver, released) = detour::start(
                 config.id.clone(),

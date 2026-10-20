@@ -51,7 +51,8 @@ same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
 ## Features
 
 - **Multi-transport**: TCP or QUIC for all protocols
-- **TLS with SNI routing**: Route by Server Name Indication
+- **TLS with SNI routing**: Select the outer TLS handler by Server Name Indication
+- **Opt-in TCP hostname sniffing**: Match inner TLS SNI or cleartext HTTP/1 Host without changing the connection destination ([TLS example](examples/sni_sniffing.yaml), [HTTP example](examples/http_host_sniffing.yaml), [semantics](CONFIG.md#tcp-hostname-sniffing))
 - **Upstream proxy chaining**: Multi-hop chains with load balancing
 - **Rule-based routing**: Route by IP/CIDR or hostname masks
 - **Named PEM certificates**: Define once, reference everywhere
@@ -86,6 +87,12 @@ dependencies, including DNS over HTTP/3. The experimental zero-copy change in
 The `nix` patch pins an [upstream commit](https://github.com/nix-rust/nix/commit/3eae6d68ec6382fef7b38cd58f97458e59a71af9)
 containing [nix #2821](https://github.com/nix-rust/nix/pull/2821) for iOS socket
 compatibility. Retain it until adopting a registry release containing that fix.
+
+The `smoltcp` patch pins a commit from our [fork's main branch](https://github.com/cfal/smoltcp/tree/a80fa50dce926117669ef061f55f4d6bdad0904a)
+to preserve TCP ACK sequencing during partial retransmission in TUN and WireGuard.
+Retain it until adopting a registry release with equivalent loss-recovery fixes.
+When updating the pin, run the fork's `socket::tcp::test::` regressions with Reno
+and CUBIC enabled, plus Shoes' rootless TUN and WireGuard suites.
 
 GitHub releases and checkout builds retain these patches. Crates.io publishing
 remains disabled because Cargo removes workspace patches from published packages.

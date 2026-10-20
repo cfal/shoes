@@ -1194,6 +1194,8 @@ Package: windows-interface 0.59.3
 Repository: https://github.com/microsoft/windows-rs
 Package: windows-link 0.2.1
 Repository: https://github.com/microsoft/windows-rs
+Package: windows-registry 0.6.1
+Repository: https://github.com/microsoft/windows-rs
 Package: windows-result 0.4.1
 Repository: https://github.com/microsoft/windows-rs
 Package: windows-strings 0.5.1
@@ -2704,6 +2706,8 @@ Package: jni-sys 0.3.1
 Repository: https://github.com/jni-rs/jni-sys
 Package: jni-sys 0.4.1
 Repository: https://github.com/jni-rs/jni-sys
+Package: resolv-conf 0.7.6
+Repository: https://github.com/hickory-dns/resolv-conf
 
                                  Apache License
                            Version 2.0, January 2004
@@ -5247,6 +5251,8 @@ Package: core-foundation-sys 0.8.7
 Repository: https://github.com/servo/core-foundation-rs
 Package: core-foundation 0.10.1
 Repository: https://github.com/servo/core-foundation-rs
+Package: core-foundation 0.9.4
+Repository: https://github.com/servo/core-foundation-rs
 Package: critical-section 1.2.0
 Repository: https://github.com/rust-embedded/critical-section
 Package: crossbeam-channel 0.5.17
@@ -5299,6 +5305,8 @@ Package: idna_adapter 1.2.2
 Repository: https://github.com/hsivonen/idna_adapter
 Package: indexmap 2.14.2
 Repository: https://github.com/indexmap-rs/indexmap
+Package: ipconfig 0.3.4
+Repository: https://github.com/liranringel/ipconfig
 Package: jobserver 0.1.35
 Repository: https://github.com/rust-lang/jobserver-rs
 Package: js-sys 0.3.106
@@ -5367,6 +5375,10 @@ Package: socket2 0.6.5
 Repository: https://github.com/rust-lang/socket2
 Package: stable_deref_trait 1.2.1
 Repository: https://github.com/storyyeller/stable_deref_trait
+Package: system-configuration-sys 0.6.0
+Repository: https://github.com/mullvad/system-configuration-rs
+Package: system-configuration 0.7.0
+Repository: https://github.com/mullvad/system-configuration-rs
 Package: tikv-jemalloc-sys 0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8
 Repository: https://github.com/tikv/jemallocator
 Package: tikv-jemallocator 0.7.0
@@ -7683,6 +7695,8 @@ Package: kem 0.3.0
 Repository: https://github.com/RustCrypto/traits
 Package: libc 0.2.190
 Repository: https://github.com/rust-lang/libc
+Package: ndk-context 0.1.1
+Repository: https://github.com/rust-windowing/android-ndk-rs
 Package: ndk-sys 0.6.0+11769913
 Repository: https://github.com/rust-mobile/ndk
 Package: num-conv 0.2.2
@@ -7753,6 +7767,8 @@ Package: time 0.3.55
 Repository: https://github.com/time-rs/time
 Package: unicode-ident 1.0.27
 Repository: https://github.com/dtolnay/unicode-ident
+Package: widestring 1.2.1
+Repository: https://github.com/VoidStarKat/widestring-rs
 
 Apache License
 Version 2.0, January 2004

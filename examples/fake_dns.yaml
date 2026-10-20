@@ -1,0 +1,26 @@
+# Both listeners share mappings; real DNS traffic uses the configured upstream.
+- dns_group: shared-fake
+  dns_servers:
+    - url: tls://1.1.1.1
+      server_name: cloudflare-dns.com
+  fake_ip:
+    ipv4_range: "198.18.0.0/15"
+    ipv6_range: null
+    max_entries: 65536
+    bypass_domains: [corp.example]
+    missing_family: forward
+    https_records: forward
+    # state_file: /var/lib/shoes/fake-dns.json
+
+- address: "0.0.0.0:1080"
+  protocol:
+    type: socks
+    udp_enabled: true
+  dns:
+    servers: shared-fake
+
+- address: "0.0.0.0:8080"
+  protocol:
+    type: http
+  dns:
+    servers: shared-fake

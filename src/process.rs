@@ -26,10 +26,25 @@ struct PreparedServers {
     wireguard: crate::wireguard::Prepared,
 }
 
-async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
+async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths).await?;
+    if let Some(previous) = previous {
+        validated
+            .validate_network_endpoints(previous.forbidden_ranges())
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("{error}; guard retained from the running configuration until restart"),
+                )
+            })?;
+    }
     #[cfg(unix)]
-    let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
+    let wireguard = if let Some(previous) = previous {
+        crate::wireguard::Prepared::with_forbidden(&mut validated, previous.forbidden_ranges())
+            .await?
+    } else {
+        crate::wireguard::Prepared::new(&mut validated).await?
+    };
     for config in &mut validated.configs {
         let Config::Server(server) = config else {
             continue;
@@ -67,9 +82,12 @@ async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
         }
         server.bind_location = BindLocation::Address(OneOrSome::Some(resolved));
     }
-    let dns = dns::build_dns_registry_with_limits(
+    let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated.configs).collect();
+    let dns = dns::build_dns_registry_for_runtime(
         std::mem::take(&mut validated.dns_groups),
         validated.global_limits,
+        previous,
+        &synthetic_endpoints,
     )
     .await
     .map_err(|error| {
@@ -95,12 +113,27 @@ async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
 struct RunningServers {
     listeners: Vec<JoinHandle<()>>,
     reporter: Option<resources::ResourceReporter>,
+    dns_snapshots: Option<dns::DnsSnapshotTask>,
     quic_retirements: crate::listener_tasks::QuicRetirements,
     #[cfg(unix)]
     wireguard: crate::wireguard::Running,
 }
 
 impl RunningServers {
+    async fn shutdown(&mut self, registries: &[&DnsRegistry]) -> io::Result<()> {
+        self.stop().await;
+        let mut result = Ok(());
+        for registry in registries {
+            if let Err(error) = registry.shutdown_checkpoint().await {
+                log::warn!("Final Fake DNS checkpoint failed: {error}");
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
+        }
+        result
+    }
+
     async fn stop(&mut self) {
         for task in &self.listeners {
             task.abort();
@@ -111,11 +144,13 @@ impl RunningServers {
         #[cfg(unix)]
         self.wireguard.stop().await;
         self.reporter = None;
+        self.dns_snapshots = None;
     }
 
     async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
         resources::configure(prepared.validated.global_limits)?;
         self.reporter = Some(resources::ResourceReporter::start());
+        self.dns_snapshots = Some(prepared.dns.snapshot_task());
         #[cfg(unix)]
         if let Err(error) = prepared
             .wireguard
@@ -366,25 +401,28 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = prepare(&paths) => result?,
+        result = prepare(&paths, None) => result?,
     };
     let mut running = RunningServers::default();
     tokio::select! {
         biased;
-        _ = shutdown.recv() => { running.stop().await; return Ok(()); }
-        result = running.start(&mut prepared) => result?,
+        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+        result = running.start(&mut prepared) => if let Err(error) = result {
+            let _ = running.shutdown(&[&prepared.dns]).await;
+            return Err(error);
+        },
     }
     loop {
         let debounce = tokio::select! {
             biased;
-            _ = shutdown.recv() => { running.stop().await; return Ok(()); }
+            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
             _ = reload.recv() => false,
             _ = changes.recv() => true,
         };
         if debounce {
             tokio::select! {
                 biased;
-                _ = shutdown.recv() => { running.stop().await; return Ok(()); }
+                _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
                 _ = reload.recv() => {}
                 _ = tokio::time::sleep(Duration::from_secs(3)) => {}
             }
@@ -399,8 +437,8 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         }
         let candidate = tokio::select! {
             biased;
-            _ = shutdown.recv() => { running.stop().await; return Ok(()); }
-            result = prepare(&paths) => result,
+            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+            result = prepare(&paths, Some(&prepared.dns)) => result,
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
@@ -410,16 +448,22 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             }
         };
         running.stop().await;
+        if let Err(error) = prepared.dns.checkpoint().await {
+            log::warn!("Reload Fake DNS checkpoint failed; continuing reload: {error}");
+        }
         tokio::select! {
             biased;
-            _ = shutdown.recv() => return Ok(()),
-            result = running.quic_retirements.wait() => result?,
+            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+            result = running.quic_retirements.wait() => if let Err(error) = result {
+                let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                return Err(error);
+            },
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             let result = tokio::select! {
                 biased;
-                _ = shutdown.recv() => { running.stop().await; return Ok(()); }
+                _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
                 result = running.start(&mut candidate) => result,
             };
             match result {
@@ -430,16 +474,22 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
                 {
                     tokio::select! {
                         biased;
-                        _ = shutdown.recv() => return Ok(()),
-                        result = running.quic_retirements.wait() => result?,
+                        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+                        result = running.quic_retirements.wait() => if let Err(error) = result {
+                            let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                            return Err(error);
+                        },
                     }
                     tokio::select! {
                         biased;
-                        _ = shutdown.recv() => return Ok(()),
+                        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
                         _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                    return Err(error);
+                }
             }
         }
         drop(std::mem::replace(&mut prepared, candidate));
@@ -449,6 +499,205 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_dns_rejected_reload_keeps_inherited_guards_without_freezing_live_pool() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let paths = [path.to_str().unwrap().to_owned()];
+        std::fs::write(
+            &path,
+            r#"[{"dns_group":"fake","dns_servers":"udp://127.0.0.1:9","fake_ip":true}]"#,
+        )
+        .unwrap();
+        let live = prepare(&paths, None).await.unwrap();
+        let context = live
+            .dns
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        context.allocate("before.example", false).unwrap();
+        std::fs::write(
+            &path,
+            r#"[{"dns_group":"ordinary","dns_servers":"udp://198.18.0.5:53"}]"#,
+        )
+        .unwrap();
+        load_validated(&paths).await.unwrap();
+        let error = prepare(&paths, Some(&live.dns)).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("running configuration until restart")
+        );
+        context.allocate("after.example", false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_dns_removed_context_rejects_forwarding_and_override_reload_targets() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let paths = [path.to_str().unwrap().to_owned()];
+        std::fs::write(
+            &path,
+            r#"[{"dns_group":"fake","dns_servers":"udp://127.0.0.1:9","fake_ip":true}]"#,
+        )
+        .unwrap();
+        let live = prepare(&paths, None).await.unwrap();
+        std::fs::write(&path, "[]").unwrap();
+        let removed = prepare(&paths, Some(&live.dns)).await.unwrap();
+        assert!(!removed.dns.forbidden_ranges().is_empty());
+
+        for server in [
+            json!({"address":"127.0.0.1:1080", "protocol":{"type":"forward", "targets":["198.18.0.5:443"]}}),
+            json!({"address":"127.0.0.1:1080", "protocol":{"type":"socks"}, "rules":[{
+                "masks":"0.0.0.0/0", "action":"allow", "override_address":"198.18.0.5:443"
+            }]}),
+        ] {
+            std::fs::write(&path, json!([server]).to_string()).unwrap();
+            load_validated(&paths).await.unwrap();
+            let error = prepare(&paths, Some(&removed.dns)).await.err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("running configuration until restart")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_dns_retained_pools_reject_tun_endpoint_reload_collisions() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let paths = [path.to_str().unwrap().to_owned()];
+        std::fs::write(
+            &path,
+            json!([
+                {"dns_group":"fake", "dns_servers":"udp://127.0.0.1:9", "fake_ip":{
+                    "ipv4_range":"198.18.0.0/29", "ipv6_range":"2001:2::/125", "max_entries":5
+                }},
+                {"device_name":"tun0", "device_fd":42, "address":"10.99.0.1"},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let live = prepare(&paths, None).await.unwrap();
+        let context = live
+            .dns
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        let ip = context.allocate("before.example", false).unwrap();
+        for config in [
+            json!([{ "dns_group":"fake", "dns_servers":"udp://127.0.0.1:9", "fake_ip":false }]),
+            json!([]),
+        ] {
+            std::fs::write(&path, config.to_string()).unwrap();
+            let retained = prepare(&paths, Some(&live.dns)).await.unwrap();
+            for field in ["address", "destination"] {
+                for (endpoint, allowed) in [
+                    ("198.18.0.5", false),
+                    ("::ffff:198.18.0.5", false),
+                    ("2001:2::5", false),
+                    ("198.18.0.1", true),
+                    ("::ffff:198.18.0.1", true),
+                    ("2001:2::1", true),
+                    ("10.99.0.1", true),
+                ] {
+                    let mut tun = json!({"device_name":"tun0", "device_fd":42});
+                    tun[field] = endpoint.into();
+                    std::fs::write(&path, json!([tun]).to_string()).unwrap();
+                    load_validated(&paths).await.unwrap();
+                    let result = prepare(&paths, Some(&retained.dns)).await;
+                    if allowed {
+                        result.unwrap();
+                    } else {
+                        let error = result.err().expect("retained TUN collision accepted");
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                        assert!(
+                            error.to_string().contains("TUN interface/gateway"),
+                            "{error}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            context.restore(ip).unwrap().as_deref(),
+            Some("before.example")
+        );
+        context.allocate("after.example", false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_dns_terminal_shutdown_closes_all_registries_after_checkpoint_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registries = Vec::new();
+        let mut contexts = Vec::new();
+        for index in 0..2 {
+            let path = directory.path().join(format!("config-{index}.yaml"));
+            let state = directory.path().join(format!("state-{index}.json"));
+            std::fs::write(
+                &path,
+                serde_json::json!([
+                    {"dns_group":"fake", "dns_servers":"system", "fake_ip":{"state_file":state}}
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            let prepared = prepare(&[path.to_str().unwrap().to_owned()], None)
+                .await
+                .unwrap();
+            let context = prepared
+                .dns
+                .get_by_name("fake")
+                .unwrap()
+                .fake_dns_context()
+                .unwrap();
+            context.allocate("before.example", false).unwrap();
+            contexts.push(context);
+            registries.push(prepared);
+        }
+        let failed_state = directory.path().join("state-0.json");
+        std::fs::remove_file(&failed_state).unwrap();
+        std::fs::create_dir(&failed_state).unwrap();
+        let marker = std::sync::Arc::new(());
+        let owned = marker.clone();
+        let mut running = RunningServers::default();
+        running.listeners.push(tokio::spawn(async move {
+            let _owned = owned;
+            std::future::pending::<()>().await;
+        }));
+        assert!(
+            running
+                .shutdown(&[&registries[0].dns, &registries[1].dns])
+                .await
+                .is_err()
+        );
+        assert_eq!(std::sync::Arc::strong_count(&marker), 1);
+        for context in contexts {
+            assert!(context.allocate("after.example", false).is_err());
+        }
+        let snapshot: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(directory.path().join("state-1.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            snapshot["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry[0] == "before.example")
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -496,7 +745,9 @@ mod tests {
             "- address: '[fe80::1%2]:8080-8081'\n  protocol: {type: http}\n",
         )
         .unwrap();
-        let prepared = prepare(&[path.to_str().unwrap().to_owned()]).await.unwrap();
+        let prepared = prepare(&[path.to_str().unwrap().to_owned()], None)
+            .await
+            .unwrap();
         let Config::Server(server) = &prepared.validated.configs[0] else {
             panic!()
         };

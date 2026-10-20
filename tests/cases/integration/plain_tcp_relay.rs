@@ -1,6 +1,6 @@
 use shoes_test_support::port_helper::PortHelper;
 use shoes_test_support::test_fixture::start_shoes_server;
-use std::{io, time::Duration};
+use std::{io, net::SocketAddrV4, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -14,24 +14,28 @@ async fn headers(socket: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn request(socket: &mut TcpStream, protocol: &str, port: u16, data: &[u8]) -> io::Result<()> {
-    let mut request = match protocol {
-        "socks" => {
-            socket.write_all(&[5, 1, 0]).await?;
-            let mut method = [0; 2];
-            socket.read_exact(&mut method).await?;
-            assert_eq!(method, [5, 0]);
-            let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
-            request.extend_from_slice(&port.to_be_bytes());
-            request
-        }
-        "http" => format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
-            .into_bytes(),
-        "forward" => Vec::new(),
-        _ => unreachable!(),
-    };
-    request.extend_from_slice(data);
-    socket.write_all(&request).await?;
+pub(super) async fn request(
+    socket: &mut TcpStream,
+    protocol: &str,
+    port: u16,
+    data: &[u8],
+) -> io::Result<()> {
+    request_to(
+        socket,
+        protocol,
+        SocketAddrV4::new([127, 0, 0, 1].into(), port),
+        data,
+    )
+    .await
+}
+
+pub(super) async fn request_to(
+    socket: &mut TcpStream,
+    protocol: &str,
+    target: SocketAddrV4,
+    data: &[u8],
+) -> io::Result<()> {
+    send_request_to(socket, protocol, target, data).await?;
     match protocol {
         "socks" => {
             let mut response = [0; 10];
@@ -42,6 +46,31 @@ async fn request(socket: &mut TcpStream, protocol: &str, port: u16, data: &[u8])
         _ => {}
     }
     Ok(())
+}
+
+pub(super) async fn send_request_to(
+    socket: &mut TcpStream,
+    protocol: &str,
+    target: SocketAddrV4,
+    data: &[u8],
+) -> io::Result<()> {
+    let mut request = match protocol {
+        "socks" => {
+            socket.write_all(&[5, 1, 0]).await?;
+            let mut method = [0; 2];
+            socket.read_exact(&mut method).await?;
+            assert_eq!(method, [5, 0]);
+            let mut request = vec![5, 1, 0, 1];
+            request.extend_from_slice(&target.ip().octets());
+            request.extend_from_slice(&target.port().to_be_bytes());
+            request
+        }
+        "http" => format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").into_bytes(),
+        "forward" => Vec::new(),
+        _ => unreachable!(),
+    };
+    request.extend_from_slice(data);
+    socket.write_all(&request).await
 }
 
 #[tokio::test]

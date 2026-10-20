@@ -16,7 +16,38 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use crate::address::{NetLocation, ResolvedLocation};
 
-type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+pub type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+pub type DnsExchangeFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send>>;
+
+fn dns_exchange_until(
+    future: DnsExchangeFuture,
+    deadline: tokio::time::Instant,
+) -> DnsExchangeFuture {
+    Box::pin(async move {
+        tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS exchange timed out")
+            })?
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct DnsSetupPending;
+
+impl std::fmt::Display for DnsSetupPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DNS exchange timed out with retained connection setup")
+    }
+}
+
+impl std::error::Error for DnsSetupPending {}
+
+pub(crate) fn dns_setup_pending(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<DnsSetupPending>())
+}
 
 const CACHING_NATIVE_RESOLVER_CACHE_CAPACITY: usize = 10_000;
 const RESOLVER_CACHE_CAPACITY: usize = 1_024;
@@ -30,6 +61,28 @@ fn bounded_lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
 
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
+
+    fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
+        None
+    }
+
+    fn exchange(&self, _request: Vec<u8>) -> DnsExchangeFuture {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "resolver does not support DNS message exchange",
+            ))
+        })
+    }
+
+    /// Completes by the deadline; wrappers forward it so fallbacks can return a retained partial.
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> DnsExchangeFuture {
+        dns_exchange_until(self.exchange(request), deadline)
+    }
 }
 
 /// Resolver wrapper that enforces a timeout on DNS resolution.
@@ -66,6 +119,31 @@ impl<T: Resolver> Debug for TimeoutResolver<T> {
 }
 
 impl<T: Resolver> Resolver for TimeoutResolver<T> {
+    fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
+        self.inner.fake_dns_context()
+    }
+
+    fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+        let future = self.inner.exchange(request);
+        let timeout = self.timeout;
+        Box::pin(async move {
+            tokio::time::timeout(timeout, future).await.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS exchange timed out")
+            })?
+        })
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> DnsExchangeFuture {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.timeout)
+            .map_or(deadline, |configured| deadline.min(configured));
+        self.inner.exchange_with_deadline(request, deadline)
+    }
+
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
         // Fast path: if already an IP address, no resolution needed
         if location.to_socket_addr_nonblocking().is_some() {
@@ -163,15 +241,17 @@ impl RefreshingResolver {
                 | std::io::ErrorKind::NotConnected
         )
     }
-}
 
-impl Resolver for RefreshingResolver {
-    fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
-        if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
-            return Box::pin(async move { Ok(vec![socket_addr]) });
-        }
-
-        let location = location.clone();
+    fn execute<T: Send + 'static>(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        operation: impl Fn(
+            Arc<dyn Resolver>,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<T>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<T>> + Send>> {
         let inner = self.inner.clone();
         let refresh_lock = self.refresh_lock.clone();
         let factory = self.factory.clone();
@@ -183,7 +263,7 @@ impl Resolver for RefreshingResolver {
             // Refreshes if idle too long using double-checked locking.
             if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
             {
-                let _guard = refresh_lock.lock().await;
+                let _guard = Self::refresh_wait(deadline, refresh_lock.lock()).await?;
                 if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
                 {
                     log::info!(
@@ -191,9 +271,9 @@ impl Resolver for RefreshingResolver {
                         description,
                         policy.max_idle
                     );
-                    match factory().await {
+                    match Self::refresh_wait(deadline, factory()).await? {
                         Ok(fresh) => {
-                            *inner.write().await = fresh;
+                            *Self::refresh_wait(deadline, inner.write()).await? = fresh;
                             let mut state = refresh_state.lock();
                             state.last_activity_at = Some(Instant::now());
                             state.generation = state.generation.wrapping_add(1);
@@ -210,52 +290,104 @@ impl Resolver for RefreshingResolver {
             }
 
             let current_generation = refresh_state.lock().generation;
-            let current = inner.read().await.clone();
-            match current.resolve_location(&location).await {
-                Ok(addrs) => {
-                    refresh_state.lock().last_activity_at = Some(Instant::now());
-                    Ok(addrs)
-                }
-                Err(err)
-                    if policy.retry_once_after_refresh
-                        && RefreshingResolver::should_refresh_for_error(&err) =>
-                {
-                    let _guard = refresh_lock.lock().await;
-                    if refresh_state.lock().generation != current_generation {
-                        let current = inner.read().await.clone();
-                        let addrs = current.resolve_location(&location).await?;
-                        refresh_state.lock().last_activity_at = Some(Instant::now());
-                        return Ok(addrs);
-                    }
-                    log::info!(
-                        "RefreshingResolver ({}): refresh-on-error ({}) for {}",
-                        description,
-                        err.kind(),
-                        location
-                    );
-                    match factory().await {
-                        Ok(fresh) => {
-                            *inner.write().await = fresh.clone();
-                            {
-                                let mut state = refresh_state.lock();
-                                state.generation = state.generation.wrapping_add(1);
-                            }
-                            let addrs = fresh.resolve_location(&location).await?;
-                            refresh_state.lock().last_activity_at = Some(Instant::now());
-                            Ok(addrs)
-                        }
-                        Err(factory_err) => {
-                            log::warn!(
-                                "RefreshingResolver ({}): error-refresh factory failed: {}",
-                                description,
-                                factory_err
-                            );
-                            Err(err)
-                        }
-                    }
-                }
-                Err(err) => Err(err),
+            let current = Self::refresh_wait(deadline, inner.read()).await?.clone();
+            let mut result = operation(current.clone()).await;
+            let retried_setup = policy.retry_once_after_refresh
+                && result.as_ref().is_err_and(dns_setup_pending)
+                && deadline.is_none_or(|limit| tokio::time::Instant::now() < limit);
+            if retried_setup {
+                result = operation(current).await;
             }
+            let error = match result {
+                Ok(value) => {
+                    refresh_state.lock().last_activity_at = Some(Instant::now());
+                    return Ok(value);
+                }
+                Err(error) => error,
+            };
+            if !policy.retry_once_after_refresh
+                || !Self::should_refresh_for_error(&error)
+                || deadline.is_some_and(|limit| tokio::time::Instant::now() >= limit)
+            {
+                return Err(error);
+            }
+
+            let _guard = Self::refresh_wait(deadline, refresh_lock.lock()).await?;
+            let retry_resolver = if refresh_state.lock().generation != current_generation {
+                if retried_setup {
+                    return Err(error);
+                }
+                Self::refresh_wait(deadline, inner.read()).await?.clone()
+            } else {
+                log::info!(
+                    "RefreshingResolver ({}): refresh-on-error ({})",
+                    description,
+                    error.kind()
+                );
+                let fresh = match Self::refresh_wait(deadline, factory()).await? {
+                    Ok(fresh) => fresh,
+                    Err(factory_err) => {
+                        log::warn!(
+                            "RefreshingResolver ({}): error-refresh factory failed: {}",
+                            description,
+                            factory_err
+                        );
+                        return Err(error);
+                    }
+                };
+                *Self::refresh_wait(deadline, inner.write()).await? = fresh.clone();
+                {
+                    let mut state = refresh_state.lock();
+                    state.generation = state.generation.wrapping_add(1);
+                }
+                // A retained setup gets one retry, then refreshes only for future calls.
+                if retried_setup {
+                    return Err(error);
+                }
+                fresh
+            };
+            let value = operation(retry_resolver).await?;
+            refresh_state.lock().last_activity_at = Some(Instant::now());
+            Ok(value)
+        })
+    }
+
+    async fn refresh_wait<T>(
+        deadline: Option<tokio::time::Instant>,
+        future: impl Future<Output = T>,
+    ) -> std::io::Result<T> {
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, future)
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS exchange timed out")
+                }),
+            None => Ok(future.await),
+        }
+    }
+}
+
+impl Resolver for RefreshingResolver {
+    fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
+        if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
+            return Box::pin(async move { Ok(vec![socket_addr]) });
+        }
+        let location = location.clone();
+        self.execute(None, move |resolver| resolver.resolve_location(&location))
+    }
+
+    fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+        self.execute(None, move |resolver| resolver.exchange(request.clone()))
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> DnsExchangeFuture {
+        // A second timer around the operation could beat its retained reply's timer wake.
+        self.execute(Some(deadline), move |resolver| {
+            resolver.exchange_with_deadline(request.clone(), deadline)
         })
     }
 }
@@ -573,6 +705,17 @@ mod tests {
     }
 
     impl Resolver for MockResolver {
+        fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let error = self.error_kind;
+            Box::pin(async move {
+                match error {
+                    Some(kind) => Err(std::io::Error::new(kind, "mock exchange error")),
+                    None => Ok(request),
+                }
+            })
+        }
+
         fn resolve_location(&self, _location: &NetLocation) -> ResolveFuture {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let addrs = self.addrs.clone();
@@ -625,12 +768,321 @@ mod tests {
         NetLocation::new(Address::Hostname("example.com".to_string()), 80)
     }
 
+    #[tokio::test]
+    async fn exchange_propagates_timeout_and_refreshes_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let builds = calls.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            let generation = builds.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                let resolver = if generation == 0 {
+                    MockResolver::with_error(std::io::ErrorKind::TimedOut)
+                } else {
+                    MockResolver::with_addrs(vec![])
+                };
+                Ok(Arc::new(resolver) as Arc<dyn Resolver>)
+            })
+        });
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+                retry_once_after_refresh: true,
+            },
+            "exchange".into(),
+        )
+        .await
+        .unwrap();
+        let resolver = TimeoutResolver::with_timeout(resolver, Duration::from_secs(1));
+        assert_eq!(resolver.exchange(vec![1, 2]).await.unwrap(), vec![1, 2]);
+        assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(
+            resolver
+                .inner
+                .refresh_state
+                .lock()
+                .last_activity_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_deadline_handles_an_unbounded_configured_timeout() {
+        let resolver =
+            TimeoutResolver::with_timeout(MockResolver::with_addrs(vec![]), Duration::MAX);
+        assert_eq!(
+            resolver
+                .exchange_with_deadline(
+                    vec![1],
+                    tokio::time::Instant::now() + Duration::from_secs(1)
+                )
+                .await
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exchange_deadline_completion_is_not_raced_by_a_refresh_timer() {
+        #[derive(Debug)]
+        struct DeadlineReply(bool);
+        impl Resolver for DeadlineReply {
+            fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+                unreachable!()
+            }
+            fn exchange_with_deadline(
+                &self,
+                request: Vec<u8>,
+                deadline: tokio::time::Instant,
+            ) -> DnsExchangeFuture {
+                let fail = self.0;
+                Box::pin(async move {
+                    tokio::time::sleep_until(deadline).await;
+                    // Model a leaf timer wake delivered after an enclosing timer's wake batch.
+                    tokio::task::yield_now().await;
+                    if fail {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            DnsSetupPending,
+                        ))
+                    } else {
+                        Ok(request)
+                    }
+                })
+            }
+        }
+        for fail in [false, true] {
+            let builds = Arc::new(AtomicUsize::new(0));
+            let calls = builds.clone();
+            let factory: ResolverFactory = Arc::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move { Ok(Arc::new(DeadlineReply(fail)) as Arc<dyn Resolver>) })
+            });
+            let resolver = RefreshingResolver::new(
+                factory,
+                RefreshPolicy {
+                    max_idle: Duration::from_secs(60),
+                    retry_once_after_refresh: true,
+                },
+                "deadline completion".into(),
+            )
+            .await
+            .unwrap();
+            let reply = resolver
+                .exchange_with_deadline(
+                    vec![1],
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                )
+                .await;
+            if fail {
+                assert!(dns_setup_pending(&reply.unwrap_err()));
+            } else {
+                assert_eq!(reply.unwrap(), vec![1]);
+            }
+            assert_eq!(builds.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_deadline_also_bounds_refresh_factory_and_lock_waits() {
+        for hold_lock in [false, true] {
+            let builds = Arc::new(AtomicUsize::new(0));
+            let calls = builds.clone();
+            let factory: ResolverFactory = Arc::new(move || {
+                let generation = calls.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    if generation > 0 {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(Arc::new(MockResolver::with_error(
+                        std::io::ErrorKind::ConnectionReset,
+                    )) as Arc<dyn Resolver>)
+                })
+            });
+            let resolver = RefreshingResolver::new(
+                factory,
+                RefreshPolicy {
+                    max_idle: Duration::from_secs(60),
+                    retry_once_after_refresh: true,
+                },
+                "deadline".into(),
+            )
+            .await
+            .unwrap();
+            let _guard = if hold_lock {
+                Some(resolver.refresh_lock.lock().await)
+            } else {
+                None
+            };
+            let started = tokio::time::Instant::now();
+            let error = resolver
+                .exchange_with_deadline(vec![], started + Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+            assert_eq!(
+                builds.load(Ordering::Relaxed),
+                if hold_lock { 1 } else { 2 }
+            );
+        }
+    }
+
     fn test_addrs() -> Vec<SocketAddr> {
         vec!["127.0.0.1:80".parse().unwrap()]
     }
 
+    #[tokio::test]
+    async fn failed_setup_retry_refreshes_only_for_future_requests() {
+        #[derive(Debug)]
+        struct SetupFailureResolver {
+            calls: AtomicUsize,
+            second_error: Option<std::io::ErrorKind>,
+        }
+        impl Resolver for SetupFailureResolver {
+            fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+                unreachable!()
+            }
+
+            fn exchange(&self, _: Vec<u8>) -> DnsExchangeFuture {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                let second_error = self.second_error;
+                Box::pin(async move {
+                    if call > 0
+                        && let Some(kind) = second_error
+                    {
+                        return Err(std::io::Error::new(kind, "retry failure"));
+                    }
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        DnsSetupPending,
+                    ))
+                })
+            }
+        }
+
+        for (second_error, factory_fails) in [
+            (None, false),
+            (Some(std::io::ErrorKind::TimedOut), false),
+            (Some(std::io::ErrorKind::InvalidData), false),
+            (None, true),
+        ] {
+            let initial = Arc::new(SetupFailureResolver {
+                calls: AtomicUsize::new(0),
+                second_error,
+            });
+            let builds = Arc::new(AtomicUsize::new(0));
+            let factory: ResolverFactory = {
+                let initial = initial.clone();
+                let builds = builds.clone();
+                Arc::new(move || {
+                    let generation = builds.fetch_add(1, Ordering::Relaxed);
+                    let initial = initial.clone();
+                    Box::pin(async move {
+                        if generation == 0 {
+                            Ok(initial as Arc<dyn Resolver>)
+                        } else if factory_fails {
+                            Err(std::io::Error::other("factory failed"))
+                        } else {
+                            Ok(Arc::new(MockResolver::with_addrs(vec![])) as Arc<dyn Resolver>)
+                        }
+                    })
+                })
+            };
+            let resolver = RefreshingResolver::new(
+                factory,
+                RefreshPolicy {
+                    max_idle: Duration::from_secs(60),
+                    retry_once_after_refresh: true,
+                },
+                "failed retained setup".into(),
+            )
+            .await
+            .unwrap();
+            let error = resolver.exchange(vec![]).await.unwrap_err();
+            assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
+            assert!(resolver.refresh_state.lock().last_activity_at.is_none());
+            assert_eq!(dns_setup_pending(&error), second_error.is_none());
+            assert_eq!(
+                error.kind(),
+                second_error.unwrap_or(std::io::ErrorKind::TimedOut)
+            );
+            let refreshable = RefreshingResolver::should_refresh_for_error(&error);
+            assert_eq!(builds.load(Ordering::Relaxed), 1 + usize::from(refreshable));
+            if refreshable && !factory_fails {
+                assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
+                assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
+                assert_eq!(builds.load(Ordering::Relaxed), 2);
+            }
+        }
+    }
+
     fn unique_location(index: usize) -> NetLocation {
         NetLocation::new(Address::Hostname(format!("host-{index}.example")), 443)
+    }
+
+    #[tokio::test]
+    async fn concurrent_setup_retries_do_not_attempt_again_after_generation_changes() {
+        #[derive(Debug, Default)]
+        struct SetupFailureResolver(AtomicUsize);
+        impl Resolver for SetupFailureResolver {
+            fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+                unreachable!()
+            }
+
+            fn exchange(&self, _: Vec<u8>) -> DnsExchangeFuture {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        DnsSetupPending,
+                    ))
+                })
+            }
+        }
+        let initial = Arc::new(SetupFailureResolver::default());
+        let fresh = Arc::new(MockResolver::with_addrs(vec![]));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let factory: ResolverFactory = {
+            let (initial, fresh, builds, gate) =
+                (initial.clone(), fresh.clone(), builds.clone(), gate.clone());
+            Arc::new(move || {
+                let generation = builds.fetch_add(1, Ordering::Relaxed);
+                let (initial, fresh, gate) = (initial.clone(), fresh.clone(), gate.clone());
+                Box::pin(async move {
+                    if generation == 0 {
+                        Ok(initial as Arc<dyn Resolver>)
+                    } else {
+                        let _permit = gate.acquire().await.unwrap();
+                        Ok(fresh as Arc<dyn Resolver>)
+                    }
+                })
+            })
+        };
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+                retry_once_after_refresh: true,
+            },
+            "concurrent retained setup retries".into(),
+        )
+        .await
+        .unwrap();
+        let mut first = resolver.exchange(vec![]);
+        let mut second = resolver.exchange(vec![]);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(initial.0.load(Ordering::Relaxed), 4);
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        gate.add_permits(1);
+        assert!(dns_setup_pending(&first.await.unwrap_err()));
+        assert!(dns_setup_pending(&second.await.unwrap_err()));
+        assert_eq!(initial.0.load(Ordering::Relaxed), 4);
+        assert_eq!(fresh.call_count.load(Ordering::Relaxed), 0);
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! This module provides UDP relay functionality for SOCKS5 UDP ASSOCIATE.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -316,7 +316,7 @@ impl AsyncWriteSourcedMessage for Socks5UdpRelayStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
@@ -331,18 +331,12 @@ impl AsyncWriteSourcedMessage for Socks5UdpRelayStream {
             }
         };
 
-        // Convert SocketAddr to NetLocation for encoding.
         // Handle IPv4-mapped IPv6 addresses (::ffff:w.x.y.z) by converting back to IPv4.
-        let source_ip = source.ip();
-        let address = match source_ip {
-            IpAddr::V4(v4) => Address::Ipv4(v4),
-            IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped() {
-                    Address::Ipv4(v4)
-                } else {
-                    Address::Ipv6(v6)
-                }
+        let address = match source.address() {
+            Address::Ipv6(v6) if v6.to_ipv4_mapped().is_some() => {
+                Address::Ipv4(v6.to_ipv4_mapped().unwrap())
             }
+            address => address.clone(),
         };
         let source_location = NetLocation::new(address, source.port());
         encode_socks5_udp_packet(&source_location, buf, &mut this.write_buf);

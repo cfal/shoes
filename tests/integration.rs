@@ -2,14 +2,20 @@
 mod anytls;
 #[path = "cases/integration/anytls_uot_integration.rs"]
 mod anytls_uot;
+#[path = "cases/integration/fake_dns.rs"]
+mod fake_dns;
 #[path = "cases/integration/h2mux_integration.rs"]
 mod h2mux;
 #[path = "cases/integration/h2mux_backpressure.rs"]
 mod h2mux_backpressure;
 #[path = "cases/integration/h2mux_singbox.rs"]
 mod h2mux_singbox;
+#[path = "cases/integration/hostname_sniffing.rs"]
+mod hostname_sniffing;
 #[path = "cases/integration/http2_proxy.rs"]
 mod http2_proxy;
+#[path = "cases/integration/http_host_sniffing.rs"]
+mod http_host_sniffing;
 #[path = "cases/integration/hysteria2_integration.rs"]
 mod hysteria2;
 #[path = "cases/integration/hysteria2_udp_integration.rs"]

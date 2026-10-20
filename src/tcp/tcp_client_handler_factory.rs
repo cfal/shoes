@@ -429,5 +429,5 @@ pub fn create_tcp_client_proxy_selector(
             Ok(ConnectRule::new(masks.into_vec(), connect_action))
         })
         .collect::<std::io::Result<Vec<_>>>()?;
-    Ok(ClientProxySelector::new(rules))
+    ClientProxySelector::new(rules).with_fake_dns_context(resolver.fake_dns_context())
 }

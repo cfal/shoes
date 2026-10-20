@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -22,7 +23,7 @@ use tokio::time::{Instant, interval};
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncMessageStream;
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::tun::TunResourceLimits;
 use crate::resolver::Resolver;
 use crate::resources::{Budget, BudgetPermit};
@@ -457,6 +458,10 @@ async fn destination_task(
     let mut read_buf = vec![0u8; 65535];
     let sleep = tokio::time::sleep(CONNECTION_TIMEOUT);
     tokio::pin!(sleep);
+    let write_timeout = tokio::time::sleep(WRITE_TIMEOUT);
+    tokio::pin!(write_timeout);
+    let mut pending: Option<QueuedPacket> = None;
+    let mut flushing = false;
 
     loop {
         let mut buf = ReadBuf::new(&mut read_buf);
@@ -466,14 +471,35 @@ async fn destination_task(
         enum Action {
             Read(io::Result<()>),
             Write(Option<QueuedPacket>),
+            Written(io::Result<()>),
             Timeout,
         }
 
+        let io = std::future::poll_fn(|cx| {
+            // Local DNS writes can depend on the read side finishing an exchange.
+            if let Some(packet) = &pending {
+                if !flushing {
+                    match Pin::new(&mut *stream).poll_write_message(cx, &packet.payload) {
+                        Poll::Ready(Ok(())) => flushing = true,
+                        Poll::Ready(Err(error)) => return Poll::Ready(Action::Written(Err(error))),
+                        Poll::Pending => (),
+                    }
+                }
+                if flushing
+                    && let Poll::Ready(result) = Pin::new(&mut *stream).poll_flush_message(cx)
+                {
+                    return Poll::Ready(Action::Written(result));
+                }
+            }
+            if let Poll::Ready(result) = Pin::new(&mut *stream).poll_read_message(cx, &mut buf) {
+                return Poll::Ready(Action::Read(result));
+            }
+            Poll::Pending
+        });
         let action = tokio::select! {
-            result = std::future::poll_fn(|cx| {
-                Pin::new(&mut *stream).poll_read_message(cx, &mut buf)
-            }) => Action::Read(result),
-            msg = write_rx.recv() => Action::Write(msg),
+            action = io => action,
+            msg = write_rx.recv(), if pending.is_none() => Action::Write(msg),
+            _ = &mut write_timeout, if pending.is_some() => Action::Timeout,
             _ = &mut sleep => Action::Timeout,
         };
 
@@ -514,29 +540,19 @@ async fn destination_task(
             }
             Action::Write(Some(packet)) => {
                 sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
-
-                match tokio::time::timeout(
-                    WRITE_TIMEOUT,
-                    send_message(&mut stream, &packet.payload),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        debug!(
-                            "[TunUdpSession {}] Send error to {}: {}",
-                            peer_addr, source_addr, e
-                        );
-                        break;
-                    }
-                    Err(_) => {
-                        debug!(
-                            "[TunUdpSession {}] Send timeout to {}",
-                            peer_addr, source_addr
-                        );
-                        break;
-                    }
-                }
+                write_timeout.as_mut().reset(Instant::now() + WRITE_TIMEOUT);
+                pending = Some(packet);
+                flushing = false;
+            }
+            Action::Written(Ok(())) => {
+                pending = None;
+            }
+            Action::Written(Err(error)) => {
+                debug!(
+                    "[TunUdpSession {}] Send error to {}: {}",
+                    peer_addr, source_addr, error
+                );
+                break;
             }
             Action::Write(None) => break,
             Action::Timeout => {
@@ -556,30 +572,7 @@ async fn create_connection(
     proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
 ) -> io::Result<Box<dyn AsyncMessageStream>> {
-    let decision = proxy_selector.judge(dest.into(), resolver).await?;
-
-    match decision {
-        ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => {
-            let stream = chain_group
-                .connect_udp_bidirectional(resolver, remote_location)
-                .await?;
-            Ok(stream)
-        }
-        ConnectDecision::Block => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "destination blocked",
-        )),
-    }
-}
-
-/// Send a UDP message through a stream.
-async fn send_message(stream: &mut Box<dyn AsyncMessageStream>, data: &[u8]) -> io::Result<()> {
-    std::future::poll_fn(|cx| Pin::new(&mut **stream).poll_write_message(cx, data)).await?;
-    std::future::poll_fn(|cx| Pin::new(&mut **stream).poll_flush_message(cx)).await?;
-    Ok(())
+    crate::routing::ingress::connect_udp(proxy_selector, dest.clone(), resolver).await
 }
 
 #[cfg(test)]
@@ -589,7 +582,7 @@ mod lifecycle_tests {
         AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
     };
     use std::sync::atomic::{AtomicU8, Ordering};
-    use std::task::{Context, Poll};
+    use std::task::Context;
 
     #[derive(Default)]
     struct FlushState {
@@ -652,6 +645,84 @@ mod lifecycle_tests {
     }
 
     impl AsyncMessageStream for StalledFlush {}
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_fake_dns_writes_continue_polling_delayed_replies() {
+        use hickory_resolver::proto::{
+            op::{Message, Query},
+            rr::{Name, RecordType},
+        };
+        #[derive(Debug)]
+        struct DelayedDns;
+        impl Resolver for DelayedDns {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                unreachable!()
+            }
+            fn exchange(&self, bytes: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(Message::from_vec(&bytes)
+                        .unwrap()
+                        .into_response()
+                        .to_vec()
+                        .unwrap())
+                })
+            }
+        }
+        let context = Arc::new(
+            crate::dns::fake_ip::FakeDnsContext::new(Default::default(), Arc::new(DelayedDns))
+                .unwrap(),
+        );
+        let budget = Arc::new(Budget::new(Some(4096)));
+        let slots = Arc::new(Budget::new(Some(1)));
+        let (tx, rx) = mpsc::channel(8);
+        let (responses, mut received) = mpsc::channel(8);
+        for id in 0..8 {
+            let mut query = Message::query();
+            query.metadata.id = id;
+            query.add_query(Query::query(
+                Name::from_ascii("queued.example.").unwrap(),
+                if id % 2 == 0 {
+                    RecordType::TXT
+                } else {
+                    RecordType::A
+                },
+            ));
+            assert!(
+                tx.try_send(
+                    QueuedPacket::reserve(
+                        PacketBuffer::copy_from_slice(&query.to_vec().unwrap()),
+                        &budget,
+                        true,
+                    )
+                    .unwrap(),
+                )
+                .is_ok()
+            );
+        }
+        let task = tokio::spawn(destination_task(
+            "10.0.0.2:1234".parse().unwrap(),
+            "198.18.0.1:53".parse().unwrap(),
+            context.udp_stream(),
+            rx,
+            responses,
+            slots.acquire(1).unwrap(),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for id in 0..8 {
+                let (bytes, source, peer) = received.recv().await.unwrap();
+                assert_eq!(source, "198.18.0.1:53".parse().unwrap());
+                assert_eq!(peer, "10.0.0.2:1234".parse().unwrap());
+                assert_eq!(Message::from_vec(&bytes).unwrap().metadata.id, id);
+            }
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        task.await.unwrap();
+        assert_eq!(budget.available_permits(), 4096);
+        assert_eq!(slots.available_permits(), 1);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn packet_permit_survives_pending_flush_and_all_termination_paths() {

@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, convert_cert_paths, create_server_configs, load_config_str};
-use crate::dns::build_dns_registry;
+use crate::dns::build_dns_registry_for_runtime;
 use crate::tcp::tcp_server::start_servers;
 #[cfg(unix)]
 use crate::tun::run_tun_from_config;
@@ -77,6 +77,17 @@ pub fn spawn_service(
 }
 
 struct ServerTasks(Vec<JoinHandle<()>>);
+
+impl ServerTasks {
+    async fn stop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+        for task in self.0.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
 
 impl Drop for ServerTasks {
     fn drop(&mut self) {
@@ -214,7 +225,11 @@ pub async fn start_from_config(
     let _resource_reporter = crate::resources::ResourceReporter::start();
 
     // Build DNS registry from expanded groups
-    let mut dns_registry = build_dns_registry(dns_groups).await?;
+    let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated_configs).collect();
+    let mut dns_registry =
+        build_dns_registry_for_runtime(dns_groups, global_limits, None, &synthetic_endpoints)
+            .await?;
+    let dns_snapshots = dns_registry.snapshot_task();
 
     // Separate TUN config from server configs, validate exactly one TUN with device_fd
     let mut tun_config = None;
@@ -264,6 +279,9 @@ pub async fn start_from_config(
         .await
     {
         wireguard_running.stop().await;
+        if let Err(error) = dns_registry.shutdown_checkpoint().await {
+            log::warn!("Final Fake DNS checkpoint failed: {error}");
+        }
         return Err(error);
     }
 
@@ -275,8 +293,12 @@ pub async fn start_from_config(
         match start_servers(Config::Server(server_config), resolver).await {
             Ok(tasks) => join_handles.0.extend(tasks),
             Err(error) => {
+                join_handles.stop().await;
                 #[cfg(unix)]
                 wireguard_running.stop().await;
+                if let Err(error) = dns_registry.shutdown_checkpoint().await {
+                    log::warn!("Final Fake DNS checkpoint failed: {error}");
+                }
                 return Err(error);
             }
         }
@@ -295,9 +317,12 @@ pub async fn start_from_config(
     ));
 
     // Cleanup any servers when TUN stops
-    drop(join_handles);
+    join_handles.stop().await;
     #[cfg(unix)]
     wireguard_running.stop().await;
+
+    drop(dns_snapshots);
+    dns_registry.shutdown_checkpoint().await?;
 
     result
 }

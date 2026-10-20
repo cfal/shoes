@@ -9,13 +9,13 @@ use crate::anytls::{AnyTlsServerHandler, PaddingFactory};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::{ClientChainHop, ClientConfig};
 use crate::config::{
-    ConfigSelection, RealityServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
+    ConfigSelection, RealityServerConfig, RuleConfig, ServerProxyConfig, ShadowTlsServerConfig,
     ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, WebsocketServerConfig,
 };
 use crate::http_handler::HttpTcpServerHandler;
 use crate::mixed_handler::MixedTcpServerHandler;
 use crate::naiveproxy::UserLookup;
-use crate::option_util::OneOrSome;
+use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::reality::RealityServerTarget;
 use crate::resolver::Resolver;
@@ -68,6 +68,20 @@ fn create_auth_credentials(
         (None, None) => None,
         _ => Some((username.unwrap_or_default(), password.unwrap_or_default())),
     }
+}
+
+fn create_override_selector(
+    override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    parent: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+) -> std::io::Result<Arc<ClientProxySelector>> {
+    let rules = override_rules
+        .map(ConfigSelection::unwrap_config)
+        .into_vec();
+    Ok(Arc::new(
+        create_tcp_client_proxy_selector(rules, resolver.clone())?
+            .inherit_inbound_policy(parent)?,
+    ))
 }
 
 /// Create a TCP server handler from config.
@@ -486,12 +500,8 @@ fn create_tls_server_target(
         &key_exchange_groups,
     )?);
 
-    // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
-        let rules = override_rules
-            .map(ConfigSelection::unwrap_config)
-            .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?)
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
     } else {
         client_proxy_selector.clone()
     };
@@ -577,12 +587,8 @@ fn create_shadow_tls_server_target(
         }
     };
 
-    // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
-        let rules = override_rules
-            .map(ConfigSelection::unwrap_config)
-            .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?)
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
     } else {
         client_proxy_selector.clone()
     };
@@ -636,12 +642,8 @@ fn create_reality_server_target(
         .map(|s| crate::reality::decode_short_id(&s))
         .collect::<std::io::Result<_>>()?;
 
-    // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
-        let rules = override_rules
-            .map(ConfigSelection::unwrap_config)
-            .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?)
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
     } else {
         client_proxy_selector.clone()
     };
@@ -732,12 +734,8 @@ fn create_websocket_server_target(
             .collect::<FxHashMap<_, _>>()
     });
 
-    // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
-        let rules = override_rules
-            .map(ConfigSelection::unwrap_config)
-            .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?)
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
     } else {
         client_proxy_selector.clone()
     };
@@ -757,6 +755,71 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::ErrorKind;
+
+    #[test]
+    fn override_selectors_inherit_context_and_sniff_but_keep_their_own_rules() {
+        use crate::address::{NetLocation, NetLocationMask};
+        use crate::client_proxy_selector::IngressTarget;
+        use crate::config::RuleActionConfig;
+        use crate::dns::fake_ip::FakeDnsContext;
+
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+        let parent = Arc::new(
+            ClientProxySelector::new(vec![])
+                .with_sniff(true)
+                .with_fake_dns_context(Some(context.clone()))
+                .unwrap(),
+        );
+        for (mask, should_sniff) in [("0.0.0.0/0", false), ("child.example", true)] {
+            let rules = NoneOrSome::One(ConfigSelection::Config(RuleConfig {
+                masks: OneOrSome::One(NetLocationMask::from(mask).unwrap()),
+                ..Default::default()
+            }));
+            let child = create_override_selector(rules, &parent, &resolver).unwrap();
+            assert!(!Arc::ptr_eq(&child, &parent));
+            let IngressTarget::LocalDns {
+                context: inherited, ..
+            } = child
+                .prepare(NetLocation::from_str("198.18.0.9:53", None).unwrap().into())
+                .unwrap()
+            else {
+                panic!("DNS was not intercepted");
+            };
+            assert!(Arc::ptr_eq(&inherited, &context));
+            let IngressTarget::Forward(target) = child
+                .prepare(
+                    NetLocation::from_str("203.0.113.7:443", None)
+                        .unwrap()
+                        .into(),
+                )
+                .unwrap()
+            else {
+                panic!("not a forward target");
+            };
+            assert_eq!(child.should_sniff(&target), should_sniff);
+        }
+
+        let mut rule = RuleConfig::default();
+        let RuleActionConfig::Allow {
+            override_address, ..
+        } = &mut rule.action
+        else {
+            panic!("default rule is not Allow");
+        };
+        *override_address = Some(NetLocation::from_str("198.18.0.9:53", None).unwrap());
+        let error = create_override_selector(
+            NoneOrSome::One(ConfigSelection::Config(rule)),
+            &parent,
+            &resolver,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "synthetic address cannot be an outbound target"
+        );
+    }
 
     #[test]
     fn native_vless_services_share_only_within_one_generation_and_protocol_path() {

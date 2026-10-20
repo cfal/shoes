@@ -2,6 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
 use crate::address::NetLocationMask;
 use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
@@ -11,12 +14,12 @@ use crate::uuid_util::parse_uuid;
 
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
-    ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
-    DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
-    ExpandedDnsSpec, GlobalLimits, PemSource, RuleActionConfig, RuleConfig, ServerConfig,
-    ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
-    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, WebsocketServerConfig,
-    direct_allow_rule,
+    BindLocation, ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config,
+    ConfigSelection, DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec,
+    ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits, PemSource, RuleActionConfig, RuleConfig,
+    ServerConfig, ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig,
+    ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, Transport, TunConfig,
+    WebsocketServerConfig, direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
@@ -155,14 +158,96 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     // Extract inline DNS configs from server/tun configs into dns_groups.
     // This replaces inline specs with group name references.
     let mut inline_dns_counter = 0u32;
+    let mut default_dns_groups = HashSet::new();
+    #[cfg(unix)]
+    let mut wireguard_server_ids = HashSet::new();
     for config in server_configs.iter_mut() {
-        extract_inline_dns(&mut config.dns, &mut dns_groups, &mut inline_dns_counter)?;
+        let identity = match &config.protocol {
+            #[cfg(unix)]
+            ServerProxyConfig::Wireguard(protocol) => {
+                let id = protocol.server_id();
+                if !wireguard_server_ids.insert(id.clone()) {
+                    return Err(super::types::wireguard::invalid(
+                        "duplicate WireGuard server identity; set a distinct wireguard_name for each server",
+                    ));
+                }
+                format!("wireguard:{id}")
+            }
+            _ => {
+                let bind = match &config.bind_location {
+                    BindLocation::Path(path) => format!(
+                        "path:{}",
+                        URL_SAFE_NO_PAD.encode(path.as_os_str().as_encoded_bytes())
+                    ),
+                    BindLocation::Address(_) => format!(
+                        "address:{}",
+                        URL_SAFE_NO_PAD.encode(config.bind_location.to_string())
+                    ),
+                    BindLocation::Unspecified {} => "no-listener".into(),
+                };
+                format!("server:{:?}:{bind}", config.transport)
+            }
+        };
+        extract_inline_dns(
+            &mut config.dns,
+            &mut dns_groups,
+            &mut inline_dns_counter,
+            &identity,
+            &mut default_dns_groups,
+        )?;
     }
     for config in tun_configs.iter_mut() {
-        extract_inline_dns(&mut config.dns, &mut dns_groups, &mut inline_dns_counter)?;
+        let identity = format!(
+            "tun:{}",
+            URL_SAFE_NO_PAD.encode(config.device_name.as_deref().unwrap_or("default"))
+        );
+        extract_inline_dns(
+            &mut config.dns,
+            &mut dns_groups,
+            &mut inline_dns_counter,
+            &identity,
+            &mut default_dns_groups,
+        )?;
     }
 
     // Expand DNS group composition references for ALL groups (named + inline).
+    let mut fake_policies = HashMap::new();
+    let mut state_files = HashSet::new();
+    for (name, group) in &dns_groups {
+        let policy = group.fake_ip.as_ref().and_then(|config| config.options());
+        if let Some(options) = &policy {
+            options.validate()?;
+            if let Some(path) = &options.state_file
+                && !state_files.insert(path.clone())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "multiple fake DNS contexts own the same state_file",
+                ));
+            }
+        }
+        if group.fake_ip.is_none()
+            && group
+                .dns_servers
+                .iter()
+                .filter_map(|spec| spec.as_group_ref())
+                .any(|name| {
+                    dns_groups.get(name).is_some_and(|referenced| {
+                        referenced
+                            .fake_ip
+                            .as_ref()
+                            .and_then(|config| config.options())
+                            .is_some()
+                    })
+                })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "DNS composition referencing a fake IP group requires an explicit fake_ip policy; reference the group directly to share its pool",
+            ));
+        }
+        fake_policies.insert(name.clone(), policy);
+    }
     let expanded_dns_groups = expand_dns_groups_composition(dns_groups)?;
 
     // Topological sort by bootstrap dependencies and detect errors
@@ -184,6 +269,8 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             global_limits,
         )?;
         final_dns_groups.push(ExpandedDnsGroup {
+            fake_ip: fake_policies.remove(&name).flatten(),
+            use_default_resolver: default_dns_groups.contains(&name),
             name,
             specs: expanded_specs,
         });
@@ -217,7 +304,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
-    let validated = ValidatedConfigs {
+    let mut validated = ValidatedConfigs {
         global_limits,
         configs: result,
         dns_groups: final_dns_groups,
@@ -225,9 +312,8 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     };
     validate_wireguard_dns(&validated)?;
     #[cfg(unix)]
-    let mut validated = validated;
-    #[cfg(unix)]
     super::wireguard_devices::collect_devices(&mut validated, &mut client_groups)?;
+    super::fake_dns::validate(&mut validated)?;
     Ok(validated)
 }
 
@@ -548,13 +634,15 @@ fn extract_inline_dns(
     dns: &mut Option<DnsConfig>,
     dns_groups: &mut HashMap<String, DnsConfigGroup>,
     counter: &mut u32,
+    identity: &str,
+    default_dns_groups: &mut HashSet<String>,
 ) -> std::io::Result<()> {
     let Some(config) = dns else {
         return Ok(());
     };
 
     // Empty means use default resolver - nothing to extract
-    if config.servers.is_empty() {
+    if config.servers.is_empty() && config.fake_ip.is_none() {
         config.servers = NoneOrSome::None;
         return Ok(());
     }
@@ -562,17 +650,38 @@ fn extract_inline_dns(
     // Already a single group reference - nothing to extract
     if let NoneOrSome::One(spec) = &config.servers
         && spec.as_group_ref().is_some()
+        && config.fake_ip.is_none()
     {
         return Ok(());
     }
 
     // Generate unique name and extract specs into a new group
-    let generated_name = format!("__inline_dns_{}", *counter);
+    let generated_name = if config.fake_ip.is_some() {
+        format!("__inline_fake_dns:{identity}")
+    } else {
+        format!("__inline_dns_{}", *counter)
+    };
     *counter += 1;
 
+    if dns_groups.contains_key(&generated_name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ambiguous private DNS context identity; use a named DNS group",
+        ));
+    }
+    let servers = std::mem::replace(&mut config.servers, NoneOrSome::Unspecified);
+    if servers.is_empty() {
+        default_dns_groups.insert(generated_name.clone());
+    }
+
     let group = DnsConfigGroup {
+        fake_ip: config.fake_ip.take(),
         dns_group: generated_name.clone(),
-        dns_servers: std::mem::replace(&mut config.servers, NoneOrSome::Unspecified),
+        dns_servers: if servers.is_empty() {
+            NoneOrSome::One(DnsServerSpec::Simple("system".into()))
+        } else {
+            servers
+        },
     };
     dns_groups.insert(generated_name.clone(), group);
 
@@ -3281,6 +3390,7 @@ mod tests {
     async fn test_tun_icmp_requires_tcp() {
         // ICMP requires TCP to be enabled
         let tun_config = TunConfig {
+            sniff: false,
             segmentation_offload: None,
             resource_limits: Default::default(),
             packet_information: None,
@@ -3310,6 +3420,7 @@ mod tests {
     #[tokio::test]
     async fn test_dns_system_with_client_chain_rejected() {
         let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
+            fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "system".to_string(),
@@ -3351,6 +3462,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "udp://8.8.8.8".to_string(),
@@ -3387,6 +3499,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "udp://8.8.8.8".to_string(),
@@ -3425,6 +3538,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "h3://1.1.1.1/dns-query".to_string(),
@@ -3461,6 +3575,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "h3://1.1.1.1/dns-query".to_string(),
@@ -3490,6 +3605,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "tcp://8.8.8.8".to_string(),
@@ -3520,6 +3636,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "tls://1.1.1.1".to_string(),
@@ -3550,6 +3667,7 @@ mod tests {
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "test-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     url: "https://1.1.1.1/dns-query".to_string(),
@@ -3575,6 +3693,7 @@ mod tests {
         // Group full-dns includes base-dns
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "base-dns".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("udp://8.8.8.8".to_string()),
@@ -3582,6 +3701,7 @@ mod tests {
                 ]),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "full-dns".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("base-dns".to_string()), // Group reference
@@ -3603,10 +3723,12 @@ mod tests {
         // C includes B, B includes A
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "level-a".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "level-b".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("level-a".to_string()),
@@ -3614,6 +3736,7 @@ mod tests {
                 ]),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "level-c".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("level-b".to_string()),
@@ -3635,10 +3758,12 @@ mod tests {
         // A includes B, B includes A - cycle!
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "group-a".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-b".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "group-b".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-a".to_string())),
             }),
@@ -3657,6 +3782,7 @@ mod tests {
     async fn test_dns_group_composition_unknown_ref() {
         // Reference to non-existent group
         let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
+            fake_ip: None,
             dns_group: "my-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent".to_string())),
         })];
@@ -3676,14 +3802,17 @@ mod tests {
         // Note: Using IP-based URLs to avoid network calls during tests
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "bootstrap-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "base-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tls://1.1.1.1".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "full-dns".to_string(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("base-dns".to_string()), // Composition reference
@@ -3740,10 +3869,12 @@ mod tests {
         // Server config references an existing dns_group
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "my-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::Server(ServerConfig {
+                sniff: false,
                 bind_location: BindLocation::Address(OneOrSome::One(
                     NetLocationPortRange::new(
                         crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
@@ -3760,6 +3891,7 @@ mod tests {
                 quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
+                    fake_ip: None,
                     servers: NoneOrSome::One(DnsServerSpec::Simple("my-dns".to_string())),
                 }),
             }),
@@ -3788,10 +3920,12 @@ mod tests {
         // Server config with both group ref and URL in servers
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "base-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::Server(ServerConfig {
+                sniff: false,
                 bind_location: BindLocation::Address(OneOrSome::One(
                     NetLocationPortRange::new(
                         crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
@@ -3808,6 +3942,7 @@ mod tests {
                 quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
+                    fake_ip: None,
                     servers: NoneOrSome::Some(vec![
                         DnsServerSpec::Simple("base-dns".to_string()), // group ref
                         DnsServerSpec::Simple("udp://1.1.1.1".to_string()), // URL
@@ -3844,14 +3979,17 @@ mod tests {
         // Server config with multiple group refs that need expansion
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "fast-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
+                fake_ip: None,
                 dns_group: "secure-dns".to_string(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tcp://1.1.1.1".to_string())),
             }),
             Config::Server(ServerConfig {
+                sniff: false,
                 bind_location: BindLocation::Address(OneOrSome::One(
                     NetLocationPortRange::new(
                         crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
@@ -3868,6 +4006,7 @@ mod tests {
                 quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
+                    fake_ip: None,
                     servers: NoneOrSome::Some(vec![
                         DnsServerSpec::Simple("fast-dns".to_string()),
                         DnsServerSpec::Simple("secure-dns".to_string()),
@@ -3903,6 +4042,7 @@ mod tests {
 
         // Server config references non-existent dns_group
         let configs = vec![Config::Server(ServerConfig {
+            sniff: false,
             bind_location: BindLocation::Address(OneOrSome::One(
                 NetLocationPortRange::new(
                     crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
@@ -3919,6 +4059,7 @@ mod tests {
             quic_settings: None,
             rules: direct_allow_rule(),
             dns: Some(DnsConfig {
+                fake_ip: None,
                 servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent-dns".to_string())),
             }),
         })];
