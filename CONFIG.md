@@ -1223,7 +1223,11 @@ caches belong to the new configuration; Fake DNS pools are preserved separately.
 alternatives OR together. Neither can be combined with `match`. For composition,
 use `match: {all: [{rule_set: local_domains}, ...]}`.
 Sources with the same resolved path and decoding options share one compiled set.
-Names must be unique. Only `.srs` and `.mrs` are inferred; JSON requires `singbox_json`.
+Names must be unique. Explicit `format` overrides detection. Otherwise SRS and
+Zstd signatures select the SRS and MRS decoders, followed by case-insensitive
+`.srs`, `.mrs`, `.json`, `.yaml`/`.yml`, and `.txt` suffixes. Zstd data must still
+contain a valid MRS payload. Unknown formats require an explicit `format`; DAT
+always requires `geosite_dat` or `geoip_dat`. YAML/text still require `behavior`.
 
 Rule-set paths are relative to the declaring config file, even when multiple
 configs are combined. FFI string configs require absolute rule-set paths. Existing

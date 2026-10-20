@@ -8,7 +8,7 @@ mod srs;
 mod yaml;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -57,15 +57,28 @@ struct SourceKey {
 }
 
 impl RuleSetConfig {
-    fn format(&self) -> io::Result<Format> {
+    fn format(&self, prefix: &[u8]) -> io::Result<Format> {
         self.format
-            .or_else(|| match self.path.extension().and_then(|s| s.to_str()) {
-                Some("srs") => Some(Format::Srs),
-                Some("mrs") => Some(Format::Mrs),
+            .or_else(|| {
+                if prefix.starts_with(b"SRS") {
+                    Some(Format::Srs)
+                } else if prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+                    // Zstd selects the MRS decoder, which still validates the payload.
+                    Some(Format::Mrs)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| match self.path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+                "srs" => Some(Format::Srs),
+                "mrs" => Some(Format::Mrs),
+                "json" => Some(Format::SingboxJson),
+                "yaml" | "yml" => Some(Format::MihomoYaml),
+                "txt" => Some(Format::MihomoText),
                 _ => None,
             })
             .ok_or_else(|| {
-                invalid("rule_set requires an explicit format (only .srs/.mrs are inferred)")
+                invalid("cannot detect rule source format; specify format explicitly (DAT requires geosite_dat or geoip_dat)")
             })
     }
 }
@@ -133,7 +146,33 @@ fn load_source(
             "rule_set path must be absolute for string configs; file configs anchor paths to their declaring file",
         ));
     }
-    let format = source.format()?;
+    let start = std::time::Instant::now();
+    let path = std::fs::canonicalize(&source.path)?;
+    if !std::fs::metadata(&path)?.is_file() {
+        return Err(invalid("rule_set source must be a regular file"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A concurrent replacement with a FIFO must not strand the compiler worker.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(invalid("rule_set source must be a regular file"));
+    }
+    if metadata.len() > MAX_INPUT as u64 {
+        return Err(invalid("rule_set input exceeds 64 MiB"));
+    }
+    let size = metadata.len() as usize;
+    let mut prefix = [0; 4];
+    let prefix = &mut prefix[..size.min(4)];
+    file.read_exact(prefix)?;
+    file.rewind()?;
+    let format = source.format(prefix)?;
     if !matches!(
         format,
         Format::MihomoYaml | Format::MihomoText | Format::Mrs
@@ -148,7 +187,6 @@ fn load_source(
             "code and attributes are only valid for DAT formats",
         ));
     }
-    let path = std::fs::canonicalize(&source.path)?;
     let key = SourceKey {
         path: path.clone(),
         format,
@@ -159,27 +197,6 @@ fn load_source(
     if let Some(predicate) = cache.get(&key) {
         return Ok(predicate.clone());
     }
-    let start = std::time::Instant::now();
-    if !std::fs::metadata(&path)?.is_file() {
-        return Err(invalid("rule_set source must be a regular file"));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // A concurrent replacement with a FIFO must not strand the compiler worker.
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(&path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(invalid("rule_set source must be a regular file"));
-    }
-    if metadata.len() > MAX_INPUT as u64 {
-        return Err(invalid("rule_set input exceeds 64 MiB"));
-    }
-    let size = metadata.len() as usize;
     let predicate = compiler.source(|compiler| {
         // JSON may retain doubled escape scratch alongside an owned map key.
         let factor = if format == Format::SingboxJson { 4 } else { 2 };
@@ -227,6 +244,59 @@ fn load_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_detection_prefers_overrides_then_signatures_then_suffixes() {
+        for (path, prefix, expected) in [
+            ("source", b"SRS\x02".as_slice(), Some(Format::Srs)),
+            ("wrong.json", b"SRS\x02", Some(Format::Srs)),
+            ("source", &[0x28, 0xb5, 0x2f, 0xfd], Some(Format::Mrs)),
+            ("list.SRS", b"", Some(Format::Srs)),
+            ("list.mrs", b"", Some(Format::Mrs)),
+            ("list.json", b"{}", Some(Format::SingboxJson)),
+            ("list.yaml", b"payl", Some(Format::MihomoYaml)),
+            ("list.yml", b"", Some(Format::MihomoYaml)),
+            ("list.txt", b"exam", Some(Format::MihomoText)),
+            ("list.dat", b"", None),
+            ("list", b"{}", None),
+            ("list", b"SR", None),
+        ] {
+            let mut source = RuleSetConfig {
+                rule_set: "test".into(),
+                path: path.into(),
+                format: None,
+                behavior: None,
+                code: None,
+                attributes: vec![],
+            };
+            assert_eq!(source.format(prefix).ok(), expected, "{path}");
+            source.format = Some(Format::MihomoText);
+            assert_eq!(source.format(prefix).unwrap(), Format::MihomoText);
+        }
+    }
+
+    #[test]
+    fn detected_binary_sources_still_require_valid_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        for bytes in [
+            include_bytes!("../../tests/fixtures/rule_sets/singbox-v2.srs").as_slice(),
+            include_bytes!("../../tests/fixtures/rule_sets/mihomo-domain.mrs").as_slice(),
+        ] {
+            let path = dir.path().join("source.json");
+            let source = RuleSetConfig {
+                rule_set: "test".into(),
+                path: path.clone(),
+                format: None,
+                behavior: None,
+                code: None,
+                attributes: vec![],
+            };
+            std::fs::write(&path, bytes).unwrap();
+            load(&[Config::RuleSet(source.clone())], &mut Compiler::default()).unwrap();
+            std::fs::write(&path, &bytes[..4]).unwrap();
+            assert!(load(&[Config::RuleSet(source)], &mut Compiler::default()).is_err());
+        }
+    }
 
     #[test]
     fn escaped_json_keys_reserve_scratch_before_parsing() {
