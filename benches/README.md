@@ -58,7 +58,7 @@ All 57 routing gates passed across 348 fresh processes. Ordinary uncached median
 | 1M members | 8,995.17 us | 0.556 us |
 | 1,024 policies, late hit | 944.72 us | 123.72 us |
 
-These synthetic membership workloads are not a general routing-throughputput
+These synthetic membership workloads are not a general routing-throughput
 claim. Many-policy evaluation remains ordered and scales with policies visited.
 The full distributions, including occasional process outliers, are in
 `results/{old,new}.log`; `results/selector.json` contains aggregates and gates.
