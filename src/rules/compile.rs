@@ -116,14 +116,19 @@ impl Compiler {
                 if v.is_empty() {
                     return Ok(Predicate::new(Kind::Constant(false)));
                 }
-                if v.iter().map(String::len).sum::<usize>() > 4 * 1024 * 1024 {
+                let pattern_bytes = v.iter().map(String::len).sum::<usize>();
+                if pattern_bytes > 512 * 1024 {
                     return Err(invalid("regex pattern budget exceeded"));
                 }
                 let before = self.bytes;
-                self.charge(64 * 1024 * 1024, 0)?;
+                // AST/HIR construction precedes the NFA size limit. ASCII
+                // case-folded classes can cost hundreds of bytes per character.
+                self.charge(pattern_bytes * 512 + 64 * 1024 * 1024, 0)?;
                 let matcher = regex_automata::meta::Regex::builder()
                     .configure(
                         regex_automata::meta::Regex::config()
+                            .which_captures(regex_automata::nfa::thompson::WhichCaptures::None)
+                            .hybrid_cache_capacity(256 * 1024)
                             .nfa_size_limit(Some(16 * 1024 * 1024))
                             .dfa_size_limit(Some(16 * 1024 * 1024))
                             .onepass_size_limit(Some(16 * 1024 * 1024)),
@@ -599,5 +604,37 @@ mod tests {
             assert_eq!(p.evaluate(Some("a.example.com"), None, 80), Outcome::Match);
         }
         assert!(compiler.bytes < 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn regex_syntax_reserve_precedes_building() {
+        let patterns = vec![format!("(?i){}", "a".repeat(60_000)); 8];
+        let mut compiler = Compiler::default();
+        compiler.charge(300 * 1024 * 1024, 0).unwrap();
+        let error = compiler
+            .compile(Expression::DomainRegex(patterns))
+            .unwrap_err();
+        assert!(error.to_string().contains("budget"));
+    }
+
+    #[test]
+    fn merged_regexes_have_no_quadratic_capture_cache() {
+        let patterns = (0..4096)
+            .map(|i| format!(r"^([^.]+)\.host{i}\.example$"))
+            .collect();
+        let predicate = Compiler::default()
+            .compile(Expression::DomainRegex(patterns))
+            .unwrap();
+        let Kind::Regex(matcher) = &predicate.kind else {
+            panic!("expected regex")
+        };
+        // Check this before creating a cache: default capture slots would make
+        // the PikeVM allocation quadratic in the number of patterns.
+        assert_eq!(matcher.group_info().slot_len(), 0);
+        let cache = matcher.create_cache();
+        assert!(cache.memory_usage() < 16 * 1024 * 1024);
+        assert!(
+            matcher.is_match("a-long-label-that-exceeds-the-backtracker-limit.host4095.example")
+        );
     }
 }
