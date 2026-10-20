@@ -2,8 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-use shoes::config::Config;
-use shoes::rule_set::{Behavior, Format, RuleSetConfig, YAML_PARSER_SCRATCH_BYTES};
+use shoes::rule_set::{Behavior, Format, RuleSource, YAML_PARSER_SCRATCH_BYTES};
 use shoes::rules::{Compiler, Expression};
 
 struct CountingAllocator;
@@ -54,17 +53,16 @@ fn load_peak(bytes: &[u8], format: Format, precharged: usize) -> (std::io::Resul
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source");
     std::fs::write(&path, bytes).unwrap();
-    let configs = [Config::RuleSet(RuleSetConfig {
-        rule_set: "test".into(),
+    let source = RuleSource {
         path,
         format: Some(format),
         behavior: (format == Format::MihomoYaml).then_some(Behavior::Domain),
         code: (format == Format::GeositeDat).then(|| "TEST".into()),
         attributes: vec![],
-    })];
+    };
     let mut compiler = Compiler::default();
     compiler.charge(precharged, 0).unwrap();
-    peak(|| shoes::rule_set::load(&configs, &mut compiler))
+    peak(|| shoes::rule_set::load_source(&source, &mut compiler).map(|_| ()))
 }
 
 fn message(tag: u32, bytes: &[u8]) -> Vec<u8> {

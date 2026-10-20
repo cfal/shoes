@@ -104,7 +104,10 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
                 );
             }
             Config::RuleConfigGroup(group) => {
-                for rule in group.rules.iter_mut() {
+                let super::RuleGroupRules::Policies(rules) = &mut group.rules else {
+                    continue;
+                };
+                for rule in rules.iter_mut() {
                     if let RuleActionConfig::Allow { client_chains, .. } = &mut rule.action {
                         for chain in client_chains.iter_mut() {
                             for hop in chain.hops.iter_mut() {

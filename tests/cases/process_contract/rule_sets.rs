@@ -37,9 +37,9 @@ async fn rule_only_reload_rejects_invalid_sources_and_recovers_missing_candidate
     let address = available_address();
     let mut config = json!([
         {"global_limits": {"reload_grace_secs": 60}},
-        {"rule_set": "deny", "path": "list.json", "format": "singbox_json"},
+        {"rule_group": "deny", "rules": ["list.json"]},
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
-         "rules": [{"rule_sets": ["deny"], "action": "block"}, {"match": {"any_destination": true}, "action": "allow"}]}
+         "rules": [{"masks": {"rule_group": "deny"}, "action": "block"}, {"masks": {"any_destination": true}, "action": "allow"}]}
     ]);
     source(&list, false);
     std::fs::write(&config_path, config.to_string()).unwrap();
@@ -64,10 +64,10 @@ async fn rule_only_reload_rejects_invalid_sources_and_recovers_missing_candidate
             .output()
             .unwrap();
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("rule_set deny"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("rule group deny"));
     }
 
-    config[1]["path"] = json!("missing/new.json");
+    config[1]["rules"] = json!(["missing/new.json"]);
     std::fs::write(&config_path, config.to_string()).unwrap();
     process.wait_for("Reload rejected").await;
     blocked(address).await;
@@ -95,9 +95,9 @@ async fn rule_sources_follow_symlink_retargeting_and_atomic_replacement() {
         .unwrap();
     let address = available_address();
     let config = json!([
-        {"rule_set": "deny", "path": "list.json", "format": "singbox_json"},
+        {"rule_group": "deny", "rules": [{"path": "list.json", "format": "singbox_json"}]},
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
-         "rules": [{"rule_sets": ["deny"], "action": "block"}, {"masks": "0.0.0.0/0", "action": "allow"}]}
+         "rules": [{"masks": {"rule_group": "deny"}, "action": "block"}, {"masks": "0.0.0.0/0", "action": "allow"}]}
     ]);
     std::fs::write(&config_path, config.to_string()).unwrap();
     let mut process = Process::start(&config_path, &[]);
@@ -131,21 +131,74 @@ async fn rejected_cyclic_source_recovers_without_a_config_edit() {
         .unwrap();
     let address = available_address();
     let mut config = json!([
-        {"rule_set": "deny", "path": list, "format": "singbox_json"},
+        {"rule_group": "deny", "rules": [{"path": list, "format": "singbox_json"}]},
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
-         "rules": [{"rule_sets": ["deny"], "action": "block"}, {"match": {"any_destination": true}, "action": "allow"}]}
+         "rules": [{"masks": {"rule_group": "deny"}, "action": "block"}, {"masks": {"any_destination": true}, "action": "allow"}]}
     ]);
     std::fs::write(&config_path, config.to_string()).unwrap();
     let mut process = Process::start(&config_path, &[]);
     process.wait_for("Servers ready").await;
     blocked(address).await;
-    config[0]["path"] = json!(loop_path);
+    config[0]["rules"][0]["path"] = json!(loop_path);
     std::fs::write(&config_path, config.to_string()).unwrap();
     process.wait_for("Reload rejected").await;
     blocked(address).await;
     let replacement = candidate_dir.path().join("replacement");
     source(&replacement, false);
     std::fs::rename(&replacement, &loop_path).unwrap();
+    process.wait_for("Servers ready").await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    process.signal(libc::SIGTERM);
+    assert!(process.exit().await.success());
+}
+
+#[tokio::test]
+async fn inline_sources_reload_and_missing_nested_sources_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+    let list = dir.path().join("list.json");
+    source(&list, false);
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("0.0.0.0", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    let nested_address = available_address();
+    let mut config = json!([
+        {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
+         "rules": [{"masks": {"all": [{"path": "list.json"}, {"any_destination": true}]}, "action": "block"},
+                   {"masks": "0.0.0.0/0"}]},
+        {"address": nested_address.to_string(), "protocol": {"type": "websocket", "targets": [{
+            "protocol": {"type": "socks"},
+            "override_rules": [{"masks": {"not": {"path": "list.json"}}, "action": "block"}]
+        }]}}
+    ]);
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    let mut process = Process::start(&config_path, &[]);
+    process.wait_for("Servers ready").await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    source(&list, true);
+    process.wait_for("Servers ready").await;
+    blocked(address).await;
+
+    config[1]["protocol"]["targets"][0]["override_rules"][0]["masks"]["not"]["path"] =
+        json!("missing/nested.json");
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    process.wait_for("Reload rejected").await;
+    blocked(address).await;
+    for mode in ["check", "--dry-run"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .args([mode, "-t", "1"])
+            .arg(&config_path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("nested.json"));
+    }
+    std::fs::create_dir(dir.path().join("missing")).unwrap();
+    source(&dir.path().join("missing/nested.json"), false);
+    process.wait_for("Servers ready").await;
+    blocked(address).await;
+    source(&list, false);
     process.wait_for("Servers ready").await;
     roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
     process.signal(libc::SIGTERM);

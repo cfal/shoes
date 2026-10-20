@@ -46,8 +46,8 @@ pub struct ValidatedConfigs {
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
 pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
     let mut compiler = crate::rules::Compiler::default();
-    let rule_files = crate::rule_set::dependencies(&all_configs);
-    crate::rule_set::load(&all_configs, &mut compiler)?;
+    let rule_files = crate::rule_set::dependencies(&mut all_configs)?;
+    crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
     // First pass: collect raw groups with unresolved references
@@ -86,7 +86,6 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
 
     for config in all_configs.into_iter() {
         match config {
-            Config::RuleSet(_) => {}
             Config::GlobalLimits(limits) => {
                 if global_limits.replace(limits).is_some() {
                     return Err(std::io::Error::new(
@@ -108,8 +107,11 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
                 }
             }
             Config::RuleConfigGroup(group) => {
+                let super::RuleGroupRules::Policies(rules) = group.rules else {
+                    continue;
+                };
                 if rule_groups
-                    .insert(group.rule_group.clone(), group.rules.into_vec())
+                    .insert(group.rule_group.clone(), rules.into_vec())
                     .is_some()
                 {
                     return Err(std::io::Error::new(
@@ -2871,14 +2873,14 @@ mod tests {
         let configs = vec![
             Config::RuleConfigGroup(RuleConfigGroup {
                 rule_group: "test-rules".to_string(),
-                rules: OneOrSome::One(RuleConfig {
+                rules: crate::config::RuleGroupRules::Policies(OneOrSome::One(RuleConfig {
                     masks: OneOrSome::One(NetLocationMask::ANY),
                     criteria: Default::default(),
                     action: RuleActionConfig::Allow {
                         override_address: None,
                         client_chains: NoneOrSome::One(ClientChain::default()),
                     },
-                }),
+                })),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-group".to_string(),

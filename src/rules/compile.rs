@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 
@@ -13,7 +13,9 @@ const MAX_REGEX_MATCHER_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct Compiler {
-    pub sets: HashMap<String, Arc<Predicate>>,
+    pub groups: HashMap<String, Arc<Predicate>>,
+    pub(crate) policy_groups: HashSet<String>,
+    pub(crate) sources: HashMap<crate::rule_set::SourceKey, Arc<Predicate>>,
     bytes: usize,
     entries: usize,
 }
@@ -148,12 +150,19 @@ impl Compiler {
                     .collect::<io::Result<Vec<_>>>()?;
                 Kind::Ports(merge_ports(ranges).into())
             }
-            Expression::RuleSet(name) => {
+            Expression::Legacy(masks) => return self.legacy(masks.into_vec()),
+            Expression::Source(source) => return crate::rule_set::load_source(&source, self),
+            Expression::RuleGroup(name) => {
+                if self.policy_groups.contains(&name) {
+                    return Err(invalid(format!(
+                        "rule group '{name}' contains policies with actions; use it in rules, not masks"
+                    )));
+                }
                 return self
-                    .sets
+                    .groups
                     .get(&name)
                     .cloned()
-                    .ok_or_else(|| invalid(format!("unknown rule_set: {name}")));
+                    .ok_or_else(|| invalid(format!("unknown rule group: {name}")));
             }
             Expression::All(v) => {
                 if v.is_empty() {
@@ -330,6 +339,7 @@ fn merge_ports(mut ranges: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
 
 fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
     let mut result = Vec::new();
+    let mut masks = Vec::new();
     let mut resolving_ranges = IpRanges::default();
     let mut no_resolve_ranges = IpRanges::default();
     let mut ports = Vec::new();
@@ -342,6 +352,10 @@ fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
     let mut cidrs = Vec::new();
     for expression in expressions {
         let (group, mut values) = match expression {
+            Expression::Legacy(values) => {
+                masks.extend(values.into_vec());
+                continue;
+            }
             Expression::Domain(values) => (&mut exact, values),
             Expression::DomainSuffix(values) => (&mut suffixes, values),
             Expression::Subdomains(values) => (&mut subdomains, values),
@@ -376,6 +390,11 @@ fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
     if !ports.is_empty() {
         result.push(Expression::PortRanges(ports));
     }
+    if !masks.is_empty() {
+        result.push(Expression::Legacy(crate::option_util::OneOrSome::Some(
+            masks,
+        )));
+    }
     let mut push_literals = |values: Vec<String>, expression: fn(Vec<String>) -> Expression| {
         if !values.is_empty() {
             result.push(expression(values));
@@ -398,6 +417,51 @@ fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
 mod tests {
     use super::*;
     use crate::rules::Outcome;
+
+    #[test]
+    fn mixed_mask_lists_keep_legacy_entries_in_one_index() {
+        let masks = ["example.com:443", "192.0.2.0/24", "0.0.0.0/0:80"];
+        let mut expressions: Vec<_> = masks
+            .iter()
+            .map(|value| {
+                Expression::Legacy(crate::option_util::OneOrSome::One(
+                    NetLocationMask::from(value).unwrap(),
+                ))
+            })
+            .collect();
+        expressions.push(Expression::Domain(vec!["exact.example".into()]));
+        let grouped = group_literals(expressions);
+        assert!(
+            matches!(&grouped[..], [Expression::Legacy(values), Expression::Domain(_)] if values.len() == 3)
+        );
+        let predicate = Compiler::default()
+            .compile(Expression::Any(grouped))
+            .unwrap();
+        for (name, ip, port, expected) in [
+            (Some("sub.example.com"), None, 443, Outcome::Match),
+            (Some("other.example"), None, 80, Outcome::Match),
+            (
+                Some("other.example"),
+                None,
+                443,
+                Outcome::Unknown { may_resolve: true },
+            ),
+            (
+                Some("other.example"),
+                Some("198.51.100.1".parse().unwrap()),
+                443,
+                Outcome::Miss,
+            ),
+            (
+                None,
+                Some("192.0.2.1".parse().unwrap()),
+                443,
+                Outcome::Match,
+            ),
+        ] {
+            assert_eq!(predicate.evaluate(name, ip, port), expected);
+        }
+    }
 
     #[test]
     fn matcher_builders_preserve_empty_predicates_and_budget_charges() {
@@ -581,7 +645,7 @@ mod tests {
             c.compile(Expression::DomainRegex(vec!["(?=a)".into()]))
                 .is_err()
         );
-        assert!(c.compile(Expression::RuleSet("missing".into())).is_err());
+        assert!(c.compile(Expression::RuleGroup("missing".into())).is_err());
         assert!(c.compile(Expression::All(vec![])).is_err());
         let deep = (0..102).fold(Expression::AnyDestination(true), |e, _| {
             Expression::Not(Box::new(e))

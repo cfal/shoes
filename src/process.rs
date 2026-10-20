@@ -17,8 +17,8 @@ async fn load_validated(
     paths: &[String],
     discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
 ) -> io::Result<ValidatedConfigs> {
-    let configs = config::load_configs(&paths.to_vec()).await?;
-    discovered(&crate::rule_set::dependencies(&configs));
+    let mut configs = config::load_configs(&paths.to_vec()).await?;
+    discovered(&crate::rule_set::dependencies(&mut configs)?);
     let (configs, _) = config::convert_cert_paths(configs).await?;
     config::compile_configs(configs).await
 }

@@ -1,4 +1,6 @@
 mod binary;
+#[cfg(test)]
+mod config_tests;
 mod geodata;
 mod json;
 mod mihomo;
@@ -7,14 +9,14 @@ mod singbox;
 mod srs;
 mod yaml;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Config, RuleGroupRules, rule_visit};
 use crate::rules::{Compiler, Predicate, invalid};
 pub use mihomo::Behavior;
 
@@ -37,18 +39,20 @@ pub enum Format {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuleSetConfig {
-    pub rule_set: String,
+pub struct RuleSource {
     pub path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<Format>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub behavior: Option<Behavior>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attributes: Vec<String>,
 }
 
 #[derive(PartialEq, Eq, Hash)]
-struct SourceKey {
+pub(crate) struct SourceKey {
     path: PathBuf,
     format: Format,
     behavior: Option<Behavior>,
@@ -56,7 +60,17 @@ struct SourceKey {
     attributes: Vec<String>,
 }
 
-impl RuleSetConfig {
+impl RuleSource {
+    pub(crate) fn from_path(path: PathBuf) -> Self {
+        Self {
+            path,
+            format: None,
+            behavior: None,
+            code: None,
+            attributes: Vec::new(),
+        }
+    }
+
     fn format(&self, prefix: &[u8]) -> io::Result<Format> {
         self.format
             .or_else(|| {
@@ -83,14 +97,40 @@ impl RuleSetConfig {
     }
 }
 
-pub fn dependencies(configs: &[Config]) -> Vec<PathBuf> {
-    configs
-        .iter()
-        .filter_map(|c| match c {
-            Config::RuleSet(s) => Some(s.path.clone()),
-            _ => None,
-        })
-        .collect()
+fn visit_sources(
+    configs: &mut [Config],
+    visitor: &mut dyn FnMut(&mut RuleSource) -> io::Result<()>,
+) -> io::Result<()> {
+    for config in configs.iter_mut() {
+        if let Config::RuleConfigGroup(group) = config
+            && let RuleGroupRules::Sources(sources) = &mut group.rules
+        {
+            for source in sources.iter_mut() {
+                visitor(source)?;
+            }
+        }
+    }
+    rule_visit::visit(
+        configs,
+        &mut |rule| {
+            if let Some(expression) = &mut rule.criteria.expression {
+                expression.visit_sources(visitor)?;
+            }
+            Ok(())
+        },
+        &mut |_| Ok(()),
+    )
+}
+
+pub fn dependencies(configs: &mut [Config]) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    visit_sources(configs, &mut |source| {
+        paths.push(source.path.clone());
+        Ok(())
+    })?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
@@ -98,58 +138,82 @@ pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
         .parent()
         .ok_or_else(|| invalid("config path has no parent"))?
         .to_path_buf();
-    for config in configs {
-        if let Config::RuleSet(source) = config
-            && source.path.is_relative()
-        {
+    visit_sources(configs, &mut |source| {
+        if source.path.is_relative() {
             source.path = base.join(&source.path);
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
-pub fn load(configs: &[Config], compiler: &mut Compiler) -> io::Result<()> {
-    let mut names = HashSet::new();
-    let mut cache: HashMap<SourceKey, Arc<Predicate>> = HashMap::new();
-    for config in configs {
-        let Config::RuleSet(source) = config else {
+pub fn load(configs: &mut [Config], compiler: &mut Compiler) -> io::Result<()> {
+    compiler
+        .policy_groups
+        .extend(["allow-all-direct".into(), "block-all".into()]);
+    let mut names: HashSet<_> = compiler.policy_groups.clone();
+    for config in configs.iter() {
+        let Config::RuleConfigGroup(group) = config else {
             continue;
         };
-        if source.rule_set.is_empty() || !names.insert(&source.rule_set) {
-            return Err(invalid("duplicate or empty rule_set name"));
+        if group.rule_group.is_empty() || !names.insert(group.rule_group.clone()) {
+            return Err(invalid(format!(
+                "duplicate or empty rule group name: {}",
+                group.rule_group
+            )));
         }
-        if names.len() > 1024 {
-            return Err(invalid("rule_set source limit exceeded"));
+        if matches!(group.rules, RuleGroupRules::Policies(_)) {
+            compiler.policy_groups.insert(group.rule_group.clone());
         }
-        let predicate = load_source(source, compiler, &mut cache).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "rule_set {} ({}): {e}",
-                    source.rule_set,
-                    source.path.display()
-                ),
-            )
-        })?;
-        compiler.sets.insert(source.rule_set.clone(), predicate);
+    }
+    rule_visit::visit(configs, &mut |_| Ok(()), &mut |name| {
+        if compiler.policy_groups.contains(name) {
+            Ok(())
+        } else if names.contains(name) {
+            Err(invalid(format!(
+                "rule group '{name}' contains file sources; reference it with masks: {{rule_group: {name}}} and an action"
+            )))
+        } else {
+            Err(invalid(format!("unknown rule group: {name}")))
+        }
+    })?;
+    for config in configs.iter() {
+        if let Config::RuleConfigGroup(group) = config
+            && let RuleGroupRules::Sources(sources) = &group.rules
+        {
+            let mut predicates = Vec::new();
+            for source in sources.iter() {
+                compiler.charge(128, 0)?;
+                predicates.push(load_source(source, compiler).map_err(|e| {
+                    io::Error::new(e.kind(), format!("rule group {}: {e}", group.rule_group))
+                })?);
+            }
+            compiler
+                .groups
+                .insert(group.rule_group.clone(), Predicate::any(predicates));
+        }
     }
     Ok(())
 }
 
-fn load_source(
-    source: &RuleSetConfig,
-    compiler: &mut Compiler,
-    cache: &mut HashMap<SourceKey, Arc<Predicate>>,
-) -> io::Result<Arc<Predicate>> {
+pub fn load_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<Predicate>> {
+    read_source(source, compiler).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("rule source {}: {e}", source.path.display()),
+        )
+    })
+}
+
+fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<Predicate>> {
     if !source.path.is_absolute() {
         return Err(invalid(
-            "rule_set path must be absolute for string configs; file configs anchor paths to their declaring file",
+            "rule source path must be absolute for string configs; file configs anchor paths to their declaring file",
         ));
     }
     let start = std::time::Instant::now();
     let path = std::fs::canonicalize(&source.path)?;
     if !std::fs::metadata(&path)?.is_file() {
-        return Err(invalid("rule_set source must be a regular file"));
+        return Err(invalid("rule source must be a regular file"));
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -162,10 +226,10 @@ fn load_source(
     let mut file = options.open(&path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(invalid("rule_set source must be a regular file"));
+        return Err(invalid("rule source must be a regular file"));
     }
     if metadata.len() > MAX_INPUT as u64 {
-        return Err(invalid("rule_set input exceeds 64 MiB"));
+        return Err(invalid("rule source input exceeds 64 MiB"));
     }
     let size = metadata.len() as usize;
     let mut prefix = [0; 4];
@@ -194,8 +258,13 @@ fn load_source(
         code: source.code.clone(),
         attributes: source.attributes.clone(),
     };
-    if let Some(predicate) = cache.get(&key) {
+    if let Some(predicate) = compiler.sources.get(&key) {
         return Ok(predicate.clone());
+    }
+    if compiler.sources.len() >= 1024 {
+        return Err(invalid(
+            "rule source limit exceeded (1024 distinct sources)",
+        ));
     }
     let predicate = compiler.source(|compiler| {
         // JSON may retain doubled escape scratch alongside an owned map key.
@@ -205,7 +274,7 @@ fn load_source(
         file.take(size as u64 + 1).read_to_end(&mut bytes)?;
         if bytes.len() != size {
             return Err(invalid(
-                "rule_set changed while reading; retry with an atomic file replacement",
+                "rule source changed while reading; retry with an atomic file replacement",
             ));
         }
         match format {
@@ -233,11 +302,11 @@ fn load_source(
         }
     })?;
     log::info!(
-        "Loaded rule_set {} ({format:?}, {size} bytes) in {:?}",
-        source.rule_set,
+        "Loaded rule source {} ({format:?}, {size} bytes) in {:?}",
+        source.path.display(),
         start.elapsed()
     );
-    cache.insert(key, predicate.clone());
+    compiler.sources.insert(key, predicate.clone());
     Ok(predicate)
 }
 
@@ -261,8 +330,7 @@ mod tests {
             ("list", b"{}", None),
             ("list", b"SR", None),
         ] {
-            let mut source = RuleSetConfig {
-                rule_set: "test".into(),
+            let mut source = RuleSource {
                 path: path.into(),
                 format: None,
                 behavior: None,
@@ -283,8 +351,7 @@ mod tests {
             include_bytes!("../../tests/fixtures/rule_sets/mihomo-domain.mrs").as_slice(),
         ] {
             let path = dir.path().join("source.json");
-            let source = RuleSetConfig {
-                rule_set: "test".into(),
+            let source = RuleSource {
                 path: path.clone(),
                 format: None,
                 behavior: None,
@@ -292,9 +359,9 @@ mod tests {
                 attributes: vec![],
             };
             std::fs::write(&path, bytes).unwrap();
-            load(&[Config::RuleSet(source.clone())], &mut Compiler::default()).unwrap();
+            load_source(&source, &mut Compiler::default()).unwrap();
             std::fs::write(&path, &bytes[..4]).unwrap();
-            assert!(load(&[Config::RuleSet(source)], &mut Compiler::default()).is_err());
+            assert!(load_source(&source, &mut Compiler::default()).is_err());
         }
     }
 
@@ -303,24 +370,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("escaped.json");
         std::fs::write(&path, format!(r#"{{"{}\n":0}}"#, "a".repeat(1024 * 1024))).unwrap();
-        let configs = vec![Config::RuleSet(RuleSetConfig {
-            rule_set: "escaped".into(),
+        let source = RuleSource {
             path,
             format: Some(Format::SingboxJson),
             behavior: None,
             code: None,
             attributes: vec![],
-        })];
+        };
         let mut compiler = Compiler::default();
         compiler.charge(509 * 1024 * 1024, 0).unwrap();
         assert!(
-            load(&configs, &mut compiler)
+            load_source(&source, &mut compiler)
                 .unwrap_err()
                 .to_string()
                 .contains("budget")
         );
         assert!(
-            load(&configs, &mut Compiler::default())
+            load_source(&source, &mut Compiler::default())
                 .unwrap_err()
                 .to_string()
                 .contains("field name too long")
@@ -331,29 +397,28 @@ mod tests {
     fn source_errors_preserve_context_and_error_kind() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("domains.json");
-        let configs = vec![Config::RuleSet(RuleSetConfig {
-            rule_set: "domains".into(),
+        let source = RuleSource {
             path: path.clone(),
             format: Some(Format::SingboxJson),
             behavior: None,
             code: None,
             attributes: Vec::new(),
-        })];
-        let context = format!("rule_set domains ({}): ", path.display());
+        };
+        let context = format!("rule source {}: ", path.display());
         let mut compiler = Compiler::default();
-        let error = load(&configs, &mut compiler).unwrap_err();
+        let error = load_source(&source, &mut compiler).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().starts_with(&context));
-        assert!(compiler.sets.is_empty());
+        assert!(compiler.sources.is_empty());
 
         std::fs::write(&path, r#"{"version":6,"rules":[]}"#).unwrap();
-        let error = load(&configs, &mut compiler).unwrap_err();
+        let error = load_source(&source, &mut compiler).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
             format!("{context}unsupported sing-box rule-set version (expected 1-5)")
         );
-        assert!(compiler.sets.is_empty());
+        assert!(compiler.sources.is_empty());
     }
 
     #[test]
@@ -365,39 +430,26 @@ mod tests {
             r#"{"version":1,"rules":[{"domain_suffix":["example.com"]}]}"#,
         )
         .unwrap();
-        let source = RuleSetConfig {
-            rule_set: "a".into(),
-            path: path.clone(),
-            format: Some(Format::SingboxJson),
-            behavior: None,
-            code: None,
-            attributes: Vec::new(),
-        };
-        let mut other = source.clone();
-        other.rule_set = "b".into();
-        let configs = vec![Config::RuleSet(source), Config::RuleSet(other)];
+        let mut configs: Vec<Config> = serde_yaml::from_str(
+            "- rule_group: a\n  rules: [domains.json]\n- rule_group: b\n  rules: [{path: domains.json, format: singbox_json}]"
+        ).unwrap();
         let mut compiler = Compiler::default();
-        load(&configs, &mut compiler).unwrap();
-        assert!(Arc::ptr_eq(&compiler.sets["a"], &compiler.sets["b"]));
+        assert!(load(&mut configs, &mut Compiler::default()).is_err());
+        anchor(&mut configs, &dir.path().join("config.yaml")).unwrap();
+        load(&mut configs, &mut compiler).unwrap();
+        assert!(Arc::ptr_eq(&compiler.groups["a"], &compiler.groups["b"]));
+        let inline = load_source(&RuleSource::from_path(path), &mut compiler).unwrap();
+        assert!(Arc::ptr_eq(&inline, &compiler.groups["a"]));
         assert!(
             load(
-                &[configs[0].clone(), configs[0].clone()],
+                &mut [configs[0].clone(), configs[0].clone()],
                 &mut Compiler::default()
             )
             .is_err()
         );
         assert!(
-            serde_yaml::from_str::<Config>(
-                "rule_set: x\npath: x.json\nformat: singbox_json\nunknown: true"
-            )
-            .is_err()
+            serde_yaml::from_str::<Config>("rule_group: x\nrules: [{path: x.json, unknown: true}]")
+                .is_err()
         );
-        let mut relative = vec![
-            serde_yaml::from_str::<Config>("rule_set: x\npath: domains.json\nformat: singbox_json")
-                .unwrap(),
-        ];
-        assert!(load(&relative, &mut Compiler::default()).is_err());
-        anchor(&mut relative, &dir.path().join("config.yaml")).unwrap();
-        load(&relative, &mut Compiler::default()).unwrap();
     }
 }

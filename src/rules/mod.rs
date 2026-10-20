@@ -1,4 +1,5 @@
 mod compile;
+mod config;
 pub mod domain;
 pub mod ip;
 
@@ -6,7 +7,7 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 pub use compile::Compiler;
 use domain::{DomainKind, Names};
@@ -16,7 +17,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Expression {
     AnyDestination(bool),
@@ -29,7 +30,7 @@ pub enum Expression {
     IpCidr(Vec<String>),
     DestinationPort(Vec<u16>),
     DestinationPortRange(Vec<String>),
-    RuleSet(String),
+    RuleGroup(String),
     All(Vec<Expression>),
     Any(Vec<Expression>),
     Not(Box<Expression>),
@@ -39,6 +40,10 @@ pub enum Expression {
     PortRanges(Vec<(u16, u16)>),
     #[serde(skip)]
     Never,
+    #[serde(untagged)]
+    Legacy(crate::option_util::OneOrSome<crate::address::NetLocationMask>),
+    #[serde(untagged)]
+    Source(crate::rule_set::RuleSource),
 }
 
 impl Expression {

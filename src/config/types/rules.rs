@@ -18,7 +18,6 @@ pub struct RuleConfig {
 #[derive(Debug, Clone, Default)]
 pub struct RuleCriteria {
     pub expression: Option<crate::rules::Expression>,
-    pub rule_sets: Vec<String>,
     pub no_resolve: bool,
     pub compiled: Option<std::sync::Arc<crate::rules::Predicate>>,
 }
@@ -32,14 +31,7 @@ impl RuleConfig {
         let predicate = if let Some(expression) = self.criteria.expression.take() {
             compiler.compile(expression)?
         } else {
-            let mut children = Vec::new();
-            if !masks.is_empty() {
-                children.push(compiler.legacy(masks)?);
-            }
-            for name in std::mem::take(&mut self.criteria.rule_sets) {
-                children.push(compiler.compile(crate::rules::Expression::RuleSet(name))?);
-            }
-            crate::rules::Predicate::any(children)
+            compiler.legacy(masks)?
         };
         if matches!(self.action, RuleActionConfig::Block)
             && predicate.dependencies.ip
@@ -225,11 +217,7 @@ impl<'de> Deserialize<'de> for RuleConfig {
         #[serde(deny_unknown_fields)]
         struct RuleConfigTemp {
             #[serde(alias = "mask")]
-            masks: Option<OneOrSome<NetLocationMask>>,
-            #[serde(rename = "match")]
-            expression: Option<serde_json::Value>,
-            #[serde(default)]
-            rule_sets: Option<OneOrSome<String>>,
+            masks: serde_json::Value,
             #[serde(default)]
             no_resolve: bool,
             // Action fields (from RuleActionConfig)
@@ -248,22 +236,14 @@ impl<'de> Deserialize<'de> for RuleConfig {
 
         let temp = RuleConfigTemp::deserialize(deserializer)?;
 
-        if temp.expression.is_some() && (temp.masks.is_some() || temp.rule_sets.is_some()) {
-            return Err(D::Error::custom(
-                "match is mutually exclusive with masks and rule_sets",
-            ));
-        }
-        if temp.expression.is_none() && temp.masks.is_none() && temp.rule_sets.is_none() {
-            return Err(D::Error::custom("rule requires masks, rule_sets or match"));
-        }
-        let masks = temp.masks.unwrap_or_else(|| OneOrSome::Some(Vec::new()));
+        let expression =
+            crate::rules::Expression::from_config(temp.masks).map_err(D::Error::custom)?;
+        let (masks, expression) = match expression {
+            crate::rules::Expression::Legacy(masks) => (masks, None),
+            expression => (OneOrSome::Some(Vec::new()), Some(expression)),
+        };
         let criteria = RuleCriteria {
-            expression: temp
-                .expression
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(D::Error::custom)?,
-            rule_sets: temp.rule_sets.map(OneOrSome::into_vec).unwrap_or_default(),
+            expression,
             no_resolve: temp.no_resolve,
             compiled: None,
         };
@@ -374,25 +354,17 @@ impl Serialize for RuleConfig {
         };
 
         let mut map = serializer.serialize_map(Some(
-            action_field_count
-                + usize::from(self.masks.iter().next().is_some())
-                + usize::from(self.criteria.expression.is_some())
-                + usize::from(!self.criteria.rule_sets.is_empty())
-                + usize::from(self.criteria.no_resolve),
+            action_field_count + 1 + usize::from(self.criteria.no_resolve),
         ))?;
 
         // Serialize masks
-        if self.masks.iter().next().is_some() {
-            map.serialize_entry("masks", &self.masks)?;
-        }
         if let Some(expression) = &self.criteria.expression {
             map.serialize_entry(
-                "match",
+                "masks",
                 &serde_json::to_value(expression).map_err(serde::ser::Error::custom)?,
             )?;
-        }
-        if !self.criteria.rule_sets.is_empty() {
-            map.serialize_entry("rule_sets", &self.criteria.rule_sets)?;
+        } else {
+            map.serialize_entry("masks", &self.masks)?;
         }
         if self.criteria.no_resolve {
             map.serialize_entry("no_resolve", &true)?;
@@ -719,8 +691,33 @@ mod tests {
     }
 
     #[test]
+    fn mixed_masks_round_trip_without_reinterpreting_strings() {
+        for masks in [
+            "blocked",
+            "[blocked, {domain: [exact.example]}, '192.0.2.0/24']",
+            "{all: [blocked, {not: {destination_port: [80]}}]}",
+        ] {
+            let rule: RuleConfig = serde_yaml::from_str(&format!("masks: {masks}")).unwrap();
+            assert!(matches!(rule.action, RuleActionConfig::Allow { .. }));
+            let encoded = serde_yaml::to_string(&rule).unwrap();
+            let mut rule: RuleConfig = serde_yaml::from_str(&encoded).unwrap();
+            rule.compile(&mut crate::rules::Compiler::default())
+                .unwrap();
+            let predicate = rule.criteria.compiled.unwrap();
+            assert_eq!(
+                predicate.evaluate(Some("child.blocked"), None, 443),
+                crate::rules::Outcome::Match
+            );
+            assert_ne!(
+                predicate.evaluate(Some("other.example"), None, 443),
+                crate::rules::Outcome::Match
+            );
+        }
+    }
+
+    #[test]
     fn typed_rule_round_trip_and_validation() {
-        let input = "match: {all: [{domain: [Example.com]}, {destination_port: [443]}]}\nno_resolve: true\naction: block";
+        let input = "masks: {all: [{domain: [Example.com]}, {destination_port: [443]}]}\nno_resolve: true\naction: block";
         let rule: RuleConfig = serde_yaml::from_str(input).unwrap();
         let encoded = serde_yaml::to_string(&rule).unwrap();
         let mut rule: RuleConfig = serde_yaml::from_str(&encoded).unwrap();
@@ -737,8 +734,15 @@ mod tests {
         assert!(serde_yaml::to_string(&rule).is_err());
         for input in [
             "match: {any_destination: true}\nmasks: example.com",
-            "match: {unknown: true}",
-            "match: {domain: [a], ip_cidr: [\"::/0\"]}",
+            "rule_sets: [old]",
+            "masks: {unknown: true}",
+            "masks: {domain: [a], ip_cidr: [\"::/0\"]}",
+            "masks: {path: a.srs, rule_group: other}",
+            "masks: {path: a.srs, fromat: srs}",
+            "masks: {path: a.srs, action: block}",
+            "masks: []",
+            "masks: {all: []}",
+            "masks: {any: []}",
         ] {
             assert!(
                 serde_yaml::from_str::<RuleConfig>(input).is_err(),
