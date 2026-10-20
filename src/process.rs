@@ -217,7 +217,12 @@ fn watch<P: AsRef<Path>>(paths: &[P], tx: mpsc::Sender<()>) -> io::Result<Recomm
             files.insert(canonical);
         }
         files.insert(path.clone());
-        resolve_watch_path(&path, &mut files, &mut 0)?;
+        if let Err(error) = resolve_watch_path(&path, &mut files, &mut 0) {
+            log::warn!(
+                "Could not resolve watch path {}: {error}; retaining lexical and discovered paths for recovery",
+                path.display()
+            );
+        }
     }
     let required_directories: HashSet<_> = required_directories
         .iter()

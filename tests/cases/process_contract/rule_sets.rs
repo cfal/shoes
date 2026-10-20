@@ -114,3 +114,40 @@ async fn rule_sources_follow_symlink_retargeting_and_atomic_replacement() {
     process.signal(libc::SIGTERM);
     assert!(process.exit().await.success());
 }
+
+#[tokio::test]
+async fn rejected_cyclic_source_recovers_without_a_config_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let candidate_dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+    let list = dir.path().join("list.json");
+    source(&list, true);
+    let loop_path = candidate_dir.path().join("loop.json");
+    let other = candidate_dir.path().join("other");
+    std::os::unix::fs::symlink(&other, &loop_path).unwrap();
+    std::os::unix::fs::symlink(&loop_path, &other).unwrap();
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("0.0.0.0", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    let mut config = json!([
+        {"rule_set": "deny", "path": list, "format": "singbox_json"},
+        {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
+         "rules": [{"rule_sets": ["deny"], "action": "block"}, {"match": {"any_destination": true}, "action": "allow"}]}
+    ]);
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    let mut process = Process::start(&config_path, &[]);
+    process.wait_for("Servers ready").await;
+    blocked(address).await;
+    config[0]["path"] = json!(loop_path);
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    process.wait_for("Reload rejected").await;
+    blocked(address).await;
+    let replacement = candidate_dir.path().join("replacement");
+    source(&replacement, false);
+    std::fs::rename(&replacement, &loop_path).unwrap();
+    process.wait_for("Servers ready").await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    process.signal(libc::SIGTERM);
+    assert!(process.exit().await.success());
+}
