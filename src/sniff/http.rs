@@ -84,37 +84,14 @@ fn valid_origin_form(target: &str) -> bool {
     // httparse checks request-line syntax, not RFC 3986 path/query characters.
     let mut bytes = target.bytes();
     while let Some(byte) = bytes.next() {
-        match byte {
-            b'%' => {
-                if !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
-                    || !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
-                {
-                    return false;
-                }
+        if byte == b'%' {
+            if !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                || !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+            {
+                return false;
             }
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~'
-            | b'!'
-            | b'$'
-            | b'&'
-            | b'\''
-            | b'('
-            | b')'
-            | b'*'
-            | b'+'
-            | b','
-            | b';'
-            | b'='
-            | b':'
-            | b'@'
-            | b'/'
-            | b'?' => {}
-            _ => return false,
+        } else if !byte.is_ascii_alphanumeric() && !b"-._~!$&'()*+,;=:@/?".contains(&byte) {
+            return false;
         }
     }
     true
