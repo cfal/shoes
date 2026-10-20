@@ -2,7 +2,7 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use crate::rules::{Expression, IpRanges, domain, invalid};
+use crate::rules::{Compiler, Expression, IpRanges, domain, invalid};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -18,9 +18,14 @@ struct Provider {
     payload: Vec<String>,
 }
 
-pub(super) fn decode(bytes: &[u8], yaml: bool, behavior: Behavior) -> io::Result<Expression> {
+pub(super) fn decode(
+    bytes: &[u8],
+    yaml: bool,
+    behavior: Behavior,
+    budget: &mut Compiler,
+) -> io::Result<Expression> {
     let entries = if yaml {
-        serde_yaml::from_slice::<Provider>(bytes)
+        serde_json::from_value::<Provider>(super::json::decode_yaml(bytes, budget)?)
             .map_err(|e| invalid(format!("Mihomo YAML: {e}")))?
             .payload
     } else {
@@ -29,8 +34,14 @@ pub(super) fn decode(bytes: &[u8], yaml: bool, behavior: Behavior) -> io::Result
             .lines()
             .map(str::trim)
             .filter(|s| !s.is_empty() && !s.starts_with('#'))
-            .map(str::to_owned)
-            .collect()
+            .map(|entry| {
+                if entry.len() > 64 * 1024 {
+                    return Err(invalid("provider entry exceeds 64 KiB"));
+                }
+                budget.charge(entry.len() * 4 + 256, 1)?;
+                Ok(entry.to_owned())
+            })
+            .collect::<io::Result<Vec<_>>>()?
     };
     if entries.len() > super::binary::MAX_ENTRIES {
         return Err(invalid("provider entry limit exceeded"));
@@ -63,15 +74,21 @@ pub(super) fn domain_entry(value: &str) -> io::Result<Expression> {
         )]));
     }
     if let Some(name) = value.strip_prefix("+.") {
-        return Ok(Expression::DomainSuffix(vec![domain::normalize(name)?.into_owned()]));
+        return Ok(Expression::DomainSuffix(vec![
+            domain::normalize(name)?.into_owned(),
+        ]));
     }
     if let Some(name) = value.strip_prefix('.') {
-        return Ok(Expression::Subdomains(vec![domain::normalize(name)?.into_owned()]));
+        return Ok(Expression::Subdomains(vec![
+            domain::normalize(name)?.into_owned(),
+        ]));
     }
     if value.contains('*') {
         return Ok(Expression::DomainRegex(vec![domain::wildcard(value)?]));
     }
-    Ok(Expression::Domain(vec![domain::normalize(value)?.into_owned()]))
+    Ok(Expression::Domain(vec![
+        domain::normalize(value)?.into_owned(),
+    ]))
 }
 
 fn ip(value: &str, no_resolve: bool) -> io::Result<Expression> {
@@ -90,8 +107,12 @@ fn classical(value: &str) -> io::Result<Expression> {
         return Err(invalid("empty classical payload"));
     }
     match kind {
-        "DOMAIN" => Ok(Expression::Domain(vec![domain::normalize(payload)?.into_owned()])),
-        "DOMAIN-SUFFIX" => Ok(Expression::DomainSuffix(vec![domain::normalize(payload)?.into_owned()])),
+        "DOMAIN" => Ok(Expression::Domain(vec![
+            domain::normalize(payload)?.into_owned(),
+        ])),
+        "DOMAIN-SUFFIX" => Ok(Expression::DomainSuffix(vec![
+            domain::normalize(payload)?.into_owned(),
+        ])),
         "DOMAIN-KEYWORD" if !payload.contains(',') => {
             Ok(Expression::DomainKeyword(vec![payload.to_owned()]))
         }
@@ -134,6 +155,10 @@ fn classical(value: &str) -> io::Result<Expression> {
 mod tests {
     use super::*;
     use crate::rules::{Compiler, Outcome};
+
+    fn decode(bytes: &[u8], yaml: bool, behavior: Behavior) -> io::Result<Expression> {
+        super::decode(bytes, yaml, behavior, &mut Compiler::default())
+    }
 
     #[test]
     fn domain_provider_boundaries_and_case() {

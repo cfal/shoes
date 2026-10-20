@@ -2661,6 +2661,7 @@ dependencies = [
  "rand_core 0.10.1",
  "rcgen",
  "regex",
+ "regex-automata",
  "rust-argon2",
  "rustc-hash",
  "rustls",

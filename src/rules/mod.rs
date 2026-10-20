@@ -116,7 +116,7 @@ pub(crate) enum Kind {
     Constant(bool),
     Domains(Names, DomainKind),
     Keywords(aho_corasick::AhoCorasick),
-    Regex(regex::bytes::RegexSet),
+    Regex(regex_automata::meta::Regex),
     Ips(IpRanges, bool),
     Ports(Box<[(u16, u16)]>),
     ByPort(Box<[(u16, Arc<Predicate>)]>),
@@ -126,6 +126,26 @@ pub(crate) enum Kind {
 }
 
 impl Predicate {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + 32
+            + match &self.kind {
+                Kind::Domains(names, _) => names.retained_bytes(),
+                Kind::Keywords(matcher) => matcher.memory_usage(),
+                Kind::Regex(matcher) => matcher.memory_usage(),
+                Kind::Ips(ranges, _) => ranges.v4.capacity() * 8 + ranges.v6.capacity() * 32,
+                Kind::Ports(ports) => ports.len() * 4,
+                Kind::ByPort(children) => {
+                    children.iter().map(|(_, p)| p.retained_bytes() + 16).sum()
+                }
+                Kind::Any(children) | Kind::All(children) => {
+                    children.iter().map(|p| p.retained_bytes() + 8).sum()
+                }
+                Kind::Not(p) => p.retained_bytes(),
+                Kind::Constant(_) => 0,
+            }
+    }
+
     pub fn any(children: Vec<Arc<Self>>) -> Arc<Self> {
         if children.len() == 1 {
             return children.into_iter().next().unwrap();

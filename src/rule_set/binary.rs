@@ -101,7 +101,7 @@ impl<'a> Reader<'a> {
     }
     pub fn strings(&mut self) -> io::Result<Vec<String>> {
         let count = self.count(false, MAX_ENTRIES, 1)?;
-        self.charge(count * 32)?;
+        self.budget.charge(count * 32, count)?;
         (0..count)
             .map(|_| {
                 let len = self.count(false, 64 * 1024, 1)?;
@@ -188,7 +188,7 @@ impl<'a> Reader<'a> {
             if keys.len() == MAX_ENTRIES {
                 return Err(invalid("domain entry limit exceeded"));
             }
-            self.charge(576)?;
+            self.budget.charge(576, 1)?;
             let mut key = Vec::new();
             let mut n = node;
             // Walking terminal to root reverses the encoded key, recovering the

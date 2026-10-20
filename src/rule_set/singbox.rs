@@ -3,7 +3,7 @@ use std::io;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::rules::{Expression, domain, invalid};
+use crate::rules::{Compiler, Expression, domain, invalid};
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -54,9 +54,9 @@ struct LogicalRule {
     invert: bool,
 }
 
-pub fn decode(bytes: &[u8]) -> io::Result<Expression> {
-    let source: Source =
-        serde_json::from_slice(bytes).map_err(|e| invalid(format!("sing-box JSON: {e}")))?;
+pub fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Expression> {
+    let source: Source = serde_json::from_value(super::json::decode(bytes, budget)?)
+        .map_err(|e| invalid(format!("sing-box JSON: {e}")))?;
     if !(1..=5).contains(&source.version) {
         return Err(invalid(
             "unsupported sing-box rule-set version (expected 1-5)",
@@ -99,28 +99,32 @@ fn rule(value: Value, depth: usize) -> io::Result<Expression> {
         return Err(invalid("unsupported rule type"));
     }
     let mut parts = Parts::default();
-    if let Some(v) = rule.domain {
-        parts.address.push(literals(values(Some(v)), 0)?);
+    for (kind, v) in [rule.domain, rule.domain_suffix, rule.domain_keyword]
+        .into_iter()
+        .enumerate()
+    {
+        let v = values(v);
+        if !v.is_empty() {
+            parts.address.push(literals(v, kind as u8)?);
+        }
     }
-    if let Some(v) = rule.domain_suffix {
-        parts.address.push(literals(values(Some(v)), 1)?);
+    let regex = values(rule.domain_regex);
+    if !regex.is_empty() {
+        parts.address.push(Expression::DomainRegex(regex));
     }
-    if let Some(v) = rule.domain_keyword {
-        parts.address.push(literals(values(Some(v)), 2)?);
+    let ips = values(rule.ip_cidr);
+    if !ips.is_empty() {
+        parts.address.push(Expression::IpCidr(ips));
     }
-    if let Some(v) = rule.domain_regex {
-        parts.address.push(Expression::DomainRegex(values(Some(v))));
-    }
-    if let Some(v) = rule.ip_cidr {
-        parts.address.push(Expression::IpCidr(values(Some(v))));
-    }
-    if let Some(v) = rule.port {
+    let ports = values(rule.port);
+    if !ports.is_empty() {
         parts.ports.push(Expression::PortRanges(
-            values(Some(v)).into_iter().map(|p| (p, p)).collect(),
+            ports.into_iter().map(|p| (p, p)).collect(),
         ));
     }
-    if let Some(v) = rule.port_range {
-        parts.ports.push(port_ranges(values(Some(v)))?);
+    let ranges = values(rule.port_range);
+    if !ranges.is_empty() {
+        parts.ports.push(port_ranges(ranges)?);
     }
     parts.finish(rule.invert)
 }
@@ -158,8 +162,10 @@ pub(super) fn literals(input: Vec<String>, kind: u8) -> io::Result<Expression> {
     let mut strict = Vec::new();
     let mut uppercase = 0;
     for value in input {
-        if !value.is_ascii() || value.is_empty() {
-            return Err(invalid("sing-box literals must be nonempty ASCII strings"));
+        if !value.is_ascii() || value.is_empty() || value.len() > 64 * 1024 {
+            return Err(invalid(
+                "sing-box literals must be nonempty ASCII strings of at most 64 KiB",
+            ));
         }
         let name = if kind == 1 {
             value.strip_prefix('.').unwrap_or(&value)
@@ -221,6 +227,25 @@ impl Parts {
 mod tests {
     use super::*;
     use crate::rules::{Compiler, Outcome};
+
+    fn decode(bytes: &[u8]) -> io::Result<Expression> {
+        super::decode(bytes, &mut Compiler::default())
+    }
+
+    #[test]
+    fn empty_fields_are_absent_but_invalid_uppercase_is_rejected() {
+        let p = Compiler::default().compile(decode(br#"{"version":1,"rules":[{"domain_suffix":["example.com"],"port":[],"domain":[] }]}"#).unwrap()).unwrap();
+        assert_eq!(p.evaluate(Some("example.com"), None, 443), Outcome::Match);
+        assert!(decode(br#"{"version":1,"rules":[{"domain":[],"port":[]}]}"#).is_err());
+        for invert in [false, true] {
+            let source = format!(
+                r#"{{"version":1,"rules":[{{"domain_keyword":["{}"],"invert":{invert}}}]}}"#,
+                "A".repeat(65_537)
+            );
+            assert!(decode(source.as_bytes()).is_err());
+            assert!(literals(vec!["A".repeat(65_537)], 2).is_err());
+        }
+    }
 
     #[test]
     fn source_groups_and_case_are_preserved() {

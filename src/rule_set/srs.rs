@@ -23,98 +23,6 @@ pub fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Expression> {
     Ok(Expression::or(rules))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rules::{Compiler, Outcome};
-    use std::io::Write;
-
-    fn decode(bytes: &[u8]) -> io::Result<Expression> {
-        super::decode(bytes, &mut Compiler::default())
-    }
-
-    fn wrap(version: u8, payload: &[u8]) -> Vec<u8> {
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(payload).unwrap();
-        let mut bytes = vec![b'S', b'R', b'S', version];
-        bytes.extend(encoder.finish().unwrap());
-        bytes
-    }
-
-    #[test]
-    fn upstream_fixture_matches_source_and_rejects_truncation() {
-        let bytes = include_bytes!("../../tests/fixtures/rule_sets/singbox-v2.srs");
-        let json = include_bytes!("../../tests/fixtures/rule_sets/singbox.json");
-        let expected = Compiler::default()
-            .compile(super::super::singbox::decode(json).unwrap())
-            .unwrap();
-        for version in 2..=5 {
-            let mut bytes = bytes.to_vec();
-            bytes[3] = version;
-            let actual = Compiler::default()
-                .compile(decode(&bytes).unwrap())
-                .unwrap();
-            for name in [
-                None,
-                Some("exact.example"),
-                Some("a.exact.example"),
-                Some("suffix.example"),
-                Some("a.suffix.example"),
-                Some("strict.example"),
-                Some("a.strict.example"),
-                Some("upper.example"),
-                Some("keyword.example"),
-                Some("regex27.example"),
-                Some("case.example"),
-                Some("not.example"),
-            ] {
-                for ip in [
-                    None,
-                    Some("192.0.2.1".parse().unwrap()),
-                    Some("2001:db8::1".parse().unwrap()),
-                    Some("203.0.113.7".parse().unwrap()),
-                ] {
-                    for port in [80, 443, 8000, 8002, 8443] {
-                        assert_eq!(
-                            actual.evaluate(name, ip, port),
-                            expected.evaluate(name, ip, port)
-                        );
-                    }
-                }
-            }
-        }
-        for n in 0..bytes.len() {
-            assert!(decode(&bytes[..n]).is_err(), "accepted truncation at {n}");
-        }
-        let mut trailing = bytes.to_vec();
-        trailing.push(0);
-        assert!(decode(&trailing).is_err());
-        let mut corrupt = bytes.to_vec();
-        *corrupt.last_mut().unwrap() ^= 1;
-        assert!(decode(&corrupt).is_err());
-    }
-
-    #[test]
-    fn versions_empty_sets_and_unsupported_items() {
-        for v in 1..=5 {
-            let predicate = Compiler::default()
-                .compile(decode(&wrap(v, &[0])).unwrap())
-                .unwrap();
-            assert_eq!(predicate.evaluate(None, None, 1), Outcome::Miss);
-            assert!(decode(&wrap(v, &[1, 0, 255, 0])).is_err());
-            assert!(
-                decode(&wrap(v, &[1, 0, 5]))
-                    .unwrap_err()
-                    .to_string()
-                    .contains("tag 5")
-            );
-            assert!(decode(&wrap(v, &[1, 1, 0, 0, 0])).is_err());
-        }
-        assert!(decode(&wrap(6, &[0])).is_err());
-    }
-}
-
 fn rule(
     reader: &mut Reader<'_>,
     version: u8,
@@ -211,5 +119,157 @@ fn rule(
             .inverted(reader.boolean()?))
         }
         tag => Err(invalid(format!("unsupported SRS rule type {tag}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::{Compiler, Outcome};
+    use std::io::Write;
+
+    fn decode(bytes: &[u8]) -> io::Result<Expression> {
+        super::decode(bytes, &mut Compiler::default())
+    }
+
+    fn wrap(version: u8, payload: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let mut bytes = vec![b'S', b'R', b'S', version];
+        bytes.extend(encoder.finish().unwrap());
+        bytes
+    }
+
+    #[test]
+    fn upstream_fixture_matches_source_and_rejects_truncation() {
+        let bytes = include_bytes!("../../tests/fixtures/rule_sets/singbox-v2.srs");
+        let json = include_bytes!("../../tests/fixtures/rule_sets/singbox.json");
+        let expected = Compiler::default()
+            .compile(super::super::singbox::decode(json, &mut Compiler::default()).unwrap())
+            .unwrap();
+        for version in 2..=5 {
+            let mut bytes = bytes.to_vec();
+            bytes[3] = version;
+            let actual = Compiler::default()
+                .compile(decode(&bytes).unwrap())
+                .unwrap();
+            for name in [
+                None,
+                Some("exact.example"),
+                Some("a.exact.example"),
+                Some("suffix.example"),
+                Some("a.suffix.example"),
+                Some("strict.example"),
+                Some("a.strict.example"),
+                Some("upper.example"),
+                Some("keyword.example"),
+                Some("regex27.example"),
+                Some("case.example"),
+                Some("not.example"),
+            ] {
+                for ip in [
+                    None,
+                    Some("192.0.2.1".parse().unwrap()),
+                    Some("2001:db8::1".parse().unwrap()),
+                    Some("203.0.113.7".parse().unwrap()),
+                ] {
+                    for port in [80, 443, 8000, 8002, 8443] {
+                        assert_eq!(
+                            actual.evaluate(name, ip, port),
+                            expected.evaluate(name, ip, port)
+                        );
+                    }
+                }
+            }
+        }
+        for n in 0..bytes.len() {
+            assert!(decode(&bytes[..n]).is_err(), "accepted truncation at {n}");
+        }
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        assert!(decode(&trailing).is_err());
+        let mut corrupt = bytes.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(decode(&corrupt).is_err());
+    }
+
+    #[test]
+    fn versions_empty_sets_and_unsupported_items() {
+        for v in 1..=5 {
+            let predicate = Compiler::default()
+                .compile(decode(&wrap(v, &[0])).unwrap())
+                .unwrap();
+            assert_eq!(predicate.evaluate(None, None, 1), Outcome::Miss);
+            assert!(decode(&wrap(v, &[1, 0, 255, 0])).is_err());
+            assert!(
+                decode(&wrap(v, &[1, 0, 5]))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tag 5")
+            );
+            assert!(decode(&wrap(v, &[1, 1, 0, 0, 0])).is_err());
+        }
+        assert!(decode(&wrap(6, &[0])).is_err());
+    }
+
+    fn chain(key: &[u8]) -> Vec<u8> {
+        assert!(key.len() < 32);
+        let mut out = vec![0, 1];
+        out.extend((1u64 << key.len()).to_be_bytes());
+        out.push(1);
+        let bitmap = (0..key.len()).fold(1u64 << (2 * key.len()), |b, i| b | (1 << (2 * i + 1)));
+        out.extend(bitmap.to_be_bytes());
+        out.push(key.len() as u8);
+        out.extend(key.iter().rev());
+        out
+    }
+
+    #[test]
+    fn original_v1_exact_and_strict_suffix_union() {
+        let mut payload = vec![2];
+        for key in [b"a".as_slice(), b"\r.a"] {
+            payload.extend([0, 2]);
+            payload.extend(chain(key));
+            payload.extend([255, 0]);
+        }
+        let p = Compiler::default()
+            .compile(decode(&wrap(1, &payload)).unwrap())
+            .unwrap();
+        for name in ["a", "b.a", "c.b.a"] {
+            assert_eq!(p.evaluate(Some(name), None, 1), Outcome::Match);
+        }
+        assert_eq!(p.evaluate(Some("ba"), None, 1), Outcome::Miss);
+    }
+
+    #[test]
+    fn mapped_ipv6_and_inconsistent_tries_reject() {
+        let mut payload = vec![1, 0, 6, 1];
+        payload.extend(1u64.to_be_bytes());
+        for _ in 0..2 {
+            payload.push(16);
+            payload.extend(
+                "::ffff:192.0.2.1"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            );
+        }
+        payload.extend([255, 0]);
+        assert!(
+            decode(&wrap(1, &payload))
+                .unwrap_err()
+                .to_string()
+                .contains("mapped")
+        );
+        for (index, byte) in [(9, 0x80), (18, 0x80), (18, 1)] {
+            let mut trie = chain(b"a");
+            trie[index] = byte;
+            assert!(
+                Reader::new(&trie, &mut Compiler::default())
+                    .domain_keys(false)
+                    .is_err()
+            );
+        }
     }
 }

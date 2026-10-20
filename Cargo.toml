@@ -133,6 +133,7 @@ rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem
 rust-argon2 = "*"
 rustc-hash = "*"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "perf"] }
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"

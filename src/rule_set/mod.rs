@@ -1,5 +1,6 @@
 mod binary;
 mod geodata;
+mod json;
 mod mihomo;
 mod mrs;
 mod singbox;
@@ -104,42 +105,79 @@ pub fn load(configs: &[Config], compiler: &mut Compiler) -> io::Result<()> {
             return Err(invalid("rule_set source limit exceeded"));
         }
         let result = (|| {
-            if !source.path.is_absolute() { return Err(invalid("rule_set path must be absolute for string configs; file configs anchor paths to their declaring file")); }
+            if !source.path.is_absolute() {
+                return Err(invalid("rule_set path must be absolute for string configs; file configs anchor paths to their declaring file"));
+            }
             let format = source.format()?;
-            if !matches!(format, Format::MihomoYaml | Format::MihomoText | Format::Mrs) && source.behavior.is_some() {
+            if !matches!(format, Format::MihomoYaml | Format::MihomoText | Format::Mrs)
+                && source.behavior.is_some()
+            {
                 return Err(invalid("behavior is only valid for Mihomo formats"));
             }
-            if !matches!(format, Format::GeositeDat | Format::GeoipDat) && (source.code.is_some() || !source.attributes.is_empty()) {
+            if !matches!(format, Format::GeositeDat | Format::GeoipDat)
+                && (source.code.is_some() || !source.attributes.is_empty())
+            {
                 return Err(invalid("code and attributes are only valid for DAT formats"));
             }
             let path = std::fs::canonicalize(&source.path)?;
-            let key = SourceKey { path: path.clone(), format, behavior: source.behavior, code: source.code.clone(), attributes: source.attributes.clone() };
-            if let Some(predicate) = cache.get(&key) { return Ok(predicate.clone()); }
+            let key = SourceKey {
+                path: path.clone(), format, behavior: source.behavior,
+                code: source.code.clone(), attributes: source.attributes.clone(),
+            };
+            if let Some(predicate) = cache.get(&key) {
+                return Ok(predicate.clone());
+            }
             let start = std::time::Instant::now();
-            if !std::fs::metadata(&path)?.is_file() { return Err(invalid("rule_set source must be a regular file")); }
-            let file = std::fs::File::open(&path)?;
-            if !file.metadata()?.is_file() { return Err(invalid("rule_set source must be a regular file")); }
-            let mut bytes = Vec::new();
-            file.take(MAX_INPUT as u64 + 1).read_to_end(&mut bytes)?;
-            if bytes.len() > MAX_INPUT { return Err(invalid("rule_set input exceeds 64 MiB")); }
-            // Reserve a conservative parse/build charge before decoding text containers.
-            compiler.charge(bytes.len().saturating_mul(16), 0)?;
-            let expression = match format {
-                Format::Srs => srs::decode(&bytes, compiler),
-                Format::SingboxJson => singbox::decode(&bytes),
-                Format::MihomoYaml | Format::MihomoText => mihomo::decode(&bytes, format == Format::MihomoYaml,
-                    source.behavior.ok_or_else(|| invalid("Mihomo YAML/text requires behavior"))?),
-                Format::Mrs => mrs::decode(&bytes, source.behavior, compiler),
-                Format::GeositeDat | Format::GeoipDat => geodata::decode(&bytes, format == Format::GeoipDat,
-                    source.code.as_deref().ok_or_else(|| invalid("DAT sources require an explicit code"))?, &source.attributes, compiler),
-            }?;
-            let input_size = bytes.len();
-            drop(bytes);
-            let predicate = compiler.compile(expression)?;
-            log::info!("Loaded rule_set {} ({format:?}, {input_size} bytes) in {:?}", source.rule_set, start.elapsed());
+            if !std::fs::metadata(&path)?.is_file() {
+                return Err(invalid("rule_set source must be a regular file"));
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // A concurrent replacement with a FIFO must not strand the compiler worker.
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            let file = options.open(&path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(invalid("rule_set source must be a regular file"));
+            }
+            if metadata.len() > MAX_INPUT as u64 {
+                return Err(invalid("rule_set input exceeds 64 MiB"));
+            }
+            let size = metadata.len() as usize;
+            let predicate = compiler.source(|compiler| {
+                // Raw input and JSON string scratch overlap; YAML also retains parser events.
+                let factor = if format == Format::MihomoYaml { 16 } else { 2 };
+                compiler.charge(size.saturating_mul(factor).saturating_add(64), 0)?;
+                let mut bytes = Vec::with_capacity(size);
+                file.take(size as u64 + 1).read_to_end(&mut bytes)?;
+                if bytes.len() != size {
+                    return Err(invalid("rule_set changed while reading; retry with an atomic file replacement"));
+                }
+                match format {
+                    Format::Srs => srs::decode(&bytes, compiler),
+                    Format::SingboxJson => singbox::decode(&bytes, compiler),
+                    Format::MihomoYaml | Format::MihomoText => mihomo::decode(
+                        &bytes, format == Format::MihomoYaml,
+                        source.behavior.ok_or_else(|| invalid("Mihomo YAML/text requires behavior"))?, compiler,
+                    ),
+                    Format::Mrs => mrs::decode(&bytes, source.behavior, compiler),
+                    Format::GeositeDat | Format::GeoipDat => geodata::decode(
+                        &bytes, format == Format::GeoipDat,
+                        source.code.as_deref().ok_or_else(|| invalid("DAT sources require an explicit code"))?,
+                        &source.attributes, compiler,
+                    ),
+                }
+            })?;
+            log::info!("Loaded rule_set {} ({format:?}, {size} bytes) in {:?}", source.rule_set, start.elapsed());
             cache.insert(key, predicate.clone());
             Ok::<_, io::Error>(predicate)
-        })().map_err(|e| io::Error::new(e.kind(), format!("rule_set {} ({}): {e}", source.rule_set, source.path.display())))?;
+        })().map_err(|e| io::Error::new(e.kind(), format!(
+            "rule_set {} ({}): {e}", source.rule_set, source.path.display()
+        )))?;
         compiler.sets.insert(source.rule_set.clone(), result);
     }
     Ok(())

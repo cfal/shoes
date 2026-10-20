@@ -18,6 +18,25 @@ pub struct Compiler {
 }
 
 impl Compiler {
+    // Temporary decode/build costs overlap only within one source. Other sources
+    // retain their immutable indexes, not their parser buffers or entry counts.
+    pub fn source(
+        &mut self,
+        decode: impl FnOnce(&mut Self) -> io::Result<Expression>,
+    ) -> io::Result<Arc<Predicate>> {
+        let (bytes, entries) = (self.bytes, self.entries);
+        self.entries = 0;
+        let result = decode(self).and_then(|expression| {
+            self.entries = 0;
+            self.compile(expression)
+        });
+        self.bytes = bytes;
+        self.entries = entries;
+        let predicate = result?;
+        self.charge(predicate.retained_bytes(), 0)?;
+        Ok(predicate)
+    }
+
     pub fn charge(&mut self, bytes: usize, entries: usize) -> io::Result<()> {
         self.bytes = self
             .bytes
@@ -80,25 +99,47 @@ impl Compiler {
                 if v.iter().map(String::len).sum::<usize>() > 4 * 1024 * 1024 {
                     return Err(invalid("keyword pattern budget exceeded"));
                 }
+                let before = self.bytes;
+                let pattern_bytes = v.iter().map(String::len).sum::<usize>();
+                self.charge(pattern_bytes.saturating_mul(256).saturating_add(4096), 0)?;
                 let v: Vec<_> = v.into_iter().map(|s| s.to_ascii_lowercase()).collect();
                 let matcher = aho_corasick::AhoCorasick::builder()
                     .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
                     .build(&v)
                     .map_err(|e| invalid(format!("keywords: {e}")))?;
+                self.bytes = before;
                 self.charge(matcher.memory_usage(), 0)?;
                 Kind::Keywords(matcher)
             }
             Expression::DomainRegex(v) => {
                 self.strings(&v)?;
+                if v.is_empty() {
+                    return Ok(Predicate::new(Kind::Constant(false)));
+                }
                 if v.iter().map(String::len).sum::<usize>() > 4 * 1024 * 1024 {
                     return Err(invalid("regex pattern budget exceeded"));
                 }
-                let matcher = regex::bytes::RegexSetBuilder::new(v)
-                    .unicode(false)
-                    .size_limit(16 * 1024 * 1024)
-                    .build()
+                let before = self.bytes;
+                self.charge(64 * 1024 * 1024, 0)?;
+                let matcher = regex_automata::meta::Regex::builder()
+                    .configure(
+                        regex_automata::meta::Regex::config()
+                            .nfa_size_limit(Some(16 * 1024 * 1024))
+                            .dfa_size_limit(Some(16 * 1024 * 1024))
+                            .onepass_size_limit(Some(16 * 1024 * 1024)),
+                    )
+                    .syntax(
+                        regex_automata::util::syntax::Config::new()
+                            .unicode(false)
+                            .utf8(false),
+                    )
+                    .build_many(&v)
                     .map_err(|e| invalid(format!("unsupported or oversized regex: {e}")))?;
-                self.charge(16 * 1024 * 1024, 0)?;
+                self.bytes = before;
+                if matcher.memory_usage() > 16 * 1024 * 1024 {
+                    return Err(invalid("compiled regex exceeds 16 MiB"));
+                }
+                self.charge(matcher.memory_usage(), 0)?;
                 Kind::Regex(matcher)
             }
             Expression::IpCidr(v) => {
@@ -204,7 +245,9 @@ impl Compiler {
             return Err(invalid("rule nesting exceeds 100 levels"));
         }
         self.strings(&v)?;
-        if v.is_empty() { return Ok(Predicate::new(Kind::Constant(false))); }
+        if v.is_empty() {
+            return Ok(Predicate::new(Kind::Constant(false)));
+        }
         Ok(Predicate::new(Kind::Domains(Names::new(v)?, kind)))
     }
 
@@ -217,9 +260,9 @@ impl Compiler {
                 *any = true;
             } else if let Address::Hostname(name) = mask.address_mask.address {
                 if name.starts_with('.') || name.contains('*') {
-                    return Err(invalid(
-                        "legacy wildcard masks are unsupported; use subdomains or domain_pattern",
-                    ));
+                    return Err(invalid(format!(
+                        "legacy wildcard mask {name:?} is unsupported; use subdomains or domain_pattern"
+                    )));
                 }
                 names.push(name);
             } else {
@@ -236,8 +279,12 @@ impl Compiler {
                 // Sniff eligibility is observable before matching. Preserve the
                 // dependencies of alternatives shadowed by a universal mask.
                 let mut children = vec![Predicate::any_destination()];
-                if names.dependencies.hostname { children.push(names); }
-                if has_ip { children.push(ips); }
+                if names.dependencies.hostname {
+                    children.push(names);
+                }
+                if has_ip {
+                    children.push(ips);
+                }
                 Predicate::any(children)
             } else if has_ip {
                 Predicate::new(Kind::Any(vec![names, ips].into()))
@@ -370,16 +417,38 @@ mod tests {
             .map(|s| NetLocationMask::from(&s).unwrap())
             .collect();
         let indexed = Compiler::default().legacy(raw.clone()).unwrap();
-        let single: Vec<_> = raw
-            .into_iter()
-            .map(|m| Compiler::default().legacy(vec![m]).unwrap())
-            .collect();
         for i in 0..200 {
             for port in [0, 80, 443, 9000] {
                 for ip in [None, Some(format!("10.0.{i}.7").parse().unwrap())] {
                     let name = format!("a.h{i}.example");
                     let expected = Outcome::combine(
-                        single.iter().map(|p| p.evaluate(Some(&name), ip, port)),
+                        raw.iter().map(|m| {
+                            if m.port != 0 && m.port != port {
+                                return Outcome::Miss;
+                            }
+                            let matched = match &m.address_mask.address {
+                                Address::Hostname(base) => {
+                                    name == *base
+                                        || name
+                                            .strip_suffix(base)
+                                            .is_some_and(|prefix| prefix.ends_with('.'))
+                                }
+                                Address::Ipv4(base) => match ip {
+                                    None => return Outcome::Unknown { may_resolve: true },
+                                    Some(std::net::IpAddr::V4(ip)) => {
+                                        (u32::from(ip) & m.address_mask.netmask as u32)
+                                            == (u32::from(*base) & m.address_mask.netmask as u32)
+                                    }
+                                    _ => false,
+                                },
+                                Address::Ipv6(_) => unreachable!(),
+                            };
+                            if matched {
+                                Outcome::Match
+                            } else {
+                                Outcome::Miss
+                            }
+                        }),
                         false,
                     );
                     assert_eq!(indexed.evaluate(Some(&name), ip, port), expected);
@@ -426,9 +495,51 @@ mod tests {
             (vec!["example.com", "0.0.0.0/0"], true, false),
             (vec!["10.0.0.0/8", "example.com", "0.0.0.0/0"], true, true),
         ] {
-            let p = Compiler::default().legacy(masks.into_iter().map(|m| NetLocationMask::from(m).unwrap()).collect()).unwrap();
+            let p = Compiler::default()
+                .legacy(
+                    masks
+                        .into_iter()
+                        .map(|m| NetLocationMask::from(m).unwrap())
+                        .collect(),
+                )
+                .unwrap();
             assert_eq!(p.dependencies.hostname, hostname);
             assert_eq!(p.dependencies.ip, ip);
         }
+    }
+
+    #[test]
+    fn source_budgets_release_scratch_and_reset_entry_counts() {
+        let mut compiler = Compiler::default();
+        for _ in 0..8 {
+            compiler
+                .source(|budget| {
+                    budget.charge(400 * 1024 * 1024, MAX_ENTRIES)?;
+                    Ok(Expression::Never)
+                })
+                .unwrap();
+        }
+        assert!(compiler.bytes < 4096);
+        assert_eq!(compiler.entries, 0);
+        assert!(
+            compiler
+                .source(|budget| {
+                    budget.charge(MAX_BYTES, 0)?;
+                    Ok(Expression::Never)
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn many_small_regex_leaves_charge_retained_memory_not_each_size_limit() {
+        let mut compiler = Compiler::default();
+        for _ in 0..128 {
+            let p = compiler
+                .compile(Expression::DomainPattern(vec!["*.example.com".into()]))
+                .unwrap();
+            assert_eq!(p.evaluate(Some("a.example.com"), None, 80), Outcome::Match);
+        }
+        assert!(compiler.bytes < 16 * 1024 * 1024);
     }
 }

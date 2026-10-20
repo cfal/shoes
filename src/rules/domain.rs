@@ -36,10 +36,23 @@ pub enum Names {
 }
 
 impl Names {
+    pub(super) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Small(names) => names.iter().map(|name| name.len() + 32).sum(),
+            Self::Indexed(names) => {
+                names.capacity() * 32 + names.iter().map(|name| name.len() + 16).sum::<usize>()
+            }
+        }
+    }
+
     pub fn new(names: Vec<String>) -> io::Result<Self> {
         let mut names = names
             .into_iter()
-            .map(|s| normalize(&s).map(|s| s.into_owned().into_boxed_str()))
+            .map(|s| {
+                normalize(&s)
+                    .map(|s| s.into_owned().into_boxed_str())
+                    .map_err(|e| invalid(format!("domain {s:?}: {e}")))
+            })
             .collect::<io::Result<Vec<_>>>()?;
         names.sort_unstable();
         names.dedup();

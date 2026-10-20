@@ -147,7 +147,7 @@ pub(super) fn decode(
                     if count > super::binary::MAX_ENTRIES {
                         return Err(invalid("DAT entry limit exceeded"));
                     }
-                    budget.charge(item.len().saturating_mul(8).saturating_add(256), 0)?;
+                    budget.charge(item.len().saturating_mul(8).saturating_add(256), 1)?;
                     if geoip {
                         cidr(item, &mut ips)?;
                     } else if let Some(rule) = domain(item, attributes)? {

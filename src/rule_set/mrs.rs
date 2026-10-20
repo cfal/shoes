@@ -180,7 +180,10 @@ mod tests {
                 .compile(decode(binary, Some(behavior), &mut Compiler::default()).unwrap())
                 .unwrap();
             let expected = Compiler::default()
-                .compile(super::super::mihomo::decode(text, false, behavior).unwrap())
+                .compile(
+                    super::super::mihomo::decode(text, false, behavior, &mut Compiler::default())
+                        .unwrap(),
+                )
                 .unwrap();
             for name in [
                 None,
