@@ -37,18 +37,19 @@ local-only coverage without external peers.
   for at least twice the measured unpaused transfer duration (minimum one second),
   then resume and verify exact bytes and continued session progress. Shoes uses
   256 KiB per-session and 1 MiB global byte budgets, with the default 30-packet
-  reorder window and 128 live requests per session. Test-owned sending and
+  reorder window and unlimited per-session requests. Test-owned sending and
   receiving sockets use 64 KiB buffers
   to keep kernel autotuning from absorbing the entire paused transfer.
   Downloads exceed the combined peer transport windows and intermediate TCP buffers;
   a 16 MiB download can fit in those buffers without backpressuring the source.
   Cancellation and connection churn use the same processes.
-- Separate Xray cases use the default 64 MiB global and 4 MiB session byte
-  budgets with 32 KiB POSTs and 30 ms pacing. H2's non-ACK-waiting uploader
-  reaches the live-request cap during a stalled upload; never-admitted requests
-  are refused for transport retry without closing the logical session. H2 and H3
-  recover after a ten-second destination pause while download heartbeats continue
-  on that same session. A separate H2 case uses a two-second packet inactivity
+- Separate Xray cases use the default unlimited aggregate and per-session byte
+  and request budgets with 32 KiB POSTs and 30 ms pacing. H2 and H3 recover after
+  a ten-second destination pause while download heartbeats continue on that same
+  session. An additional H2 variant explicitly caps live packet requests at 128
+  to exercise refusal and Xray transport replay without closing the logical
+  session. The per-connection request limit remains 250 in these cases.
+  A separate H2 case uses a two-second packet inactivity
   timeout to check permanent-stall containment and subsequent session availability.
 - Mihomo server recovery is also checked with the default Shoes client byte limits.
   The client sequence window prevents ACKs for later packets from advancing past
@@ -80,9 +81,12 @@ Xray client H2C is not included. Packet-up does not signal upload FIN. A complet
 stalled session can retain shared-carrier flow-control credit, so the pressure
 tests require recovery after consumption resumes, not independent progress while
 the shared window is exhausted. Attached out-of-window POSTs wait for their
-predecessors subject to inactivity and per-session request limits; the pressure
-fixtures do not widen either request-count limit. Deterministic GOAWAY, credit starvation,
-timeout races, and memory-release ordering remain covered by the XHTTP library tests.
+predecessors subject to packet inactivity. Normal pressure fixtures leave aggregate
+and per-session request caps unlimited; client pipeline depth, transport flow
+control and the 250-request per-connection limit still constrain concurrency.
+The explicit 128-request Xray H2 case covers per-session refusal and recovery.
+Deterministic GOAWAY, credit starvation, timeout races, and memory-release ordering
+remain covered by the XHTTP library tests.
 
 ## Throughput And Stall Qualification
 
@@ -130,10 +134,11 @@ Shoes binary; their rates are not production throughput measurements.
 
 Service handlers include the GET and briefly rejected requests, not just admitted
 packet requests. RSS includes both Shoes and Xray and excludes the test harness.
-The default cap survived every tested pause, but Xray's retry backoff delayed
+The then-default 128 cap survived every tested pause, but Xray's retry backoff delayed
 completion after longer pauses. A larger cap reduced that delay while retaining
 more requests. These samples qualify this workload, not arbitrary stalls, packet
-sizes, transport-credit contention, or overload.
+sizes, transport-credit contention, or overload. These measurements predate the
+unlimited admission defaults.
 
 A release-build run with four concurrent sessions, 150 ms added RTT, 32 KiB POSTs
 and a ten-second destination pause also passed all three directions. Total times

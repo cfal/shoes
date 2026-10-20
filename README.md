@@ -458,9 +458,9 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   failures after a successful response has started, retain their existing handling.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
   padding, path/query handling, packet sizing/pacing, and stream-up keepalives
-  follow modern Xray. `limits` bounds sessions, buffered bytes, requests and
-  setup/header deadlines and packet inactivity; `pool` bounds connections and
-  idle retention.
+  follow modern Xray. `limits` can bound sessions, buffered bytes and requests;
+  setup/header deadlines and packet inactivity remain bounded by default.
+  `pool` bounds connections and idle retention.
   Split legs may use different carriers on the same selected route. H2/H3 admission
   respects peer stream capacity; draining carriers retain their connection slots.
   A full pool refuses new sessions rather than exceeding its configured cap.
@@ -491,14 +491,28 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   other request types also retain it for response headers. `setup_timeout_secs`
   is unchanged. A live peer that never ACKs can retain bounded client resources
   until the stream is dropped or the transport fails.
+- XHTTP client and server admission caps are opt-in:
+  `limits.max_sessions`, `max_pending_sessions`, `max_requests`,
+  `max_requests_per_session`, `max_buffered_bytes` and `max_session_buffered_bytes`
+  default to unlimited. Omitted or `null` caps are unlimited, except that setting
+  an aggregate byte or request cap also supplies a per-session safeguard when
+  its corresponding session cap is omitted or `null`: `min(max_buffered_bytes,
+  4194304)` bytes or 128 requests. The aggregate cap still applies when lower.
+  This preserves ordered-packet headroom and bounds one session's admission waiters. Explicit
+  session caps override these fallbacks. Values must be positive
+  (`max_requests_per_session` must be at least 2).
+  `limits.max_requests_per_connection` defaults to 250. Explicit global limits
+  still apply. Packet sizes, reorder windows, timeouts and transport flow-control
+  windows remain bounded. Without admission or byte caps, overload can consume
+  more memory; configure explicit caps when resource isolation is required.
 - H2/H3 packet-up follows Xray's paced, write-gated pipeline: the next POST may start
   after the preceding body is transmitted, without waiting for its ACK. Client
   `packet_pipeline_depth` defaults to 30 (minimum 1), matching the reference peers'
   default reorder depth. The window advances only through consecutive ACKs, so
   later ACKs cannot accumulate an unbounded sequence gap at a stalled peer.
-  Larger depths require a correspondingly larger peer reorder queue. Client
-  and Shoes server request limits must also agree: allow at least the effective
-  client POST depth plus one reserved head slot in server
+  Larger depths require a correspondingly larger peer reorder queue. Explicit
+  server request limits must accommodate the effective client POST depth plus
+  one reserved head slot in server
   `limits.max_requests_per_session` (31 for the default H2/H3 client depth).
   Lower the client depth when using a smaller server cap; Shoes does not replay
   refused POSTs. Pool, byte and client request limits may reduce the effective depth.
@@ -506,26 +520,26 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   download slot in the shared pool (31 slots at the default depth). Delayed ACKs
   retain those slots; several stalled or high-latency sessions can fill the pool
   and refuse new sessions, including sessions to healthy destinations.
-  Client `limits.max_requests_per_session` is an additional ceiling (128, minimum 2): one
-  slot is for the download leg. `limits.max_requests`
-  bounds outstanding POSTs across a client instance (4096 by default). Reaching
+  The effective client `limits.max_requests_per_session` is an additional
+  ceiling: one slot is for the download leg. `limits.max_requests`, when configured,
+  bounds outstanding POSTs across a client instance. Reaching
   either client bound backpressures the local writer. Pool limits may constrain
   concurrency further. H1 keeps one ACK-gated POST on a reusable upload connection,
   plus the download connection; it does not open opportunistic upload connections
   or use raw HTTP/1 pipelining. Use H2/H3 for high-latency packet-up throughput.
-  Unsent bytes remain subject to the byte budgets;
+  Unsent bytes remain subject to any configured byte budgets;
   successfully transmitted bodies are not retained while awaiting ACKs.
   Outstanding POST payload sizes also count against a separate logical credit
-  limit equal to `max_session_buffered_bytes`, bounding peer-side backlog without
-  keeping sent allocations or consuming the download's memory allowance.
+  limit when a session byte cap is configured or derived, bounding peer-side
+  backlog without keeping sent allocations or consuming the download's memory allowance.
   Tiny writes are coalesced into allocations of at most 16 KiB while transferring
   their existing byte permits, avoiding per-write metadata and small-DATA-frame
   amplification without throttling datagram-sized writes.
-  On the server, `limits.max_requests_per_session` bounds live packet requests
-  across carriers, including empty bodies, duplicates and admission waiters.
-  One slot is reserved for a missing head packet. `limits.max_requests` additionally
-  bounds all active HTTP request handlers across the service, including waiters
-  and streaming requests, and must be at least 2 for split server modes.
+  On the server, the effective `limits.max_requests_per_session` bounds live packet
+  requests across carriers, including empty bodies, duplicates and admission waiters.
+  One slot is reserved for a missing head packet. An explicit `limits.max_requests`
+  additionally bounds all active HTTP request handlers across the service,
+  including waiters and streaming requests, and must be at least 2 for split server modes.
   Body pumps start only after packet byte/reorder admission;
   waiting packets do not each absorb an extra four-slot application pipe.
   H2 rejects never-admitted excess POSTs with `REFUSED_STREAM`, preserving the
@@ -536,8 +550,8 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   still terminates the session. Hard limits and inactivity expiry remain backstops,
   not promises of lossless operation under arbitrary overload.
   Attached sessions wait for late predecessors beyond the default 30-packet reorder
-  window, subject to this request cap and packet inactivity timeout. Unattached
-  sessions still reject out-of-window packets.
+  window, subject to packet inactivity and any configured or derived request cap.
+  Unattached sessions still reject out-of-window packets.
   Budget `max_session_buffered_bytes` for the desired bandwidth-delay product
   and packet queue, not a fixed POST concurrency multiplier. Server download
   pipes have an independent allowance of the same size, so a full packet queue
@@ -551,9 +565,12 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   carrier flow-control credit indefinitely, so other sessions may time out.
 - H2 receive windows default to 4 MiB per stream and 8 MiB per connection through
   `limits.h2_stream_window_bytes` and `limits.h2_connection_window_bytes`. The
-  stream window is capped by session/global byte limits; the connection window
-  is capped by the global limit, with HTTP/2's mandatory 65535-byte minimum.
-  Increase both the window and byte limits for higher bandwidth-delay products.
+  stream window is capped by the effective (configured or derived) session byte
+  limit and any configured global byte limit. The connection window is capped
+  by an explicit global byte limit, with HTTP/2's mandatory 65535-byte minimum.
+  Increase windows and effective byte limits for higher bandwidth-delay products.
+  When a global byte cap is set, stream windows above 4 MiB also require an
+  explicit `limits.max_session_buffered_bytes` above 4 MiB.
   Transport buffers are additional to application-accounted bytes: window limits
   apply per carrier, not to total RSS. Exposed servers also need connection limits.
 - The server bounds the initial TCP HTTP header/preface to four seconds after

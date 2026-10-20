@@ -184,8 +184,8 @@ mod tests {
         for fragment_size in [1, 13, CHUNK] {
             let size = 2 * CHUNK + 17;
             let budget = Arc::new(Budget::new(Some(size)));
-            let source = Memory::new(budget.clone(), size);
-            let target = Memory::new(budget.clone(), size);
+            let source = Memory::new(budget.clone(), Some(size));
+            let target = Memory::new(budget.clone(), Some(size));
             let mut packet = target.reserve_packet(size, 0).unwrap();
             let (mut writer, mut reader) = pipe(source.clone());
             let expected: Vec<_> = (0..size).map(|index| (index % 251) as u8).collect();
@@ -218,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_reads_explicit_eof_and_errors() {
-        let memory = Memory::new(Arc::new(Budget::new(Some(128))), 128);
+        let memory = Memory::new(Arc::new(Budget::new(Some(128))), Some(128));
         let (mut writer, mut reader) = pipe(memory.clone());
         writer.write_all(b"abcdef").await.unwrap();
         writer.shutdown().await.unwrap();
@@ -245,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn flush_waits_for_consumer_and_memory_is_returned() {
         let budget = Arc::new(Budget::new(Some(4)));
-        let memory = Memory::new(budget.clone(), 4);
+        let memory = Memory::new(budget.clone(), Some(4));
         let (mut writer, mut reader) = pipe(memory.clone());
         writer.write_all(b"data").await.unwrap();
         assert!(memory.copy(b"x").is_err());
@@ -261,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_barrier_ack_keeps_subsequent_operations_fallible() {
         for drain in [false, true] {
-            let memory = Memory::new(Arc::new(Budget::new(Some(128))), 128);
+            let memory = Memory::new(Arc::new(Budget::new(Some(128))), Some(128));
             let (mut writer, reader) = pipe(memory);
             writer.drain_before_shutdown = drain;
             let mut barrier = Box::pin(async {
@@ -293,7 +293,7 @@ mod tests {
     async fn forwarding_preserves_buffered_bytes_barriers_fin_and_errors() {
         for failure in [false, true] {
             let budget = Arc::new(Budget::new(Some(8)));
-            let memory = Memory::new(budget.clone(), 8);
+            let memory = Memory::new(budget.clone(), Some(8));
             let (mut source, mut incoming) = pipe(memory.clone());
             let (mut destination, mut outgoing) = pipe(memory);
             source.write_all(b"12345678").await.unwrap();
@@ -333,7 +333,7 @@ mod tests {
             .unwrap();
             assert_eq!(budget.snapshot().active, 0);
         }
-        let memory = Memory::new(Arc::new(Budget::new(Some(8))), 8);
+        let memory = Memory::new(Arc::new(Budget::new(Some(8))), Some(8));
         let (source, mut incoming) = pipe(memory.clone());
         let (mut destination, _outgoing) = pipe(memory);
         drop(source);
@@ -350,8 +350,8 @@ mod tests {
     #[tokio::test]
     async fn byte_budget_backpressures_other_sessions_and_wakes_on_release() {
         let budget = Arc::new(Budget::new(Some(8)));
-        let (mut first, mut first_reader) = pipe(Memory::new(budget.clone(), 8));
-        let (mut second, mut second_reader) = pipe(Memory::new(budget.clone(), 8));
+        let (mut first, mut first_reader) = pipe(Memory::new(budget.clone(), Some(8)));
+        let (mut second, mut second_reader) = pipe(Memory::new(budget.clone(), Some(8)));
         first.write_all(b"12345678").await.unwrap();
         let mut blocked = Box::pin(second.write_all(b"next"));
         assert!(futures::poll!(&mut blocked).is_pending());
@@ -493,10 +493,10 @@ impl Memory {
         })
     }
 
-    pub fn new(global: Arc<Budget>, session_limit: usize) -> Self {
+    pub fn new(global: Arc<Budget>, session_limit: Option<usize>) -> Self {
         Self {
             global,
-            session: Arc::new(Budget::new(Some(session_limit))),
+            session: Arc::new(Budget::new(session_limit)),
         }
     }
     #[cfg(test)]
