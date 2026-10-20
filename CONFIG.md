@@ -1081,6 +1081,9 @@ or configure rules for the ECH public names.
 ```yaml
 rules:
   - masks: string | [string]   # IP/CIDR or hostname masks
+    rule_sets: string | [string]  # Optional named sets, ORed with masks
+    match: Expression?        # Typed predicate; mutually exclusive with masks/rule_sets
+    no_resolve: boolean?      # Default false; known IPs still participate
     action: allow | block
     # For action: allow
     override_address: string?  # Optional address override
@@ -1237,7 +1240,9 @@ cannot match normalized lowercase queries and produce a warning. Regex patterns
 retain their own case flags; only the bounded ASCII Rust regex subset is accepted.
 
 Files are limited to 64 MiB, inflated payloads to 256 MiB, and compilation has a
-512 MiB conservative allocation budget. These are safety ceilings, not a mobile
+512 MiB conservative allocation budget. Each source is limited to 2 million
+entries. Temporary decode/build charges are released between sources; retained
+indexes count toward the generation budget. These are safety ceilings, not a mobile
 memory guarantee. Remote URLs and GeoIP `.db` (MMDB) files are not supported;
 use country SRS files from sing-geoip instead.
 
