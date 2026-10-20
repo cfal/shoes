@@ -403,6 +403,70 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn http_sniff_example_blocks_private_targets_before_host_allows() {
+        use crate::config::{Config, ConfigSelection, ServerProxyConfig};
+
+        let mut configs = crate::config::create_server_configs(
+            serde_yaml::from_str(include_str!("../../examples/http_host_sniffing.yaml")).unwrap(),
+        )
+        .unwrap();
+        let Config::Server(config) = configs.configs.remove(0) else {
+            panic!("expected server config")
+        };
+        assert!(matches!(
+            config.protocol,
+            ServerProxyConfig::Socks {
+                username: Some(_),
+                password: Some(_),
+                ..
+            }
+        ));
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
+        let selector = crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
+            rules,
+            resolver.clone(),
+        )
+        .unwrap()
+        .with_sniff(config.sniff);
+        for (target, blocked) in [
+            ("0.0.0.0:80", true),
+            ("[::]:80", true),
+            ("[::ffff:0.0.0.0]:80", true),
+            ("10.0.0.1:80", true),
+            ("172.16.0.1:80", true),
+            ("192.168.0.1:80", true),
+            ("127.0.0.1:80", true),
+            ("169.254.169.254:80", true),
+            ("[::1]:80", true),
+            ("[fc00::1]:80", true),
+            ("[fe80::1]:80", true),
+            ("[::ffff:127.0.0.1]:80", true),
+            ("192.0.2.1:80", false),
+            ("[2001:db8::1]:80", false),
+        ] {
+            let prepared = PreparedTcp::new(
+                &selector,
+                NetLocation::from_str(target, None).unwrap(),
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+            )
+            .unwrap();
+            let route = prepared
+                .route(&mut tokio::io::empty(), &selector, &resolver)
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    route.target,
+                    TcpRouteTarget::Forward(ConnectDecision::Block)
+                ),
+                blocked,
+                "{target}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn http_sniff_eligibility_and_misses_keep_ordinary_routing() {
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         for enabled in [false, true] {
