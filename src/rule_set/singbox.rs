@@ -99,13 +99,14 @@ fn rule(value: Value, depth: usize) -> io::Result<Expression> {
         return Err(invalid("unsupported rule type"));
     }
     let mut parts = Parts::default();
-    for (kind, v) in [rule.domain, rule.domain_suffix, rule.domain_keyword]
-        .into_iter()
-        .enumerate()
-    {
+    for (kind, v) in [
+        (LiteralKind::Exact, rule.domain),
+        (LiteralKind::Suffix, rule.domain_suffix),
+        (LiteralKind::Keyword, rule.domain_keyword),
+    ] {
         let v = values(v);
         if !v.is_empty() {
-            parts.address.push(literals(v, kind as u8)?);
+            parts.address.push(literals(v, kind)?);
         }
     }
     let regex = values(rule.domain_regex);
@@ -155,9 +156,16 @@ pub(super) fn port_ranges(values: Vec<String>) -> io::Result<Expression> {
     Ok(Expression::PortRanges(ranges))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum LiteralKind {
+    Exact,
+    Suffix,
+    Keyword,
+}
+
 // The source folds query case, not literal pattern case. False alternatives must
 // remain false under enclosing AND/NOT nodes, not disappear as missing fields.
-pub(super) fn literals(input: Vec<String>, kind: u8) -> io::Result<Expression> {
+pub(super) fn literals(input: Vec<String>, kind: LiteralKind) -> io::Result<Expression> {
     let mut names = Vec::new();
     let mut strict = Vec::new();
     let mut uppercase = 0;
@@ -167,19 +175,19 @@ pub(super) fn literals(input: Vec<String>, kind: u8) -> io::Result<Expression> {
                 "sing-box literals must be nonempty ASCII strings of at most 64 KiB",
             ));
         }
-        let name = if kind == 1 {
+        let name = if kind == LiteralKind::Suffix {
             value.strip_prefix('.').unwrap_or(&value)
         } else {
             &value
         };
-        if kind != 2 {
+        if kind != LiteralKind::Keyword {
             domain::normalize(name)?;
         }
         if value.bytes().any(|b| b.is_ascii_uppercase()) {
             uppercase += 1;
             continue;
         }
-        if kind == 1 && value.starts_with('.') {
+        if kind == LiteralKind::Suffix && value.starts_with('.') {
             strict.push(name.to_owned());
         } else {
             names.push(value);
@@ -191,13 +199,12 @@ pub(super) fn literals(input: Vec<String>, kind: u8) -> io::Result<Expression> {
         );
     }
     Ok(match kind {
-        0 => Expression::Domain(names),
-        1 => Expression::or(vec![
+        LiteralKind::Exact => Expression::Domain(names),
+        LiteralKind::Suffix => Expression::or(vec![
             Expression::DomainSuffix(names),
             Expression::Subdomains(strict),
         ]),
-        2 => Expression::DomainKeyword(names),
-        _ => return Err(invalid("invalid literal kind")),
+        LiteralKind::Keyword => Expression::DomainKeyword(names),
     })
 }
 
@@ -243,7 +250,7 @@ mod tests {
                 "A".repeat(65_537)
             );
             assert!(decode(source.as_bytes()).is_err());
-            assert!(literals(vec!["A".repeat(65_537)], 2).is_err());
+            assert!(literals(vec!["A".repeat(65_537)], LiteralKind::Keyword).is_err());
         }
     }
 

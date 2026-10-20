@@ -317,28 +317,31 @@ fn merge_ports(mut ranges: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
 
 fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
     let mut result = Vec::new();
-    let mut ranges = [IpRanges::default(), IpRanges::default()];
+    let mut resolving_ranges = IpRanges::default();
+    let mut no_resolve_ranges = IpRanges::default();
     let mut ports = Vec::new();
-    let mut domains = [
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    ];
+    let mut exact = Vec::new();
+    let mut suffixes = Vec::new();
+    let mut subdomains = Vec::new();
+    let mut patterns = Vec::new();
+    let mut keywords = Vec::new();
+    let mut regexes = Vec::new();
+    let mut cidrs = Vec::new();
     for expression in expressions {
-        let (i, mut v) = match expression {
-            Expression::Domain(v) => (0, v),
-            Expression::DomainSuffix(v) => (1, v),
-            Expression::Subdomains(v) => (2, v),
-            Expression::DomainPattern(v) => (3, v),
-            Expression::DomainKeyword(v) => (4, v),
-            Expression::DomainRegex(v) => (5, v),
-            Expression::IpCidr(v) => (6, v),
-            Expression::Ranges(v, no_resolve) => {
-                ranges[usize::from(no_resolve)].append(v);
+        let (group, mut values) = match expression {
+            Expression::Domain(values) => (&mut exact, values),
+            Expression::DomainSuffix(values) => (&mut suffixes, values),
+            Expression::Subdomains(values) => (&mut subdomains, values),
+            Expression::DomainPattern(values) => (&mut patterns, values),
+            Expression::DomainKeyword(values) => (&mut keywords, values),
+            Expression::DomainRegex(values) => (&mut regexes, values),
+            Expression::IpCidr(values) => (&mut cidrs, values),
+            Expression::Ranges(ranges, true) => {
+                no_resolve_ranges.append(ranges);
+                continue;
+            }
+            Expression::Ranges(ranges, false) => {
+                resolving_ranges.append(ranges);
                 continue;
             }
             Expression::PortRanges(mut v) => {
@@ -350,29 +353,28 @@ fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
                 continue;
             }
         };
-        domains[i].append(&mut v);
+        group.append(&mut values);
     }
-    for (i, ranges) in ranges.into_iter().enumerate() {
+    for (ranges, no_resolve) in [(resolving_ranges, false), (no_resolve_ranges, true)] {
         if !ranges.v4.is_empty() || !ranges.v6.is_empty() {
-            result.push(Expression::Ranges(ranges, i != 0));
+            result.push(Expression::Ranges(ranges, no_resolve));
         }
     }
     if !ports.is_empty() {
         result.push(Expression::PortRanges(ports));
     }
-    for (i, v) in domains.into_iter().enumerate() {
-        if !v.is_empty() {
-            result.push(match i {
-                0 => Expression::Domain(v),
-                1 => Expression::DomainSuffix(v),
-                2 => Expression::Subdomains(v),
-                3 => Expression::DomainPattern(v),
-                4 => Expression::DomainKeyword(v),
-                5 => Expression::DomainRegex(v),
-                _ => Expression::IpCidr(v),
-            });
+    let mut push_literals = |values: Vec<String>, expression: fn(Vec<String>) -> Expression| {
+        if !values.is_empty() {
+            result.push(expression(values));
         }
-    }
+    };
+    push_literals(exact, Expression::Domain);
+    push_literals(suffixes, Expression::DomainSuffix);
+    push_literals(subdomains, Expression::Subdomains);
+    push_literals(patterns, Expression::DomainPattern);
+    push_literals(keywords, Expression::DomainKeyword);
+    push_literals(regexes, Expression::DomainRegex);
+    push_literals(cidrs, Expression::IpCidr);
     if result.is_empty() {
         result.push(Expression::Never);
     }
@@ -408,6 +410,62 @@ mod tests {
                 .legacy(vec![NetLocationMask::from("*.x").unwrap()])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn literal_groups_preserve_kinds_order_and_resolution_permissions() {
+        let mut resolving = IpRanges::default();
+        resolving.add_cidr("192.0.2.0/24").unwrap();
+        let mut no_resolve = IpRanges::default();
+        no_resolve.add_cidr("198.51.100.0/24").unwrap();
+        let grouped = group_literals(vec![
+            Expression::Domain(vec!["first.example".into()]),
+            Expression::DomainSuffix(vec!["suffix.example".into()]),
+            Expression::Subdomains(vec!["strict.example".into()]),
+            Expression::DomainPattern(vec!["*.pattern.example".into()]),
+            Expression::DomainKeyword(vec!["keyword".into()]),
+            Expression::DomainRegex(vec!["^regex$".into()]),
+            Expression::IpCidr(vec!["203.0.113.0/24".into()]),
+            Expression::Ranges(no_resolve, true),
+            Expression::Ranges(resolving, false),
+            Expression::PortRanges(vec![(80, 80)]),
+            Expression::Never,
+            Expression::Domain(vec!["second.example".into()]),
+            Expression::PortRanges(vec![(443, 443)]),
+            Expression::Domain(Vec::new()),
+        ]);
+        let [
+            Expression::Never,
+            Expression::Ranges(resolving, false),
+            Expression::Ranges(no_resolve, true),
+            Expression::PortRanges(ports),
+            Expression::Domain(exact),
+            Expression::DomainSuffix(suffixes),
+            Expression::Subdomains(subdomains),
+            Expression::DomainPattern(patterns),
+            Expression::DomainKeyword(keywords),
+            Expression::DomainRegex(regexes),
+            Expression::IpCidr(cidrs),
+        ] = grouped.as_slice()
+        else {
+            panic!("unexpected groups: {grouped:?}");
+        };
+        assert!(resolving.contains("192.0.2.1".parse().unwrap()));
+        assert!(!resolving.contains("198.51.100.1".parse().unwrap()));
+        assert!(no_resolve.contains("198.51.100.1".parse().unwrap()));
+        assert!(!no_resolve.contains("192.0.2.1".parse().unwrap()));
+        assert_eq!(ports, &[(80, 80), (443, 443)]);
+        assert_eq!(exact, &["first.example", "second.example"]);
+        assert_eq!(suffixes, &["suffix.example"]);
+        assert_eq!(subdomains, &["strict.example"]);
+        assert_eq!(patterns, &["*.pattern.example"]);
+        assert_eq!(keywords, &["keyword"]);
+        assert_eq!(regexes, &["^regex$"]);
+        assert_eq!(cidrs, &["203.0.113.0/24"]);
+        assert!(matches!(
+            group_literals(vec![Expression::Domain(Vec::new())]).as_slice(),
+            [Expression::Never]
+        ));
     }
 
     #[test]

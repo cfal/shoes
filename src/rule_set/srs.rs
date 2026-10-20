@@ -1,7 +1,7 @@
 use std::io;
 
 use super::binary::{MAX_ENTRIES, Reader, inflate};
-use super::singbox::{Parts, literals, port_ranges};
+use super::singbox::{LiteralKind, Parts, literals, port_ranges};
 use crate::rules::{Compiler, Expression, IpRanges, invalid};
 
 pub fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Expression> {
@@ -62,17 +62,17 @@ fn rule(
                             }
                         }
                         if !exact.is_empty() {
-                            parts.address.push(literals(exact, 0)?);
+                            parts.address.push(literals(exact, LiteralKind::Exact)?);
                         }
                         if !suffix.is_empty() {
-                            parts.address.push(literals(suffix, 1)?);
+                            parts.address.push(literals(suffix, LiteralKind::Suffix)?);
                         }
                     }
                     3 | 4 => {
                         let strings = reader.strings()?;
                         if !strings.is_empty() {
                             parts.address.push(if tag == 3 {
-                                literals(strings, 2)?
+                                literals(strings, LiteralKind::Keyword)?
                             } else {
                                 Expression::DomainRegex(strings)
                             });
