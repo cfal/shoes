@@ -889,7 +889,7 @@ async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
                     .with_sniff(true),
             );
             let (client, transport) = tokio::io::duplex(8192);
-            let (done, finished) = tokio::sync::oneshot::channel();
+            let (done, mut finished) = tokio::sync::oneshot::channel();
             let resolver_clone = resolver.clone();
             let mut drivers = JoinSet::new();
             drivers.spawn(async move {
@@ -919,7 +919,14 @@ async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
             stream.write_all(&payload).await.unwrap();
             if during_dial {
                 resolver.started.notified().await;
+            } else {
+                // Paused time advances after the H2 drivers deliver queued DATA to the probe.
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
+            assert!(matches!(
+                finished.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
             let reset_at = tokio::time::Instant::now();
             drop(stream);
             tokio::time::timeout(crate::sniff::SNIFF_TIMEOUT, finished)
