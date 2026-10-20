@@ -6,14 +6,14 @@ use tokio::io::AsyncRead;
 use crate::address::NetLocation;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision, IngressTarget};
 use crate::resolver::Resolver;
-use crate::sniff::{SNIFF_TIMEOUT, TlsProbe};
+use crate::sniff::{SNIFF_TIMEOUT, StreamProbe};
 
 use super::tcp_handler::TcpClientSetupResult;
 
 pub(crate) struct PreparedTcp {
     target: IngressTarget,
     prefix: Vec<u8>,
-    probe: Option<TlsProbe>,
+    probe: Option<StreamProbe>,
 }
 
 pub(crate) struct RoutedTcp {
@@ -66,7 +66,7 @@ impl PreparedTcp {
         let target = selector.prepare(target.into())?;
         let probe = match &target {
             IngressTarget::Forward(target) if selector.should_sniff(target) => {
-                Some(TlsProbe::from_prefix(std::mem::take(&mut prefix)))
+                Some(StreamProbe::from_prefix(std::mem::take(&mut prefix)))
             }
             _ => None,
         };
@@ -78,7 +78,7 @@ impl PreparedTcp {
     }
 
     pub(crate) fn needs_sniff_read(&self) -> bool {
-        self.probe.as_ref().is_some_and(TlsProbe::needs_more)
+        self.probe.as_ref().is_some_and(StreamProbe::needs_more)
     }
 
     #[cfg(test)]
@@ -101,9 +101,9 @@ impl PreparedTcp {
         selector: &'a ClientProxySelector,
         resolver: &Arc<dyn Resolver>,
     ) -> io::Result<TcpRoute<'a>> {
-        let (server_name, prefix) = if let Some(probe) = self.probe {
+        let (hostname, prefix) = if let Some(probe) = self.probe {
             let result = probe.finish(inbound, SNIFF_TIMEOUT).await?;
-            (result.server_name, result.prefix)
+            (result.hostname, result.prefix)
         } else {
             (None, self.prefix)
         };
@@ -114,7 +114,7 @@ impl PreparedTcp {
             } => (wire_destination, TcpRouteTarget::LocalDns(context)),
             IngressTarget::Forward(target) => {
                 let routed = selector
-                    .judge_prepared(target, server_name.as_deref(), resolver)
+                    .judge_prepared(target, hostname.as_deref(), resolver)
                     .await?;
                 (
                     routed.wire_destination,
@@ -348,6 +348,111 @@ pub(crate) mod tests {
                 assert_eq!(ip.0.octets()[1] & 254, 18);
             } else {
                 assert_eq!(bytes, b"greetinglater");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_host_routes_only_the_original_destination_and_port() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        for fake in [false, true] {
+            let context = Arc::new(
+                crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
+                    .unwrap(),
+            );
+            let target = if fake {
+                NetLocation::from_ip_addr(context.allocate("restored.example", false).unwrap(), 443)
+            } else {
+                NetLocation::from_str(TARGET, None).unwrap()
+            };
+            let rule = serde_yaml::from_str("masks: sniff.example:443\naction: allow").unwrap();
+            let selector =
+                crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
+                    vec![rule],
+                    resolver.clone(),
+                )
+                .unwrap()
+                .with_sniff(true)
+                .with_fake_dns_context(fake.then_some(context))
+                .unwrap();
+            let bytes = b"GET / HTTP/1.1\r\nHost: SnIfF.Example.:80\r\n\r\n";
+            for split in [0, 5, bytes.len()] {
+                let prepared =
+                    PreparedTcp::new(&selector, target.clone(), bytes[..split].to_vec()).unwrap();
+                assert_eq!(prepared.needs_sniff_read(), split < bytes.len());
+                let route = prepared
+                    .route(&mut &bytes[split..], &selector, &resolver)
+                    .await
+                    .unwrap();
+                assert_eq!(route.wire_destination, target);
+                assert_eq!(route.prefix, bytes);
+                let TcpRouteTarget::Forward(ConnectDecision::Allow {
+                    remote_location, ..
+                }) = route.target
+                else {
+                    panic!("Host-only rule did not match")
+                };
+                assert_eq!(
+                    remote_location.location().to_string(),
+                    if fake { "restored.example:443" } else { TARGET }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_sniff_eligibility_and_misses_keep_ordinary_routing() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        for enabled in [false, true] {
+            let rules = serde_yaml::from_str(
+                "- masks: sniff.example\n  action: block\n- masks: 0.0.0.0/0\n  action: allow",
+            )
+            .unwrap();
+            let selector =
+                crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
+                    rules,
+                    resolver.clone(),
+                )
+                .unwrap()
+                .with_sniff(enabled);
+            for (target, bytes, blocked) in [
+                (TARGET, crate::sniff::tests::http_request(), enabled),
+                (
+                    "supplied.example:443",
+                    crate::sniff::tests::http_request(),
+                    false,
+                ),
+                (
+                    TARGET,
+                    b"GET / HTTP/1.1\r\nHost: sniff.example\r\nHost: other.example\r\n\r\n"
+                        .to_vec(),
+                    false,
+                ),
+                (
+                    TARGET,
+                    b"GET / HTTP/1.1\r\n\r\nHost: sniff.example".to_vec(),
+                    false,
+                ),
+            ] {
+                let prepared = PreparedTcp::new(
+                    &selector,
+                    NetLocation::from_str(target, None).unwrap(),
+                    bytes.clone(),
+                )
+                .unwrap();
+                assert!(!prepared.needs_sniff_read());
+                let route = prepared
+                    .route(&mut tokio::io::empty(), &selector, &resolver)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    matches!(
+                        route.target,
+                        TcpRouteTarget::Forward(ConnectDecision::Block)
+                    ),
+                    blocked
+                );
+                assert_eq!(route.prefix, bytes);
             }
         }
     }

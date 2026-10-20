@@ -427,14 +427,14 @@ impl ClientProxySelector {
     pub(crate) async fn judge_prepared<'a>(
         &'a self,
         target: PreparedDestination,
-        server_name: Option<&str>,
+        hostname: Option<&str>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<RoutedDestination<'a>> {
-        let decision = if let Some(name) = server_name {
+        let decision = if let Some(name) = hostname {
             if !target.is_sniffable() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "SNI requires a prepared IP-origin destination",
+                    "sniffed hostname requires a prepared IP-origin destination",
                 ));
             }
             let mut connection_target = target.connection_target;

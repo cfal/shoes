@@ -6,30 +6,34 @@ use rustls::server::Acceptor;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{Instant, timeout_at};
 
+mod http;
+
 pub(crate) const SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
 const MAX_INSPECTED_BYTES: usize = 64 * 1024;
 
 pub(crate) struct SniffResult {
-    pub server_name: Option<String>,
+    pub hostname: Option<String>,
     pub prefix: Vec<u8>,
 }
 
-pub(crate) struct TlsProbe {
+pub(crate) struct StreamProbe {
     prefix: Vec<u8>,
     acceptor: Option<Box<Acceptor>>,
     fed: usize,
     finished: bool,
-    server_name: Option<String>,
+    hostname: Option<String>,
+    http: http::HttpProbe,
 }
 
-impl TlsProbe {
+impl StreamProbe {
     pub fn from_prefix(prefix: Vec<u8>) -> Self {
         let mut probe = Self {
             prefix,
             acceptor: None,
             fed: 0,
             finished: false,
-            server_name: None,
+            hostname: None,
+            http: http::HttpProbe::default(),
         };
         probe.inspect();
         probe
@@ -43,11 +47,15 @@ impl TlsProbe {
         if self.finished || self.prefix.is_empty() {
             return;
         }
+        let limit = self.prefix.len().min(MAX_INSPECTED_BYTES);
         if self.prefix[0] != 0x16 {
-            self.finished = true;
+            if let http::Inspection::Finished(hostname) = self.http.inspect(&self.prefix[..limit]) {
+                self.hostname = hostname;
+                self.finished = true;
+            }
+            self.finished |= limit == MAX_INSPECTED_BYTES;
             return;
         }
-        let limit = self.prefix.len().min(MAX_INSPECTED_BYTES);
         let acceptor = self.acceptor.get_or_insert_with(Box::default);
         while self.fed < limit {
             // An exhausted slice signals EOF to rustls, not a temporary read boundary.
@@ -61,7 +69,7 @@ impl TlsProbe {
             match acceptor.accept() {
                 Ok(None) => {}
                 Ok(Some(accepted)) => {
-                    self.server_name = accepted
+                    self.hostname = accepted
                         .client_hello()
                         .server_name()
                         .filter(|name| name.trim_end_matches('.').parse::<IpAddr>().is_err())
@@ -103,7 +111,7 @@ impl TlsProbe {
             self.inspect();
         }
         Ok(SniffResult {
-            server_name: self.server_name,
+            hostname: self.hostname,
             prefix: self.prefix,
         })
     }
@@ -119,8 +127,8 @@ pub(crate) mod tests {
 
     #[test]
     fn probe_and_capture_future_do_not_embed_large_buffers() {
-        assert!(std::mem::size_of::<TlsProbe>() < 256);
-        let probe = TlsProbe::from_prefix(Vec::new());
+        assert!(std::mem::size_of::<StreamProbe>() < 256);
+        let probe = StreamProbe::from_prefix(Vec::new());
         let mut reader = tokio::io::empty();
         let future = probe.finish(&mut reader, SNIFF_TIMEOUT);
         assert!(std::mem::size_of_val(&future) < 1024);
@@ -181,6 +189,93 @@ pub(crate) mod tests {
 
     struct NoRead;
 
+    pub(crate) fn http_request() -> Vec<u8> {
+        b"POST / HTTP/1.1\r\nHost: sniff.example\r\nContent-Length: 4\r\n\r\nbody".to_vec()
+    }
+
+    #[tokio::test]
+    async fn http_capture_all_splits_preserve_body_and_later_requests() {
+        let mut bytes = http_request();
+        bytes.extend_from_slice(b"GET / HTTP/1.1\r\nHost: later.example\r\n\r\n");
+        let header_end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        for split in 0..=bytes.len() {
+            let probe = StreamProbe::from_prefix(bytes[..split].to_vec());
+            assert_eq!(probe.needs_more(), split < header_end);
+            let mut reader = &bytes[split..];
+            let result = probe.finish(&mut reader, SNIFF_TIMEOUT).await.unwrap();
+            assert_eq!(result.hostname.as_deref(), Some("sniff.example"));
+            let mut replay = result.prefix;
+            replay.extend_from_slice(reader);
+            assert_eq!(replay, bytes);
+        }
+        let result = StreamProbe::from_prefix(bytes.clone())
+            .finish(&mut NoRead, SNIFF_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(result.prefix, bytes);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_capture_timeout_eof_and_zero_budget_preserve_partial_headers() {
+        let prefix = b"GET / HTTP/1.1\r\nHost: sniff.example\r\n".to_vec();
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let start = Instant::now();
+        let result = StreamProbe::from_prefix(prefix.clone())
+            .finish(&mut reader, SNIFF_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(Instant::now() - start, SNIFF_TIMEOUT);
+        assert_eq!(result.hostname, None);
+        assert_eq!(result.prefix, prefix);
+        for budget in [Duration::ZERO, SNIFF_TIMEOUT] {
+            let result = StreamProbe::from_prefix(prefix.clone())
+                .finish(&mut tokio::io::empty(), budget)
+                .await
+                .unwrap();
+            assert_eq!(result.hostname, None);
+            assert_eq!(result.prefix, prefix);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_capture_byte_limit_and_large_prefixes() {
+        for length in [
+            MAX_INSPECTED_BYTES - 1,
+            MAX_INSPECTED_BYTES,
+            MAX_INSPECTED_BYTES + 1,
+        ] {
+            let mut bytes = b"GET / HTTP/1.1\r\nHost: sniff.example\r\nX: ".to_vec();
+            bytes.resize(length - 4, b'a');
+            bytes.extend_from_slice(b"\r\n\r\n");
+            let mut reader = bytes.as_slice();
+            let result = StreamProbe::from_prefix(Vec::new())
+                .finish(&mut reader, SNIFF_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.hostname.as_deref(),
+                (length <= MAX_INSPECTED_BYTES).then_some("sniff.example")
+            );
+            assert_eq!(result.prefix.len(), length.min(MAX_INSPECTED_BYTES));
+            let mut replay = result.prefix;
+            replay.extend_from_slice(reader);
+            assert_eq!(replay, bytes);
+            let result = StreamProbe::from_prefix(bytes.clone())
+                .finish(&mut NoRead, SNIFF_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(result.prefix, bytes);
+        }
+        let mut bytes = http_request();
+        bytes.resize(MAX_INSPECTED_BYTES + 100, 0xff);
+        let result = StreamProbe::from_prefix(bytes.clone())
+            .finish(&mut NoRead, SNIFF_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(result.hostname.as_deref(), Some("sniff.example"));
+        assert_eq!(result.prefix, bytes);
+    }
+
     impl AsyncRead for NoRead {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -196,20 +291,20 @@ pub(crate) mod tests {
         for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
             let mut bytes = hello(version, true);
             bytes.extend_from_slice(b"trailing data");
-            let probe = TlsProbe::from_prefix(bytes.clone());
+            let probe = StreamProbe::from_prefix(bytes.clone());
             assert!(!probe.needs_more());
             let result = probe.finish(&mut NoRead, SNIFF_TIMEOUT).await.unwrap();
-            assert_eq!(result.server_name.as_deref(), Some("sniff.example"));
+            assert_eq!(result.hostname.as_deref(), Some("sniff.example"));
             assert_eq!(result.prefix, bytes);
         }
         for bytes in [
             b"SSH-2.0\r\n".to_vec(),
             hello(&rustls::version::TLS13, false),
         ] {
-            let probe = TlsProbe::from_prefix(bytes.clone());
+            let probe = StreamProbe::from_prefix(bytes.clone());
             assert!(!probe.needs_more());
             let result = probe.finish(&mut NoRead, SNIFF_TIMEOUT).await.unwrap();
-            assert_eq!(result.server_name, None);
+            assert_eq!(result.hostname, None);
             assert_eq!(result.prefix, bytes);
         }
     }
@@ -219,13 +314,13 @@ pub(crate) mod tests {
         let bytes = hello(&rustls::version::TLS13, true);
         for bytes in [bytes.clone(), records(&bytes, 2), records(&bytes, 137)] {
             for split in 0..bytes.len() {
-                let probe = TlsProbe::from_prefix(bytes[..split].to_vec());
+                let probe = StreamProbe::from_prefix(bytes[..split].to_vec());
                 assert!(probe.needs_more(), "split {split}");
                 let result = probe
                     .finish(&mut &bytes[split..], SNIFF_TIMEOUT)
                     .await
                     .unwrap();
-                assert_eq!(result.server_name.as_deref(), Some("sniff.example"));
+                assert_eq!(result.hostname.as_deref(), Some("sniff.example"));
                 assert_eq!(result.prefix, bytes);
             }
         }
@@ -235,13 +330,13 @@ pub(crate) mod tests {
     async fn zero_budget_eof_and_oversized_prefix_preserve_bytes() {
         let bytes = hello(&rustls::version::TLS13, true);
         let prefix = bytes[..bytes.len() / 2].to_vec();
-        let result = TlsProbe::from_prefix(prefix.clone())
+        let result = StreamProbe::from_prefix(prefix.clone())
             .finish(&mut NoRead, Duration::ZERO)
             .await
             .unwrap();
-        assert_eq!(result.server_name, None);
+        assert_eq!(result.hostname, None);
         assert_eq!(result.prefix, prefix);
-        let result = TlsProbe::from_prefix(prefix.clone())
+        let result = StreamProbe::from_prefix(prefix.clone())
             .finish(&mut tokio::io::empty(), SNIFF_TIMEOUT)
             .await
             .unwrap();
@@ -249,11 +344,11 @@ pub(crate) mod tests {
 
         let mut oversized = bytes;
         oversized.resize(MAX_INSPECTED_BYTES + 100, 0);
-        let result = TlsProbe::from_prefix(oversized.clone())
+        let result = StreamProbe::from_prefix(oversized.clone())
             .finish(&mut NoRead, SNIFF_TIMEOUT)
             .await
             .unwrap();
-        assert_eq!(result.server_name.as_deref(), Some("sniff.example"));
+        assert_eq!(result.hostname.as_deref(), Some("sniff.example"));
         assert_eq!(result.prefix, oversized);
     }
 
@@ -267,11 +362,11 @@ pub(crate) mod tests {
             writer.write_all(&bytes[1..8]).await.unwrap();
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
-        let probe = TlsProbe::from_prefix(bytes[..1].to_vec());
+        let probe = StreamProbe::from_prefix(bytes[..1].to_vec());
         let capture = async {
             let result = probe.finish(&mut reader, SNIFF_TIMEOUT).await.unwrap();
             assert_eq!(Instant::now() - started, SNIFF_TIMEOUT);
-            assert_eq!(result.server_name, None);
+            assert_eq!(result.hostname, None);
             assert_eq!(result.prefix, bytes[..8]);
         };
         tokio::join!(sender, capture);
@@ -289,16 +384,17 @@ pub(crate) mod tests {
                 Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
             }
         }
-        let result = TlsProbe::from_prefix(Vec::new())
+        let result = StreamProbe::from_prefix(Vec::new())
             .finish(&mut Failed, SNIFF_TIMEOUT)
             .await;
         assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::ConnectionReset));
-        let bytes = hello(&rustls::version::TLS13, true);
-        let mut reader = (&bytes[..8]).chain(Failed);
-        let result = TlsProbe::from_prefix(Vec::new())
-            .finish(&mut reader, SNIFF_TIMEOUT)
-            .await;
-        assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::ConnectionReset));
+        for bytes in [hello(&rustls::version::TLS13, true), http_request()] {
+            let mut reader = (&bytes[..8]).chain(Failed);
+            let result = StreamProbe::from_prefix(Vec::new())
+                .finish(&mut reader, SNIFF_TIMEOUT)
+                .await;
+            assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::ConnectionReset));
+        }
     }
 
     #[tokio::test]
@@ -315,11 +411,11 @@ pub(crate) mod tests {
             extension.resize(padding_size + 4, 0);
             let bytes = extend_hello(base.clone(), &extension);
             assert_eq!(bytes.len(), wire_len);
-            let probe = TlsProbe::from_prefix(bytes.clone());
+            let probe = StreamProbe::from_prefix(bytes.clone());
             assert!(!probe.needs_more());
             let result = probe.finish(&mut NoRead, SNIFF_TIMEOUT).await.unwrap();
             assert_eq!(
-                result.server_name.as_deref(),
+                result.hostname.as_deref(),
                 // rustls's incomplete-handshake buffer itself is limited to 0xffff.
                 (wire_len < MAX_INSPECTED_BYTES).then_some("sniff.example")
             );
@@ -332,11 +428,11 @@ pub(crate) mod tests {
         let mut bytes = hello(&rustls::version::TLS13, true);
         bytes.extend_from_slice(&vec![42; 8192]);
         let mut reader = bytes.as_slice();
-        let mut result = TlsProbe::from_prefix(Vec::new())
+        let mut result = StreamProbe::from_prefix(Vec::new())
             .finish(&mut reader, SNIFF_TIMEOUT)
             .await
             .unwrap();
-        assert_eq!(result.server_name.as_deref(), Some("sniff.example"));
+        assert_eq!(result.hostname.as_deref(), Some("sniff.example"));
         assert!(!reader.is_empty());
         result.prefix.extend_from_slice(reader);
         assert_eq!(result.prefix, bytes);
@@ -371,10 +467,10 @@ pub(crate) mod tests {
             .unwrap();
         invalid[name] = b'/';
         for bytes in [legacy, duplicate.unwrap(), invalid] {
-            let probe = TlsProbe::from_prefix(bytes.clone());
+            let probe = StreamProbe::from_prefix(bytes.clone());
             assert!(!probe.needs_more());
             let result = probe.finish(&mut NoRead, SNIFF_TIMEOUT).await.unwrap();
-            assert_eq!(result.server_name, None);
+            assert_eq!(result.hostname, None);
             assert_eq!(result.prefix, bytes);
         }
     }
@@ -390,11 +486,11 @@ pub(crate) mod tests {
             bytes.extend_from_slice(fragment);
         }
         let mut reader = bytes.as_slice();
-        let result = TlsProbe::from_prefix(Vec::new())
+        let result = StreamProbe::from_prefix(Vec::new())
             .finish(&mut reader, SNIFF_TIMEOUT)
             .await
             .unwrap();
-        assert_eq!(result.server_name, None);
+        assert_eq!(result.hostname, None);
         assert_eq!(result.prefix.len(), MAX_INSPECTED_BYTES);
         assert_eq!(result.prefix, bytes[..MAX_INSPECTED_BYTES]);
         assert_eq!(reader, &bytes[MAX_INSPECTED_BYTES..]);
@@ -406,7 +502,7 @@ pub(crate) mod tests {
         for index in 0..bytes.len() {
             let mut changed = bytes.clone();
             changed[index] ^= 0xff;
-            let result = TlsProbe::from_prefix(changed.clone())
+            let result = StreamProbe::from_prefix(changed.clone())
                 .finish(&mut NoRead, Duration::ZERO)
                 .await
                 .unwrap();
@@ -414,10 +510,10 @@ pub(crate) mod tests {
         }
         let mut not_hello = bytes;
         not_hello[5] = 2;
-        let probe = TlsProbe::from_prefix(not_hello.clone());
+        let probe = StreamProbe::from_prefix(not_hello.clone());
         assert!(!probe.needs_more());
         let result = probe.finish(&mut NoRead, SNIFF_TIMEOUT).await.unwrap();
-        assert_eq!(result.server_name, None);
+        assert_eq!(result.hostname, None);
         assert_eq!(result.prefix, not_hello);
     }
 
@@ -437,17 +533,20 @@ pub(crate) mod tests {
                 Poll::Ready(Ok(()))
             }
         }
-        let hello = hello(&rustls::version::TLS13, true);
-        let mut bytes = hello.clone();
-        bytes.extend_from_slice(b"later application data");
-        let mut reader = OneByte(&bytes);
-        let result = TlsProbe::from_prefix(Vec::new())
-            .finish(&mut reader, SNIFF_TIMEOUT)
-            .await
-            .unwrap();
-        assert_eq!(result.server_name.as_deref(), Some("sniff.example"));
-        assert_eq!(result.prefix, hello);
-        assert_eq!(reader.0, b"later application data");
+        let mut http = http_request();
+        http.truncate(http.len() - 4);
+        for head in [hello(&rustls::version::TLS13, true), http] {
+            let mut bytes = head.clone();
+            bytes.extend_from_slice(b"later application data");
+            let mut reader = OneByte(&bytes);
+            let result = StreamProbe::from_prefix(Vec::new())
+                .finish(&mut reader, SNIFF_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(result.hostname.as_deref(), Some("sniff.example"));
+            assert_eq!(result.prefix, head);
+            assert_eq!(reader.0, b"later application data");
+        }
     }
 
     #[tokio::test]
@@ -462,11 +561,11 @@ pub(crate) mod tests {
         extensions.extend_from_slice(&[2; 32]);
         let bytes = extend_hello(hello(&rustls::version::TLS13, true), &extensions);
         assert!(bytes.len() > 32768);
-        let result = TlsProbe::from_prefix(Vec::new())
+        let result = StreamProbe::from_prefix(Vec::new())
             .finish(&mut bytes.as_slice(), SNIFF_TIMEOUT)
             .await
             .unwrap();
-        assert_eq!(result.server_name.as_deref(), Some("sniff.example"));
+        assert_eq!(result.hostname.as_deref(), Some("sniff.example"));
         assert_eq!(result.prefix, bytes);
     }
 }
