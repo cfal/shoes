@@ -10,8 +10,12 @@ mod h2mux;
 mod h2mux_backpressure;
 #[path = "cases/integration/h2mux_singbox.rs"]
 mod h2mux_singbox;
+#[path = "cases/integration/hostname_sniffing.rs"]
+mod hostname_sniffing;
 #[path = "cases/integration/http2_proxy.rs"]
 mod http2_proxy;
+#[path = "cases/integration/http_host_sniffing.rs"]
+mod http_host_sniffing;
 #[path = "cases/integration/hysteria2_integration.rs"]
 mod hysteria2;
 #[path = "cases/integration/hysteria2_udp_integration.rs"]
@@ -38,8 +42,6 @@ mod shadowsocks_uot;
 mod shadowsocks_uot_edge_cases;
 #[path = "cases/integration/snell_integration.rs"]
 mod snell;
-#[path = "cases/integration/sni_sniffing.rs"]
-mod sni_sniffing;
 #[path = "cases/integration/socks_integration.rs"]
 mod socks;
 #[path = "cases/integration/socks5_udp_associate_test.rs"]

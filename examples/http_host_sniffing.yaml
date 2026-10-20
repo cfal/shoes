@@ -1,0 +1,24 @@
+# Host selects the initial route, never a replacement destination or port.
+# Later requests on the same stream keep that route, even if Host changes.
+# Host is chosen by the client, not an authenticated destination identity.
+- address: '0.0.0.0:1080'
+  protocol:
+    type: socks
+    username: "proxy-user"
+    password: "replace-this-password"
+  sniff: true
+  rules:
+    - masks:
+        - "0.0.0.0/8"
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "::/128"
+        - "::1/128"
+        - "fc00::/7"
+        - "fe80::/10"
+      action: block
+    - masks: example.com
+      action: allow

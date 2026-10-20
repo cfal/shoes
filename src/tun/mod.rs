@@ -31,6 +31,8 @@
 mod offload;
 use crate::ip_stack::{packet, tcp_conn, wake};
 mod tcp_stack_direct;
+#[cfg(test)]
+mod tcp_tests;
 mod tun_server;
 pub(crate) mod udp_handler;
 pub(crate) mod udp_manager;
@@ -541,6 +543,7 @@ mod tests {
             for case in [
                 FakeTcpCase::Dns,
                 FakeTcpCase::Tls,
+                FakeTcpCase::Http,
                 FakeTcpCase::Plain,
                 FakeTcpCase::Unknown,
             ] {

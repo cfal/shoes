@@ -1,4 +1,5 @@
 # SNI selects a route, never a replacement destination. Omission disables sniffing.
+# The same setting also inspects cleartext HTTP/1 Host headers.
 - address: "0.0.0.0:1080"
   protocol:
     type: mixed

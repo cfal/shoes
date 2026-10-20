@@ -212,6 +212,13 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum UdpCase {
+        Dns,
+        Tls,
+        Http,
+    }
+
     pub(crate) struct UdpFixture {
         pub selector: Arc<ClientProxySelector>,
         pub resolver: Arc<dyn Resolver>,
@@ -221,14 +228,15 @@ pub(crate) mod tests {
     }
 
     impl UdpFixture {
-        pub(crate) async fn new(dns: bool, tasks: &mut tokio::task::JoinSet<()>) -> Self {
+        pub(crate) async fn new(case: UdpCase, tasks: &mut tokio::task::JoinSet<()>) -> Self {
+            let dns = case == UdpCase::Dns;
             let resolver: Arc<dyn Resolver> = Arc::new(RealDns);
             let context =
                 Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
-            let payload = if dns {
-                query(RecordType::A)
-            } else {
-                crate::sniff::tests::hello(&rustls::version::TLS13, true)
+            let payload = match case {
+                UdpCase::Dns => query(RecordType::A),
+                UdpCase::Tls => crate::sniff::tests::hello(&rustls::version::TLS13, true),
+                UdpCase::Http => crate::sniff::tests::http_request(),
             };
             let mut rules = Vec::new();
             let target = if dns {
@@ -256,7 +264,7 @@ pub(crate) mod tests {
                 ));
                 NetLocation::from_ip_addr(context.allocate("restored.example", false).unwrap(), 443)
             };
-            // A TCP ClientHello would select this block, not the restored hostname.
+            // The same TLS or HTTP bytes over TCP would select this block.
             rules.insert(
                 0,
                 ConnectRule::new(

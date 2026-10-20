@@ -547,13 +547,13 @@ mod lifetime_tests {
 
     #[tokio::test]
     async fn fake_dns_udp_modes() {
-        use crate::routing::ingress::tests::{PacketMode, UdpFixture};
+        use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         timeout(Duration::from_secs(10), async {
             for fixed in [false, true] {
-                for dns in [false, true] {
+                for case in [UdpCase::Dns, UdpCase::Tls, UdpCase::Http] {
                     let mut tasks = tokio::task::JoinSet::new();
-                    let fixture = UdpFixture::new(dns, &mut tasks).await;
+                    let fixture = UdpFixture::new(case, &mut tasks).await;
                     let mode = if fixed {
                         PacketMode::Fixed
                     } else {

@@ -903,12 +903,12 @@ forwarded through `dns.servers`, never to the application's requested resolver.
 An explicit rule override to port 53 is ordinary forwarding, not interception.
 
 A/AAAA synthesis creates scoped mappings. Later connections to those addresses
-restore the hostname before routing or SNI sniffing. A restored hostname is
+restore the hostname before routing or hostname sniffing. A restored hostname is
 resolved normally when a rule or direct connection needs a real IP; a proxy can
-receive the hostname instead. With `sniff: true`, visible TLS SNI takes precedence
-for hostname rules only; the restored name remains the connection target and is
-what IP rules resolve. SNI is client-controlled, so a different SNI can bypass a
-hostname deny rule on the restored name.
+receive the hostname instead. With `sniff: true`, visible TLS SNI or HTTP Host
+takes precedence for hostname rules only; the restored name remains the
+connection target and is what IP rules resolve. Both hints are client-controlled,
+so a different sniffed name can bypass a hostname deny rule on the restored name.
 Unmapped addresses inside the receiving context's ranges fail closed. Addresses
 from another context's non-overlapping range are not recognized and are routed
 as ordinary IPs. Overlapping ranges may map to an unrelated hostname in the
@@ -1023,33 +1023,56 @@ See [the shared-pool example](examples/fake_dns.yaml).
 
 Rules determine how incoming connections are routed.
 
-### TLS SNI Routing
+<a id="tls-sni-routing"></a>
+
+### TCP Hostname Sniffing
 
 Set `sniff: true` on a server (including WireGuard) or TUN configuration to use
-visible TLS ClientHello SNI for hostname rules. The default is `false`. The option
-applies to logical TCP streams, including multiplexed and QUIC-carried TCP, not
-UDP/QUIC Initial packets, HTTP Host headers, or the outer TLS carrier handshake.
+visible TLS ClientHello SNI or cleartext HTTP/1.0 and HTTP/1.1 Host for hostname
+rules. The default is `false`. The option applies to logical TCP streams,
+including multiplexed and QUIC-carried TCP, not UDP/QUIC Initial packets,
+HTTP/2 or HTTP/3 application headers, or the outer TLS carrier handshake.
 Nested `override_rules` inherit the setting.
 
 Sniffing applies to literal IP targets, including restored Fake DNS mappings,
-when hostname rules exist. Explicitly supplied hostnames are not sniffed. SNI
-takes precedence over the restored DNS name for hostname rules only. IP/CIDR
-masks and the outbound destination still use the original real IP or restored
+when hostname rules exist. Explicitly supplied hostnames are not sniffed. The
+sniffed hostname takes precedence over the restored DNS name for hostname rules
+only. IP/CIDR masks and the outbound destination still use the original real IP or restored
 DNS hostname, including through proxy chains. IP rules resolve the restored
-hostname when needed, never the SNI name. An explicit rule `override_address`
+hostname when needed, never the sniffed name. An explicit rule `override_address`
 can still change the destination.
 
 Capture is best-effort, limited to 300 ms and 64 KiB of wire data. Unknown,
-malformed, oversized, or incomplete TLS falls back to ordinary routing using the
-original IP or restored DNS hostname; captured bytes are replayed unchanged.
+malformed, oversized, or incomplete TLS or HTTP falls back to ordinary routing
+using the original IP or restored DNS hostname; captured bytes are replayed
+unchanged.
 Transport errors still terminate the connection.
 Server-first applications can incur the full delay. When more client bytes are
 needed, response-gated protocols send success before routing/dialing; a later
 failure closes or resets the stream rather than sending another status.
 
-SNI is client-controlled, not authenticated identity or a domain firewall. Put
-mandatory IP deny rules before hostname allows. With ECH, only the visible outer
-name is available, not the encrypted inner hostname.
+HTTP inspection accepts origin-form requests (`GET /path HTTP/1.1`) and
+`OPTIONS *`, on any destination port. It requires a complete CRLF-delimited
+header section with exactly one valid Host and at most 128 fields. Host names
+are matched case-insensitively with an optional terminal DNS dot; a numeric port
+is validated but never changes the destination or rule-matching port. IP-literal
+Host values, duplicate Host fields, absolute-form requests, and CONNECT requests
+produce no hint. Request bodies are not parsed or awaited.
+
+The probe sees application bytes after proxy setup: the outer CONNECT headers
+are not sniffed. A plaintext request inside a tunnel exposes Host; an inner
+HTTPS connection still exposes only visible TLS SNI. Normal HTTP forward-proxy
+requests are rewritten to origin-form before reaching the probe.
+
+Routing happens once per logical TCP stream. Later keep-alive or pipelined
+requests with different Host values, and traffic after an HTTP Upgrade, remain
+on the first route without another hostname check. Existing `sniff: true`
+configurations now also use HTTP Host; omitted or false settings are unchanged.
+See [the HTTP Host example](examples/http_host_sniffing.yaml).
+
+SNI and Host are client-controlled, not authenticated identity or a domain
+firewall. Put mandatory IP deny rules before hostname allows. With ECH, only the
+visible outer name is available, not the encrypted inner hostname.
 For Fake DNS flows, that outer name takes precedence over the restored hostname
 for hostname rules. Disable `sniff` when routing must follow the restored name,
 or configure rules for the ECH public names.

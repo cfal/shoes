@@ -287,7 +287,11 @@ async fn h2mux_udp_fake_dns() -> Result<()> {
 async fn port_53_interception_does_not_probe_or_forward_non_dns() -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     tokio::time::timeout(Duration::from_secs(20), async {
-        for enabled in [false, true] {
+        for (enabled, payload) in [
+            (false, vec![0, 3, 1, 2, 3]),
+            (true, vec![0, 3, 1, 2, 3]),
+            (true, b"GET / HTTP/1.1\r\nHost: sniff.invalid\r\n\r\n".to_vec()),
+        ] {
             let tcp = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
             let echo_port = tcp.local_addr()?.port();
             let udp = tokio::net::UdpSocket::bind(("0.0.0.0", echo_port)).await?;
@@ -321,13 +325,12 @@ async fn port_53_interception_does_not_probe_or_forward_non_dns() -> Result<()> 
                 "sniff":true,
                 "dns":{"fake_ip":enabled, "servers":format!("udp://127.0.0.1:{}", upstream.local_addr()?.port())},
                 "rules":[
-                    {"mask":"sniff.invalid", "action":"block"},
+                    {"mask":"sniff.invalid", "action":"allow", "override_address":format!("127.0.0.1:{echo_port}")},
                     {"mask":"0.0.0.0/0", "action":"allow", "override_address":format!("127.0.0.1:{echo_port}")}
                 ]
             }]);
             let (_process, _config) = start_shoes_server(&config.to_string())?;
             ports.wait_for_all_ports().await?;
-            let payload = [0, 3, 1, 2, 3];
             let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
             super::plain_tcp_relay::request_to(&mut tcp, "socks", "127.0.0.1:53".parse()?, &payload).await?;
             tcp.shutdown().await?;

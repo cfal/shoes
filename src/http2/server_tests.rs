@@ -17,6 +17,7 @@ async fn fake_dns_adapter_contract() {
         for case in [
             FakeTcpCase::Dns,
             FakeTcpCase::Tls,
+            FakeTcpCase::Http,
             FakeTcpCase::Plain,
             FakeTcpCase::Unknown,
         ] {
@@ -862,9 +863,17 @@ async fn reset_and_connection_teardown_cancel_pending_setup() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
-    for during_dial in [false, true] {
+    for (during_dial, payload) in [
+        (false, Vec::new()),
+        (
+            true,
+            crate::sniff::tests::hello(&rustls::version::TLS13, true),
+        ),
+        (false, b"GET / HTTP/1.1\r\nHost: sniff.example\r\n".to_vec()),
+        (true, crate::sniff::tests::http_request()),
+    ] {
         tokio::time::timeout(Duration::from_secs(3), async {
             let resolver = Arc::new(PendingResolver {
                 started: Arc::new(tokio::sync::Notify::new()),
@@ -880,7 +889,7 @@ async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
                     .with_sniff(true),
             );
             let (client, transport) = tokio::io::duplex(8192);
-            let (done, finished) = tokio::sync::oneshot::channel();
+            let (done, mut finished) = tokio::sync::oneshot::channel();
             let resolver_clone = resolver.clone();
             let mut drivers = JoinSet::new();
             drivers.spawn(async move {
@@ -907,18 +916,24 @@ async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
                 .await
                 .unwrap();
             assert_eq!(response.status, StatusCode::OK);
+            stream.write_all(&payload).await.unwrap();
             if during_dial {
-                stream
-                    .write_all(&crate::sniff::tests::hello(&rustls::version::TLS13, true))
-                    .await
-                    .unwrap();
                 resolver.started.notified().await;
+            } else {
+                // Paused time advances after the H2 drivers deliver queued DATA to the probe.
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
+            assert!(matches!(
+                finished.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            let reset_at = tokio::time::Instant::now();
             drop(stream);
-            tokio::time::timeout(Duration::from_millis(100), finished)
+            tokio::time::timeout(crate::sniff::SNIFF_TIMEOUT, finished)
                 .await
                 .unwrap()
                 .unwrap();
+            assert_eq!(tokio::time::Instant::now(), reset_at);
             if during_dial {
                 resolver.dropped.notified().await;
             }
@@ -928,4 +943,79 @@ async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
         .await
         .unwrap();
     }
+}
+
+#[tokio::test]
+async fn concurrent_streams_keep_independent_http_host_routes() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut upstreams = JoinSet::new();
+        let mut rules = Vec::new();
+        for name in ["a.invalid", "b.invalid"] {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            rules.push(
+                serde_yaml::from_str(&format!(
+                    "masks: {name}\naction: allow\noverride_address: 127.0.0.1:{}",
+                    listener.local_addr().unwrap().port(),
+                ))
+                .unwrap(),
+            );
+            let barrier = barrier.clone();
+            upstreams.spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let expected = format!("GET / HTTP/1.1\r\nHost: {name}\r\n\r\n");
+                let mut bytes = vec![0; expected.len()];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(bytes, expected.as_bytes());
+                barrier.wait().await;
+                stream.write_all(name.as_bytes()).await.unwrap();
+                assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+                stream.shutdown().await.unwrap();
+            });
+        }
+        let selector = Arc::new(
+            create_tcp_client_proxy_selector(rules, resolver.clone())
+                .unwrap()
+                .with_sniff(true),
+        );
+        let (client, transport) = tokio::io::duplex(8192);
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(serve(
+            Box::new(transport),
+            None,
+            selector,
+            resolver,
+        )));
+        let mut session = H2ClientSession::new(Box::new(client)).await.unwrap();
+        let mut second_session = session.clone();
+        let (first, second) = tokio::join!(
+            session.open(connect(crate::tcp::ingress::tests::TARGET)),
+            second_session.open(connect(crate::tcp::ingress::tests::TARGET)),
+        );
+        let (response, mut first) = first.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let (response, mut second) = second.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        async fn exchange(stream: &mut H2MultiStream, name: &str) {
+            stream
+                .write_all(format!("GET / HTTP/1.1\r\nHost: {name}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut reply = vec![0; name.len()];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, name.as_bytes());
+            stream.shutdown().await.unwrap();
+            assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+        }
+        tokio::join!(
+            exchange(&mut first, "a.invalid"),
+            exchange(&mut second, "b.invalid")
+        );
+        while let Some(result) = upstreams.join_next().await {
+            result.unwrap();
+        }
+        assert!(session.is_ready());
+    })
+    .await
+    .unwrap();
 }
