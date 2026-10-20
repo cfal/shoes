@@ -61,13 +61,23 @@ fn rule(
                                 _ => exact.push(key),
                             }
                         }
-                        parts.address.push(literals(exact, 0)?);
-                        parts.address.push(literals(suffix, 1)?);
+                        if !exact.is_empty() {
+                            parts.address.push(literals(exact, 0)?);
+                        }
+                        if !suffix.is_empty() {
+                            parts.address.push(literals(suffix, 1)?);
+                        }
                     }
-                    3 => parts.address.push(literals(reader.strings()?, 2)?),
-                    4 => parts
-                        .address
-                        .push(Expression::DomainRegex(reader.strings()?)),
+                    3 | 4 => {
+                        let strings = reader.strings()?;
+                        if !strings.is_empty() {
+                            parts.address.push(if tag == 3 {
+                                literals(strings, 2)?
+                            } else {
+                                Expression::DomainRegex(strings)
+                            });
+                        }
+                    }
                     6 => {
                         if reader.byte()? != 1 {
                             return Err(invalid("unsupported SRS IP-set version"));
@@ -82,18 +92,28 @@ fn rule(
                             let to = reader.take(b)?;
                             ranges.add_encoded(from, to, false)?;
                         }
-                        parts.address.push(Expression::Ranges(ranges, false));
+                        if count != 0 {
+                            parts.address.push(Expression::Ranges(ranges, false));
+                        }
                     }
                     9 => {
                         let count = reader.count(false, MAX_ENTRIES, 2)?;
                         reader.charge(count * 8)?;
-                        parts.ports.push(Expression::PortRanges(
+                        let ports = Expression::PortRanges(
                             (0..count)
                                 .map(|_| reader.u16().map(|p| (p, p)))
                                 .collect::<io::Result<_>>()?,
-                        ));
+                        );
+                        if count != 0 {
+                            parts.ports.push(ports);
+                        }
                     }
-                    10 => parts.ports.push(port_ranges(reader.strings()?)?),
+                    10 => {
+                        let strings = reader.strings()?;
+                        if !strings.is_empty() {
+                            parts.ports.push(port_ranges(strings)?);
+                        }
+                    }
                     _ => return Err(invalid(format!("unsupported SRS predicate tag {tag}"))),
                 }
             }
@@ -240,6 +260,31 @@ mod tests {
             assert_eq!(p.evaluate(Some(name), None, 1), Outcome::Match);
         }
         assert_eq!(p.evaluate(Some("ba"), None, 1), Outcome::Miss);
+    }
+
+    #[test]
+    fn empty_binary_conditions_are_absent_not_false() {
+        for tag in [3, 4, 9, 10] {
+            for invert in [0, 1] {
+                assert!(decode(&wrap(2, &[1, 0, tag, 0, 255, invert])).is_err());
+            }
+            let mut payload = vec![1, 0, 2];
+            payload.extend(chain(b"a"));
+            payload.extend([tag, 0, 255, 0]);
+            let p = Compiler::default()
+                .compile(decode(&wrap(2, &payload)).unwrap())
+                .unwrap();
+            assert_eq!(p.evaluate(Some("a"), None, 443), Outcome::Match);
+        }
+        let mut empty_ips = vec![1, 0, 6, 1];
+        empty_ips.extend(0u64.to_be_bytes());
+        empty_ips.extend([255, 1]);
+        assert!(decode(&wrap(2, &empty_ips)).is_err());
+        // A valid empty root-only domain set: no terminals, one node terminator.
+        let mut empty_names = vec![1, 0, 2, 0, 0, 1];
+        empty_names.extend(1u64.to_be_bytes());
+        empty_names.extend([0, 255, 1]);
+        assert!(decode(&wrap(2, &empty_names)).is_err());
     }
 
     #[test]
