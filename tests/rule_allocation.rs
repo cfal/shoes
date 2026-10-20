@@ -79,6 +79,7 @@ fn adversarial_inputs_stay_within_their_compilation_reserves() {
     for yaml in [
         format!("payload: [{}]", "[],".repeat(350_000)),
         format!("{{[{}]: a}}", "a,".repeat(350_000)),
+        format!("[[{}]]", ":,".repeat(350_000)),
     ] {
         let (result, used) = load_peak(yaml.as_bytes(), Format::MihomoYaml);
         assert!(result.is_err());

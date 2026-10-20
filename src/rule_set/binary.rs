@@ -33,21 +33,6 @@ pub(super) fn inflate(bytes: &[u8], budget: &mut Compiler) -> io::Result<Vec<u8>
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn counted_strings_allocate_only_the_charged_slots() {
-        let mut bytes = vec![9];
-        bytes.extend_from_slice(&[1, b'a'].repeat(9));
-        let mut budget = Compiler::default();
-        let strings = Reader::new(&bytes, &mut budget).strings().unwrap();
-        assert_eq!(strings.len(), 9);
-        assert_eq!(strings.capacity(), 9);
-    }
-}
-
 pub(super) struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -227,5 +212,20 @@ impl<'a> Reader<'a> {
             keys.push(String::from_utf8(key).map_err(|_| invalid("invalid domain key"))?);
         }
         Ok(keys)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counted_strings_allocate_only_the_charged_slots() {
+        let mut bytes = vec![9];
+        bytes.extend_from_slice(&[1, b'a'].repeat(9));
+        let mut budget = Compiler::default();
+        let strings = Reader::new(&bytes, &mut budget).strings().unwrap();
+        assert_eq!(strings.len(), 9);
+        assert_eq!(strings.capacity(), 9);
     }
 }
