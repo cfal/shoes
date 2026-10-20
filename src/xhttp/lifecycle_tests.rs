@@ -99,8 +99,10 @@ async fn echo_peer(version: XhttpVersion, drain: bool) -> (SocketAddr, Tasks) {
                                 .unwrap()
                                 .into_data()
                                 .unwrap();
-                            let memory =
-                                Memory::new(Arc::new(Budget::new(Some(1024 * 1024))), 1024 * 1024);
+                            let memory = Memory::new(
+                                Arc::new(Budget::new(Some(1024 * 1024))),
+                                Some(1024 * 1024),
+                            );
                             let (mut write, read) = pipe(memory);
                             let tasks = Arc::new(Tasks::new());
                             tasks.spawn(async move {
@@ -372,7 +374,7 @@ async fn draining_carriers_keep_their_physical_pool_slots_until_tails_finish() {
 async fn h2_goaway_retires_carrier_without_closing_active_response() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let (address, _server) = echo_peer(XhttpVersion::H2, true).await;
-        let memory = Memory::new(Arc::new(Budget::new(Some(1024 * 1024))), 1024 * 1024);
+        let memory = Memory::new(Arc::new(Budget::new(Some(1024 * 1024))), Some(1024 * 1024));
         let tasks = Tasks::new();
         let carrier = super::carrier::Carrier::tcp(
             Box::new(tokio::net::TcpStream::connect(address).await.unwrap()),
@@ -563,10 +565,12 @@ async fn sent_packet_releases_bytes_before_acknowledgement() {
 
 #[tokio::test]
 async fn packet_upload_pipelines_written_requests_before_acknowledgement() {
-    for (request_limit, byte_limit, depth, hold_head_only) in [
-        (9, 4 * 1024 * 1024, 30, false),
-        (128, 8 * 1024, 30, false),
-        (128, 4 * 1024 * 1024, 8, true),
+    for (request_limit, byte_limit, depth, hold_head_only, aggregate_only) in [
+        (9, 4 * 1024 * 1024, 30, false, false),
+        (128, 8 * 1024, 30, false, false),
+        (128, 4 * 1024 * 1024, 8, true, false),
+        (8, 4 * 1024 * 1024, 30, false, true),
+        (128, 8 * 1024, 30, false, true),
     ] {
         tokio::time::timeout(Duration::from_secs(5), async {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -613,10 +617,15 @@ async fn packet_upload_pipelines_written_requests_before_acknowledgement() {
                 });
             }
         });
+        let limits = if aggregate_only {
+            serde_json::json!({"max_requests":request_limit, "max_buffered_bytes":byte_limit})
+        } else {
+            serde_json::json!({"max_requests_per_session":request_limit, "max_session_buffered_bytes":byte_limit})
+        };
         let config = serde_json::from_value(serde_json::json!({
             "sc_max_each_post_bytes":1024, "sc_min_posts_interval_ms":1,
                 "packet_pipeline_depth":depth,
-            "limits":{"max_requests_per_session":request_limit, "max_session_buffered_bytes":byte_limit},
+            "limits":limits,
             "pool":{"max_connections":1}, "protocol":{"type":"socks"}
         }))
         .unwrap();
@@ -1207,7 +1216,7 @@ async fn h1_packet_upload_inactivity_and_deferred_ack() {
             .await
             .unwrap();
         let budget = Arc::new(Budget::new(Some(128 * 1024)));
-        let memory = Memory::new(budget.clone(), 128 * 1024);
+        let memory = Memory::new(budget.clone(), Some(128 * 1024));
         let chunks = (0..64)
             .map(|_| memory.copy(&[b'x'; 1024]).unwrap())
             .collect();
@@ -1291,7 +1300,7 @@ async fn h1_abandoned_packet_fails_without_waiting_for_inactivity() {
         let carrier = Carrier::tcp(Box::new(client), XhttpVersion::H1, 8192)
             .await
             .unwrap();
-        let memory = Memory::new(Arc::new(Budget::new(Some(128 * 1024))), 128 * 1024);
+        let memory = Memory::new(Arc::new(Budget::new(Some(128 * 1024))), Some(128 * 1024));
         let tasks = Arc::new(Tasks::new());
         let chunks = (0..4)
             .map(|_| memory.copy(&[0; 16 * 1024]).unwrap())
@@ -1412,7 +1421,7 @@ async fn h2_packet_upload_inactivity_and_early_or_deferred_ack() {
             .unwrap();
         let tasks = Arc::new(Tasks::new());
         let budget = Arc::new(Budget::new(Some(128 * 1024)));
-        let memory = Memory::new(budget.clone(), 128 * 1024);
+        let memory = Memory::new(budget.clone(), Some(128 * 1024));
         let chunks = (0..4)
             .map(|_| memory.copy(&[b'x'; 16 * 1024]).unwrap())
             .collect();
@@ -1478,7 +1487,7 @@ async fn h2_packet_upload_inactivity_and_early_or_deferred_ack() {
         assert!(received.try_recv().is_err(), "request must not replay");
         assert_eq!(budget.snapshot().active, 0);
         let fresh = Tasks::new();
-        let memory = Memory::new(budget.clone(), 128 * 1024);
+        let memory = Memory::new(budget.clone(), Some(128 * 1024));
         let probe = carrier.request(
             Request::get("https://localhost/probe")
                 .body(Body::Empty)
@@ -1527,7 +1536,7 @@ async fn h1_waiting_packet_ack_does_not_consume_another_sessions_connections() {
                             async move {
                                 if request.method() == http::Method::GET {
                                     let memory =
-                                        Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                                        Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                                     let (writer, reader) = pipe(memory);
                                     return Ok::<_, io::Error>(Response::new(
                                         Body::stream(reader).with_guard(writer),
@@ -1606,7 +1615,7 @@ async fn h1_packet_connection_close_redials_without_replaying_packets() {
                             async move {
                                 if request.method() == http::Method::GET {
                                     let memory =
-                                        Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                                        Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                                     let (writer, reader) = pipe(memory);
                                     return Ok::<_, io::Error>(Response::new(
                                         Body::stream(reader).with_guard(writer),
@@ -1844,7 +1853,7 @@ async fn split_requests_share_service_across_listener_addresses() {
                 .unwrap(),
         );
     }
-    let memory = Memory::new(Arc::new(Budget::new(Some(1024 * 1024))), 1024 * 1024);
+    let memory = Memory::new(Arc::new(Budget::new(Some(1024 * 1024))), Some(1024 * 1024));
     let request = |method: &str, path: &str, body| {
         Request::builder()
             .method(method)
@@ -1979,7 +1988,7 @@ async fn h3_packet_fin_does_not_write_frames_after_the_payload() {
         let (outgoing, incoming, _endpoint) = quic_pair(1).await;
         let carrier = super::carrier::Carrier::quic(outgoing, 8192).await.unwrap();
         let tasks = Arc::new(Tasks::new());
-        let memory = Memory::new(Arc::new(Budget::new(Some(4096))), 4096);
+        let memory = Memory::new(Arc::new(Budget::new(Some(4096))), Some(4096));
         let reservation = carrier.reserve().await.unwrap();
         let workers = tasks.clone();
         tasks.spawn(async move {
@@ -2040,7 +2049,7 @@ async fn h3_packet_upload_inactivity_and_early_or_deferred_ack() {
             });
             let tasks = Arc::new(Tasks::new());
             let budget = Arc::new(Budget::new(Some(256 * 1024)));
-            let memory = Memory::new(budget.clone(), 256 * 1024);
+            let memory = Memory::new(budget.clone(), Some(256 * 1024));
             let chunks = (0..8)
                 .map(|_| memory.copy(&[b'x'; 16 * 1024]).unwrap())
                 .collect();
@@ -2097,7 +2106,7 @@ async fn h3_packet_upload_inactivity_and_early_or_deferred_ack() {
             assert!(received.try_recv().is_err(), "request must not replay");
             assert_eq!(budget.snapshot().active, 0);
             let fresh = Tasks::new();
-            let memory = Memory::new(budget.clone(), 256 * 1024);
+            let memory = Memory::new(budget.clone(), Some(256 * 1024));
             let probe = carrier.request(
                 Request::get("https://localhost/probe")
                     .body(Body::Empty)
@@ -2264,7 +2273,7 @@ async fn h3_unused_stream_reservations_reset_without_transmitting_requests() {
             .unwrap()
             .unwrap();
         assert_eq!(seen.load(Ordering::Relaxed), 0);
-        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
         let mut response = carrier
             .request_reserved(
                 Request::get("https://localhost/")
@@ -2322,7 +2331,7 @@ async fn h3_empty_data_preserves_request_and_response_bodies() {
                     }
                     let _ = driver.accept().await;
                 });
-                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                 let mut response = carrier
                     .request(
                         Request::post("https://localhost/")
@@ -2375,7 +2384,7 @@ async fn h3_goaway_preserves_active_response_and_refuses_new_reservations() {
             stream.finish().await.unwrap();
             let _ = driver.accept().await;
         });
-        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
         let mut response = carrier
             .request(
                 Request::get("https://localhost/")
@@ -2418,7 +2427,7 @@ async fn h3_idle_upload_observes_stop_sending_without_closing_the_carrier() {
         let _ = driver.accept().await;
     });
     let tasks = Tasks::new();
-    let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+    let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
     let (_writer, reader) = pipe(memory.clone());
     let _response = carrier
         .request(
@@ -2543,7 +2552,7 @@ async fn h3_response_timeout_does_not_replay_the_request() {
                 }
             }
         });
-        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
         let tasks = Tasks::new();
         let error = carrier
             .request(

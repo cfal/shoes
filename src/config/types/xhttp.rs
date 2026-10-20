@@ -105,13 +105,13 @@ fn conflicts_with_framing(name: &http::HeaderName) -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct XhttpLimits {
-    pub max_sessions: usize,
-    pub max_pending_sessions: usize,
-    pub max_buffered_bytes: usize,
-    pub max_session_buffered_bytes: usize,
+    pub max_sessions: Option<usize>,
+    pub max_pending_sessions: Option<usize>,
+    pub max_buffered_bytes: Option<usize>,
+    pub max_session_buffered_bytes: Option<usize>,
     pub max_requests_per_connection: usize,
-    pub max_requests_per_session: usize,
-    pub max_requests: usize,
+    pub max_requests_per_session: Option<usize>,
+    pub max_requests: Option<usize>,
     pub h2_stream_window_bytes: usize,
     pub h2_connection_window_bytes: usize,
     pub setup_timeout_secs: u64,
@@ -122,13 +122,13 @@ pub struct XhttpLimits {
 impl Default for XhttpLimits {
     fn default() -> Self {
         Self {
-            max_sessions: 1024,
-            max_pending_sessions: 256,
-            max_buffered_bytes: 64 * 1024 * 1024,
-            max_session_buffered_bytes: 4 * 1024 * 1024,
-            max_requests_per_connection: 128,
-            max_requests_per_session: 128,
-            max_requests: 4096,
+            max_sessions: None,
+            max_pending_sessions: None,
+            max_buffered_bytes: None,
+            max_session_buffered_bytes: None,
+            max_requests_per_connection: 250,
+            max_requests_per_session: None,
+            max_requests: None,
             h2_stream_window_bytes: 4 * 1024 * 1024,
             h2_connection_window_bytes: 8 * 1024 * 1024,
             setup_timeout_secs: 60,
@@ -139,15 +139,28 @@ impl Default for XhttpLimits {
 }
 
 impl XhttpLimits {
+    pub(crate) fn session_byte_limit(&self) -> Option<usize> {
+        // Packet admission needs bounded predecessor headroom when bytes are capped globally.
+        self.max_session_buffered_bytes.or_else(|| {
+            self.max_buffered_bytes
+                .map(|limit| limit.min(4 * 1024 * 1024))
+        })
+    }
+
+    pub(crate) fn session_request_limit(&self) -> Option<usize> {
+        self.max_requests_per_session
+            .or(self.max_requests.map(|_| 128))
+    }
+
     pub(crate) fn h2_windows(&self) -> (u32, u32) {
         let stream_window = self
             .h2_stream_window_bytes
-            .min(self.max_session_buffered_bytes)
-            .min(self.max_buffered_bytes) as u32;
+            .min(self.session_byte_limit().unwrap_or(usize::MAX))
+            .min(self.max_buffered_bytes.unwrap_or(usize::MAX)) as u32;
         // HTTP/2 starts every connection with at least 65535 bytes of credit.
         let connection_window = self
             .h2_connection_window_bytes
-            .min(self.max_buffered_bytes)
+            .min(self.max_buffered_bytes.unwrap_or(usize::MAX))
             .max(65535) as u32;
         (stream_window, connection_window)
     }
@@ -165,16 +178,27 @@ impl XhttpLimits {
     }
 
     pub fn validate(&self) -> io::Result<()> {
-        if self.max_requests_per_session < 2 {
+        if self.max_requests_per_session.is_some_and(|limit| limit < 2) {
             return Err(invalid("XHTTP session request limit must be at least 2"));
         }
+        for (name, limit) in [
+            ("max_sessions", self.max_sessions),
+            ("max_pending_sessions", self.max_pending_sessions),
+            ("max_buffered_bytes", self.max_buffered_bytes),
+            (
+                "max_session_buffered_bytes",
+                self.max_session_buffered_bytes,
+            ),
+            ("max_requests", self.max_requests),
+        ] {
+            if limit == Some(0) {
+                return Err(invalid(&format!(
+                    "XHTTP limits.{name} must be positive; omit it for unlimited"
+                )));
+            }
+        }
         if [
-            self.max_sessions,
-            self.max_pending_sessions,
-            self.max_buffered_bytes,
-            self.max_session_buffered_bytes,
             self.max_requests_per_connection,
-            self.max_requests,
             self.h2_stream_window_bytes,
             self.h2_connection_window_bytes,
         ]
@@ -364,7 +388,9 @@ impl XhttpServerConfig {
             return Err(invalid("nested XHTTP is not supported"));
         }
         self.limits.validate()?;
-        if self.mode != XhttpMode::StreamOne && self.limits.max_requests < 2 {
+        if self.mode != XhttpMode::StreamOne
+            && self.limits.max_requests.is_some_and(|limit| limit < 2)
+        {
             return Err(invalid(
                 "XHTTP split server modes require at least two aggregate requests",
             ));
@@ -379,12 +405,20 @@ impl XhttpServerConfig {
             return Err(invalid("XHTTP packet size must be positive"));
         }
         if matches!(self.mode, XhttpMode::Auto | XhttpMode::PacketUp) {
-            if max as usize > self.limits.max_session_buffered_bytes {
+            if self
+                .limits
+                .session_byte_limit()
+                .is_some_and(|limit| max as usize > limit)
+            {
                 return Err(invalid(
                     "XHTTP maximum packet size exceeds the session byte budget",
                 ));
             }
-            if max as usize > self.limits.max_buffered_bytes {
+            if self
+                .limits
+                .max_buffered_bytes
+                .is_some_and(|limit| max as usize > limit)
+            {
                 return Err(invalid(
                     "XHTTP maximum packet size exceeds the global byte budget",
                 ));
@@ -626,10 +660,10 @@ mod tests {
         assert_eq!(limits.packet_timeout_secs, 300);
         assert_eq!(limits.setup_timeout_secs, 60);
         assert_eq!(limits.response_header_timeout_secs, 60);
-        assert_eq!(limits.max_requests_per_session, 128);
+        assert_eq!(limits.max_requests_per_session, None);
         for limit in [0, 1, 2] {
             let limits = XhttpLimits {
-                max_requests_per_session: limit,
+                max_requests_per_session: Some(limit),
                 ..limits.clone()
             };
             assert_eq!(limits.validate().is_ok(), limit >= 2);
@@ -650,6 +684,68 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn xhttp_admission_caps_are_opt_in() {
+        let fields = [
+            "max_sessions",
+            "max_pending_sessions",
+            "max_requests",
+            "max_requests_per_session",
+            "max_buffered_bytes",
+            "max_session_buffered_bytes",
+        ];
+        let mut unlimited = serde_json::json!({});
+        for field in fields {
+            unlimited[field] = serde_json::Value::Null;
+            for value in [0, 1, 2, 8192] {
+                let mut input = serde_json::json!({});
+                input[field] = value.into();
+                let limits: XhttpLimits = serde_json::from_value(input).unwrap();
+                assert_eq!(
+                    limits.validate().is_ok(),
+                    value
+                        >= if field == "max_requests_per_session" {
+                            2
+                        } else {
+                            1
+                        },
+                    "{field}={value}"
+                );
+                assert_eq!(serde_json::to_value(limits).unwrap()[field], value);
+            }
+        }
+        for input in [serde_json::json!({}), unlimited] {
+            let limits: XhttpLimits = serde_json::from_value(input.clone()).unwrap();
+            limits.validate().unwrap();
+            assert_eq!(limits.max_requests_per_connection, 250);
+            assert_eq!(limits.request_limit_with(GlobalLimits::default()), 250);
+            let serialized = serde_json::to_value(limits).unwrap();
+            for field in fields {
+                assert!(serialized[field].is_null(), "{field}");
+            }
+            let config = serde_json::json!({
+                "limits": input,
+                "sc_max_each_post_bytes": 8 * 1024 * 1024,
+                "protocol": {"type": "socks"}
+            });
+            serde_json::from_value::<XhttpClientConfig>(config.clone())
+                .unwrap()
+                .validate()
+                .unwrap();
+            serde_json::from_value::<XhttpServerConfig>(config)
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
+        assert_eq!(
+            XhttpLimits::default().request_limit_with(GlobalLimits {
+                max_streams_per_connection: Some(10),
+                ..GlobalLimits::default()
+            }),
+            10
+        );
+    }
+
     #[test]
     fn client_validates_session_request_limits() {
         for limit in [0, 1, 2, 5, 128, 129] {
@@ -702,14 +798,49 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_caps_derive_session_safeguards() {
+        let mut limits = XhttpLimits::default();
+        assert_eq!(limits.session_byte_limit(), None);
+        assert_eq!(limits.session_request_limit(), None);
+        for (global, expected) in [(48, 48), (8 * 1024 * 1024, 4 * 1024 * 1024)] {
+            limits.max_buffered_bytes = Some(global);
+            assert_eq!(limits.session_byte_limit(), Some(expected));
+        }
+        for global in [1, 2, 16, 4096] {
+            limits.max_requests = Some(global);
+            assert_eq!(limits.session_request_limit(), Some(128));
+        }
+        limits.max_session_buffered_bytes = Some(16 * 1024 * 1024);
+        limits.max_requests_per_session = Some(256);
+        assert_eq!(limits.session_byte_limit(), Some(16 * 1024 * 1024));
+        assert_eq!(limits.session_request_limit(), Some(256));
+        for session_limit in [None, Some(8 * 1024 * 1024)] {
+            let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+                "sc_max_each_post_bytes": 8 * 1024 * 1024,
+                "limits": {"max_buffered_bytes": 16 * 1024 * 1024,
+                    "max_session_buffered_bytes": session_limit},
+                "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            assert_eq!(config.validate().is_ok(), session_limit.is_some());
+        }
+    }
+
+    #[test]
     fn h2_windows_follow_byte_limits_and_protocol_bounds() {
         let mut limits = XhttpLimits::default();
         assert_eq!(limits.h2_windows(), (4 * 1024 * 1024, 8 * 1024 * 1024));
-        limits.max_session_buffered_bytes = 16384;
-        limits.max_buffered_bytes = 32768;
+        limits.max_session_buffered_bytes = Some(16384);
+        limits.max_buffered_bytes = Some(32768);
         assert_eq!(limits.h2_windows(), (16384, 65535));
         limits.h2_stream_window_bytes = 8192;
         assert_eq!(limits.h2_windows().0, 8192);
+        limits.h2_stream_window_bytes = 4 * 1024 * 1024;
+        limits.max_session_buffered_bytes = None;
+        assert_eq!(limits.h2_windows(), (32768, 65535));
+        limits.max_session_buffered_bytes = Some(16384);
+        limits.max_buffered_bytes = None;
+        assert_eq!(limits.h2_windows(), (16384, 8 * 1024 * 1024));
         limits.h2_connection_window_bytes = i32::MAX as usize + 1;
         assert!(limits.validate().is_err());
     }
@@ -744,7 +875,14 @@ fn server_packet_size_must_fit_both_byte_budgets() {
             (serde_json::json!("16-33"), false),
             (serde_json::json!(0), false),
         ] {
-            for (session, global) in [(32, 64), (64, 32), (32, 32)] {
+            for (session, global) in [
+                (Some(32), Some(64)),
+                (Some(64), Some(32)),
+                (Some(32), Some(32)),
+                (Some(32), None),
+                (None, Some(32)),
+                (None, None),
+            ] {
                 let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
                     "mode": mode, "sc_max_each_post_bytes": packet,
                     "limits": {
@@ -756,8 +894,8 @@ fn server_packet_size_must_fit_both_byte_budgets() {
                 .unwrap();
                 assert_eq!(
                     config.validate().is_ok(),
-                    fits || mode.starts_with("stream-"),
-                    "mode={mode}, packet={packet}, session={session}, global={global}"
+                    fits || mode.starts_with("stream-") || (session.is_none() && global.is_none()),
+                    "mode={mode}, packet={packet}, session={session:?}, global={global:?}"
                 );
             }
         }

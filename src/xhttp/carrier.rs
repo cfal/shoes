@@ -679,7 +679,7 @@ mod tests {
                     let (carrier, mut requests, _server) = h2_peer().await;
                     let tasks = Tasks::new();
                     let budget = Arc::new(Budget::new(Some(16 * 1024)));
-                    let memory = Memory::new(budget.clone(), 16 * 1024);
+                    let memory = Memory::new(budget.clone(), Some(16 * 1024));
                     let (mut upload, body) = pipe(memory.clone());
                     let data = vec![7; if blocked_upload { 2048 } else { 1024 }];
                     upload.write_all(&data).await.unwrap();
@@ -769,7 +769,7 @@ mod tests {
             ] {
                 let (carrier, mut requests, server) = h2_peer().await;
                 let tasks = Tasks::new();
-                let memory = Memory::new(Arc::new(Budget::new(Some(16 * 1024))), 16 * 1024);
+                let memory = Memory::new(Arc::new(Budget::new(Some(16 * 1024))), Some(16 * 1024));
                 let (mut upload, body) = pipe(memory.clone());
                 let request = Request::post("http://localhost/stream-one")
                     .body(Body::stream(body))
@@ -861,7 +861,7 @@ mod tests {
                 .await
                 .unwrap();
             let tasks = Tasks::new();
-            let memory = Memory::new(Arc::new(Budget::new(Some(16 * 1024))), 16 * 1024);
+            let memory = Memory::new(Arc::new(Budget::new(Some(16 * 1024))), Some(16 * 1024));
             let (upload, body) = pipe(memory.clone());
             let mut response = carrier
                 .request(
@@ -903,7 +903,7 @@ mod tests {
             let (carrier, mut requests, _server) = h2_peer().await;
             let tasks = Tasks::new();
             let budget = Arc::new(Budget::new(Some(16 * 1024)));
-            let memory = Memory::new(budget.clone(), 16 * 1024);
+            let memory = Memory::new(budget.clone(), Some(16 * 1024));
             let (signal, written) = UploadSignal::channel();
             let request = Request::post("http://localhost/packet/0")
                 .extension(signal)

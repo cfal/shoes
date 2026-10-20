@@ -38,6 +38,7 @@ pub struct XhttpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::xhttp::XhttpLimits;
     use serde_json::json;
 
     #[derive(Debug)]
@@ -64,18 +65,306 @@ mod tests {
     }
 
     fn service() -> Arc<State> {
-        let config: XhttpServerConfig = serde_json::from_value(json!({"path":"/t", "sc_max_buffered_posts":2, "sc_max_each_post_bytes":16, "limits":{"max_sessions":2,"max_pending_sessions":2},"protocol":{"type":"socks"}})).unwrap();
+        service_with_limits(XhttpLimits {
+            max_sessions: Some(2),
+            max_pending_sessions: Some(2),
+            max_requests: Some(4096),
+            max_buffered_bytes: Some(1024),
+            ..XhttpLimits::default()
+        })
+    }
+
+    fn service_with_limits(limits: XhttpLimits) -> Arc<State> {
+        let config: XhttpServerConfig = serde_json::from_value(json!({
+            "path": "/t", "sc_max_buffered_posts": 2, "sc_max_each_post_bytes": 16,
+            "limits": limits, "protocol": {"type": "socks"}
+        }))
+        .unwrap();
         Arc::new(State {
             path: Path::new(&config.path).unwrap(),
             inner: Arc::new(Echo),
             resolver: Arc::new(crate::resolver::NativeResolver::new()),
-            memory: Arc::new(Budget::new(Some(1024))),
-            admission: Arc::new(Budget::new(Some(2))),
-            requests: Arc::new(Budget::new(Some(config.limits.max_requests))),
+            memory: Arc::new(Budget::new(config.limits.max_buffered_bytes)),
+            admission: Arc::new(Budget::new(config.limits.max_sessions)),
+            pending: Arc::new(Budget::new(config.limits.max_pending_sessions)),
+            requests: Arc::new(Budget::new(config.limits.max_requests)),
             sessions: parking_lot::Mutex::new(HashMap::new()),
             tasks: Tasks::new(),
             config,
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_defaults_admit_past_old_caps_and_reap_orphans() {
+        let state = service_with_limits(XhttpLimits::default());
+        for id in 0..1025 {
+            state.session(&id.to_string()).unwrap();
+        }
+        assert_eq!(state.admission.snapshot().active, 1025);
+        assert_eq!(state.pending.snapshot().active, 1025);
+        let requests = state.requests.acquire(4097).unwrap();
+        let bytes = state.memory.acquire(64 * 1024 * 1024 + 1).unwrap();
+        let session = state.session("0").unwrap();
+        let session_bytes = session
+            .memory
+            .reserve_packet(4 * 1024 * 1024 + 1, 0)
+            .unwrap();
+        let packets: Vec<_> = (0..129)
+            .map(|_| PacketRequest::new(session.clone(), 1).unwrap())
+            .collect();
+        assert_eq!(session.packet_requests.snapshot().active, 129);
+        drop((requests, bytes, session_bytes, packets));
+        assert_eq!(state.requests.snapshot().active, 0);
+        assert_eq!(state.memory.snapshot().active, 0);
+        assert_eq!(session.packet_requests.snapshot().active, 0);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        state.reap();
+        assert_eq!(state.admission.snapshot().active, 0);
+        assert_eq!(state.pending.snapshot().active, 0);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        state.reap();
+        assert!(state.sessions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_session_caps_remain_independent() {
+        for pending in [false, true] {
+            let state = service_with_limits(XhttpLimits {
+                max_sessions: (!pending).then_some(2),
+                max_pending_sessions: pending.then_some(2),
+                ..XhttpLimits::default()
+            });
+            let first = state.session("a").unwrap();
+            state.session("b").unwrap();
+            assert!(matches!(
+                state.session("c"),
+                Err(StatusCode::SERVICE_UNAVAILABLE)
+            ));
+            let (_reader, _permit) = first.claim_download().unwrap();
+            if pending {
+                state.session("c").unwrap();
+            } else {
+                assert!(matches!(
+                    state.session("c"),
+                    Err(StatusCode::SERVICE_UNAVAILABLE)
+                ));
+                state.close("a");
+                state.session("c").unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_session_permits_follow_attachment_rejection_and_expiry() {
+        let state = service_with_limits(XhttpLimits {
+            max_sessions: Some(2),
+            max_pending_sessions: Some(1),
+            ..XhttpLimits::default()
+        });
+        let first = state.session("a").unwrap();
+        assert!(state.session("b").is_err());
+        assert_eq!(state.pending.snapshot().active, 1);
+        assert_eq!(state.admission.snapshot().active, 1);
+        let (_reader, _permit) = first.claim_download().unwrap();
+        assert_eq!(state.pending.snapshot().active, 0);
+        assert!(first.claim_download().is_err());
+        let second = state.session("b").unwrap();
+        assert!(state.session("c").is_err());
+        assert_eq!(state.pending.snapshot().active, 1);
+        state.close("a");
+        assert_eq!(state.pending.snapshot().active, 1);
+        state.close("b");
+        assert!(second.claim_download().is_err());
+        assert_eq!(state.pending.snapshot().active, 0);
+        state.session("c").unwrap();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        state.reap();
+        assert_eq!(state.pending.snapshot().active, 0);
+        assert_eq!(state.admission.snapshot().active, 0);
+        state.session("d").unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_request_cap_derives_per_session_admission() {
+        let state = service_with_limits(XhttpLimits {
+            max_requests: Some(4096),
+            ..XhttpLimits::default()
+        });
+        let session = state.session("a").unwrap();
+        let mut packets = Vec::new();
+        for _ in 0..127 {
+            packets.push(PacketRequest::new(session.clone(), 1).unwrap());
+        }
+        assert!(matches!(
+            PacketRequest::new(session.clone(), 1),
+            Err(Rejection::Full)
+        ));
+        packets.push(PacketRequest::new(session.clone(), 0).unwrap());
+        let other = state.session("b").unwrap();
+        let _other_packet = PacketRequest::new(other, 0).unwrap();
+        drop(packets);
+        assert_eq!(session.packet_requests.snapshot().active, 0);
+        assert_eq!(session.head_request.snapshot().active, 0);
+    }
+
+    async fn deferred_packet(state: Arc<State>, sequence: u64, data: Vec<u8>) -> StatusCode {
+        let request = Request::post(format!("http://localhost/t/a/{sequence}"))
+            .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+            .header("content-length", data.len())
+            .body(())
+            .unwrap();
+        let (mut writer, mut reader) = pipe(state.new_memory());
+        let ready = reader.defer();
+        let pump = tokio::spawn(async move {
+            if ready.await.is_ok() {
+                let _ = writer.write_all(&data).await;
+                let _ = writer.shutdown().await;
+            }
+        });
+        let status = state.handle(request, reader).await.status();
+        pump.abort();
+        status
+    }
+
+    #[tokio::test]
+    async fn global_only_byte_cap_preserves_reordered_headroom() {
+        let mut state = service_with_limits(XhttpLimits {
+            max_buffered_bytes: Some(48),
+            ..XhttpLimits::default()
+        });
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .sc_max_buffered_posts = 4;
+        let session = state.session("a").unwrap();
+        let (mut reader, _permit) = session.claim_download().unwrap();
+        let mut posts = tokio::task::JoinSet::new();
+        for sequence in [1, 2, 3] {
+            posts.spawn(deferred_packet(
+                state.clone(),
+                sequence,
+                vec![sequence as u8; 16],
+            ));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    {
+                        let state = session.state.lock();
+                        if state.receiving.contains_key(&sequence)
+                            || state.pending.contains_key(&sequence)
+                        {
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        posts.spawn(deferred_packet(state.clone(), 0, vec![0; 16]));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut data = [0; 64];
+            reader.read_exact(&mut data).await.unwrap();
+            for (sequence, packet) in data.chunks(16).enumerate() {
+                assert_eq!(packet, [sequence as u8; 16]);
+            }
+            while let Some(status) = posts.join_next().await {
+                assert_eq!(status.unwrap(), StatusCode::OK);
+            }
+        })
+        .await
+        .expect("reordered uploads must progress under a global-only byte cap");
+        state.close("a");
+        drop(reader);
+        assert_eq!(state.memory.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn global_only_byte_cap_recovers_after_destination_stall() {
+        let mut state = service_with_limits(XhttpLimits {
+            max_buffered_bytes: Some(8 * 1024 * 1024),
+            ..XhttpLimits::default()
+        });
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.sc_max_each_post_bytes = crate::config::xhttp::XhttpRange::Number(1_000_000);
+        config.sc_max_buffered_posts = 30;
+        let session = state.session("a").unwrap();
+        let (mut reader, _permit) = session.claim_download().unwrap();
+        let mut posts = tokio::task::JoinSet::new();
+        for sequence in 0..38 {
+            posts.spawn(deferred_packet(
+                state.clone(),
+                sequence,
+                vec![sequence as u8; 1_000_000],
+            ));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut data = vec![0; 1_000_000];
+            for sequence in 0..38 {
+                reader.read_exact(&mut data).await.unwrap();
+                assert!(data.iter().all(|byte| *byte == sequence));
+            }
+            while let Some(status) = posts.join_next().await {
+                assert_eq!(status.unwrap(), StatusCode::OK);
+            }
+        })
+        .await
+        .expect("uploads must resume under a global-only byte cap");
+        state.close("a");
+        drop(reader);
+        assert_eq!(state.memory.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn default_h2_connection_admits_250_live_requests() {
+        let state = service_with_limits(XhttpLimits::default());
+        let (client, server) = tokio::io::duplex(65536);
+        let tasks = Tasks::new();
+        let server_state = state.clone();
+        tasks.spawn(async move {
+            server_state
+                .serve_h2(
+                    Box::new(server),
+                    tokio::time::Instant::now() + Duration::from_secs(4),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut sender, connection) = h2::client::handshake(client).await.unwrap();
+        tasks.spawn(async move {
+            connection.await.unwrap();
+        });
+        let mut downloads = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for id in 0..250 {
+                sender = sender.clone().ready().await.unwrap();
+                let request = Request::get(format!("https://localhost/t/{id}"))
+                    .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                    .body(())
+                    .unwrap();
+                let (response, send) = sender.send_request(request, true).unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                downloads.push((send, response.into_body()));
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(sender.current_max_send_streams(), 250);
+        assert_eq!(state.requests.snapshot().active, 250);
+        assert_eq!(state.admission.snapshot().active, 250);
+        for (mut send, _) in downloads {
+            send.send_reset(h2::Reason::CANCEL);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.requests.snapshot().active != 0 || state.admission.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[derive(Debug)]
@@ -170,7 +459,7 @@ mod tests {
         let inner = Arc::get_mut(&mut state).unwrap();
         inner.inner = Arc::new(DrainUpload);
         inner.memory = Arc::new(Budget::new(Some(16384)));
-        inner.config.limits.max_buffered_bytes = 16384;
+        inner.config.limits.max_buffered_bytes = Some(16384);
         inner.config.sc_stream_up_server_secs = crate::config::xhttp::XhttpRange::Number(-1);
         let (mut writer, body) = pipe(state.new_memory());
         writer.write_all(&[42; 16384]).await.unwrap();
@@ -320,7 +609,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(15), async {
             let (carrier, _server, _endpoint) =
                 streaming_carrier(service(), XhttpVersion::H3).await;
-            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
             let (mut writer, reader) = pipe(memory.clone());
             let tasks = Tasks::new();
             let request = Request::post("https://localhost/t/")
@@ -359,7 +648,7 @@ mod tests {
                 inner.config.sc_stream_up_server_secs =
                     crate::config::xhttp::XhttpRange::Number(-1);
                 let (carrier, _server, _endpoint) = streaming_carrier(state.clone(), version).await;
-                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                 let (_writer, reader) = pipe(memory.clone());
                 let upload = Tasks::new();
                 let request = Request::post(format!("https://localhost/t/{suffix}"))
@@ -430,7 +719,7 @@ mod tests {
             .header("content-length", data.len())
             .body(())
             .unwrap();
-        let (mut writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+        let (mut writer, body) = pipe(Memory::new(state.memory.clone(), Some(1024)));
         writer.write_all(data).await.unwrap();
         writer.shutdown().await.unwrap();
         state.handle(request, body).await
@@ -440,16 +729,14 @@ mod tests {
         let mut state = service();
         let config = &mut Arc::get_mut(&mut state).unwrap().config;
         config.limits.packet_timeout_secs = 10;
-        config.limits.max_session_buffered_bytes = budget;
+        config.limits.max_session_buffered_bytes = Some(budget);
         config.sc_max_buffered_posts = 8;
         state
     }
 
     fn attached_reader(state: &Arc<State>, id: &str) -> Reader {
         let session = state.session(id).unwrap();
-        let mut session = session.state.lock();
-        session.downloaded = true;
-        session.reader.take().unwrap()
+        session.claim_download().unwrap().0
     }
 
     fn open_post(
@@ -460,7 +747,7 @@ mod tests {
             .header("referer", format!("/?x_padding={}", "X".repeat(100)))
             .body(())
             .unwrap();
-        let (writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+        let (writer, body) = pipe(Memory::new(state.memory.clone(), Some(1024)));
         let state = state.clone();
         (
             writer,
@@ -612,7 +899,7 @@ mod tests {
                         config.matching_headers = [("X-Token".into(), "secret".into())].into();
                         let (carrier, server, _endpoint) =
                             streaming_carrier_with_h3_limit(state.clone(), version, 2).await;
-                        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                         let tasks = Tasks::new();
                         let valid = || {
                             Request::builder()
@@ -717,7 +1004,7 @@ mod tests {
                             // until the client observes STOP_SENDING on its idle probe.
                             let (carrier, _server, _endpoint) =
                                 streaming_carrier_with_h3_limit(state.clone(), version, 2).await;
-                            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                             let tasks = Tasks::new();
                             let mut request = Request::builder()
                                 .method(method)
@@ -852,10 +1139,10 @@ mod tests {
                     let service = Arc::get_mut(&mut state).unwrap();
                     service.config.close_on_http1_error = true;
                     service.config.matching_headers = [("x-token".into(), "secret".into())].into();
-                    service.config.limits.max_requests_per_session = 2;
+                    service.config.limits.max_requests_per_session = Some(2);
                     let (carrier, _server, _endpoint) =
                         streaming_carrier_with_h3_limit(state.clone(), version, 2).await;
-                    let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                    let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                     let tasks = Tasks::new();
                     let make = |method: &str, path: &str| {
                         Request::builder()
@@ -964,7 +1251,7 @@ mod tests {
                     streaming_carrier(state.clone(), version).await;
                 let (shared_carrier, _shared_server, _shared_endpoint) =
                     streaming_carrier_with_h3_limit(state.clone(), version, 2).await;
-                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                 let tasks = Tasks::new();
                 let request = |method: &str, path: &str, data: &'static [u8]| {
                     Request::builder()
@@ -1072,7 +1359,7 @@ mod tests {
                     ("/t/session", StatusCode::BAD_REQUEST),
                 ] {
                     let (carrier, _server, _endpoint) = streaming_carrier(service(), version).await;
-                    let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                    let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                     let tasks = Tasks::new();
                     let request = Request::get(format!("https://localhost{path}"))
                         .header("origin", "https://probe.test")
@@ -1157,7 +1444,7 @@ mod tests {
                         };
                         let (carrier, _server, _endpoint) =
                             streaming_carrier(state.clone(), version).await;
-                        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                         let tasks = Tasks::new();
                         let mut request = Request::post("https://localhost/t/session/0")
                             .header("referer", format!("/?x_padding={}", "X".repeat(100)));
@@ -1262,10 +1549,10 @@ mod tests {
                     .close_on_http1_error = true;
                 let held = state
                     .requests
-                    .acquire(state.config.limits.max_requests)
+                    .acquire(state.config.limits.max_requests.unwrap())
                     .unwrap();
                 let (carrier, _server, _endpoint) = streaming_carrier(state.clone(), version).await;
-                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                 let tasks = Tasks::new();
                 let request = Request::builder()
                     .method("OPTIONS")
@@ -1325,7 +1612,7 @@ mod tests {
                     assert!(!service.config.close_on_http1_error);
                     let (carrier, _server, _endpoint) =
                         streaming_carrier_with_h3_limit(state.clone(), XhttpVersion::H3, 2).await;
-                    let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                    let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                     let tasks = Tasks::new();
                     let download = Request::get("https://localhost/t/session")
                         .header("x-token", "secret")
@@ -1407,7 +1694,7 @@ mod tests {
                             Some(
                                 state
                                     .requests
-                                    .acquire(state.config.limits.max_requests)
+                                    .acquire(state.config.limits.max_requests.unwrap())
                                     .unwrap(),
                             )
                         } else {
@@ -1485,7 +1772,7 @@ mod tests {
                     .header("x-extra", "X".repeat(if oversized { 512 } else { 1 }))
                     .body(())
                     .unwrap();
-                let (_, body) = pipe(Memory::new(state.memory.clone(), 1024));
+                let (_, body) = pipe(Memory::new(state.memory.clone(), Some(1024)));
                 let response = state.handle(request, body).await;
                 assert_eq!(
                     response.status(),
@@ -1795,7 +2082,7 @@ mod tests {
                 .config
                 .close_on_http1_error = true;
             let (carrier, _server, _endpoint) = streaming_carrier(state.clone(), version).await;
-            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
             for sequence in 0..32 {
                 let tasks = Tasks::new();
                 let (mut writer, reader) = pipe(memory.clone());
@@ -1950,7 +2237,10 @@ mod tests {
         let size = super::super::stream::CHUNK + 7;
         let inner = Arc::get_mut(&mut state).unwrap();
         inner.config.sc_max_each_post_bytes = crate::config::xhttp::XhttpRange::Number(size as i64);
+        inner.config.limits.max_buffered_bytes = Some(size);
+        inner.config.limits.max_session_buffered_bytes = Some(2 * size);
         inner.memory = Arc::new(Budget::new(Some(size)));
+        inner.config.validate().unwrap();
         let session = state.session("a").unwrap();
         let (mut writer, post) = open_post(&state, "a/1");
         for index in 0..size {
@@ -2032,7 +2322,7 @@ mod tests {
             .unwrap()
             .config
             .limits
-            .max_requests_per_session = 4;
+            .max_requests_per_session = Some(4);
         let _reader = attached_reader(&state, "a");
         let session = state.session("a").unwrap();
         let mut duplicates = Vec::new();
@@ -2065,7 +2355,7 @@ mod tests {
             let (carrier, _server, _endpoint) =
                 streaming_carrier(state.clone(), XhttpVersion::H2).await;
             let tasks = Tasks::new();
-            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
             let make = |path: &str| {
                 Request::get(format!("https://localhost/t/{path}"))
                     .header("referer", format!("/?x_padding={}", "X".repeat(100)))
@@ -2152,7 +2442,7 @@ mod tests {
                     .unwrap()
                     .config
                     .limits
-                    .max_requests_per_session = 4;
+                    .max_requests_per_session = Some(4);
                 let _reader = attached_reader(&state, "a");
                 let session = state.session("a").unwrap();
                 let mut servers = Vec::new();
@@ -2171,7 +2461,7 @@ mod tests {
                         carrier
                             .request(
                                 request,
-                                Memory::new(Arc::new(Budget::new(Some(1024))), 1024),
+                                Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024)),
                                 &tasks,
                                 Duration::from_secs(4),
                             )
@@ -2242,7 +2532,7 @@ mod tests {
                     let response = carrier
                         .request(
                             request,
-                            Memory::new(Arc::new(Budget::new(Some(1024))), 1024),
+                            Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024)),
                             &tasks,
                             Duration::from_secs(3),
                         )
@@ -2356,7 +2646,7 @@ mod tests {
             drop(response);
             tokio::task::yield_now().await;
             assert_eq!(state.admission.snapshot().active, 0);
-            assert!(state.sessions.lock().len() <= state.config.limits.max_sessions);
+            assert!(state.sessions.lock().len() <= state.config.limits.max_sessions.unwrap());
         }
         assert_eq!(
             request(&state, "GET", "session-9", b"").await.status(),
@@ -2495,7 +2785,7 @@ mod tests {
             .header("content-length", "17")
             .body(())
             .unwrap();
-        let (_writer, reader) = pipe(Memory::new(state.memory.clone(), 1024));
+        let (_writer, reader) = pipe(Memory::new(state.memory.clone(), Some(1024)));
         let response =
             tokio::time::timeout(Duration::from_millis(100), state.handle(request, reader))
                 .await
@@ -2510,13 +2800,9 @@ mod tests {
             .unwrap()
             .config
             .limits
-            .max_session_buffered_bytes = 32;
+            .max_session_buffered_bytes = Some(32);
         let session = state.session("a").unwrap();
-        let mut reader = {
-            let mut session = session.state.lock();
-            session.downloaded = true;
-            session.reader.take().unwrap()
-        };
+        let (mut reader, _permit) = session.claim_download().unwrap();
         for sequence in 0..4 {
             assert_eq!(
                 request(&state, "POST", &format!("a/{sequence}"), b"12345678")
@@ -2543,13 +2829,9 @@ mod tests {
             .unwrap()
             .config
             .limits
-            .max_session_buffered_bytes = 32;
+            .max_session_buffered_bytes = Some(32);
         let session = state.session("a").unwrap();
-        let mut reader = {
-            let mut session = session.state.lock();
-            session.downloaded = true;
-            session.reader.take().unwrap()
-        };
+        let (mut reader, _permit) = session.claim_download().unwrap();
         for sequence in 0..4 {
             assert_eq!(
                 request(&state, "POST", &format!("a/{sequence}"), b"12345678")
@@ -2578,11 +2860,7 @@ mod tests {
     async fn contiguous_packets_wait_when_the_post_queue_is_full() {
         let state = service();
         let session = state.session("a").unwrap();
-        let mut reader = {
-            let mut session = session.state.lock();
-            session.downloaded = true;
-            session.reader.take().unwrap()
-        };
+        let (mut reader, _permit) = session.claim_download().unwrap();
         for sequence in 0..4 {
             assert_eq!(
                 request(&state, "POST", &format!("a/{sequence}"), b"12345678")
@@ -2624,14 +2902,12 @@ mod tests {
         {
             let state = Arc::get_mut(&mut state).unwrap();
             state.config.sc_max_buffered_posts = 4;
-            state.config.limits.max_session_buffered_bytes = 64;
+            state.config.limits.max_session_buffered_bytes = Some(64);
         }
         let session = state.session("a").unwrap();
         let mut reader = None;
         if !attach_late {
-            let mut session = session.state.lock();
-            session.downloaded = true;
-            reader = session.reader.take();
+            reader = Some(session.claim_download().unwrap().0);
         }
         let mut writers = Vec::new();
         let mut posts = tokio::task::JoinSet::new();
@@ -2641,7 +2917,7 @@ mod tests {
                 .header("content-length", "16")
                 .body(())
                 .unwrap();
-            let (writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+            let (writer, body) = pipe(Memory::new(state.memory.clone(), Some(1024)));
             writers.push(writer);
             let state = state.clone();
             posts.spawn(async move { state.handle(post, body).await.status() });
@@ -2709,10 +2985,10 @@ mod tests {
         {
             let state = Arc::get_mut(&mut state).unwrap();
             state.config.sc_max_buffered_posts = 4;
-            state.config.limits.max_session_buffered_bytes = 24;
+            state.config.limits.max_session_buffered_bytes = Some(24);
         }
         let session = state.session("a").unwrap();
-        session.state.lock().downloaded = true;
+        let (_reader, _permit) = session.claim_download().unwrap();
         let mut posts = tokio::task::JoinSet::new();
         let mut writers = Vec::new();
         for sequence in [1, 2, 0] {
@@ -2721,7 +2997,7 @@ mod tests {
                 .header("content-length", "8")
                 .body(())
                 .unwrap();
-            let (mut writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+            let (mut writer, body) = pipe(Memory::new(state.memory.clone(), Some(1024)));
             let state = state.clone();
             posts.spawn(async move { state.handle(post, body).await.status() });
             if sequence == 2 {
@@ -2757,7 +3033,7 @@ mod tests {
                 .unwrap()
                 .config
                 .limits
-                .max_session_buffered_bytes = 64;
+                .max_session_buffered_bytes = Some(64);
             let session = state.session("a").unwrap();
             let mut posts = Vec::new();
             let mut writers = Vec::new();
@@ -2767,7 +3043,7 @@ mod tests {
                     .header("content-length", "16")
                     .body(())
                     .unwrap();
-                let (mut writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+                let (mut writer, body) = pipe(Memory::new(state.memory.clone(), Some(1024)));
                 let state = state.clone();
                 posts.push(tokio::spawn(async move {
                     state.handle(post, body).await.status()
@@ -2835,7 +3111,7 @@ mod tests {
                 .header("content-length", "16")
                 .body(())
                 .unwrap();
-            let (mut writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+            let (mut writer, body) = pipe(Memory::new(state.memory.clone(), Some(1024)));
             let post = tokio::spawn(async move { state.handle(post, body).await.status() });
             if buffered {
                 writer.write_all(b"partial").await.unwrap();
@@ -2866,11 +3142,7 @@ mod tests {
     async fn attached_duplicate_packets_are_queued_only_once() {
         let state = service();
         let session = state.session("a").unwrap();
-        let mut reader = {
-            let mut state = session.state.lock();
-            state.downloaded = true;
-            state.reader.take().unwrap()
-        };
+        let (mut reader, _permit) = session.claim_download().unwrap();
         for sequence in 0..4 {
             assert_eq!(
                 request(&state, "POST", &format!("a/{sequence}"), b"12345678")
@@ -2968,6 +3240,7 @@ struct State {
     resolver: Arc<dyn Resolver>,
     memory: Arc<Budget>,
     admission: Arc<Budget>,
+    pending: Arc<Budget>,
     requests: Arc<Budget>,
     sessions: parking_lot::Mutex<HashMap<String, Entry>>,
     tasks: Tasks,
@@ -3000,6 +3273,7 @@ struct SessionState {
     downloaded: bool,
     upload_deadline: Option<tokio::time::Instant>,
     permit: Option<BudgetPermit>,
+    pending_permit: Option<BudgetPermit>,
 }
 impl SessionState {
     fn predecessors_available(&self, sequence: u64, in_progress: &BTreeMap<u64, usize>) -> bool {
@@ -3030,6 +3304,7 @@ impl Session {
             return Err(StatusCode::CONFLICT);
         }
         state.downloaded = true;
+        state.pending_permit.take();
         Ok((state.reader.take().unwrap(), state.permit.take().unwrap()))
     }
 
@@ -3204,9 +3479,10 @@ impl XhttpServer {
             path: Path::new(&config.path)?,
             inner,
             resolver: resolver.clone(),
-            memory: Arc::new(Budget::new(Some(config.limits.max_buffered_bytes))),
-            admission: Arc::new(Budget::new(Some(config.limits.max_sessions))),
-            requests: Arc::new(Budget::new(Some(config.limits.max_requests))),
+            memory: Arc::new(Budget::new(config.limits.max_buffered_bytes)),
+            admission: Arc::new(Budget::new(config.limits.max_sessions)),
+            pending: Arc::new(Budget::new(config.limits.max_pending_sessions)),
+            requests: Arc::new(Budget::new(config.limits.max_requests)),
             sessions: parking_lot::Mutex::new(HashMap::new()),
             tasks: Tasks::new(),
             config,
@@ -3386,10 +3662,7 @@ impl TcpServerHandler for XhttpServer {
 
 impl State {
     fn new_memory(&self) -> Memory {
-        Memory::new(
-            self.memory.clone(),
-            self.config.limits.max_session_buffered_bytes,
-        )
+        Memory::new(self.memory.clone(), self.config.limits.session_byte_limit())
     }
 
     #[cfg(test)]
@@ -3416,14 +3689,17 @@ impl State {
                 let mut state = session.state.lock();
                 state.pending.clear();
                 state.permit.take();
+                state.pending_permit.take();
                 state.writer.take();
                 state.reader.take();
             }
-            let closed = sessions
-                .values()
-                .filter(|entry| matches!(entry, Entry::Closed { .. }))
-                .count();
-            if closed >= self.config.limits.max_sessions {
+            if self.config.limits.max_sessions.is_some_and(|limit| {
+                sessions
+                    .values()
+                    .filter(|entry| matches!(entry, Entry::Closed { .. }))
+                    .count()
+                    >= limit
+            }) {
                 let oldest = sessions
                     .iter()
                     .filter_map(|(id, entry)| match entry {
@@ -3479,22 +3755,13 @@ impl State {
                 Entry::Closed { .. } => Err(StatusCode::CONFLICT),
             };
         }
-        if sessions
-            .values()
-            .filter(|entry| matches!(entry, Entry::Live(_)))
-            .count()
-            >= self.config.limits.max_sessions
-            || sessions
-                .values()
-                .filter(|entry| matches!(entry, Entry::Live(s) if !s.state.lock().downloaded))
-                .count()
-                >= self.config.limits.max_pending_sessions
-        {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
         let permit = crate::resources::try_stream().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         let admission = self
             .admission
+            .acquire(1)
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let pending_permit = self
+            .pending
             .acquire(1)
             .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         let memory = self.new_memory();
@@ -3513,6 +3780,7 @@ impl State {
                 downloaded: false,
                 upload_deadline: None,
                 permit: Some(permit),
+                pending_permit: Some(pending_permit),
             }),
             memory,
             ready: Notify::new(),
@@ -3521,9 +3789,12 @@ impl State {
             admission: parking_lot::Mutex::new(Some(admission)),
             activity,
             progress: Notify::new(),
-            packet_requests: Arc::new(Budget::new(Some(
-                self.config.limits.max_requests_per_session - 1,
-            ))),
+            packet_requests: Arc::new(Budget::new(
+                self.config
+                    .limits
+                    .session_request_limit()
+                    .map(|limit| limit - 1),
+            )),
             head_request: Arc::new(Budget::new(Some(1))),
         });
         sessions.insert(id.into(), Entry::Live(session.clone()));
@@ -3773,7 +4044,12 @@ impl State {
         let initial =
             wire::header_payload(request.headers()).map_err(|_| StatusCode::BAD_REQUEST)?;
         let mut size = initial.len();
-        let mut reservation = max.min(self.config.limits.max_session_buffered_bytes);
+        let session_limit = self
+            .config
+            .limits
+            .session_byte_limit()
+            .unwrap_or(usize::MAX);
+        let mut reservation = max.min(session_limit);
         if let Some(length) = request.headers().get(http::header::CONTENT_LENGTH) {
             let length = length
                 .to_str()
@@ -3788,7 +4064,7 @@ impl State {
         if size > max {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
-        if reservation > self.config.limits.max_session_buffered_bytes {
+        if reservation > session_limit {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
         let arrived = tokio::time::Instant::now();
@@ -3826,7 +4102,7 @@ impl State {
                             let headroom = if contiguous || sequence == state.next {
                                 0
                             } else {
-                                max.min(self.config.limits.max_session_buffered_bytes)
+                                max.min(session_limit)
                             };
                             if let Some(memory) =
                                 session.memory.reserve_packet(reservation, headroom)

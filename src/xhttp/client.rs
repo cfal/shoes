@@ -155,10 +155,10 @@ impl Client {
     ) -> io::Result<Self> {
         let path = Path::new(&config.path)?;
         Ok(Self {
-            memory: Arc::new(Budget::new(Some(config.limits.max_buffered_bytes))),
-            admission: Arc::new(Budget::new(Some(config.limits.max_sessions))),
-            pending: Arc::new(Budget::new(Some(config.limits.max_pending_sessions))),
-            requests: Arc::new(Budget::new(Some(config.limits.max_requests))),
+            memory: Arc::new(Budget::new(config.limits.max_buffered_bytes)),
+            admission: Arc::new(Budget::new(config.limits.max_sessions)),
+            pending: Arc::new(Budget::new(config.limits.max_pending_sessions)),
+            requests: Arc::new(Budget::new(config.limits.max_requests)),
             allocation: parking_lot::Mutex::new(std::collections::HashMap::new()),
             tasks: Tasks::new(),
             reaper_started: std::sync::Once::new(),
@@ -377,10 +377,7 @@ impl Client {
         )
         .await??;
         drop(pending);
-        let memory = Memory::new(
-            self.memory.clone(),
-            self.config.limits.max_session_buffered_bytes,
-        );
+        let memory = Memory::new(self.memory.clone(), self.config.limits.session_byte_limit());
         let tasks = Arc::new(Tasks::new());
         let (mut write, upload_reader) = pipe(memory.clone());
         write.drain_before_shutdown = self.mode == XhttpMode::PacketUp;
@@ -577,12 +574,13 @@ impl Client {
             1
         } else {
             // The download leg retains one request slot for the logical session.
-            self.config.limits.max_requests_per_session - 1
+            self.config
+                .limits
+                .session_request_limit()
+                .map_or(usize::MAX, |limit| limit - 1)
         };
         let mut window = PacketWindow::default();
-        let unacknowledged = Arc::new(Budget::new(Some(
-            self.config.limits.max_session_buffered_bytes,
-        )));
+        let unacknowledged = Arc::new(Budget::new(self.config.limits.session_byte_limit()));
         let mut inflight = futures::stream::FuturesUnordered::new();
         let mut idle_lane = Some(lane);
         let mut pending = std::collections::VecDeque::new();
@@ -789,6 +787,32 @@ mod tests {
     use rustls::NamedGroup;
     use serde_json::json;
 
+    #[test]
+    fn default_client_admission_is_uncapped() {
+        let config = serde_json::from_value(json!({"protocol": {"type": "socks"}})).unwrap();
+        let client = Client::new(
+            config,
+            NetLocation::from_str("localhost:443", None).unwrap(),
+            "localhost".into(),
+            XhttpVersion::H2,
+            XhttpMode::PacketUp,
+            Security::Plain,
+        )
+        .unwrap();
+        for (budget, count) in [
+            (&client.admission, 1025),
+            (&client.pending, 257),
+            (&client.requests, 4097),
+            (&client.memory, 64 * 1024 * 1024 + 1),
+        ] {
+            assert_eq!(budget.limit(), None);
+            let permit = budget.acquire(count).unwrap();
+            assert_eq!(budget.snapshot().active, count);
+            drop(permit);
+            assert_eq!(budget.snapshot().active, 0);
+        }
+    }
+
     struct QuicDialer {
         carriers:
             parking_lot::Mutex<std::collections::VecDeque<crate::tcp::carrier_dialer::QuicCarrier>>,
@@ -938,7 +962,7 @@ mod tests {
             let download = client.lease(&route, true).await.unwrap();
             let upload = client.lease(&route, true).await.unwrap();
             let retired = Arc::downgrade(&upload.carrier);
-            let memory = Memory::new(client.memory.clone(), 65536);
+            let memory = Memory::new(client.memory.clone(), Some(65536));
             let (mut writer, reader) = pipe(memory.clone());
             let tasks = Tasks::new();
             let (result, ()) = tokio::join!(
