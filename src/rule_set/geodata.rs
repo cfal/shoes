@@ -77,15 +77,16 @@ fn fields<'a>(
     Ok(())
 }
 
-fn selector(value: &str) -> io::Result<()> {
+fn selector(value: &str, category: bool) -> io::Result<()> {
     if value.is_empty()
         || value.len() > 128
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        || !value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_') || (category && b == b'!')
+        })
+        || value.starts_with('!')
     {
         return Err(invalid(
-            "DAT selectors require nonempty ASCII letters, digits, '-' or '_'; use attributes for boolean filters",
+            "invalid DAT selector; use a literal category code and separate boolean attributes",
         ));
     }
     Ok(())
@@ -98,9 +99,9 @@ pub(super) fn decode(
     attributes: &[String],
     budget: &mut Compiler,
 ) -> io::Result<Expression> {
-    selector(code)?;
+    selector(code, true)?;
     for attr in attributes {
-        selector(attr)?;
+        selector(attr, false)?;
     }
     if geoip && !attributes.is_empty() {
         return Err(invalid("GeoIP has no attribute filters"));
@@ -150,7 +151,7 @@ pub(super) fn decode(
                     budget.charge(item.len().saturating_mul(8).saturating_add(256), 1)?;
                     if geoip {
                         cidr(item, &mut ips)?;
-                    } else if let Some(rule) = domain(item, attributes)? {
+                    } else if let Some(rule) = domain(item, attributes, budget)? {
                         rules.push(rule);
                     }
                 }
@@ -171,7 +172,11 @@ pub(super) fn decode(
     Ok(result)
 }
 
-fn domain(bytes: &[u8], attributes: &[String]) -> io::Result<Option<Expression>> {
+fn domain(
+    bytes: &[u8],
+    attributes: &[String],
+    budget: &mut Compiler,
+) -> io::Result<Option<Expression>> {
     let mut seen = [false; 3];
     fields(bytes, |tag, field| {
         match (tag, field) {
@@ -182,6 +187,9 @@ fn domain(bytes: &[u8], attributes: &[String]) -> io::Result<Option<Expression>>
                 }
             }
             (3, Field::Bytes(attr)) => {
+                // Prost grows the repeated field geometrically; include old and
+                // new vector storage before decoding even an empty attribute.
+                budget.charge(4 * std::mem::size_of::<Attribute>(), 1)?;
                 let mut key = false;
                 let mut value = false;
                 fields(attr, |tag, field| {
@@ -253,6 +261,51 @@ fn cidr(bytes: &[u8], ranges: &mut IpRanges) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::rules::Outcome;
+
+    #[test]
+    fn attributes_are_charged_before_prost_materialization() {
+        let mut bytes = vec![0x12, 1, b'a'];
+        bytes.extend_from_slice(&[0x1a, 0].repeat(10_000));
+        let mut budget = Compiler::default();
+        budget.charge(511 * 1024 * 1024, 0).unwrap();
+        assert!(
+            domain(&bytes, &[], &mut budget)
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+    }
+
+    #[test]
+    fn literal_category_exclamation_is_not_selector_syntax() {
+        let bytes = Sites {
+            entries: vec![Site {
+                code: "GEOLOCATION-!CN".into(),
+                domains: vec![Domain {
+                    kind: 3,
+                    value: "example.com".into(),
+                    attributes: vec![],
+                }],
+            }],
+        }
+        .encode_to_vec();
+        let expression = decode(
+            &bytes,
+            false,
+            "geolocation-!cn",
+            &[],
+            &mut Compiler::default(),
+        )
+        .unwrap();
+        let predicate = Compiler::default().compile(expression).unwrap();
+        assert_eq!(
+            predicate.evaluate(Some("example.com"), None, 80),
+            Outcome::Match
+        );
+        for code in ["!cn", "test@ads", "geosite:test"] {
+            assert!(selector(code, true).is_err());
+        }
+    }
 
     #[derive(Clone, PartialEq, Message)]
     struct Site {
