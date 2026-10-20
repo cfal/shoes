@@ -177,11 +177,13 @@ fn domain(
     attributes: &[String],
     budget: &mut Compiler,
 ) -> io::Result<Option<Expression>> {
-    let mut seen = [false; 3];
+    let mut kind_seen = false;
+    let mut value_seen = false;
     fields(bytes, |tag, field| {
         match (tag, field) {
-            (1, Field::Number(0..=3)) if !std::mem::replace(&mut seen[1], true) => {}
-            (2, Field::Bytes(value)) if !std::mem::replace(&mut seen[2], true) => {
+            (1, Field::Number(0..=3)) if !kind_seen => kind_seen = true,
+            (2, Field::Bytes(value)) if !value_seen => {
+                value_seen = true;
                 if value.is_empty() || value.len() > 64 * 1024 {
                     return Err(invalid("invalid DAT domain value length"));
                 }
@@ -190,18 +192,7 @@ fn domain(
                 // Prost grows the repeated field geometrically; include old and
                 // new vector storage before decoding even an empty attribute.
                 budget.charge(4 * std::mem::size_of::<Attribute>(), 1)?;
-                let mut key = false;
-                let mut value = false;
-                fields(attr, |tag, field| {
-                    match (tag, field) {
-                        (1, Field::Bytes(s))
-                            if s.len() <= 128 && !std::mem::replace(&mut key, true) => {}
-                        (2, Field::Number(0 | 1)) | (3, Field::Number(_))
-                            if !std::mem::replace(&mut value, true) => {}
-                        _ => return Err(invalid("unsupported or duplicate DAT attribute field")),
-                    }
-                    Ok(())
-                })?;
+                validate_attribute(attr)?;
             }
             _ => return Err(invalid("unsupported DAT domain field or enum")),
         }
@@ -230,13 +221,28 @@ fn domain(
     }))
 }
 
-fn cidr(bytes: &[u8], ranges: &mut IpRanges) -> io::Result<()> {
-    let mut seen = [false; 3];
+fn validate_attribute(bytes: &[u8]) -> io::Result<()> {
+    let mut key_seen = false;
+    let mut value_seen = false;
     fields(bytes, |tag, field| {
         match (tag, field) {
-            (1, Field::Bytes(ip))
-                if matches!(ip.len(), 4 | 16) && !std::mem::replace(&mut seen[1], true) => {}
-            (2, Field::Number(0..=128)) if !std::mem::replace(&mut seen[2], true) => {}
+            (1, Field::Bytes(key)) if key.len() <= 128 && !key_seen => key_seen = true,
+            (2, Field::Number(0 | 1)) | (3, Field::Number(_)) if !value_seen => {
+                value_seen = true;
+            }
+            _ => return Err(invalid("unsupported or duplicate DAT attribute field")),
+        }
+        Ok(())
+    })
+}
+
+fn cidr(bytes: &[u8], ranges: &mut IpRanges) -> io::Result<()> {
+    let mut ip_seen = false;
+    let mut prefix_seen = false;
+    fields(bytes, |tag, field| {
+        match (tag, field) {
+            (1, Field::Bytes(ip)) if matches!(ip.len(), 4 | 16) && !ip_seen => ip_seen = true,
+            (2, Field::Number(0..=128)) if !prefix_seen => prefix_seen = true,
             _ => return Err(invalid("unsupported DAT CIDR field")),
         }
         Ok(())
@@ -261,6 +267,60 @@ fn cidr(bytes: &[u8], ranges: &mut IpRanges) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::rules::Outcome;
+
+    #[test]
+    fn wire_validation_preserves_defaults_and_duplicate_rejection() {
+        let name = [0x12, 1, b'a'];
+        assert!(matches!(
+            domain(&name, &[], &mut Compiler::default()).unwrap(),
+            Some(Expression::DomainKeyword(names)) if names == ["a"]
+        ));
+        for fields in [vec![0x08, 0, 0x08, 0], name.to_vec()] {
+            let bytes = [name.as_slice(), &fields].concat();
+            assert_eq!(
+                domain(&bytes, &[], &mut Compiler::default())
+                    .unwrap_err()
+                    .to_string(),
+                "unsupported DAT domain field or enum"
+            );
+        }
+
+        for bytes in [
+            &[][..],
+            &[0x0a, 1, b'a'],
+            &[0x10, 0],
+            &[0x18, 7],
+            &[0x10, 1, 0x0a, 1, b'a'],
+        ] {
+            validate_attribute(bytes).unwrap();
+        }
+        for bytes in [
+            &[0x0a, 0, 0x0a, 0][..],
+            &[0x10, 0, 0x10, 1],
+            &[0x10, 1, 0x18, 7],
+            &[0x18, 7, 0x10, 1],
+            &[0x10, 2],
+        ] {
+            assert_eq!(
+                validate_attribute(bytes).unwrap_err().to_string(),
+                "unsupported or duplicate DAT attribute field"
+            );
+        }
+
+        let ip = [0x0a, 4, 192, 0, 2, 1];
+        let mut ranges = IpRanges::default();
+        cidr(&ip, &mut ranges).unwrap();
+        assert_eq!(ranges.v4, [(0, u32::MAX)]);
+        for fields in [ip.to_vec(), vec![0x10, 24, 0x10, 24]] {
+            let bytes = [ip.as_slice(), &fields].concat();
+            assert_eq!(
+                cidr(&bytes, &mut IpRanges::default())
+                    .unwrap_err()
+                    .to_string(),
+                "unsupported DAT CIDR field"
+            );
+        }
+    }
 
     #[test]
     fn attributes_are_charged_before_prost_materialization() {
