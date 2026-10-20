@@ -204,6 +204,7 @@ impl Compiler {
             return Err(invalid("rule nesting exceeds 100 levels"));
         }
         self.strings(&v)?;
+        if v.is_empty() { return Ok(Predicate::new(Kind::Constant(false))); }
         Ok(Predicate::new(Kind::Domains(Names::new(v)?, kind)))
     }
 
@@ -232,7 +233,12 @@ impl Compiler {
             let has_ip = !ips.v4.is_empty() || !ips.v6.is_empty();
             let ips = self.visit(Expression::Ranges(ips, false), 0)?;
             let predicate = if any {
-                Predicate::any_destination()
+                // Sniff eligibility is observable before matching. Preserve the
+                // dependencies of alternatives shadowed by a universal mask.
+                let mut children = vec![Predicate::any_destination()];
+                if names.dependencies.hostname { children.push(names); }
+                if has_ip { children.push(ips); }
+                Predicate::any(children)
             } else if has_ip {
                 Predicate::new(Kind::Any(vec![names, ips].into()))
             } else {
@@ -410,5 +416,19 @@ mod tests {
         });
         assert!(c.compile(deep).is_err());
         assert!(c.charge(MAX_BYTES, 0).is_err());
+    }
+
+    #[test]
+    fn universal_keeps_real_dependencies_but_empty_sets_add_none() {
+        for (masks, hostname, ip) in [
+            (vec!["0.0.0.0/0"], false, false),
+            (vec!["10.0.0.0/8"], false, true),
+            (vec!["example.com", "0.0.0.0/0"], true, false),
+            (vec!["10.0.0.0/8", "example.com", "0.0.0.0/0"], true, true),
+        ] {
+            let p = Compiler::default().legacy(masks.into_iter().map(|m| NetLocationMask::from(m).unwrap()).collect()).unwrap();
+            assert_eq!(p.dependencies.hostname, hostname);
+            assert_eq!(p.dependencies.ip, ip);
+        }
     }
 }
