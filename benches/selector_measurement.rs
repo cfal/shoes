@@ -86,7 +86,7 @@ fn selector_measurement() {
     let mut rng = 0x83ab_d317_26e3_a175;
     let query_count = if mode == "cold" { 32768 } else { 4096 };
     let queries: Vec<_> = (0..query_count)
-        .map(|_| {
+        .map(|query| {
             let id = match workload.as_str() {
                 "early" => random(&mut rng) % count.min(16),
                 "late" => count - 1 - random(&mut rng) % count.min(16),
@@ -98,6 +98,9 @@ fn selector_measurement() {
             } else {
                 format!("miss{}.invalid", random(&mut rng))
             };
+            if mode == "cold" {
+                host = format!("q{query}.{host}");
+            }
             if random(&mut rng) & 3 == 0 {
                 host.make_ascii_uppercase();
                 host.push('.');
@@ -112,6 +115,14 @@ fn selector_measurement() {
             (host, location, expected)
         })
         .collect();
+    if mode == "cold" {
+        let keys: std::collections::HashSet<_> = queries
+            .iter()
+            .map(|(_, location, _)| RoutingCacheKey::from_location(location))
+            .collect();
+        assert_eq!(keys.len(), query_count);
+        assert!(query_count > cache_size);
+    }
     let lookup = |i: usize| {
         let (host, location, _) = &queries[i & (query_count - 1)];
         runtime.block_on(async {
