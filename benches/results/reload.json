@@ -1,5 +1,11 @@
 {
-  "binary_sha256": "d4d169486e4caf6d55d9f4820318b05995d2e0dda27b79325ab953644c7b81df",
+  "source": {
+    "revision": "82556016a296e27d85d1b9c2a3d4488d5fc9f551",
+    "tree": "e369e06b6c862103220d0ff6fba212083917a4f4",
+    "tracked_tree_clean": true,
+    "build": "CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo build --bin shoes"
+  },
+  "binary_sha256": "737c9bf37b9067cbb40365b8decc8ec49889bcceb101cdd7b172d418f456446b",
   "allocator": "server jemalloc",
   "profile": "debug",
   "workers": 1,
@@ -7,33 +13,33 @@
     {
       "generation": 0,
       "pinned_connections": 1,
-      "elapsed_ms": 1923.123666,
-      "rss_kib": 59492,
-      "high_water_kib": 79948
+      "elapsed_ms": 2503.929997,
+      "rss_kib": 58712,
+      "high_water_kib": 65872
     },
     {
       "generation": 1,
       "pinned_connections": 2,
-      "elapsed_ms": 1920.675348,
-      "rss_kib": 72412,
-      "high_water_kib": 100960
+      "elapsed_ms": 2415.558059,
+      "rss_kib": 69304,
+      "high_water_kib": 82284
     },
     {
       "generation": 2,
       "pinned_connections": 3,
-      "elapsed_ms": 1898.9505209999998,
-      "rss_kib": 82804,
-      "high_water_kib": 110244
+      "elapsed_ms": 2409.5530630000003,
+      "rss_kib": 82336,
+      "high_water_kib": 94420
     },
     {
       "generation": 3,
       "pinned_connections": 4,
-      "elapsed_ms": 1882.3662610000001,
-      "rss_kib": 93456,
-      "high_water_kib": 118728
+      "elapsed_ms": 2399.0942990000003,
+      "rss_kib": 89836,
+      "high_water_kib": 104524
     }
   ],
-  "sampled_peak_rss_kib": 117332,
+  "sampled_peak_rss_kib": 104616,
   "inputs": [
     {
       "path": "/home/ubuntu/tmp/shoes-rule-reject-335129e2.yaml",

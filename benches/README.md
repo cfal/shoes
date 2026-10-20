@@ -88,19 +88,29 @@ The full distributions, including occasional process outliers, are in
 `reload_memory.mjs` exercises the real server with the 197,553-entry Loyalsoldier
 reject YAML plus sing-geoip CN/US SRS. Four live TCP streams retain four selector
 generations across three SIGHUP reloads and must continue echoing exact bytes.
-The debug server used jemalloc. Initial load/reload took roughly 1.9-2.0 seconds;
-peak RSS was approximately 116 MiB with one worker and 122 MiB with eight.
-Raw RSS/HWM samples and input/binary hashes are in `results/reload*.json`.
+The debug server at `82556016` used jemalloc and includes the final YAML and
+decompression allocation fixes. Initial load/reload took 2.37-2.50 seconds;
+sampled peak RSS was 102.2 MiB with one worker and 103.7 MiB with eight.
+These replace the older `d8c44452` decoder measurements. Raw RSS/HWM samples,
+source revision/tree, tracked-tree cleanliness, build command and input/binary
+hashes are in `results/reload*.json`.
 This is a measured four-generation overlap, not a bound on arbitrary draining
 connections or a mobile memory guarantee. Requested heap and concurrent routing
 latency were not measured. Android/iOS device validation remains outstanding.
 
 ```sh
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo build --bin shoes
+export BENCH_BUILD_COMMAND='CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo build --bin shoes'
 BENCH_PROFILE=debug BENCH_WORKERS=1 node benches/reload_memory.mjs \
   SHOES_BINARY SCRATCH_DIR REJECT_YAML CN_SRS US_SRS
 BENCH_PROFILE=debug BENCH_WORKERS=8 taskset -c 0,1,3-7 \
   node benches/reload_memory.mjs SHOES_BINARY SCRATCH_DIR REJECT_YAML CN_SRS US_SRS
 ```
+
+Run from the source checkout used to build the binary. `BENCH_BUILD_COMMAND`
+records that command; the harness does not rebuild or infer binary provenance.
+Tracked-tree cleanliness excludes untracked files. Harness regressions run with
+`node --test benches/*.test.mjs`.
 
 The one-worker run had no affinity restriction; the eight-worker run excluded
 CPU 2 to avoid the selector benchmark. Both ran in the shared VM.
