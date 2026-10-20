@@ -4,6 +4,9 @@
 //! - Session multiplexing: Multiple proxy streams over a single TLS connection
 //! - Configurable padding: First N packets are padded to obscure fingerprints
 //! - Password authentication: SHA256-based user authentication
+//!
+//! Portions are derived from anytls-rs (<https://github.com/jxo-me/anytls-rs>)
+//! under the MIT License; see `THIRD_PARTY_NOTICES.md`.
 
 mod anytls_client_handler;
 mod anytls_client_session;

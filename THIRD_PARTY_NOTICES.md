@@ -4,7 +4,8 @@
 Shoes' production and build dependencies, including transitive dependencies
 across all target platforms. A given binary may link only a subset of them.
 The release tarballs, Android AAR (`classes.jar/META-INF/shoes`) and iOS
-XCFramework include this bundle and the additional GotaTun notices below.
+XCFramework include this bundle and the additional GotaTun and anytls-rs
+notices below.
 
 Regenerate the bundle after changing Cargo.lock, using cargo-about 0.9.2:
 
@@ -45,3 +46,34 @@ provide the corresponding modified covered source and retain these notices.
 Embedding a Shoes static or dynamic library does not remove these obligations.
 
 These source-availability details supplement the reproduced dependency licenses.
+
+## AnyTLS Source
+
+Portions of the AnyTLS implementation in `src/anytls/`, including the padding
+scheme, frame definitions, settings map and stream tests, are derived from
+anytls-rs (https://github.com/jxo-me/anytls-rs), which is distributed under the
+following license:
+
+```text
+MIT License
+
+Copyright (c) 2024 Mickey and AnyTLS Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
