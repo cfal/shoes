@@ -91,6 +91,7 @@ path = "tests/stress.rs"
 required-features = ["stress-tests"]
 
 [dependencies]
+aho-corasick = "1"
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
@@ -128,6 +129,7 @@ rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 rust-argon2 = "*"
 rustc-hash = "*"
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"

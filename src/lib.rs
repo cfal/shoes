@@ -81,6 +81,7 @@ mod quic_stream;
 mod reality;
 mod reality_client_handler;
 pub mod resolver;
+pub mod rules;
 pub mod resources;
 mod routing;
 mod rustls_config_util;
