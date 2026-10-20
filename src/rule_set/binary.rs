@@ -33,6 +33,21 @@ pub(super) fn inflate(bytes: &[u8], budget: &mut Compiler) -> io::Result<Vec<u8>
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counted_strings_allocate_only_the_charged_slots() {
+        let mut bytes = vec![9];
+        bytes.extend_from_slice(&[1, b'a'].repeat(9));
+        let mut budget = Compiler::default();
+        let strings = Reader::new(&bytes, &mut budget).strings().unwrap();
+        assert_eq!(strings.len(), 9);
+        assert_eq!(strings.capacity(), 9);
+    }
+}
+
 pub(super) struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -102,14 +117,15 @@ impl<'a> Reader<'a> {
     pub fn strings(&mut self) -> io::Result<Vec<String>> {
         let count = self.count(false, MAX_ENTRIES, 1)?;
         self.budget.charge(count * 32, count)?;
-        (0..count)
-            .map(|_| {
-                let len = self.count(false, 64 * 1024, 1)?;
-                self.charge(len * 2)?;
-                String::from_utf8(self.take(len)?.to_vec())
-                    .map_err(|_| invalid("invalid UTF-8 rule string"))
-            })
-            .collect()
+        let mut strings = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = self.count(false, 64 * 1024, 1)?;
+            self.charge(len * 2)?;
+            let string = String::from_utf8(self.take(len)?.to_vec())
+                .map_err(|_| invalid("invalid UTF-8 rule string"))?;
+            strings.push(string);
+        }
+        Ok(strings)
     }
     pub fn end(&self) -> io::Result<()> {
         if self.remaining() == 0 {
@@ -126,7 +142,11 @@ impl<'a> Reader<'a> {
         let words = |r: &mut Self| -> io::Result<Vec<u64>> {
             let len = r.count(mrs, MAX_INFLATED / 8, 8)?;
             r.charge(len * 8)?;
-            (0..len).map(|_| r.u64()).collect()
+            let mut words = Vec::with_capacity(len);
+            for _ in 0..len {
+                words.push(r.u64()?);
+            }
+            Ok(words)
         };
         let leaves = words(self)?;
         let bitmap = words(self)?;

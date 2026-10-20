@@ -13,12 +13,13 @@ pub fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Expression> {
     let count = reader.count(false, MAX_ENTRIES, 1)?;
     reader.charge(count * 128)?;
     let mut remaining = MAX_ENTRIES;
-    let rules = (0..count)
-        .map(|i| {
+    let mut rules = Vec::with_capacity(count);
+    for i in 0..count {
+        rules.push(
             rule(&mut reader, bytes[3], 0, &mut remaining)
-                .map_err(|e| invalid(format!("SRS rule {i}: {e}")))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+                .map_err(|e| invalid(format!("SRS rule {i}: {e}")))?,
+        );
+    }
     reader.end()?;
     Ok(Expression::or(rules))
 }
@@ -49,7 +50,11 @@ fn rule(
                     2 => {
                         let mut exact = Vec::new();
                         let mut suffix = Vec::new();
-                        for key in reader.domain_keys(false)? {
+                        let keys = reader.domain_keys(false)?;
+                        if keys.is_empty() {
+                            return Err(invalid("empty SRS domain set"));
+                        }
+                        for key in keys {
                             match key.as_bytes().first() {
                                 Some(b'\n') if version >= 2 => suffix.push(key[1..].to_owned()),
                                 Some(b'\r') if key.starts_with("\r.") => {
@@ -83,6 +88,9 @@ fn rule(
                             return Err(invalid("unsupported SRS IP-set version"));
                         }
                         let count = reader.count(true, MAX_ENTRIES, 2)?;
+                        if count == 0 {
+                            return Err(invalid("empty SRS IP set"));
+                        }
                         reader.charge(count * 64)?;
                         let mut ranges = IpRanges::default();
                         for _ in 0..count {
@@ -92,20 +100,18 @@ fn rule(
                             let to = reader.take(b)?;
                             ranges.add_encoded(from, to, false)?;
                         }
-                        if count != 0 {
-                            parts.address.push(Expression::Ranges(ranges, false));
-                        }
+                        parts.address.push(Expression::Ranges(ranges, false));
                     }
                     9 => {
                         let count = reader.count(false, MAX_ENTRIES, 2)?;
                         reader.charge(count * 8)?;
-                        let ports = Expression::PortRanges(
-                            (0..count)
-                                .map(|_| reader.u16().map(|p| (p, p)))
-                                .collect::<io::Result<_>>()?,
-                        );
+                        let mut ports = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            let port = reader.u16()?;
+                            ports.push((port, port));
+                        }
                         if count != 0 {
-                            parts.ports.push(ports);
+                            parts.ports.push(Expression::PortRanges(ports));
                         }
                     }
                     10 => {
@@ -128,9 +134,10 @@ fn rule(
             if count == 0 {
                 return Err(invalid("empty SRS logical rule"));
             }
-            let children = (0..count)
-                .map(|_| rule(reader, version, depth + 1, remaining))
-                .collect::<io::Result<Vec<_>>>()?;
+            let mut children = Vec::with_capacity(count);
+            for _ in 0..count {
+                children.push(rule(reader, version, depth + 1, remaining)?);
+            }
             Ok(if mode == 0 {
                 Expression::All(children)
             } else {
@@ -263,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_binary_conditions_are_absent_not_false() {
+    fn empty_lists_are_absent_but_empty_index_objects_reject() {
         for tag in [3, 4, 9, 10] {
             for invert in [0, 1] {
                 assert!(decode(&wrap(2, &[1, 0, tag, 0, 255, invert])).is_err());
@@ -278,12 +285,12 @@ mod tests {
         }
         let mut empty_ips = vec![1, 0, 6, 1];
         empty_ips.extend(0u64.to_be_bytes());
-        empty_ips.extend([255, 1]);
+        empty_ips.extend([9, 1, 1, 187, 255, 1]);
         assert!(decode(&wrap(2, &empty_ips)).is_err());
         // A valid empty root-only domain set: no terminals, one node terminator.
         let mut empty_names = vec![1, 0, 2, 0, 0, 1];
         empty_names.extend(1u64.to_be_bytes());
-        empty_names.extend([0, 255, 1]);
+        empty_names.extend([0, 9, 1, 1, 187, 255, 1]);
         assert!(decode(&wrap(2, &empty_names)).is_err());
     }
 

@@ -71,6 +71,12 @@ pub(super) fn decode(
             let keys = r.domain_keys(true)?;
             let mut rules = Vec::with_capacity(keys.len());
             for key in keys {
+                if key.starts_with('.')
+                    || key.ends_with('.')
+                    || key.bytes().any(|b| b.is_ascii_uppercase())
+                {
+                    return Err(invalid("noncanonical MRS domain key"));
+                }
                 // MRS's internal + marker denotes a strict suffix. Inclusive
                 // source entries also produce a separate exact terminal.
                 rules.push(domain_entry(if key.starts_with("+.") {
@@ -125,6 +131,26 @@ mod tests {
             }
         }
         raw_frame(&body)
+    }
+
+    #[test]
+    fn noncanonical_domain_keys_reject_instead_of_changing_membership() {
+        for key in ["A", ".a", "a.", "+.a", "a"] {
+            let mut body = b"MRS\x01\x00".to_vec();
+            body.extend(1i64.to_be_bytes());
+            body.extend(0i64.to_be_bytes());
+            body.push(1);
+            body.extend(1i64.to_be_bytes());
+            body.extend((1u64 << key.len()).to_be_bytes());
+            body.extend(1i64.to_be_bytes());
+            let bitmap =
+                (0..key.len()).fold(1u64 << (key.len() * 2), |bits, i| bits | (1 << (2 * i + 1)));
+            body.extend(bitmap.to_be_bytes());
+            body.extend((key.len() as i64).to_be_bytes());
+            body.extend(key.bytes().rev());
+            let result = decode(&raw_frame(&body), None, &mut Compiler::default());
+            assert_eq!(result.is_ok(), matches!(key, "+.a" | "a"), "{key}");
+        }
     }
 
     #[test]
