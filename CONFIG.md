@@ -1196,6 +1196,12 @@ root dot and lowercases ASCII without changing the dial target.
 Declare a named local source as a top-level config item, then reference it from
 rules. Sources are read and compiled during validation, including `--dry-run`,
 before a reload stops existing listeners. Invalid sources reject the candidate.
+Automatic reload watches imported files as well as configs. A parseable rejected
+candidate keeps its source paths watched, so creating or repairing a missing file
+can recover without another config edit. Active sources remain watched until a
+replacement activates. `--no-reload` disables file watches; SIGHUP still reloads.
+Established connections retain their original rules until they drain. New routing
+caches belong to the new configuration; Fake DNS pools are preserved separately.
 
 ```yaml
 - rule_set: local_domains

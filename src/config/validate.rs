@@ -311,6 +311,9 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     // Combine into Config list (only Server and TunServer variants)
     let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
     result.extend(tun_configs.into_iter().map(Config::TunServer));
+    // Expansion can introduce built-in defaults. User/group predicates already
+    // hold shared Arcs; finish defaults before any listener starts.
+    super::rule_visit::compile(&mut result, &mut compiler)?;
 
     let mut validated = ValidatedConfigs {
         rule_files,

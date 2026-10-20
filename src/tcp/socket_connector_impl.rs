@@ -551,6 +551,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routed_ip_pins_first_answer_instead_of_dialing_an_unjudged_fallback() {
+        use crate::address::NetLocationMask;
+        use crate::client_proxy_selector::{
+            ClientProxySelector, ConnectAction, ConnectDecision, ConnectRule,
+        };
+        let refused = tokio::net::TcpSocket::new_v4().unwrap();
+        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let reachable = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let good = SocketAddr::from(([127, 0, 0, 1], reachable.local_addr().unwrap().port()));
+        let resolver: Arc<dyn Resolver> =
+            Arc::new(FixedResolver(vec![refused.local_addr().unwrap(), good]));
+        let selector = ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::from("127.0.0.0/8").unwrap()],
+            ConnectAction::new_allow(
+                None,
+                super::super::chain_builder::build_direct_chain_group(resolver.clone()),
+            ),
+        )]);
+        let location: ResolvedLocation = NetLocation::from_str("fallback.example:443", None)
+            .unwrap()
+            .into();
+        let ConnectDecision::Allow {
+            remote_location, ..
+        } = selector.judge(location.clone(), &resolver).await.unwrap()
+        else {
+            panic!("expected allow")
+        };
+        assert_eq!(
+            remote_location.resolved_addr(),
+            Some(refused.local_addr().unwrap())
+        );
+        let connector = SocketConnectorImpl::new_tcp(None, true);
+        assert!(
+            connector
+                .connect(&resolver, &remote_location)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reachable.accept())
+                .await
+                .is_err()
+        );
+        let stream = connector.connect(&resolver, &location).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), reachable.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(stream);
+    }
+
+    #[tokio::test]
     async fn hostname_quic_prefers_ipv4_without_waiting_for_stalled_ipv6() {
         use tokio::io::AsyncWriteExt;
         let Ok(blackhole) = UdpSocket::bind("[::1]:0").await else {

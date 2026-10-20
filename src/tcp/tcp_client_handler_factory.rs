@@ -413,9 +413,13 @@ pub fn create_tcp_client_proxy_selector(
 ) -> std::io::Result<ClientProxySelector> {
     let rules = rules
         .into_iter()
-        .map(|mut rule_config| {
-            // Internal protocol adapters also construct small rules without config validation.
-            rule_config.compile(&mut crate::rules::Compiler::default())?;
+        .map(|rule_config| {
+            #[cfg(test)]
+            let rule_config = {
+                let mut rule_config = rule_config;
+                rule_config.compile(&mut crate::rules::Compiler::default())?;
+                rule_config
+            };
             let RuleConfig {
                 criteria, action, ..
             } = rule_config;
@@ -431,7 +435,12 @@ pub fn create_tcp_client_proxy_selector(
                 RuleActionConfig::Block => ConnectAction::new_block(),
             };
             Ok(ConnectRule::compiled(
-                criteria.compiled.unwrap(),
+                criteria.compiled.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "routing predicates must be compiled during config preparation",
+                    )
+                })?,
                 criteria.no_resolve,
                 connect_action,
             ))
