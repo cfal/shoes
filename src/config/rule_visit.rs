@@ -78,22 +78,30 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn generated_default_is_compiled_during_validation() {
-        let configs =
-            serde_yaml::from_str("- address: '127.0.0.1:1080'\n  protocol: {type: socks}\n")
-                .unwrap();
-        let validated = crate::config::create_server_configs(configs).unwrap();
-        let Config::Server(server) = &validated.configs[0] else {
-            panic!("expected server")
-        };
-        let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-            panic!("expected generated default rule")
-        };
-        let predicate = rule.criteria.compiled.as_ref().unwrap();
-        assert_eq!(
-            predicate.evaluate(Some("example.com"), None, 443),
-            crate::rules::Outcome::Match
-        );
+    fn generated_defaults_are_compiled_during_validation() {
+        for rules in ["[]", "block-all", "allow-all-direct"] {
+            let configs = serde_yaml::from_str(&format!(
+                "- address: '127.0.0.1:1080'\n  protocol: {{type: socks}}\n  rules: {rules}\n"
+            ))
+            .unwrap();
+            let validated = crate::config::create_server_configs(configs).unwrap();
+            let Config::Server(server) = &validated.configs[0] else {
+                panic!("expected server")
+            };
+            let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
+                panic!("expected generated default rule")
+            };
+            let predicate = rule
+                .criteria
+                .compiled
+                .as_ref()
+                .unwrap_or_else(|| panic!("uncompiled validation-generated rule: {rules}"));
+            assert_eq!(
+                predicate.evaluate(Some("example.com"), None, 443),
+                crate::rules::Outcome::Match,
+                "rules: {rules}"
+            );
+        }
     }
 
     #[test]
