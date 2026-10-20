@@ -557,16 +557,22 @@ async fn xray_h2_packet_inactivity_bounds_permanent_stalls() -> fixture::Result 
 
 #[tokio::test]
 async fn xray_h2_default_byte_budgets_stalled_upload() -> fixture::Result {
-    xray_default_byte_budgets_stalled_upload("h2").await
+    xray_stalled_upload("h2", None).await
 }
 
 #[tokio::test]
 async fn xray_h3_default_byte_budgets_stalled_upload() -> fixture::Result {
-    xray_default_byte_budgets_stalled_upload("h3").await
+    xray_stalled_upload("h3", None).await
 }
 
-async fn xray_default_byte_budgets_stalled_upload(version: &str) -> fixture::Result {
-    let fixture = Fixture::new(Peer::Xray)?;
+#[tokio::test]
+async fn xray_h2_explicit_request_cap_stalled_upload() -> fixture::Result {
+    xray_stalled_upload("h2", Some(128)).await
+}
+
+async fn xray_stalled_upload(version: &str, request_limit: Option<usize>) -> fixture::Result {
+    let mut fixture = Fixture::new(Peer::Xray)?;
+    fixture.server_request_limit = request_limit;
     let pair = fixture.start_with_client_patch(fixture::Case {
             peer: Peer::Xray, shoes_client: false, protocol: "vless", version, mode: "packet-up",
         }, |config| {
@@ -641,7 +647,9 @@ async fn xray_default_byte_budgets_stalled_upload(version: &str) -> fixture::Res
         Ok::<_, std::io::Error>(())
     })
     .await
-    .map_err(|error| format!("default budgets, {version}: {error}"))??;
+    .map_err(|error| {
+        format!("default byte budgets, {version}, request cap {request_limit:?}: {error}")
+    })??;
     Ok(())
 }
 
