@@ -15,12 +15,6 @@ pub(super) fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Value> {
     Ok(value)
 }
 
-pub(super) fn decode_yaml(bytes: &[u8], budget: &mut Compiler) -> io::Result<Value> {
-    Seed { budget, depth: 0 }
-        .deserialize(serde_yaml::Deserializer::from_slice(bytes))
-        .map_err(|e| invalid(format!("rule-set YAML: {e}")))
-}
-
 struct Seed<'a> {
     budget: &'a mut Compiler,
     depth: usize,

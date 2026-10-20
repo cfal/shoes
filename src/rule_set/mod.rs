@@ -5,6 +5,7 @@ mod mihomo;
 mod mrs;
 mod singbox;
 mod srs;
+mod yaml;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
@@ -177,10 +178,10 @@ fn load_source(
     }
     let size = metadata.len() as usize;
     let predicate = compiler.source(|compiler| {
-        // Raw input and JSON string scratch overlap; YAML also retains parser events.
-        let factor = if format == Format::MihomoYaml { 16 } else { 2 };
+        // JSON may retain doubled escape scratch alongside an owned map key.
+        let factor = if format == Format::SingboxJson { 4 } else { 2 };
         compiler.charge(size.saturating_mul(factor).saturating_add(64), 0)?;
-        let mut bytes = Vec::with_capacity(size);
+        let mut bytes = Vec::with_capacity(size + 1);
         file.take(size as u64 + 1).read_to_end(&mut bytes)?;
         if bytes.len() != size {
             return Err(invalid(
@@ -223,6 +224,35 @@ fn load_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escaped_json_keys_reserve_scratch_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escaped.json");
+        std::fs::write(&path, format!(r#"{{"{}\n":0}}"#, "a".repeat(1024 * 1024))).unwrap();
+        let configs = vec![Config::RuleSet(RuleSetConfig {
+            rule_set: "escaped".into(),
+            path,
+            format: Some(Format::SingboxJson),
+            behavior: None,
+            code: None,
+            attributes: vec![],
+        })];
+        let mut compiler = Compiler::default();
+        compiler.charge(509 * 1024 * 1024, 0).unwrap();
+        assert!(
+            load(&configs, &mut compiler)
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+        assert!(
+            load(&configs, &mut Compiler::default())
+                .unwrap_err()
+                .to_string()
+                .contains("field name too long")
+        );
+    }
 
     #[test]
     fn source_errors_preserve_context_and_error_kind() {

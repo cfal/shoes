@@ -12,12 +12,6 @@ pub enum Behavior {
     Classical,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Provider {
-    payload: Vec<String>,
-}
-
 pub(super) fn decode(
     bytes: &[u8],
     yaml: bool,
@@ -25,9 +19,7 @@ pub(super) fn decode(
     budget: &mut Compiler,
 ) -> io::Result<Expression> {
     let entries = if yaml {
-        serde_json::from_value::<Provider>(super::json::decode_yaml(bytes, budget)?)
-            .map_err(|e| invalid(format!("Mihomo YAML: {e}")))?
-            .payload
+        super::yaml::decode(bytes, budget)?
     } else {
         std::str::from_utf8(bytes)
             .map_err(|_| invalid("invalid UTF-8 provider"))?
@@ -116,8 +108,7 @@ fn classical(value: &str) -> io::Result<Expression> {
         "DOMAIN-KEYWORD" if !payload.contains(',') => {
             Ok(Expression::DomainKeyword(vec![payload.to_owned()]))
         }
-        // Keep the source's case default scoped so inline overrides still work.
-        "DOMAIN-REGEX" => Ok(Expression::DomainRegex(vec![format!("(?i:{payload})")])),
+        "DOMAIN-REGEX" => Ok(Expression::DomainRegex(vec![format!("(?i){payload}")])),
         "IP-CIDR" | "IP-CIDR6" => {
             let (cidr, no_resolve) = match payload.split_once(',') {
                 Some((cidr, flag)) if flag.trim() == "no-resolve" => (cidr.trim(), true),
@@ -180,6 +171,19 @@ mod tests {
 
     #[test]
     fn classical_casing_ports_and_resolution() {
+        for payload in ["foo)|(.*", "a)b(", "ads)|(?i:tracker"] {
+            assert!(
+                Compiler::default()
+                    .compile(classical(&format!("DOMAIN-REGEX,{payload}")).unwrap())
+                    .is_err()
+            );
+        }
+        let comment = classical("DOMAIN-REGEX,(?x)^EXAMPLE$ # trailing comment").unwrap();
+        let predicate = Compiler::default().compile(comment).unwrap();
+        assert_eq!(
+            predicate.evaluate(Some("example"), None, 80),
+            Outcome::Match
+        );
         for entry in ["DOMAIN-KEYWORD,EXAMPLE", "DOMAIN-REGEX,^EXAMPLE$"] {
             let p = Compiler::default()
                 .compile(classical(entry).unwrap())

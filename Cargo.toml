@@ -52,6 +52,10 @@ name = "process_contract"
 path = "tests/process_contract.rs"
 
 [[test]]
+name = "rule_allocation"
+path = "tests/rule_allocation.rs"
+
+[[test]]
 name = "integration"
 path = "tests/integration.rs"
 required-features = ["integration-tests"]
@@ -106,6 +110,7 @@ futures = "*"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 ruzstd = "0.9.1"
 prost = "0.14.4"
+yaml-rust2 = { version = "0.13", default-features = false }
 h2 = "*"
 h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn = "*"
