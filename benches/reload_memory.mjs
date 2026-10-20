@@ -78,12 +78,14 @@ async function main() {
   await once(reservation, 'close');
   const config = [
     { global_limits: { reload_grace_secs: 60 } },
-    { rule_set: 'domains', path: path.resolve(domains), format: 'mihomo_yaml', behavior: 'domain' },
-    { rule_set: 'cn', path: path.resolve(cn) },
-    { rule_set: 'us', path: path.resolve(us) },
+    { rule_group: 'imported', rules: [
+      { path: path.resolve(domains), format: 'mihomo_yaml', behavior: 'domain' },
+      path.resolve(cn),
+      path.resolve(us),
+    ] },
     { address: `0.0.0.0:${port}`, protocol: { type: 'forward', target: `127.0.0.1:${echo.address().port}` },
-      rules: [{ rule_sets: ['domains', 'cn', 'us'], action: 'block' },
-        { match: { any_destination: true }, action: 'allow' }] },
+      rules: [{ masks: { rule_group: 'imported' }, action: 'block' },
+        { masks: { any_destination: true }, action: 'allow' }] },
   ];
   const configPath = path.join(directory, 'reload.json');
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
