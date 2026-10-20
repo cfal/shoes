@@ -88,65 +88,8 @@ impl Compiler {
                     .collect::<io::Result<Vec<_>>>()?;
                 return self.visit(Expression::DomainRegex(patterns), depth + 1);
             }
-            Expression::DomainKeyword(v) => {
-                self.strings(&v)?;
-                if v.is_empty() {
-                    return Ok(Predicate::new(Kind::Constant(false)));
-                }
-                if v.iter().any(String::is_empty) {
-                    return Err(invalid("empty domain keyword"));
-                }
-                if v.iter().map(String::len).sum::<usize>() > 4 * 1024 * 1024 {
-                    return Err(invalid("keyword pattern budget exceeded"));
-                }
-                let before = self.bytes;
-                let pattern_bytes = v.iter().map(String::len).sum::<usize>();
-                self.charge(pattern_bytes.saturating_mul(256).saturating_add(4096), 0)?;
-                let v: Vec<_> = v.into_iter().map(|s| s.to_ascii_lowercase()).collect();
-                let matcher = aho_corasick::AhoCorasick::builder()
-                    .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
-                    .build(&v)
-                    .map_err(|e| invalid(format!("keywords: {e}")))?;
-                self.bytes = before;
-                self.charge(matcher.memory_usage(), 0)?;
-                Kind::Keywords(matcher)
-            }
-            Expression::DomainRegex(v) => {
-                self.strings(&v)?;
-                if v.is_empty() {
-                    return Ok(Predicate::new(Kind::Constant(false)));
-                }
-                let pattern_bytes = v.iter().map(String::len).sum::<usize>();
-                if pattern_bytes > 512 * 1024 {
-                    return Err(invalid("regex pattern budget exceeded"));
-                }
-                let before = self.bytes;
-                // AST/HIR construction precedes the NFA size limit. ASCII
-                // case-folded classes can cost hundreds of bytes per character.
-                self.charge(pattern_bytes * 512 + 64 * 1024 * 1024, 0)?;
-                let matcher = regex_automata::meta::Regex::builder()
-                    .configure(
-                        regex_automata::meta::Regex::config()
-                            .which_captures(regex_automata::nfa::thompson::WhichCaptures::None)
-                            .hybrid_cache_capacity(256 * 1024)
-                            .nfa_size_limit(Some(16 * 1024 * 1024))
-                            .dfa_size_limit(Some(16 * 1024 * 1024))
-                            .onepass_size_limit(Some(16 * 1024 * 1024)),
-                    )
-                    .syntax(
-                        regex_automata::util::syntax::Config::new()
-                            .unicode(false)
-                            .utf8(false),
-                    )
-                    .build_many(&v)
-                    .map_err(|e| invalid(format!("unsupported or oversized regex: {e}")))?;
-                self.bytes = before;
-                if matcher.memory_usage() > 16 * 1024 * 1024 {
-                    return Err(invalid("compiled regex exceeds 16 MiB"));
-                }
-                self.charge(matcher.memory_usage(), 0)?;
-                Kind::Regex(matcher)
-            }
+            Expression::DomainKeyword(patterns) => self.compile_keywords(patterns)?,
+            Expression::DomainRegex(patterns) => self.compile_regex(patterns)?,
             Expression::IpCidr(v) => {
                 self.strings(&v)?;
                 let mut ranges = IpRanges::default();
@@ -237,6 +180,70 @@ impl Compiler {
             Expression::Not(p) => Kind::Not(self.visit_domain(*p, depth + 1)?),
         };
         Ok(Predicate::new(kind))
+    }
+
+    fn compile_keywords(&mut self, patterns: Vec<String>) -> io::Result<Kind> {
+        self.strings(&patterns)?;
+        if patterns.is_empty() {
+            return Ok(Kind::Constant(false));
+        }
+        if patterns.iter().any(String::is_empty) {
+            return Err(invalid("empty domain keyword"));
+        }
+        let pattern_bytes = patterns.iter().map(String::len).sum::<usize>();
+        if pattern_bytes > 4 * 1024 * 1024 {
+            return Err(invalid("keyword pattern budget exceeded"));
+        }
+        let before = self.bytes;
+        self.charge(pattern_bytes.saturating_mul(256).saturating_add(4096), 0)?;
+        let patterns: Vec<_> = patterns
+            .into_iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let matcher = aho_corasick::AhoCorasick::builder()
+            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+            .build(&patterns)
+            .map_err(|e| invalid(format!("keywords: {e}")))?;
+        self.bytes = before;
+        self.charge(matcher.memory_usage(), 0)?;
+        Ok(Kind::Keywords(matcher))
+    }
+
+    fn compile_regex(&mut self, patterns: Vec<String>) -> io::Result<Kind> {
+        self.strings(&patterns)?;
+        if patterns.is_empty() {
+            return Ok(Kind::Constant(false));
+        }
+        let pattern_bytes = patterns.iter().map(String::len).sum::<usize>();
+        if pattern_bytes > 512 * 1024 {
+            return Err(invalid("regex pattern budget exceeded"));
+        }
+        let before = self.bytes;
+        // AST/HIR construction precedes the NFA size limit. ASCII
+        // case-folded classes can cost hundreds of bytes per character.
+        self.charge(pattern_bytes * 512 + 64 * 1024 * 1024, 0)?;
+        let matcher = regex_automata::meta::Regex::builder()
+            .configure(
+                regex_automata::meta::Regex::config()
+                    .which_captures(regex_automata::nfa::thompson::WhichCaptures::None)
+                    .hybrid_cache_capacity(256 * 1024)
+                    .nfa_size_limit(Some(16 * 1024 * 1024))
+                    .dfa_size_limit(Some(16 * 1024 * 1024))
+                    .onepass_size_limit(Some(16 * 1024 * 1024)),
+            )
+            .syntax(
+                regex_automata::util::syntax::Config::new()
+                    .unicode(false)
+                    .utf8(false),
+            )
+            .build_many(&patterns)
+            .map_err(|e| invalid(format!("unsupported or oversized regex: {e}")))?;
+        self.bytes = before;
+        if matcher.memory_usage() > 16 * 1024 * 1024 {
+            return Err(invalid("compiled regex exceeds 16 MiB"));
+        }
+        self.charge(matcher.memory_usage(), 0)?;
+        Ok(Kind::Regex(matcher))
     }
 
     fn visit_domain(&mut self, expression: Expression, depth: usize) -> io::Result<Arc<Predicate>> {
@@ -390,6 +397,38 @@ fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
 mod tests {
     use super::*;
     use crate::rules::Outcome;
+
+    #[test]
+    fn matcher_builders_preserve_empty_predicates_and_budget_charges() {
+        for expression in [
+            Expression::DomainKeyword(Vec::new()),
+            Expression::DomainRegex(Vec::new()),
+        ] {
+            let mut compiler = Compiler::default();
+            let predicate = compiler.compile(expression).unwrap();
+            assert_eq!(predicate.evaluate(None, None, 443), Outcome::Miss);
+            assert!(!predicate.dependencies.hostname);
+            assert_eq!((compiler.bytes, compiler.entries), (128, 0));
+        }
+        for regex in [false, true] {
+            let pattern = String::from("example");
+            let string_bytes = pattern.capacity() * 4 + 96;
+            let expression = if regex {
+                Expression::DomainRegex(vec![pattern])
+            } else {
+                Expression::DomainKeyword(vec![pattern])
+            };
+            let mut compiler = Compiler::default();
+            let predicate = compiler.compile(expression).unwrap();
+            let retained = match &predicate.kind {
+                Kind::Keywords(matcher) => matcher.memory_usage(),
+                Kind::Regex(matcher) => matcher.memory_usage(),
+                other => panic!("unexpected matcher: {other:?}"),
+            };
+            assert_eq!(compiler.bytes, 128 + string_bytes + retained);
+            assert_eq!(compiler.entries, 1);
+        }
+    }
 
     #[test]
     fn port_buckets_preserve_pairs_and_dns_permissions() {
