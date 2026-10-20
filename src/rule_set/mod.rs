@@ -18,6 +18,9 @@ use crate::config::Config;
 use crate::rules::{Compiler, Predicate, invalid};
 pub use mihomo::Behavior;
 
+/// Conservative YAML parser scratch reservation, excluding retained entries.
+pub const YAML_PARSER_SCRATCH_BYTES: usize = 64 * 1024 * 1024;
+
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]

@@ -6,6 +6,7 @@ pub(super) const MAX_ENTRIES: usize = 2_000_000;
 pub(super) const MAX_INFLATED: usize = 256 * 1024 * 1024;
 
 pub(super) fn inflate(bytes: &[u8], budget: &mut Compiler) -> io::Result<Vec<u8>> {
+    budget.charge(128 * 1024, 0)?;
     let mut decoder = flate2::Decompress::new(true);
     let mut result = Vec::new();
     let mut chunk = [0; 8192];
@@ -16,11 +17,7 @@ pub(super) fn inflate(bytes: &[u8], budget: &mut Compiler) -> io::Result<Vec<u8>
             .decompress(&bytes[input..], &mut chunk, flate2::FlushDecompress::None)
             .map_err(|e| invalid(format!("invalid zlib stream: {e}")))?;
         let written = (decoder.total_out() - output) as usize;
-        if result.len() + written > MAX_INFLATED {
-            return Err(invalid("inflated rule-set size limit exceeded"));
-        }
-        budget.charge(written * 2, 0)?;
-        result.extend_from_slice(&chunk[..written]);
+        append_inflated(&mut result, &chunk[..written], budget)?;
         if status == flate2::Status::StreamEnd {
             if decoder.total_in() as usize != bytes.len() {
                 return Err(invalid("trailing compressed rule-set bytes"));
@@ -31,6 +28,29 @@ pub(super) fn inflate(bytes: &[u8], budget: &mut Compiler) -> io::Result<Vec<u8>
             return Err(invalid("truncated zlib stream"));
         }
     }
+}
+
+pub(super) fn append_inflated(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    budget: &mut Compiler,
+) -> io::Result<()> {
+    let len = output
+        .len()
+        .checked_add(bytes.len())
+        .filter(|&len| len <= MAX_INFLATED)
+        .ok_or_else(|| invalid("inflated rule-set size limit exceeded"))?;
+    if len > output.capacity() {
+        let capacity = len.max(output.capacity() * 2).min(MAX_INFLATED);
+        // Keep prior capacity charges until source compilation ends, covering
+        // old and new buffers during a moving reallocation.
+        budget.charge(capacity, 0)?;
+        output
+            .try_reserve_exact(capacity - output.len())
+            .map_err(io::Error::other)?;
+    }
+    output.extend_from_slice(bytes);
+    Ok(())
 }
 
 pub(super) struct Reader<'a> {
@@ -218,6 +238,23 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inflation_growth_is_admitted_before_reallocation() {
+        let mut budget = Compiler::default();
+        budget.charge(512 * 1024 * 1024 - 20 * 1024, 0).unwrap();
+        let mut output = Vec::new();
+        append_inflated(&mut output, &[0; 8192], &mut budget).unwrap();
+        assert_eq!(output.capacity(), 8192);
+        assert!(
+            append_inflated(&mut output, &[0], &mut budget)
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+        assert_eq!(output.len(), 8192);
+        assert_eq!(output.capacity(), 8192);
+    }
 
     #[test]
     fn counted_strings_allocate_only_the_charged_slots() {

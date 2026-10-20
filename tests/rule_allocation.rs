@@ -1,8 +1,9 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use shoes::config::Config;
-use shoes::rule_set::{Behavior, Format, RuleSetConfig};
+use shoes::rule_set::{Behavior, Format, RuleSetConfig, YAML_PARSER_SCRATCH_BYTES};
 use shoes::rules::{Compiler, Expression};
 
 struct CountingAllocator;
@@ -49,7 +50,7 @@ fn peak<T>(run: impl FnOnce() -> T) -> (T, usize) {
     (result, PEAK.load(Relaxed).saturating_sub(baseline))
 }
 
-fn load_peak(bytes: &[u8], format: Format) -> (std::io::Result<()>, usize) {
+fn load_peak(bytes: &[u8], format: Format, precharged: usize) -> (std::io::Result<()>, usize) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source");
     std::fs::write(&path, bytes).unwrap();
@@ -61,7 +62,9 @@ fn load_peak(bytes: &[u8], format: Format) -> (std::io::Result<()>, usize) {
         code: (format == Format::GeositeDat).then(|| "TEST".into()),
         attributes: vec![],
     })];
-    peak(|| shoes::rule_set::load(&configs, &mut Compiler::default()))
+    let mut compiler = Compiler::default();
+    compiler.charge(precharged, 0).unwrap();
+    peak(|| shoes::rule_set::load(&configs, &mut compiler))
 }
 
 fn message(tag: u32, bytes: &[u8]) -> Vec<u8> {
@@ -81,16 +84,16 @@ fn adversarial_inputs_stay_within_their_compilation_reserves() {
         format!("{{[{}]: a}}", "a,".repeat(350_000)),
         format!("[[{}]]", ":,".repeat(350_000)),
     ] {
-        let (result, used) = load_peak(yaml.as_bytes(), Format::MihomoYaml);
+        let (result, used) = load_peak(yaml.as_bytes(), Format::MihomoYaml, 0);
         assert!(result.is_err());
         assert!(
-            used < 32 * 1024 * 1024 + yaml.len() * 2,
+            used < YAML_PARSER_SCRATCH_BYTES + yaml.len() * 2,
             "YAML peak: {used}"
         );
         println!("YAML bytes={}, peak={used}", yaml.len());
     }
     let json = format!(r#"{{"{}\n":0}}"#, "a".repeat(1024 * 1024));
-    let (result, used) = load_peak(json.as_bytes(), Format::SingboxJson);
+    let (result, used) = load_peak(json.as_bytes(), Format::SingboxJson, 0);
     assert!(result.is_err());
     assert!(used < json.len() * 4 + 4096, "JSON peak: {used}");
     println!("JSON bytes={}, peak={used}", json.len());
@@ -101,7 +104,7 @@ fn adversarial_inputs_stay_within_their_compilation_reserves() {
     let mut category = message(1, b"TEST");
     category.extend(message(2, &domain));
     let dat = message(1, &category);
-    let (result, used) = load_peak(&dat, Format::GeositeDat);
+    let (result, used) = load_peak(&dat, Format::GeositeDat, 0);
     result.unwrap();
     assert!(
         used < dat.len() * 10 + count * 160 + 4096,
@@ -115,4 +118,26 @@ fn adversarial_inputs_stay_within_their_compilation_reserves() {
     let reserve = bytes * 512 + 64 * 1024 * 1024;
     assert!(used < reserve, "regex peak: {used}, reserve: {reserve}");
     println!("regex bytes={bytes}, peak={used}, reserve={reserve}");
+
+    let inflated = vec![0; 8 * 1024 * 1024 + 1];
+    let mut zlib =
+        flate2::write::ZlibEncoder::new(b"SRS\x02".to_vec(), flate2::Compression::fast());
+    zlib.write_all(&inflated).unwrap();
+    let zstd = ruzstd::encoding::compress_to_vec(
+        inflated.as_slice(),
+        ruzstd::encoding::CompressionLevel::Fastest,
+    );
+    for (format, input, available) in [
+        (Format::Srs, zlib.finish().unwrap(), 20 * 1024 * 1024),
+        (Format::Mrs, zstd, 44 * 1024 * 1024),
+    ] {
+        let (result, used) = load_peak(&input, format, 512 * 1024 * 1024 - available);
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("budget"), "{format:?}: {error}");
+        assert!(
+            used < available,
+            "{format:?} peak: {used}, available: {available}"
+        );
+        println!("{format:?} growth rejection peak={used}, available={available}");
+    }
 }

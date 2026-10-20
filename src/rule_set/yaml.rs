@@ -4,10 +4,10 @@ use std::io;
 use yaml_rust2::parser::{Event, Parser};
 use yaml_rust2::scanner::TScalarStyle;
 
+use super::YAML_PARSER_SCRATCH_BYTES as PARSER_SCRATCH;
 use crate::rules::{Compiler, invalid};
 
 const READ_AHEAD: usize = 128 * 1024;
-const PARSER_SCRATCH: usize = READ_AHEAD * 256;
 
 pub(super) fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Vec<String>> {
     budget.charge(PARSER_SCRATCH, 0)?;

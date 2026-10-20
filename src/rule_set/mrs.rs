@@ -1,6 +1,6 @@
 use std::io::{self, Read};
 
-use super::binary::{MAX_ENTRIES, MAX_INFLATED, Reader};
+use super::binary::{MAX_ENTRIES, Reader, append_inflated};
 use super::mihomo::{Behavior, domain_entry};
 use crate::rules::{Compiler, Expression, IpRanges, invalid};
 
@@ -18,11 +18,7 @@ fn inflate(bytes: &[u8], budget: &mut Compiler) -> io::Result<Vec<u8>> {
         if len == 0 {
             break;
         }
-        if output.len() + len > MAX_INFLATED {
-            return Err(invalid("MRS inflated size limit exceeded"));
-        }
-        budget.charge(len * 2, 0)?;
-        output.extend_from_slice(&chunk[..len]);
+        append_inflated(&mut output, &chunk[..len], budget)?;
     }
     let (remaining, decoder) = decoder.into_parts();
     if !remaining.is_empty() || !decoder.is_finished() {
