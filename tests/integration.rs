@@ -12,6 +12,8 @@ mod h2mux_backpressure;
 mod h2mux_singbox;
 #[path = "cases/integration/http2_proxy.rs"]
 mod http2_proxy;
+#[path = "cases/integration/http_host_sniffing.rs"]
+mod http_host_sniffing;
 #[path = "cases/integration/hysteria2_integration.rs"]
 mod hysteria2;
 #[path = "cases/integration/hysteria2_udp_integration.rs"]

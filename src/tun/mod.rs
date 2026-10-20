@@ -541,6 +541,7 @@ mod tests {
             for case in [
                 FakeTcpCase::Dns,
                 FakeTcpCase::Tls,
+                FakeTcpCase::Http,
                 FakeTcpCase::Plain,
                 FakeTcpCase::Unknown,
             ] {

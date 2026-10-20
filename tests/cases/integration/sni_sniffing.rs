@@ -12,6 +12,21 @@ fn hello() -> Vec<u8> {
     hello_with_sni(true)
 }
 
+fn http_request() -> Vec<u8> {
+    b"GET / HTTP/1.1\r\nHost: sniff.invalid\r\n\r\n".to_vec()
+}
+
+async fn nested_exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    payload: &[u8],
+) -> io::Result<()> {
+    stream.write_all(payload).await?;
+    let mut response = [0; 12];
+    stream.read_exact(&mut response).await?;
+    assert_eq!(&response, b"nested reply");
+    stream.shutdown().await
+}
+
 fn hello_with_sni(sni: bool) -> Vec<u8> {
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -73,7 +88,7 @@ async fn nested_tls_connect_inherits_fake_dns_and_sniff_but_uses_child_rules() -
         let server_tls = rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap()
             .with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()], rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into()).map_err(io::Error::other)?;
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
-        for fake in [false, true] {
+        for (fake, inner_http) in [(false, false), (true, false), (false, true), (true, true)] {
             let exit = TcpListener::bind("0.0.0.0:0").await?;
             let mut ports = PortHelper::new();
             let (_, port) = ports.get_localhost_listener_port();
@@ -129,13 +144,21 @@ async fn nested_tls_connect_inherits_fake_dns_and_sniff_but_uses_child_rules() -
                 }
                 assert_eq!(stream.read_u16().await?, 443);
                 stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-                let mut tls = acceptor.accept(stream).await?;
-                assert_eq!(tls.get_ref().1.server_name(), Some("sniff.invalid"));
-                let mut payload = [0; 12];
-                tls.read_exact(&mut payload).await?;
-                assert_eq!(&payload, b"nested hello");
-                tls.write_all(b"nested reply").await?;
-                tls.shutdown().await
+                if inner_http {
+                    let mut payload = vec![0; http_request().len()];
+                    stream.read_exact(&mut payload).await?;
+                    assert_eq!(payload, http_request());
+                    stream.write_all(b"nested reply").await?;
+                    stream.shutdown().await
+                } else {
+                    let mut tls = acceptor.accept(stream).await?;
+                    assert_eq!(tls.get_ref().1.server_name(), Some("sniff.invalid"));
+                    let mut payload = [0; 12];
+                    tls.read_exact(&mut payload).await?;
+                    assert_eq!(&payload, b"nested hello");
+                    tls.write_all(b"nested reply").await?;
+                    tls.shutdown().await
+                }
             };
             let client = async {
                 let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
@@ -144,12 +167,12 @@ async fn nested_tls_connect_inherits_fake_dns_and_sniff_but_uses_child_rules() -
                 let mut headers = Vec::new();
                 while !headers.ends_with(b"\r\n\r\n") { headers.push(outer.read_u8().await?); }
                 assert!(headers.starts_with(b"HTTP/1.1 200"));
-                let mut inner = connector.connect("sniff.invalid".try_into().unwrap(), outer).await?;
-                inner.write_all(b"nested hello").await?;
-                let mut response = [0; 12];
-                inner.read_exact(&mut response).await?;
-                assert_eq!(&response, b"nested reply");
-                inner.shutdown().await
+                if inner_http {
+                    nested_exchange(outer, &http_request()).await
+                } else {
+                    let inner = connector.connect("sniff.invalid".try_into().unwrap(), outer).await?;
+                    nested_exchange(inner, b"nested hello").await
+                }
             };
             tokio::try_join!(upstream, client)?;
         }
@@ -165,6 +188,13 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
         for protocol in ["socks", "http"] {
             for (sniff, kind, pipelined) in [
                 (false, "tls", true),
+                (false, "http", true),
+                (true, "http", true),
+                (true, "http", false),
+                (true, "http-duplicate", false),
+                (true, "http-missing", false),
+                (true, "http-partial", false),
+                (true, "supplied-hostname-http", false),
                 (true, "tls", true),
                 (true, "tls", false),
                 (true, "plain", true),
@@ -181,7 +211,7 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 let dns_port = real_dns.local_addr()?.port();
                 let mut ports = PortHelper::new();
                 let (_, port) = ports.get_localhost_listener_port();
-                let (restored_action, sniff_action) = if sniff && kind == "tls" {
+                let (restored_action, sniff_action) = if sniff && matches!(kind, "tls" | "http") {
                     ("action: block", "client_chain: exit")
                 } else {
                     ("client_chain: exit", "action: block")
@@ -212,7 +242,7 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 ports.wait_for_all_ports().await?;
 
                 let unknown: SocketAddrV4 = "198.18.0.250:443".parse().unwrap();
-                for prefix in [Vec::new(), hello()] {
+                for prefix in [Vec::new(), hello(), http_request()] {
                     let mut client = TcpStream::connect(("127.0.0.1", port)).await?;
                     send_request_to(&mut client, protocol, unknown, &prefix).await?;
                     let mut reply = Vec::new();
@@ -262,6 +292,10 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 dns.shutdown().await?;
                 let fake_target = SocketAddrV4::new(fake_ip.unwrap(), 443);
                 let payload = match kind {
+                    "http" | "supplied-hostname-http" => http_request(),
+                    "http-duplicate" => b"GET / HTTP/1.1\r\nHost: sniff.invalid\r\nHost: other.invalid\r\n\r\n".to_vec(),
+                    "http-missing" => b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+                    "http-partial" => b"GET / HTTP/1.1\r\nHost: sniff.invalid\r\n".to_vec(),
                     "tls" | "supplied-hostname" => hello(),
                     "no-sni" => hello_with_sni(false),
                     "partial" => hello()[..5].to_vec(),
@@ -293,7 +327,7 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 };
                 let client = async {
                     let mut client = TcpStream::connect(("127.0.0.1", port)).await?;
-                    if kind == "supplied-hostname" {
+                    if kind.starts_with("supplied-hostname") {
                         if protocol == "http" {
                             client.write_all(b"CONNECT restored.invalid:443 HTTP/1.1\r\nHost: restored.invalid:443\r\n\r\n").await?;
                             let mut headers = Vec::new();
@@ -324,7 +358,7 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                         client.write_all(&payload).await?;
                     }
                     let mut response = Vec::new();
-                    if matches!(kind, "server-first" | "partial") {
+                    if matches!(kind, "server-first" | "partial" | "http-partial") {
                         response.resize(8, 0);
                         client.read_exact(&mut response).await?;
                         assert_eq!(response, b"greeting");
@@ -354,7 +388,7 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
 async fn listener_config_enables_route_only_sniffing_for_gated_and_pipelined_clients()
 -> io::Result<()> {
     timeout(Duration::from_secs(30), async {
-        for protocol in ["socks", "http"] {
+        for (protocol, bytes) in [("socks", hello()), ("http", hello()), ("socks", http_request()), ("http", http_request())] {
             for (sniff, pipelined) in [(None, false), (Some(false), false), (Some(true), false), (Some(true), true)] {
                 let target = TcpListener::bind("0.0.0.0:0").await?;
                 let target_port = target.local_addr()?.port();
@@ -365,7 +399,6 @@ async fn listener_config_enables_route_only_sniffing_for_gated_and_pipelined_cli
                     "- address: '0.0.0.0:{port}'\n  protocol: {{type: {protocol}}}\n{setting}  rules:\n    - masks: sniff.invalid\n      action: allow\n",
                 ))?;
                 ports.wait_for_all_ports().await?;
-                let bytes = hello();
                 let mut client = TcpStream::connect(("127.0.0.1", port)).await?;
                 let result = super::plain_tcp_relay::request(
                     &mut client, protocol, target_port, if pipelined { &bytes } else { &[] },
@@ -382,7 +415,7 @@ async fn listener_config_enables_route_only_sniffing_for_gated_and_pipelined_cli
                 let (mut upstream, _) = target.accept().await?;
                 let mut received = Vec::new();
                 upstream.read_to_end(&mut received).await?;
-                let mut expected = bytes;
+                let mut expected = bytes.clone();
                 expected.extend_from_slice(b"tail");
                 assert_eq!(received, expected);
                 upstream.write_all(b"after half-close").await?;

@@ -634,12 +634,12 @@ mod sniff_tests {
 
     #[tokio::test]
     async fn fake_dns_udp_modes() {
-        use crate::routing::ingress::tests::{PacketMode, UdpFixture};
+        use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             for fixed in [false, true] {
-                for dns in [false, true] {
+                for case in [UdpCase::Dns, UdpCase::Tls, UdpCase::Http] {
                     let mut tasks = JoinSet::new();
-                    let fixture = UdpFixture::new(dns, &mut tasks).await;
+                    let fixture = UdpFixture::new(case, &mut tasks).await;
                     let mode = if fixed {
                         PacketMode::Fixed
                     } else {
@@ -682,7 +682,7 @@ mod sniff_tests {
         use crate::tcp::ingress::tests::FakeTcpCase;
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             for padded in [false, true] {
-                for case in [FakeTcpCase::Dns, FakeTcpCase::Tls, FakeTcpCase::Plain, FakeTcpCase::Unknown] {
+                for case in [FakeTcpCase::Dns, FakeTcpCase::Tls, FakeTcpCase::Http, FakeTcpCase::Plain, FakeTcpCase::Unknown] {
                     let mut upstreams = JoinSet::new();
                     let (selector, resolver, target, payload) = case.fixture(&mut upstreams).await;
                     let tasks = Arc::new(Mutex::new(JoinSet::new()));

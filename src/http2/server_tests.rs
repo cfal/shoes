@@ -17,6 +17,7 @@ async fn fake_dns_adapter_contract() {
         for case in [
             FakeTcpCase::Dns,
             FakeTcpCase::Tls,
+            FakeTcpCase::Http,
             FakeTcpCase::Plain,
             FakeTcpCase::Unknown,
         ] {
@@ -864,7 +865,15 @@ async fn reset_and_connection_teardown_cancel_pending_setup() {
 
 #[tokio::test]
 async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
-    for during_dial in [false, true] {
+    for (during_dial, payload) in [
+        (false, Vec::new()),
+        (
+            true,
+            crate::sniff::tests::hello(&rustls::version::TLS13, true),
+        ),
+        (false, b"GET / HTTP/1.1\r\nHost: sniff.example\r\n".to_vec()),
+        (true, crate::sniff::tests::http_request()),
+    ] {
         tokio::time::timeout(Duration::from_secs(3), async {
             let resolver = Arc::new(PendingResolver {
                 started: Arc::new(tokio::sync::Notify::new()),
@@ -907,11 +916,8 @@ async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
                 .await
                 .unwrap();
             assert_eq!(response.status, StatusCode::OK);
+            stream.write_all(&payload).await.unwrap();
             if during_dial {
-                stream
-                    .write_all(&crate::sniff::tests::hello(&rustls::version::TLS13, true))
-                    .await
-                    .unwrap();
                 resolver.started.notified().await;
             }
             drop(stream);

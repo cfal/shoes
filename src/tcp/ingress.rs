@@ -256,6 +256,7 @@ pub(crate) mod tests {
     pub(crate) enum FakeTcpCase {
         Dns,
         Tls,
+        Http,
         Plain,
         Unknown,
     }
@@ -272,6 +273,7 @@ pub(crate) mod tests {
         ) {
             let payload = match self {
                 Self::Tls => crate::sniff::tests::hello(&rustls::version::TLS13, true),
+                Self::Http => crate::sniff::tests::http_request(),
                 Self::Plain => b"not TLS".to_vec(),
                 Self::Dns => {
                     use hickory_resolver::proto::{
@@ -291,11 +293,11 @@ pub(crate) mod tests {
                 }
                 Self::Unknown => Vec::new(),
             };
-            let (selector, resolver) = if matches!(self, Self::Tls | Self::Plain) {
+            let (selector, resolver) = if matches!(self, Self::Tls | Self::Http | Self::Plain) {
                 socks_target_at(
                     payload.clone(),
                     "restored.example:443",
-                    if self == Self::Tls {
+                    if matches!(self, Self::Tls | Self::Http) {
                         "sniff.example"
                     } else {
                         "restored.example"

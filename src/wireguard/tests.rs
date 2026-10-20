@@ -339,30 +339,34 @@ async fn wireguard_config_sniffs_literal_and_restored_targets_without_rewriting(
             (NetLocation::from_str("192.0.2.9:443", None).unwrap(), NetLocation::from_str("192.0.2.9:443", None).unwrap()),
             (NetLocation::from_ip_addr(ip.0.into(), 443), NetLocation::from_str("restored.example:443", None).unwrap()),
         ] {
-            let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
-            let upstream = async {
-                let (mut stream, _) = exit.accept().await.unwrap();
-                let mut greeting = [0; 3];
-                stream.read_exact(&mut greeting).await.unwrap();
-                assert_eq!(greeting, [5, 1, 0]);
-                stream.write_all(&[5, 0]).await.unwrap();
-                stream.read_exact(&mut greeting).await.unwrap();
-                assert_eq!(greeting, [5, 1, 0]);
-                assert_eq!(crate::socks_handler::read_location_direct(&mut stream).await.unwrap(), expected);
-                stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
-                let mut bytes = vec![0; hello.len()];
-                stream.read_exact(&mut bytes).await.unwrap();
-                assert_eq!(bytes, hello);
-                stream.write_all(b"sniffed").await.unwrap();
-            };
-            let client = async {
-                let mut stream = connector.connect(&resolver, &target.into()).await.unwrap();
-                stream.write_all(&hello).await.unwrap();
-                let mut response = [0; 7];
-                stream.read_exact(&mut response).await.unwrap();
-                assert_eq!(&response, b"sniffed");
-            };
-            tokio::join!(upstream, client);
+            for payload in [
+                crate::sniff::tests::hello(&rustls::version::TLS13, true),
+                crate::sniff::tests::http_request(),
+            ] {
+                let upstream = async {
+                    let (mut stream, _) = exit.accept().await.unwrap();
+                    let mut greeting = [0; 3];
+                    stream.read_exact(&mut greeting).await.unwrap();
+                    assert_eq!(greeting, [5, 1, 0]);
+                    stream.write_all(&[5, 0]).await.unwrap();
+                    stream.read_exact(&mut greeting).await.unwrap();
+                    assert_eq!(greeting, [5, 1, 0]);
+                    assert_eq!(crate::socks_handler::read_location_direct(&mut stream).await.unwrap(), expected);
+                    stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                    let mut bytes = vec![0; payload.len()];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    assert_eq!(bytes, payload);
+                    stream.write_all(b"sniffed").await.unwrap();
+                };
+                let client = async {
+                    let mut stream = connector.connect(&resolver, &target.clone().into()).await.unwrap();
+                    stream.write_all(&payload).await.unwrap();
+                    let mut response = [0; 7];
+                    stream.read_exact(&mut response).await.unwrap();
+                    assert_eq!(&response, b"sniffed");
+                };
+                tokio::join!(upstream, client);
+            }
         }
         running.stop().await;
     }).await.unwrap();

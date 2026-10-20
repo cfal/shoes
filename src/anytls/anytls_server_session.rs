@@ -1021,12 +1021,12 @@ mod tests {
 
     #[tokio::test]
     async fn fake_dns_udp_modes() {
-        use crate::routing::ingress::tests::{PacketMode, UdpFixture};
+        use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
         timeout(Duration::from_secs(10), async {
             for fixed in [false, true] {
-                for dns in [false, true] {
+                for case in [UdpCase::Dns, UdpCase::Tls, UdpCase::Http] {
                     let mut tasks = tokio::task::JoinSet::new();
-                    let fixture = UdpFixture::new(dns, &mut tasks).await;
+                    let fixture = UdpFixture::new(case, &mut tasks).await;
                     let mode = if fixed {
                         PacketMode::Fixed
                     } else {
@@ -1071,7 +1071,7 @@ mod tests {
                         }
                         assert_eq!(&status, &Frame::control(Command::SynAck, id).encode()[..]);
                         // The second stream proves the session survives; DNS supports repeated queries.
-                        if id == 2 || dns {
+                        if id == 2 || case == UdpCase::Dns {
                             peer.write_all(
                                 &Frame::data(id, Bytes::from(fixture.request(mode))).encode(),
                             )
@@ -1121,7 +1121,12 @@ mod tests {
         use crate::tcp::ingress::tests::FakeTcpCase;
         timeout(Duration::from_secs(10), async {
             for version in [1, 2] {
-                for case in [FakeTcpCase::Dns, FakeTcpCase::Tls, FakeTcpCase::Plain] {
+                for case in [
+                    FakeTcpCase::Dns,
+                    FakeTcpCase::Tls,
+                    FakeTcpCase::Http,
+                    FakeTcpCase::Plain,
+                ] {
                     let mut tasks = tokio::task::JoinSet::new();
                     let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
                     let (server, mut peer) = duplex(8192);
