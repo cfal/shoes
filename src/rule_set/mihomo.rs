@@ -55,26 +55,23 @@ pub(super) fn decode(
 pub(super) fn domain_entry(value: &str) -> io::Result<Expression> {
     let suffix = value
         .strip_prefix("+.")
-        .map(|v| (v, '*'))
-        .or_else(|| value.strip_prefix('.').map(|v| (v, '+')));
-    if let Some((name, repeat)) = suffix
-        && name.contains('*')
-    {
-        let pattern = domain::wildcard(name)?;
-        return Ok(Expression::DomainRegex(vec![format!(
-            r"^(?:[^.]+\.){repeat}{}",
-            &pattern[1..]
-        )]));
-    }
-    if let Some(name) = value.strip_prefix("+.") {
-        return Ok(Expression::DomainSuffix(vec![
-            domain::normalize(name)?.into_owned(),
-        ]));
-    }
-    if let Some(name) = value.strip_prefix('.') {
-        return Ok(Expression::Subdomains(vec![
-            domain::normalize(name)?.into_owned(),
-        ]));
+        .map(|name| (name, true))
+        .or_else(|| value.strip_prefix('.').map(|name| (name, false)));
+    if let Some((name, include_root)) = suffix {
+        if name.contains('*') {
+            let pattern = domain::wildcard(name)?;
+            let repeat = if include_root { '*' } else { '+' };
+            return Ok(Expression::DomainRegex(vec![format!(
+                r"^(?:[^.]+\.){repeat}{}",
+                &pattern[1..]
+            )]));
+        }
+        let names = vec![domain::normalize(name)?.into_owned()];
+        return Ok(if include_root {
+            Expression::DomainSuffix(names)
+        } else {
+            Expression::Subdomains(names)
+        });
     }
     if value.contains('*') {
         return Ok(Expression::DomainRegex(vec![domain::wildcard(value)?]));
@@ -184,6 +181,13 @@ mod tests {
             (".Example.COM", "a.b.example.com", "example.com"),
             ("*.Example.COM", "a.example.com", "a.b.example.com"),
             ("a.*.Example.COM", "a.b.example.com", "a.b.c.example.com"),
+            ("+.*.Example.COM", "a.example.com", "example.com"),
+            (
+                "+.a.*.Example.COM",
+                "x.a.b.example.com",
+                "a.b.c.example.com",
+            ),
+            (".a.*.Example.COM", "x.a.b.example.com", "a.b.example.com"),
         ] {
             let p = Compiler::default()
                 .compile(domain_entry(entry).unwrap())
