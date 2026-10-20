@@ -35,7 +35,7 @@ pub struct RuleConfigGroup {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum RuleGroupRules {
-    Policies(OneOrSome<RuleConfig>),
+    Policies(Box<OneOrSome<RuleConfig>>),
     Sources(OneOrSome<crate::rule_set::RuleSource>),
 }
 
@@ -72,11 +72,11 @@ impl<'de> Deserialize<'de> for RuleGroupRules {
             ));
         }
         if sources.is_empty() {
-            Ok(Self::Policies(if is_list {
+            Ok(Self::Policies(Box::new(if is_list {
                 OneOrSome::Some(policies)
             } else {
                 OneOrSome::One(policies.pop().unwrap())
-            }))
+            })))
         } else {
             Ok(Self::Sources(if is_list {
                 OneOrSome::Some(sources)
@@ -497,14 +497,14 @@ client_proxies:
     fn test_rule_config_group() {
         let original = vec![Config::RuleConfigGroup(RuleConfigGroup {
             rule_group: "test-rule-group".to_string(),
-            rules: RuleGroupRules::Policies(OneOrSome::Some(vec![
+            rules: RuleGroupRules::Policies(Box::new(OneOrSome::Some(vec![
                 create_test_rule_config(),
                 RuleConfig {
                     masks: OneOrSome::One(NetLocationMask::ANY),
                     criteria: Default::default(),
                     action: RuleActionConfig::Block,
                 },
-            ])),
+            ]))),
         })];
 
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
@@ -515,10 +515,10 @@ client_proxies:
         if let Config::RuleConfigGroup(group) = &deserialized[0] {
             assert_eq!(group.rule_group, "test-rule-group");
             // Check that we have the correct number of rules by pattern matching
-            match &group.rules {
-                RuleGroupRules::Policies(OneOrSome::Some(vec)) => assert_eq!(vec.len(), 2),
-                _ => panic!("Expected a list of policies"),
-            }
+            let RuleGroupRules::Policies(rules) = &group.rules else {
+                panic!("Expected policies");
+            };
+            assert!(matches!(rules.as_ref(), OneOrSome::Some(values) if values.len() == 2));
         } else {
             panic!("Expected rule config group");
         }

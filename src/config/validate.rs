@@ -2873,14 +2873,16 @@ mod tests {
         let configs = vec![
             Config::RuleConfigGroup(RuleConfigGroup {
                 rule_group: "test-rules".to_string(),
-                rules: crate::config::RuleGroupRules::Policies(OneOrSome::One(RuleConfig {
-                    masks: OneOrSome::One(NetLocationMask::ANY),
-                    criteria: Default::default(),
-                    action: RuleActionConfig::Allow {
-                        override_address: None,
-                        client_chains: NoneOrSome::One(ClientChain::default()),
+                rules: crate::config::RuleGroupRules::Policies(Box::new(OneOrSome::One(
+                    RuleConfig {
+                        masks: OneOrSome::One(NetLocationMask::ANY),
+                        criteria: Default::default(),
+                        action: RuleActionConfig::Allow {
+                            override_address: None,
+                            client_chains: NoneOrSome::One(ClientChain::default()),
+                        },
                     },
-                })),
+                ))),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-group".to_string(),
