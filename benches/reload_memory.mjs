@@ -4,6 +4,7 @@ import net from 'node:net';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 import crypto from 'node:crypto';
 
 export function checkEcho(socket, message, { signal, timeout = 5000 } = {}) {
@@ -87,13 +88,14 @@ async function main() {
   const configPath = path.join(directory, 'reload.json');
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
   const child = spawn(binary, ['-t', String(workers), '--no-reload', configPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const closed = new Promise(resolve => child.once('close', resolve));
   const controller = new AbortController();
   const { signal } = controller;
   const stopped = new Promise(resolve => signal.addEventListener('abort', () => resolve(signal.reason), { once: true }));
   const exited = new Promise(resolve => {
     child.once('error', error => { controller.abort(error); resolve(); });
-    child.once('exit', (code, signal) => {
-      controller.abort(Error(`server exited: code=${code}, signal=${signal}`));
+    child.once('exit', (code, exitSignal) => {
+      controller.abort(Error(`server exited: code=${code}, signal=${exitSignal}`));
       resolve();
     });
   });
@@ -160,6 +162,9 @@ async function main() {
     const kill = setTimeout(() => child.kill('SIGKILL'), 2000);
     await exited;
     clearTimeout(kill);
+    await Promise.race([closed, delay(1000, undefined, { ref: false })]);
+    child.stdout.destroy();
+    child.stderr.destroy();
     for (const socket of echoSockets) socket.destroy();
     echo.close();
     fs.writeFileSync(path.join(directory, 'server.log'), output + stderr);

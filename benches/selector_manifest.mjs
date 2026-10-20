@@ -25,7 +25,7 @@ if (helper.sha256 !== artifacts['selector_measurement.rs'].sha256) throw Error('
 if (file(path.join(baseline, 'benches/selector_measurement.rs')).sha256 !== helper.sha256) {
   throw Error('copy the measured helper into BASELINE_WORKTREE/benches/selector_measurement.rs');
 }
-const patch = run('git', ['diff', '--binary'], baseline);
+const patch = execFileSync('git', ['diff', '--binary'], { cwd: baseline, encoding: 'utf8' });
 if (!patch.includes('diff --git a/benches/selector_measurement.rs b/benches/selector_measurement.rs') ||
     !fs.readFileSync(path.join(baseline, 'src/client_proxy_selector.rs'), 'utf8')
       .includes('#[path = "../benches/selector_measurement.rs"]')) {

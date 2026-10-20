@@ -3,10 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 test('manifest records supplied commands and embeds a portable baseline helper', t => {
-  const root = fs.mkdtempSync(path.join(os.homedir(), 'tmp/selector-manifest-test-'));
+  const scratch = path.join(os.homedir(), 'tmp');
+  fs.mkdirSync(scratch, { recursive: true });
+  const root = fs.mkdtempSync(path.join(scratch, 'selector-manifest-test-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const baseline = path.join(root, 'baseline');
   const candidate = path.join(root, 'candidate');
@@ -43,7 +46,8 @@ test('manifest records supplied commands and embeds a portable baseline helper',
     profile: 'explicit test profile', run: 'explicit test run', aggregate: 'explicit aggregation',
   };
   write(root, 'commands.json', JSON.stringify(commands));
-  const invoke = () => spawnSync(process.execPath, [path.resolve('benches/selector_manifest.mjs'),
+  const script = fileURLToPath(new URL('./selector_manifest.mjs', import.meta.url));
+  const invoke = () => spawnSync(process.execPath, [script,
     baseline, results, 'HEAD', path.join(root, 'commands.json')], { cwd: candidate, encoding: 'utf8' });
   const result = invoke();
   assert.equal(result.status, 0, result.stderr);
@@ -55,6 +59,14 @@ test('manifest records supplied commands and embeds a portable baseline helper',
   assert.equal(manifest.aggregate, commands.aggregate);
   assert.match(manifest.baseline.patch, /\+\/\/ measured helper/);
   assert.ok(!manifest.baseline.patch.includes(root));
+  const reproduction = path.join(root, 'reproduction');
+  git(root, 'clone', '-q', baseline, reproduction);
+  const applyOptions = { cwd: reproduction, input: manifest.baseline.patch, encoding: 'utf8' };
+  execFileSync('git', ['apply', '--check', '-'], applyOptions);
+  execFileSync('git', ['apply', '-'], applyOptions);
+  assert.equal(fs.readFileSync(path.join(reproduction, 'benches/selector_measurement.rs'), 'utf8'), helper);
+  assert.equal(fs.readFileSync(path.join(reproduction, 'src/client_proxy_selector.rs'), 'utf8'),
+    fs.readFileSync(path.join(baseline, 'src/client_proxy_selector.rs'), 'utf8'));
   git(baseline, 'reset', '-q', '--', 'benches/selector_measurement.rs');
   const missingPatch = invoke();
   assert.notEqual(missingPatch.status, 0);
