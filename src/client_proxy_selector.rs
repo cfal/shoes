@@ -1,4 +1,8 @@
 use log::debug;
+
+#[cfg(test)]
+#[path = "../benches/selector_measurement.rs"]
+mod measurement_bench;
 use lru::LruCache;
 use parking_lot::RwLock;
 use std::hash::Hash;
@@ -6,12 +10,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+#[cfg(test)]
 use crate::address::NetLocationMask;
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::dns::fake_ip::FakeDnsContext;
 use crate::resolver::{Resolver, resolve_location};
-use crate::rules::{Compiler, Outcome, Predicate, domain};
+#[cfg(test)]
+use crate::rules::Compiler;
+use crate::rules::{Outcome, Predicate, domain};
 
 /// Cache key for routing decisions.
 /// We cache based on the destination address and port.
@@ -128,6 +135,7 @@ pub struct ConnectRule {
 }
 
 impl ConnectRule {
+    #[cfg(test)]
     pub fn new(masks: Vec<NetLocationMask>, action: ConnectAction) -> Self {
         Self::compiled(
             Compiler::default()
@@ -706,6 +714,45 @@ mod tests {
             ConnectDecision::Block
         ));
         assert_eq!(selector.cache_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn ip_only_no_resolve_block_falls_through_without_sniffing_or_dns() {
+        let legacy = ClientProxySelector::with_options(vec![block_rule(vec!["10.0.0.0/8"])], true);
+        assert!(!legacy.should_sniff(&prepared(&legacy, "192.0.2.1:443")));
+        let predicate = Compiler::default()
+            .compile(crate::rules::Expression::IpCidr(vec!["10.0.0.0/8".into()]))
+            .unwrap();
+        let selector = ClientProxySelector::with_options(
+            vec![
+                ConnectRule::compiled(predicate, true, ConnectAction::Block),
+                allow_rule(vec!["0.0.0.0/0"], "direct"),
+            ],
+            true,
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+        assert!(matches!(
+            selector
+                .judge(
+                    NetLocation::from_str("unresolved.example:443", None)
+                        .unwrap()
+                        .into(),
+                    &resolver
+                )
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            selector
+                .judge(
+                    NetLocation::from_str("10.0.0.1:443", None).unwrap().into(),
+                    &resolver
+                )
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
     }
 
     #[tokio::test]

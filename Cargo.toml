@@ -5,6 +5,7 @@ publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
 rust-version = "1.95"
 autotests = false
+autobenches = false
 license = "MIT"
 description = "A multi-protocol proxy server."
 homepage = "https://github.com/cfal/shoes/"
