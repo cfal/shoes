@@ -77,12 +77,11 @@ fn selector_measurement() {
             crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
         ),
     ));
-    let cache_size = if mode == "warm" || mode == "cold" {
-        10_000
-    } else {
-        0
-    };
-    let selector = ClientProxySelector::with_options_and_cache_size(rules, false, cache_size);
+    let cache_enabled = mode == "warm" || mode == "cold";
+    let cache_size = if cache_enabled { 10_000 } else { 0 };
+    let selector =
+        ClientProxySelector::with_options_and_cache_size(rules, cache_enabled, cache_size);
+    assert_eq!(selector.is_cache_enabled(), cache_enabled);
     let build_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut rng = 0x83ab_d317_26e3_a175;
     let query_count = if mode == "cold" { 32768 } else { 4096 };
