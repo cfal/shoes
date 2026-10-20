@@ -23,7 +23,7 @@ impl Expression {
                 if values.iter().all(Value::is_string) {
                     return decode(Value::Array(values)).map(Self::Legacy);
                 }
-                Self::parse_children(Value::Array(values), depth).map(Self::Any)
+                Self::parse_children(values, depth).map(Self::Any)
             }
             Value::Object(fields) if fields.contains_key("path") => {
                 decode(Value::Object(fields)).map(Self::Source)
@@ -47,8 +47,8 @@ impl Expression {
                     "destination_port" => decode(value).map(Self::DestinationPort),
                     "destination_port_range" => decode(value).map(Self::DestinationPortRange),
                     "rule_group" => decode(value).map(Self::RuleGroup),
-                    "all" => Self::parse_children(value, depth).map(Self::All),
-                    "any" => Self::parse_children(value, depth).map(Self::Any),
+                    "all" => Self::parse_children(decode(value)?, depth).map(Self::All),
+                    "any" => Self::parse_children(decode(value)?, depth).map(Self::Any),
                     "not" => Self::parse_config(value, depth + 1).map(|p| Self::Not(Box::new(p))),
                     _ => Err(invalid(format!("unknown masks field: {field}"))),
                 }
@@ -59,8 +59,7 @@ impl Expression {
         }
     }
 
-    fn parse_children(value: Value, depth: usize) -> io::Result<Vec<Self>> {
-        let values: Vec<Value> = decode(value)?;
+    fn parse_children(values: Vec<Value>, depth: usize) -> io::Result<Vec<Self>> {
         if values.is_empty() {
             return Err(invalid("all/any requires at least one predicate"));
         }
@@ -90,4 +89,62 @@ impl Expression {
 
 fn decode<T: serde::de::DeserializeOwned>(value: Value) -> io::Result<T> {
     serde_json::from_value(value).map_err(|e| invalid(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn composite_errors_preserve_list_context_and_child_order() {
+        for (value, message) in [
+            (json!([]), "masks cannot be empty"),
+            (
+                json!({"all": []}),
+                "all/any requires at least one predicate",
+            ),
+            (
+                json!({"any": []}),
+                "all/any requires at least one predicate",
+            ),
+            (
+                json!({"all": true}),
+                "invalid type: boolean `true`, expected a sequence",
+            ),
+            (
+                json!(["example.com", {"any": []}]),
+                "all/any requires at least one predicate",
+            ),
+            (
+                json!({"any": [{"unknown": true}, false]}),
+                "unknown masks field: unknown",
+            ),
+        ] {
+            let error = Expression::from_config(value).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn composite_forms_share_the_same_depth_limit() {
+        for form in ["list", "all", "any", "not"] {
+            let wrap = |value| match form {
+                "list" => json!([value]),
+                "not" => json!({"not": value}),
+                operator => json!({operator: [value]}),
+            };
+            let value =
+                (0..MAX_DEPTH).fold(json!({"any_destination": true}), |value, _| wrap(value));
+            Expression::from_config(value.clone()).unwrap();
+            assert_eq!(
+                Expression::from_config(wrap(value))
+                    .unwrap_err()
+                    .to_string(),
+                "rule nesting exceeds 100 levels",
+                "{form}"
+            );
+        }
+    }
 }
