@@ -413,8 +413,12 @@ pub fn create_tcp_client_proxy_selector(
 ) -> std::io::Result<ClientProxySelector> {
     let rules = rules
         .into_iter()
-        .map(|rule_config| {
-            let RuleConfig { masks, action } = rule_config;
+        .map(|mut rule_config| {
+            // Internal protocol adapters also construct small rules without config validation.
+            rule_config.compile(&mut crate::rules::Compiler::default())?;
+            let RuleConfig {
+                criteria, action, ..
+            } = rule_config;
             let connect_action = match action {
                 RuleActionConfig::Allow {
                     override_address,
@@ -426,7 +430,11 @@ pub fn create_tcp_client_proxy_selector(
                 }
                 RuleActionConfig::Block => ConnectAction::new_block(),
             };
-            Ok(ConnectRule::new(masks.into_vec(), connect_action))
+            Ok(ConnectRule::compiled(
+                criteria.compiled.unwrap(),
+                criteria.no_resolve,
+                connect_action,
+            ))
         })
         .collect::<std::io::Result<Vec<_>>>()?;
     ClientProxySelector::new(rules).with_fake_dns_context(resolver.fake_dns_context())

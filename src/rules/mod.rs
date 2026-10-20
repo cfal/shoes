@@ -124,6 +124,22 @@ pub(crate) enum Kind {
 }
 
 impl Predicate {
+    pub fn any(children: Vec<Arc<Self>>) -> Arc<Self> {
+        if children.len() == 1 {
+            return children.into_iter().next().unwrap();
+        }
+        Self::new(Kind::Any(children.into()))
+    }
+
+    pub fn has_no_resolve_ip(&self) -> bool {
+        match &self.kind {
+            Kind::Ips(_, no_resolve) => *no_resolve,
+            Kind::Any(ps) | Kind::All(ps) => ps.iter().any(|p| p.has_no_resolve_ip()),
+            Kind::ByPort(ps) => ps.iter().any(|(_, p)| p.has_no_resolve_ip()),
+            Kind::Not(p) => p.has_no_resolve_ip(),
+            _ => false,
+        }
+    }
     pub(crate) fn new(kind: Kind) -> Arc<Self> {
         let dependencies = match &kind {
             Kind::Domains(..) | Kind::Keywords(..) | Kind::Regex(..) => Dependencies {
@@ -189,7 +205,10 @@ impl Predicate {
                 );
             }
             Kind::Any(children) => {
-                return Outcome::combine(children.iter().map(|p| p.evaluate(name, ip, port)), false);
+                return Outcome::combine(
+                    children.iter().map(|p| p.evaluate(name, ip, port)),
+                    false,
+                );
             }
             Kind::All(children) => {
                 return Outcome::combine(children.iter().map(|p| p.evaluate(name, ip, port)), true);

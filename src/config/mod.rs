@@ -16,6 +16,7 @@
 mod client_visit;
 mod fake_dns;
 mod pem;
+mod rule_visit;
 mod types;
 mod validate;
 #[cfg(unix)]

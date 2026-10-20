@@ -301,6 +301,7 @@ mod tests {
 
     fn create_test_rule_config() -> RuleConfig {
         RuleConfig {
+            criteria: Default::default(),
             masks: OneOrSome::Some(vec![
                 NetLocationMask::from("192.168.0.0/16:80").unwrap(),
                 NetLocationMask::from("10.0.0.0/8:443").unwrap(),
@@ -399,6 +400,7 @@ client_proxies:
                 create_test_rule_config(),
                 RuleConfig {
                     masks: OneOrSome::One(NetLocationMask::ANY),
+                    criteria: Default::default(),
                     action: RuleActionConfig::Block,
                 },
             ]),
@@ -690,7 +692,7 @@ client_proxies:
             };
 
             // Parse the YAML
-            let configs: Vec<Config> = match serde_yaml::from_str(&content) {
+            let mut configs: Vec<Config> = match serde_yaml::from_str(&content) {
                 Ok(c) => c,
                 Err(e) => {
                     failures.push(format!("- {file_name}: Failed to parse YAML: {e}"));
@@ -698,8 +700,30 @@ client_proxies:
                 }
             };
 
-            // Just test parsing, not full validation with file reads
-            // since certificate files don't exist in test environment
+            if let Err(error) = crate::config::rule_visit::compile(
+                &mut configs,
+                &mut crate::rules::Compiler::default(),
+            ) {
+                failures.push(format!("- {file_name}: invalid rules: {error}"));
+                continue;
+            }
+            if file_name == "mixed.yaml" {
+                let certificate =
+                    rcgen::generate_simple_self_signed(vec!["proxy.local".into()]).unwrap();
+                for config in &mut configs {
+                    if let Config::Server(server) = config
+                        && let crate::config::ServerProxyConfig::Tls { tls_targets, .. } = &mut server.protocol
+                    {
+                        for target in tls_targets.values_mut() {
+                            target.cert = certificate.cert.pem();
+                            target.key = certificate.signing_key.serialize_pem();
+                        }
+                    }
+                }
+                crate::config::create_server_configs(configs.clone())
+                    .expect("mixed example must pass full validation");
+            }
+            // Other examples contain deployment-specific certificates and keys.
             println!("  ✓ Parsed successfully ({} configs)", configs.len());
         }
 

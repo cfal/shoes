@@ -43,7 +43,9 @@ pub struct ValidatedConfigs {
 /// - Expands DNS groups (composition, client chains) and validates them
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
-pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    let mut compiler = crate::rules::Compiler::default();
+    super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
@@ -58,6 +60,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         String::from("allow-all-direct"),
         vec![RuleConfig {
             masks: OneOrSome::One(NetLocationMask::ANY),
+            criteria: Default::default(),
             action: RuleActionConfig::Allow {
                 override_address: None,
                 client_chains: NoneOrSome::One(ClientChain::default()),
@@ -68,6 +71,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         String::from("block-all"),
         vec![RuleConfig {
             masks: OneOrSome::One(NetLocationMask::ANY),
+            criteria: Default::default(),
             action: RuleActionConfig::Block,
         }],
     );
@@ -2054,6 +2058,8 @@ fn validate_rule_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
+    // Only generated defaults remain uncompiled; user predicates compile before expansion.
+    rule_config.compile(&mut crate::rules::Compiler::default())?;
     if let RuleActionConfig::Allow {
         ref mut client_chains,
         ..
@@ -2862,6 +2868,7 @@ mod tests {
                 rule_group: "test-rules".to_string(),
                 rules: OneOrSome::One(RuleConfig {
                     masks: OneOrSome::One(NetLocationMask::ANY),
+                    criteria: Default::default(),
                     action: RuleActionConfig::Allow {
                         override_address: None,
                         client_chains: NoneOrSome::One(ClientChain::default()),

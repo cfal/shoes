@@ -27,6 +27,7 @@ mod quic_stream;
 mod reality;
 mod reality_client_handler;
 mod resolver;
+mod rules;
 mod resources;
 mod routing;
 mod rustls_config_util;

@@ -1122,25 +1122,74 @@ client_chain:
 ### Mask Syntax
 ```yaml
 # IP/CIDR masks
-masks: "0.0.0.0/0"             # All IPv4
-masks: "::/0"                  # All IPv6
+masks: "0.0.0.0/0"             # Any destination, including hostnames and IPv6
+masks: "::/0"                  # Same legacy universal predicate
 masks: "192.168.0.0/16"        # Subnet
 masks: "10.0.0.1:80"           # Specific IP and port
 
 # Hostname masks
-masks: "*.google.com"          # Wildcard subdomain
-masks: "example.com"           # Exact match
+match: { subdomains: [google.com] } # Descendants, excluding the apex
+masks: "example.com"           # Name and all descendants
 
 # Multiple masks
 masks:
   - "192.168.0.0/16"
   - "10.0.0.0/8"
-  - "*.internal.com"
+  - "internal.com"
 ```
 
 ### Built-in Rule Groups
 - `allow-all-direct` - Allow all connections, direct routing
 - `block-all` - Block all connections
+
+### Typed Destination Predicates
+
+`match` accepts one operator per node: `all`, `any`, `not`, or a leaf. It cannot
+be combined with `masks` or `rule_sets`. Lists inside a leaf are alternatives.
+
+```yaml
+rules:
+  - match:
+      all:
+        - domain_suffix: [example.com]
+        - destination_port: [443]
+    action: allow
+  - match: { any_destination: true }
+    action: block
+```
+
+Leaves: `domain` (exact), `domain_suffix` (apex and descendants), `subdomains`
+(descendants only), `domain_pattern` (`*` matches one label), `domain_keyword`,
+`domain_regex`, `ip_cidr`, `destination_port`, `destination_port_range`
+(inclusive `"8000:9000"`), and `any_destination: true`. Native domain literals
+and keywords are case-insensitive. Regexes are unanchored and case-sensitive
+unless they enable case folding; backreferences, lookaround and non-ASCII
+patterns are unsupported. Typed ports are 1-65535. Empty sets match nothing;
+empty `all`/`any` nodes are rejected.
+
+Policies still use first-match order. Inside one policy, a known OR match or AND
+miss can avoid DNS, regardless of predicate order. An earlier unresolved policy
+cannot be bypassed by a later domain rule. IP predicates use the selected local
+DNS answer, pinning it for direct dialing; lookup failure aborts routing. Direct
+multi-address fallback is disabled after this pinning. Hostname-forwarding proxy
+protocols may still resolve independently at the exit.
+
+`no_resolve: true` on a rule prohibits initiating DNS, but consumes an address
+already supplied/resolved. Without an address, IP predicates remain unknown,
+including under `not`; an undecidable policy falls through even when its action
+is `block`. Domain predicates without a hostname are false, including for
+literal-IP connections without a sniff hint. No reverse DNS is performed.
+
+Migration: legacy `*.x` and `.x` masks are rejected at startup and reload; replace
+them explicitly with `subdomains` or `domain_pattern`. Bare masks still include
+the apex and descendants. Legacy `/0` masks remain universal without DNS, but
+typed `ip_cidr: ["::/0"]` is IPv6-only and requires an IP. Other legacy IPv6 masks
+no longer match IPv4 through numeric overlap; mapped-only legacy masks normalize
+to IPv4 with a warning. Explicit typed mapped IPv6 predicates must use IPv4
+spelling. Invalid supplied hostnames (including non-ASCII, whitespace, empty
+labels and excessive length) are now rejected even with catch-all-only rules;
+use A-label/punycode names. Invalid sniff hints are ignored. Matching strips one
+root dot and lowercases ASCII without changing the dial target.
 
 ### Example Rules
 ```yaml
@@ -1153,7 +1202,10 @@ rules:
         type: direct
 
   # Block specific domains
-  - masks: ["*.ads.example.com", "tracking.example.com"]
+  - match:
+      any:
+        - subdomains: [ads.example.com]
+        - domain_suffix: [tracking.example.com]
     action: block
 
   # Route through upstream proxy
