@@ -16,32 +16,42 @@ case variation and port guards are independently randomized. Timings are the
 median and p95 of 15 batch averages, not individual request tails. DNS uses an
 immediately ready counted stub, not Fake DNS or network resolution.
 
-For old/new comparisons, inject this same file as a test module in a detached
-checkout of the baseline's `client_proxy_selector.rs`. Pin both source revisions,
+For old/new comparisons, copy this helper into a detached baseline checkout at
+`benches/selector_measurement.rs`, run `git add -N` on the copy, and include it in
+`src/client_proxy_selector.rs` with `#[path = "../benches/selector_measurement.rs"]`.
+The resulting patch must contain the helper bytes, not an external absolute path.
+Pin both source revisions,
 hash this helper and each lockfile/diff, rebuild both test executables, and record
 their hashes. Use identical Rust flags, allocator, CPU pinning and workload.
 Compare medians across processes; preserve individual samples and outliers.
 
 The matrix covers 16/100k/1M entries, homogeneous and mixed port guards, and
 128/1,024 ordered policies with early/late/missing hits. `BENCH_MODE=warm` and
-`cold` are also available for cache experiments; `floor` measures the ready
+`cold` are also available for cache experiments. Cold mode cycles 32,768 unique
+hostname keys through a 10,000-entry cache, including small and early-hit cases;
+`floor` measures the ready
 future, runtime entry and cloned-location wrapper. No cache policy change is
 implied by these measurements. Host measurements do not establish mobile memory,
 concurrent cache contention or network throughput.
 
 The library test uses the system allocator, not the server binary's jemalloc.
-Both sides use the production release profile (fat LTO, one codegen unit).
+Both sides use the production release profile (fat LTO, default 16 codegen units,
+strip enabled, non-incremental release builds).
 The baseline matrix runs before the candidate matrix; repeated fresh processes
 and retained min/max values expose noise, but do not remove run-order effects.
 
 ```sh
 node benches/compare_selector.mjs RESULTS/old.log RESULTS/new.log
-node benches/selector_manifest.mjs BASELINE_WORKTREE RESULTS CANDIDATE_REVISION
+node benches/selector_manifest.mjs BASELINE_WORKTREE RESULTS CANDIDATE_REVISION COMMANDS_JSON
 ```
 
+`COMMANDS_JSON` must contain the actual `baseline_build`, `candidate_build`,
+`profile`, `run` and `aggregate` strings for that measurement. The generator does
+not infer build commands or flags from the current checkout.
+
 The comparator requires exactly three processes for each of 58 cases. Its 57
-routing gates cover small-rule no-regression, 100k/1M scaling, and many-policy
-no-regression. The remaining case calibrates the harness floor. The manifest
+routing gates cover a small-rule/many-policy regression budget of the greater of
+25% or 250 ns, plus 100k/1M scaling. The remaining case calibrates the harness floor. The manifest
 records the exact baseline patch/lockfile, candidate tree/source hashes, helper,
 executables, raw logs, toolchain and commands. Executables stay local rather than
 being committed; raw logs and aggregate results are retained in `results/`.
@@ -57,6 +67,18 @@ All 57 routing gates passed across 348 fresh processes. Ordinary uncached median
 | 100k members | 711.62 us | 0.508 us |
 | 1M members | 8,995.17 us | 0.556 us |
 | 1,024 policies, late hit | 944.72 us | 123.72 us |
+
+The budget is not a no-regression guarantee: all nine 16-member cases and all six
+unguarded many-policy early-hit cases slowed by 44-150 ns (up to 41%). At these
+baselines, the 250 ns allowance dominates. Thirteen of those cases have
+non-overlapping per-process ranges.
+
+The historical baseline patch used an external absolute helper path. It is kept
+unchanged in the manifest as build evidence; `results/baseline-reproduction.patch`
+reconstructs a portable patch with the exact measured helper from `d8c44452`.
+This reconstruction was not used to build the retained executable. The retained
+manifest's profile metadata corrects an earlier unsupported codegen-units=1 claim;
+its tooling hashes still identify the original measurement scripts.
 
 These synthetic membership workloads are not a general routing-throughput
 claim. Many-policy evaluation remains ordered and scales with policies visited.
