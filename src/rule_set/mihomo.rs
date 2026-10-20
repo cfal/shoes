@@ -21,11 +21,12 @@ pub(super) fn decode(
     let entries = if yaml {
         super::yaml::decode(bytes, budget)?
     } else {
-        std::str::from_utf8(bytes)
-            .map_err(|_| invalid("invalid UTF-8 provider"))?
+        let text = std::str::from_utf8(bytes).map_err(|_| invalid("invalid UTF-8 provider"))?;
+        text.strip_prefix('\u{feff}')
+            .unwrap_or(text)
             .lines()
             .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.starts_with('#'))
+            .filter(|s| !s.is_empty() && !s.starts_with('#') && !s.starts_with("//"))
             .map(|entry| {
                 if entry.len() > 64 * 1024 {
                     return Err(invalid("provider entry exceeds 64 KiB"));
@@ -149,6 +150,30 @@ mod tests {
 
     fn decode(bytes: &[u8], yaml: bool, behavior: Behavior) -> io::Result<Expression> {
         super::decode(bytes, yaml, behavior, &mut Compiler::default())
+    }
+
+    #[test]
+    fn text_providers_accept_bom_and_both_comment_styles() {
+        for (behavior, entry) in [
+            (Behavior::Domain, "example.com"),
+            (Behavior::Ipcidr, "192.0.2.0/24"),
+            (Behavior::Classical, "DOMAIN,example.com"),
+        ] {
+            let text = format!("\u{feff}{entry}\r\n # comment\r\n  // Premium comment\r\n\r\n");
+            let predicate = Compiler::default()
+                .compile(decode(text.as_bytes(), false, behavior).unwrap())
+                .unwrap();
+            assert_eq!(
+                predicate.evaluate(Some("example.com"), Some("192.0.2.1".parse().unwrap()), 443),
+                Outcome::Match
+            );
+            let empty = Compiler::default()
+                .compile(
+                    decode("\u{feff}// comment\n# comment".as_bytes(), false, behavior).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(empty.evaluate(None, None, 443), Outcome::Miss);
+        }
     }
 
     #[test]

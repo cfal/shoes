@@ -1250,7 +1250,8 @@ compilation reserves. Remote URLs and GeoIP `.db` (MMDB) files are not supported
 use country SRS files from sing-geoip instead.
 
 Mihomo providers use `format: mihomo_yaml` (a `payload` string list),
-`format: mihomo_text` (one entry per line, blank lines and `#` comments ignored),
+`format: mihomo_text` (one entry per line, blank lines and `#`/`//` comments ignored;
+one leading UTF-8 BOM is accepted),
 or `format: mrs`. YAML/text require `behavior: domain`, `ipcidr`, or `classical`.
 MRS supports domain/IP only; an optional configured behavior must match its header.
 MRS accepts one zstd frame with at most an 8 MiB window.
