@@ -77,14 +77,16 @@ fn default_rule(reader: &mut Reader<'_>, version: u8) -> io::Result<Expression> 
                     parts.address.push(literals(suffix, LiteralKind::Suffix)?);
                 }
             }
-            3 | 4 => {
+            3 => {
                 let strings = reader.strings()?;
                 if !strings.is_empty() {
-                    parts.address.push(if tag == 3 {
-                        literals(strings, LiteralKind::Keyword)?
-                    } else {
-                        Expression::DomainRegex(strings)
-                    });
+                    parts.address.push(literals(strings, LiteralKind::Keyword)?);
+                }
+            }
+            4 => {
+                let strings = reader.strings()?;
+                if !strings.is_empty() {
+                    parts.address.push(Expression::DomainRegex(strings));
                 }
             }
             6 => {
@@ -299,6 +301,16 @@ mod tests {
         empty_names.extend(1u64.to_be_bytes());
         empty_names.extend([0, 9, 1, 1, 187, 255, 1]);
         assert!(decode(&wrap(2, &empty_names)).is_err());
+    }
+
+    #[test]
+    fn repeated_predicate_tag_rejects_before_empty_rule_validation() {
+        assert_eq!(
+            decode(&wrap(2, &[1, 0, 3, 0, 3, 0, 255, 0]))
+                .unwrap_err()
+                .to_string(),
+            "SRS rule 0: duplicate SRS tag 3"
+        );
     }
 
     #[test]

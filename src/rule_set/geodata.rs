@@ -106,70 +106,76 @@ pub(super) fn decode(
     if geoip && !attributes.is_empty() {
         return Err(invalid("GeoIP has no attribute filters"));
     }
-    let mut found = false;
-    let mut result = Expression::Never;
+    let mut selected = None;
     fields(bytes, |tag, field| {
         let (1, Field::Bytes(category)) = (tag, field) else {
             return Err(invalid("unsupported DAT list field"));
         };
-        let mut category_code = None;
-        fields(category, |tag, field| {
-            match (tag, field) {
-                (1, Field::Bytes(value)) if category_code.is_none() => {
-                    category_code = Some(
-                        std::str::from_utf8(value)
-                            .map_err(|_| invalid("invalid DAT category code"))?,
-                    );
-                }
-                (2, Field::Bytes(_)) => {}
-                (3, Field::Number(0 | 1)) if geoip => {}
-                _ => return Err(invalid("unsupported or duplicate DAT category field")),
-            }
-            Ok(())
-        })?;
-        let category_code = category_code.ok_or_else(|| invalid("DAT category has no code"))?;
-        if !category_code.eq_ignore_ascii_case(code) {
+        if !category_code(category, geoip)?.eq_ignore_ascii_case(code) {
             return Ok(());
         }
-        if found {
+        if selected.is_some() {
             return Err(invalid("duplicate selected DAT category"));
         }
-        found = true;
-        let mut count = 0;
-        let mut rules = Vec::new();
-        let mut ips = IpRanges::default();
-        let mut invert = None;
-        fields(category, |tag, field| {
-            match (tag, field) {
-                (1, _) => {}
-                (3, Field::Number(value)) if invert.is_none() => invert = Some(value != 0),
-                (2, Field::Bytes(item)) => {
-                    count += 1;
-                    if count > super::binary::MAX_ENTRIES {
-                        return Err(invalid("DAT entry limit exceeded"));
-                    }
-                    budget.charge(item.len().saturating_mul(8).saturating_add(256), 1)?;
-                    if geoip {
-                        cidr(item, &mut ips)?;
-                    } else if let Some(rule) = domain(item, attributes, budget)? {
-                        rules.push(rule);
-                    }
-                }
-                _ => return Err(invalid("duplicate or unsupported DAT category field")),
-            }
-            Ok(())
-        })?;
-        result = if geoip {
-            Expression::Ranges(ips, false).inverted(invert.unwrap_or(false))
-        } else {
-            Expression::or(rules)
-        };
+        selected = Some(category_entries(category, geoip, attributes, budget)?);
         Ok(())
     })?;
-    if !found {
-        return Err(invalid(format!("DAT category {code:?} not found")));
-    }
-    Ok(result)
+    selected.ok_or_else(|| invalid(format!("DAT category {code:?} not found")))
+}
+
+fn category_code(category: &[u8], geoip: bool) -> io::Result<&str> {
+    let mut code = None;
+    fields(category, |tag, field| {
+        match (tag, field) {
+            (1, Field::Bytes(value)) if code.is_none() => {
+                code = Some(
+                    std::str::from_utf8(value).map_err(|_| invalid("invalid DAT category code"))?,
+                );
+            }
+            (2, Field::Bytes(_)) => {}
+            (3, Field::Number(0 | 1)) if geoip => {}
+            _ => return Err(invalid("unsupported or duplicate DAT category field")),
+        }
+        Ok(())
+    })?;
+    code.ok_or_else(|| invalid("DAT category has no code"))
+}
+
+fn category_entries(
+    category: &[u8],
+    geoip: bool,
+    attributes: &[String],
+    budget: &mut Compiler,
+) -> io::Result<Expression> {
+    let mut count = 0;
+    let mut rules = Vec::new();
+    let mut ips = IpRanges::default();
+    let mut invert = None;
+    fields(category, |tag, field| {
+        match (tag, field) {
+            (1, _) => {}
+            (3, Field::Number(value)) if invert.is_none() => invert = Some(value != 0),
+            (2, Field::Bytes(item)) => {
+                count += 1;
+                if count > super::binary::MAX_ENTRIES {
+                    return Err(invalid("DAT entry limit exceeded"));
+                }
+                budget.charge(item.len().saturating_mul(8).saturating_add(256), 1)?;
+                if geoip {
+                    cidr(item, &mut ips)?;
+                } else if let Some(rule) = domain(item, attributes, budget)? {
+                    rules.push(rule);
+                }
+            }
+            _ => return Err(invalid("duplicate or unsupported DAT category field")),
+        }
+        Ok(())
+    })?;
+    Ok(if geoip {
+        Expression::Ranges(ips, false).inverted(invert.unwrap_or(false))
+    } else {
+        Expression::or(rules)
+    })
 }
 
 fn domain(
@@ -392,6 +398,66 @@ mod tests {
     struct GeoIps {
         #[prost(message, repeated, tag = "1")]
         entries: Vec<GeoIp>,
+    }
+
+    #[test]
+    fn selected_category_duplicates_and_unselected_framing_reject() {
+        let category = Site {
+            code: "TEST".into(),
+            domains: vec![],
+        };
+        let bytes = Sites {
+            entries: vec![category.clone(), category],
+        }
+        .encode_to_vec();
+        assert_eq!(
+            decode(&bytes, false, "test", &[], &mut Compiler::default())
+                .unwrap_err()
+                .to_string(),
+            "duplicate selected DAT category"
+        );
+        assert_eq!(
+            decode(&bytes, false, "absent", &[], &mut Compiler::default())
+                .unwrap_err()
+                .to_string(),
+            "DAT category \"absent\" not found"
+        );
+        for code in ["a", "absent"] {
+            for (category, error) in [
+                (vec![0x12, 0], "DAT category has no code"),
+                (
+                    vec![0x0a, 1, b'a', 0x0a, 1, b'a'],
+                    "unsupported or duplicate DAT category field",
+                ),
+                (
+                    vec![0x0a, 1, b'a', 0x18, 2],
+                    "unsupported or duplicate DAT category field",
+                ),
+            ] {
+                let mut bytes = vec![0x0a, category.len() as u8];
+                bytes.extend(category);
+                assert_eq!(
+                    decode(&bytes, true, code, &[], &mut Compiler::default())
+                        .unwrap_err()
+                        .to_string(),
+                    error
+                );
+            }
+        }
+        // Duplicate reverse flags are checked only in the selected category.
+        let bytes = [0x0a, 7, 0x0a, 1, b'a', 0x18, 0, 0x18, 1];
+        assert_eq!(
+            decode(&bytes, true, "a", &[], &mut Compiler::default())
+                .unwrap_err()
+                .to_string(),
+            "duplicate or unsupported DAT category field"
+        );
+        assert_eq!(
+            decode(&bytes, true, "absent", &[], &mut Compiler::default())
+                .unwrap_err()
+                .to_string(),
+            "DAT category \"absent\" not found"
+        );
     }
 
     #[test]

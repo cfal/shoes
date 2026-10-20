@@ -9,6 +9,7 @@ use domain::{DomainKind, Names};
 pub const MAX_ENTRIES: usize = 2_000_000;
 pub const MAX_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_DEPTH: usize = 100;
+const MAX_REGEX_MATCHER_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct Compiler {
@@ -227,9 +228,9 @@ impl Compiler {
                 regex_automata::meta::Regex::config()
                     .which_captures(regex_automata::nfa::thompson::WhichCaptures::None)
                     .hybrid_cache_capacity(256 * 1024)
-                    .nfa_size_limit(Some(16 * 1024 * 1024))
-                    .dfa_size_limit(Some(16 * 1024 * 1024))
-                    .onepass_size_limit(Some(16 * 1024 * 1024)),
+                    .nfa_size_limit(Some(MAX_REGEX_MATCHER_BYTES))
+                    .dfa_size_limit(Some(MAX_REGEX_MATCHER_BYTES))
+                    .onepass_size_limit(Some(MAX_REGEX_MATCHER_BYTES)),
             )
             .syntax(
                 regex_automata::util::syntax::Config::new()
@@ -239,7 +240,7 @@ impl Compiler {
             .build_many(&patterns)
             .map_err(|e| invalid(format!("unsupported or oversized regex: {e}")))?;
         self.bytes = before;
-        if matcher.memory_usage() > 16 * 1024 * 1024 {
+        if matcher.memory_usage() > MAX_REGEX_MATCHER_BYTES {
             return Err(invalid("compiled regex exceeds 16 MiB"));
         }
         self.charge(matcher.memory_usage(), 0)?;
