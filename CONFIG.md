@@ -1250,9 +1250,11 @@ not the group above. No filesystem or name-existence heuristic changes this.
 Actions and routing options belong to the referencing policy, not the sources.
 Omitting `action` still means `allow`; an action-free group does not imply block.
 Source objects reject action fields and cannot be mixed with predicate operators.
-Sources with the same canonical path and effective decoding options share one
-compiled set, including across named groups and inline uses. Each generation
-accepts at most 1,024 distinct sources.
+Sources with the same canonical path and decoding options share one compiled
+set, including across named groups and inline uses. DAT codes and attribute
+names are case-insensitive; attribute order and duplicates do not affect sharing.
+For MRS, omitted and explicitly supplied `behavior` values use separate cache
+entries. Each generation accepts at most 1,024 distinct sources.
 
 Explicit `format` overrides detection. Otherwise SRS and
 Zstd signatures select the SRS and MRS decoders, followed by case-insensitive

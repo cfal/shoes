@@ -251,12 +251,19 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             "code and attributes are only valid for DAT formats",
         ));
     }
+    let mut attributes: Vec<_> = source
+        .attributes
+        .iter()
+        .map(|attribute| attribute.to_ascii_lowercase())
+        .collect();
+    attributes.sort_unstable();
+    attributes.dedup();
     let key = SourceKey {
         path: path.clone(),
         format,
         behavior: source.behavior,
-        code: source.code.clone(),
-        attributes: source.attributes.clone(),
+        code: source.code.as_ref().map(|code| code.to_ascii_lowercase()),
+        attributes,
     };
     if let Some(predicate) = compiler.sources.get(&key) {
         return Ok(predicate.clone());

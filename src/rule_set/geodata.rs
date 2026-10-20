@@ -272,7 +272,9 @@ fn cidr(bytes: &[u8], ranges: &mut IpRanges) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rule_set::{Format, RuleSource, load_source};
     use crate::rules::Outcome;
+    use std::sync::Arc;
 
     #[test]
     fn wire_validation_preserves_defaults_and_duplicate_rejection() {
@@ -398,6 +400,122 @@ mod tests {
     struct GeoIps {
         #[prost(message, repeated, tag = "1")]
         entries: Vec<GeoIp>,
+    }
+
+    #[test]
+    fn equivalent_geosite_options_share_cached_predicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geosite.dat");
+        let bytes = Sites {
+            entries: vec![Site {
+                code: "TEST".into(),
+                domains: [
+                    ("both.example", vec!["ads", "mobile"]),
+                    ("ads.example", vec!["ads"]),
+                ]
+                .into_iter()
+                .map(|(value, attributes)| Domain {
+                    kind: 3,
+                    value: value.into(),
+                    attributes: attributes
+                        .into_iter()
+                        .map(|key| Attribute {
+                            key: key.into(),
+                            value: Some(attribute::Value::Bool(true)),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            }],
+        }
+        .encode_to_vec();
+        std::fs::write(&path, bytes).unwrap();
+        let mut source = RuleSource {
+            path,
+            format: Some(Format::GeositeDat),
+            behavior: None,
+            code: Some("test".into()),
+            attributes: vec!["ads".into(), "mobile".into()],
+        };
+        let mut compiler = Compiler::default();
+        let first = load_source(&source, &mut compiler).unwrap();
+        assert_eq!(
+            first.evaluate(Some("both.example"), None, 80),
+            Outcome::Match
+        );
+        assert_eq!(first.evaluate(Some("ads.example"), None, 80), Outcome::Miss);
+        source.code = Some("TEST".into());
+        source.attributes = vec!["MOBILE".into(), "ADS".into(), "ads".into()];
+        let equivalent = load_source(&source, &mut compiler).unwrap();
+        assert!(Arc::ptr_eq(&first, &equivalent));
+        assert_eq!(compiler.sources.len(), 1);
+
+        source.attributes = vec!["ads".into()];
+        let different = load_source(&source, &mut compiler).unwrap();
+        assert!(!Arc::ptr_eq(&first, &different));
+        assert_eq!(
+            different.evaluate(Some("ads.example"), None, 80),
+            Outcome::Match
+        );
+        assert_eq!(compiler.sources.len(), 2);
+
+        source.code = Some("ABSENT".into());
+        let error = load_source(&source, &mut compiler).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DAT category \"ABSENT\" not found")
+        );
+        assert_eq!(compiler.sources.len(), 2);
+    }
+
+    #[test]
+    fn geoip_cache_preserves_distinct_categories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip.dat");
+        let bytes = GeoIps {
+            entries: ["TEST", "OTHER"]
+                .into_iter()
+                .map(|code| GeoIp {
+                    code: code.into(),
+                    reverse: code == "OTHER",
+                    cidrs: vec![Cidr {
+                        ip: vec![192, 0, 2, 0],
+                        prefix: 24,
+                    }],
+                })
+                .collect(),
+        }
+        .encode_to_vec();
+        std::fs::write(&path, bytes).unwrap();
+        let mut source = RuleSource {
+            path,
+            format: Some(Format::GeoipDat),
+            behavior: None,
+            code: Some("test".into()),
+            attributes: vec![],
+        };
+        let mut compiler = Compiler::default();
+        let first = load_source(&source, &mut compiler).unwrap();
+        source.code = Some("TEST".into());
+        assert!(Arc::ptr_eq(
+            &first,
+            &load_source(&source, &mut compiler).unwrap()
+        ));
+        assert_eq!(compiler.sources.len(), 1);
+
+        source.code = Some("other".into());
+        let different = load_source(&source, &mut compiler).unwrap();
+        assert!(!Arc::ptr_eq(&first, &different));
+        let ip = Some("192.0.2.1".parse().unwrap());
+        assert_eq!(first.evaluate(None, ip, 80), Outcome::Match);
+        assert_eq!(different.evaluate(None, ip, 80), Outcome::Miss);
+        assert_eq!(compiler.sources.len(), 2);
+
+        source.attributes = vec!["ADS".into()];
+        let error = load_source(&source, &mut compiler).unwrap_err();
+        assert!(error.to_string().contains("GeoIP has no attribute filters"));
+        assert_eq!(compiler.sources.len(), 2);
     }
 
     #[test]
