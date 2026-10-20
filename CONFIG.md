@@ -1243,7 +1243,10 @@ Files are limited to 64 MiB, inflated payloads to 256 MiB, and compilation has a
 512 MiB conservative allocation budget. Each source is limited to 2 million
 entries. Temporary decode/build charges are released between sources; retained
 indexes count toward the generation budget. These are safety ceilings, not a mobile
-memory guarantee. Remote URLs and GeoIP `.db` (MMDB) files are not supported;
+memory guarantee. Runtime regex caches are separate per worker and generation;
+capture tracking is disabled and each lazy-DFA cache is capped at 256 KiB.
+Regex groups accept at most 512 KiB of pattern text, with syntax-proportional
+compilation reserves. Remote URLs and GeoIP `.db` (MMDB) files are not supported;
 use country SRS files from sing-geoip instead.
 
 Mihomo providers use `format: mihomo_yaml` (a `payload` string list),
@@ -1251,6 +1254,9 @@ Mihomo providers use `format: mihomo_yaml` (a `payload` string list),
 or `format: mrs`. YAML/text require `behavior: domain`, `ipcidr`, or `classical`.
 MRS supports domain/IP only; an optional configured behavior must match its header.
 MRS accepts one zstd frame with at most an 8 MiB window.
+YAML supports block and flow sequences in one mapping containing only `payload`;
+tags, anchors, aliases and multiple documents are rejected. Parser read-ahead
+between events is limited to 128 KiB, including comments and whitespace.
 
 Domain providers distinguish bare exact names, `+.example.com` (apex and all
 descendants), `.example.com` (descendants only), and `*` as one whole nonempty
