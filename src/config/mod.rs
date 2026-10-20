@@ -75,14 +75,8 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
 }
 
 pub async fn compile_configs(configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
-    use std::sync::{Arc, OnceLock};
-    static COMPILER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-    let permit = COMPILER
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(std::io::Error::other)?;
+    static COMPILER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    let permit = COMPILER.acquire().await.map_err(std::io::Error::other)?;
     tokio::task::spawn_blocking(move || {
         // A canceled caller cannot release the permit while its build is still running.
         let _permit = permit;
