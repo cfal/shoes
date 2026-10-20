@@ -60,6 +60,25 @@ pub(crate) struct SourceKey {
     attributes: Vec<String>,
 }
 
+impl SourceKey {
+    fn new(path: PathBuf, format: Format, source: &RuleSource) -> Self {
+        let mut attributes: Vec<_> = source
+            .attributes
+            .iter()
+            .map(|attribute| attribute.to_ascii_lowercase())
+            .collect();
+        attributes.sort_unstable();
+        attributes.dedup();
+        Self {
+            path,
+            format,
+            behavior: source.behavior,
+            code: source.code.as_ref().map(|code| code.to_ascii_lowercase()),
+            attributes,
+        }
+    }
+}
+
 impl RuleSource {
     pub(crate) fn from_path(path: PathBuf) -> Self {
         Self {
@@ -72,28 +91,31 @@ impl RuleSource {
     }
 
     fn format(&self, prefix: &[u8]) -> io::Result<Format> {
-        self.format
-            .or_else(|| {
-                if prefix.starts_with(b"SRS") {
-                    Some(Format::Srs)
-                } else if prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-                    // Zstd selects the MRS decoder, which still validates the payload.
-                    Some(Format::Mrs)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| match self.path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-                "srs" => Some(Format::Srs),
-                "mrs" => Some(Format::Mrs),
-                "json" => Some(Format::SingboxJson),
-                "yaml" | "yml" => Some(Format::MihomoYaml),
-                "txt" => Some(Format::MihomoText),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                invalid("cannot detect rule source format; specify format explicitly (DAT requires geosite_dat or geoip_dat)")
-            })
+        if let Some(format) = self.format {
+            return Ok(format);
+        }
+        if prefix.starts_with(b"SRS") {
+            return Ok(Format::Srs);
+        }
+        if prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            // Zstd selects the MRS decoder, which still validates the payload.
+            return Ok(Format::Mrs);
+        }
+        let extension = self
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        match extension.as_deref() {
+            Some("srs") => Ok(Format::Srs),
+            Some("mrs") => Ok(Format::Mrs),
+            Some("json") => Ok(Format::SingboxJson),
+            Some("yaml" | "yml") => Ok(Format::MihomoYaml),
+            Some("txt") => Ok(Format::MihomoText),
+            _ => Err(invalid(
+                "cannot detect rule source format; specify format explicitly (DAT requires geosite_dat or geoip_dat)",
+            )),
+        }
     }
 }
 
@@ -251,20 +273,7 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             "code and attributes are only valid for DAT formats",
         ));
     }
-    let mut attributes: Vec<_> = source
-        .attributes
-        .iter()
-        .map(|attribute| attribute.to_ascii_lowercase())
-        .collect();
-    attributes.sort_unstable();
-    attributes.dedup();
-    let key = SourceKey {
-        path: path.clone(),
-        format,
-        behavior: source.behavior,
-        code: source.code.as_ref().map(|code| code.to_ascii_lowercase()),
-        attributes,
-    };
+    let key = SourceKey::new(path, format, source);
     if let Some(predicate) = compiler.sources.get(&key) {
         return Ok(predicate.clone());
     }
