@@ -1080,11 +1080,9 @@ or configure rules for the ECH public names.
 ### Rule Config
 ```yaml
 rules:
-  - masks: string | [string]   # IP/CIDR or hostname masks
-    rule_sets: string | [string]  # Optional named sets, ORed with masks
-    match: Expression?        # Typed predicate; mutually exclusive with masks/rule_sets
+  - masks: Mask | [Mask]      # Strings, typed predicates, file sources, or group references
     no_resolve: boolean?      # Default false; known IPs still participate
-    action: allow | block
+    action: allow | block     # Default allow
     # For action: allow
     override_address: string?  # Optional address override
     client_chain: ClientChain | [ClientChain]  # Proxy chain(s) for routing
@@ -1131,7 +1129,7 @@ masks: "192.168.0.0/16"        # Subnet
 masks: "10.0.0.1:80"           # Specific IP and port
 
 # Hostname masks
-match: { subdomains: [google.com] } # Descendants, excluding the apex
+masks: { subdomains: [google.com] } # Descendants, excluding the apex
 masks: "example.com"           # Name and all descendants
 
 # Multiple masks
@@ -1147,17 +1145,20 @@ masks:
 
 ### Typed Destination Predicates
 
-`match` accepts one operator per node: `all`, `any`, `not`, or a leaf. It cannot
-be combined with `masks` or `rule_sets`. Lists inside a leaf are alternatives.
+`masks` accepts legacy strings, typed predicates, file sources, and action-free
+group references. A list combines its entries with OR. Predicate objects contain
+one operator: `all`, `any`, `not`, or a leaf. The same forms work recursively inside
+`all`/`any`/`not`; strings always remain legacy masks, never group names or paths.
+Lists inside a typed leaf are alternatives.
 
 ```yaml
 rules:
-  - match:
+  - masks:
       all:
         - domain_suffix: [example.com]
         - destination_port: [443]
     action: allow
-  - match: { any_destination: true }
+  - masks: { any_destination: true }
     action: block
 ```
 
@@ -1194,10 +1195,10 @@ labels and excessive length) are now rejected even with catch-all-only rules;
 use A-label/punycode names. Invalid sniff hints are ignored. Matching strips one
 root dot and lowercases ASCII without changing the dial target.
 
-### Local Rule Sets
+### Local Rule Sources
 
-Declare a named local source as a top-level config item, then reference it from
-rules. Sources are read and compiled during validation, including `--dry-run`,
+Declare an action-free `rule_group` containing file paths, or load a file inline
+under `masks`. Sources are read and compiled during validation, including `--dry-run`,
 before a reload stops existing listeners. Invalid sources reject the candidate.
 Automatic reload watches imported files as well as configs. A parseable rejected
 candidate keeps its source paths watched, so creating or repairing a missing file
@@ -1207,30 +1208,61 @@ Established connections retain their original rules until they drain. New routin
 caches belong to the new configuration; Fake DNS pools are preserved separately.
 
 ```yaml
-- rule_set: local_domains
-  path: lists/domains.srs
-  format: srs
-- rule_set: local_addresses
-  path: lists/addresses.json
-  format: singbox_json
-- rule_group: imported
+- rule_group: blocked
   rules:
-    - rule_sets: [local_domains, local_addresses]
+    - lists/domains.srs
+    - path: lists/addresses.json
+      format: singbox_json
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: {rule_group: blocked}
       action: block
+    - masks: {path: lists/extra.srs}
+      action: block
+    - masks:
+        - "192.168.0.0/16"
+        - "internal.example"
+        - path: lists/direct.txt
+          behavior: domain
+      action: allow
 ```
 
-`rule_sets` is an OR of the named sets. When `masks` is also present, both sets of
-alternatives OR together. Neither can be combined with `match`. For composition,
-use `match: {all: [{rule_set: local_domains}, ...]}`.
-Sources with the same resolved path and decoding options share one compiled set.
-Names must be unique. Explicit `format` overrides detection. Otherwise SRS and
+Sources and groups also compose with typed predicates:
+
+```yaml
+rules:
+  - masks:
+      all:
+        - rule_group: blocked
+        - destination_port: [443]
+        - not: {path: lists/exceptions.srs}
+    action: block
+```
+
+File groups OR their sources together. A source is a path string inside a group's
+`rules`, or an object with `path` and optional `format`, `behavior`, `code`, and
+`attributes`. Inline sources under `masks` require the object form; a mask string
+is always an IP/CIDR/hostname. For example, `masks: blocked` matches that hostname,
+not the group above. No filesystem or name-existence heuristic changes this.
+
+Actions and routing options belong to the referencing policy, not the sources.
+Omitting `action` still means `allow`; an action-free group does not imply block.
+Source objects reject action fields and cannot be mixed with predicate operators.
+Sources with the same canonical path and effective decoding options share one
+compiled set, including across named groups and inline uses. Each generation
+accepts at most 1,024 distinct sources.
+
+Explicit `format` overrides detection. Otherwise SRS and
 Zstd signatures select the SRS and MRS decoders, followed by case-insensitive
 `.srs`, `.mrs`, `.json`, `.yaml`/`.yml`, and `.txt` suffixes. Zstd data must still
 contain a valid MRS payload. Unknown formats require an explicit `format`; DAT
 always requires `geosite_dat` or `geoip_dat`. YAML/text still require `behavior`.
 
-Rule-set paths are relative to the declaring config file, even when multiple
-configs are combined. FFI string configs require absolute rule-set paths. Existing
+Source paths are relative to the declaring config file, including inline sources
+inside nested predicates and protocol overrides, even when multiple configs are
+combined. FFI string configs require absolute source paths. Existing
 PEM `cert`/`key` paths remain relative to the working directory; absolute paths
 avoid mixing these conventions.
 
@@ -1294,7 +1326,7 @@ rules:
         type: direct
 
   # Block specific domains
-  - match:
+  - masks:
       any:
         - subdomains: [ads.example.com]
         - domain_suffix: [tracking.example.com]
@@ -1333,6 +1365,18 @@ rules:
 ```
 
 ### Rule Group
+
+A group contains either ordered policies or action-free file sources. Member shape
+determines its kind: objects with `masks` are policies, even when `action` is
+omitted; paths and `{path: ...}` objects are sources. Empty groups and mixed kinds
+are rejected. Both kinds share one namespace, including built-in names. `rule` is
+an alias for `rules`; either accepts one item directly or a nonempty list.
+
+Policy groups are referenced from `rules` or `override_rules`, preserving order,
+actions, and routing options. Source groups are referenced only with
+`masks: {rule_group: name}`, with the caller's action. Cross-kind references are
+errors: actions are never discarded or invented. Group nesting is not supported.
+
 ```yaml
 - rule_group: standard-rules
   rules:
@@ -1351,6 +1395,14 @@ rules:
     type: http
   rules: standard-rules        # Reference by name
 ```
+
+The unshipped `rule_set`, `rule_sets`, and `match` spellings are replaced, not
+aliases. Convert a named `rule_set` to `rule_group` with its source under `rules`;
+convert `rule_sets: [a, b]` to `masks: [{rule_group: a}, {rule_group: b}]`. Move typed
+`match` expressions under `masks`, replacing `{rule_set: a}` leaves with
+`{rule_group: a}`. Existing mask strings and action-bearing policy groups retain
+their semantics. Keep mixed legacy masks and imported groups in one OR list:
+splitting them into separate policies can change ordered DNS evaluation.
 
 ## Named PEMs
 
