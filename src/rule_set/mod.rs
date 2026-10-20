@@ -1,4 +1,6 @@
 mod binary;
+mod mihomo;
+mod mrs;
 mod singbox;
 mod srs;
 
@@ -11,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::rules::{Compiler, Predicate, invalid};
+pub use mihomo::Behavior;
 
 const MAX_INPUT: usize = 64 * 1024 * 1024;
 
@@ -19,6 +22,9 @@ const MAX_INPUT: usize = 64 * 1024 * 1024;
 pub enum Format {
     Srs,
     SingboxJson,
+    MihomoYaml,
+    MihomoText,
+    Mrs,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -27,6 +33,7 @@ pub struct RuleSetConfig {
     pub rule_set: String,
     pub path: PathBuf,
     pub format: Option<Format>,
+    pub behavior: Option<Behavior>,
 }
 
 impl RuleSetConfig {
@@ -34,9 +41,12 @@ impl RuleSetConfig {
         self.format
             .or_else(|| match self.path.extension().and_then(|s| s.to_str()) {
                 Some("srs") => Some(Format::Srs),
+                Some("mrs") => Some(Format::Mrs),
                 _ => None,
             })
-            .ok_or_else(|| invalid("rule_set requires an explicit format (only .srs is inferred)"))
+            .ok_or_else(|| {
+                invalid("rule_set requires an explicit format (only .srs/.mrs are inferred)")
+            })
     }
 }
 
@@ -67,7 +77,7 @@ pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
 
 pub fn load(configs: &[Config], compiler: &mut Compiler) -> io::Result<()> {
     let mut names = HashSet::new();
-    let mut cache: HashMap<(PathBuf, Format), Arc<Predicate>> = HashMap::new();
+    let mut cache: HashMap<(PathBuf, Format, Option<Behavior>), Arc<Predicate>> = HashMap::new();
     for config in configs {
         let Config::RuleSet(source) = config else {
             continue;
@@ -81,8 +91,11 @@ pub fn load(configs: &[Config], compiler: &mut Compiler) -> io::Result<()> {
         let result = (|| {
             if !source.path.is_absolute() { return Err(invalid("rule_set path must be absolute for string configs; file configs anchor paths to their declaring file")); }
             let format = source.format()?;
+            if matches!(format, Format::Srs | Format::SingboxJson) && source.behavior.is_some() {
+                return Err(invalid("behavior is only valid for Mihomo formats"));
+            }
             let path = std::fs::canonicalize(&source.path)?;
-            let key = (path.clone(), format);
+            let key = (path.clone(), format, source.behavior);
             if let Some(predicate) = cache.get(&key) { return Ok(predicate.clone()); }
             let start = std::time::Instant::now();
             if !std::fs::metadata(&path)?.is_file() { return Err(invalid("rule_set source must be a regular file")); }
@@ -96,6 +109,9 @@ pub fn load(configs: &[Config], compiler: &mut Compiler) -> io::Result<()> {
             let expression = match format {
                 Format::Srs => srs::decode(&bytes, compiler),
                 Format::SingboxJson => singbox::decode(&bytes),
+                Format::MihomoYaml | Format::MihomoText => mihomo::decode(&bytes, format == Format::MihomoYaml,
+                    source.behavior.ok_or_else(|| invalid("Mihomo YAML/text requires behavior"))?),
+                Format::Mrs => mrs::decode(&bytes, source.behavior, compiler),
             }?;
             let input_size = bytes.len();
             drop(bytes);
@@ -125,6 +141,7 @@ mod tests {
             rule_set: "a".into(),
             path: path.clone(),
             format: Some(Format::SingboxJson),
+            behavior: None,
         };
         let mut other = source.clone();
         other.rule_set = "b".into();

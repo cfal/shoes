@@ -264,6 +264,8 @@ fn merge_ports(mut ranges: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
 
 fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
     let mut result = Vec::new();
+    let mut ranges = [IpRanges::default(), IpRanges::default()];
+    let mut ports = Vec::new();
     let mut domains = [
         Vec::new(),
         Vec::new(),
@@ -282,12 +284,28 @@ fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
             Expression::DomainKeyword(v) => (4, v),
             Expression::DomainRegex(v) => (5, v),
             Expression::IpCidr(v) => (6, v),
+            Expression::Ranges(v, no_resolve) => {
+                ranges[usize::from(no_resolve)].append(v);
+                continue;
+            }
+            Expression::PortRanges(mut v) => {
+                ports.append(&mut v);
+                continue;
+            }
             other => {
                 result.push(other);
                 continue;
             }
         };
         domains[i].append(&mut v);
+    }
+    for (i, ranges) in ranges.into_iter().enumerate() {
+        if !ranges.v4.is_empty() || !ranges.v6.is_empty() {
+            result.push(Expression::Ranges(ranges, i != 0));
+        }
+    }
+    if !ports.is_empty() {
+        result.push(Expression::PortRanges(ports));
     }
     for (i, v) in domains.into_iter().enumerate() {
         if !v.is_empty() {

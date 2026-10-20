@@ -103,6 +103,7 @@ digest = "*"
 etherparse = "*"
 futures = "*"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+ruzstd = "0.9.1"
 h2 = "*"
 h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn = "*"

@@ -1,0 +1,6 @@
+# Original interoperability fixture
+Exact.Example
++.Suffix.Example
+.Strict.Example
+*.Wildcard.Example
+a.*.Middle.Example

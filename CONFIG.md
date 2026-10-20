@@ -1213,7 +1213,7 @@ before a reload stops existing listeners. Invalid sources reject the candidate.
 `rule_sets` is an OR of the named sets and cannot be combined with `masks` or
 `match`. For composition, use `match: {all: [{rule_set: local_domains}, ...]}`.
 Sources with the same resolved path and decoding options share one compiled set.
-Names must be unique. Only `.srs` is inferred; JSON requires `singbox_json`.
+Names must be unique. Only `.srs` and `.mrs` are inferred; JSON requires `singbox_json`.
 
 Rule-set paths are relative to the declaring config file, even when multiple
 configs are combined. FFI string configs require absolute rule-set paths. Existing
@@ -1233,6 +1233,22 @@ Files are limited to 64 MiB, inflated payloads to 256 MiB, and compilation has a
 512 MiB conservative allocation budget. These are safety ceilings, not a mobile
 memory guarantee. Remote URLs and GeoIP `.db` (MMDB) files are not supported;
 use country SRS files from sing-geoip instead.
+
+Mihomo providers use `format: mihomo_yaml` (a `payload` string list),
+`format: mihomo_text` (one entry per line, blank lines and `#` comments ignored),
+or `format: mrs`. YAML/text require `behavior: domain`, `ipcidr`, or `classical`.
+MRS supports domain/IP only; an optional configured behavior must match its header.
+MRS accepts one zstd frame with at most an 8 MiB window.
+
+Domain providers distinguish bare exact names, `+.example.com` (apex and all
+descendants), `.example.com` (descendants only), and `*` as one whole nonempty
+label. Literal labels are case-insensitive. Classical providers accept `DOMAIN`,
+`DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `DOMAIN-REGEX`, `IP-CIDR`, `IP-CIDR6`, and
+`DST-PORT`. Entries are alternatives, not paired independent lists. IP entries
+may end with `,no-resolve`; destination ports accept `80/443/8000-9000`.
+Other operators/options fail validation. Classical keywords and regexes are
+case-insensitive, with inline regex case overrides preserved. Unlike some Mihomo
+classical paths, Shoes normalizes incoming query names to lowercase.
 
 ### Example Rules
 ```yaml
