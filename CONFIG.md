@@ -1210,8 +1210,9 @@ before a reload stops existing listeners. Invalid sources reject the candidate.
       action: block
 ```
 
-`rule_sets` is an OR of the named sets and cannot be combined with `masks` or
-`match`. For composition, use `match: {all: [{rule_set: local_domains}, ...]}`.
+`rule_sets` is an OR of the named sets. When `masks` is also present, both sets of
+alternatives OR together. Neither can be combined with `match`. For composition,
+use `match: {all: [{rule_set: local_domains}, ...]}`.
 Sources with the same resolved path and decoding options share one compiled set.
 Names must be unique. Only `.srs` and `.mrs` are inferred; JSON requires `singbox_json`.
 
@@ -1249,6 +1250,16 @@ may end with `,no-resolve`; destination ports accept `80/443/8000-9000`.
 Other operators/options fail validation. Classical keywords and regexes are
 case-insensitive, with inline regex case overrides preserved. Unlike some Mihomo
 classical paths, Shoes normalizes incoming query names to lowercase.
+
+Xray geodata uses explicit `format: geosite_dat` or `format: geoip_dat`, with a
+required case-insensitive `code: CN` category selector. GeoSite optionally accepts
+`attributes: [ads]`: every listed attribute must have a true boolean value on the
+domain. Unlike Xray's key-presence filters, false, integer and key-only attributes
+do not satisfy this filter. Inline `@` selectors and other selection syntax are
+rejected. GeoIP supports `reverse_match` and separate IPv4/IPv6 membership.
+The loader scans protobuf framing without decoding unselected category bodies;
+selected entries reject unknown fields/enums and unsupported regex syntax.
+DAT has no relation to the MMDB `.db` files in sing-geoip releases.
 
 ### Example Rules
 ```yaml

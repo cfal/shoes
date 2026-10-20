@@ -1,4 +1,5 @@
 mod binary;
+mod geodata;
 mod mihomo;
 mod mrs;
 mod singbox;
@@ -25,6 +26,8 @@ pub enum Format {
     MihomoYaml,
     MihomoText,
     Mrs,
+    GeositeDat,
+    GeoipDat,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -34,6 +37,18 @@ pub struct RuleSetConfig {
     pub path: PathBuf,
     pub format: Option<Format>,
     pub behavior: Option<Behavior>,
+    pub code: Option<String>,
+    #[serde(default)]
+    pub attributes: Vec<String>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct SourceKey {
+    path: PathBuf,
+    format: Format,
+    behavior: Option<Behavior>,
+    code: Option<String>,
+    attributes: Vec<String>,
 }
 
 impl RuleSetConfig {
@@ -77,7 +92,7 @@ pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
 
 pub fn load(configs: &[Config], compiler: &mut Compiler) -> io::Result<()> {
     let mut names = HashSet::new();
-    let mut cache: HashMap<(PathBuf, Format, Option<Behavior>), Arc<Predicate>> = HashMap::new();
+    let mut cache: HashMap<SourceKey, Arc<Predicate>> = HashMap::new();
     for config in configs {
         let Config::RuleSet(source) = config else {
             continue;
@@ -91,11 +106,14 @@ pub fn load(configs: &[Config], compiler: &mut Compiler) -> io::Result<()> {
         let result = (|| {
             if !source.path.is_absolute() { return Err(invalid("rule_set path must be absolute for string configs; file configs anchor paths to their declaring file")); }
             let format = source.format()?;
-            if matches!(format, Format::Srs | Format::SingboxJson) && source.behavior.is_some() {
+            if !matches!(format, Format::MihomoYaml | Format::MihomoText | Format::Mrs) && source.behavior.is_some() {
                 return Err(invalid("behavior is only valid for Mihomo formats"));
             }
+            if !matches!(format, Format::GeositeDat | Format::GeoipDat) && (source.code.is_some() || !source.attributes.is_empty()) {
+                return Err(invalid("code and attributes are only valid for DAT formats"));
+            }
             let path = std::fs::canonicalize(&source.path)?;
-            let key = (path.clone(), format, source.behavior);
+            let key = SourceKey { path: path.clone(), format, behavior: source.behavior, code: source.code.clone(), attributes: source.attributes.clone() };
             if let Some(predicate) = cache.get(&key) { return Ok(predicate.clone()); }
             let start = std::time::Instant::now();
             if !std::fs::metadata(&path)?.is_file() { return Err(invalid("rule_set source must be a regular file")); }
@@ -112,6 +130,8 @@ pub fn load(configs: &[Config], compiler: &mut Compiler) -> io::Result<()> {
                 Format::MihomoYaml | Format::MihomoText => mihomo::decode(&bytes, format == Format::MihomoYaml,
                     source.behavior.ok_or_else(|| invalid("Mihomo YAML/text requires behavior"))?),
                 Format::Mrs => mrs::decode(&bytes, source.behavior, compiler),
+                Format::GeositeDat | Format::GeoipDat => geodata::decode(&bytes, format == Format::GeoipDat,
+                    source.code.as_deref().ok_or_else(|| invalid("DAT sources require an explicit code"))?, &source.attributes, compiler),
             }?;
             let input_size = bytes.len();
             drop(bytes);
@@ -142,6 +162,8 @@ mod tests {
             path: path.clone(),
             format: Some(Format::SingboxJson),
             behavior: None,
+            code: None,
+            attributes: Vec::new(),
         };
         let mut other = source.clone();
         other.rule_set = "b".into();
