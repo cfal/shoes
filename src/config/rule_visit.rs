@@ -79,17 +79,28 @@ mod tests {
 
     #[test]
     fn group_predicates_are_shared_before_listener_expansion() {
-        let configs = serde_yaml::from_str("\
+        let configs = serde_yaml::from_str(
+            "\
 - rule_group: shared\n  rules: [{match: {domain_suffix: [example.com]}, action: block}]\n\
 - address: '127.0.0.1:1080'\n  protocol: {type: socks}\n  rules: shared\n\
-- address: '127.0.0.1:1081'\n  protocol: {type: socks}\n  rules: shared\n").unwrap();
+- address: '127.0.0.1:1081'\n  protocol: {type: socks}\n  rules: shared\n",
+        )
+        .unwrap();
         let validated = crate::config::create_server_configs(configs).unwrap();
-        let predicates: Vec<_> = validated.configs.iter().filter_map(|config| {
-            if let Config::Server(server) = config {
-                let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else { panic!("unexpanded group") };
-                Some(rule.criteria.compiled.as_ref().unwrap().clone())
-            } else { None }
-        }).collect();
+        let predicates: Vec<_> = validated
+            .configs
+            .iter()
+            .filter_map(|config| {
+                if let Config::Server(server) = config {
+                    let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
+                        panic!("unexpanded group")
+                    };
+                    Some(rule.criteria.compiled.as_ref().unwrap().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(predicates.len(), 2);
         assert!(Arc::ptr_eq(&predicates[0], &predicates[1]));
     }

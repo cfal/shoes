@@ -27,6 +27,7 @@ const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 /// Result of config validation containing server configs and expanded DNS groups.
 /// DNS resolvers are built at runtime from the expanded groups.
 pub struct ValidatedConfigs {
+    pub rule_files: Vec<std::path::PathBuf>,
     pub global_limits: GlobalLimits,
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
@@ -45,6 +46,8 @@ pub struct ValidatedConfigs {
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
 pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
     let mut compiler = crate::rules::Compiler::default();
+    let rule_files = crate::rule_set::dependencies(&all_configs);
+    crate::rule_set::load(&all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
     // First pass: collect raw groups with unresolved references
@@ -83,6 +86,7 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
 
     for config in all_configs.into_iter() {
         match config {
+            Config::RuleSet(_) => {}
             Config::GlobalLimits(limits) => {
                 if global_limits.replace(limits).is_some() {
                     return Err(std::io::Error::new(
@@ -309,6 +313,7 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
     let mut validated = ValidatedConfigs {
+        rule_files,
         global_limits,
         configs: result,
         dns_groups: final_dns_groups,

@@ -54,7 +54,11 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
             }
         };
 
-        let mut configs = match serde_yaml::from_str::<Vec<Config>>(&config_str) {
+        let parsed =
+            tokio::task::spawn_blocking(move || serde_yaml::from_str::<Vec<Config>>(&config_str))
+                .await
+                .map_err(std::io::Error::other)?;
+        let mut configs = match parsed {
             Ok(c) => c,
             Err(e) => {
                 return Err(std::io::Error::new(
@@ -63,10 +67,29 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
                 ));
             }
         };
+        crate::rule_set::anchor(&mut configs, std::path::Path::new(config_filename))?;
         all_configs.append(&mut configs)
     }
 
     Ok(all_configs)
+}
+
+pub async fn compile_configs(configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    use std::sync::{Arc, OnceLock};
+    static COMPILER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let permit = COMPILER
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(std::io::Error::other)?;
+    tokio::task::spawn_blocking(move || {
+        // A canceled caller cannot release the permit while its build is still running.
+        let _permit = permit;
+        create_server_configs(configs)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Load config from a string (used by FFI targets)

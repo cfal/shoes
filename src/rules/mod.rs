@@ -36,6 +36,8 @@ pub enum Expression {
     #[serde(skip)]
     Ranges(IpRanges, bool),
     #[serde(skip)]
+    PortRanges(Vec<(u16, u16)>),
+    #[serde(skip)]
     Never,
 }
 

@@ -129,6 +129,13 @@ impl Compiler {
                 self.charge(v.len() * 8, v.len())?;
                 Kind::Ports(merge_ports(v.into_iter().map(|p| (p, p)).collect()).into())
             }
+            Expression::PortRanges(v) => {
+                self.charge(v.capacity() * 8, v.len())?;
+                if v.iter().any(|(a, b)| a > b) {
+                    return Err(invalid("descending port range"));
+                }
+                Kind::Ports(merge_ports(v).into())
+            }
             Expression::DestinationPortRange(v) => {
                 self.strings(&v)?;
                 let ranges = v

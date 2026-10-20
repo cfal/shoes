@@ -1,0 +1,215 @@
+use std::io;
+
+use super::binary::{MAX_ENTRIES, Reader, inflate};
+use super::singbox::{Parts, literals, port_ranges};
+use crate::rules::{Compiler, Expression, IpRanges, invalid};
+
+pub fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Expression> {
+    if bytes.len() < 4 || &bytes[..3] != b"SRS" || !(1..=5).contains(&bytes[3]) {
+        return Err(invalid("expected SRS version 1-5"));
+    }
+    let payload = inflate(&bytes[4..], budget)?;
+    let mut reader = Reader::new(&payload, budget);
+    let count = reader.count(false, MAX_ENTRIES, 1)?;
+    reader.charge(count * 128)?;
+    let mut remaining = MAX_ENTRIES;
+    let rules = (0..count)
+        .map(|i| {
+            rule(&mut reader, bytes[3], 0, &mut remaining)
+                .map_err(|e| invalid(format!("SRS rule {i}: {e}")))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    reader.end()?;
+    Ok(Expression::or(rules))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::{Compiler, Outcome};
+    use std::io::Write;
+
+    fn decode(bytes: &[u8]) -> io::Result<Expression> {
+        super::decode(bytes, &mut Compiler::default())
+    }
+
+    fn wrap(version: u8, payload: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let mut bytes = vec![b'S', b'R', b'S', version];
+        bytes.extend(encoder.finish().unwrap());
+        bytes
+    }
+
+    #[test]
+    fn upstream_fixture_matches_source_and_rejects_truncation() {
+        let bytes = include_bytes!("../../tests/fixtures/rule_sets/singbox-v2.srs");
+        let json = include_bytes!("../../tests/fixtures/rule_sets/singbox.json");
+        let expected = Compiler::default()
+            .compile(super::super::singbox::decode(json).unwrap())
+            .unwrap();
+        for version in 2..=5 {
+            let mut bytes = bytes.to_vec();
+            bytes[3] = version;
+            let actual = Compiler::default()
+                .compile(decode(&bytes).unwrap())
+                .unwrap();
+            for name in [
+                None,
+                Some("exact.example"),
+                Some("a.exact.example"),
+                Some("suffix.example"),
+                Some("a.suffix.example"),
+                Some("strict.example"),
+                Some("a.strict.example"),
+                Some("upper.example"),
+                Some("keyword.example"),
+                Some("regex27.example"),
+                Some("case.example"),
+                Some("not.example"),
+            ] {
+                for ip in [
+                    None,
+                    Some("192.0.2.1".parse().unwrap()),
+                    Some("2001:db8::1".parse().unwrap()),
+                    Some("203.0.113.7".parse().unwrap()),
+                ] {
+                    for port in [80, 443, 8000, 8002, 8443] {
+                        assert_eq!(
+                            actual.evaluate(name, ip, port),
+                            expected.evaluate(name, ip, port)
+                        );
+                    }
+                }
+            }
+        }
+        for n in 0..bytes.len() {
+            assert!(decode(&bytes[..n]).is_err(), "accepted truncation at {n}");
+        }
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        assert!(decode(&trailing).is_err());
+        let mut corrupt = bytes.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(decode(&corrupt).is_err());
+    }
+
+    #[test]
+    fn versions_empty_sets_and_unsupported_items() {
+        for v in 1..=5 {
+            let predicate = Compiler::default()
+                .compile(decode(&wrap(v, &[0])).unwrap())
+                .unwrap();
+            assert_eq!(predicate.evaluate(None, None, 1), Outcome::Miss);
+            assert!(decode(&wrap(v, &[1, 0, 255, 0])).is_err());
+            assert!(
+                decode(&wrap(v, &[1, 0, 5]))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("tag 5")
+            );
+            assert!(decode(&wrap(v, &[1, 1, 0, 0, 0])).is_err());
+        }
+        assert!(decode(&wrap(6, &[0])).is_err());
+    }
+}
+
+fn rule(
+    reader: &mut Reader<'_>,
+    version: u8,
+    depth: usize,
+    remaining: &mut usize,
+) -> io::Result<Expression> {
+    if depth > 100 || *remaining == 0 {
+        return Err(invalid("SRS rule count/nesting limit exceeded"));
+    }
+    *remaining -= 1;
+    match reader.byte()? {
+        0 => {
+            let mut parts = Parts::default();
+            let mut seen = [false; 256];
+            loop {
+                let tag = reader.byte()?;
+                if tag == 255 {
+                    return parts.finish(reader.boolean()?);
+                }
+                if std::mem::replace(&mut seen[tag as usize], true) {
+                    return Err(invalid(format!("duplicate SRS tag {tag}")));
+                }
+                match tag {
+                    2 => {
+                        let mut exact = Vec::new();
+                        let mut suffix = Vec::new();
+                        for key in reader.domain_keys(false)? {
+                            match key.as_bytes().first() {
+                                Some(b'\n') if version >= 2 => suffix.push(key[1..].to_owned()),
+                                Some(b'\r') if key.starts_with("\r.") => {
+                                    suffix.push(key[1..].to_owned())
+                                }
+                                Some(b'\n' | b'\r') => {
+                                    return Err(invalid("invalid SRS domain marker/version"));
+                                }
+                                _ => exact.push(key),
+                            }
+                        }
+                        parts.address.push(literals(exact, 0)?);
+                        parts.address.push(literals(suffix, 1)?);
+                    }
+                    3 => parts.address.push(literals(reader.strings()?, 2)?),
+                    4 => parts
+                        .address
+                        .push(Expression::DomainRegex(reader.strings()?)),
+                    6 => {
+                        if reader.byte()? != 1 {
+                            return Err(invalid("unsupported SRS IP-set version"));
+                        }
+                        let count = reader.count(true, MAX_ENTRIES, 2)?;
+                        reader.charge(count * 64)?;
+                        let mut ranges = IpRanges::default();
+                        for _ in 0..count {
+                            let a = reader.count(false, 16, 1)?;
+                            let from = reader.take(a)?;
+                            let b = reader.count(false, 16, 1)?;
+                            let to = reader.take(b)?;
+                            ranges.add_encoded(from, to, false)?;
+                        }
+                        parts.address.push(Expression::Ranges(ranges, false));
+                    }
+                    9 => {
+                        let count = reader.count(false, MAX_ENTRIES, 2)?;
+                        reader.charge(count * 8)?;
+                        parts.ports.push(Expression::PortRanges(
+                            (0..count)
+                                .map(|_| reader.u16().map(|p| (p, p)))
+                                .collect::<io::Result<_>>()?,
+                        ));
+                    }
+                    10 => parts.ports.push(port_ranges(reader.strings()?)?),
+                    _ => return Err(invalid(format!("unsupported SRS predicate tag {tag}"))),
+                }
+            }
+        }
+        1 => {
+            let mode = reader.byte()?;
+            if mode > 1 {
+                return Err(invalid("invalid SRS logical mode"));
+            }
+            let count = reader.count(false, MAX_ENTRIES, 1)?;
+            reader.charge(count * 128)?;
+            if count == 0 {
+                return Err(invalid("empty SRS logical rule"));
+            }
+            let children = (0..count)
+                .map(|_| rule(reader, version, depth + 1, remaining))
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok(if mode == 0 {
+                Expression::All(children)
+            } else {
+                Expression::Any(children)
+            }
+            .inverted(reader.boolean()?))
+        }
+        tag => Err(invalid(format!("unsupported SRS rule type {tag}"))),
+    }
+}

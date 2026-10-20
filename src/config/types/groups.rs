@@ -150,6 +150,7 @@ impl Serialize for NamedPem {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Config {
+    RuleSet(crate::rule_set::RuleSetConfig),
     GlobalLimits(GlobalLimits),
     Server(ServerConfig),
     /// TUN device server - accepts IP packets from a TUN device.
@@ -194,7 +195,11 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let is_tun_config = has_device_name || has_device_fd;
 
         // Try to determine which variant based on fields
-        if map.contains_key(Value::String("global_limits".to_string())) {
+        if map.contains_key(Value::String("rule_set".to_string())) {
+            serde_yaml::from_value(value)
+                .map(Config::RuleSet)
+                .map_err(|e| Error::custom(format!("invalid rule_set: {e}")))
+        } else if map.contains_key(Value::String("global_limits".to_string())) {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct GlobalLimitsEntry {
@@ -258,6 +263,7 @@ impl serde::ser::Serialize for Config {
         S: serde::ser::Serializer,
     {
         match self {
+            Config::RuleSet(source) => source.serialize(serializer),
             Config::GlobalLimits(limits) => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(1))?;
@@ -712,7 +718,8 @@ client_proxies:
                     rcgen::generate_simple_self_signed(vec!["proxy.local".into()]).unwrap();
                 for config in &mut configs {
                     if let Config::Server(server) = config
-                        && let crate::config::ServerProxyConfig::Tls { tls_targets, .. } = &mut server.protocol
+                        && let crate::config::ServerProxyConfig::Tls { tls_targets, .. } =
+                            &mut server.protocol
                     {
                         for target in tls_targets.values_mut() {
                             target.cert = certificate.cert.pem();

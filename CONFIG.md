@@ -1191,6 +1191,49 @@ labels and excessive length) are now rejected even with catch-all-only rules;
 use A-label/punycode names. Invalid sniff hints are ignored. Matching strips one
 root dot and lowercases ASCII without changing the dial target.
 
+### Local Rule Sets
+
+Declare a named local source as a top-level config item, then reference it from
+rules. Sources are read and compiled during validation, including `--dry-run`,
+before a reload stops existing listeners. Invalid sources reject the candidate.
+
+```yaml
+- rule_set: local_domains
+  path: lists/domains.srs
+  format: srs
+- rule_set: local_addresses
+  path: lists/addresses.json
+  format: singbox_json
+- rule_group: imported
+  rules:
+    - rule_sets: [local_domains, local_addresses]
+      action: block
+```
+
+`rule_sets` is an OR of the named sets and cannot be combined with `masks` or
+`match`. For composition, use `match: {all: [{rule_set: local_domains}, ...]}`.
+Sources with the same resolved path and decoding options share one compiled set.
+Names must be unique. Only `.srs` is inferred; JSON requires `singbox_json`.
+
+Rule-set paths are relative to the declaring config file, even when multiple
+configs are combined. FFI string configs require absolute rule-set paths. Existing
+PEM `cert`/`key` paths remain relative to the working directory; absolute paths
+avoid mixing these conventions.
+
+SRS versions 1-5 and sing-box source versions 1-5 support destination domain,
+suffix, keyword, regex, IP, port, inversion and nested logical rules. Unsupported
+fields, tags and versions fail validation, including inside inverted expressions.
+Source address alternatives form an OR; destination ports constrain that OR.
+An empty top-level set matches nothing. Empty individual rules are invalid.
+sing-box literal spelling is preserved: uppercase domain/suffix/keyword entries
+cannot match normalized lowercase queries and produce a warning. Regex patterns
+retain their own case flags; only the bounded ASCII Rust regex subset is accepted.
+
+Files are limited to 64 MiB, inflated payloads to 256 MiB, and compilation has a
+512 MiB conservative allocation budget. These are safety ceilings, not a mobile
+memory guarantee. Remote URLs and GeoIP `.db` (MMDB) files are not supported;
+use country SRS files from sing-geoip instead.
+
 ### Example Rules
 ```yaml
 rules:

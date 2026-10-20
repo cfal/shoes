@@ -16,7 +16,7 @@ use crate::resources;
 async fn load_validated(paths: &[String]) -> io::Result<ValidatedConfigs> {
     let configs = config::load_configs(&paths.to_vec()).await?;
     let (configs, _) = config::convert_cert_paths(configs).await?;
-    config::create_server_configs(configs)
+    config::compile_configs(configs).await
 }
 
 struct PreparedServers {
