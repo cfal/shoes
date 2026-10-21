@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use serde_json::{Value, json};
 use shoes_test_support::process::ProcessGuard;
 use tokio::{
@@ -863,10 +864,7 @@ fn wrap(
             };
         }
         (Kind::Xray, Transport::Tls) => {
-            let certificate = rustls_pemfile::certs(&mut cert.as_bytes())
-                .next()
-                .unwrap()
-                .unwrap();
+            let certificate = CertificateDer::from_pem_slice(cert.as_bytes()).unwrap();
             let pin: String = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &certificate)
                 .as_ref()
                 .iter()

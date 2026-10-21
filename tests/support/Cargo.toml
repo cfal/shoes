@@ -15,7 +15,6 @@ hyper-util = { version = "*", features = ["tokio", "server"] }
 rand = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls = "*"
-rustls-pemfile = "*"
 serde_json = "*"
 tempfile = "*"
 tokio = { version = "*", features = [

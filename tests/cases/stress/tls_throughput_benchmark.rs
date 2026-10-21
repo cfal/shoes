@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use shoes_test_support as common;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -37,8 +38,7 @@ async fn tls_client(
     cert_path: &Path,
 ) -> TestResult<tokio_rustls::client::TlsStream<TcpStream>> {
     let mut root_store = rustls::RootCertStore::empty();
-    let certs = rustls_pemfile::certs(&mut io::BufReader::new(std::fs::File::open(cert_path)?))
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs = CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()?;
     let (added, ignored) = root_store.add_parsable_certificates(certs);
     if added == 0 || ignored != 0 {
         return Err(format!("loaded {added} certificates and ignored {ignored}").into());

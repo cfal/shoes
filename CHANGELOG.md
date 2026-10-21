@@ -10,6 +10,8 @@
 - Bound each iOS service's socket-protection callback to its own protector so stopping an older service cannot clear a replacement callback.
 - Expanded deterministic TUN lifecycle and dual-stack handshake tests, added kernel half-close and active-shutdown coverage, and enabled kernel TUN checks on pull requests and master pushes.
 - Released Fake DNS snapshot locks explicitly on owner teardown so concurrently starting subprocesses cannot delay reopening the state file.
+- Updated Rust dependencies, including GotaTun 0.10.2, Tokio 1.54.0, LRU 0.19.0, and ML-KEM 0.3.3, which removes secret-dependent table lookups. Existing Web PKI compromise protections are retained.
+- Refreshed the BLAKE3 fork with upstream buffer-alignment and AVX-512 soundness fixes while retaining the binary-context key derivation API.
 
 ## v0.3.4
 
