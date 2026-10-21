@@ -75,6 +75,7 @@ pub struct TcpStackDirect {
     running: Arc<AtomicBool>,
     /// Receiver for UDP packets (filtered from TUN by the stack thread)
     udp_rx: Option<Receiver<PacketBuffer>>,
+    tcp_rx: Option<mpsc::UnboundedReceiver<NewTcpConnection>>,
     /// Shared state with the stack thread
     shared_state: Arc<Mutex<SharedState>>,
     /// TUN file descriptor (owned, will be closed on drop)
@@ -133,11 +134,13 @@ impl TcpStackDirect {
     ) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
         let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        let (tcp_tx, tcp_rx) = mpsc::unbounded_channel();
 
         let running = Arc::new(AtomicBool::new(true));
+        // Retains connections from packets already queued when the stack thread starts.
         let shared_state = Arc::new(Mutex::new(SharedState {
             udp_response_rx: None,
-            new_conn_tx: None,
+            new_conn_tx: Some(tcp_tx),
         }));
 
         let thread_handle = {
@@ -188,6 +191,7 @@ impl TcpStackDirect {
             wake,
             running,
             udp_rx: Some(udp_rx),
+            tcp_rx: Some(tcp_rx),
             shared_state,
             _tun_fd: tun_fd,
         })
@@ -202,18 +206,14 @@ impl TcpStackDirect {
         self.udp_rx.take()
     }
 
+    pub fn take_tcp_rx(&mut self) -> Option<mpsc::UnboundedReceiver<NewTcpConnection>> {
+        self.tcp_rx.take()
+    }
+
     /// Set the channel for UDP responses to write back to TUN.
     pub fn set_udp_response_tx(&mut self, rx: Receiver<PacketBuffer>) {
         if let Ok(mut state) = self.shared_state.lock() {
             state.udp_response_rx = Some(rx);
-        }
-        self.wake.notify();
-    }
-
-    /// Set the channel for notifying about new TCP connections.
-    pub fn set_new_conn_tx(&mut self, tx: mpsc::UnboundedSender<NewTcpConnection>) {
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.new_conn_tx = Some(tx);
         }
         self.wake.notify();
     }
@@ -685,7 +685,6 @@ fn publish_connection(
     sender: &mut Option<mpsc::UnboundedSender<NewTcpConnection>>,
     shared_state: &Mutex<SharedState>,
 ) {
-    // Setup can publish the handler after this iteration's initial snapshot.
     if sender.is_none()
         && let Ok(mut state) = shared_state.lock()
     {
@@ -1203,6 +1202,32 @@ mod tests {
     }
 
     #[test]
+    fn queued_syn_survives_delayed_handler_setup() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut syn = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+            .tcp(10001, 443, 101, 4096)
+            .syn()
+            .write(&mut syn, b"")
+            .unwrap();
+        peer.send(&syn).unwrap();
+
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        let mut buffer = [0; 1500];
+        let length = peer.recv(&mut buffer).unwrap();
+        let ip = Ipv4Packet::new_checked(&buffer[..length]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(!tcp.rst());
+        assert!(tcp.syn() && tcp.ack());
+        assert_eq!(tcp.ack_number().0, 102);
+
+        let mut rx = stack.take_tcp_rx().unwrap();
+        let connection = rx.try_recv().unwrap();
+        assert_eq!(connection.remote_addr, "1.1.1.1:443".parse().unwrap());
+    }
+
+    #[test]
     fn transmit_storage_is_reused_and_initialized() {
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
@@ -1471,8 +1496,7 @@ mod tests {
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        stack.set_new_conn_tx(tx);
+        let mut rx = stack.take_tcp_rx().unwrap();
         let mut buf = [0; 1500];
         for port in 10000..10300 {
             let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
@@ -1510,8 +1534,7 @@ mod tests {
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        stack.set_new_conn_tx(tx);
+        let mut rx = stack.take_tcp_rx().unwrap();
         let packet = |sequence, acknowledgment: Option<u32>, payload: &[u8]| {
             let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
                 .tcp(10001, 443, sequence, 4096);
@@ -1790,8 +1813,7 @@ mod tests {
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        stack.set_new_conn_tx(tx);
+        let mut rx = stack.take_tcp_rx().unwrap();
         let mut syn = Vec::new();
         etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
             .tcp(10001, 443, 101, 4096)

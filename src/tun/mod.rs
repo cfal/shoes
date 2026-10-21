@@ -81,7 +81,7 @@ use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
 use packet::PacketBuffer;
-use tcp_stack_direct::{NewTcpConnection, PACKET_QUEUE_CAPACITY, TcpStackDirect};
+use tcp_stack_direct::{PACKET_QUEUE_CAPACITY, TcpStackDirect};
 use udp_manager::TunUdpManager;
 
 /// Run the TUN server with the given configuration.
@@ -157,8 +157,7 @@ async fn run_tun_server_inner(
     let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::channel::<PacketBuffer>(PACKET_QUEUE_CAPACITY);
     tcp_stack.set_udp_response_tx(udp_to_stack_rx);
 
-    let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();
-    tcp_stack.set_new_conn_tx(tcp_conn_tx);
+    let mut tcp_conn_rx = tcp_stack.take_tcp_rx().expect("tcp_rx already taken");
 
     let mut tasks = JoinSet::new();
     if config.tcp_enabled {
