@@ -49,7 +49,7 @@ mod android;
 #[cfg(target_os = "android")]
 pub use android::*;
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", all(test, unix, feature = "ffi")))]
 mod ios;
 
 #[cfg(target_os = "ios")]

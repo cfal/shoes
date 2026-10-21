@@ -24,7 +24,7 @@ use tokio::{
 
 use crate::http_proxy_support as support;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Peer {
     SingBox,
     Caddy,
@@ -43,7 +43,9 @@ async fn native_caddy_naive_preserves_multiplexing_idle_and_large_transfers()
 }
 
 async fn transport_compatibility(peer: Peer) -> Result<(), Box<dyn std::error::Error>> {
-    tokio::time::timeout(Duration::from_secs(120), async {
+    let phase = std::cell::Cell::new("startup");
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
         let (cert, key) = generate_test_cert_files()?;
         let mut ports = PortHelper::new();
         let (_, server) = ports.get_localhost_listener_port();
@@ -90,27 +92,59 @@ async fn transport_compatibility(peer: Peer) -> Result<(), Box<dyn std::error::E
         ports.wait_for_all_ports().await?;
         let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
         let target = format!("127.0.0.1:{}", echo.local_addr().port());
+        phase.set("initial CONNECT");
         let mut first = support::connect(entry, &target).await?;
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // Exceed the standard HTTP/2 proxy's 30 s + 5 s PING watchdog, which
         // Naive must not inherit, but stay below Caddy 2.11.7's 60 s body timeout.
+        phase.set("active stream idle wait");
         tokio::time::sleep(Duration::from_secs(40)).await;
+        phase.set("active stream after idle");
         first.write_all(b"quiet").await?;
         let mut response = [0; 5];
         first.read_exact(&mut response).await?;
         assert_eq!(&response, b"quiet");
+        eprintln!(
+            "{peer:?}: active stream survived idle at {:?}",
+            started.elapsed()
+        );
         // Concurrent preflight contention may legitimately dial a spare carrier.
+        phase.set("multiplexed CONNECTs");
         let second = support::connect(entry, &target).await?;
         let third = support::connect(entry, &target).await?;
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        tokio::try_join!(large_exchange(first, peer), large_exchange(second, peer), large_exchange(third, peer))?;
+        phase.set("concurrent bulk transfers and EOF");
+        tokio::try_join!(
+            large_exchange(first, peer),
+            large_exchange(second, peer),
+            large_exchange(third, peer)
+        )?;
+        eprintln!(
+            "{peer:?}: concurrent bulk transfers finished at {:?}",
+            started.elapsed()
+        );
 
+        phase.set("empty carrier idle wait");
         tokio::time::sleep(Duration::from_secs(40)).await;
-        large_exchange(support::connect(entry, &target).await?, peer).await?;
+        phase.set("CONNECT after carrier idle");
+        let last = support::connect(entry, &target).await?;
+        phase.set("bulk transfer and EOF after carrier idle");
+        large_exchange(last, peer).await?;
         assert_eq!(count.load(Ordering::SeqCst), 1, "idle carrier was not reused");
         Ok::<_, Box<dyn std::error::Error>>(())
-    }).await?
+    })
+    .await;
+    result.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{peer:?} timed out during {} after {:?}",
+                phase.get(),
+                started.elapsed()
+            ),
+        )
+    })?
 }
 
 async fn forward_carriers(

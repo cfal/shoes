@@ -17,7 +17,8 @@ pub(crate) mod udp;
 pub(crate) mod wake;
 
 // Matches Linux tcp_keepalive_time and shadowsocks-rust.
-const TCP_PEER_SILENCE_TIMEOUT: SmolDuration = SmolDuration::from_secs(7200);
+pub(crate) const TCP_PEER_SILENCE_TIMEOUT: SmolDuration = SmolDuration::from_secs(7200);
+pub(crate) const TCP_HANDSHAKE_TIMEOUT: SmolDuration = SmolDuration::from_secs(30);
 // Bounds orphaned FIN exchanges independently of traffic refreshing smoltcp's silence timer.
 const TCP_ORPHAN_TIMEOUT: SmolDuration = SmolDuration::from_secs(60);
 

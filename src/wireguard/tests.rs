@@ -1031,6 +1031,20 @@ async fn wireguard_outer_chain_requires_udp_before_starting() {
 #[tokio::test]
 async fn wireguard_nested_outer_chain_and_reload() {
     use serde_json::{Value, json};
+    // Concurrent harness forks can retain even CLOEXEC sockets until exec completes.
+    if std::env::var_os("SHOES_WIREGUARD_NESTED_RELOAD_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wireguard::tests::wireguard_nested_outer_chain_and_reload",
+                "--nocapture",
+            ])
+            .env("SHOES_WIREGUARD_NESTED_RELOAD_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(30), async {
         let carrier_port = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let inner_port = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();

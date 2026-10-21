@@ -562,9 +562,7 @@ fn kernel_reset_half_open_does_not_capture_the_next_connection() -> io::Result<(
                     // No kernel TCP socket owns the raw SYN, so Linux resets the received SYN-ACK.
                     Ok(())
                 });
-                let (mut abandoned, _) = listener.accept().await?;
                 probe.await.map_err(io::Error::other)??;
-                assert_eq!(abandoned.read(&mut [0; 1]).await?, 0);
                 let mut stream = TcpStream::connect(target).await?;
                 let (mut upstream, _) = listener.accept().await?;
                 stream.write_all(b"after reset").await?;
@@ -573,6 +571,7 @@ fn kernel_reset_half_open_does_not_capture_the_next_connection() -> io::Result<(
                 upstream.write_all(&data).await?;
                 stream.read_exact(&mut data).await?;
                 assert_eq!(&data, b"after reset");
+                assert!(futures::FutureExt::now_or_never(listener.accept()).is_none());
                 kernel.assert_transfer(before, data.len())
             })
             .await?

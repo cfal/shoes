@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Fixed TUN startup resets for queued TCP connections, rejected SYN admission, and stale passive listeners after handshake resets. TUN and WireGuard now defer inbound routing and hostname sniffing until TCP establishment; half-open TUN connections expire after 30 seconds instead of retaining the established-connection timeout.
+- Propagated TUN worker startup and runtime failures, including hard write errors, to the service owner. The daemon now stops with an error rather than silently continuing without TUN. Temporary Linux link-down drops packets without stopping the daemon. Invalid supplied descriptors are rejected before taking ownership.
+- Kept reply-only TUN UDP sessions alive while destination traffic continues.
+- Bound each iOS service's socket-protection callback to its own protector so stopping an older service cannot clear a replacement callback.
+- Expanded deterministic TUN lifecycle and dual-stack handshake tests, added kernel half-close and active-shutdown coverage, and enabled kernel TUN checks on pull requests and master pushes.
+- Released Fake DNS snapshot locks explicitly on owner teardown so concurrently starting subprocesses cannot delay reopening the state file.
+
 ## v0.3.4
 
 - Updated Web PKI dependencies for the [eMudhra intermediate CA compromise](https://emudhra.we-have-a-problem.com/) (CVE-2026-111943): removed `emSign ECC Root CA - G3` from bundled roots and blocked the eight compromised intermediate keys, including cross-signed chains, during certificate verification. Affected deployments need certificates with an unaffected CA chain. Existing binaries must be rebuilt or upgraded to receive this protection.
@@ -8,7 +17,6 @@
 - Fixed Vision DIRECT decisions under backpressure and tightened TLS ServerHello parsing.
 - Fixed bracketed IPv6 literals in destinations and DNS upstream URLs being treated as hostnames.
 - Fixed TCP loss recovery in TUN and WireGuard through a pinned smoltcp fork.
-- Fixed a TUN startup race that could reset TCP connections already queued on the device before the connection handler was registered.
 - Fixed XHTTP shutdown handling for complete HTTP/2 responses. Added server `matching_headers` for exact required-header matching and opt-in `close_on_http1_error` for silent HTTP/1 closure on header or path mismatches. H2/H3 mismatches return plain 404s without affecting sibling streams, subject to request-admission limits. XHTTP 400/404 responses now omit XHTTP-specific and CORS headers.
 - XHTTP aggregate/session admission and byte caps are now opt-in, and the per-connection request limit defaults to 250 instead of 128. Uncapped workloads can use more memory under overload. Setting only an aggregate byte or request cap derives the previous per-session safeguard (at most 4 MiB or 128 requests); explicit session caps override it. To restore all v0.3.3 XHTTP limits, set `max_sessions: 1024`, `max_pending_sessions: 256`, `max_requests: 4096`, `max_requests_per_session: 128`, `max_requests_per_connection: 128`, `max_buffered_bytes: 67108864`, and `max_session_buffered_bytes: 4194304` under `limits`. Packet sizes, reorder windows, transport windows and timeouts are unchanged.
 - Added ordered destination predicates and shared domain/IP indexes, with local SRS, sing-box JSON, Mihomo YAML/text/MRS and Xray GeoSite/GeoIP DAT rule sets. Sources compile before listener replacement and participate in config-file watching; invalid candidates retain the running configuration. IP rules resolve only when needed and pin the judged address; DNS failures stop routing.

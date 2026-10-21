@@ -22,6 +22,13 @@ pub(super) struct SnapshotStore {
     pub(super) serial: parking_lot::Mutex<()>,
 }
 
+impl Drop for SnapshotStore {
+    fn drop(&mut self) {
+        // A concurrent fork can retain the open-file description until exec.
+        let _ = self._lock.unlock();
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Snapshot {
@@ -291,6 +298,21 @@ mod tests {
             ipv6_range: Some("2001:2::/112".into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn owner_drop_releases_lock_despite_an_inherited_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = options(&directory.path().join("state.json"));
+        let pool = FakeIpPool::new(&options).unwrap();
+        let inherited = pool.store.as_ref().unwrap()._lock.try_clone().unwrap();
+        assert!(FakeIpPool::new(&options).is_err());
+        drop(pool);
+        let replacement = FakeIpPool::new(&options).unwrap();
+        drop(inherited);
+        assert!(FakeIpPool::new(&options).is_err());
+        drop(replacement);
+        assert!(FakeIpPool::new(&options).is_ok());
     }
 
     #[test]
