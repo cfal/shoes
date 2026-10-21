@@ -80,27 +80,38 @@ impl AsyncWrite for H2MultiStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Only reserve capacity when needed to avoid resetting h2's internal state on re-polls
-        if self.send.capacity() == 0 {
-            self.send.reserve_capacity(buf.len());
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if self.shutdown_sent {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
 
-        match self.send.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(capacity))) => {
+        self.send.reserve_capacity(buf.len());
+        loop {
+            // poll_capacity reports increases, not readiness of already assigned credit.
+            let capacity = self.send.capacity();
+            if capacity > 0 {
                 let to_send = buf.len().min(capacity);
                 self.send
                     .send_data(Bytes::copy_from_slice(&buf[..to_send]), false)
                     .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;
-                Poll::Ready(Ok(to_send))
+                return Poll::Ready(Ok(to_send));
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(format!(
-                "H2 poll_capacity error: {e}"
-            )))),
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "H2 stream closed",
-            ))),
-            Poll::Pending => Poll::Pending,
+            match std::task::ready!(self.send.poll_capacity(cx)) {
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => {
+                    return Poll::Ready(Err(io::Error::other(format!(
+                        "H2 poll_capacity error: {e}"
+                    ))));
+                }
+                None => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "H2 stream closed",
+                    )));
+                }
+            }
         }
     }
 
@@ -145,6 +156,101 @@ impl AsyncStream for H2MultiStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_writes_do_not_strand_credit_on_multiplexed_streams() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::{mpsc, oneshot};
+        use tokio::task::JoinSet;
+        use tokio::time::{Duration, timeout};
+
+        timeout(Duration::from_secs(5), async {
+            let (client, server) = tokio::io::duplex(8192);
+            let (accepted_tx, mut accepted_rx) = mpsc::channel(3);
+            let (release_tx, release_rx) = oneshot::channel();
+            let (updated_tx, updated_rx) = oneshot::channel();
+            let mut drivers = JoinSet::new();
+            drivers.spawn(async move {
+                let mut connection = h2::server::Builder::new()
+                    .initial_window_size(0)
+                    .handshake::<_, Bytes>(server)
+                    .await
+                    .unwrap();
+                for _ in 0..3 {
+                    let (request, mut response) = connection.accept().await.unwrap().unwrap();
+                    let send = response
+                        .send_response(http::Response::new(()), false)
+                        .unwrap();
+                    accepted_tx.send((send, request.into_body())).await.unwrap();
+                }
+                tokio::select! {
+                    result = release_rx => result.unwrap(),
+                    _ = connection.accept() => panic!("unexpected stream"),
+                }
+                connection.set_initial_window_size(64).unwrap();
+                updated_tx.send(()).unwrap();
+                while connection.accept().await.is_some() {}
+            });
+            let (mut request, mut connection) = h2::client::handshake(client).await.unwrap();
+            let mut ping = connection.ping_pong().unwrap();
+            drivers.spawn(async move { connection.await.unwrap() });
+            let mut streams = Vec::new();
+            let mut peers = Vec::new();
+            for _ in 0..3 {
+                request = request.ready().await.unwrap();
+                let (response, send) = request
+                    .send_request(
+                        http::Request::builder()
+                            .method("CONNECT")
+                            .uri("example.com:443")
+                            .body(())
+                            .unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                let recv = response.await.unwrap().into_body();
+                peers.push(accepted_rx.recv().await.unwrap());
+                let mut stream = H2MultiStream::new(send, recv);
+                std::future::poll_fn(|cx| {
+                    assert!(Pin::new(&mut stream).poll_write(cx, &[42; 64]).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                streams.push(stream);
+            }
+
+            release_tx.send(()).unwrap();
+            updated_rx.await.unwrap();
+            // The PING reply fences the server's window update before smaller retries.
+            ping.ping(h2::Ping::opaque()).await.unwrap();
+            for stream in &mut streams {
+                assert_eq!(stream.send.capacity(), 64);
+                stream.write_all(b"a").await.unwrap();
+                timeout(Duration::from_secs(1), stream.write_all(b"b"))
+                    .await
+                    .expect("write stalled despite unused capacity")
+                    .unwrap();
+                assert_eq!(stream.write(&[]).await.unwrap(), 0);
+                stream.shutdown().await.unwrap();
+                assert_eq!(
+                    stream.write(b"after shutdown").await.unwrap_err().kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+            }
+            for (_send, mut recv) in peers {
+                let mut received = Vec::new();
+                while let Some(data) = recv.data().await {
+                    let data = data.unwrap();
+                    received.extend_from_slice(&data);
+                    recv.flow_control().release_capacity(data.len()).unwrap();
+                }
+                assert_eq!(received, b"ab");
+            }
+            drivers.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn test_h2_multi_stream_is_async_stream() {
