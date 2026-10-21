@@ -152,6 +152,24 @@ mod tests {
     }
 
     #[test]
+    fn malformed_wildcards_describe_the_provider_grammar() {
+        for entry in ["a*.example.com", "**.x", "+.a*.example.com", ".**.x"] {
+            let error = domain_entry(entry).unwrap_err().to_string();
+            assert!(
+                error.contains("wildcard labels must be '*'"),
+                "{entry}: {error}"
+            );
+            assert!(!error.contains("domain_pattern"));
+        }
+        let overlong = format!("*.{}", "a".repeat(252));
+        let error = decode(overlong.as_bytes(), false, Behavior::Domain).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "provider entry 0: wildcard pattern must be 1-253 bytes"
+        );
+    }
+
+    #[test]
     fn text_providers_accept_bom_and_both_comment_styles() {
         for (behavior, entry) in [
             (Behavior::Domain, "example.com"),
@@ -254,16 +272,5 @@ mod tests {
             .compile(decode(b"# empty\n\n", false, Behavior::Domain).unwrap())
             .unwrap();
         assert_eq!(p.evaluate(None, None, 80), Outcome::Miss);
-    }
-}
-#[test]
-fn malformed_wildcards_describe_the_provider_grammar() {
-    for entry in ["a*.example.com", "**.x", "+.a*.example.com", ".**.x"] {
-        let error = domain_entry(entry).unwrap_err().to_string();
-        assert!(
-            error.contains("wildcard labels must be '*'"),
-            "{entry}: {error}"
-        );
-        assert!(!error.contains("domain_pattern"));
     }
 }

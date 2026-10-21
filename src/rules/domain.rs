@@ -93,7 +93,7 @@ pub enum DomainKind {
 pub fn wildcard(pattern: &str) -> io::Result<String> {
     let pattern = pattern.strip_suffix('.').unwrap_or(pattern);
     if pattern.is_empty() || pattern.len() > 253 {
-        return Err(invalid("invalid domain_pattern length"));
+        return Err(invalid("wildcard pattern must be 1-253 bytes"));
     }
     let mut result = String::from("^(?:");
     for (i, label) in pattern.split('.').enumerate() {
@@ -130,6 +130,12 @@ mod tests {
             assert_eq!(
                 wildcard(pattern).unwrap_err().to_string(),
                 "wildcard labels must be '*' or a literal hostname label: invalid hostname label"
+            );
+        }
+        for pattern in ["", ".", &"*".repeat(254)] {
+            assert_eq!(
+                wildcard(pattern).unwrap_err().to_string(),
+                "wildcard pattern must be 1-253 bytes"
             );
         }
     }
