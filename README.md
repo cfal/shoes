@@ -584,7 +584,7 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
 - Advanced placement/padding obfuscation, custom session IDs, separate downloads,
   full XMUX policy, and legacy Vision over XHTTP are not supported. Unsupported
   options are rejected rather than silently ignored. Public CDN compatibility is not implied.
-- REALITY XHTTP interoperates with Xray 26.10.17 in both directions over H2,
+- REALITY XHTTP interoperates with Xray 26.10.21 in both directions over H2,
   including all three modes and `auto`. REALITY prefers X25519MLKEM768 with
   X25519 fallback according to the cover target. Optional `mldsa65_seed` and
   `mldsa65_verify` apply to the outer REALITY configuration, independently of

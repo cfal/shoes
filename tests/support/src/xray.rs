@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::process::ProcessGuard;
 
-pub const VERSION: &str = "26.10.17";
+pub const VERSION: &str = "26.10.21";
 
 pub struct Peer {
     _process: ProcessGuard,

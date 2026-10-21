@@ -14,10 +14,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: v26.10.10
-            revision: 701af60772cda123492f86e383e1fdba066614a9
-          - name: v26.10.17
-            revision: 92ccc939aaf4f8965f369cf0b142e005aeaa11d5
+          - name: v26.10.21
+            revision: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
     name: Xray ${{ matrix.name }}
     env:
       CARGO_BUILD_JOBS: 1
@@ -27,7 +25,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.3'
           cache: false
       - uses: actions/checkout@v4
         with:

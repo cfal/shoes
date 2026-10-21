@@ -20,12 +20,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27.1'
+          go-version: '1.27.3'
           cache: false
       - uses: actions/checkout@v4
         with:
           repository: XTLS/Xray-core
-          ref: 92ccc939aaf4f8965f369cf0b142e005aeaa11d5
+          ref: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
           path: peers/xray
       - uses: actions/checkout@v4
         with:

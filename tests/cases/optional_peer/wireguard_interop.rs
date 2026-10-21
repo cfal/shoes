@@ -29,7 +29,7 @@ fn singbox_server(port: u16) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "Requires Xray 26.10.17; set SHOES_TEST_XRAY_BIN"]
+#[ignore = "Requires Xray 26.10.21; set SHOES_TEST_XRAY_BIN"]
 async fn wireguard_xray_both_roles_tcp_udp_ipv4_ipv6() -> io::Result<()> {
     tokio::time::timeout(Duration::from_secs(90), async {
         for shoes_is_server in [false, true] {
