@@ -570,27 +570,28 @@ fn run_direct_stack_thread(
                 continue;
             }
 
-            if let Some(protocol) = get_ip_protocol(&pkt) {
-                trace!(
-                    "Received packet: protocol={:?}, len={}",
-                    protocol,
-                    pkt.len()
-                );
-                match protocol {
-                    IpProtocol::Tcp if config.tcp_enabled => {
-                        if let Some(flow) = extract_tcp_info(&pkt) {
-                            stack_packets.push((pkt, Some(flow)));
-                        }
+            let Some(protocol) = get_ip_protocol(&pkt) else {
+                continue;
+            };
+            trace!(
+                "Received packet: protocol={:?}, len={}",
+                protocol,
+                pkt.len()
+            );
+            match protocol {
+                IpProtocol::Tcp if config.tcp_enabled => {
+                    if let Some(flow) = extract_tcp_info(&pkt) {
+                        stack_packets.push((pkt, Some(flow)));
                     }
-                    IpProtocol::Icmp | IpProtocol::Icmpv6 if config.icmp_enabled => {
-                        stack_packets.push((pkt, None));
-                    }
-                    IpProtocol::Udp if config.udp_enabled => {
-                        let _ = udp_tx.try_send(pkt);
-                    }
-                    _ => {
-                        trace!("ignoring packet with protocol {:?}", protocol);
-                    }
+                }
+                IpProtocol::Icmp | IpProtocol::Icmpv6 if config.icmp_enabled => {
+                    stack_packets.push((pkt, None));
+                }
+                IpProtocol::Udp if config.udp_enabled => {
+                    let _ = udp_tx.try_send(pkt);
+                }
+                _ => {
+                    trace!("ignoring packet with protocol {:?}", protocol);
                 }
             }
         }

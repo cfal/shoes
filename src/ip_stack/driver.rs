@@ -139,11 +139,10 @@ impl PacketStack {
         let counts = Arc::new(FlowCounts::default());
         let (input, input_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (output_tx, output) = mpsc::channel(QUEUE_CAPACITY);
-        let (tcp_tx, tcp) = mpsc::channel(
-            limits
-                .tcp_connection_limit()
-                .map_or(QUEUE_CAPACITY, |limit| limit.max(QUEUE_CAPACITY)),
-        );
+        let accept_capacity = limits
+            .tcp_connection_limit()
+            .map_or(QUEUE_CAPACITY, |limit| limit.max(QUEUE_CAPACITY));
+        let (tcp_tx, tcp) = mpsc::channel(accept_capacity);
         let (udp_tx, udp) = mpsc::channel(QUEUE_CAPACITY);
         let (replies, replies_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (commands, command_rx) = mpsc::channel(QUEUE_CAPACITY);
@@ -254,8 +253,8 @@ struct TcpEntry {
     local: SocketAddr,
     outbound: bool,
     established: bool,
-    pending: Option<(oneshot::Sender<io::Result<TcpConnection>>, TcpConnection)>,
-    inbound: Option<(mpsc::OwnedPermit<AcceptedTcp>, AcceptedTcp)>,
+    pending_connect: Option<(oneshot::Sender<io::Result<TcpConnection>>, TcpConnection)>,
+    pending_accept: Option<(mpsc::OwnedPermit<AcceptedTcp>, AcceptedTcp)>,
 }
 impl TcpEntry {
     fn pump(&mut self, handle: SocketHandle, socket: &mut TcpSocket<'_>, now: Instant) {
@@ -263,20 +262,20 @@ impl TcpEntry {
             self.established = true;
             socket.set_timeout(Some(super::TCP_PEER_SILENCE_TIMEOUT));
         }
-        if let Some((result, _)) = &self.pending {
+        if let Some((result, _)) = &self.pending_connect {
             if result.is_closed() {
-                self.pending = None;
+                self.pending_connect = None;
                 socket.abort();
             } else if self.established {
-                let (result, connection) = self.pending.take().unwrap();
+                let (result, connection) = self.pending_connect.take().unwrap();
                 let _ = result.send(Ok(connection));
             } else if socket.state() == State::Closed {
-                let (result, _) = self.pending.take().unwrap();
+                let (result, _) = self.pending_connect.take().unwrap();
                 let _ = result.send(Err(io::ErrorKind::ConnectionRefused.into()));
             }
         }
         if self.established
-            && let Some((permit, connection)) = self.inbound.take()
+            && let Some((permit, connection)) = self.pending_accept.take()
         {
             // Unlike OwnedPermit::send, try_send drops the connection if the receiver is gone.
             let _ = permit.release().try_send(connection);
@@ -523,8 +522,8 @@ fn run(
                             local,
                             outbound: true,
                             established: false,
-                            pending: Some((result, connection)),
-                            inbound: None,
+                            pending_connect: Some((result, connection)),
+                            pending_accept: None,
                         },
                     );
                 }
@@ -654,8 +653,8 @@ fn run(
                         local: info.target,
                         outbound: false,
                         established: false,
-                        pending: None,
-                        inbound: Some((permit, accepted_connection)),
+                        pending_connect: None,
+                        pending_accept: Some((permit, accepted_connection)),
                     },
                 );
                 continue;
@@ -746,8 +745,8 @@ mod tests {
                 local: SocketAddr::new(ipv4, LAST_EPHEMERAL_PORT),
                 outbound: true,
                 established: false,
-                pending: None,
-                inbound: None,
+                pending_connect: None,
+                pending_accept: None,
             },
         )]);
         let local = SocketAddr::new(ipv4, FIRST_EPHEMERAL_PORT);
@@ -1312,8 +1311,8 @@ mod tests {
                     local: target,
                     outbound: false,
                     established: false,
-                    pending: None,
-                    inbound: None,
+                    pending_connect: None,
+                    pending_accept: None,
                 },
             )]);
             let counts = FlowCounts::default();
@@ -1528,8 +1527,8 @@ mod tests {
                 local: target,
                 outbound: false,
                 established: false,
-                pending: None,
-                inbound: Some((
+                pending_connect: None,
+                pending_accept: Some((
                     accepted.clone().try_reserve_owned().unwrap(),
                     AcceptedTcp {
                         connection: TcpConnection::new(control, Wake::new().unwrap().0),
