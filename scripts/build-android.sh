@@ -7,7 +7,7 @@
 # Requirements:
 #   - Android NDK: set ANDROID_NDK_HOME, or NDK_HOME, or have ANDROID_HOME with NDK installed
 #   - cargo-ndk: installed automatically if missing
-#   - Gradle 8.6+ available as `gradle` in PATH, or ./gradlew in android/
+#   - Gradle 9.6.0+ available as `gradle` in PATH
 #   - Java 17+
 #   - Python 3 for dependency-notice verification
 #
@@ -78,7 +78,7 @@ fi
 if ! command -v gradle &>/dev/null; then
     echo "Error: 'gradle' not found in PATH."
     echo "  Install Gradle: https://gradle.org/install/"
-    echo "  Or run: sdk install gradle 8.6  (via SDKMAN)"
+    echo "  Or run: sdk install gradle 9.8.2  (via SDKMAN)"
     exit 1
 fi
 gradle assembleRelease --no-daemon

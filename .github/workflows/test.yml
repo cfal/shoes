@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - uses: taiki-e/install-action@v2
       with:
@@ -47,20 +47,20 @@ jobs:
       WG_SING_BOX_COMMIT: 7054cac5124465ffdb145870d7c01885566711b1
       WG_XRAY_COMMIT: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - name: Restore pinned WireGuard peers
       id: wireguard-peers
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: ~/.cache/shoes-wireguard
         key: ${{ runner.os }}-${{ runner.arch }}-wireguard-peers-go1.27.3-${{ env.WG_SING_BOX_COMMIT }}-${{ env.WG_XRAY_COMMIT }}
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@v7
       if: steps.wireguard-peers.outputs.cache-hit != 'true'
       with:
         go-version: '1.27.3'
         cache: false
-    - uses: actions/cache@v4
+    - uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -85,7 +85,7 @@ jobs:
         go build -mod=readonly -p 1 -o "$HOME/.cache/shoes-wireguard/xray" ./main
     - name: Save pinned WireGuard peers
       if: steps.wireguard-peers.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       with:
         path: ~/.cache/shoes-wireguard
         key: ${{ steps.wireguard-peers.outputs.cache-primary-key }}
@@ -108,25 +108,25 @@ jobs:
     timeout-minutes: 25
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/registry
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache cargo index
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache cargo build
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -151,10 +151,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-node@v4
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
       with:
-        node-version: '22'
+        node-version: '24'
+        package-manager-cache: false
     - name: Test benchmark harness and manifests
       run: node --test benches/*.test.mjs
 
@@ -163,13 +164,13 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache Rust build
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -239,25 +240,25 @@ jobs:
           peer: kernel-wireguard
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/registry
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache cargo index
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache cargo build
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -331,7 +332,7 @@ jobs:
     - name: Restore pinned XHTTP peers
       if: matrix.target == 'xhttp_interop'
       id: xhttp-peers
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: |
           ~/.cache/shoes-xray/xray
@@ -340,7 +341,7 @@ jobs:
 
     - name: Install Go for XHTTP peers
       if: matrix.target == 'xhttp_interop' && steps.xhttp-peers.outputs.cache-hit != 'true'
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: '1.27.3'
         cache: false
@@ -369,7 +370,7 @@ jobs:
 
     - name: Save pinned XHTTP peers
       if: matrix.target == 'xhttp_interop' && steps.xhttp-peers.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       with:
         path: |
           ~/.cache/shoes-xray/xray
