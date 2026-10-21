@@ -25,7 +25,6 @@ use std::sync::atomic::Ordering;
 
 use log::{error, info};
 use parking_lot::Mutex;
-use std::sync::OnceLock;
 use tokio::sync::oneshot;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
@@ -39,46 +38,16 @@ use super::common::{
 /// The callback receives a file descriptor and should return true if protected successfully.
 pub type ProtectSocketCallback = extern "C" fn(fd: c_int) -> bool;
 
-/// Global socket protector callback.
-static PROTECT_CALLBACK: OnceLock<Mutex<Option<ProtectSocketCallback>>> = OnceLock::new();
-
 /// Socket protector implementation for iOS.
-struct IosSocketProtector;
+struct IosSocketProtector(ProtectSocketCallback);
 
 impl crate::tun::SocketProtector for IosSocketProtector {
     fn protect(&self, fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
-        let callback = *PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
-
-        if let Some(callback) = callback {
-            if callback(fd as c_int) {
-                Ok(())
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Socket protection failed",
-                ))
-            }
-        } else {
+        if (self.0)(fd as c_int) {
             Ok(())
+        } else {
+            Err(std::io::Error::other("Socket protection failed"))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tun::SocketProtector;
-
-    #[test]
-    fn protection_callback_runs_without_holding_its_slot() {
-        extern "C" fn callback(_: c_int) -> bool {
-            PROTECT_CALLBACK.get().unwrap().try_lock().is_some()
-        }
-        let slot = PROTECT_CALLBACK.get_or_init(|| Mutex::new(None));
-        let previous = slot.lock().replace(callback);
-        let result = IosSocketProtector.protect(-1);
-        *slot.lock() = previous;
-        result.unwrap();
     }
 }
 
@@ -102,10 +71,9 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
     let level_str = if log_level.is_null() {
         "info"
     } else {
-        match CStr::from_ptr(log_level).to_str() {
-            Ok(s) => s,
-            Err(_) => "info",
-        }
+        unsafe { CStr::from_ptr(log_level) }
+            .to_str()
+            .unwrap_or("info")
     };
 
     let filter = crate::logging::parse_log_level(level_str).unwrap_or(log::LevelFilter::Info);
@@ -123,7 +91,6 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
     }
 
     TUN_SERVICE.get_or_init(|| Mutex::new(None));
-    PROTECT_CALLBACK.get_or_init(|| Mutex::new(None));
 
     info!("shoes iOS initialized with log level: {}", level_str);
     0
@@ -162,7 +129,7 @@ pub unsafe extern "C" fn shoes_start(
         return -1;
     }
 
-    let config_str = match CStr::from_ptr(config_yaml).to_str() {
+    let config_str = match unsafe { CStr::from_ptr(config_yaml) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
             error!("shoes_start: invalid UTF-8 in config_yaml: {}", e);
@@ -172,12 +139,7 @@ pub unsafe extern "C" fn shoes_start(
 
     info!("shoes_start: config length = {} bytes", config_str.len());
 
-    {
-        let mut callback_guard = PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
-        *callback_guard = Some(protect_callback);
-    }
-
-    crate::tun::set_global_socket_protector(Arc::new(IosSocketProtector));
+    crate::tun::set_global_socket_protector(Arc::new(IosSocketProtector(protect_callback)));
 
     crate::thread_util::set_num_threads(2);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -216,14 +178,7 @@ pub unsafe extern "C" fn shoes_start(
 /// * `handle` - Handle returned by shoes_start (currently unused, we use global state)
 #[unsafe(no_mangle)]
 pub extern "C" fn shoes_stop(_handle: c_long) {
-    if !common::stop_service() {
-        return;
-    }
-
-    if let Some(callback) = PROTECT_CALLBACK.get() {
-        let mut guard = callback.lock();
-        *guard = None;
-    }
+    common::stop_service();
 }
 
 /// Check if the shoes service is running.
@@ -262,10 +217,33 @@ pub unsafe extern "C" fn shoes_set_log_file(path: *const c_char) -> c_int {
         return -1;
     }
 
-    let path_str = match CStr::from_ptr(path).to_str() {
+    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
         Ok(s) => s,
         Err(_) => return -1,
     };
 
     setup_log_file(path_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tun::SocketProtector;
+
+    #[test]
+    fn protectors_keep_their_own_callback_across_replacement() {
+        extern "C" fn old(fd: c_int) -> bool {
+            fd == 1
+        }
+        extern "C" fn new(fd: c_int) -> bool {
+            fd == 2
+        }
+        let old = Arc::new(IosSocketProtector(old));
+        let new = IosSocketProtector(new);
+        old.protect(1).unwrap();
+        assert!(old.protect(2).is_err());
+        drop(old);
+        new.protect(2).unwrap();
+        assert!(new.protect(1).is_err());
+    }
 }

@@ -125,6 +125,8 @@ async fn prepare_tracking(
 #[derive(Default)]
 struct RunningServers {
     listeners: Vec<JoinHandle<()>>,
+    #[cfg(unix)]
+    tun: Vec<JoinHandle<io::Result<()>>>,
     reporter: Option<resources::ResourceReporter>,
     dns_snapshots: Option<dns::DnsSnapshotTask>,
     quic_retirements: crate::listener_tasks::QuicRetirements,
@@ -133,6 +135,20 @@ struct RunningServers {
 }
 
 impl RunningServers {
+    async fn tun_failure(&mut self) -> io::Error {
+        #[cfg(unix)]
+        if !self.tun.is_empty() {
+            let (result, index, _) = futures::future::select_all(self.tun.iter_mut()).await;
+            drop(self.tun.swap_remove(index));
+            return match result {
+                Ok(Err(error)) => error,
+                Ok(Ok(())) => io::Error::other("TUN service stopped unexpectedly"),
+                Err(error) => io::Error::other(error),
+            };
+        }
+        std::future::pending().await
+    }
+
     async fn shutdown(&mut self, registries: &[&DnsRegistry]) -> io::Result<()> {
         self.stop().await;
         let mut result = Ok(());
@@ -148,6 +164,15 @@ impl RunningServers {
     }
 
     async fn stop(&mut self) {
+        #[cfg(unix)]
+        {
+            for task in &self.tun {
+                task.abort();
+            }
+            for task in self.tun.drain(..) {
+                let _ = task.await;
+            }
+        }
         for task in &self.listeners {
             task.abort();
         }
@@ -180,6 +205,17 @@ impl RunningServers {
                 _ => None,
             };
             let resolver = prepared.dns.get_for_server(dns_ref);
+            #[cfg(unix)]
+            if let Config::TunServer(config) = config {
+                match crate::tun::start_tun_server(config.clone(), resolver).await {
+                    Ok(task) => self.tun.push(task),
+                    Err(error) => {
+                        self.stop().await;
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
             let startup = crate::tcp::tcp_server::start_servers(config.clone(), resolver);
             match self.quic_retirements.track(startup).await {
                 Ok(tasks) => self.listeners.extend(tasks),
@@ -196,6 +232,10 @@ impl RunningServers {
 
 impl Drop for RunningServers {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        for task in &self.tun {
+            task.abort();
+        }
         for task in &self.listeners {
             task.abort();
         }
@@ -485,6 +525,10 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         let debounce = tokio::select! {
             biased;
             _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+            error = running.tun_failure() => {
+                let _ = running.shutdown(&[&prepared.dns]).await;
+                return Err(error);
+            },
             _ = reload.recv() => false,
             _ = changes.recv() => true,
         };
@@ -492,6 +536,10 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             tokio::select! {
                 biased;
                 _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+                error = running.tun_failure() => {
+                    let _ = running.shutdown(&[&prepared.dns]).await;
+                    return Err(error);
+                },
                 _ = reload.recv() => {}
                 _ = tokio::time::sleep(Duration::from_secs(3)) => {}
             }
@@ -505,6 +553,10 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         let candidate = tokio::select! {
             biased;
             _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+            error = running.tun_failure() => {
+                let _ = running.shutdown(&[&prepared.dns]).await;
+                return Err(error);
+            },
             result = prepare_tracking(&paths, Some(&prepared.dns), &mut discovered) => result,
         };
         let mut candidate = match candidate {

@@ -159,6 +159,9 @@ impl TunUdpManager {
             tokio::select! {
                 // Handle responses from destination tasks (write to TUN)
                 Some((payload, src_addr, dst_addr)) = self.response_rx.recv() => {
+                    if let Some(session) = self.sessions.get_mut(&dst_addr) {
+                        session.last_active = Instant::now();
+                    }
                     debug!(
                         "[TunUdpManager] Response: {} -> {} ({} bytes)",
                         src_addr, dst_addr, payload.len()
@@ -913,6 +916,64 @@ mod lifecycle_tests {
                 .unwrap();
             assert_eq!(&*response, payload);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reply_only_sessions_expire_only_after_inactivity() {
+        let (_input, from_tun) = mpsc::channel(1);
+        let (to_tun, mut output) = mpsc::channel(1);
+        let (wake, _receiver) = super::super::wake::Wake::new().unwrap();
+        let (reader, writer) =
+            super::super::udp_handler::UdpHandler::new(from_tun, to_tun, wake).split();
+        let mut manager = TunUdpManager::new(
+            reader,
+            writer,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            TunResourceLimits::default(),
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        let (alive, mut closed) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _alive = alive;
+            std::future::pending::<()>().await;
+        });
+        let local = "10.0.0.2:1234".parse().unwrap();
+        manager.sessions.push(
+            local,
+            Session {
+                tx,
+                handle,
+                last_active: Instant::now(),
+            },
+        );
+        let responses = manager.response_tx.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(manager.run());
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            responses
+                .send((
+                    PacketBuffer::copy_from_slice(b""),
+                    "1.1.1.1:443".parse().unwrap(),
+                    local,
+                ))
+                .await
+                .unwrap();
+            output.recv().await.unwrap();
+            assert!(matches!(
+                closed.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        tokio::time::advance(SESSION_TIMEOUT + Duration::from_secs(31)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), closed)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        tasks.shutdown().await;
     }
 
     #[tokio::test]

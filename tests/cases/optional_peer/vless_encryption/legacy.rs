@@ -102,11 +102,17 @@ async fn legacy_peers_assert_direct_end_and_eof_over_tls_and_reality() {
         for peer_client in [false, true] {
             for transport in [Transport::Tls, Transport::Reality] {
                 for inner_tls12 in [None, Some(true), Some(false)] {
+                    let mihomo_requires_reply_first = peer == Kind::Mihomo
+                        && !peer_client
+                        && matches!(transport, Transport::Reality)
+                        && inner_tls12 == Some(true);
                     // sing-box's Vision wrapper has no CloseWrite. Clients close both sides on
                     // upload EOF; servers can reset TLS 1.2 replies when the target closes first.
                     // Upstream fix: https://github.com/SagerNet/sing-vmess/pull/16
+                    let singbox_requires_reply_first =
+                        peer == Kind::SingBox && (peer_client || inner_tls12 == Some(true));
                     let half_close_before_reply =
-                        peer != Kind::SingBox || (!peer_client && inner_tls12 != Some(true));
+                        !mihomo_requires_reply_first && !singbox_requires_reply_first;
                     decision_case(
                         peer,
                         peer_client,
@@ -119,6 +125,12 @@ async fn legacy_peers_assert_direct_end_and_eof_over_tls_and_reality() {
             }
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "pinned Mihomo REALITY server fully closes on target EOF and can reset pending TLS 1.2 replies"]
+async fn mihomo_reality_tls12_half_close_preserves_reply() {
+    decision_case(Kind::Mihomo, false, Transport::Reality, Some(true), true).await;
 }
 
 #[tokio::test]

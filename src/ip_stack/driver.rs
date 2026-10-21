@@ -1,4 +1,5 @@
 use super::{
+    TCP_HANDSHAKE_TIMEOUT,
     packet::PacketBuffer,
     tcp_conn::{TcpConnection, TcpConnectionControl},
     udp::{UdpConnection, UdpControl},
@@ -27,7 +28,6 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const QUEUE_CAPACITY: usize = 64;
-const TCP_HANDSHAKE_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(30);
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
 const LAST_EPHEMERAL_PORT: u16 = 65535;
 
@@ -139,7 +139,10 @@ impl PacketStack {
         let counts = Arc::new(FlowCounts::default());
         let (input, input_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (output_tx, output) = mpsc::channel(QUEUE_CAPACITY);
-        let (tcp_tx, tcp) = mpsc::channel(QUEUE_CAPACITY);
+        let accept_capacity = limits
+            .tcp_connection_limit()
+            .map_or(QUEUE_CAPACITY, |limit| limit.max(QUEUE_CAPACITY));
+        let (tcp_tx, tcp) = mpsc::channel(accept_capacity);
         let (udp_tx, udp) = mpsc::channel(QUEUE_CAPACITY);
         let (replies, replies_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (commands, command_rx) = mpsc::channel(QUEUE_CAPACITY);
@@ -250,7 +253,8 @@ struct TcpEntry {
     local: SocketAddr,
     outbound: bool,
     established: bool,
-    pending: Option<(oneshot::Sender<io::Result<TcpConnection>>, TcpConnection)>,
+    pending_connect: Option<(oneshot::Sender<io::Result<TcpConnection>>, TcpConnection)>,
+    pending_accept: Option<(mpsc::OwnedPermit<AcceptedTcp>, AcceptedTcp)>,
 }
 impl TcpEntry {
     fn pump(&mut self, handle: SocketHandle, socket: &mut TcpSocket<'_>, now: Instant) {
@@ -258,17 +262,23 @@ impl TcpEntry {
             self.established = true;
             socket.set_timeout(Some(super::TCP_PEER_SILENCE_TIMEOUT));
         }
-        if let Some((result, _)) = &self.pending {
+        if let Some((result, _)) = &self.pending_connect {
             if result.is_closed() {
-                self.pending = None;
+                self.pending_connect = None;
                 socket.abort();
             } else if self.established {
-                let (result, connection) = self.pending.take().unwrap();
+                let (result, connection) = self.pending_connect.take().unwrap();
                 let _ = result.send(Ok(connection));
             } else if socket.state() == State::Closed {
-                let (result, _) = self.pending.take().unwrap();
+                let (result, _) = self.pending_connect.take().unwrap();
                 let _ = result.send(Err(io::ErrorKind::ConnectionRefused.into()));
             }
+        }
+        if self.established
+            && let Some((permit, connection)) = self.pending_accept.take()
+        {
+            // Unlike OwnedPermit::send, try_send drops the connection if the receiver is gone.
+            let _ = permit.release().try_send(connection);
         }
         super::pump_tcp(handle, socket, &self.control, now);
     }
@@ -512,7 +522,8 @@ fn run(
                             local,
                             outbound: true,
                             established: false,
-                            pending: Some((result, connection)),
+                            pending_connect: Some((result, connection)),
+                            pending_accept: None,
                         },
                     );
                 }
@@ -609,7 +620,7 @@ fn run(
                 {
                     continue;
                 }
-                let Ok(permit) = accepted.try_reserve() else {
+                let Ok(permit) = accepted.clone().try_reserve_owned() else {
                     continue;
                 };
                 let mut socket = tcp_socket(limits.tcp_buffer_size);
@@ -629,11 +640,11 @@ fn run(
                     limits.tcp_buffer_size,
                 ));
                 let connection = TcpConnection::new(control.clone(), wake.clone());
-                permit.send(AcceptedTcp {
+                let accepted_connection = AcceptedTcp {
                     connection,
                     source: info.source,
                     target: info.target,
-                });
+                };
                 tcp.insert(
                     handle,
                     TcpEntry {
@@ -642,7 +653,8 @@ fn run(
                         local: info.target,
                         outbound: false,
                         established: false,
-                        pending: None,
+                        pending_connect: None,
+                        pending_accept: Some((permit, accepted_connection)),
                     },
                 );
                 continue;
@@ -650,7 +662,12 @@ fn run(
             device.packet = Some(packet);
             iface.poll_ingress_single(now(), &mut device, &mut sockets);
             // A reset passive open returns to Listen and must not capture the next peer's SYN.
-            if sockets.get::<TcpSocket>(handle).state() == State::Listen {
+            // Outbound entries stay until pump reports refusal to their pending connects.
+            let socket = sockets.get::<TcpSocket>(handle);
+            if !tcp[&handle].outbound
+                && matches!(socket.state(), State::Listen | State::Closed)
+                && socket.remote_endpoint().is_none()
+            {
                 sockets.remove(handle);
                 tcp.remove(&handle);
             }
@@ -728,7 +745,8 @@ mod tests {
                 local: SocketAddr::new(ipv4, LAST_EPHEMERAL_PORT),
                 outbound: true,
                 established: false,
-                pending: None,
+                pending_connect: None,
+                pending_accept: None,
             },
         )]);
         let local = SocketAddr::new(ipv4, FIRST_EPHEMERAL_PORT);
@@ -807,6 +825,17 @@ mod tests {
         control: TcpControl,
         ack: Option<u32>,
     ) -> PacketBuffer {
+        tcp_segment_with_data(source, target, sequence, control, ack, &[])
+    }
+
+    fn tcp_segment_with_data(
+        source: SocketAddr,
+        target: SocketAddr,
+        sequence: u32,
+        control: TcpControl,
+        ack: Option<u32>,
+        payload: &[u8],
+    ) -> PacketBuffer {
         let mut tcp = etherparse::TcpHeader::new(source.port(), target.port(), sequence, 65535);
         tcp.syn = control == TcpControl::Syn;
         tcp.rst = control == TcpControl::Rst;
@@ -823,10 +852,98 @@ mod tests {
             _ => unreachable!(),
         }
         .tcp_header(tcp);
-        let mut packet = PacketBuffer::with_capacity(builder.size(0));
-        packet.resize(builder.size(0));
-        builder.write(&mut &mut packet[..], &[]).unwrap();
+        let mut packet = PacketBuffer::with_capacity(builder.size(payload.len()));
+        packet.resize(builder.size(payload.len()));
+        builder.write(&mut &mut packet[..], payload).unwrap();
         packet
+    }
+
+    #[tokio::test]
+    async fn inbound_publication_waits_for_handshake_and_preserves_final_ack_data_and_fin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (source, target) in [
+                ("10.77.0.2:40000", "198.18.0.1:443"),
+                ("[fd77::2]:40000", "[fd77::1]:443"),
+            ] {
+                for fin in [false, true] {
+                    let source: SocketAddr = source.parse().unwrap();
+                    let target: SocketAddr = target.parse().unwrap();
+                    let mut stack = PacketStack::new(
+                        vec![target.ip()],
+                        1408,
+                        true,
+                        TunResourceLimits::default(),
+                    )
+                    .unwrap();
+                    let mut accepted = stack.tcp.take().unwrap();
+                    let mut output = stack.output.take().unwrap();
+                    let syn = tcp_segment(source, target, 1000, TcpControl::Syn, None);
+                    stack
+                        .input
+                        .send(PacketBuffer::copy_from_slice(&syn))
+                        .await
+                        .unwrap();
+                    stack.input.send(syn).await.unwrap();
+                    stack.handle.wake.notify();
+                    let reply = output.recv().await.unwrap();
+                    let info = packet_info(&reply).unwrap();
+                    let tcp =
+                        TcpPacket::new_checked(&reply[info.transport_offset..info.length]).unwrap();
+                    assert!(tcp.syn() && tcp.ack() && !tcp.rst());
+                    assert!(matches!(
+                        accepted.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                    stack
+                        .input
+                        .send(tcp_segment_with_data(
+                            source,
+                            target,
+                            1001,
+                            if fin {
+                                TcpControl::Fin
+                            } else {
+                                TcpControl::None
+                            },
+                            Some((tcp.seq_number() + 1).0 as u32),
+                            b"request",
+                        ))
+                        .await
+                        .unwrap();
+                    stack.handle.wake.notify();
+                    let mut flow = accepted.recv().await.unwrap();
+                    assert_eq!(flow.source, source);
+                    assert_eq!(flow.target, target);
+                    let mut data = [0; 7];
+                    flow.connection.read_exact(&mut data).await.unwrap();
+                    assert_eq!(&data, b"request");
+                    if fin {
+                        assert_eq!(flow.connection.read(&mut [0; 1]).await.unwrap(), 0);
+                    }
+                    flow.connection.write_all(b"response").await.unwrap();
+                    loop {
+                        let reply = output.recv().await.unwrap();
+                        let info = packet_info(&reply).unwrap();
+                        let tcp =
+                            TcpPacket::new_checked(&reply[info.transport_offset..info.length])
+                                .unwrap();
+                        assert!(!tcp.rst());
+                        if !tcp.payload().is_empty() {
+                            assert_eq!(tcp.payload(), b"response");
+                            break;
+                        }
+                    }
+                    assert!(matches!(
+                        accepted.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -958,6 +1075,7 @@ mod tests {
             let mut output = stack.output.take().unwrap();
             let mut inbound_udp = stack.udp.take().unwrap();
             let target = "198.18.0.1:443".parse().unwrap();
+            let mut first_ack = None;
             for port in 40000..40000 + QUEUE_CAPACITY as u16 {
                 let source = SocketAddr::new("10.77.0.2".parse().unwrap(), port);
                 stack
@@ -966,9 +1084,17 @@ mod tests {
                     .await
                     .unwrap();
                 stack.handle.wake.notify();
-                output.recv().await.unwrap();
+                let reply = output.recv().await.unwrap();
+                if first_ack.is_none() {
+                    let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+                    let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                    first_ack = Some((tcp.seq_number() + 1).0 as u32);
+                }
             }
-            assert_eq!(accepted.len(), QUEUE_CAPACITY);
+            assert!(matches!(
+                accepted.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
             let overflow = "10.77.0.2:50000".parse().unwrap();
             stack
                 .input
@@ -993,6 +1119,18 @@ mod tests {
                     overflow.port()
                 );
             }
+            stack
+                .input
+                .send(tcp_segment(
+                    "10.77.0.2:40000".parse().unwrap(),
+                    target,
+                    1001,
+                    TcpControl::None,
+                    first_ack,
+                ))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
             let _first = accepted.recv().await.unwrap();
             stack
                 .input
@@ -1010,6 +1148,132 @@ mod tests {
                     break;
                 }
             }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_handshakes_use_the_configured_limit_not_the_packet_queue_limit() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                true,
+                TunResourceLimits {
+                    max_tcp_connections: Some(128),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut output = stack.output.take().unwrap();
+            let mut accepted = stack.tcp.take().unwrap();
+            let target = "198.18.0.1:443".parse().unwrap();
+            let mut acknowledgments = Vec::new();
+            for port in 40000..40096 {
+                let source = SocketAddr::new("10.77.0.2".parse().unwrap(), port);
+                stack
+                    .input
+                    .send(tcp_segment(source, target, 1000, TcpControl::Syn, None))
+                    .await
+                    .unwrap();
+                stack.handle.wake.notify();
+                loop {
+                    let reply = output.recv().await.unwrap();
+                    let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+                    let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                    assert!(tcp.syn() && tcp.ack() && !tcp.rst());
+                    if tcp.dst_port() == port {
+                        acknowledgments.push((source, (tcp.seq_number() + 1).0 as u32));
+                        break;
+                    }
+                }
+                assert!(matches!(
+                    accepted.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            }
+            let mut connections = Vec::new();
+            for (source, ack) in acknowledgments {
+                stack
+                    .input
+                    .send(tcp_segment(
+                        source,
+                        target,
+                        1001,
+                        TcpControl::None,
+                        Some(ack),
+                    ))
+                    .await
+                    .unwrap();
+                stack.handle.wake.notify();
+                let connection = accepted.recv().await.unwrap();
+                assert_eq!(connection.source, source);
+                connections.push(connection);
+            }
+            assert_eq!(connections.len(), 96);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_receiver_dropped_during_handshake_resets_the_connection() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                true,
+                TunResourceLimits {
+                    max_tcp_connections: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut output = stack.output.take().unwrap();
+            let source = "10.77.0.2:40000".parse().unwrap();
+            let target = "198.18.0.1:443".parse().unwrap();
+            stack
+                .input
+                .send(tcp_segment(source, target, 1000, TcpControl::Syn, None))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+            let reply = output.recv().await.unwrap();
+            let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.syn() && tcp.ack());
+            let ack = (tcp.seq_number() + 1).0 as u32;
+            drop(stack.tcp.take());
+            stack
+                .input
+                .send(tcp_segment_with_data(
+                    source,
+                    target,
+                    1001,
+                    TcpControl::None,
+                    Some(ack),
+                    b"request",
+                ))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+            loop {
+                let reply = output.recv().await.unwrap();
+                let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+                if TcpPacket::new_checked(ip.payload()).unwrap().rst() {
+                    break;
+                }
+            }
+            // Commands run before ingress, so two barriers also observe post-egress cleanup.
+            for port in [53, 54] {
+                let _barrier = stack
+                    .handle
+                    .open_udp(SocketAddr::new(target.ip(), port))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(stack.counts.tcp.load(Ordering::Relaxed), 0);
         })
         .await
         .unwrap();
@@ -1047,7 +1311,8 @@ mod tests {
                     local: target,
                     outbound: false,
                     established: false,
-                    pending: None,
+                    pending_connect: None,
+                    pending_accept: None,
                 },
             )]);
             let counts = FlowCounts::default();
@@ -1131,65 +1396,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_half_open_releases_admission_before_the_next_peer() {
-        use tokio::io::AsyncReadExt;
-
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let mut stack = PacketStack::new(
-                vec!["10.77.0.1".parse().unwrap()],
-                1408,
-                true,
-                TunResourceLimits {
-                    max_tcp_connections: Some(1),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            let mut accepted = stack.tcp.take().unwrap();
-            let mut output = stack.output.take().unwrap();
-            let target = "198.18.0.1:443".parse().unwrap();
-            let first = "10.77.0.2:40000".parse().unwrap();
-            let second = "10.77.0.3:50000".parse().unwrap();
-            stack
-                .input
-                .send(tcp_segment(first, target, 1000, TcpControl::Syn, None))
-                .await
+    async fn reset_releases_half_open_and_established_flows_before_the_next_syn() {
+        for established in [false, true] {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let mut stack = PacketStack::new(
+                    vec!["10.77.0.1".parse().unwrap()],
+                    1408,
+                    true,
+                    TunResourceLimits {
+                        max_tcp_connections: Some(1),
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
-            stack.handle.wake.notify();
-            let mut flow = accepted.recv().await.unwrap();
-            assert_eq!(flow.source, first);
-            let reply = output.recv().await.unwrap();
-            let ip = Ipv4Packet::new_checked(&*reply).unwrap();
-            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
-            assert!(tcp.syn() && tcp.ack());
-            assert_eq!(tcp.ack_number().0, 1001);
-
-            // An abandoned connect responds to SYN-ACK with RST and no ACK flag.
-            stack
-                .input
-                .try_send(tcp_segment(first, target, 1001, TcpControl::Rst, None))
-                .unwrap();
-            stack
-                .input
-                .try_send(tcp_segment(second, target, 5000, TcpControl::Syn, None))
-                .unwrap();
-            stack.handle.wake.notify();
-            assert_eq!(flow.connection.read(&mut [0; 1]).await.unwrap(), 0);
-            let next = accepted.recv().await.unwrap();
-            assert_eq!(next.source, second);
-            assert_eq!(next.target, target);
-            for port in [53, 54] {
-                let _barrier = stack
-                    .handle
-                    .open_udp(SocketAddr::new(target.ip(), port))
+                let mut accepted = stack.tcp.take().unwrap();
+                let mut output = stack.output.take().unwrap();
+                let target = "198.18.0.1:443".parse().unwrap();
+                let first = "10.77.0.2:40000".parse().unwrap();
+                let second = if established {
+                    first
+                } else {
+                    "10.77.0.3:50000".parse().unwrap()
+                };
+                stack
+                    .input
+                    .send(tcp_segment(first, target, 1000, TcpControl::Syn, None))
                     .await
                     .unwrap();
-            }
-            assert_eq!(stack.counts.tcp.load(Ordering::Relaxed), 1);
-            assert!(accepted.try_recv().is_err());
-        })
-        .await
-        .unwrap();
+                stack.handle.wake.notify();
+                let reply = output.recv().await.unwrap();
+                let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                assert!(tcp.syn() && tcp.ack());
+                assert_eq!(tcp.ack_number().0, 1001);
+                assert!(matches!(
+                    accepted.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                let mut previous = if established {
+                    stack
+                        .input
+                        .send(tcp_segment(
+                            first,
+                            target,
+                            1001,
+                            TcpControl::None,
+                            Some((tcp.seq_number() + 1).0 as u32),
+                        ))
+                        .await
+                        .unwrap();
+                    stack.handle.wake.notify();
+                    Some(accepted.recv().await.unwrap())
+                } else {
+                    None
+                };
+
+                // An abandoned connect responds to SYN-ACK with RST and no ACK flag.
+                stack
+                    .input
+                    .try_send(tcp_segment(first, target, 1001, TcpControl::Rst, None))
+                    .unwrap();
+                stack
+                    .input
+                    .try_send(tcp_segment(second, target, 5000, TcpControl::Syn, None))
+                    .unwrap();
+                stack.handle.wake.notify();
+                let reply = output.recv().await.unwrap();
+                let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                assert_eq!(tcp.dst_port(), second.port());
+                assert!(tcp.syn() && tcp.ack());
+                stack
+                    .input
+                    .send(tcp_segment(
+                        second,
+                        target,
+                        5001,
+                        TcpControl::None,
+                        Some((tcp.seq_number() + 1).0 as u32),
+                    ))
+                    .await
+                    .unwrap();
+                stack.handle.wake.notify();
+                let next = accepted.recv().await.unwrap();
+                assert_eq!(next.source, second);
+                assert_eq!(next.target, target);
+                if let Some(previous) = &mut previous {
+                    use tokio::io::AsyncReadExt;
+                    assert_eq!(previous.connection.read(&mut [0; 1]).await.unwrap(), 0);
+                }
+                for port in [53, 54] {
+                    let _barrier = stack
+                        .handle
+                        .open_udp(SocketAddr::new(target.ip(), port))
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(stack.counts.tcp.load(Ordering::Relaxed), 1);
+                assert!(accepted.try_recv().is_err());
+            })
+            .await
+            .unwrap();
+        }
     }
 
     #[test]
@@ -1211,13 +1519,23 @@ mod tests {
             socket.listen(target).unwrap();
             let mut sockets = SocketSet::new(vec![]);
             let handle = sockets.add(socket);
+            let control = Arc::new(TcpConnectionControl::new(4096, 4096));
+            let (accepted, mut accepted_rx) = mpsc::channel(1);
             let mut entry = TcpEntry {
-                control: Arc::new(TcpConnectionControl::new(4096, 4096)),
+                control: control.clone(),
                 remote: source,
                 local: target,
                 outbound: false,
                 established: false,
-                pending: None,
+                pending_connect: None,
+                pending_accept: Some((
+                    accepted.clone().try_reserve_owned().unwrap(),
+                    AcceptedTcp {
+                        connection: TcpConnection::new(control, Wake::new().unwrap().0),
+                        source,
+                        target,
+                    },
+                )),
             };
             device.packet = Some(tcp_segment(source, target, 1000, TcpControl::Syn, None));
             iface.poll(start, &mut device, &mut sockets);
@@ -1225,6 +1543,11 @@ mod tests {
             entry.pump(handle, socket, start);
             assert_eq!(socket.state(), State::SynReceived);
             assert_eq!(socket.timeout(), Some(TCP_HANDSHAKE_TIMEOUT));
+            assert!(matches!(
+                accepted_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(accepted.capacity(), 0);
             if complete {
                 let reply = packets.try_recv().unwrap();
                 let ip = Ipv4Packet::new_checked(&*reply).unwrap();
@@ -1259,6 +1582,10 @@ mod tests {
                     State::Closed
                 }
             );
+            let flow = accepted_rx.try_recv().ok();
+            assert_eq!(flow.is_some(), complete);
+            drop(entry);
+            assert_eq!(accepted.capacity(), 1);
         }
     }
 
@@ -1284,7 +1611,6 @@ mod tests {
                 .await
                 .unwrap();
             stack.handle.wake.notify();
-            let mut flow = accepted.recv().await.unwrap();
             let synack = output.recv().await.unwrap();
             let ip = Ipv4Packet::new_checked(&*synack).unwrap();
             let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
@@ -1301,6 +1627,7 @@ mod tests {
                 .await
                 .unwrap();
             stack.handle.wake.notify();
+            let mut flow = accepted.recv().await.unwrap();
             flow.connection.shutdown().await.unwrap();
             drop(flow);
 
@@ -1367,6 +1694,49 @@ mod tests {
             handle.open_udp(target).await.err().unwrap().kind(),
             io::ErrorKind::NotConnected
         );
+    }
+
+    #[tokio::test]
+    async fn refused_outbound_handshakes_report_connection_refused() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (local, target) in [("10.77.0.1", "10.77.0.2:443"), ("fd77::1", "[fd77::2]:443")] {
+                let target: SocketAddr = target.parse().unwrap();
+                let mut stack = PacketStack::new(
+                    vec![local.parse().unwrap()],
+                    1408,
+                    false,
+                    TunResourceLimits::default(),
+                )
+                .unwrap();
+                let mut output = stack.output.take().unwrap();
+                let reject = async {
+                    let syn = output.recv().await.unwrap();
+                    let info = packet_info(&syn).unwrap();
+                    let tcp =
+                        TcpPacket::new_checked(&syn[info.transport_offset..info.length]).unwrap();
+                    assert!(tcp.syn() && !tcp.ack());
+                    stack
+                        .input
+                        .send(tcp_segment(
+                            target,
+                            info.source,
+                            0,
+                            TcpControl::Rst,
+                            Some((tcp.seq_number() + 1).0 as u32),
+                        ))
+                        .await
+                        .unwrap();
+                    stack.handle.wake.notify();
+                };
+                let (result, ()) = tokio::join!(stack.handle.connect(target), reject);
+                assert_eq!(
+                    result.err().unwrap().kind(),
+                    io::ErrorKind::ConnectionRefused
+                );
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1439,6 +1809,7 @@ mod tests {
             )
             .unwrap();
             let mut accepted = stack.tcp.take().unwrap();
+            let mut output = stack.output.take().unwrap();
             for malformed in 0..5 {
                 let source = if malformed < 4 {
                     "10.77.0.2"
@@ -1475,6 +1846,26 @@ mod tests {
                 stack.input.send(packet).await.unwrap();
                 stack.handle.wake.notify();
             }
+            let reply = output.recv().await.unwrap();
+            let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert_eq!(
+                ip.dst_addr(),
+                "10.77.0.3".parse::<std::net::Ipv4Addr>().unwrap()
+            );
+            assert!(tcp.syn() && tcp.ack());
+            stack
+                .input
+                .send(tcp_segment(
+                    "10.77.0.3:40000".parse().unwrap(),
+                    "198.18.0.1:443".parse().unwrap(),
+                    1001,
+                    TcpControl::None,
+                    Some((tcp.seq_number() + 1).0 as u32),
+                ))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
             let flow = accepted.recv().await.unwrap();
             assert_eq!(flow.source, "10.77.0.3:40000".parse().unwrap());
             assert_eq!(flow.target, "198.18.0.1:443".parse().unwrap());

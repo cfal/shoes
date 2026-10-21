@@ -13,9 +13,9 @@ env:
   SING_BOX_SHA256: 12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f
   MIHOMO_VERSION: 1.19.31
   MIHOMO_SHA256: 04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
-  XRAY_VERSION: 26.10.17
-  XRAY_SHA256: ecdd54eccd24c4c21a8f00968e7dbf7f5996da92383d2321170b560dc4a95158
-  XRAY_COMMIT: 92ccc939aaf4f8965f369cf0b142e005aeaa11d5
+  XRAY_VERSION: 26.10.21
+  XRAY_SHA256: 0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978
+  XRAY_COMMIT: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
   MIHOMO_ALPHA_COMMIT: 94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f
   NAIVE_CADDY_VERSION: 2.11.7-naive
   NAIVE_CADDY_SHA256: ac97057c925bb098eb575e7b0cb8bd547d4c5f845b09a3dedfbe34444aa7ae88
@@ -45,7 +45,7 @@ jobs:
     env:
       GOMAXPROCS: 1
       WG_SING_BOX_COMMIT: 7054cac5124465ffdb145870d7c01885566711b1
-      WG_XRAY_COMMIT: 92ccc939aaf4f8965f369cf0b142e005aeaa11d5
+      WG_XRAY_COMMIT: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
@@ -54,11 +54,11 @@ jobs:
       uses: actions/cache/restore@v4
       with:
         path: ~/.cache/shoes-wireguard
-        key: ${{ runner.os }}-${{ runner.arch }}-wireguard-peers-go1.27.1-${{ env.WG_SING_BOX_COMMIT }}-${{ env.WG_XRAY_COMMIT }}
+        key: ${{ runner.os }}-${{ runner.arch }}-wireguard-peers-go1.27.3-${{ env.WG_SING_BOX_COMMIT }}-${{ env.WG_XRAY_COMMIT }}
     - uses: actions/setup-go@v5
       if: steps.wireguard-peers.outputs.cache-hit != 'true'
       with:
-        go-version: '1.27.1'
+        go-version: '1.27.3'
         cache: false
     - uses: actions/cache@v4
       with:
@@ -336,13 +336,13 @@ jobs:
         path: |
           ~/.cache/shoes-xray/xray
           ~/.cache/shoes-mihomo/mihomo
-        key: ${{ runner.os }}-xhttp-peers-go1.27.1-${{ env.XRAY_COMMIT }}-${{ env.MIHOMO_ALPHA_COMMIT }}
+        key: ${{ runner.os }}-xhttp-peers-go1.27.3-${{ env.XRAY_COMMIT }}-${{ env.MIHOMO_ALPHA_COMMIT }}
 
     - name: Install Go for XHTTP peers
       if: matrix.target == 'xhttp_interop' && steps.xhttp-peers.outputs.cache-hit != 'true'
       uses: actions/setup-go@v5
       with:
-        go-version: '1.27.1'
+        go-version: '1.27.3'
         cache: false
 
     - name: Build pinned Xray test peer

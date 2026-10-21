@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Fixed Naive HTTP/2 writes stalling on already available flow-control credit after a pending write is cancelled and retried with a smaller buffer. The historical sing-box interoperability timeout remains unconfirmed; its test now reports per-stream progress and carrier-forwarder failures.
+- Switched Mihomo REALITY/TLS 1.2 interoperability coverage to reply-first sequencing while retaining early half-close as an opt-in regression for the pinned peer's full-close limitation. No Shoes TLS errors are suppressed and no peer patch is applied.
+- Fixed TUN startup resets for queued TCP connections, rejected SYN admission, and stale passive listeners after handshake resets. TUN and WireGuard now defer inbound routing and hostname sniffing until TCP establishment; half-open TUN connections expire after 30 seconds instead of retaining the established-connection timeout.
+- Propagated TUN worker startup and runtime failures, including hard write errors, to the service owner. The daemon now stops with an error rather than silently continuing without TUN. Temporary Linux link-down and Apple utun queue backpressure drop packets without stopping the service. Invalid supplied descriptors are rejected before taking ownership.
+- Kept reply-only TUN UDP sessions alive while destination traffic continues.
+- Bound each iOS service's socket-protection callback to its own protector so stopping an older service cannot clear a replacement callback.
+- Expanded deterministic TUN lifecycle and dual-stack handshake tests, added kernel half-close and active-shutdown coverage, and enabled kernel TUN checks on pull requests and master pushes.
+- Released Fake DNS snapshot locks explicitly on owner teardown so concurrently starting subprocesses cannot delay reopening the state file.
+
 ## v0.3.4
 
 - Updated Web PKI dependencies for the [eMudhra intermediate CA compromise](https://emudhra.we-have-a-problem.com/) (CVE-2026-111943): removed `emSign ECC Root CA - G3` from bundled roots and blocked the eight compromised intermediate keys, including cross-signed chains, during certificate verification. Affected deployments need certificates with an unaffected CA chain. Existing binaries must be rebuilt or upgraded to receive this protection.

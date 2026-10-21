@@ -3,10 +3,10 @@
 The `xhttp_interop` integration target runs real Shoes processes against Shoes,
 Xray-core, and Mihomo Alpha. CI builds and caches these peers from pinned source:
 
-- Xray-core: `92ccc939aaf4f8965f369cf0b142e005aeaa11d5` (26.10.17).
+- Xray-core: `1b1647cd9ddf0abc34b981d4611fc03bcac1ca74` (26.10.21).
 - Mihomo Alpha: `94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f`.
 
-Use Go 1.27.1, `GOMAXPROCS=1`, and `go build -p 1`. Build Xray's `./main` package.
+Use Go 1.27.3, `GOMAXPROCS=1`, and `go build -p 1`. Build Xray's `./main` package.
 Build Mihomo's root package with `CGO_ENABLED=0` and
 `-ldflags '-X github.com/metacubex/mihomo/constant.Version=alpha-94b13aed'`.
 The full peer setup is in `.github/workflows/test.yml`; the stable Mihomo peer

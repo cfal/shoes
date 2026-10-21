@@ -38,8 +38,8 @@ GOMAXPROCS=1 go run -p 1 /path/to/shoes/tests/fixtures/vless_encryption/generate
 ```
 
 The peer suite uses `XRAY_BINARY`, `MIHOMO_BINARY`, `SHOES_TEST_SING_BOX_BIN`, and
-optionally `SHOES_TEST_SHOES_BIN`. CI pins Xray 26.10.17
-(`92ccc939aaf4f8965f369cf0b142e005aeaa11d5`), including its Vision TLS-buffer
+optionally `SHOES_TEST_SHOES_BIN`. CI pins Xray 26.10.21
+(`1b1647cd9ddf0abc34b981d4611fc03bcac1ca74`), including its Vision TLS-buffer
 compatibility fix. The committed vectors retain their original provenance above.
 Missing requested peers fail rather than skip. The wire tap distinguishes fresh
 from resumed handshakes and checks raw DIRECT lengths. Successful transfers plus
@@ -59,8 +59,8 @@ The enabled matrix covers:
 - Legacy plain VLESS over WS/WSS and Mihomo raw/TLS/REALITY. Legacy Vision uses
   Xray, Mihomo, and sing-box in both roles, asserting DIRECT for inner TLS 1.3,
   END for plain/TLS 1.2 traffic, exact payloads under slow reads, and remote EOF.
-  Clients half-close before receiving the full reply except in the sing-box cases
-  below.
+  Clients half-close before receiving the full reply except in the peer-limited
+  cases below.
   The pinned sing-box Vision client closes both directions on upload EOF, so its
   enabled cases finish receiving before closing. The ignored
   `singbox_vision_client_half_close_preserves_pending_reply` retains that failing
@@ -73,6 +73,22 @@ The enabled matrix covers:
   the Vision half-close fix in
   [SagerNet/sing-vmess#16](https://github.com/SagerNet/sing-vmess/pull/16).
   Plain and TLS 1.3 server cases still assert early half-close.
+  Mihomo's REALITY server at `94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f`
+  [implements `CloseWrite` as a full close](https://github.com/MetaCubeX/mihomo/blob/94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f/listener/reality/reality.go#L90-L115).
+  Target EOF can therefore close the carrier while the upload reader is still
+  active. With inner TLS 1.2, delaying Shoes' outer TLS alert by 100 ms reproduced
+  a carrier reset and missing inner `close_notify`; changing only the experimental
+  peer's closer to TLS `CloseWrite` made the same injected test pass. This isolates
+  a peer half-close limitation, not a general leak-safe peer fix. The enabled
+  REALITY/TLS 1.2 server case receives and verifies the full reply before sending
+  inner `close_notify`, then still requires clean EOF. The ignored
+  `mihomo_reality_tls12_half_close_preserves_reply` retains the strict early-close
+  regression; run it explicitly with `--ignored` when evaluating a peer fix.
+  The race is timing-dependent: an ordinary passing run does not demonstrate a
+  peer fix. Reliable reproduction requires delaying Shoes' outer close alert by
+  about 100 ms, as in the diagnostic experiment above.
+  Other Mihomo roles and transports retain early half-close coverage. Shoes does
+  not suppress TLS errors or patch the peer to pass this suite.
   All native-Vision peer cases close inner TLS gracefully without
   requiring transport-level half-close support: WebSocket and Mihomo's masked
   native wrapper can close both transport halves. Native TCP half-close and a

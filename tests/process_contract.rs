@@ -513,7 +513,7 @@ fn reality_mldsa_keygen_outputs_interoperable_seed_and_key() {
 
 impl Process {
     fn start(path: &Path, arguments: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+        let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
             .args(["-t", "1"])
             .args(arguments)
             .arg(path)
@@ -522,6 +522,10 @@ impl Process {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        Self::from_child(child)
+    }
+
+    fn from_child(mut child: Child) -> Self {
         let (tx, lines) = tokio::sync::mpsc::unbounded_channel();
         let readers: Vec<Box<dyn io::Read + Send>> = vec![
             Box::new(child.stdout.take().unwrap()),
@@ -587,6 +591,46 @@ fn available_address() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tun_worker_failure_exits_nonzero_and_releases_other_listeners() {
+    use std::os::fd::OwnedFd;
+    for fail_at_startup in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let address = available_address();
+        std::fs::write(&path, format!(
+            "- address: '{address}'\n  protocol: {{type: socks}}\n  rules: allow-all-direct\n- device_fd: 0\n  rules: allow-all-direct\n"
+        )).unwrap();
+        let (peer, tun) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut peer = Some(peer);
+        if fail_at_startup {
+            peer.take();
+        }
+        let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .args(["-t", "1"])
+            .arg(&path)
+            .stdin(Stdio::from(OwnedFd::from(tun)))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut process = Process::from_child(child);
+        if !fail_at_startup {
+            process.wait_for("Servers ready").await;
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(&[5, 1, 0]).await.unwrap();
+            let mut greeting = [0; 2];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 0]);
+            peer.take();
+        }
+        process.wait_for("TUN device closed (EOF)").await;
+        assert!(!process.exit().await.success());
+        std::net::TcpListener::bind(address).unwrap();
+    }
 }
 
 fn forward(address: SocketAddr, target: SocketAddr) -> String {

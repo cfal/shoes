@@ -382,9 +382,19 @@ pub async fn start_servers(
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
         #[cfg(unix)]
-        Config::TunServer(tun_config) => start_tun_server(tun_config, resolver)
-            .await
-            .map(|t| vec![t]),
+        Config::TunServer(tun_config) => {
+            let task = tokio_util::task::AbortOnDropHandle::new(
+                start_tun_server(tun_config, resolver).await?,
+            );
+            Ok(vec![tokio::spawn(async move {
+                if let Err(error) = task
+                    .await
+                    .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+                {
+                    error!("TUN server error: {error}");
+                }
+            })])
+        }
         #[cfg(not(unix))]
         Config::TunServer(_) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

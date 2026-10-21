@@ -260,6 +260,20 @@ mod tests {
 
     #[tokio::test]
     async fn quic_reload_disconnects_connections_and_accepts_new_peers() {
+        // Concurrent harness forks can retain even CLOEXEC sockets until exec completes.
+        if std::env::var_os("SHOES_QUIC_RETIREMENT_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "listener_tasks::tests::quic_reload_disconnects_connections_and_accepts_new_peers",
+                    "--nocapture",
+                ])
+                .env("SHOES_QUIC_RETIREMENT_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
@@ -299,8 +313,16 @@ mod tests {
                 .unwrap()
         };
         let retirements = QuicRetirements::default();
+        // Keeps the released port out of the OS ephemeral pool used by parallel tests.
+        let start = rand::random::<u16>() % 10000;
+        let reservation = (0..10000)
+            .map(|offset| 10000 + (start + offset) % 10000)
+            .find_map(|port| std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).ok())
+            .expect("no non-ephemeral UDP test port available");
+        let bind_address = reservation.local_addr().unwrap();
+        drop(reservation);
         let listener = retirements
-            .track(async { create_listener("0.0.0.0:0".parse().unwrap()) })
+            .track(async { create_listener(bind_address) })
             .await;
         let bind_address = listener.local_addr().unwrap();
         let target = std::net::SocketAddr::from(([127, 0, 0, 1], bind_address.port()));

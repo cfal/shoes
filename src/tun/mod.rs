@@ -81,7 +81,7 @@ use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
 use packet::PacketBuffer;
-use tcp_stack_direct::{NewTcpConnection, PACKET_QUEUE_CAPACITY, TcpStackDirect};
+use tcp_stack_direct::{PACKET_QUEUE_CAPACITY, TcpStackDirect};
 use udp_manager::TunUdpManager;
 
 /// Run the TUN server with the given configuration.
@@ -118,6 +118,10 @@ async fn run_tun_server_inner(
 
     let (fd, offload) = if let Some(fd) = config.raw_fd {
         info!("Using provided raw FD: {}", fd);
+        // Raw descriptors must be validated before constructing an IO-safety wrapper.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         let fd = if config.close_fd_on_drop {
             unsafe { OwnedFd::from_raw_fd(fd) }
         } else {
@@ -157,8 +161,8 @@ async fn run_tun_server_inner(
     let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::channel::<PacketBuffer>(PACKET_QUEUE_CAPACITY);
     tcp_stack.set_udp_response_tx(udp_to_stack_rx);
 
-    let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();
-    tcp_stack.set_new_conn_tx(tcp_conn_tx);
+    let mut tcp_conn_rx = tcp_stack.take_tcp_rx().expect("tcp_rx already taken");
+    tcp_stack.ready().await?;
 
     let mut tasks = JoinSet::new();
     if config.tcp_enabled {
@@ -223,26 +227,22 @@ async fn run_tun_server_inner(
     }
 
     // Wait for shutdown signal or stack thread exit
-    tokio::select! {
+    let result = tokio::select! {
         _ = &mut shutdown_rx => {
             info!("TUN server shutdown requested");
+            Ok(())
         }
-        _ = async {
-            // Poll until stack stops running
-            while tcp_stack.is_running() {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-        } => {
-            warn!("Stack thread ended unexpectedly");
-        }
-    }
+        result = tcp_stack.finished() => result.and_then(|()| {
+            Err(std::io::Error::other("TUN stack stopped unexpectedly"))
+        }),
+    };
 
     tasks.shutdown().await;
 
     // tcp_stack is dropped here, which stops the stack thread
 
     info!("TUN server stopped");
-    Ok(())
+    result
 }
 
 /// Convert a SocketAddr to a NetLocation.
@@ -339,21 +339,20 @@ async fn handle_udp_packets(
 pub async fn start_tun_server(
     config: TunConfig,
     resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
-) -> std::io::Result<JoinHandle<()>> {
+) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {
         let _keep_alive = shutdown_tx;
         let mut ready = Some(ready_tx);
-        if let Err(error) =
-            run_tun_from_config_inner(config, shutdown_rx, true, resolver, &mut ready).await
-        {
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(Err(error));
-            } else {
-                warn!("TUN server error: {error}");
-            }
+        let result =
+            run_tun_from_config_inner(config, shutdown_rx, true, resolver, &mut ready).await;
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(result);
+            Ok(())
+        } else {
+            result
         }
     });
     let handle = tokio_util::task::AbortOnDropHandle::new(handle);
@@ -466,6 +465,78 @@ mod tests {
         assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
         task.abort();
         let _ = task.await;
+    }
+
+    #[test]
+    fn invalid_raw_descriptors_return_errors_without_aborting() {
+        const CHILD: &str = "SHOES_INVALID_TUN_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tun::tests::invalid_raw_descriptors_return_errors_without_aborting",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for fd in [-1, -2, i32::MAX] {
+                    for close in [false, true] {
+                        let mut config = TunServerConfig::new();
+                        config.raw_fd = Some(fd);
+                        config.close_fd_on_drop = close;
+                        let (_shutdown, stopped) = oneshot::channel();
+                        let error = run_tun_server(
+                            config,
+                            Arc::new(ClientProxySelector::new(Vec::new())),
+                            Arc::new(crate::resolver::NativeResolver::new()),
+                            stopped,
+                        )
+                        .await
+                        .unwrap_err();
+                        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+                    }
+                }
+            });
+    }
+
+    #[tokio::test]
+    async fn device_failure_propagates_before_and_after_readiness() {
+        use std::os::fd::IntoRawFd;
+        for fail_before_start in [false, true] {
+            let (peer, tun) = std::os::unix::net::UnixStream::pair().unwrap();
+            let mut peer = Some(peer);
+            if fail_before_start {
+                peer.take();
+            }
+            let config = compiled_config(&format!("device_fd: {}", tun.into_raw_fd()));
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let error = if fail_before_start {
+                start_tun_server(config, resolver).await.unwrap_err()
+            } else {
+                let (_shutdown, stopped) = oneshot::channel();
+                let (ready, started) = oneshot::channel();
+                let task = tokio::spawn(async move {
+                    run_tun_from_config_inner(config, stopped, true, resolver, &mut Some(ready))
+                        .await
+                });
+                started.await.unwrap().unwrap();
+                peer.take();
+                tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err()
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
     }
 
     #[tokio::test]
@@ -690,7 +761,10 @@ mod tests {
 
     #[tokio::test]
     async fn borrowed_tun_fd_remains_open_after_stop() {
-        let (_peer, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        use std::io::Read;
+        let (mut peer, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
         let config = TunServerConfig::new()
             .raw_fd(client.as_raw_fd())
             .close_fd_on_drop(false);
@@ -705,6 +779,12 @@ mod tests {
         .await
         .unwrap();
         assert!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } >= 0);
+        drop(client);
+        assert_eq!(
+            peer.read(&mut [0]).unwrap(),
+            0,
+            "stack leaked its duplicate descriptor"
+        );
     }
 
     #[tokio::test]

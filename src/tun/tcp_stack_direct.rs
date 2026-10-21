@@ -4,7 +4,7 @@
 //! using `poll()` on TUN and wake fds for event-driven I/O.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io,
     net::SocketAddr,
     os::fd::{AsRawFd, OwnedFd, RawFd},
@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use log::{debug, error, info, trace, warn};
+use log::{debug, info, trace, warn};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -28,7 +28,10 @@ use smoltcp::{
         Ipv6Packet, TcpPacket,
     },
 };
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    oneshot,
+};
 
 use super::TunServerConfig;
 use super::packet::PacketBuffer;
@@ -42,6 +45,25 @@ struct SocketInfo {
     control: Arc<TcpConnectionControl>,
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
+    pending: Option<NewTcpConnection>,
+}
+
+impl SocketInfo {
+    fn pump(
+        &mut self,
+        handle: SocketHandle,
+        socket: &mut TcpSocket<'_>,
+        accepted: &mpsc::UnboundedSender<NewTcpConnection>,
+        now: SmolInstant,
+    ) {
+        if matches!(socket.state(), TcpState::Established | TcpState::CloseWait)
+            && let Some(connection) = self.pending.take()
+        {
+            socket.set_timeout(Some(crate::ip_stack::TCP_PEER_SILENCE_TIMEOUT));
+            let _ = accepted.send(connection);
+        }
+        crate::ip_stack::pump_tcp(handle, socket, &self.control, now);
+    }
 }
 
 impl Drop for SocketInfo {
@@ -56,12 +78,10 @@ pub struct NewTcpConnection {
     pub remote_addr: SocketAddr,
 }
 
-/// Shared state for communication between main thread and stack thread.
-struct SharedState {
-    /// Channel for UDP responses to write to TUN
-    udp_response_rx: Option<Receiver<PacketBuffer>>,
-    /// Channel for notifying tokio about new TCP connections
-    new_conn_tx: Option<mpsc::UnboundedSender<NewTcpConnection>>,
+struct StackChannels {
+    udp: Sender<PacketBuffer>,
+    tcp: mpsc::UnboundedSender<NewTcpConnection>,
+    ready: oneshot::Sender<()>,
 }
 
 /// Direct TCP Stack Manager.
@@ -75,8 +95,11 @@ pub struct TcpStackDirect {
     running: Arc<AtomicBool>,
     /// Receiver for UDP packets (filtered from TUN by the stack thread)
     udp_rx: Option<Receiver<PacketBuffer>>,
-    /// Shared state with the stack thread
-    shared_state: Arc<Mutex<SharedState>>,
+    tcp_rx: Option<mpsc::UnboundedReceiver<NewTcpConnection>>,
+    ready: Option<oneshot::Receiver<()>>,
+    completion: oneshot::Receiver<io::Result<()>>,
+    /// Receiver waiting for handoff to the stack thread.
+    pending_udp_response_rx: Arc<Mutex<Option<Receiver<PacketBuffer>>>>,
     /// TUN file descriptor (owned, will be closed on drop)
     _tun_fd: OwnedFd,
 }
@@ -133,16 +156,16 @@ impl TcpStackDirect {
     ) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
         let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        let (tcp_tx, tcp_rx) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (completion_tx, completion) = oneshot::channel();
 
         let running = Arc::new(AtomicBool::new(true));
-        let shared_state = Arc::new(Mutex::new(SharedState {
-            udp_response_rx: None,
-            new_conn_tx: None,
-        }));
+        let pending_udp_response_rx = Arc::new(Mutex::new(None));
 
         let thread_handle = {
             let running = running.clone();
-            let shared_state = shared_state.clone();
+            let pending_udp_response_rx = pending_udp_response_rx.clone();
             let stack_wake = wake.clone();
 
             thread::Builder::new()
@@ -155,18 +178,20 @@ impl TcpStackDirect {
                         run_direct_stack_thread(
                             device,
                             config,
-                            udp_tx,
+                            StackChannels {
+                                udp: udp_tx,
+                                tcp: tcp_tx,
+                                ready: ready_tx,
+                            },
                             running.clone(),
-                            shared_state,
+                            pending_udp_response_rx,
                             stack_wake,
                             wake_rx,
-                        );
+                        )
                     }));
 
-                    match result {
-                        Ok(()) => {
-                            info!("smoltcp direct stack thread exited normally");
-                        }
+                    let result = match result {
+                        Ok(result) => result,
                         Err(panic_info) => {
                             let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
                                 s.to_string()
@@ -175,11 +200,14 @@ impl TcpStackDirect {
                             } else {
                                 "Unknown panic".to_string()
                             };
-                            error!("smoltcp direct stack thread PANICKED: {}", msg);
+                            Err(io::Error::other(format!(
+                                "TUN stack thread panicked: {msg}"
+                            )))
                         }
-                    }
+                    };
 
                     running.store(false, Ordering::Relaxed);
+                    let _ = completion_tx.send(result);
                 })?
         };
 
@@ -188,7 +216,10 @@ impl TcpStackDirect {
             wake,
             running,
             udp_rx: Some(udp_rx),
-            shared_state,
+            tcp_rx: Some(tcp_rx),
+            ready: Some(ready_rx),
+            completion,
+            pending_udp_response_rx,
             _tun_fd: tun_fd,
         })
     }
@@ -202,23 +233,35 @@ impl TcpStackDirect {
         self.udp_rx.take()
     }
 
-    /// Set the channel for UDP responses to write back to TUN.
-    pub fn set_udp_response_tx(&mut self, rx: Receiver<PacketBuffer>) {
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.udp_response_rx = Some(rx);
-        }
-        self.wake.notify();
+    pub fn take_tcp_rx(&mut self) -> Option<mpsc::UnboundedReceiver<NewTcpConnection>> {
+        self.tcp_rx.take()
     }
 
-    /// Set the channel for notifying about new TCP connections.
-    pub fn set_new_conn_tx(&mut self, tx: mpsc::UnboundedSender<NewTcpConnection>) {
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.new_conn_tx = Some(tx);
+    pub async fn ready(&mut self) -> io::Result<()> {
+        let ready = self.ready.take().expect("stack readiness already consumed");
+        if ready.await.is_err() {
+            self.finished().await?;
+            return Err(io::Error::other("TUN stack stopped during initialization"));
+        }
+        Ok(())
+    }
+
+    pub async fn finished(&mut self) -> io::Result<()> {
+        (&mut self.completion)
+            .await
+            .map_err(|_| io::Error::other("TUN stack lost its completion result"))?
+    }
+
+    /// Set the channel for UDP responses to write back to TUN.
+    pub fn set_udp_response_tx(&mut self, rx: Receiver<PacketBuffer>) {
+        if let Ok(mut pending) = self.pending_udp_response_rx.lock() {
+            *pending = Some(rx);
         }
         self.wake.notify();
     }
 
     /// Check if the stack thread is still running.
+    #[cfg(test)]
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
@@ -233,6 +276,7 @@ struct DirectDevice {
     packet_information: bool,
     offload: bool,
     gso_packets: u64,
+    tx_error: Option<io::Error>,
 }
 
 impl DirectDevice {
@@ -245,6 +289,7 @@ impl DirectDevice {
             packet_information,
             offload: false,
             gso_packets: 0,
+            tx_error: None,
         }
     }
 
@@ -341,6 +386,7 @@ impl Device for DirectDevice {
             offload: self.offload,
             segment_size: None,
             gso_packets: &mut self.gso_packets,
+            error: &mut self.tx_error,
         })
     }
 
@@ -384,6 +430,7 @@ struct DirectTxToken<'a> {
     offload: bool,
     segment_size: Option<std::num::NonZeroU16>,
     gso_packets: &'a mut u64,
+    error: &'a mut Option<io::Error>,
 }
 
 impl TxToken for DirectTxToken<'_> {
@@ -412,7 +459,7 @@ impl TxToken for DirectTxToken<'_> {
             }
         }
         if let Err(e) = write_result {
-            warn!("Failed to write to TUN: {}", e);
+            self.error.get_or_insert(e);
         }
 
         result
@@ -426,12 +473,18 @@ const MAX_EGRESS_SWEEPS: usize = 8;
 fn run_direct_stack_thread(
     mut device: DirectDevice,
     config: TunServerConfig,
-    udp_tx: Sender<PacketBuffer>,
+    channels: StackChannels,
     running: Arc<AtomicBool>,
-    shared_state: Arc<Mutex<SharedState>>,
+    pending_udp_response_rx: Arc<Mutex<Option<Receiver<PacketBuffer>>>>,
     stack_wake: Wake,
     mut wake_rx: WakeReceiver,
-) {
+) -> io::Result<()> {
+    let StackChannels {
+        udp: udp_tx,
+        tcp: tcp_tx,
+        ready,
+    } = channels;
+    let mut ready = Some(ready);
     info!("smoltcp direct stack thread initializing...");
 
     let limits = &config.resource_limits;
@@ -467,7 +520,7 @@ fn run_direct_stack_thread(
 
     let mut socket_set = SocketSet::new(vec![]);
     let mut sockets: HashMap<SocketHandle, SocketInfo> = HashMap::new();
-    let mut active_connections = HashSet::new();
+    let mut active_connections = HashMap::new();
 
     let mut poll_count: u64 = 0;
     let mut last_log_time = std::time::Instant::now();
@@ -475,31 +528,22 @@ fn run_direct_stack_thread(
     let mut wait_error_count: u32 = 0;
     const MAX_WAIT_ERRORS: u32 = 10;
     let mut udp_response_rx = None;
-    let mut new_conn_tx = None;
 
     info!("smoltcp direct stack thread started, entering main loop");
 
     while running.load(Ordering::Relaxed) {
-        if let Err(error) = wake_rx.drain() {
-            error!("TUN wake channel failed: {error}");
-            break;
-        }
-        if let Ok(mut state) = shared_state.lock() {
-            if let Some(rx) = state.udp_response_rx.take() {
-                udp_response_rx = Some(rx);
-            }
-            if let Some(tx) = state.new_conn_tx.take() {
-                new_conn_tx = Some(tx);
-            }
+        wake_rx.drain()?;
+        if let Ok(mut pending) = pending_udp_response_rx.lock()
+            && let Some(rx) = pending.take()
+        {
+            udp_response_rx = Some(rx);
         }
         let mut responses_written = 0;
         if let Some(ref mut udp_rx) = udp_response_rx {
             for _ in 0..MAX_PACKET_BATCH {
                 let Ok(pkt) = udp_rx.try_recv() else { break };
                 responses_written += 1;
-                if let Err(e) = device.write_packet(&pkt) {
-                    warn!("Failed to write UDP response to TUN: {}", e);
-                }
+                device.write_packet(&pkt)?;
             }
         }
 
@@ -508,15 +552,8 @@ fn run_direct_stack_thread(
         let mut packets_read = 0;
 
         while packets_read < MAX_PACKET_BATCH {
-            let pkt = match device.try_recv() {
-                Ok(Some(p)) => p,
-                Ok(None) => break,
-                Err(e) => {
-                    // Critical error reading from TUN (EOF or EIO)
-                    error!("TUN device read failed: {}. Stack thread stopping.", e);
-                    running.store(false, Ordering::Relaxed);
-                    break;
-                }
+            let Some(pkt) = device.try_recv()? else {
+                break;
             };
             packets_read += 1;
 
@@ -525,72 +562,28 @@ fn run_direct_stack_thread(
                 continue;
             }
 
-            if let Some(protocol) = get_ip_protocol(&pkt) {
-                trace!(
-                    "Received packet: protocol={:?}, len={}",
-                    protocol,
-                    pkt.len()
-                );
-                match protocol {
-                    IpProtocol::Tcp if config.tcp_enabled => {
-                        match extract_tcp_info(&pkt) {
-                            Some((src_addr, dst_addr, is_syn)) => {
-                                trace!("TCP packet: {} -> {}, SYN={}", src_addr, dst_addr, is_syn);
-                                if is_syn && !active_connections.contains(&(src_addr, dst_addr)) {
-                                    // Check connection limit
-                                    if let Some(limit) = limits.tcp_connection_limit()
-                                        && sockets.len() >= limit
-                                    {
-                                        warn!(
-                                            "Connection limit reached ({}), dropping SYN from {}",
-                                            limit, src_addr
-                                        );
-                                        continue;
-                                    }
-
-                                    info!("New TCP SYN: {} -> {}", src_addr, dst_addr);
-
-                                    if let Some((new_conn, control)) = create_tcp_connection(
-                                        src_addr,
-                                        dst_addr,
-                                        &mut socket_set,
-                                        &stack_wake,
-                                        limits.tcp_buffer_size,
-                                    ) {
-                                        sockets.insert(
-                                            new_conn.handle,
-                                            SocketInfo {
-                                                control,
-                                                src_addr,
-                                                dst_addr,
-                                            },
-                                        );
-                                        active_connections.insert((src_addr, dst_addr));
-
-                                        publish_connection(
-                                            new_conn.new_tcp_conn,
-                                            &mut new_conn_tx,
-                                            &shared_state,
-                                        );
-                                    }
-                                }
-                            }
-                            None => {
-                                warn!("Failed to parse TCP packet, len={}", pkt.len());
-                            }
-                        }
-
-                        stack_packets.push(pkt);
+            let Some(protocol) = get_ip_protocol(&pkt) else {
+                continue;
+            };
+            trace!(
+                "Received packet: protocol={:?}, len={}",
+                protocol,
+                pkt.len()
+            );
+            match protocol {
+                IpProtocol::Tcp if config.tcp_enabled => {
+                    if let Some(flow) = extract_tcp_info(&pkt) {
+                        stack_packets.push((pkt, Some(flow)));
                     }
-                    IpProtocol::Icmp | IpProtocol::Icmpv6 if config.icmp_enabled => {
-                        stack_packets.push(pkt);
-                    }
-                    IpProtocol::Udp if config.udp_enabled => {
-                        let _ = udp_tx.try_send(pkt);
-                    }
-                    _ => {
-                        trace!("ignoring packet with protocol {:?}", protocol);
-                    }
+                }
+                IpProtocol::Icmp | IpProtocol::Icmpv6 if config.icmp_enabled => {
+                    stack_packets.push((pkt, None));
+                }
+                IpProtocol::Udp if config.udp_enabled => {
+                    let _ = udp_tx.try_send(pkt);
+                }
+                _ => {
+                    trace!("ignoring packet with protocol {:?}", protocol);
                 }
             }
         }
@@ -599,35 +592,90 @@ fn run_direct_stack_thread(
             wait_error_count = 0;
         }
 
-        // Skip remaining work if a fatal read error was detected above.
         if !running.load(Ordering::Relaxed) {
             break;
         }
 
         iface.poll_maintenance(stack_now());
-        for pkt in stack_packets {
+        for (pkt, flow) in stack_packets {
+            let known = flow.and_then(|(src, dst, _)| active_connections.get(&(src, dst)).copied());
+            let incoming = match (flow, known) {
+                (Some((src, dst, true)), None) => {
+                    if limits
+                        .tcp_connection_limit()
+                        .is_some_and(|limit| sockets.len() >= limit)
+                    {
+                        continue;
+                    }
+                    create_tcp_connection(
+                        src,
+                        dst,
+                        &mut socket_set,
+                        &stack_wake,
+                        limits.tcp_buffer_size,
+                    )
+                    .map(|connection| (src, dst, connection))
+                }
+                _ => None,
+            };
             device.store_packet(pkt);
             iface.poll_ingress_single(stack_now(), &mut device, &mut socket_set);
+            if let Some(error) = device.tx_error.take() {
+                return Err(error);
+            }
+            if let Some((src_addr, dst_addr, incoming)) = incoming {
+                let handle = incoming.handle;
+                // Admission follows smoltcp's TCP flag and option validation.
+                if socket_set.get::<TcpSocket>(handle).state() != TcpState::SynReceived {
+                    socket_set.remove(handle);
+                    continue;
+                }
+                sockets.insert(
+                    handle,
+                    SocketInfo {
+                        control: incoming.control,
+                        src_addr,
+                        dst_addr,
+                        pending: Some(incoming.connection),
+                    },
+                );
+                active_connections.insert((src_addr, dst_addr), handle);
+            } else if let Some(handle) = known {
+                let socket = socket_set.get::<TcpSocket>(handle);
+                if matches!(socket.state(), TcpState::Listen | TcpState::Closed)
+                    && socket.remote_endpoint().is_none()
+                {
+                    // A reset passive open must not capture another peer later in this batch.
+                    socket_set.remove(handle);
+                    if let Some(info) = sockets.remove(&handle) {
+                        active_connections.remove(&(info.src_addr, info.dst_addr));
+                    }
+                }
+            }
         }
 
-        for (handle, socket_info) in sockets.iter() {
+        for (handle, socket_info) in sockets.iter_mut() {
             let handle = *handle;
-            let control = &socket_info.control;
             let socket = socket_set.get_mut::<TcpSocket>(handle);
 
-            crate::ip_stack::pump_tcp(handle, socket, control, stack_now());
+            socket_info.pump(handle, socket, &tcp_tx, stack_now());
         }
 
         // Amortizes loop overhead without starving later sockets or draining indefinitely.
         for _ in 0..MAX_EGRESS_SWEEPS {
-            if iface.poll_egress(stack_now(), &mut device, &mut socket_set)
-                == smoltcp::iface::PollResult::None
-            {
+            let result = iface.poll_egress(stack_now(), &mut device, &mut socket_set);
+            if let Some(error) = device.tx_error.take() {
+                return Err(error);
+            }
+            if result == smoltcp::iface::PollResult::None {
                 break;
             }
         }
         let has_local_work =
             reconcile_sockets(&mut sockets, &mut socket_set, &mut active_connections);
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(());
+        }
 
         poll_count += 1;
         if last_log_time.elapsed() >= Duration::from_secs(30) {
@@ -663,10 +711,7 @@ fn run_direct_stack_thread(
             Err(e) => {
                 wait_error_count += 1;
                 if wait_error_count >= MAX_WAIT_ERRORS {
-                    error!(
-                        "TUN poll failed {wait_error_count} consecutive times (last: {e}). Stack thread stopping."
-                    );
-                    break;
+                    return Err(e);
                 }
                 warn!("TUN poll error ({wait_error_count}): {e}");
             }
@@ -674,32 +719,17 @@ fn run_direct_stack_thread(
     }
 
     info!("smoltcp direct stack thread stopped");
+    Ok(())
 }
 
 fn stack_now() -> SmolInstant {
     std::time::Instant::now().into()
 }
 
-fn publish_connection(
-    connection: NewTcpConnection,
-    sender: &mut Option<mpsc::UnboundedSender<NewTcpConnection>>,
-    shared_state: &Mutex<SharedState>,
-) {
-    // Setup can publish the handler after this iteration's initial snapshot.
-    if sender.is_none()
-        && let Ok(mut state) = shared_state.lock()
-    {
-        *sender = state.new_conn_tx.take();
-    }
-    if let Some(sender) = sender {
-        let _ = sender.send(connection);
-    }
-}
-
 fn reconcile_sockets(
     sockets: &mut HashMap<SocketHandle, SocketInfo>,
     socket_set: &mut SocketSet<'_>,
-    active_connections: &mut HashSet<(SocketAddr, SocketAddr)>,
+    active_connections: &mut HashMap<(SocketAddr, SocketAddr), SocketHandle>,
 ) -> bool {
     let mut has_local_work = false;
     sockets.retain(|handle, info| {
@@ -725,10 +755,10 @@ fn reconcile_sockets(
     has_local_work
 }
 
-/// Result of creating a TCP connection.
-struct CreateConnectionResult {
+struct CreatedTcpConnection {
     handle: SocketHandle,
-    new_tcp_conn: NewTcpConnection,
+    connection: NewTcpConnection,
+    control: Arc<TcpConnectionControl>,
 }
 
 /// Create a new TCP connection in the smoltcp stack.
@@ -738,8 +768,9 @@ fn create_tcp_connection(
     socket_set: &mut SocketSet<'static>,
     wake: &Wake,
     buffer_size: usize,
-) -> Option<(CreateConnectionResult, Arc<TcpConnectionControl>)> {
+) -> Option<CreatedTcpConnection> {
     let mut socket = crate::ip_stack::tcp_socket(buffer_size);
+    socket.set_timeout(Some(crate::ip_stack::TCP_HANDSHAKE_TIMEOUT));
 
     if let Err(e) = socket.listen(dst_addr) {
         warn!("Failed to listen on socket for {}: {:?}", dst_addr, e);
@@ -753,16 +784,14 @@ fn create_tcp_connection(
     let handle = socket_set.add(socket);
     let connection = TcpConnection::new(control.clone(), wake.clone());
 
-    Some((
-        CreateConnectionResult {
-            handle,
-            new_tcp_conn: NewTcpConnection {
-                connection,
-                remote_addr: dst_addr,
-            },
+    Some(CreatedTcpConnection {
+        handle,
+        connection: NewTcpConnection {
+            connection,
+            remote_addr: dst_addr,
         },
         control,
-    ))
+    })
 }
 
 /// Extract IP protocol from a raw IP packet.
@@ -793,7 +822,7 @@ fn extract_tcp_info(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, bool)> {
     match version {
         4 => {
             let ip = Ipv4Packet::new_checked(packet).ok()?;
-            if ip.next_header() != IpProtocol::Tcp {
+            if ip.next_header() != IpProtocol::Tcp || ip.frag_offset() != 0 || ip.more_frags() {
                 return None;
             }
             let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
@@ -875,6 +904,9 @@ fn should_filter_packet(packet: &[u8]) -> bool {
             if let Ok(ip) = Ipv6Packet::new_checked(packet) {
                 let src = ip.src_addr();
                 let dst = ip.dst_addr();
+                if src.to_ipv4_mapped().is_some() || dst.to_ipv4_mapped().is_some() {
+                    return true;
+                }
 
                 let src_bytes = src.octets();
                 let dst_bytes = dst.octets();
@@ -975,11 +1007,15 @@ fn write_framed_packet(fd: RawFd, data: &[u8], header: &[u8]) -> io::Result<bool
 /// Returns Err(WouldBlock) when no data is available, so callers can
 /// distinguish it from Ok(0) which indicates EOF.
 fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -1021,6 +1057,18 @@ fn write_framed_packet_with(
                 ));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // Linux rejects writes to an administratively down TUN with EIO.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                trace!("TUN interface down, packet dropped");
+                return Ok(false);
+            }
+            // Apple netif-mode utun reports a full input queue as ENOSPC.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => {
+                trace!("TUN input queue full, packet dropped");
+                return Ok(false);
+            }
             Err(error)
                 if error.raw_os_error() == Some(libc::ENOBUFS)
                     || error.kind() == io::ErrorKind::WouldBlock =>
@@ -1060,6 +1108,40 @@ mod tests {
     }
 
     #[test]
+    fn eio_writes_are_packet_drops_only_on_linux_kernels() {
+        for header in [&[][..], &[0; 4][..], &[0; 10][..]] {
+            let mut attempts = 0;
+            let result = write_framed_packet_with(b"packet", header, |_, _| {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            });
+            if cfg!(any(target_os = "linux", target_os = "android")) {
+                assert!(!result.unwrap());
+            } else {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+            }
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
+    fn enospc_writes_are_packet_drops_only_on_apple_kernels() {
+        for header in [&[][..], &[0; 4][..], &[0; 10][..]] {
+            let mut attempts = 0;
+            let result = write_framed_packet_with(b"packet", header, |_, _| {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+            if cfg!(any(target_os = "macos", target_os = "ios")) {
+                assert!(!result.unwrap());
+            } else {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOSPC));
+            }
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
     fn interface_forwards_ipv4_segmentation_and_keeps_ipv6_mtu() {
         for ipv6 in [false, true] {
             let (peer, tun) = UnixDatagram::pair().unwrap();
@@ -1093,7 +1175,7 @@ mod tests {
                 addresses.push(IpCidr::new(dst.ip().into(), 0)).unwrap();
             });
             let mut sockets = SocketSet::new(vec![]);
-            let (connection, _) =
+            let connection =
                 create_tcp_connection(src, dst, &mut sockets, &Wake::new().unwrap().0, 65536)
                     .unwrap();
             let packet = |ack: Option<u32>| {
@@ -1173,33 +1255,346 @@ mod tests {
         (stack, control)
     }
 
-    #[test]
-    fn handler_published_after_setup_snapshot_receives_the_connection() {
-        let state = Mutex::new(SharedState {
-            udp_response_rx: None,
-            new_conn_tx: None,
-        });
-        let mut snapshot = state.lock().unwrap().new_conn_tx.take();
-        assert!(snapshot.is_none());
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        state.lock().unwrap().new_conn_tx = Some(sender);
+    #[tokio::test]
+    async fn hard_tcp_write_errors_fail_startup_and_running_workers() {
+        for startup in [true, false] {
+            let (peer, tun) = UnixDatagram::pair().unwrap();
+            let mut syn = Vec::new();
+            etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                .tcp(10001, 443, 101, 4096)
+                .syn()
+                .write(&mut syn, &[])
+                .unwrap();
+            tun.shutdown(std::net::Shutdown::Write).unwrap();
+            if startup {
+                peer.send(&syn).unwrap();
+            }
+            let mut stack = TcpStackDirect::new(tun.into(), 1500);
+            let error = tokio::time::timeout(Duration::from_secs(5), async {
+                if startup {
+                    stack.ready().await.unwrap_err()
+                } else {
+                    stack.ready().await.unwrap();
+                    peer.send(&syn).unwrap();
+                    stack.finished().await.unwrap_err()
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        }
+    }
 
-        let (wake, _wake_rx) = Wake::new().unwrap();
-        let control = Arc::new(TcpConnectionControl::new(1024, 1024));
-        let address = "192.0.2.1:443".parse().unwrap();
-        publish_connection(
-            NewTcpConnection {
-                connection: TcpConnection::new(control.clone(), wake),
-                remote_addr: address,
-            },
-            &mut snapshot,
-            &state,
-        );
-        let connection = receiver.try_recv().unwrap();
-        assert_eq!(connection.remote_addr, address);
-        assert!(control.orphan_deadline().is_none());
-        assert!(snapshot.is_some());
-        assert!(state.lock().unwrap().new_conn_tx.is_none());
+    #[tokio::test]
+    async fn hard_udp_write_errors_reach_the_owner() {
+        let (_peer, tun) = UnixDatagram::pair().unwrap();
+        tun.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        stack.ready().await.unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(PacketBuffer::copy_from_slice(&[0x45, 1, 2, 3]))
+            .unwrap();
+        stack.set_udp_response_tx(rx);
+        let error = tokio::time::timeout(Duration::from_secs(5), stack.finished())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn queued_syn_survives_delayed_handler_setup() {
+        use tokio::io::AsyncReadExt;
+        for ipv6 in [false, true] {
+            for framed in [false, true] {
+                let (peer, tun) = UnixDatagram::pair().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let (source, target): (SocketAddr, SocketAddr) = if ipv6 {
+                    (
+                        "[fd00::2]:10001".parse().unwrap(),
+                        "[2001:db8::1]:443".parse().unwrap(),
+                    )
+                } else {
+                    (
+                        "10.0.0.2:10001".parse().unwrap(),
+                        "1.1.1.1:443".parse().unwrap(),
+                    )
+                };
+                let packet = |ack: Option<u32>| {
+                    let builder = match (source.ip(), target.ip()) {
+                        (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
+                            etherparse::PacketBuilder::ipv4(src.octets(), dst.octets(), 64)
+                        }
+                        (std::net::IpAddr::V6(src), std::net::IpAddr::V6(dst)) => {
+                            etherparse::PacketBuilder::ipv6(src.octets(), dst.octets(), 64)
+                        }
+                        _ => unreachable!(),
+                    }
+                    .tcp(
+                        10001,
+                        443,
+                        if ack.is_some() { 102 } else { 101 },
+                        4096,
+                    );
+                    let mut bytes = if framed {
+                        packet_header(if ipv6 { 0x60 } else { 0x45 })
+                            .unwrap()
+                            .to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    match ack {
+                        Some(ack) => builder
+                            .ack(ack)
+                            .fin()
+                            .write(&mut bytes, b"first data")
+                            .unwrap(),
+                        None => builder.syn().write(&mut bytes, b"").unwrap(),
+                    }
+                    bytes
+                };
+                peer.send(&packet(None)).unwrap();
+                peer.send(&packet(None)).unwrap();
+                let mut stack = TcpStackDirect::with_config(
+                    tun.into(),
+                    TunServerConfig::new().packet_information(framed),
+                )
+                .unwrap();
+                let mut buffer = [0; 1500];
+                let length = peer.recv(&mut buffer).unwrap();
+                let bytes = &buffer[if framed { 4 } else { 0 }..length];
+                let payload = if ipv6 {
+                    let ip = Ipv6Packet::new_checked(bytes).unwrap();
+                    assert_eq!(std::net::IpAddr::V6(ip.dst_addr()), source.ip());
+                    &bytes[40..]
+                } else {
+                    let ip = Ipv4Packet::new_checked(bytes).unwrap();
+                    assert!(ip.verify_checksum());
+                    assert_eq!(std::net::IpAddr::V4(ip.dst_addr()), source.ip());
+                    &bytes[ip.header_len() as usize..]
+                };
+                let tcp = TcpPacket::new_checked(payload).unwrap();
+                assert!(tcp.verify_checksum(&target.ip().into(), &source.ip().into()));
+                assert!(tcp.syn() && tcp.ack() && !tcp.rst());
+                assert_eq!(tcp.ack_number().0, 102);
+                assert!(
+                    stack.tcp_rx.as_ref().unwrap().is_empty(),
+                    "routing must wait for the handshake"
+                );
+                peer.send(&packet(Some((tcp.seq_number() + 1).0 as u32)))
+                    .unwrap();
+                let mut rx = stack.take_tcp_rx().unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    let mut flow = rx.recv().await.unwrap();
+                    assert_eq!(flow.remote_addr, target);
+                    let mut bytes = Vec::new();
+                    flow.connection.read_to_end(&mut bytes).await.unwrap();
+                    assert_eq!(bytes, b"first data");
+                    assert!(matches!(
+                        rx.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_half_open_releases_admission_before_the_next_packet() {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (peer, tun) = UnixDatagram::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            for (port, sequence, reset) in
+                [(10001, 101, false), (10001, 102, true), (10002, 501, false)]
+            {
+                let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                    .tcp(port, 443, sequence, 4096);
+                let mut packet = Vec::new();
+                if reset { builder.rst() } else { builder.syn() }
+                    .write(&mut packet, b"")
+                    .unwrap();
+                peer.send(&packet).unwrap();
+            }
+            let mut config = TunServerConfig::new();
+            config.resource_limits.max_tcp_connections = Some(1);
+            let mut stack = TcpStackDirect::with_config(tun.into(), config).unwrap();
+            let mut rx = stack.take_tcp_rx().unwrap();
+            let mut reply = [0; 1500];
+            let n = peer.recv(&mut reply).unwrap();
+            let ip = Ipv4Packet::new_checked(&reply[..n]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.syn() && tcp.ack() && !tcp.rst());
+            assert_eq!(tcp.dst_port(), 10002);
+            assert_eq!(tcp.ack_number().0, 502);
+            let mut packet = Vec::new();
+            etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                .tcp(10002, 443, 502, 4096)
+                .ack((tcp.seq_number() + 1).0 as u32)
+                .write(&mut packet, b"second peer")
+                .unwrap();
+            peer.send(&packet).unwrap();
+            let mut second = rx.recv().await.unwrap();
+            let mut received = [0; 11];
+            second.connection.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"second peer");
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_syns_never_publish_connections() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let source = Ipv4Address::new(10, 0, 0, 2);
+        let target = Ipv4Address::new(1, 1, 1, 1);
+        for malformed in 0..6 {
+            let mut packet = vec![0; 44];
+            let mut ip = Ipv4Packet::new_unchecked(&mut packet[..]);
+            smoltcp::wire::Ipv4Repr {
+                src_addr: source,
+                dst_addr: target,
+                next_header: IpProtocol::Tcp,
+                payload_len: 24,
+                hop_limit: 64,
+            }
+            .emit(&mut ip, &Default::default());
+            let mut tcp = TcpPacket::new_unchecked(ip.payload_mut());
+            tcp.set_header_len(24);
+            tcp.set_src_port(if malformed == 2 { 0 } else { 10001 + malformed });
+            tcp.set_dst_port(443);
+            tcp.set_seq_number(smoltcp::wire::TcpSeqNumber(101));
+            tcp.set_syn(true);
+            tcp.set_fin(malformed == 0);
+            tcp.set_rst(malformed == 1);
+            tcp.set_window_len(4096);
+            if malformed == 3 {
+                tcp.options_mut().copy_from_slice(&[2, 1, 0, 0]);
+            }
+            tcp.fill_checksum(&source.into(), &target.into());
+            if malformed == 4 {
+                ip.set_more_frags(true);
+                ip.fill_checksum();
+            }
+            peer.send(&packet).unwrap();
+        }
+        let mut config = TunServerConfig::new();
+        config.resource_limits.max_tcp_connections = Some(1);
+        let mut stack = TcpStackDirect::with_config(tun.into(), config).unwrap();
+        let mut buffer = [0; 1500];
+        let n = peer.recv(&mut buffer).unwrap();
+        let ip = Ipv4Packet::new_checked(&buffer[..n]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.syn() && tcp.ack() && !tcp.rst());
+        assert_eq!(tcp.dst_port(), 10006);
+        let mut ack = Vec::new();
+        etherparse::PacketBuilder::ipv4(source.octets(), target.octets(), 64)
+            .tcp(10006, 443, 102, 4096)
+            .ack((tcp.seq_number() + 1).0 as u32)
+            .write(&mut ack, b"")
+            .unwrap();
+        peer.send(&ack).unwrap();
+        let mut rx = stack.take_tcp_rx().unwrap();
+        let _flow = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn handshake_timeout_is_lifted_only_when_the_connection_is_published() {
+        for complete in [false, true] {
+            let (peer, tun) = UnixDatagram::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
+            let start = SmolInstant::from_secs(1);
+            let mut iface = Interface::new(
+                InterfaceConfig::new(HardwareAddress::Ip),
+                &mut device,
+                start,
+            );
+            let src = "10.0.0.2:10001".parse().unwrap();
+            let dst: SocketAddr = "1.1.1.1:443".parse().unwrap();
+            iface.update_ip_addrs(|ips| ips.push(IpCidr::new(dst.ip().into(), 0)).unwrap());
+            let mut sockets = SocketSet::new(vec![]);
+            let incoming =
+                create_tcp_connection(src, dst, &mut sockets, &Wake::new().unwrap().0, 4096)
+                    .unwrap();
+            let handle = incoming.handle;
+            let mut entry = SocketInfo {
+                control: incoming.control,
+                src_addr: src,
+                dst_addr: dst,
+                pending: Some(incoming.connection),
+            };
+            let (accepted, mut rx) = mpsc::unbounded_channel();
+            let mut syn = Vec::new();
+            etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                .tcp(10001, 443, 101, 4096)
+                .syn()
+                .write(&mut syn, b"")
+                .unwrap();
+            device.store_packet(PacketBuffer::copy_from_slice(&syn));
+            iface.poll(start, &mut device, &mut sockets);
+            entry.pump(
+                handle,
+                sockets.get_mut::<TcpSocket>(handle),
+                &accepted,
+                start,
+            );
+            assert!(rx.is_empty());
+            assert_eq!(
+                sockets.get::<TcpSocket>(handle).timeout(),
+                Some(smoltcp::time::Duration::from_secs(30))
+            );
+            let mut buffer = [0; 1500];
+            let n = peer.recv(&mut buffer).unwrap();
+            let ip = Ipv4Packet::new_checked(&buffer[..n]).unwrap();
+            let syn_ack = TcpPacket::new_checked(ip.payload()).unwrap();
+            if complete {
+                let mut ack = Vec::new();
+                etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                    .tcp(10001, 443, 102, 4096)
+                    .ack((syn_ack.seq_number() + 1).0 as u32)
+                    .write(&mut ack, b"")
+                    .unwrap();
+                device.store_packet(PacketBuffer::copy_from_slice(&ack));
+                iface.poll(start, &mut device, &mut sockets);
+                entry.pump(
+                    handle,
+                    sockets.get_mut::<TcpSocket>(handle),
+                    &accepted,
+                    start,
+                );
+            }
+            let flow = rx.try_recv().ok();
+            assert_eq!(flow.is_some(), complete);
+            let after_handshake_deadline = start + smoltcp::time::Duration::from_secs(31);
+            iface.poll(after_handshake_deadline, &mut device, &mut sockets);
+            let socket = sockets.get_mut::<TcpSocket>(handle);
+            entry.pump(handle, socket, &accepted, after_handshake_deadline);
+            assert_eq!(
+                socket.state(),
+                if complete {
+                    TcpState::Established
+                } else {
+                    TcpState::Closed
+                }
+            );
+            assert!(rx.is_empty(), "published twice");
+        }
     }
 
     #[test]
@@ -1257,14 +1652,14 @@ mod tests {
                 assert_eq!(error.kind(), io::ErrorKind::WriteZero);
                 assert_eq!(attempts, 1);
             }
-            for code in [libc::EAGAIN, libc::ENOBUFS, libc::EIO] {
+            for code in [libc::EAGAIN, libc::ENOBUFS, libc::EBADF, libc::EPIPE] {
                 let mut attempts = 0;
                 let result = write_packet_with(&payload, framed, |_, _| {
                     attempts += 1;
                     Err(io::Error::from_raw_os_error(code))
                 });
                 assert_eq!(attempts, 1);
-                if code == libc::EIO {
+                if matches!(code, libc::EBADF | libc::EPIPE) {
                     assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
                 } else {
                     result.unwrap();
@@ -1294,7 +1689,11 @@ mod tests {
         let mut socket_set = SocketSet::new(vec![]);
         let src_addr = "10.0.0.2:10001".parse().unwrap();
         let dst_addr = "1.1.1.1:443".parse().unwrap();
-        let (connection, control) = create_tcp_connection(
+        let CreatedTcpConnection {
+            handle,
+            connection,
+            control,
+        } = create_tcp_connection(
             src_addr,
             dst_addr,
             &mut socket_set,
@@ -1302,16 +1701,17 @@ mod tests {
             4096,
         )
         .unwrap();
-        let handle = connection.handle;
+        let (accepted, mut accepted_rx) = mpsc::unbounded_channel();
         let mut sockets = HashMap::from([(
             handle,
             SocketInfo {
                 control: control.clone(),
                 src_addr,
                 dst_addr,
+                pending: Some(connection),
             },
         )]);
-        let mut active = HashSet::from([(src_addr, dst_addr)]);
+        let mut active = HashMap::from([((src_addr, dst_addr), handle)]);
         let ingress =
             |iface: &mut Interface,
              device: &mut DirectDevice,
@@ -1347,6 +1747,13 @@ mod tests {
             Some(acknowledgement),
             false,
         );
+        sockets.get_mut(&handle).unwrap().pump(
+            handle,
+            socket_set.get_mut::<TcpSocket>(handle),
+            &accepted,
+            SmolInstant::from_millis(1),
+        );
+        let connection = accepted_rx.try_recv().unwrap();
         socket_set.get_mut::<TcpSocket>(handle).close();
         control.set_send_state(TcpSocketState::Closing);
         drop(connection);
@@ -1419,7 +1826,7 @@ mod tests {
         });
         let mut socket_set = SocketSet::new(vec![]);
         let mut sockets = HashMap::new();
-        let mut active = HashSet::new();
+        let mut active = HashMap::new();
         let dst_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
         let mut last_handle = None;
         for port in 10000..10070 {
@@ -1436,9 +1843,10 @@ mod tests {
                     control: Arc::new(TcpConnectionControl::new(1024, 1024)),
                     src_addr,
                     dst_addr,
+                    pending: None,
                 },
             );
-            active.insert((src_addr, dst_addr));
+            active.insert((src_addr, dst_addr), handle);
             last_handle = Some(handle);
         }
         let last_handle = last_handle.unwrap();
@@ -1464,15 +1872,14 @@ mod tests {
         assert!(!sockets.contains_key(&last_handle));
     }
 
-    #[test]
-    fn default_admission_preserves_bursts_beyond_old_queue_and_socket_caps() {
+    #[tokio::test]
+    async fn default_admission_preserves_bursts_beyond_old_queue_and_socket_caps() {
         use std::os::unix::net::UnixDatagram;
 
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        stack.set_new_conn_tx(tx);
+        let mut rx = stack.take_tcp_rx().unwrap();
         let mut buf = [0; 1500];
         for port in 10000..10300 {
             let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
@@ -1497,8 +1904,15 @@ mod tests {
                 .unwrap();
             peer.send(&ack).unwrap();
         }
-        assert_eq!(rx.len(), 300);
-        let connections: Vec<_> = (0..300).map(|_| rx.try_recv().unwrap()).collect();
+        let connections = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut connections = Vec::new();
+            for _ in 0..300 {
+                connections.push(rx.recv().await.unwrap());
+            }
+            connections
+        })
+        .await
+        .unwrap();
         drop(connections);
     }
 
@@ -1510,8 +1924,7 @@ mod tests {
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        stack.set_new_conn_tx(tx);
+        let mut rx = stack.take_tcp_rx().unwrap();
         let packet = |sequence, acknowledgment: Option<u32>, payload: &[u8]| {
             let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
                 .tcp(10001, 443, sequence, 4096);
@@ -1530,8 +1943,8 @@ mod tests {
         let syn_ack = TcpPacket::new_checked(ip.payload()).unwrap();
         assert!(syn_ack.syn() && syn_ack.ack());
         let acknowledgment = (syn_ack.seq_number().0 as u32).wrapping_add(1);
-        let mut incoming = rx.recv().await.unwrap();
         peer.send(&packet(102, Some(acknowledgment), b"x")).unwrap();
+        let mut incoming = rx.recv().await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(1),
             incoming.connection.read_exact(&mut [0]),
@@ -1561,6 +1974,73 @@ mod tests {
     }
 
     #[test]
+    fn mapped_ipv6_addresses_are_filtered_before_transport_dispatch() {
+        for (source, target) in [
+            ("::ffff:10.0.0.2", "2001:db8::1"),
+            ("fd00::2", "::ffff:1.1.1.1"),
+            ("fd00::2", "2001:db8::1"),
+        ] {
+            let source: std::net::Ipv6Addr = source.parse().unwrap();
+            let target: std::net::Ipv6Addr = target.parse().unwrap();
+            for tcp in [false, true] {
+                let builder = etherparse::PacketBuilder::ipv6(source.octets(), target.octets(), 64);
+                let mut packet = Vec::new();
+                if tcp {
+                    builder
+                        .tcp(10001, 443, 101, 4096)
+                        .syn()
+                        .write(&mut packet, b"")
+                        .unwrap();
+                } else {
+                    builder.udp(10001, 443).write(&mut packet, b"").unwrap();
+                }
+                assert_eq!(
+                    should_filter_packet(&packet),
+                    source.to_ipv4_mapped().is_some() || target.to_ipv4_mapped().is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_tcp_receiver_resets_established_connections() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        drop(stack.take_tcp_rx());
+        let packet = |ack: Option<u32>| {
+            let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64).tcp(
+                10001,
+                443,
+                if ack.is_some() { 102 } else { 101 },
+                4096,
+            );
+            let mut bytes = Vec::new();
+            match ack {
+                Some(ack) => builder.ack(ack).write(&mut bytes, b"x").unwrap(),
+                None => builder.syn().write(&mut bytes, b"").unwrap(),
+            }
+            bytes
+        };
+        peer.send(&packet(None)).unwrap();
+        let mut buffer = [0; 1500];
+        let n = peer.recv(&mut buffer).unwrap();
+        let ip = Ipv4Packet::new_checked(&buffer[..n]).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.syn() && tcp.ack() && !tcp.rst());
+        peer.send(&packet(Some((tcp.seq_number() + 1).0 as u32)))
+            .unwrap();
+        loop {
+            let n = peer.recv(&mut buffer).unwrap();
+            let ip = Ipv4Packet::new_checked(&buffer[..n]).unwrap();
+            if TcpPacket::new_checked(ip.payload()).unwrap().rst() {
+                break;
+            }
+        }
+        assert!(stack.is_running());
+    }
+
+    #[test]
     fn packet_information_roundtrips_ipv4_and_ipv6() {
         use std::os::unix::net::UnixDatagram;
         let (peer, tun) = UnixDatagram::pair().unwrap();
@@ -1581,20 +2061,59 @@ mod tests {
     }
 
     #[test]
-    fn disabled_udp_does_not_reach_async_handler() {
-        use std::os::unix::net::UnixDatagram;
-        let (peer, tun) = UnixDatagram::pair().unwrap();
-        let mut stack =
-            TcpStackDirect::with_config(tun.into(), TunServerConfig::new().udp_enabled(false))
-                .unwrap();
-        let mut rx = stack.take_udp_rx().unwrap();
-        let builder =
-            etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64).udp(1000, 53);
-        let mut packet = Vec::new();
-        builder.write(&mut packet, b"dns").unwrap();
-        peer.send(&packet).unwrap();
-        thread::sleep(Duration::from_millis(40));
-        assert!(rx.try_recv().is_err());
+    fn disabled_tcp_and_udp_do_not_reach_async_handlers() {
+        use smoltcp::wire::Icmpv4Packet;
+        for tcp in [false, true] {
+            let (peer, tun) = UnixDatagram::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut stack = TcpStackDirect::with_config(
+                tun.into(),
+                TunServerConfig::new().tcp_enabled(!tcp).udp_enabled(tcp),
+            )
+            .unwrap();
+            let mut udp_rx = stack.take_udp_rx().unwrap();
+            let mut tcp_rx = stack.take_tcp_rx().unwrap();
+            let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64);
+            let mut packet = Vec::new();
+            if tcp {
+                builder
+                    .tcp(10001, 443, 101, 4096)
+                    .syn()
+                    .write(&mut packet, b"")
+                    .unwrap();
+            } else {
+                builder.udp(1000, 53).write(&mut packet, b"dns").unwrap();
+            }
+            peer.send(&packet).unwrap();
+            // Two ingress replies also fence TCP egress from the preceding iteration.
+            for sequence in [1, 2] {
+                let mut sentinel = Vec::new();
+                etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                    .icmpv4_echo_request(17, sequence)
+                    .write(&mut sentinel, b"processed")
+                    .unwrap();
+                peer.send(&sentinel).unwrap();
+                let mut response = [0; 1500];
+                let n = peer.recv(&mut response).unwrap();
+                let ip = Ipv4Packet::new_checked(&response[..n]).unwrap();
+                assert_eq!(ip.next_header(), IpProtocol::Icmp);
+                assert_eq!(
+                    Icmpv4Packet::new_checked(ip.payload())
+                        .unwrap()
+                        .echo_seq_no(),
+                    sequence
+                );
+            }
+            assert!(matches!(
+                udp_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                tcp_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(stack.is_running());
+        }
     }
 
     #[test]
@@ -1619,29 +2138,35 @@ mod tests {
 
         for enabled in [true, false] {
             let (peer, tun) = UnixDatagram::pair().unwrap();
-            peer.set_read_timeout(Some(Duration::from_millis(if enabled {
-                1000
-            } else {
-                200
-            })))
-            .unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let stack = TcpStackDirect::with_config(
                 tun.into(),
                 TunServerConfig::new().icmp_enabled(enabled),
             )
             .unwrap();
+            if !enabled {
+                peer.send(&ipv4_request).unwrap();
+                peer.send(&ipv6_request).unwrap();
+                let mut syn = Vec::new();
+                etherparse::PacketBuilder::ipv4(ipv4_src, ipv4_dst, 64)
+                    .tcp(10001, 443, 101, 4096)
+                    .syn()
+                    .write(&mut syn, b"")
+                    .unwrap();
+                peer.send(&syn).unwrap();
+                let mut response = [0; 1500];
+                let n = peer.recv(&mut response).unwrap();
+                let ip = Ipv4Packet::new_checked(&response[..n]).unwrap();
+                assert_eq!(ip.next_header(), IpProtocol::Tcp);
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                assert!(tcp.syn() && tcp.ack() && !tcp.rst());
+                assert!(stack.is_running());
+                continue;
+            }
             for request in [&ipv4_request, &ipv6_request] {
                 peer.send(request).unwrap();
                 let mut response = [0; 1500];
                 let result = peer.recv(&mut response);
-                if !enabled {
-                    assert!(matches!(
-                        result.unwrap_err().kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ));
-                    assert!(stack.is_running());
-                    continue;
-                }
                 let response = &response[..result.unwrap()];
                 if request[0] >> 4 == 4 {
                     let ip = Ipv4Packet::new_checked(response).unwrap();
@@ -1680,32 +2205,49 @@ mod tests {
                 flag.0.store(true, Ordering::Relaxed);
             }
         }
-        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
-        let waker = waker(flag.clone());
-        let mut cx = Context::from_waker(&waker);
+        let read_flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let write_flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let read_waker = waker(read_flag.clone());
+        let write_waker = waker(write_flag.clone());
+        let mut read_cx = Context::from_waker(&read_waker);
+        let mut write_cx = Context::from_waker(&write_waker);
         let control = Arc::new(TcpConnectionControl::new(1, 1));
         let mut conn = TcpConnection::new(control.clone(), Wake::new().unwrap().0);
         let info = SocketInfo {
             control: control.clone(),
             src_addr: "127.0.0.1:1".parse().unwrap(),
             dst_addr: "127.0.0.1:2".parse().unwrap(),
+            pending: None,
         };
         let mut buf = [0; 1];
         assert!(
             Pin::new(&mut conn)
-                .poll_read(&mut cx, &mut ReadBuf::new(&mut buf))
+                .poll_read(&mut read_cx, &mut ReadBuf::new(&mut buf))
                 .is_pending()
         );
-        assert!(Pin::new(&mut conn).poll_write(&mut cx, b"a").is_ready());
-        assert!(Pin::new(&mut conn).poll_write(&mut cx, b"b").is_pending());
-        drop(info);
-        assert!(flag.0.load(Ordering::Relaxed));
         assert!(
             Pin::new(&mut conn)
-                .poll_read(&mut cx, &mut ReadBuf::new(&mut buf))
+                .poll_write(&mut write_cx, b"a")
                 .is_ready()
         );
-        assert!(Pin::new(&mut conn).poll_write(&mut cx, b"b").is_ready());
+        assert!(
+            Pin::new(&mut conn)
+                .poll_write(&mut write_cx, b"b")
+                .is_pending()
+        );
+        drop(info);
+        assert!(read_flag.0.load(Ordering::Relaxed));
+        assert!(write_flag.0.load(Ordering::Relaxed));
+        assert!(
+            Pin::new(&mut conn)
+                .poll_read(&mut read_cx, &mut ReadBuf::new(&mut buf))
+                .is_ready()
+        );
+        assert!(
+            Pin::new(&mut conn)
+                .poll_write(&mut write_cx, b"b")
+                .is_ready()
+        );
         drop(conn);
         assert!(control.orphan_deadline().is_some());
     }
@@ -1790,8 +2332,7 @@ mod tests {
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        stack.set_new_conn_tx(tx);
+        let rx = stack.take_tcp_rx().unwrap();
         let mut syn = Vec::new();
         etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
             .tcp(10001, 443, 101, 4096)
@@ -1799,7 +2340,6 @@ mod tests {
             .write(&mut syn, b"")
             .unwrap();
         peer.send(&syn).unwrap();
-        let _connection = rx.blocking_recv().unwrap();
         let mut buf = [0; 1500];
         let mut sequence = None;
         for _ in 0..2 {
@@ -1812,6 +2352,7 @@ mod tests {
             }
             sequence = Some(tcp.seq_number());
         }
+        assert!(rx.is_empty());
     }
 
     #[test]

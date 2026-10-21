@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{Barrier, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -226,6 +226,179 @@ async fn offload_on_off_bulk_dual_stack_and_mtu_variants() -> io::Result<()> {
                     drop(reset);
                     bulk_echo(tun.connect_tcp(peer.local_addr().port()).await?, 4097, 17).await?;
                 }
+            }
+        }
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn server_half_close_preserves_client_upload() -> io::Result<()> {
+    timeout(TEST_TIMEOUT, async {
+        for ipv6 in [false, true] {
+            for offload in [false, true] {
+                let peer = TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).await?;
+                let tun = KernelTun::start_options(ipv6, Some(offload), 1280, 4096).await?;
+                let mut client = tun.connect_tcp(peer.local_addr()?.port()).await?;
+                let data = payload(3, 7, 256 * 1024 + 1);
+                let ((), ()) = tokio::try_join!(
+                    async {
+                        let (mut stream, _) = peer.accept().await?;
+                        stream.write_all(b"banner").await?;
+                        stream.shutdown().await?;
+                        let mut received = Vec::new();
+                        stream.read_to_end(&mut received).await?;
+                        assert_eq!(received, data, "ipv6={ipv6}, offload={offload}");
+                        io::Result::Ok(())
+                    },
+                    async {
+                        let mut received = Vec::new();
+                        client.read_to_end(&mut received).await?;
+                        assert_eq!(received, b"banner");
+                        // Upload starts after EOF, exercising the still-open direction.
+                        client.write_all(&data).await?;
+                        client.shutdown().await
+                    }
+                )?;
+            }
+        }
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn reload_removes_tun_and_active_upstreams_without_exiting() -> io::Result<()> {
+    timeout(TEST_TIMEOUT, async {
+        for ipv6 in [false, true] {
+            for offload in [false, true] {
+                let listener =
+                    TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).await?;
+                let tun = KernelTun::start_with(ipv6, Some(offload), 1500, 4096, |config| {
+                    let file = tempfile::NamedTempFile::new()?;
+                    std::fs::write(file.path(), config)?;
+                    let process = shoes_test_support::process::spawn_privileged_process(
+                        std::path::Path::new(env!("CARGO_BIN_EXE_shoes")),
+                        "reloadable-tun",
+                        |command| {
+                            command.args(["-t", "2"]).arg(file.path());
+                        },
+                    )?;
+                    Ok((process, file))
+                })
+                .await?;
+                let mut client = tun.connect_tcp(listener.local_addr()?.port()).await?;
+                client.write_all(b"active").await?;
+                let (mut upstream, _) = listener.accept().await?;
+                let mut data = [0; 6];
+                upstream.read_exact(&mut data).await?;
+                assert_eq!(&data, b"active");
+                upstream.write_all(b"reply").await?;
+                client.read_exact(&mut data[..5]).await?;
+                assert_eq!(&data[..5], b"reply");
+                let interface = std::path::Path::new("/sys/class/net").join(&tun.name);
+                assert!(interface.try_exists()?);
+                let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let address = reservation.local_addr()?;
+                let replacement = format!(
+                    "- address: '{address}'\n  protocol: {{type: socks}}\n  rules: allow-all-direct\n"
+                );
+                drop(reservation);
+                std::fs::write(tun._config.path(), replacement)?;
+                timeout(Duration::from_secs(10), async {
+                    while interface.try_exists()? {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    io::Result::Ok(())
+                })
+                .await??;
+                match upstream.read(&mut data).await {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    result => panic!("upstream not closed on shutdown: {result:?}"),
+                }
+                let mut replacement = timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Ok(stream) = TcpStream::connect(address).await {
+                            return io::Result::Ok(stream);
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await??;
+                replacement.write_all(&[5, 1, 0]).await?;
+                let mut greeting = [0; 2];
+                replacement.read_exact(&mut greeting).await?;
+                assert_eq!(greeting, [5, 0]);
+            }
+        }
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn link_down_drops_replies_and_recovers_without_restarting() -> io::Result<()> {
+    timeout(TEST_TIMEOUT, async {
+        for ipv6 in [false, true] {
+            for offload in [false, true] {
+                let listener =
+                    TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).await?;
+                let tun = KernelTun::start_options(ipv6, Some(offload), 1500, 4096).await?;
+                let mut client = tun.connect_tcp(listener.local_addr()?.port()).await?;
+                let (mut upstream, _) = listener.accept().await?;
+                upstream.write_all(b"before").await?;
+                let mut data = [0; 6];
+                client.read_exact(&mut data).await?;
+                assert_eq!(&data, b"before");
+
+                let dropped_path = std::path::Path::new("/sys/class/net")
+                    .join(&tun.name)
+                    .join("statistics/rx_dropped");
+                let dropped = || -> io::Result<u64> {
+                    std::fs::read_to_string(&dropped_path)?
+                        .trim()
+                        .parse()
+                        .map_err(io::Error::other)
+                };
+                let before = dropped()?;
+                run_ip(&["link", "set", &tun.name, "down"])?;
+                upstream.write_all(b"during").await?;
+                // The kernel increments rx_dropped before returning EIO for a down TUN.
+                timeout(Duration::from_secs(5), async {
+                    while dropped()? == before {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    io::Result::Ok(())
+                })
+                .await??;
+                run_ip(&["link", "set", &tun.name, "up"])?;
+                // Link-down flushes the fixture's route and IPv6 address.
+                if ipv6 {
+                    run_ip(&[
+                        "-6",
+                        "address",
+                        "replace",
+                        &format!("{}/128", tun.source),
+                        "dev",
+                        &tun.name,
+                        "nodad",
+                    ])?;
+                }
+                run_ip(&[
+                    if ipv6 { "-6" } else { "-4" },
+                    "route",
+                    "replace",
+                    &format!("{}/{}", tun.target, if ipv6 { 128 } else { 32 }),
+                    "dev",
+                    &tun.name,
+                ])?;
+                client.read_exact(&mut data).await?;
+                assert_eq!(&data, b"during");
+                client.write_all(b"after").await?;
+                upstream.read_exact(&mut data[..5]).await?;
+                assert_eq!(&data[..5], b"after");
             }
         }
         Ok(())
