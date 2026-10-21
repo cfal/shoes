@@ -9088,9 +9088,9 @@ For these and/or other purposes and motivations, and without any expectation of 
      d. Affirmer understands and acknowledges that Creative Commons is not a party to this document and has no duty or obligation with respect to this CC0 or use of the Work. 
 
 License: Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0)
-Package: webpki-root-certs 1.0.9
+Package: webpki-root-certs 1.0.10
 Repository: https://github.com/rustls/webpki-roots
-Package: webpki-roots 1.0.9
+Package: webpki-roots 1.0.10
 Repository: https://github.com/rustls/webpki-roots
 
 # Community Data License Agreement - Permissive - Version 2.0
@@ -9574,7 +9574,7 @@ THIS SOFTWARE.
 
 
 License: ISC License (ISC)
-Package: rustls-webpki 0.103.15
+Package: rustls-webpki 0.103.16
 Repository: https://github.com/rustls/webpki
 
 Except as otherwise noted, this project is licensed under the following
