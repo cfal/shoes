@@ -216,14 +216,14 @@ impl ConnectAction {
 }
 
 /// Threshold for enabling cache based on rule count.
-/// If rule count exceeds this value, caching is enabled even without DNS resolution.
+/// Caching is enabled by default when the rule count exceeds this value.
 const CACHE_RULE_THRESHOLD: usize = 16;
 
 #[derive(Debug)]
 pub struct ClientProxySelector {
     rules: Vec<ConnectRule>,
     /// LRU cache for routing decisions. Speeds up repeated lookups for the same destination.
-    /// None if caching is disabled (few rules and no DNS resolution).
+    /// None when caching is disabled; DNS-dependent and sniffed routes bypass it.
     cache: Option<RoutingCache>,
     has_ip_rules: bool,
     has_hostname_rules: bool,
@@ -423,11 +423,8 @@ impl ClientProxySelector {
                     "sniffed hostname requires a prepared IP-origin destination",
                 ));
             }
-            let mut connection_target = target.connection_target;
-            match match_rule(&self.rules, &mut connection_target, resolver, Some(name)).await? {
-                Some(index) => self.rules[index].action.to_decision(connection_target),
-                None => ConnectDecision::Block,
-            }
+            self.judge_uncached(target.connection_target, resolver, Some(name))
+                .await?
         } else {
             self.judge_ordinary(target.connection_target, resolver)
                 .await?
@@ -479,14 +476,14 @@ impl ClientProxySelector {
         // not a hostname-only decision from a previous resolution.
         let dns_dependent = location.location().address().hostname().is_some() && self.has_ip_rules;
         if dns_dependent {
-            return self.judge_uncached(location, resolver).await;
+            return self.judge_uncached(location, resolver, None).await;
         }
 
         // If caching is disabled, go directly to rule matching
         let cache = match &self.cache {
             Some(c) => c,
             None => {
-                return self.judge_uncached(location, resolver).await;
+                return self.judge_uncached(location, resolver, None).await;
             }
         };
 
@@ -518,9 +515,10 @@ impl ClientProxySelector {
         &'a self,
         location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
+        hostname: Option<&str>,
     ) -> std::io::Result<ConnectDecision<'a>> {
         let mut location = location;
-        match match_rule(&self.rules, &mut location, resolver, None).await? {
+        match match_rule(&self.rules, &mut location, resolver, hostname).await? {
             Some(rule_index) => Ok(self.rules[rule_index].action.to_decision(location)),
             None => Ok(ConnectDecision::Block),
         }
@@ -2522,7 +2520,7 @@ mod tests {
 
         // Use judge_uncached - should NOT populate cache
         let decision = selector
-            .judge_uncached(location.into(), &resolver)
+            .judge_uncached(location.into(), &resolver, None)
             .await
             .unwrap();
         match decision {
