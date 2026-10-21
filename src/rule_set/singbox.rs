@@ -77,23 +77,31 @@ fn rule(value: Value, depth: usize) -> io::Result<Expression> {
         return Err(invalid("rule nesting exceeds 100"));
     }
     if value.get("type").and_then(Value::as_str) == Some("logical") {
-        let rule: LogicalRule =
-            serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
-        if rule.kind != "logical" || rule.rules.is_empty() {
-            return Err(invalid("empty/invalid logical rule"));
-        }
-        let children = rule
-            .rules
-            .into_iter()
-            .map(|v| self::rule(v, depth + 1))
-            .collect::<io::Result<Vec<_>>>()?;
-        return Ok(match rule.mode.as_str() {
-            "and" => Expression::All(children),
-            "or" => Expression::Any(children),
-            _ => return Err(invalid("logical mode must be and or or")),
-        }
-        .inverted(rule.invert));
+        logical_rule(value, depth)
+    } else {
+        default_rule(value)
     }
+}
+
+fn logical_rule(value: Value, depth: usize) -> io::Result<Expression> {
+    let rule: LogicalRule = serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
+    if rule.kind != "logical" || rule.rules.is_empty() {
+        return Err(invalid("empty/invalid logical rule"));
+    }
+    let children = rule
+        .rules
+        .into_iter()
+        .map(|v| self::rule(v, depth + 1))
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(match rule.mode.as_str() {
+        "and" => Expression::All(children),
+        "or" => Expression::Any(children),
+        _ => return Err(invalid("logical mode must be and or or")),
+    }
+    .inverted(rule.invert))
+}
+
+fn default_rule(value: Value) -> io::Result<Expression> {
     let rule: DefaultRule = serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
     if rule.kind.as_deref().is_some_and(|s| s != "default") {
         return Err(invalid("unsupported rule type"));
@@ -237,6 +245,26 @@ mod tests {
 
     fn decode(bytes: &[u8]) -> io::Result<Expression> {
         super::decode(bytes, &mut Compiler::default())
+    }
+
+    #[test]
+    fn logical_children_are_validated_before_mode() {
+        let invalid_child =
+            br#"{"version":1,"rules":[{"type":"logical","mode":"invalid","rules":[{}]}]}"#;
+        assert_eq!(
+            decode(invalid_child).unwrap_err().to_string(),
+            "rule 0: empty rule"
+        );
+        let valid_child = br#"{"version":1,"rules":[{"type":"logical","mode":"invalid","rules":[{"domain":"example.com"}]}]}"#;
+        assert_eq!(
+            decode(valid_child).unwrap_err().to_string(),
+            "rule 0: logical mode must be and or or"
+        );
+        let empty = br#"{"version":1,"rules":[{"type":"logical","mode":"invalid","rules":[]}]}"#;
+        assert_eq!(
+            decode(empty).unwrap_err().to_string(),
+            "rule 0: empty/invalid logical rule"
+        );
     }
 
     #[test]
