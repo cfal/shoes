@@ -78,6 +78,14 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    fn any(values: impl Iterator<Item = Self>) -> Self {
+        Self::combine(values, false)
+    }
+
+    fn all(values: impl Iterator<Item = Self>) -> Self {
+        Self::combine(values, true)
+    }
+
     pub fn negate(self) -> Self {
         match self {
             Self::Match => Self::Miss,
@@ -107,7 +115,6 @@ impl Outcome {
 pub struct Dependencies {
     pub hostname: bool,
     pub ip: bool,
-    pub may_resolve: bool,
 }
 
 #[derive(Debug)]
@@ -173,9 +180,8 @@ impl Predicate {
                 hostname: true,
                 ..Dependencies::default()
             },
-            Kind::Ips(_, no_resolve) => Dependencies {
+            Kind::Ips(..) => Dependencies {
                 ip: true,
-                may_resolve: !no_resolve,
                 ..Dependencies::default()
             },
             Kind::Not(p) => p.dependencies,
@@ -190,7 +196,6 @@ impl Predicate {
         values.fold(Dependencies::default(), |a, b| Dependencies {
             hostname: a.hostname || b.hostname,
             ip: a.ip || b.ip,
-            may_resolve: a.may_resolve || b.may_resolve,
         })
     }
 
@@ -212,10 +217,7 @@ impl Predicate {
                     };
                 }
             },
-            Kind::Ports(ports) => {
-                let i = ports.partition_point(|&(start, _)| start <= port);
-                i.checked_sub(1).is_some_and(|i| port <= ports[i].1)
-            }
+            Kind::Ports(ports) => contains_sorted(ports, port),
             Kind::ByPort(cases) => {
                 let unrestricted = cases.first().filter(|(p, _)| *p == 0).map(|(_, p)| p);
                 let selected = cases
@@ -223,22 +225,18 @@ impl Predicate {
                     .ok()
                     .filter(|i| cases[*i].0 != 0)
                     .map(|i| &cases[i].1);
-                return Outcome::combine(
+                return Outcome::any(
                     unrestricted
                         .into_iter()
                         .chain(selected)
                         .map(|p| p.evaluate(name, ip, port)),
-                    false,
                 );
             }
             Kind::Any(children) => {
-                return Outcome::combine(
-                    children.iter().map(|p| p.evaluate(name, ip, port)),
-                    false,
-                );
+                return Outcome::any(children.iter().map(|p| p.evaluate(name, ip, port)));
             }
             Kind::All(children) => {
-                return Outcome::combine(children.iter().map(|p| p.evaluate(name, ip, port)), true);
+                return Outcome::all(children.iter().map(|p| p.evaluate(name, ip, port)));
             }
             Kind::Not(p) => return p.evaluate(name, ip, port).negate(),
         };
@@ -250,9 +248,41 @@ impl Predicate {
     }
 }
 
+fn contains_sorted<T: Ord>(ranges: &[(T, T)], value: T) -> bool {
+    let i = ranges.partition_point(|(start, _)| start <= &value);
+    i.checked_sub(1).is_some_and(|i| value <= ranges[i].1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn range_lookup_handles_boundaries_and_gaps() {
+        let ranges = [(0, 0), (80, 90), (u16::MAX, u16::MAX)];
+        for port in [0, 80, 85, 90, u16::MAX] {
+            assert!(contains_sorted(&ranges, port));
+        }
+        for port in [1, 79, 91, u16::MAX - 1] {
+            assert!(!contains_sorted(&ranges, port));
+        }
+        assert!(!contains_sorted(&[], 0u16));
+    }
+
+    #[test]
+    fn combinations_keep_empty_identities_and_short_circuit() {
+        assert_eq!(Outcome::any(std::iter::empty()), Outcome::Miss);
+        assert_eq!(Outcome::all(std::iter::empty()), Outcome::Match);
+        let unreachable = || panic!("evaluated after a decisive outcome");
+        assert_eq!(
+            Outcome::any(std::iter::once(Outcome::Match).chain(std::iter::once_with(unreachable))),
+            Outcome::Match
+        );
+        assert_eq!(
+            Outcome::all(std::iter::once(Outcome::Miss).chain(std::iter::once_with(unreachable))),
+            Outcome::Miss
+        );
+    }
+
     #[test]
     fn unavailable_truth_table() {
         use Outcome::*;

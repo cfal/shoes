@@ -82,7 +82,7 @@ impl Compiler {
             Expression::Never => Kind::Constant(false),
             p @ (Expression::Domain(_)
             | Expression::DomainSuffix(_)
-            | Expression::Subdomains(_)) => return self.visit_domain(p, depth),
+            | Expression::Subdomains(_)) => return self.visit_child(p, depth),
             Expression::DomainPattern(v) => {
                 self.strings(&v)?;
                 let patterns = v
@@ -99,7 +99,7 @@ impl Compiler {
                 for cidr in v {
                     ranges.add_cidr(&cidr)?;
                 }
-                if ranges.v4.is_empty() && ranges.v6.is_empty() {
+                if ranges.is_empty() {
                     return Ok(Predicate::new(Kind::Constant(false)));
                 }
                 Kind::Ips(ranges.finish(), false)
@@ -109,7 +109,7 @@ impl Compiler {
                     ranges.v4.capacity() * 16 + ranges.v6.capacity() * 64,
                     ranges.v4.len() + ranges.v6.len(),
                 )?;
-                if ranges.v4.is_empty() && ranges.v6.is_empty() {
+                if ranges.is_empty() {
                     return Ok(Predicate::new(Kind::Constant(false)));
                 }
                 Kind::Ips(ranges.finish(), no_resolve)
@@ -170,7 +170,7 @@ impl Compiler {
                 }
                 Kind::All(
                     v.into_iter()
-                        .map(|p| self.visit_domain(p, depth + 1))
+                        .map(|p| self.visit_child(p, depth + 1))
                         .collect::<io::Result<Vec<_>>>()?
                         .into(),
                 )
@@ -182,12 +182,12 @@ impl Compiler {
                 Kind::Any(
                     group_literals(v)
                         .into_iter()
-                        .map(|p| self.visit_domain(p, depth + 1))
+                        .map(|p| self.visit_child(p, depth + 1))
                         .collect::<io::Result<Vec<_>>>()?
                         .into(),
                 )
             }
-            Expression::Not(p) => Kind::Not(self.visit_domain(*p, depth + 1)?),
+            Expression::Not(p) => Kind::Not(self.visit_child(*p, depth + 1)?),
         };
         Ok(Predicate::new(kind))
     }
@@ -256,7 +256,9 @@ impl Compiler {
         Ok(Kind::Regex(matcher))
     }
 
-    fn visit_domain(&mut self, expression: Expression, depth: usize) -> io::Result<Arc<Predicate>> {
+    // Domain leaves share their parent or legacy bucket's node charge. Other
+    // expressions still go through visit and pay their own 128-byte charge.
+    fn visit_child(&mut self, expression: Expression, depth: usize) -> io::Result<Arc<Predicate>> {
         let (v, kind) = match expression {
             Expression::Domain(v) => (v, DomainKind::Exact),
             Expression::DomainSuffix(v) => (v, DomainKind::Suffix),
@@ -294,8 +296,8 @@ impl Compiler {
         let mut cases = Vec::with_capacity(buckets.len());
         for (port, (names, ips, any)) in buckets {
             // Validate every entry even when another alternative is universal.
-            let names = self.visit_domain(Expression::DomainSuffix(names), 0)?;
-            let has_ip = !ips.v4.is_empty() || !ips.v6.is_empty();
+            let names = self.visit_child(Expression::DomainSuffix(names), 0)?;
+            let has_ip = !ips.is_empty();
             let ips = self.visit(Expression::Ranges(ips, false), 0)?;
             let predicate = if any {
                 // Sniff eligibility is observable before matching. Preserve the
@@ -383,7 +385,7 @@ fn group_literals(expressions: Vec<Expression>) -> Vec<Expression> {
         group.append(&mut values);
     }
     for (ranges, no_resolve) in [(resolving_ranges, false), (no_resolve_ranges, true)] {
-        if !ranges.v4.is_empty() || !ranges.v6.is_empty() {
+        if !ranges.is_empty() {
             result.push(Expression::Ranges(ranges, no_resolve));
         }
     }

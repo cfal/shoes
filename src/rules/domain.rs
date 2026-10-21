@@ -63,29 +63,25 @@ impl Names {
         })
     }
 
-    fn contains(&self, name: &str) -> bool {
-        match self {
-            Self::Small(names) => names.iter().any(|s| &**s == name),
-            Self::Indexed(names) => names.contains(name),
-        }
-    }
-
     pub fn matches(&self, name: &str, kind: DomainKind) -> bool {
-        if let Self::Small(names) = self {
-            return names.iter().any(|base| {
-                (kind != DomainKind::Subdomains && &**base == name)
-                    || (kind != DomainKind::Exact
-                        && name.strip_suffix(&**base).is_some_and(|p| p.ends_with('.')))
-            });
-        }
-        if kind != DomainKind::Subdomains && self.contains(name) {
+        let names = match self {
+            Self::Small(names) => {
+                return names.iter().any(|base| {
+                    (kind != DomainKind::Subdomains && &**base == name)
+                        || (kind != DomainKind::Exact
+                            && name.strip_suffix(&**base).is_some_and(|p| p.ends_with('.')))
+                });
+            }
+            Self::Indexed(names) => names,
+        };
+        if kind != DomainKind::Subdomains && names.contains(name) {
             return true;
         }
         if kind == DomainKind::Exact {
             return false;
         }
         name.match_indices('.')
-            .any(|(i, _)| self.contains(&name[i + 1..]))
+            .any(|(i, _)| names.contains(&name[i + 1..]))
     }
 }
 
@@ -135,12 +131,16 @@ mod tests {
         ] {
             assert!(normalize(bad).is_err(), "{bad:?}");
         }
-        for count in [1, 17] {
+        for count in [1, 16, 17] {
             let names = Names::new((0..count).map(|i| format!("{i}.example")).collect()).unwrap();
             assert!(names.matches("a.0.example", DomainKind::Suffix));
             assert!(names.matches("0.example", DomainKind::Suffix));
             assert!(!names.matches("0.example", DomainKind::Subdomains));
             assert!(!names.matches("a0.example", DomainKind::Suffix));
+            assert!(names.matches("0.example", DomainKind::Exact));
+            assert!(!names.matches("a.0.example", DomainKind::Exact));
+            assert!(names.matches("a.b.0.example", DomainKind::Subdomains));
+            assert!(!names.matches("a0.example", DomainKind::Subdomains));
         }
         let regex = regex::Regex::new(&wildcard("*.Example.com").unwrap()).unwrap();
         assert!(regex.is_match("a.example.com"));

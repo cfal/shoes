@@ -1,7 +1,7 @@
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 
-use super::invalid;
+use super::{contains_sorted, invalid};
 use crate::address::{Address, AddressMask};
 
 const MAPPED_START: u128 = 0xffff_0000_0000;
@@ -14,6 +14,10 @@ pub struct IpRanges {
 }
 
 impl IpRanges {
+    pub fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
+    }
+
     pub fn add_v4(&mut self, start: u32, end: u32) -> io::Result<()> {
         if start > end {
             return Err(invalid("reversed IPv4 range"));
@@ -103,16 +107,8 @@ impl IpRanges {
 
     pub fn contains(&self, ip: IpAddr) -> bool {
         match ip.to_canonical() {
-            IpAddr::V4(ip) => {
-                let ip = u32::from(ip);
-                let i = self.v4.partition_point(|&(s, _)| s <= ip);
-                i.checked_sub(1).is_some_and(|i| ip <= self.v4[i].1)
-            }
-            IpAddr::V6(ip) => {
-                let ip = u128::from(ip);
-                let i = self.v6.partition_point(|&(s, _)| s <= ip);
-                i.checked_sub(1).is_some_and(|i| ip <= self.v6[i].1)
-            }
+            IpAddr::V4(ip) => contains_sorted(&self.v4, u32::from(ip)),
+            IpAddr::V6(ip) => contains_sorted(&self.v6, u128::from(ip)),
         }
     }
 
