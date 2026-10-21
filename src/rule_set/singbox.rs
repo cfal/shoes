@@ -248,6 +248,15 @@ mod tests {
     }
 
     #[test]
+    fn malformed_literals_do_not_suggest_native_rule_syntax() {
+        let source = br#"{"version":1,"rules":[{"domain":"a*.example.com"}]}"#;
+        assert_eq!(
+            decode(source).unwrap_err().to_string(),
+            "rule 0: invalid hostname label"
+        );
+    }
+
+    #[test]
     fn logical_children_are_validated_before_mode() {
         let invalid_child =
             br#"{"version":1,"rules":[{"type":"logical","mode":"invalid","rules":[{}]}]}"#;

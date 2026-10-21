@@ -18,9 +18,7 @@ pub fn normalize(name: &str) -> io::Result<Cow<'_, str>> {
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
     }) {
-        return Err(invalid(
-            "invalid hostname label (wildcards require domain_pattern)",
-        ));
+        return Err(invalid("invalid hostname label"));
     }
     Ok(if name.bytes().any(|c| c.is_ascii_uppercase()) {
         Cow::Owned(name.to_ascii_lowercase())
@@ -106,7 +104,12 @@ pub fn wildcard(pattern: &str) -> io::Result<String> {
             result.push_str("[^.]+");
         } else {
             // Normalize only literal labels; '*' is an operator, not a hostname.
-            result.push_str(&regex::escape(&normalize(label)?));
+            let label = normalize(label).map_err(|error| {
+                invalid(format!(
+                    "wildcard labels must be '*' or a literal hostname label: {error}"
+                ))
+            })?;
+            result.push_str(&regex::escape(&label));
         }
     }
     result.push_str(")$");
@@ -116,6 +119,21 @@ pub fn wildcard(pattern: &str) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_labels_have_context_appropriate_diagnostics() {
+        for pattern in ["a*.example.com", "**.x"] {
+            assert_eq!(
+                normalize(pattern).unwrap_err().to_string(),
+                "invalid hostname label"
+            );
+            assert_eq!(
+                wildcard(pattern).unwrap_err().to_string(),
+                "wildcard labels must be '*' or a literal hostname label: invalid hostname label"
+            );
+        }
+    }
+
     #[test]
     fn normalization_and_boundaries() {
         assert_eq!(normalize("ExAmPlE.com.").unwrap(), "example.com");

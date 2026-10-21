@@ -256,3 +256,14 @@ mod tests {
         assert_eq!(p.evaluate(None, None, 80), Outcome::Miss);
     }
 }
+#[test]
+fn malformed_wildcards_describe_the_provider_grammar() {
+    for entry in ["a*.example.com", "**.x", "+.a*.example.com", ".**.x"] {
+        let error = domain_entry(entry).unwrap_err().to_string();
+        assert!(
+            error.contains("wildcard labels must be '*'"),
+            "{entry}: {error}"
+        );
+        assert!(!error.contains("domain_pattern"));
+    }
+}
