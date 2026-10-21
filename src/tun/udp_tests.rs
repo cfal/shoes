@@ -1,4 +1,5 @@
 use super::*;
+use crate::tcp::tcp_client_handler_factory::create_test_selector;
 use etherparse::PacketBuilder;
 use futures::FutureExt;
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
@@ -92,11 +93,7 @@ async fn roundtrips(ipv6: bool, framed: bool) {
         .packet_information(framed);
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let selector = Arc::new(
-        create_tcp_client_proxy_selector(
-            vec![crate::config::RuleConfig::default()],
-            resolver.clone(),
-        )
-        .unwrap(),
+        create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone()).unwrap(),
     );
     let (shutdown, shutdown_rx) = oneshot::channel();
     let mut tasks = JoinSet::new();
@@ -231,11 +228,7 @@ async fn raw_fd_fake_dns_and_restored_application_udp_preserve_sources() {
     let context = Arc::new(FakeDnsContext::new(Default::default(), real.clone()).unwrap());
     let resolver: Arc<dyn Resolver> = Arc::new(FakeDnsResolver::new(real, context));
     let selector = Arc::new(
-        create_tcp_client_proxy_selector(
-            vec![crate::config::RuleConfig::default()],
-            resolver.clone(),
-        )
-        .unwrap(),
+        create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone()).unwrap(),
     );
     let (shutdown, shutdown_rx) = oneshot::channel();
     let mut tasks = JoinSet::new();

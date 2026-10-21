@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-use crate::address::NetLocationMask;
 use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
@@ -27,6 +26,7 @@ const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 /// Result of config validation containing server configs and expanded DNS groups.
 /// DNS resolvers are built at runtime from the expanded groups.
 pub struct ValidatedConfigs {
+    pub rule_files: Vec<std::path::PathBuf>,
     pub global_limits: GlobalLimits,
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
@@ -43,7 +43,11 @@ pub struct ValidatedConfigs {
 /// - Expands DNS groups (composition, client chains) and validates them
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
-pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    let mut compiler = crate::rules::Compiler::default();
+    let rule_files = crate::rule_set::dependencies(&mut all_configs)?;
+    crate::rule_set::load(&mut all_configs, &mut compiler)?;
+    super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
@@ -57,7 +61,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     rule_groups.insert(
         String::from("allow-all-direct"),
         vec![RuleConfig {
-            masks: OneOrSome::One(NetLocationMask::ANY),
+            criteria: Default::default(),
             action: RuleActionConfig::Allow {
                 override_address: None,
                 client_chains: NoneOrSome::One(ClientChain::default()),
@@ -67,7 +71,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     rule_groups.insert(
         String::from("block-all"),
         vec![RuleConfig {
-            masks: OneOrSome::One(NetLocationMask::ANY),
+            criteria: Default::default(),
             action: RuleActionConfig::Block,
         }],
     );
@@ -100,8 +104,11 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
                 }
             }
             Config::RuleConfigGroup(group) => {
+                let super::RuleGroupRules::Policies(rules) = group.rules else {
+                    continue;
+                };
                 if rule_groups
-                    .insert(group.rule_group.clone(), group.rules.into_vec())
+                    .insert(group.rule_group.clone(), rules.into_vec())
                     .is_some()
                 {
                     return Err(std::io::Error::new(
@@ -305,6 +312,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
     let mut validated = ValidatedConfigs {
+        rule_files,
         global_limits,
         configs: result,
         dns_groups: final_dns_groups,
@@ -2054,6 +2062,8 @@ fn validate_rule_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
+    // Only generated defaults remain uncompiled; user predicates compile before expansion.
+    rule_config.compile(&mut crate::rules::Compiler::default())?;
     if let RuleActionConfig::Allow {
         ref mut client_chains,
         ..
@@ -2860,13 +2870,15 @@ mod tests {
         let configs = vec![
             Config::RuleConfigGroup(RuleConfigGroup {
                 rule_group: "test-rules".to_string(),
-                rules: OneOrSome::One(RuleConfig {
-                    masks: OneOrSome::One(NetLocationMask::ANY),
-                    action: RuleActionConfig::Allow {
-                        override_address: None,
-                        client_chains: NoneOrSome::One(ClientChain::default()),
+                rules: crate::config::RuleGroupRules::Policies(Box::new(OneOrSome::One(
+                    RuleConfig {
+                        criteria: Default::default(),
+                        action: RuleActionConfig::Allow {
+                            override_address: None,
+                            client_chains: NoneOrSome::One(ClientChain::default()),
+                        },
                     },
-                }),
+                ))),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-group".to_string(),

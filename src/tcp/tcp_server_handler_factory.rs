@@ -772,10 +772,18 @@ mod tests {
                 .unwrap(),
         );
         for (mask, should_sniff) in [("0.0.0.0/0", false), ("child.example", true)] {
-            let rules = NoneOrSome::One(ConfigSelection::Config(RuleConfig {
-                masks: OneOrSome::One(NetLocationMask::from(mask).unwrap()),
+            let mut rule = RuleConfig {
+                criteria: crate::config::rules::RuleCriteria {
+                    expression: crate::rules::Expression::Legacy(OneOrSome::One(
+                        NetLocationMask::from(mask).unwrap(),
+                    )),
+                    ..Default::default()
+                },
                 ..Default::default()
-            }));
+            };
+            rule.compile(&mut crate::rules::Compiler::default())
+                .unwrap();
+            let rules = NoneOrSome::One(ConfigSelection::Config(rule));
             let child = create_override_selector(rules, &parent, &resolver).unwrap();
             assert!(!Arc::ptr_eq(&child, &parent));
             let IngressTarget::LocalDns {
@@ -808,6 +816,8 @@ mod tests {
             panic!("default rule is not Allow");
         };
         *override_address = Some(NetLocation::from_str("198.18.0.9:53", None).unwrap());
+        rule.compile(&mut crate::rules::Compiler::default())
+            .unwrap();
         let error = create_override_selector(
             NoneOrSome::One(ConfigSelection::Config(rule)),
             &parent,

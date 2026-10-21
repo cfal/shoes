@@ -11,6 +11,18 @@ mod lifecycle;
 mod listeners;
 mod transports;
 
+fn compiled_server(value: Value) -> crate::config::ServerConfig {
+    let mut configs = [crate::config::Config::Server(
+        serde_json::from_value(value).unwrap(),
+    )];
+    crate::config::rule_visit::compile(&mut configs, &mut crate::rules::Compiler::default())
+        .unwrap();
+    let [crate::config::Config::Server(server)] = configs else {
+        unreachable!()
+    };
+    server
+}
+
 pub(super) fn fixtures() -> Value {
     serde_json::from_str(include_str!(
         "../../../tests/fixtures/vless_encryption/vectors.json"

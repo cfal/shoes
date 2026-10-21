@@ -34,7 +34,7 @@
         protocol:
           type: direct
     # Block ad domains
-    - masks: ["*.doubleclick.net", "*.googlesyndication.com"]
+    - masks: { subdomains: ["doubleclick.net", "googlesyndication.com"] }
       action: block
     # Route everything else through upstream
     - masks: "0.0.0.0/0"

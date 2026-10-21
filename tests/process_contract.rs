@@ -26,6 +26,10 @@ mod wireguard_dns;
 mod fake_dns;
 
 #[cfg(unix)]
+#[path = "cases/process_contract/rule_sets.rs"]
+mod rule_sets;
+
+#[cfg(unix)]
 #[tokio::test]
 async fn wireguard_reload_retains_invalid_candidates_rebinds_and_releases_on_exit() {
     wireguard_reload(false).await;

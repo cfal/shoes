@@ -29,6 +29,8 @@ mod reality_client_handler;
 mod resolver;
 mod resources;
 mod routing;
+mod rule_set;
+mod rules;
 mod rustls_config_util;
 mod rustls_connection_util;
 mod shadow_tls;

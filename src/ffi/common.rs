@@ -11,7 +11,7 @@ use log::info;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::config::{Config, convert_cert_paths, create_server_configs, load_config_str};
+use crate::config::{Config, convert_cert_paths, load_config_str};
 use crate::dns::build_dns_registry_for_runtime;
 use crate::tcp::tcp_server::start_servers;
 #[cfg(unix)]
@@ -205,14 +205,17 @@ pub async fn start_from_config(
 ) -> std::io::Result<()> {
     info!("Parsing config for TUN server");
 
-    let configs: Vec<Config> = load_config_str(config_yaml)?;
+    let config_yaml = config_yaml.to_owned();
+    let configs: Vec<Config> = tokio::task::spawn_blocking(move || load_config_str(&config_yaml))
+        .await
+        .map_err(std::io::Error::other)??;
 
     let (configs, pem_count) = convert_cert_paths(configs).await?;
     if pem_count > 0 {
         info!("Loaded {} PEM files", pem_count);
     }
 
-    let mut validated = create_server_configs(configs)?;
+    let mut validated = crate::config::compile_configs(configs).await?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
     let crate::config::ValidatedConfigs {
@@ -330,6 +333,10 @@ pub async fn start_from_config(
 #[cfg(all(test, unix))]
 #[path = "wireguard_tests.rs"]
 mod wireguard_tests;
+
+#[cfg(all(test, unix))]
+#[path = "rule_source_tests.rs"]
+mod rule_source_tests;
 
 #[cfg(all(test, unix))]
 mod tests {

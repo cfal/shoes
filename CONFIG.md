@@ -1080,8 +1080,9 @@ or configure rules for the ECH public names.
 ### Rule Config
 ```yaml
 rules:
-  - masks: string | [string]   # IP/CIDR or hostname masks
-    action: allow | block
+  - masks: Mask | [Mask]      # Strings, typed predicates, file sources, or group references
+    no_resolve: boolean?      # Default false; known IPs still participate
+    action: allow | block     # Default allow
     # For action: allow
     override_address: string?  # Optional address override
     client_chain: ClientChain | [ClientChain]  # Proxy chain(s) for routing
@@ -1122,25 +1123,202 @@ client_chain:
 ### Mask Syntax
 ```yaml
 # IP/CIDR masks
-masks: "0.0.0.0/0"             # All IPv4
-masks: "::/0"                  # All IPv6
+masks: "0.0.0.0/0"             # Any destination, including hostnames and IPv6
+masks: "::/0"                  # Same legacy universal predicate
 masks: "192.168.0.0/16"        # Subnet
 masks: "10.0.0.1:80"           # Specific IP and port
 
 # Hostname masks
-masks: "*.google.com"          # Wildcard subdomain
-masks: "example.com"           # Exact match
+masks: { subdomains: [google.com] } # Descendants, excluding the apex
+masks: "example.com"           # Name and all descendants
 
 # Multiple masks
 masks:
   - "192.168.0.0/16"
   - "10.0.0.0/8"
-  - "*.internal.com"
+  - "internal.com"
 ```
 
 ### Built-in Rule Groups
 - `allow-all-direct` - Allow all connections, direct routing
 - `block-all` - Block all connections
+
+### Typed Destination Predicates
+
+`masks` accepts legacy strings, typed predicates, file sources, and action-free
+group references. A list combines its entries with OR. Predicate objects contain
+one operator: `all`, `any`, `not`, or a leaf. The same forms work recursively inside
+`all`/`any`/`not`; strings always remain legacy masks, never group names or paths.
+Lists inside a typed leaf are alternatives.
+
+Keep mixed legacy masks and imported groups in one OR list: splitting them into
+separate policies can change ordered DNS evaluation.
+
+```yaml
+rules:
+  - masks:
+      all:
+        - domain_suffix: [example.com]
+        - destination_port: [443]
+    action: allow
+  - masks: { any_destination: true }
+    action: block
+```
+
+Leaves: `domain` (exact), `domain_suffix` (apex and descendants), `subdomains`
+(descendants only), `domain_pattern` (`*` matches one label), `domain_keyword`,
+`domain_regex`, `ip_cidr`, `destination_port`, `destination_port_range`
+(inclusive `"8000:9000"`), and `any_destination: true`. Native domain literals
+and keywords are case-insensitive. Regexes are unanchored and case-sensitive
+unless they enable case folding; backreferences, lookaround and non-ASCII
+patterns are unsupported. Typed ports are 1-65535. Empty sets match nothing;
+empty `all`/`any` nodes are rejected.
+
+Policies still use first-match order. Inside one policy, a known OR match or AND
+miss can avoid DNS, regardless of predicate order. An earlier unresolved policy
+cannot be bypassed by a later domain rule. IP predicates use the selected local
+DNS answer, pinning it for direct dialing; lookup failure aborts routing. Direct
+multi-address fallback is disabled after this pinning. Hostname-forwarding proxy
+protocols may still resolve independently at the exit.
+
+`no_resolve: true` on a rule prohibits initiating DNS, but consumes an address
+already supplied/resolved. Without an address, IP predicates remain unknown,
+including under `not`; an undecidable policy falls through even when its action
+is `block`. Domain predicates without a hostname are false, including for
+literal-IP connections without a sniff hint. No reverse DNS is performed.
+
+Migration: legacy `*.x` and `.x` masks are rejected at startup and reload; replace
+them explicitly with `subdomains` or `domain_pattern`. Bare masks still include
+the apex and descendants. Legacy `/0` masks remain universal without DNS, but
+typed `ip_cidr: ["::/0"]` is IPv6-only and requires an IP. Other legacy IPv6 masks
+no longer match IPv4 through numeric overlap; mapped-only legacy masks normalize
+to IPv4 with a warning. Explicit typed mapped IPv6 predicates must use IPv4
+spelling. Invalid supplied hostnames (including non-ASCII, whitespace, empty
+labels and excessive length) are now rejected even with catch-all-only rules;
+use A-label/punycode names. Invalid sniff hints are ignored. Matching strips one
+root dot and lowercases ASCII without changing the dial target.
+
+### Local Rule Sources
+
+Declare an action-free `rule_group` containing file paths, or load a file inline
+under `masks`. Sources are read and compiled during validation, including `--dry-run`,
+before a reload stops existing listeners. Invalid sources reject the candidate.
+Automatic reload watches imported files as well as configs. A parseable rejected
+candidate keeps its source paths watched, so creating or repairing a missing file
+can recover without another config edit. Active sources remain watched until a
+replacement activates. `--no-reload` disables file watches; SIGHUP still reloads.
+Established connections retain their original rules until they drain. New routing
+caches belong to the new configuration; Fake DNS pools are preserved separately.
+
+```yaml
+- rule_group: blocked
+  rules:
+    - lists/domains.srs
+    - path: lists/addresses.json
+      format: singbox_json
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: {rule_group: blocked}
+      action: block
+    - masks: {path: lists/extra.srs}
+      action: block
+    - masks:
+        - "192.168.0.0/16"
+        - "internal.example"
+        - path: lists/direct.txt
+          behavior: domain
+      action: allow
+```
+
+Sources and groups also compose with typed predicates:
+
+```yaml
+rules:
+  - masks:
+      all:
+        - rule_group: blocked
+        - destination_port: [443]
+        - not: {path: lists/exceptions.srs}
+    action: block
+```
+
+File groups OR their sources together. A source is a path string inside a group's
+`rules`, or an object with `path` and optional `format`, `behavior`, `code`, and
+`attributes`. Inline sources under `masks` require the object form; a mask string
+is always an IP/CIDR/hostname. For example, `masks: blocked` matches that hostname,
+not the group above. No filesystem or name-existence heuristic changes this.
+
+Actions and routing options belong to the referencing policy, not the sources.
+Omitting `action` still means `allow`; an action-free group does not imply block.
+Source objects reject action fields and cannot be mixed with predicate operators.
+Sources with the same canonical path and decoding options share one compiled
+set, including across named groups and inline uses. DAT codes and attribute
+names are case-insensitive; attribute order and duplicates do not affect sharing.
+For MRS, omitted and explicitly supplied `behavior` values use separate cache
+entries. Each generation accepts at most 1,024 distinct sources.
+
+Explicit `format` overrides detection. Otherwise SRS and
+Zstd signatures select the SRS and MRS decoders, followed by case-insensitive
+`.srs`, `.mrs`, `.json`, `.yaml`/`.yml`, and `.txt` suffixes. Zstd data must still
+contain a valid MRS payload. Unknown formats require an explicit `format`; DAT
+always requires `geosite_dat` or `geoip_dat`. YAML/text still require `behavior`.
+
+Source paths are relative to the declaring config file, including inline sources
+inside nested predicates and protocol overrides, even when multiple configs are
+combined. FFI string configs require absolute source paths. Existing
+PEM `cert`/`key` paths remain relative to the working directory; absolute paths
+avoid mixing these conventions.
+
+SRS versions 1-5 and sing-box source versions 1-5 support destination domain,
+suffix, keyword, regex, IP, port, inversion and nested logical rules. Unsupported
+fields, tags and versions fail validation, including inside inverted expressions.
+Source address alternatives form an OR; destination ports constrain that OR.
+An empty top-level set matches nothing. Empty individual rules are invalid.
+sing-box literal spelling is preserved: uppercase domain/suffix/keyword entries
+cannot match normalized lowercase queries and produce a warning. Regex patterns
+retain their own case flags; only the bounded ASCII Rust regex subset is accepted.
+
+Files are limited to 64 MiB, inflated payloads to 256 MiB, and compilation has a
+512 MiB conservative allocation budget. Each source is limited to 2 million
+entries. Temporary decode/build charges are released between sources; retained
+indexes count toward the generation budget. These are safety ceilings, not a mobile
+memory guarantee. Runtime regex caches are separate per worker and generation;
+capture tracking is disabled and each lazy-DFA cache is capped at 256 KiB.
+Regex groups accept at most 512 KiB of pattern text, with syntax-proportional
+compilation reserves. Remote URLs and GeoIP `.db` (MMDB) files are not supported;
+use country SRS files from sing-geoip instead.
+
+Mihomo providers use `format: mihomo_yaml` (a `payload` string list),
+`format: mihomo_text` (one entry per line, blank lines and `#`/`//` comments ignored;
+one leading UTF-8 BOM is accepted),
+or `format: mrs`. YAML/text require `behavior: domain`, `ipcidr`, or `classical`.
+MRS supports domain/IP only; an optional configured behavior must match its header.
+MRS accepts one zstd frame with at most an 8 MiB window.
+YAML supports block and flow sequences in one mapping containing only `payload`;
+tags, anchors, aliases and multiple documents are rejected. Parser read-ahead
+between events is limited to 128 KiB, including comments and whitespace.
+
+Domain providers distinguish bare exact names, `+.example.com` (apex and all
+descendants), `.example.com` (descendants only), and `*` as one whole nonempty
+label. Literal labels are case-insensitive. Classical providers accept `DOMAIN`,
+`DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `DOMAIN-REGEX`, `IP-CIDR`, `IP-CIDR6`, and
+`DST-PORT`. Entries are alternatives, not paired independent lists. IP entries
+may end with `,no-resolve`; destination ports accept `80/443/8000-9000`.
+Other operators/options fail validation. Classical keywords and regexes are
+case-insensitive, with inline regex case overrides preserved. Unlike some Mihomo
+classical paths, Shoes normalizes incoming query names to lowercase.
+
+Xray geodata uses explicit `format: geosite_dat` or `format: geoip_dat`, with a
+required case-insensitive `code: CN` category selector. GeoSite optionally accepts
+`attributes: [ads]`: every listed attribute must have a true boolean value on the
+domain. Unlike Xray's key-presence filters, false, integer and key-only attributes
+do not satisfy this filter. Inline `@` selectors and other selection syntax are
+rejected. GeoIP supports `reverse_match` and separate IPv4/IPv6 membership.
+The loader scans protobuf framing without decoding unselected category bodies;
+selected entries reject unknown fields/enums and unsupported regex syntax.
+DAT has no relation to the MMDB `.db` files in sing-geoip releases.
 
 ### Example Rules
 ```yaml
@@ -1153,7 +1331,10 @@ rules:
         type: direct
 
   # Block specific domains
-  - masks: ["*.ads.example.com", "tracking.example.com"]
+  - masks:
+      any:
+        - subdomains: [ads.example.com]
+        - domain_suffix: [tracking.example.com]
     action: block
 
   # Route through upstream proxy
@@ -1189,6 +1370,18 @@ rules:
 ```
 
 ### Rule Group
+
+A group contains either ordered policies or action-free file sources. Member shape
+determines its kind: objects with `masks` are policies, even when `action` is
+omitted; paths and `{path: ...}` objects are sources. Empty groups and mixed kinds
+are rejected. Both kinds share one namespace, including built-in names. `rule` is
+an alias for `rules`; either accepts one item directly or a nonempty list.
+
+Policy groups are referenced from `rules` or `override_rules`, preserving order,
+actions, and routing options. Source groups are referenced only with
+`masks: {rule_group: name}`, with the caller's action. Cross-kind references are
+errors: actions are never discarded or invented. Group nesting is not supported.
+
 ```yaml
 - rule_group: standard-rules
   rules:

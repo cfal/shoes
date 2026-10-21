@@ -1,7 +1,7 @@
 use super::*;
 use crate::http2::client::H2ClientSession;
 use crate::resolver::NativeResolver;
-use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+use crate::tcp::tcp_client_handler_factory::create_test_selector;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -151,11 +151,7 @@ async fn peer(auth: bool, mixed: bool, resolver: Arc<dyn Resolver>, blocked: boo
     let selector = Arc::new(if blocked {
         ClientProxySelector::new(vec![])
     } else {
-        create_tcp_client_proxy_selector(
-            vec![crate::config::RuleConfig::default()],
-            resolver.clone(),
-        )
-        .unwrap()
+        create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone()).unwrap()
     });
     let credentials = auth.then(|| ("user".into(), "pass".into()));
     let handler: Box<dyn TcpServerHandler> = if mixed {
@@ -243,11 +239,7 @@ async fn accepted_tunnel_survives_graceful_shutdown(auth: bool) {
     let (mut client, transport) = tokio::io::duplex(8192);
     let resolver = Arc::new(NativeResolver::new());
     let selector = Arc::new(
-        create_tcp_client_proxy_selector(
-            vec![crate::config::RuleConfig::default()],
-            resolver.clone(),
-        )
-        .unwrap(),
+        create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone()).unwrap(),
     );
     let server = tokio::spawn(serve(
         Box::new(transport),
@@ -395,11 +387,8 @@ async fn final_upload_data_survives_graceful_goaway() {
         let (mut client, transport) = tokio::io::duplex(8192);
         let resolver = Arc::new(NativeResolver::new());
         let selector = Arc::new(
-            create_tcp_client_proxy_selector(
-                vec![crate::config::RuleConfig::default()],
-                resolver.clone(),
-            )
-            .unwrap(),
+            create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone())
+                .unwrap(),
         );
         let server = tokio::spawn(serve(Box::new(transport), None, selector, resolver));
         // Literal HPACK :method CONNECT and :authority, followed by END_HEADERS.
@@ -488,11 +477,7 @@ async fn unread_upload_does_not_exhaust_connection_credit() {
         dropped: Arc::new(tokio::sync::Notify::new()),
     });
     let selector = Arc::new(
-        create_tcp_client_proxy_selector(
-            vec![crate::config::RuleConfig::default()],
-            resolver.clone(),
-        )
-        .unwrap(),
+        create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone()).unwrap(),
     );
     let (client, transport) = tokio::io::duplex(8192);
     let server = tokio::spawn(serve(Box::new(transport), None, selector, resolver.clone()));
@@ -884,7 +869,7 @@ async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
             )
             .unwrap();
             let selector = Arc::new(
-                create_tcp_client_proxy_selector(vec![rule], resolver.clone())
+                create_test_selector(vec![rule], resolver.clone())
                     .unwrap()
                     .with_sniff(true),
             );
@@ -975,7 +960,7 @@ async fn concurrent_streams_keep_independent_http_host_routes() {
             });
         }
         let selector = Arc::new(
-            create_tcp_client_proxy_selector(rules, resolver.clone())
+            create_test_selector(rules, resolver.clone())
                 .unwrap()
                 .with_sniff(true),
         );

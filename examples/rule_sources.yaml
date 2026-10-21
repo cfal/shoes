@@ -1,0 +1,24 @@
+- rule_group: imported
+  rules:
+    - ../tests/fixtures/rule_sets/singbox-v2.srs
+    - path: ../tests/fixtures/rule_sets/mihomo-domain.txt
+      behavior: domain
+
+- rule_group: standard
+  rules:
+    - masks: {rule_group: imported}
+      action: block
+    - masks: ["192.168.0.0/16", "internal.example"]
+      action: allow
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  rules:
+    - standard
+    - masks:
+        all:
+          - path: ../tests/fixtures/rule_sets/mihomo-ip.mrs
+          - destination_port: [443]
+      action: block
+    - masks: "0.0.0.0/0"
+      action: allow
