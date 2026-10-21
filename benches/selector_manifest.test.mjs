@@ -21,6 +21,7 @@ test('manifest records supplied commands and embeds a portable baseline helper',
     fs.writeFileSync(target, content);
   };
   write(baseline, 'src/lib.rs', '// fixture\n');
+  write(baseline, 'src/removed.rs', '// removed in the candidate\n');
   write(baseline, 'src/client_proxy_selector.rs', '// selector\n');
   write(baseline, 'Cargo.lock', '# fixture\n');
   git(baseline, 'init', '-q');
@@ -28,6 +29,7 @@ test('manifest records supplied commands and embeds a portable baseline helper',
   const commit = cwd => git(cwd, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture');
   commit(baseline);
   git(root, 'clone', '-q', baseline, candidate);
+  git(candidate, 'rm', 'src/removed.rs');
   const helper = '// measured helper\n';
   write(candidate, 'benches/selector_measurement.rs', helper);
   for (const file of ['run_selector.sh', 'compare_selector.mjs', 'selector_manifest.mjs']) {
@@ -52,6 +54,7 @@ test('manifest records supplied commands and embeds a portable baseline helper',
   const result = invoke();
   assert.equal(result.status, 0, result.stderr);
   const manifest = JSON.parse(result.stdout);
+  assert.ok(!Object.hasOwn(manifest.candidate.sources, 'src/removed.rs'));
   assert.equal(manifest.baseline.build, commands.baseline_build);
   assert.equal(manifest.candidate.build, commands.candidate_build);
   assert.equal(manifest.profile, commands.profile);

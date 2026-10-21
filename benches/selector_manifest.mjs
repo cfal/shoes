@@ -13,7 +13,7 @@ const run = (cmd, args, cwd = process.cwd()) => execFileSync(cmd, args, { cwd, e
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const file = p => ({ bytes: fs.statSync(p).size, sha256: hash(fs.readFileSync(p)) });
 const base = run('git', ['rev-parse', 'HEAD'], baseline);
-const sources = run('git', ['diff', '--name-only', `${base}..${revision}`]).split('\n')
+const sources = run('git', ['diff', '--name-only', '--diff-filter=d', `${base}..${revision}`]).split('\n')
   .filter(p => /\.(rs|toml|lock|sh|mjs)$/.test(p));
 sources.push('src/lib.rs');
 const artifacts = {};
