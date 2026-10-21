@@ -114,7 +114,7 @@ async fn route_source(path: &std::path::Path, named: bool) {
     }));
     let config = serde_json::to_string(&configs).unwrap();
     let (shutdown, shutdown_rx) = oneshot::channel();
-    let service = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+    let mut service = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         start_from_config(&config, shutdown_rx).await
     }));
     let packet = |destination, port, payload: &[u8]| {
@@ -129,7 +129,10 @@ async fn route_source(path: &std::path::Path, named: bool) {
         .await
         .unwrap();
     let mut bytes = [0; 2048];
-    let (length, peer) = echo.recv_from(&mut bytes).await.unwrap();
+    let (length, peer) = tokio::select! {
+        result = &mut service => panic!("FFI service exited before routing: {result:?}"),
+        result = echo.recv_from(&mut bytes) => result.unwrap(),
+    };
     assert_eq!(&bytes[..length], b"allowed");
     echo.send_to(&bytes[..length], peer).await.unwrap();
     let length = wire.recv(&mut bytes).await.unwrap();
