@@ -1,0 +1,1218 @@
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":1130.4915445321308,"build_ms":0.13808,"count":16,"iterations":5322,"median_ns":484.2632468996618,"mode":"ordinary","policies":1,"ports":"none","resolver_calls":0,"samples":[475.369785794814,476.6512589252161,477.19447576099213,477.6153701615934,477.6490041337843,477.7805336339722,483.1659150695227,484.2632468996618,488.4327320556182,489.2010522360015,528.7200300638857,546.6174370537392,673.6993611424276,856.9180759113116,1130.4915445321308],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.06s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":508.32883165829145,"build_ms":38.59092699999999,"count":100000,"iterations":9552,"median_ns":500.43624371859295,"mode":"ordinary","policies":1,"ports":"none","resolver_calls":0,"samples":[497.51434254606363,498.80098408710217,499.4690117252931,499.5735971524288,499.89918341708545,500.0144472361809,500.2268634840871,500.43624371859295,501.68205611390283,501.87259212730316,502.9948701842546,504.04815745393637,504.68142797319933,505.9303810720268,508.32883165829145],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":460.17018057096743,"build_ms":0.09018,"count":16,"iterations":9913,"median_ns":455.7698981135882,"mode":"ordinary","policies":1,"ports":"fixed","resolver_calls":0,"samples":[452.54988399071925,454.15898315343486,454.50691011802684,454.62806415817613,455.0810047412489,455.4642388782407,455.6014324624231,455.7698981135882,456.6456168667406,456.90083728437406,457.177141127812,457.34157167356,457.6725511954,457.9226268536265,460.17018057096743],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":500.09307921840406,"build_ms":53.730869,"count":100000,"iterations":10389,"median_ns":481.1634421022235,"mode":"ordinary","policies":1,"ports":"fixed","resolver_calls":0,"samples":[478.4365193955145,479.79083646164213,480.1546828376167,480.8141303301569,480.9102897295216,481.04697275964963,481.12012705746463,481.1634421022235,481.8853595148715,482.8546539609202,486.0224275676196,488.102512272596,493.16459717008377,495.00789296371164,500.09307921840406],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":489.7871142618849,"build_ms":0.08059,"count":16,"iterations":9592,"median_ns":468.84872810675563,"mode":"ordinary","policies":1,"ports":"mixed","resolver_calls":0,"samples":[463.4265012510425,464.76094662218514,466.84184737281066,467.4726855713094,467.8134904086739,468.1616972477064,468.2608423686405,468.84872810675563,469.37833611342785,469.8985613010842,470.03732276897415,470.6023769808173,476.5364887406172,477.351647206005,489.7871142618849],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":546.6146657871592,"build_ms":53.856289000000004,"count":100000,"iterations":9096,"median_ns":533.1933817062445,"mode":"ordinary","policies":1,"ports":"mixed","resolver_calls":0,"samples":[530.1722735268249,531.1287379067722,531.8565303430079,532.5437554969217,532.7393359718558,532.9735048372911,532.9989006156552,533.1933817062445,533.3308047493404,533.5034080914688,534.0333113456464,534.1465479331574,535.3613676341249,539.48845646438,546.6146657871592],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":1526.0684531369063,"build_ms":552.8132770000001,"count":1000000,"iterations":7874,"median_ns":876.0180340360681,"mode":"ordinary","policies":1,"ports":"none","resolver_calls":0,"samples":[782.5180340360681,808.6761493522987,809.0495300990602,809.7886715773432,820.8669037338075,841.0370840741681,845.6827533655068,876.0180340360681,910.266192532385,963.6583693167387,967.0478790957582,974.751714503429,1456.3124206248413,1480.1807213614427,1526.0684531369063],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 1.01s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":651.343969653018,"build_ms":6.030497,"count":12800,"iterations":8963,"median_ns":592.8603146267991,"mode":"ordinary","policies":128,"ports":"none","resolver_calls":0,"samples":[561.3630480865781,562.397300011157,563.5844025437912,564.1522927591209,565.2334039941984,565.2357469597233,568.146491130202,592.8603146267991,593.8566328238313,598.084012049537,599.8780542229165,602.8156867120384,603.5308490460783,614.8439138681246,651.343969653018],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.10s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":10384.20654396728,"build_ms":7.629016,"count":12800,"iterations":489,"median_ns":9780.075664621678,"mode":"ordinary","policies":128,"ports":"mixed","resolver_calls":0,"samples":[8797.233128834356,9072.243353783231,9121.693251533743,9215.496932515338,9308.584867075664,9324.840490797545,9665.924335378322,9780.075664621678,9836.680981595093,9846.006134969326,9914.226993865032,9921.118609406953,9985.98773006135,10114.738241308793,10384.20654396728],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":17772.88552188552,"build_ms":5.380887,"count":12800,"iterations":297,"median_ns":17583.289562289563,"mode":"ordinary","policies":128,"ports":"none","resolver_calls":0,"samples":[16749.68686868687,16852.48148148148,16951.303030303032,16958.878787878788,17179.68686868687,17337.599326599327,17515.680134680133,17583.289562289563,17626.151515151516,17664.670033670034,17667.026936026938,17682.07744107744,17712.14478114478,17713.117845117846,17772.88552188552],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.16s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":22664.023391812865,"build_ms":7.603386,"count":12800,"iterations":171,"median_ns":21477.64912280702,"mode":"ordinary","policies":128,"ports":"mixed","resolver_calls":0,"samples":[18410.748538011696,18505.83625730994,18570.573099415204,18663.85380116959,19045.36842105263,20778.643274853803,21247.175438596492,21477.64912280702,21538.116959064326,21695.13450292398,22060.573099415204,22264.081871345028,22461.502923976608,22502.85380116959,22664.023391812865],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":12706.50408719346,"build_ms":6.532166,"count":12800,"iterations":367,"median_ns":10669.66757493188,"mode":"ordinary","policies":128,"ports":"none","resolver_calls":0,"samples":[10060.811989100817,10098.1689373297,10183.891008174387,10247.133514986375,10259.66485013624,10571.629427792916,10630.811989100817,10669.66757493188,10671.844686648501,11170.403269754768,11675.468664850136,11972.310626702998,12259.392370572206,12371.41144414169,12706.50408719346],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":12530.47461928934,"build_ms":7.697686,"count":12800,"iterations":394,"median_ns":11673.190355329949,"mode":"ordinary","policies":128,"ports":"mixed","resolver_calls":0,"samples":[11499.918781725888,11532.68274111675,11541.210659898477,11552.177664974619,11592.657360406092,11615.096446700507,11652.380710659898,11673.190355329949,11692.327411167513,11796.543147208122,11870.72842639594,12177.96192893401,12232.428934010153,12329.383248730965,12530.47461928934],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":561.8968908629441,"build_ms":36.044429,"count":102400,"iterations":6304,"median_ns":550.1535532994924,"mode":"ordinary","policies":1024,"ports":"none","resolver_calls":0,"samples":[540.0488578680203,543.5672588832488,543.614847715736,545.7182741116751,545.9609771573604,546.7414340101523,548.061230964467,550.1535532994924,551.1132614213197,552.253807106599,554.3302664974619,555.6944796954315,556.4162436548223,558.6100888324873,561.8968908629441],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.10s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":113753.40384615384,"build_ms":60.309125,"count":102400,"iterations":52,"median_ns":90140.32692307692,"mode":"ordinary","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[65714.19230769231,68038.98076923077,72384.19230769231,75935.51923076922,79895.15384615384,88871.88461538461,88903.61538461539,90140.32692307692,93709.55769230769,95588.98076923077,99779.75,100624.15384615384,105560.32692307692,110860.32692307692,113753.40384615384],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.52s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":151421.0285714286,"build_ms":37.878818,"count":102400,"iterations":35,"median_ns":142045.91428571427,"mode":"ordinary","policies":1024,"ports":"none","resolver_calls":0,"samples":[130276.2,130352.4857142857,131093.94285714286,136809.65714285715,137205.34285714285,138822.2,139927.94285714286,142045.91428571427,142159.05714285714,142833.05714285714,144120.77142857143,145513.91428571427,146827.34285714285,147123.34285714285,151421.0285714286],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.75s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":196951.8076923077,"build_ms":54.705218,"count":102400,"iterations":26,"median_ns":187265.26923076922,"mode":"ordinary","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[184666.07692307694,186114.5,186286.42307692306,186378.34615384616,186447.96153846153,186459.53846153847,187026.8076923077,187265.26923076922,187376.8076923077,187857.1923076923,188916.42307692306,189326.42307692306,189596.42307692306,190707.96153846153,196951.8076923077],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.87s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":92769.4,"build_ms":36.443989,"count":102400,"iterations":55,"median_ns":90605.21818181819,"mode":"ordinary","policies":1024,"ports":"none","resolver_calls":0,"samples":[84209.4,85336.67272727273,89967.03636363636,89999.21818181819,90017.4,90130.67272727273,90232.85454545454,90605.21818181819,90816.14545454546,91046.4909090909,91197.94545454545,91770.67272727273,91938.85454545454,91968.12727272727,92769.4],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.50s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":99168.98076923077,"build_ms":57.750457,"count":102400,"iterations":52,"median_ns":91907.25,"mode":"ordinary","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[91272.26923076923,91308.23076923077,91437.63461538461,91595.90384615384,91622.05769230769,91695.51923076923,91734.75,91907.25,91926.67307692308,92190.32692307692,92415.92307692308,92578.98076923077,93344.17307692308,97593.59615384616,99168.98076923077],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.66s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":496.8735089676478,"build_ms":0.0697,"count":16,"iterations":11653,"median_ns":457.866386338282,"mode":"sniff","policies":1,"ports":"none","resolver_calls":0,"samples":[424.0287479618982,425.4515575388312,430.613318458766,430.7763666008753,431.14451214279586,431.1651076975886,436.4573071312108,457.866386338282,461.5486999056037,481.39165880030896,483.6493606796533,483.86655796790524,491.9494550759461,496.61512056981036,496.8735089676478],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.09s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":527.0141345978479,"build_ms":37.015158,"count":100000,"iterations":10966,"median_ns":450.87880722232353,"mode":"sniff","policies":1,"ports":"none","resolver_calls":0,"samples":[449.13067663687764,449.22195878168884,449.228250957505,449.2592558818165,449.41154477475834,449.94683567390115,450.7556994346161,450.87880722232353,451.7916286704359,453.0847163961335,455.45476928688674,455.55234360751416,523.4084442823272,527.0058362210468,527.0141345978479],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":427.92044831099616,"build_ms":0.06146,"count":16,"iterations":12759,"median_ns":410.216082765107,"mode":"sniff","policies":1,"ports":"fixed","resolver_calls":0,"samples":[407.293439924759,407.9141782271338,407.96747393996395,408.12500979700604,409.2136531076103,409.8743631946077,409.8939572066776,410.216082765107,410.39948271808134,410.7724743318442,410.836037306999,411.7593071557332,412.19272670271965,415.6075711262638,427.92044831099616],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.09s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":441.1573420698925,"build_ms":60.360515,"count":100000,"iterations":11904,"median_ns":426.27158938172045,"mode":"sniff","policies":1,"ports":"fixed","resolver_calls":0,"samples":[425.3046875,425.36517137096774,425.49033938172045,425.6785114247312,426.12962029569894,426.1867439516129,426.2043850806452,426.27158938172045,426.32115255376345,426.4765625,426.69077620967744,426.966313844086,427.71816196236557,427.7332829301075,441.1573420698925],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":418.599983473806,"build_ms":0.08891,"count":16,"iterations":12102,"median_ns":417.3497768963808,"mode":"sniff","policies":1,"ports":"mixed","resolver_calls":0,"samples":[413.8139976863328,414.97909436456786,415.0972566517931,415.42364898363905,416.3218476284912,416.9919847959015,417.1531151875723,417.3497768963808,417.4489340604859,417.5712278962155,417.9340604858701,418.0025615600727,418.2372335151215,418.5603206081639,418.599983473806],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":565.1775691699605,"build_ms":55.954598000000004,"count":100000,"iterations":10120,"median_ns":485.8327075098814,"mode":"sniff","policies":1,"ports":"mixed","resolver_calls":0,"samples":[483.5491106719368,483.6518774703557,483.89100790513834,483.94446640316204,484.8475296442688,485.21116600790515,485.4928853754941,485.8327075098814,486.1666996047431,486.2556324110672,486.39001976284584,487.62717391304346,488.225,528.5677865612648,565.1775691699605],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":500.7121771217712,"build_ms":523.826954,"count":1000000,"iterations":9756,"median_ns":498.31457564575646,"mode":"sniff","policies":1,"ports":"none","resolver_calls":0,"samples":[496.1241287412874,496.6909594095941,496.8211357113571,497.12248872488726,497.2752152521525,497.7262197621976,497.98144731447314,498.31457564575646,498.3381508815088,498.7686551865519,498.87320623206233,499.0546330463305,499.4534645346453,500.1739442394424,500.7121771217712],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.80s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":494.76916170108564,"build_ms":4.497947000000001,"count":12800,"iterations":12251,"median_ns":484.82540200799934,"mode":"sniff","policies":128,"ports":"none","resolver_calls":0,"samples":[406.52248796016653,408.35744020896254,465.0189372296139,473.57987103093626,473.609174761244,480.1825973389927,482.8803362990776,484.82540200799934,487.3093625010203,487.8072810382826,490.97102277365116,492.0770549342911,493.4916333360542,494.53399722471636,494.76916170108564],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.10s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8526.054187192118,"build_ms":6.0418959999999995,"count":12800,"iterations":609,"median_ns":7947.714285714285,"mode":"sniff","policies":128,"ports":"mixed","resolver_calls":0,"samples":[7312.031198686371,7493.311986863711,7622.6551724137935,7742.261083743842,7771.571428571428,7773.11658456486,7906.152709359606,7947.714285714285,7956.169129720854,7982.934318555008,8021.850574712644,8057.663382594417,8158.4515599343185,8336.513957307061,8526.054187192118],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":17409.989932885906,"build_ms":3.794698,"count":12800,"iterations":298,"median_ns":15881.570469798658,"mode":"sniff","policies":128,"ports":"none","resolver_calls":0,"samples":[14437.845637583892,14456.869127516778,14538.51677852349,14754.117449664429,15215.694630872484,15700.057046979866,15796.76845637584,15881.570469798658,16056.063758389262,16578.177852348992,16866.96979865772,16904.28523489933,17048.177852348992,17057.305369127516,17409.989932885906],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":17907.708860759492,"build_ms":6.165306,"count":12800,"iterations":316,"median_ns":15477.680379746835,"mode":"sniff","policies":128,"ports":"mixed","resolver_calls":0,"samples":[15352.113924050633,15366.731012658227,15423.471518987342,15425.275316455696,15434.29746835443,15444.48417721519,15458.253164556962,15477.680379746835,15489.35759493671,15509.64240506329,15537.870253164558,15860.148734177215,16108.946202531646,17721.731012658227,17907.708860759492],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9698.151631477927,"build_ms":3.822047,"count":12800,"iterations":521,"median_ns":8512.758157389635,"mode":"sniff","policies":128,"ports":"none","resolver_calls":0,"samples":[8446.618042226488,8464.946257197696,8481.011516314778,8487.614203454894,8492.452975047985,8495.618042226488,8507.328214971209,8512.758157389635,8518.573896353168,8520.013435700575,8525.485604606525,8526.27255278311,8567.097888675624,8605.752399232246,9698.151631477927],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9849.594285714285,"build_ms":6.238857,"count":12800,"iterations":525,"median_ns":9688.965714285714,"mode":"sniff","policies":128,"ports":"mixed","resolver_calls":0,"samples":[9658.984761904761,9668.394285714287,9673.746666666666,9673.784761904762,9680.470476190476,9686.565714285714,9686.813333333334,9688.965714285714,9707.346666666666,9711.594285714285,9711.670476190477,9730.908571428572,9737.251428571428,9741.099047619047,9849.594285714285],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":412.918818884685,"build_ms":30.026983,"count":102400,"iterations":12158,"median_ns":410.32464221089,"mode":"sniff","policies":1024,"ports":"none","resolver_calls":0,"samples":[405.6084882381971,406.06160552722486,406.72618851784836,407.3833689751604,407.57912485606187,409.353265339694,409.48404342819543,410.32464221089,410.45048527718376,411.3609968744859,411.4169271261721,411.7541536436914,411.7664911992104,412.2238855074848,412.918818884685],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":78843.92647058824,"build_ms":48.418082,"count":102400,"iterations":68,"median_ns":68345.69117647059,"mode":"sniff","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[50496.73529411765,56550.41176470588,61737.470588235294,61908.19117647059,63658.794117647056,67896.86764705883,68322.01470588235,68345.69117647059,68887.30882352941,72775.69117647059,72840.25,74149.2205882353,76624.07352941176,76916.13235294117,78843.92647058824],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.42s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":128070.69230769231,"build_ms":30.457402000000002,"count":102400,"iterations":39,"median_ns":126043.51282051283,"mode":"sniff","policies":1024,"ports":"none","resolver_calls":0,"samples":[124973.79487179487,124975.05128205128,125119.15384615384,125271.23076923077,125659.66666666667,125886.07692307692,126027.8717948718,126043.51282051283,126257.8717948718,126323.0,126562.23076923077,126750.17948717948,126800.43589743589,127163.76923076923,128070.69230769231],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.63s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":153554.61764705883,"build_ms":48.559252,"count":102400,"iterations":34,"median_ns":142859.35294117648,"mode":"sniff","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[141527.29411764705,141694.91176470587,142180.20588235295,142542.85294117648,142577.85294117648,142610.79411764705,142613.73529411765,142859.35294117648,143069.0294117647,143434.0294117647,143678.14705882352,143753.73529411765,144281.67647058822,144410.5,153554.61764705883],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.73s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":81905.16417910448,"build_ms":30.872182000000002,"count":102400,"iterations":67,"median_ns":72857.11940298507,"mode":"sniff","policies":1024,"ports":"none","resolver_calls":0,"samples":[72087.13432835821,72228.31343283581,72333.3880597015,72626.97014925373,72674.88059701493,72708.02985074627,72797.11940298507,72857.11940298507,73022.34328358209,73039.20895522388,73045.32835820895,73089.65671641791,73142.05970149254,73682.79104477612,81905.16417910448],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.42s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":94165.41509433962,"build_ms":48.195941999999995,"count":102400,"iterations":53,"median_ns":92609.94339622642,"mode":"sniff","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[91279.37735849057,91500.1320754717,91897.67924528301,91969.18867924529,92278.24528301887,92359.58490566038,92441.83018867925,92609.94339622642,92838.45283018867,92985.03773584905,93164.6603773585,93872.58490566038,93995.60377358491,94034.6603773585,94165.41509433962],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.51s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":581.3706797235022,"build_ms":0.08145999999999999,"count":16,"iterations":6944,"median_ns":572.8423099078341,"mode":"dns","policies":1,"ports":"none","resolver_calls":104160,"samples":[563.8822004608295,567.6696428571429,569.4292914746544,570.7932027649769,570.9514688940092,571.2612327188941,572.5285138248848,572.8423099078341,574.6900921658987,575.6908122119817,576.1676267281106,576.4556451612904,580.03125,580.5685483870968,581.3706797235022],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.07s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":607.6265443425076,"build_ms":35.345279,"count":100000,"iterations":8175,"median_ns":600.2699694189603,"mode":"dns","policies":1,"ports":"none","resolver_calls":122625,"samples":[596.3494801223242,597.0662996941896,597.3305198776759,597.7416513761468,598.3837308868501,598.9011620795108,599.0638532110091,600.2699694189603,600.3849541284403,600.4901529051988,601.9874006116208,602.542752293578,602.6332721712538,604.1110703363914,607.6265443425076],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":556.9532876064333,"build_ms":0.08679,"count":16,"iterations":8456,"median_ns":549.3716887417219,"mode":"dns","policies":1,"ports":"fixed","resolver_calls":126840,"samples":[544.9570719016083,546.0298013245033,546.2460974456008,546.9130794701987,547.4063386944182,547.6841296121097,548.3676679280984,549.3716887417219,549.4189924314096,549.4580179754021,549.990302743614,550.5176206244087,551.981669820246,552.0894039735099,556.9532876064333],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":576.4153486299844,"build_ms":54.236078,"count":100000,"iterations":8978,"median_ns":568.8323680106928,"mode":"dns","policies":1,"ports":"fixed","resolver_calls":134670,"samples":[565.25139229227,565.870683893963,565.9753842726665,567.118177767877,568.148474047672,568.4369570060147,568.7755624860771,568.8323680106928,569.1865671641791,569.1965916685231,569.3647805747382,569.8927378035197,570.027511695255,572.2963911784361,576.4153486299844],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":571.0282624723519,"build_ms":0.09014,"count":16,"iterations":8138,"median_ns":565.378102727943,"mode":"dns","policies":1,"ports":"mixed","resolver_calls":122070,"samples":[560.4679282378963,561.4361022364217,563.5030720078644,564.5363725731138,564.8386581469648,565.2123371835831,565.315556647825,565.378102727943,565.419882034898,565.596829687884,565.6238633570902,565.8303022855739,566.2222904890637,570.8561071516343,571.0282624723519],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":641.8616725618999,"build_ms":54.375529,"count":100000,"iterations":7916,"median_ns":632.6373168266801,"mode":"dns","policies":1,"ports":"mixed","resolver_calls":118740,"samples":[627.0233703890854,629.3743052046489,629.9693026781202,630.627463365336,630.9369631126832,631.2314300151592,632.6134411318848,632.6373168266801,632.9847145022738,633.0680899444163,633.2184183931279,633.6744567963618,634.4981051035877,636.694921677615,641.8616725618999],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":654.5314339218834,"build_ms":477.376362,"count":1000000,"iterations":7476,"median_ns":647.9396736222579,"mode":"dns","policies":1,"ports":"none","resolver_calls":112140,"samples":[644.2277956126271,644.2291332263243,644.9501070090957,645.8864365971108,646.6516853932584,647.2146869983949,647.3778758694489,647.9396736222579,648.9856875334403,649.1181112894596,649.3135366506153,649.4511771000535,649.7281968967362,649.780230069556,654.5314339218834],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.75s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":608.3422591566635,"build_ms":3.6340280000000003,"count":12800,"iterations":6498,"median_ns":558.0098491843644,"mode":"dns","policies":128,"ports":"none","resolver_calls":97470,"samples":[547.8713450292398,555.11972914743,555.147429978455,555.2074484456756,555.8753462603878,556.6092643890428,557.7036011080332,558.0098491843644,558.6823638042474,559.1040320098492,559.134810710988,559.2748538011696,560.2120652508464,560.4396737457679,608.3422591566635],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.07s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8071.691525423729,"build_ms":5.957147,"count":12800,"iterations":590,"median_ns":7622.708474576271,"mode":"dns","policies":128,"ports":"mixed","resolver_calls":8850,"samples":[7393.435593220339,7438.401694915255,7439.471186440678,7441.284745762712,7515.350847457627,7528.842372881356,7533.028813559322,7622.708474576271,7626.9610169491525,7753.181355932204,7761.571186440678,7941.166101694916,7956.232203389831,7958.757627118644,8071.691525423729],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":14476.955752212389,"build_ms":3.663248,"count":12800,"iterations":339,"median_ns":14411.938053097345,"mode":"dns","policies":128,"ports":"none","resolver_calls":5085,"samples":[14356.333333333334,14358.840707964602,14364.41592920354,14378.2802359882,14386.77581120944,14403.206489675516,14407.752212389381,14411.938053097345,14413.08849557522,14418.929203539823,14433.029498525073,14446.53982300885,14454.17994100295,14463.825958702066,14476.955752212389],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":15490.492163009405,"build_ms":5.891077,"count":12800,"iterations":319,"median_ns":15418.579937304075,"mode":"dns","policies":128,"ports":"mixed","resolver_calls":4785,"samples":[15367.705329153605,15381.119122257054,15382.153605015674,15391.275862068966,15396.82445141066,15402.153605015674,15409.551724137931,15418.579937304075,15420.210031347962,15421.746081504702,15423.12539184953,15429.836990595611,15436.103448275862,15451.871473354233,15490.492163009405],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9601.924496644295,"build_ms":3.6152979999999997,"count":12800,"iterations":596,"median_ns":8435.330536912752,"mode":"dns","policies":128,"ports":"none","resolver_calls":8940,"samples":[8414.726510067114,8418.719798657718,8423.937919463087,8428.385906040268,8429.676174496644,8432.864093959732,8433.082214765102,8435.330536912752,8437.142617449665,8438.18288590604,8445.095637583892,8481.857382550335,9212.008389261746,9387.895973154362,9601.924496644295],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9929.290456431536,"build_ms":5.974425999999999,"count":12800,"iterations":482,"median_ns":9759.744813278008,"mode":"dns","policies":128,"ports":"mixed","resolver_calls":7230,"samples":[9705.616182572614,9730.844398340249,9735.346473029045,9745.782157676349,9753.354771784232,9755.885892116183,9758.29460580913,9759.744813278008,9765.719917012448,9771.217842323651,9775.491701244813,9810.636929460581,9813.354771784232,9820.556016597511,9929.290456431536],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":565.6839481555334,"build_ms":29.694023,"count":102400,"iterations":8024,"median_ns":562.0547108673978,"mode":"dns","policies":1024,"ports":"none","resolver_calls":120360,"samples":[558.4181206380857,558.4506480558325,560.2613409770688,561.6608923230309,561.6820787637089,561.854187437687,561.904037886341,562.0547108673978,562.087113659023,562.2827766699901,562.5893569292124,564.2032652043869,564.571036889332,565.2613409770688,565.6839481555334],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":82734.10769230769,"build_ms":46.907332000000004,"count":102400,"iterations":65,"median_ns":67042.27692307692,"mode":"dns","policies":1024,"ports":"mixed","resolver_calls":975,"samples":[59110.123076923075,59138.876923076925,59971.49230769231,62416.1076923077,64691.8,65627.2,65897.2,67042.27692307692,71356.43076923076,75573.8,77379.81538461539,78430.56923076924,79068.41538461538,80612.7076923077,82734.10769230769],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.41s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":123393.175,"build_ms":29.941622000000002,"count":102400,"iterations":40,"median_ns":121764.425,"mode":"dns","policies":1024,"ports":"none","resolver_calls":600,"samples":[120949.425,121040.425,121280.2,121529.175,121550.95,121623.925,121671.425,121764.425,122003.675,122059.925,122333.425,122702.425,122904.925,123244.675,123393.175],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.62s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":144834.45454545456,"build_ms":47.468502,"count":102400,"iterations":33,"median_ns":143741.12121212122,"mode":"dns","policies":1024,"ports":"mixed","resolver_calls":495,"samples":[141671.42424242425,141689.60606060605,142701.75757575757,142967.78787878787,142978.42424242425,143249.0,143497.51515151514,143741.12121212122,143744.15151515152,143785.66666666666,143991.12121212122,144159.60606060605,144332.9393939394,144612.33333333334,144834.45454545456],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.73s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":75327.49275362318,"build_ms":29.623052,"count":102400,"iterations":69,"median_ns":72333.0,"mode":"dns","policies":1024,"ports":"none","resolver_calls":1035,"samples":[71956.47826086957,72023.86956521739,72157.0579710145,72235.31884057971,72261.55072463768,72269.53623188406,72317.63768115942,72333.0,72423.57971014493,72432.85507246378,72440.10144927536,72444.01449275362,72464.73913043478,72687.63768115942,75327.49275362318],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.42s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":96101.07547169812,"build_ms":47.287343,"count":102400,"iterations":53,"median_ns":92022.01886792453,"mode":"dns","policies":1024,"ports":"mixed","resolver_calls":795,"samples":[91097.88679245283,91513.52830188679,91579.75471698113,91618.62264150943,91758.43396226416,91894.09433962264,91973.3396226415,92022.01886792453,92142.2075471698,92198.62264150943,92277.32075471699,92431.07547169812,92624.09433962264,93120.1320754717,96101.07547169812],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.51s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":155.6087751371115,"build_ms":0.0693,"count":16,"iterations":14222,"median_ns":155.05751652369568,"mode":"floor","policies":1,"ports":"none","resolver_calls":0,"samples":[154.05203206300098,154.09077485585712,154.41281113767403,154.6827450428913,154.68703417240894,154.68844044438194,154.8614118970609,155.05751652369568,155.08641541274082,155.1546196034313,155.26571508929828,155.40704542258473,155.5005625087892,155.53494585852903,155.6087751371115],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.04s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":578.2753279059249,"build_ms":0.059959,"count":16,"iterations":8844,"median_ns":575.070895522388,"mode":"dns","policies":1,"ports":"none","resolver_calls":132660,"samples":[572.4295567616463,573.1735639981908,574.1041383989145,574.6287878787879,574.8458842152872,574.9216417910447,575.0279285391225,575.070895522388,575.2665083672547,575.4892582541836,576.1948213478064,576.7861827227499,576.8936001809136,577.4600859339665,578.2753279059249],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.09s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":610.8335789732253,"build_ms":36.798588,"count":100000,"iterations":8142,"median_ns":605.5461802996807,"mode":"dns","policies":1,"ports":"none","resolver_calls":122130,"samples":[602.3909358879882,602.4032178825842,602.6427167772047,603.2224269221322,603.5515843773029,605.0057725374601,605.1802996806681,605.5461802996807,605.5953082780644,605.6088184721199,605.7083026283468,607.6968803733727,609.9775239498895,610.1273642839598,610.8335789732253],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":558.9632648096339,"build_ms":0.09827000000000001,"count":16,"iterations":8221,"median_ns":552.7950371001094,"mode":"dns","policies":1,"ports":"fixed","resolver_calls":123315,"samples":[548.3502007055102,549.3489843084783,550.4034788955115,551.2148157158497,551.7671816080768,552.2232088553704,552.432550784576,552.7950371001094,553.1634837610997,553.5709767668167,553.6234034788955,554.7411507115922,554.913879090135,556.0220167862791,558.9632648096339],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":576.981091966883,"build_ms":54.608777999999994,"count":100000,"iterations":8938,"median_ns":572.8638397851869,"mode":"dns","policies":1,"ports":"fixed","resolver_calls":134070,"samples":[571.1162452450212,571.56153501902,571.5928619377937,571.8838666368315,572.0504587155963,572.1847169389125,572.4420452002685,572.8638397851869,573.1771089729245,573.7040724994406,573.7074289550235,573.8562318191989,574.4559185500112,575.4539046766614,576.981091966883],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":580.0697493180933,"build_ms":0.08632,"count":16,"iterations":7699,"median_ns":567.892843226393,"mode":"dns","policies":1,"ports":"mixed","resolver_calls":115485,"samples":[561.5374723990128,565.6095596830758,566.4186257955579,566.7576308611508,566.8629692167814,567.5111053383556,567.8577737368489,567.892843226393,568.0436420314327,568.28769970126,568.2941940511755,568.4346018963502,569.3399142745811,569.7698402389921,580.0697493180933],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.07s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":650.2616570327554,"build_ms":54.837668,"count":100000,"iterations":7785,"median_ns":638.7125240847785,"mode":"dns","policies":1,"ports":"mixed","resolver_calls":116775,"samples":[636.0922286448298,636.6251766217084,637.3933204881182,637.5988439306359,638.006037251124,638.5044315992293,638.5815028901734,638.7125240847785,639.4074502247913,639.6155427103404,639.7761078998074,640.2488118175979,640.4684649967887,642.3168914579319,650.2616570327554],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":697.1224983210208,"build_ms":492.35911300000004,"count":1000000,"iterations":7445,"median_ns":655.5429147078577,"mode":"dns","policies":1,"ports":"none","resolver_calls":111675,"samples":[653.6261920752182,653.9002014775017,654.5825386165211,654.8928139691068,655.0351914036266,655.0445936870383,655.3387508394895,655.5429147078577,655.6114170584285,658.9102753525856,659.1507051712558,660.3637340496978,681.4717259905977,687.6597716588315,697.1224983210208],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.77s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":597.1802932405567,"build_ms":3.7907879999999996,"count":12800,"iterations":8048,"median_ns":570.3886679920477,"mode":"dns","policies":128,"ports":"none","resolver_calls":120720,"samples":[568.3756212723658,568.6489811133201,569.6144383697813,569.7809393638171,570.1213966202783,570.2147117296223,570.2681411530815,570.3886679920477,571.576416500994,571.6223906560637,573.6738320079523,575.3723906560637,578.8317594433399,589.9983846918489,597.1802932405567],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8131.0,"build_ms":6.120146,"count":12800,"iterations":598,"median_ns":7728.842809364549,"mode":"dns","policies":128,"ports":"mixed","resolver_calls":8970,"samples":[7512.219063545151,7522.436454849499,7541.984949832776,7584.59364548495,7594.961538461538,7657.63712374582,7698.005016722408,7728.842809364549,7781.667224080267,7818.607023411371,7878.272575250836,7939.911371237458,8028.608695652174,8088.274247491639,8131.0],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":14723.441520467837,"build_ms":3.673737,"count":12800,"iterations":342,"median_ns":14588.295321637426,"mode":"dns","policies":128,"ports":"none","resolver_calls":5130,"samples":[14460.108187134503,14502.739766081871,14538.061403508771,14550.956140350878,14563.5,14579.026315789473,14582.593567251462,14588.295321637426,14599.28947368421,14606.456140350878,14635.049707602338,14640.809941520467,14648.149122807017,14660.692982456141,14723.441520467837],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":15620.577160493827,"build_ms":6.142816,"count":12800,"iterations":324,"median_ns":15476.873456790123,"mode":"dns","policies":128,"ports":"mixed","resolver_calls":4860,"samples":[15338.75925925926,15390.854938271605,15405.361111111111,15424.496913580248,15437.645061728395,15456.132716049382,15471.256172839507,15476.873456790123,15481.811728395061,15490.175925925925,15525.29938271605,15529.311728395061,15537.984567901234,15544.095679012345,15620.577160493827],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8976.081967213115,"build_ms":3.7127079999999997,"count":12800,"iterations":488,"median_ns":8795.651639344262,"mode":"dns","policies":128,"ports":"none","resolver_calls":7320,"samples":[8766.79918032787,8769.768442622952,8774.64549180328,8777.188524590163,8790.034836065573,8790.219262295082,8790.629098360656,8795.651639344262,8796.407786885246,8797.73975409836,8797.782786885246,8802.844262295082,8814.235655737704,8820.52868852459,8976.081967213115],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":10377.533203125,"build_ms":6.845466,"count":12800,"iterations":512,"median_ns":9879.759765625,"mode":"dns","policies":128,"ports":"mixed","resolver_calls":7680,"samples":[9818.470703125,9830.990234375,9834.701171875,9857.26171875,9861.205078125,9871.244140625,9876.439453125,9879.759765625,9880.560546875,9887.943359375,9908.080078125,9935.208984375,10151.751953125,10270.052734375,10377.533203125],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":604.9042732822445,"build_ms":30.073912,"count":102400,"iterations":7699,"median_ns":568.0590985842317,"mode":"dns","policies":1024,"ports":"none","resolver_calls":115485,"samples":[565.7251591115729,566.3991427458111,566.6941161189765,566.734381088453,567.0044161579426,567.0707884140797,567.1240420833875,568.0590985842317,568.4279776594362,569.7891934017405,572.3622548382907,577.892843226393,580.4412261332641,591.7219119366151,604.9042732822445],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":90516.984375,"build_ms":48.039522,"count":102400,"iterations":64,"median_ns":70264.796875,"mode":"dns","policies":1024,"ports":"mixed","resolver_calls":960,"samples":[56028.40625,60221.53125,62087.3125,67109.484375,68409.328125,68896.046875,69917.9375,70264.796875,74467.609375,74979.171875,79118.390625,81255.265625,81906.203125,82656.046875,90516.984375],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.43s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":162580.68421052632,"build_ms":31.868272000000005,"count":102400,"iterations":38,"median_ns":145105.7105263158,"mode":"dns","policies":1024,"ports":"none","resolver_calls":570,"samples":[125759.92105263157,128736.23684210527,129332.28947368421,130247.02631578948,131854.13157894736,133763.07894736843,144323.05263157896,145105.7105263158,145849.65789473685,147505.97368421053,148457.81578947368,150853.86842105264,152032.7894736842,154854.13157894736,162580.68421052632],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.81s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":162576.35294117648,"build_ms":47.933772,"count":102400,"iterations":34,"median_ns":143953.4411764706,"mode":"dns","policies":1024,"ports":"mixed","resolver_calls":510,"samples":[142509.61764705883,142619.0294117647,143078.76470588235,143396.67647058822,143524.61764705883,143548.14705882352,143806.67647058822,143953.4411764706,144737.29411764705,145260.79411764705,146072.5588235294,149248.73529411765,149586.38235294117,160713.4411764706,162576.35294117648],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.74s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":75148.04411764706,"build_ms":30.479043,"count":102400,"iterations":68,"median_ns":72245.25,"mode":"dns","policies":1024,"ports":"none","resolver_calls":1020,"samples":[71406.88235294117,71660.39705882352,71667.16176470589,71688.63235294117,71934.2205882353,71958.19117647059,71986.86764705883,72245.25,72269.2205882353,72381.42647058824,72596.86764705883,72623.94117647059,72707.75,73254.51470588235,75148.04411764706],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.43s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":181534.98113207548,"build_ms":47.436903,"count":102400,"iterations":53,"median_ns":93029.18867924529,"mode":"dns","policies":1024,"ports":"mixed","resolver_calls":795,"samples":[92050.3396226415,92077.11320754717,92304.47169811321,92373.52830188679,92698.43396226416,92815.60377358491,92947.11320754717,93029.18867924529,93088.43396226416,93335.81132075471,93818.05660377358,93980.1320754717,94471.83018867925,96575.98113207547,181534.98113207548],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.52s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":515.5044976881043,"build_ms":0.06733,"count":16,"iterations":11895,"median_ns":432.42934005884825,"mode":"sniff","policies":1,"ports":"none","resolver_calls":0,"samples":[425.8778478352249,426.08381672971836,428.38310214375787,428.8379150903741,430.20403530895334,430.792517864649,431.47767969735185,432.42934005884825,432.6327868852459,433.31290458175704,433.4860865910046,435.7651954602774,436.1426649852879,438.92114333753676,515.5044976881043],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.09s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":461.0662239089184,"build_ms":37.259038000000004,"count":100000,"iterations":10540,"median_ns":450.89535104364325,"mode":"sniff","policies":1,"ports":"none","resolver_calls":0,"samples":[449.51015180265654,449.5130929791271,449.5803605313093,450.30806451612904,450.4998102466793,450.78055028462995,450.8052182163188,450.89535104364325,451.4228652751423,451.4456356736243,451.8431688804554,452.85740037950666,453.2169829222011,453.57666034155596,461.0662239089184],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":469.8695652173913,"build_ms":0.07808,"count":16,"iterations":12374,"median_ns":407.25448521092613,"mode":"sniff","policies":1,"ports":"fixed","resolver_calls":0,"samples":[401.45684499757556,402.1259899789882,403.10627121383544,403.2767900436399,403.90310328107324,404.8842734766446,406.08913851624374,407.25448521092613,408.1684984645224,409.78721512849523,410.60505899466625,410.9881202521416,420.22199773719086,422.538144496525,469.8695652173913],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":639.1545591182364,"build_ms":54.779978,"count":100000,"iterations":11976,"median_ns":432.2884101536406,"mode":"sniff","policies":1,"ports":"fixed","resolver_calls":0,"samples":[422.7811456245825,423.5760688042752,424.50125250501003,424.51795257181027,424.8686539746159,431.3248997995992,431.47019038076155,432.2884101536406,432.6909652638611,435.27196058784233,440.3688209752839,441.4033901135605,520.3629759519038,534.5304776219104,639.1545591182364],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":634.2747402276101,"build_ms":0.12218,"count":16,"iterations":8084,"median_ns":409.7140029688273,"mode":"sniff","policies":1,"ports":"mixed","resolver_calls":0,"samples":[406.8948540326571,407.68777832756064,407.9463137060861,408.5920336467095,409.03612073231074,409.1808510638298,409.51484413656607,409.7140029688273,409.85502226620486,410.19767441860466,411.75383473527955,575.4648688767936,608.7688025729836,618.4323354774864,634.2747402276101],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.07s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":479.1775383420695,"build_ms":54.355428999999994,"count":100000,"iterations":10302,"median_ns":475.30450397980974,"mode":"sniff","policies":1,"ports":"mixed","resolver_calls":0,"samples":[471.88866239565135,472.5662007377208,472.88361483207143,473.11376431760823,474.21151232770336,474.36002717918853,474.44059405940595,475.30450397980974,475.7820811492914,475.9441855950301,476.38973014948556,476.71879246748205,477.35468841001745,477.74868957483983,479.1775383420695],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":599.8863590366323,"build_ms":486.410385,"count":1000000,"iterations":9882,"median_ns":512.536632260676,"mode":"sniff","policies":1,"ports":"none","resolver_calls":0,"samples":[496.2464076097956,497.0559603319166,497.0600080955272,497.3868650070836,497.97581461242663,498.1984416110099,498.22070431086826,512.536632260676,518.4089253187614,558.5161910544424,563.3966808338394,574.7345679012345,581.4305808540781,581.5752884031573,599.8863590366323],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.77s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":432.7014707077273,"build_ms":3.7476179999999997,"count":12800,"iterations":12307,"median_ns":400.0964491752661,"mode":"sniff","policies":128,"ports":"none","resolver_calls":0,"samples":[397.84082229625415,397.88551231006744,397.94076541805475,399.0133257495734,399.27252782969043,399.3294060290891,399.3529698545543,400.0964491752661,400.22320630535467,400.29308523604453,400.40773543511824,400.7391728284716,400.815552124807,416.4578695051597,432.7014707077273],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.09s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8205.542808219177,"build_ms":6.414856,"count":12800,"iterations":584,"median_ns":7625.166095890411,"mode":"sniff","policies":128,"ports":"mixed","resolver_calls":0,"samples":[7332.683219178082,7347.119863013699,7527.443493150685,7551.056506849315,7555.148972602739,7563.198630136986,7610.921232876713,7625.166095890411,7673.832191780822,7711.176369863014,8087.666095890411,8096.227739726028,8105.715753424657,8126.897260273972,8205.542808219177],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":14217.08547008547,"build_ms":3.6682580000000002,"count":12800,"iterations":351,"median_ns":14151.871794871795,"mode":"sniff","policies":128,"ports":"none","resolver_calls":0,"samples":[14092.669515669515,14116.059829059828,14124.179487179486,14135.034188034188,14137.598290598291,14148.54131054131,14149.735042735043,14151.871794871795,14160.960113960115,14165.378917378917,14189.564102564103,14194.094017094018,14194.749287749288,14198.709401709402,14217.08547008547],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":28970.83282674772,"build_ms":6.083736999999999,"count":12800,"iterations":329,"median_ns":15414.641337386018,"mode":"sniff","policies":128,"ports":"mixed","resolver_calls":0,"samples":[15094.857142857143,15193.851063829787,15207.620060790274,15254.124620060791,15282.331306990882,15300.142857142857,15318.382978723404,15414.641337386018,15459.626139817628,15474.337386018236,17328.042553191488,18217.73860182371,20708.924012158055,27708.161094224924,28970.83282674772],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.16s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":15075.309829059828,"build_ms":4.998037,"count":12800,"iterations":468,"median_ns":10167.621794871795,"mode":"sniff","policies":128,"ports":"none","resolver_calls":0,"samples":[9482.260683760684,9503.455128205129,9549.568376068377,9593.989316239316,9699.416666666666,9920.722222222223,10054.673076923076,10167.621794871795,10386.403846153846,10477.66452991453,10887.450854700855,10907.814102564103,12437.173076923076,14529.777777777777,15075.309829059828],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":11533.5085995086,"build_ms":7.222486,"count":12800,"iterations":407,"median_ns":11042.30221130221,"mode":"sniff","policies":128,"ports":"mixed","resolver_calls":0,"samples":[10515.373464373464,10679.157248157248,10682.845208845209,10790.805896805898,10882.378378378378,10888.592137592137,11026.727272727272,11042.30221130221,11045.570024570025,11073.211302211303,11356.257985257986,11375.717444717444,11475.03194103194,11482.40049140049,11533.5085995086],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":495.8578783151326,"build_ms":33.381831,"count":102400,"iterations":6410,"median_ns":459.9138845553822,"mode":"sniff","policies":1024,"ports":"none","resolver_calls":0,"samples":[425.101248049922,425.9733229329173,434.4522620904836,441.4302652106084,441.59890795631827,442.8358814352574,444.33354134165364,459.9138845553822,469.611232449298,470.8265210608424,474.38502340093606,482.17909516380655,482.62839313572545,488.70015600624026,495.8578783151326],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.09s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":78361.58208955223,"build_ms":54.589578,"count":102400,"iterations":67,"median_ns":72184.58208955223,"mode":"sniff","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[53107.58208955224,56622.35820895522,62405.49253731343,64979.82089552239,67483.0895522388,69900.40298507463,70298.16417910448,72184.58208955223,72239.05970149254,73215.32835820895,73842.35820895522,74039.95522388059,74693.3880597015,75553.23880597015,78361.58208955223],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.46s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":155841.15625,"build_ms":33.348470999999996,"count":102400,"iterations":32,"median_ns":149726.78125,"mode":"sniff","policies":1024,"ports":"none","resolver_calls":0,"samples":[144405.21875,146395.84375,146501.1875,147296.1875,147390.21875,147925.84375,148095.21875,149726.78125,151096.78125,152649.28125,152773.0625,153190.21875,153742.40625,154777.40625,155841.15625],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.66s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":156975.53125,"build_ms":57.404616,"count":102400,"iterations":32,"median_ns":144400.5625,"mode":"sniff","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[140838.65625,142509.90625,142624.28125,142638.03125,143483.96875,143928.6875,144009.0,144400.5625,144688.03125,145668.375,150523.03125,152207.40625,153141.15625,154112.40625,156975.53125],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.75s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":73002.94029850746,"build_ms":29.701143,"count":102400,"iterations":67,"median_ns":72489.97014925373,"mode":"sniff","policies":1024,"ports":"none","resolver_calls":0,"samples":[71858.01492537314,72135.62686567164,72170.70149253731,72171.44776119402,72346.97014925373,72355.77611940299,72367.26865671642,72489.97014925373,72522.20895522388,72556.07462686567,72571.59701492537,72599.20895522388,72884.13432835821,72930.70149253731,73002.94029850746],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.41s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":95404.09433962264,"build_ms":47.898622,"count":102400,"iterations":53,"median_ns":92834.84905660378,"mode":"sniff","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[92218.81132075471,92232.39622641509,92591.64150943396,92603.16981132075,92697.1320754717,92755.60377358491,92789.75471698113,92834.84905660378,92975.41509433962,93024.28301886792,93744.84905660378,93753.71698113208,93783.15094339622,94036.92452830188,95404.09433962264],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.52s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":478.2257513985019,"build_ms":0.07313,"count":16,"iterations":10547,"median_ns":476.00142220536645,"mode":"ordinary","policies":1,"ports":"none","resolver_calls":0,"samples":[472.2221484782403,473.1826111690528,474.23599127714044,474.312790366929,475.56907177396414,475.8146392339054,475.9435858537973,476.00142220536645,476.19389399829333,476.48402389305016,476.6395183464492,476.7371764482791,477.3932871906703,477.595335166398,478.2257513985019],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":514.4743005181347,"build_ms":39.307977,"count":100000,"iterations":9650,"median_ns":508.0671502590674,"mode":"ordinary","policies":1,"ports":"none","resolver_calls":0,"samples":[504.30642487046634,505.13336787564765,506.25150259067357,506.6174093264249,506.7499481865285,506.76963730569946,507.2939896373057,508.0671502590674,508.32715025906737,508.50642487046633,508.9862176165803,510.50746113989635,511.1136787564767,511.2691191709845,514.4743005181347],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":461.7920972644377,"build_ms":0.07150000000000001,"count":16,"iterations":9870,"median_ns":456.577304964539,"mode":"ordinary","policies":1,"ports":"fixed","resolver_calls":0,"samples":[453.64913880445795,454.62178318135767,455.17497467071934,455.21550151975686,455.286524822695,455.97953394123607,456.40091185410336,456.577304964539,456.7838905775076,457.5499493414387,458.2985815602837,458.91357649442756,459.15987841945287,459.6278622087133,461.7920972644377],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":486.06129032258065,"build_ms":53.259909,"count":100000,"iterations":10230,"median_ns":480.8266862170088,"mode":"ordinary","policies":1,"ports":"fixed","resolver_calls":0,"samples":[475.78367546432065,476.1834799608993,477.89902248289343,479.01827956989246,479.6086999022483,479.9518084066471,480.688954056696,480.8266862170088,481.78172043010755,482.0994134897361,482.15806451612906,482.8932551319648,484.7162267839687,485.78074291300095,486.06129032258065],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":476.09400474667217,"build_ms":0.0819,"count":16,"iterations":9691,"median_ns":467.96801155711483,"mode":"ordinary","policies":1,"ports":"mixed","resolver_calls":0,"samples":[464.4491796512228,465.39645031472503,465.5131565369931,465.9970075327624,466.9700753276236,466.99380868847385,467.3229800846146,467.96801155711483,468.613971726344,468.9409761634506,470.0100092869673,470.2742751006088,472.3473325766175,473.2687029202353,476.09400474667217],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":544.3800734024179,"build_ms":53.533379,"count":100000,"iterations":9264,"median_ns":536.5162996545769,"mode":"ordinary","policies":1,"ports":"mixed","resolver_calls":0,"samples":[531.9556347150259,532.8775906735751,534.1825345423143,534.5042098445596,535.1734671848013,535.2177245250432,535.263061312608,536.5162996545769,536.6738989637306,538.0404792746114,538.3675518134716,538.7906951640759,539.7514032815199,543.350280656304,544.3800734024179],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":564.4454282308872,"build_ms":479.17112000000003,"count":1000000,"iterations":5873,"median_ns":552.8482887791589,"mode":"ordinary","policies":1,"ports":"none","resolver_calls":0,"samples":[550.6858505022986,551.3447982291844,551.4197173505875,551.584879959135,551.9526647369318,552.053124467904,552.6456666099098,552.8482887791589,553.655372041546,554.1525625744935,554.5952664736932,554.6039502809467,555.5130257108804,558.6766558828538,564.4454282308872],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.73s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":466.7833777902569,"build_ms":3.8090379999999997,"count":12800,"iterations":7123,"median_ns":458.5705461182086,"mode":"ordinary","policies":128,"ports":"none","resolver_calls":0,"samples":[456.7412607047592,457.20876035378353,457.6074687631616,457.61729608311106,457.80836726098556,457.9401937385933,458.37399971921946,458.5705461182086,458.66320370630353,458.8836164537414,459.2977677944686,460.8799663063316,462.49585848659274,464.46693808788433,466.7833777902569],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.06s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8105.890728476821,"build_ms":6.0085370000000005,"count":12800,"iterations":604,"median_ns":7636.4188741721855,"mode":"ordinary","policies":128,"ports":"mixed","resolver_calls":0,"samples":[7385.673841059603,7467.577814569537,7518.670529801325,7542.346026490066,7546.55298013245,7547.312913907284,7622.710264900662,7636.4188741721855,7679.332781456954,7710.774834437086,7733.819536423841,7810.7566225165565,7963.488410596026,7966.039735099338,8105.890728476821],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":16445.942196531792,"build_ms":3.6740280000000003,"count":12800,"iterations":346,"median_ns":14343.488439306358,"mode":"ordinary","policies":128,"ports":"none","resolver_calls":0,"samples":[14290.771676300577,14308.777456647398,14319.297687861272,14322.332369942196,14325.28034682081,14325.973988439306,14326.234104046243,14343.488439306358,14347.621387283238,14358.462427745664,14389.239884393064,14395.514450867053,14450.106936416185,14565.106936416185,16445.942196531792],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":16404.805555555555,"build_ms":6.124056,"count":12800,"iterations":324,"median_ns":15343.817901234568,"mode":"ordinary","policies":128,"ports":"mixed","resolver_calls":0,"samples":[15201.503086419752,15217.583333333334,15280.762345679012,15294.404320987655,15310.237654320988,15321.657407407407,15330.854938271605,15343.817901234568,15353.388888888889,15355.762345679012,15365.487654320988,15411.07098765432,15433.354938271605,15589.466049382716,16404.805555555555],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9223.991349480968,"build_ms":3.676778,"count":12800,"iterations":578,"median_ns":8559.321799307958,"mode":"ordinary","policies":128,"ports":"none","resolver_calls":0,"samples":[8502.659169550174,8505.271626297577,8509.493079584776,8512.987889273356,8517.313148788928,8548.31660899654,8556.534602076124,8559.321799307958,8560.375432525952,8564.752595155709,8565.686851211072,8573.31660899654,8635.081314878893,8648.801038062284,9223.991349480968],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9962.409663865546,"build_ms":6.016376,"count":12800,"iterations":476,"median_ns":9597.83193277311,"mode":"ordinary","policies":128,"ports":"mixed","resolver_calls":0,"samples":[9548.16806722689,9549.237394957983,9555.752100840336,9558.060924369747,9559.19537815126,9577.661764705883,9592.20168067227,9597.83193277311,9626.08613445378,9628.628151260504,9640.876050420167,9662.073529411764,9673.71218487395,9687.66386554622,9962.409663865546],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":460.68751910341314,"build_ms":29.645422,"count":102400,"iterations":9815,"median_ns":459.325216505349,"mode":"ordinary","policies":1024,"ports":"none","resolver_calls":0,"samples":[456.181049414162,456.7435557819664,457.61161487519104,457.64921039225675,457.8418746816098,458.0537952114111,459.27834946510444,459.325216505349,459.61049414162,459.7419256240448,459.9845134997453,460.2574630667346,460.277840040754,460.3562913907285,460.68751910341314],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":76107.60294117648,"build_ms":47.777203,"count":102400,"iterations":68,"median_ns":67823.20588235294,"mode":"ordinary","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[49287.76470588235,55324.82352941176,60848.79411764706,61120.98529411765,63213.48529411765,67085.70588235294,67188.63235294117,67823.20588235294,68417.60294117648,71503.19117647059,72512.01470588235,72661.2794117647,74820.10294117648,75255.69117647059,76107.60294117648],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.41s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":125050.675,"build_ms":30.287492999999998,"count":102400,"iterations":40,"median_ns":123718.175,"mode":"ordinary","policies":1024,"ports":"none","resolver_calls":0,"samples":[122507.7,122611.925,122744.925,122761.175,122847.175,122945.925,123640.675,123718.175,123869.675,123870.175,124116.2,124124.425,124181.425,124843.425,125050.675],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.63s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":145517.91428571427,"build_ms":47.864032,"count":102400,"iterations":35,"median_ns":142499.05714285714,"mode":"ordinary","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[140889.62857142856,141166.2,141554.77142857143,141641.62857142856,142226.77142857143,142309.62857142856,142351.37142857144,142499.05714285714,142622.48571428572,142810.77142857143,143385.34285714285,143440.77142857143,143699.91428571427,144119.34285714285,145517.91428571427],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.73s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":73808.19117647059,"build_ms":29.555573000000003,"count":102400,"iterations":68,"median_ns":72590.83823529411,"mode":"ordinary","policies":1024,"ports":"none","resolver_calls":0,"samples":[72124.80882352941,72426.0,72518.63235294117,72521.0,72526.86764705883,72557.16176470589,72570.39705882352,72590.83823529411,72705.83823529411,72851.57352941176,72868.48529411765,73008.48529411765,73168.33823529411,73419.95588235294,73808.19117647059],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.42s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":93191.98148148147,"build_ms":48.039882,"count":102400,"iterations":54,"median_ns":91041.61111111111,"mode":"ordinary","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[89081.98148148147,90444.75925925926,90491.98148148147,90496.79629629629,90879.5925925926,90959.75925925926,90994.03703703704,91041.61111111111,91204.01851851853,91256.24074074074,91363.46296296296,91525.87037037036,91553.46296296296,92516.98148148147,93191.98148148147],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.51s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":168.23446955662592,"build_ms":0.05809,"count":16,"iterations":16194,"median_ns":153.59633197480548,"mode":"floor","policies":1,"ports":"none","resolver_calls":0,"samples":[152.65209336791403,152.7854761022601,152.9349759170063,152.9355316783994,152.95226627145857,153.01086822279856,153.4554773372854,153.59633197480548,153.6562307027294,153.7018648882302,153.96313449425713,153.99580091391874,154.86038038779796,154.98511794491787,168.23446955662592],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.04s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":473.93122433743935,"build_ms":0.07063000000000001,"count":16,"iterations":10716,"median_ns":469.57792086599477,"mode":"ordinary","policies":1,"ports":"none","resolver_calls":0,"samples":[467.03499440089587,467.6266330720418,467.7423478910041,467.9010824934677,468.3843784994401,468.9816162747294,469.12812616648006,469.57792086599477,469.81961552818217,470.83585293019786,470.9179731243001,471.239921612542,471.6859835759612,471.7102463605823,473.93122433743935],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":522.8006417555118,"build_ms":38.769018,"count":100000,"iterations":9661,"median_ns":508.31352862022567,"mode":"ordinary","policies":1,"ports":"none","resolver_calls":0,"samples":[505.24241796915436,506.2071214160025,506.59217472311354,506.9483490321913,507.5713694234551,507.6448607804575,507.8208260014491,508.31352862022567,508.6633888831384,508.8279681192423,509.1747231135493,509.6291274195218,509.7482662250285,515.477383293655,522.8006417555118],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":458.5986939744731,"build_ms":0.07143999999999999,"count":16,"iterations":10107,"median_ns":455.5939447907391,"mode":"ordinary","policies":1,"ports":"fixed","resolver_calls":0,"samples":[453.104482042149,453.74572078757296,454.26605323043435,454.3334322746611,454.351142772336,454.66577619471656,455.01009201543485,455.5939447907391,455.6403482734738,456.20045513010785,456.3527258335807,456.46848718709805,457.15514000197885,458.2009498367468,458.5986939744731],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":549.7008338798838,"build_ms":52.542679,"count":100000,"iterations":10673,"median_ns":475.92869858521505,"mode":"ordinary","policies":1,"ports":"fixed","resolver_calls":0,"samples":[474.39773259627094,474.5026702895156,474.7753209032137,475.05640401011897,475.2053780567788,475.34873044130046,475.6391829851026,475.92869858521505,476.02239295418343,476.30066523001966,478.415347137637,479.21174927386863,479.3260564040101,479.5462381710859,549.7008338798838],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":482.96084306229983,"build_ms":0.07579000000000001,"count":16,"iterations":9679,"median_ns":470.06271309019525,"mode":"ordinary","policies":1,"ports":"mixed","resolver_calls":0,"samples":[461.8046285773324,462.1393739022626,464.35561524950924,465.7235251575576,465.7254881702655,468.14939559871885,469.8292178944106,470.06271309019525,475.0260357474946,477.0727347866515,477.11416468643455,479.58849054654405,480.5452009505114,480.7941936150429,482.96084306229983],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":539.0530130909877,"build_ms":53.467048000000005,"count":100000,"iterations":9243,"median_ns":531.7707454289733,"mode":"ordinary","policies":1,"ports":"mixed","resolver_calls":0,"samples":[526.541923617873,526.9119333549713,530.4670561506005,530.5536081358866,531.2081575246132,531.6203613545385,531.6982581412962,531.7707454289733,532.2154062533809,532.2511089473114,533.4034404414151,533.5190955317538,534.1974467164341,537.9938331710483,539.0530130909877],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":557.5303047340605,"build_ms":490.758513,"count":1000000,"iterations":8893,"median_ns":555.724389969639,"mode":"ordinary","policies":1,"ports":"none","resolver_calls":0,"samples":[552.5994602496345,553.8498819296076,554.0962554818396,554.4852130889464,554.8068143483639,555.0631957719555,555.1003036095806,555.724389969639,555.9672776340942,556.4508040031485,556.5463847970314,556.5475092769594,557.0175418868773,557.0986168896885,557.5303047340605],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.77s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":467.8778327152864,"build_ms":3.724138,"count":12800,"iterations":9708,"median_ns":465.0470745776679,"mode":"ordinary","policies":128,"ports":"none","resolver_calls":0,"samples":[457.6737742068397,461.6333951380305,462.1391635764318,462.5408941079522,463.04573547589615,464.1169138854553,464.8339513803049,465.0470745776679,465.07086938607335,465.5725175113309,465.8546559538525,466.171920065925,466.3748454882571,467.1423568191183,467.8778327152864],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8324.601926163725,"build_ms":6.117656,"count":12800,"iterations":623,"median_ns":7670.894060995184,"mode":"ordinary","policies":128,"ports":"mixed","resolver_calls":0,"samples":[7103.60834670947,7579.064205457464,7604.041733547351,7621.5842696629215,7625.886035313001,7643.174959871589,7647.780096308186,7670.894060995184,7683.686998394864,7757.571428571428,7785.581059390048,8084.2969502407705,8119.337078651685,8278.711075441413,8324.601926163725],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":16059.611111111111,"build_ms":3.700358,"count":12800,"iterations":342,"median_ns":14491.45321637427,"mode":"ordinary","policies":128,"ports":"none","resolver_calls":0,"samples":[14411.277777777777,14433.236842105263,14462.476608187135,14467.915204678362,14470.049707602338,14482.09649122807,14483.795321637426,14491.45321637427,14547.154970760233,14561.862573099415,14578.412280701754,14588.061403508771,14649.201754385966,15100.634502923976,16059.611111111111],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":17331.260869565216,"build_ms":6.116846,"count":12800,"iterations":299,"median_ns":15663.76923076923,"mode":"ordinary","policies":128,"ports":"mixed","resolver_calls":0,"samples":[15547.816053511706,15596.882943143813,15621.060200668897,15624.207357859532,15634.605351170569,15643.90635451505,15658.986622073578,15663.76923076923,15687.347826086956,15704.003344481605,15713.033444816054,15970.428093645485,16032.598662207358,17158.886287625417,17331.260869565216],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8777.923214285714,"build_ms":3.795298,"count":12800,"iterations":560,"median_ns":8672.335714285715,"mode":"ordinary","policies":128,"ports":"none","resolver_calls":0,"samples":[8571.067857142858,8574.405357142858,8589.691071428571,8620.994642857142,8625.673214285714,8637.048214285714,8640.369642857142,8672.335714285715,8695.476785714285,8712.208928571428,8713.351785714285,8724.655357142858,8749.655357142858,8758.335714285715,8777.923214285714],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9670.658203125,"build_ms":6.123327,"count":12800,"iterations":512,"median_ns":9551.578125,"mode":"ordinary","policies":128,"ports":"mixed","resolver_calls":0,"samples":[9480.521484375,9524.466796875,9535.423828125,9544.193359375,9546.595703125,9546.927734375,9548.861328125,9551.578125,9554.37109375,9560.814453125,9584.388671875,9587.904296875,9590.462890625,9616.576171875,9670.658203125],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":465.35365223680134,"build_ms":29.682723000000003,"count":102400,"iterations":9679,"median_ns":461.63932224403345,"mode":"ordinary","policies":1024,"ports":"none","resolver_calls":0,"samples":[460.6784791817337,460.82632503357786,460.97603058167164,461.11147845851843,461.2126252712057,461.2643868168199,461.55150325446846,461.63932224403345,462.4875503667734,462.7406756896374,463.65502634569685,463.7491476392189,464.3534456038847,464.36491373075734,465.35365223680134],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":76297.30882352941,"build_ms":47.764332,"count":102400,"iterations":68,"median_ns":67375.83823529411,"mode":"ordinary","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[49999.23529411765,55160.85294117647,62100.544117647056,63000.85294117647,65768.7794117647,66462.17647058824,67224.2205882353,67375.83823529411,67649.9705882353,71394.51470588235,71819.95588235294,72488.04411764706,74648.48529411765,76021.13235294117,76297.30882352941],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.41s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":123213.7,"build_ms":29.395742,"count":102400,"iterations":40,"median_ns":122231.175,"mode":"ordinary","policies":1024,"ports":"none","resolver_calls":0,"samples":[121546.925,121733.7,121866.175,121930.175,122070.425,122211.425,122217.925,122231.175,122531.425,122548.675,122570.425,122889.675,123025.675,123113.425,123213.7],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.69s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":171161.07692307694,"build_ms":47.234392,"count":102400,"iterations":26,"median_ns":142926.46153846153,"mode":"ordinary","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[137741.46153846153,139962.96153846153,141262.61538461538,141957.23076923078,142178.0,142199.92307692306,142321.07692307694,142926.46153846153,143744.92307692306,145289.11538461538,156082.1923076923,159674.92307692306,164888.0,169745.26923076922,171161.07692307694],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.70s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":72795.46376811594,"build_ms":30.926461999999997,"count":102400,"iterations":69,"median_ns":70833.0,"mode":"ordinary","policies":1024,"ports":"none","resolver_calls":0,"samples":[70467.92753623189,70528.79710144928,70542.13043478261,70604.60869565218,70609.95652173914,70676.04347826086,70684.01449275362,70833.0,70844.59420289854,70980.97101449275,71294.60869565218,71398.50724637682,71449.23188405797,71601.84057971014,72795.46376811594],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.41s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":93516.7358490566,"build_ms":50.18938,"count":102400,"iterations":53,"median_ns":90621.2641509434,"mode":"ordinary","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[89496.35849056604,89734.28301886792,90241.45283018867,90403.7358490566,90421.07547169812,90518.83018867925,90593.52830188679,90621.2641509434,90889.18867924529,91415.60377358491,91578.45283018867,91812.01886792453,92184.28301886792,92504.09433962264,93516.7358490566],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.54s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":431.85598308668074,"build_ms":0.07017999999999999,"count":16,"iterations":11825,"median_ns":423.9625369978858,"mode":"sniff","policies":1,"ports":"none","resolver_calls":0,"samples":[421.38748414376323,421.7249048625793,421.729133192389,422.72786469344607,423.1151797040169,423.46105708245244,423.7832558139535,423.9625369978858,424.62638477801266,425.0492177589852,425.51010570824525,426.63906976744187,426.89285412262154,427.7012262156448,431.85598308668074],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":457.64178966789666,"build_ms":38.765426999999995,"count":100000,"iterations":10840,"median_ns":452.1131918819188,"mode":"sniff","policies":1,"ports":"none","resolver_calls":0,"samples":[448.93238007380074,449.255258302583,450.0679889298893,450.4895756457565,450.8788745387454,451.7249077490775,451.76171586715867,452.1131918819188,452.2893911439114,453.26632841328416,453.4712177121771,453.50894833948337,453.5532287822878,454.4674354243542,457.64178966789666],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":412.4891492373015,"build_ms":0.0851,"count":16,"iterations":12718,"median_ns":410.0257115898726,"mode":"sniff","policies":1,"ports":"fixed","resolver_calls":0,"samples":[407.5261047334487,408.2086019814436,409.1678723069665,409.1922472086806,409.48238716779366,409.81891806887876,409.9195628243435,410.0257115898726,410.0343607485454,410.1483723855952,410.73101116527755,410.97161503381034,411.10135241390157,411.1540336530901,412.4891492373015],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.09s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":426.3104500381388,"build_ms":53.679759,"count":100000,"iterations":11799,"median_ns":422.6482752775659,"mode":"sniff","policies":1,"ports":"fixed","resolver_calls":0,"samples":[421.1574709721163,421.4778371048394,421.51428087126027,421.604118993135,421.9016018306636,422.0643274853801,422.18467666751417,422.6482752775659,422.82125603864733,423.25349605898805,423.3729129587253,423.8983812187474,423.94753792694297,424.5153826595474,426.3104500381388],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":416.5706472940984,"build_ms":0.08018,"count":16,"iterations":12251,"median_ns":411.9334748183822,"mode":"sniff","policies":1,"ports":"mixed","resolver_calls":0,"samples":[410.95886050118355,410.9931434168639,411.05109786956166,411.3514815117133,411.48861317443476,411.6225614235573,411.8102195739123,411.9334748183822,412.02897722634884,412.6060729736348,412.7823851114195,413.3211166435393,413.8973961309281,414.6197861399069,416.5706472940984],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":486.2515445719329,"build_ms":55.290297,"count":100000,"iterations":10197,"median_ns":479.69275277042266,"mode":"sniff","policies":1,"ports":"mixed","resolver_calls":0,"samples":[476.8586839266451,478.3070510934589,478.32568402471315,478.45905658527016,478.814062959694,479.2985191723056,479.31911346474453,479.69275277042266,479.78601549475337,480.0487398254389,480.20564872021185,480.86270471707365,481.9914680788467,485.0992448759439,486.2515445719329],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":498.9404909240924,"build_ms":472.324564,"count":1000000,"iterations":9696,"median_ns":494.30971534653463,"mode":"sniff","policies":1,"ports":"none","resolver_calls":0,"samples":[491.3425123762376,491.9045998349835,492.241852310231,492.8958333333333,492.92770214521454,493.1174711221122,494.2829001650165,494.30971534653463,494.8645833333333,495.029702970297,495.20389851485146,495.39366749174917,496.2950701320132,497.0563118811881,498.9404909240924],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.75s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":405.45986164736166,"build_ms":3.642458,"count":12800,"iterations":12432,"median_ns":402.7290057915058,"mode":"sniff","policies":128,"ports":"none","resolver_calls":0,"samples":[402.1064189189189,402.20616151866153,402.297055984556,402.46685971685974,402.5013674388674,402.6196106821107,402.6590250965251,402.7290057915058,402.9309041184041,403.15934684684686,403.2301319176319,403.3290701415701,403.4690315315315,403.534185971686,405.45986164736166],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.09s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8046.126229508197,"build_ms":6.116457,"count":12800,"iterations":610,"median_ns":7665.077049180328,"mode":"sniff","policies":128,"ports":"mixed","resolver_calls":0,"samples":[7347.554098360656,7467.552459016393,7482.454098360656,7510.0934426229505,7567.290163934426,7652.0934426229505,7652.488524590164,7665.077049180328,7670.372131147541,7671.177049180328,7727.308196721311,7830.552459016393,7830.896721311476,8019.962295081968,8046.126229508197],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":14609.816860465116,"build_ms":3.696828,"count":12800,"iterations":344,"median_ns":14473.247093023256,"mode":"sniff","policies":128,"ports":"none","resolver_calls":0,"samples":[14392.607558139534,14419.875,14441.648255813954,14453.77034883721,14457.462209302326,14467.869186046511,14471.386627906977,14473.247093023256,14483.79941860465,14486.531976744185,14492.22965116279,14504.816860465116,14512.813953488372,14518.130813953489,14609.816860465116],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":15411.707112970711,"build_ms":6.084676,"count":12800,"iterations":239,"median_ns":15322.836820083681,"mode":"sniff","policies":128,"ports":"mixed","resolver_calls":0,"samples":[15208.820083682009,15254.719665271967,15258.150627615063,15282.71129707113,15301.916317991632,15314.050209205021,15316.769874476988,15322.836820083681,15327.606694560669,15336.305439330545,15346.016736401674,15352.246861924687,15361.707112970711,15383.63179916318,15411.707112970711],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":8427.559176672385,"build_ms":3.6918279999999997,"count":12800,"iterations":583,"median_ns":8414.506003430532,"mode":"sniff","policies":128,"ports":"none","resolver_calls":0,"samples":[8355.054888507719,8359.102915951973,8365.603773584906,8393.888507718697,8398.092624356776,8400.337907375642,8411.161234991423,8414.506003430532,8416.135506003431,8418.948542024014,8420.337907375642,8421.53859348199,8422.106346483704,8422.842195540308,8427.559176672385],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9689.729166666666,"build_ms":6.1204659999999995,"count":12800,"iterations":528,"median_ns":9631.20643939394,"mode":"sniff","policies":128,"ports":"mixed","resolver_calls":0,"samples":[9583.782196969696,9587.797348484848,9596.774621212122,9611.869318181818,9618.498106060606,9619.501893939394,9630.392045454546,9631.20643939394,9631.604166666666,9639.558712121212,9641.926136363636,9646.035984848484,9650.960227272728,9671.642045454546,9689.729166666666],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":400.36448465997455,"build_ms":29.503053,"count":102400,"iterations":7073,"median_ns":399.38625759932137,"mode":"sniff","policies":1024,"ports":"none","resolver_calls":0,"samples":[397.93128799660684,398.3810264385692,398.57047928743106,398.8799660681465,399.19256326876854,399.2136292945002,399.29987275554925,399.38625759932137,399.4258447617701,399.434186342429,399.4624628870352,399.6307083274424,399.66322635373956,399.67029548989115,400.36448465997455],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":79118.46268656716,"build_ms":47.726062,"count":102400,"iterations":67,"median_ns":70186.98507462686,"mode":"sniff","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[52909.97014925373,57413.08955223881,61541.46268656717,64163.08955223881,64180.86567164179,66253.83582089552,68276.5223880597,70186.98507462686,72096.37313432836,72511.0,75935.02985074627,77182.49253731343,77355.92537313433,77576.5223880597,79118.46268656716],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.42s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":124993.34210526316,"build_ms":31.349832000000003,"count":102400,"iterations":38,"median_ns":122809.13157894737,"mode":"sniff","policies":1024,"ports":"none","resolver_calls":0,"samples":[121294.68421052632,121780.44736842105,121855.21052631579,122043.86842105263,122462.57894736843,122699.65789473684,122752.28947368421,122809.13157894737,123042.81578947368,123120.18421052632,123125.71052631579,123774.92105263157,123954.13157894737,124288.8947368421,124993.34210526316],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.68s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":143827.5588235294,"build_ms":47.942192,"count":102400,"iterations":34,"median_ns":141697.0,"mode":"sniff","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[139718.76470588235,140014.91176470587,140506.67647058822,141154.61764705883,141259.0294117647,141383.4411764706,141483.73529411765,141697.0,141952.85294117648,142004.0294117647,142045.5,142333.14705882352,142557.29411764705,142586.08823529413,143827.5588235294],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.74s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":91690.64912280702,"build_ms":29.887492,"count":102400,"iterations":57,"median_ns":85423.80701754386,"mode":"sniff","policies":1024,"ports":"none","resolver_calls":0,"samples":[78176.45614035087,81285.56140350878,82385.91228070176,82839.43859649122,82981.52631578948,83726.9649122807,84805.0350877193,85423.80701754386,86456.78947368421,86483.1052631579,87024.85964912281,87626.78947368421,91618.01754385965,91637.84210526316,91690.64912280702],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.46s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":96311.67307692308,"build_ms":53.956068,"count":102400,"iterations":52,"median_ns":93121.86538461539,"mode":"sniff","policies":1024,"ports":"mixed","resolver_calls":0,"samples":[91050.32692307692,91697.46153846153,91847.63461538461,92257.44230769231,92364.94230769231,92420.13461538461,92871.67307692308,93121.86538461539,93226.88461538461,93430.51923076923,93682.25,93991.67307692308,94251.09615384616,95792.82692307692,96311.67307692308],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.57s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":581.2982556150952,"build_ms":0.09551,"count":16,"iterations":8771,"median_ns":572.7826929654543,"mode":"dns","policies":1,"ports":"none","resolver_calls":131565,"samples":[567.6521491278075,568.4593546915974,568.551704480675,568.6121308858739,569.2289362672443,569.8651237031125,570.7509976057462,572.7826929654543,572.983354235549,573.6572796716451,574.7288792612017,578.0660129973777,579.3497890776422,579.886785999316,581.2982556150952],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":629.402418172936,"build_ms":38.250358,"count":100000,"iterations":8188,"median_ns":607.4776502198339,"mode":"dns","policies":1,"ports":"none","resolver_calls":122820,"samples":[603.8894723986322,604.1044211040547,604.7639228138739,604.9568881289692,605.1413043478261,605.1902784562775,605.5003663898387,607.4776502198339,608.6598680996581,609.6332437713727,610.8618710307768,610.9742305813386,611.6141914997557,614.6637762579385,629.402418172936],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":768.9860511048018,"build_ms":0.08541,"count":16,"iterations":8101,"median_ns":550.0169114924083,"mode":"dns","policies":1,"ports":"fixed","resolver_calls":121515,"samples":[547.8061967658314,548.4294531539316,548.7949635847426,549.3490927046043,549.409579064313,549.847796568325,549.9540797432416,550.0169114924083,550.5069744475991,552.2142945315393,552.9387729909888,554.6299222318232,560.8143439081595,610.0960375262314,768.9860511048018],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":600.6530771808333,"build_ms":54.892818000000005,"count":100000,"iterations":8953,"median_ns":571.3455824863174,"mode":"dns","policies":1,"ports":"fixed","resolver_calls":134295,"samples":[569.6522953200044,569.7416508432927,569.9661565955546,570.0097174131575,570.3559700658997,570.9021557019993,571.318775829331,571.3455824863174,573.4029934100301,573.7704679995533,574.1848542388026,578.0461297888976,581.6493912654976,588.4728024125991,600.6530771808333],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":635.16913076727,"build_ms":0.09718,"count":16,"iterations":7846,"median_ns":561.945832271221,"mode":"dns","policies":1,"ports":"mixed","resolver_calls":117690,"samples":[558.9559010961,559.59559010961,560.1028549579404,561.1887586031098,561.3214376752485,561.6464440479225,561.7063471832781,561.945832271221,562.5614325771094,563.3809584501657,563.4599796074433,563.8080550599032,564.0247259750191,564.640198827428,635.16913076727],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.08s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":642.7801189245088,"build_ms":54.225128,"count":100000,"iterations":7736,"median_ns":636.7783092037229,"mode":"dns","policies":1,"ports":"mixed","resolver_calls":116040,"samples":[626.6800672182006,628.7845139607032,632.8046794208893,634.8806876938986,635.7377197518098,636.1953205791107,636.3685367114788,636.7783092037229,636.9258014477766,637.6185367114788,637.9067993795243,637.9741468459152,639.5523526370217,639.7307394002069,642.7801189245088],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.14s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":773.5939580133129,"build_ms":476.460592,"count":1000000,"iterations":7812,"median_ns":713.1166154633896,"mode":"dns","policies":1,"ports":"none","resolver_calls":117180,"samples":[634.1458013312852,634.3979774705581,634.9893753200205,637.5303379416283,694.1112391193036,704.8074756784434,710.2095494111624,713.1166154633896,721.2950588837685,724.7640809011776,728.1140552995391,738.0794930875576,743.1024065540195,761.3731438812084,773.5939580133129],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.80s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":670.1063673168936,"build_ms":3.9938079999999996,"count":12800,"iterations":5434,"median_ns":647.5576002944424,"mode":"dns","policies":128,"ports":"none","resolver_calls":81510,"samples":[596.9576739050423,612.1269782848731,613.370997423629,619.0353330879647,631.7718071402282,634.2543246227457,636.8877438351122,647.5576002944424,649.384983437615,650.5590725064409,651.6004784688995,652.4398233345602,657.8704453441295,664.2837688627162,670.1063673168936],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.06s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9435.421471172962,"build_ms":6.944216,"count":12800,"iterations":503,"median_ns":8803.1351888668,"mode":"dns","policies":128,"ports":"mixed","resolver_calls":7545,"samples":[7787.391650099404,8079.675944333996,8106.017892644136,8540.433399602385,8678.005964214712,8735.900596421472,8788.34592445328,8803.1351888668,8825.461232604373,8833.057654075546,9014.330019880716,9018.622266401591,9263.93041749503,9373.751491053677,9435.421471172962],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":16872.70996978852,"build_ms":3.653568,"count":12800,"iterations":331,"median_ns":14617.996978851963,"mode":"dns","policies":128,"ports":"none","resolver_calls":4965,"samples":[14434.31419939577,14453.102719033233,14479.688821752266,14497.4833836858,14509.99093655589,14523.948640483384,14585.972809667674,14617.996978851963,14633.91842900302,14666.788519637463,14706.58006042296,14923.646525679758,15106.667673716012,16697.543806646525,16872.70996978852],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":16076.15909090909,"build_ms":6.130237,"count":12800,"iterations":308,"median_ns":15889.535714285714,"mode":"dns","policies":128,"ports":"mixed","resolver_calls":4620,"samples":[15730.282467532468,15781.061688311689,15827.814935064935,15845.25,15865.087662337663,15883.074675324675,15889.40909090909,15889.535714285714,15898.142857142857,15902.522727272728,15929.438311688311,15936.41883116883,15976.15909090909,16054.827922077922,16076.15909090909],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.15s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9048.411032028469,"build_ms":3.707437,"count":12800,"iterations":562,"median_ns":8929.709964412812,"mode":"dns","policies":128,"ports":"none","resolver_calls":8430,"samples":[8897.396797153026,8904.870106761566,8906.720640569394,8908.766903914591,8921.115658362989,8926.987544483985,8928.339857651246,8929.709964412812,8931.685053380783,8935.012455516015,8939.44306049822,8955.156583629892,8960.314946619217,8984.26512455516,9048.411032028469],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.12s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":9909.369140625,"build_ms":6.054346000000001,"count":12800,"iterations":512,"median_ns":9869.642578125,"mode":"dns","policies":128,"ports":"mixed","resolver_calls":7680,"samples":[9811.654296875,9827.513671875,9847.650390625,9855.716796875,9864.134765625,9866.55859375,9868.470703125,9869.642578125,9870.736328125,9874.896484375,9878.685546875,9886.029296875,9888.412109375,9895.794921875,9909.369140625],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.13s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":573.6561963190184,"build_ms":29.669673,"count":102400,"iterations":8150,"median_ns":568.0560736196319,"mode":"dns","policies":1024,"ports":"none","resolver_calls":122250,"samples":[564.9787730061349,565.3885889570552,566.1077300613497,566.3764417177914,566.9272392638037,567.1420858895706,567.4990184049079,568.0560736196319,568.3198773006135,568.3235582822086,568.4695705521473,569.0266257668711,569.7407361963191,571.1984049079755,573.6561963190184],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.11s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":81446.57352941176,"build_ms":48.042342000000005,"count":102400,"iterations":68,"median_ns":68533.92647058824,"mode":"dns","policies":1024,"ports":"mixed","resolver_calls":1020,"samples":[50358.05882352941,55897.75,60341.147058823524,61595.25000000001,64658.632352941175,67996.0,68482.32352941176,68533.92647058824,68830.55882352941,71747.30882352941,72748.63235294117,75512.45588235294,76828.7794117647,78364.36764705883,81446.57352941176],"workload":"early"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.42s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":126469.92307692308,"build_ms":29.938782,"count":102400,"iterations":39,"median_ns":124480.94871794872,"mode":"dns","policies":1024,"ports":"none","resolver_calls":585,"samples":[123640.43589743589,123660.97435897436,124060.17948717948,124237.35897435897,124301.71794871795,124447.35897435897,124473.02564102564,124480.94871794872,124927.10256410256,125210.43589743589,125275.30769230769,125533.2564102564,125798.1282051282,126462.48717948717,126469.92307692308],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.62s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":144865.5,"build_ms":48.192562,"count":102400,"iterations":34,"median_ns":142984.32352941178,"mode":"dns","policies":1024,"ports":"mixed","resolver_calls":510,"samples":[140265.82352941178,141379.32352941178,141829.61764705883,142052.88235294117,142572.5588235294,142647.85294117648,142967.5588235294,142984.32352941178,143262.26470588235,143440.5,143821.38235294117,143943.14705882352,143963.73529411765,143978.14705882352,144865.5],"workload":"late"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.73s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":80967.44117647059,"build_ms":30.086152000000002,"count":102400,"iterations":68,"median_ns":72820.39705882352,"mode":"dns","policies":1024,"ports":"none","resolver_calls":1020,"samples":[72429.07352941176,72483.05882352941,72503.20588235294,72584.36764705883,72653.48529411765,72754.66176470589,72818.33823529411,72820.39705882352,72852.75,72901.57352941176,72948.7794117647,72991.86764705883,73414.07352941176,73645.98529411765,80967.44117647059],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.42s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":93703.01923076923,"build_ms":48.285322,"count":102400,"iterations":52,"median_ns":92567.84615384616,"mode":"dns","policies":1024,"ports":"mixed","resolver_calls":780,"samples":[91457.63461538461,92034.55769230769,92195.71153846153,92361.28846153847,92400.13461538461,92494.19230769231,92538.23076923077,92567.84615384616,92728.21153846153,93113.21153846153,93280.13461538461,93526.48076923077,93632.63461538461,93684.75,93703.01923076923],"workload":"miss"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.52s
+
+
+running 1 test
+test client_proxy_selector::measurement_bench::selector_measurement ... SELECTOR_BENCH {"batch_p95_ns":159.18544913462293,"build_ms":0.086449,"count":16,"iterations":12769,"median_ns":155.7067115670765,"mode":"floor","policies":1,"ports":"none","resolver_calls":0,"samples":[155.26814942438722,155.30096327042054,155.3903203069935,155.49674994126397,155.54694964366823,155.60098676482104,155.63387892552277,155.7067115670765,155.97454773279034,156.80546636384997,156.9174563395724,156.92998668650637,158.1359542642337,159.00689169081366,159.18544913462293],"workload":"mixed"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1754 filtered out; finished in 0.03s
+

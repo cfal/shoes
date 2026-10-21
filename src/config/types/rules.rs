@@ -4,20 +4,64 @@ use serde::{Deserialize, Serialize};
 
 use crate::address::{NetLocation, NetLocationMask};
 use crate::option_util::{NoneOrSome, OneOrSome};
+use crate::rules::Expression;
 
 use super::client::ClientConfig;
 use super::selection::ConfigSelection;
 
 #[derive(Debug, Clone)]
 pub struct RuleConfig {
-    pub masks: OneOrSome<NetLocationMask>,
+    pub criteria: RuleCriteria,
     pub action: RuleActionConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuleCriteria {
+    pub expression: Expression,
+    pub no_resolve: bool,
+    pub compiled: Option<std::sync::Arc<crate::rules::Predicate>>,
+}
+
+impl Default for RuleCriteria {
+    fn default() -> Self {
+        Self {
+            expression: Expression::Legacy(OneOrSome::One(NetLocationMask::ANY)),
+            no_resolve: false,
+            compiled: None,
+        }
+    }
+}
+
+impl RuleConfig {
+    pub(crate) fn compile(&mut self, compiler: &mut crate::rules::Compiler) -> std::io::Result<()> {
+        if self.criteria.compiled.is_some() {
+            return Ok(());
+        }
+        let expression = std::mem::replace(
+            &mut self.criteria.expression,
+            Expression::Legacy(OneOrSome::Some(Vec::new())),
+        );
+        let predicate = match expression {
+            Expression::Legacy(masks) => compiler.legacy(masks.into_vec())?,
+            expression => compiler.compile(expression)?,
+        };
+        if matches!(self.action, RuleActionConfig::Block)
+            && predicate.dependencies.ip
+            && (self.criteria.no_resolve || predicate.has_no_resolve_ip())
+        {
+            log::warn!(
+                "block rule with no_resolve IP predicates can fall through when no address is available (including under not)"
+            );
+        }
+        self.criteria.compiled = Some(predicate);
+        Ok(())
+    }
 }
 
 impl Default for RuleConfig {
     fn default() -> Self {
         Self {
-            masks: OneOrSome::One(NetLocationMask::ANY),
+            criteria: RuleCriteria::default(),
             action: RuleActionConfig::Allow {
                 override_address: None,
                 client_chains: NoneOrSome::One(ClientChain::default()),
@@ -184,7 +228,9 @@ impl<'de> Deserialize<'de> for RuleConfig {
         #[serde(deny_unknown_fields)]
         struct RuleConfigTemp {
             #[serde(alias = "mask")]
-            masks: Option<OneOrSome<NetLocationMask>>,
+            masks: serde_json::Value,
+            #[serde(default)]
+            no_resolve: bool,
             // Action fields (from RuleActionConfig)
             #[serde(default)]
             action: Option<String>,
@@ -201,8 +247,12 @@ impl<'de> Deserialize<'de> for RuleConfig {
 
         let temp = RuleConfigTemp::deserialize(deserializer)?;
 
-        // masks is required
-        let masks = temp.masks.ok_or_else(|| D::Error::missing_field("masks"))?;
+        let expression = Expression::from_config(temp.masks).map_err(D::Error::custom)?;
+        let criteria = RuleCriteria {
+            expression,
+            no_resolve: temp.no_resolve,
+            compiled: None,
+        };
 
         // Determine action type
         let action_str = temp.action.as_deref().unwrap_or("allow");
@@ -270,7 +320,7 @@ impl<'de> Deserialize<'de> for RuleConfig {
             }
         };
 
-        Ok(RuleConfig { masks, action })
+        Ok(RuleConfig { criteria, action })
     }
 }
 
@@ -280,6 +330,12 @@ impl Serialize for RuleConfig {
         S: serde::Serializer,
     {
         use serde::ser::SerializeMap;
+
+        if self.criteria.compiled.is_some() {
+            return Err(serde::ser::Error::custom(
+                "compiled runtime rules cannot be serialized",
+            ));
+        }
 
         // Count fields: masks + action fields
         let action_field_count = match &self.action {
@@ -299,10 +355,23 @@ impl Serialize for RuleConfig {
             }
         };
 
-        let mut map = serializer.serialize_map(Some(1 + action_field_count))?;
+        let mut map = serializer.serialize_map(Some(
+            action_field_count + 1 + usize::from(self.criteria.no_resolve),
+        ))?;
 
-        // Serialize masks
-        map.serialize_entry("masks", &self.masks)?;
+        match &self.criteria.expression {
+            Expression::Legacy(masks) => map.serialize_entry("masks", masks)?,
+            expression => {
+                // Direct YAML enum serialization emits tags, not predicate mappings.
+                map.serialize_entry(
+                    "masks",
+                    &serde_json::to_value(expression).map_err(serde::ser::Error::custom)?,
+                )?;
+            }
+        }
+        if self.criteria.no_resolve {
+            map.serialize_entry("no_resolve", &true)?;
+        }
 
         // Serialize action fields (flattened)
         match &self.action {
@@ -605,10 +674,13 @@ mod tests {
 
     fn create_test_rule_config() -> RuleConfig {
         RuleConfig {
-            masks: OneOrSome::Some(vec![
-                NetLocationMask::from("192.168.0.0/16:80").unwrap(),
-                NetLocationMask::from("10.0.0.0/8:443").unwrap(),
-            ]),
+            criteria: RuleCriteria {
+                expression: Expression::Legacy(OneOrSome::Some(vec![
+                    NetLocationMask::from("192.168.0.0/16:80").unwrap(),
+                    NetLocationMask::from("10.0.0.0/8:443").unwrap(),
+                ])),
+                ..Default::default()
+            },
             action: RuleActionConfig::Allow {
                 override_address: Some(NetLocation::from_ip_addr(
                     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
@@ -620,6 +692,87 @@ mod tests {
                     ))),
                 }),
             },
+        }
+    }
+
+    #[test]
+    fn legacy_masks_keep_scalar_and_list_serialization() {
+        for masks in [
+            "example.com",
+            "[example.com]",
+            "[example.com, '192.0.2.0/24']",
+        ] {
+            let rule: RuleConfig = serde_yaml::from_str(&format!("masks: {masks}")).unwrap();
+            let encoded = serde_yaml::to_value(&rule).unwrap();
+            let expected: serde_yaml::Value = serde_yaml::from_str(masks).unwrap();
+            assert_eq!(encoded["masks"], expected);
+        }
+        let default = serde_yaml::to_value(RuleConfig::default()).unwrap();
+        assert_eq!(default["masks"], "0.0.0.0/0");
+        let error = serde_yaml::from_str::<RuleConfig>("masks: []\naction: invalid")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("masks cannot be empty"), "{error}");
+    }
+
+    #[test]
+    fn mixed_masks_round_trip_without_reinterpreting_strings() {
+        for masks in [
+            "blocked",
+            "[blocked, {domain: [exact.example]}, '192.0.2.0/24']",
+            "{all: [blocked, {not: {destination_port: [80]}}]}",
+        ] {
+            let rule: RuleConfig = serde_yaml::from_str(&format!("masks: {masks}")).unwrap();
+            assert!(matches!(rule.action, RuleActionConfig::Allow { .. }));
+            let encoded = serde_yaml::to_string(&rule).unwrap();
+            let mut rule: RuleConfig = serde_yaml::from_str(&encoded).unwrap();
+            rule.compile(&mut crate::rules::Compiler::default())
+                .unwrap();
+            let predicate = rule.criteria.compiled.unwrap();
+            assert_eq!(
+                predicate.evaluate(Some("child.blocked"), None, 443),
+                crate::rules::Outcome::Match
+            );
+            assert_ne!(
+                predicate.evaluate(Some("other.example"), None, 443),
+                crate::rules::Outcome::Match
+            );
+        }
+    }
+
+    #[test]
+    fn typed_rule_round_trip_and_validation() {
+        let input = "masks: {all: [{domain: [Example.com]}, {destination_port: [443]}]}\nno_resolve: true\naction: block";
+        let rule: RuleConfig = serde_yaml::from_str(input).unwrap();
+        let encoded = serde_yaml::to_string(&rule).unwrap();
+        let mut rule: RuleConfig = serde_yaml::from_str(&encoded).unwrap();
+        rule.compile(&mut crate::rules::Compiler::default())
+            .unwrap();
+        assert_eq!(
+            rule.criteria
+                .compiled
+                .as_ref()
+                .unwrap()
+                .evaluate(Some("example.com"), None, 443),
+            crate::rules::Outcome::Match
+        );
+        assert!(serde_yaml::to_string(&rule).is_err());
+        for input in [
+            "match: {any_destination: true}\nmasks: example.com",
+            "rule_sets: [old]",
+            "masks: {unknown: true}",
+            "masks: {domain: [a], ip_cidr: [\"::/0\"]}",
+            "masks: {path: a.srs, rule_group: other}",
+            "masks: {path: a.srs, fromat: srs}",
+            "masks: {path: a.srs, action: block}",
+            "masks: []",
+            "masks: {all: []}",
+            "masks: {any: []}",
+        ] {
+            assert!(
+                serde_yaml::from_str::<RuleConfig>(input).is_err(),
+                "{input}"
+            );
         }
     }
 

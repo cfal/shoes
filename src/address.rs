@@ -595,6 +595,9 @@ impl AddressMask {
 
 impl std::fmt::Display for AddressMask {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if let Address::Hostname(hostname) = &self.address {
+            return f.write_str(hostname);
+        }
         // Convert the 128-bit netmask back to number of bits
         let bits = if self.netmask == 0 {
             0
@@ -730,6 +733,17 @@ impl serde::ser::Serialize for NetLocationMask {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn hostname_masks_serialize_without_cidr_bits() {
+        for input in ["example.com", "example.com:443"] {
+            let mask = NetLocationMask::from(input).unwrap();
+            assert_eq!(mask.to_string(), input);
+            let encoded = serde_yaml::to_string(&mask).unwrap();
+            let decoded: NetLocationMask = serde_yaml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.to_string(), input);
+        }
+    }
 
     #[test]
     fn test_bracketed_ipv6_locations() {

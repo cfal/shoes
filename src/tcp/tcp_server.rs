@@ -814,7 +814,11 @@ mod lifetime_tests {
         .unwrap();
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let handler = Arc::new(Handler(Arc::new(
-            create_tcp_client_proxy_selector(vec![rule], resolver.clone()).unwrap(),
+            super::super::tcp_client_handler_factory::create_test_selector(
+                vec![rule],
+                resolver.clone(),
+            )
+            .unwrap(),
         )));
         let (server, mut peer) = tokio::io::duplex(512);
         let mut tasks = tokio::task::JoinSet::new();

@@ -414,7 +414,9 @@ pub fn create_tcp_client_proxy_selector(
     let rules = rules
         .into_iter()
         .map(|rule_config| {
-            let RuleConfig { masks, action } = rule_config;
+            let RuleConfig {
+                criteria, action, ..
+            } = rule_config;
             let connect_action = match action {
                 RuleActionConfig::Allow {
                     override_address,
@@ -426,8 +428,49 @@ pub fn create_tcp_client_proxy_selector(
                 }
                 RuleActionConfig::Block => ConnectAction::new_block(),
             };
-            Ok(ConnectRule::new(masks.into_vec(), connect_action))
+            Ok(ConnectRule::compiled(
+                criteria.compiled.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "routing predicates must be compiled during config preparation",
+                    )
+                })?,
+                criteria.no_resolve,
+                connect_action,
+            ))
         })
         .collect::<std::io::Result<Vec<_>>>()?;
     ClientProxySelector::new(rules).with_fake_dns_context(resolver.fake_dns_context())
+}
+
+#[cfg(test)]
+pub(crate) fn create_test_selector(
+    mut rules: Vec<RuleConfig>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<ClientProxySelector> {
+    for rule in &mut rules {
+        rule.compile(&mut crate::rules::Compiler::default())?;
+    }
+    create_tcp_client_proxy_selector(rules, resolver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selector_requires_precompiled_rules() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let mut rule = RuleConfig::default();
+        let error =
+            create_tcp_client_proxy_selector(vec![rule.clone()], resolver.clone()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "routing predicates must be compiled during config preparation"
+        );
+        rule.compile(&mut crate::rules::Compiler::default())
+            .unwrap();
+        create_tcp_client_proxy_selector(vec![rule], resolver).unwrap();
+    }
 }

@@ -411,6 +411,9 @@ mod tests {
         let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let occupied_addr = occupied.local_addr().unwrap();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut rule = RuleConfig::default();
+        rule.compile(&mut crate::rules::Compiler::default())
+            .unwrap();
         let config = ServerConfig {
             sniff: false,
             bind_location: BindLocation::Address(OneOrSome::Some(
@@ -431,7 +434,7 @@ mod tests {
                 client_fingerprints: NoneOrSome::None,
                 num_endpoints: 2,
             }),
-            rules: NoneOrSome::One(ConfigSelection::Config(RuleConfig::default())),
+            rules: NoneOrSome::One(ConfigSelection::Config(rule)),
             dns: None,
         };
         drop(first);

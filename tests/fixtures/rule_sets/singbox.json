@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": ["exact.example", "UPPER.example"],
+      "domain_suffix": ["suffix.example", ".strict.example", "UPPER.suffix"],
+      "domain_keyword": ["keyword", "UPPER"],
+      "domain_regex": ["^regex[0-9]+\\.example$", "(?i)^CASE\\.example$"],
+      "ip_cidr": ["192.0.2.0/24", "2001:db8::/32"],
+      "port": [443],
+      "port_range": ["8000:8002"]
+    },
+    {
+      "type": "logical",
+      "mode": "and",
+      "rules": [
+        { "domain": ["not.example"], "invert": true },
+        { "port": [8443] }
+      ]
+    }
+  ]
+}

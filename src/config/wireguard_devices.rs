@@ -630,7 +630,10 @@ mod tests {
             "rule_group: empty\nrules: []\n",
         )
         .unwrap_err();
-        assert!(error.to_string().contains("OneOrSome"), "{error}");
+        assert!(
+            error.to_string().contains("rule group cannot be empty"),
+            "{error}"
+        );
     }
 
     #[test]

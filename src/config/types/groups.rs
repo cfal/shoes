@@ -29,7 +29,62 @@ pub struct ClientConfigGroup {
 pub struct RuleConfigGroup {
     pub rule_group: String,
     #[serde(alias = "rule")]
-    pub rules: OneOrSome<RuleConfig>,
+    pub rules: RuleGroupRules,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum RuleGroupRules {
+    Policies(Box<OneOrSome<RuleConfig>>),
+    Sources(OneOrSome<crate::rule_set::RuleSource>),
+}
+
+impl<'de> Deserialize<'de> for RuleGroupRules {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        use serde_yaml::Value;
+
+        let value = Value::deserialize(deserializer)?;
+        let is_list = value.is_sequence();
+        let values = match value {
+            Value::Sequence(values) => values,
+            value => vec![value],
+        };
+        if values.is_empty() {
+            return Err(Error::custom("rule group cannot be empty"));
+        }
+        let mut policies = Vec::new();
+        let mut sources = Vec::new();
+        for value in values {
+            match value {
+                Value::String(path) => {
+                    sources.push(crate::rule_set::RuleSource::from_path(path.into()))
+                }
+                Value::Mapping(ref fields) if fields.contains_key("path") => {
+                    sources.push(serde_yaml::from_value(value).map_err(Error::custom)?);
+                }
+                value => policies.push(serde_yaml::from_value(value).map_err(Error::custom)?),
+            }
+        }
+        if !policies.is_empty() && !sources.is_empty() {
+            return Err(Error::custom(
+                "rule group cannot mix policies with file sources",
+            ));
+        }
+        if sources.is_empty() {
+            Ok(Self::Policies(Box::new(if is_list {
+                OneOrSome::Some(policies)
+            } else {
+                OneOrSome::One(policies.pop().unwrap())
+            })))
+        } else {
+            Ok(Self::Sources(if is_list {
+                OneOrSome::Some(sources)
+            } else {
+                OneOrSome::One(sources.pop().unwrap())
+            }))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -194,7 +249,11 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let is_tun_config = has_device_name || has_device_fd;
 
         // Try to determine which variant based on fields
-        if map.contains_key(Value::String("global_limits".to_string())) {
+        if map.contains_key(Value::String("rule_set".to_string())) {
+            Err(Error::custom(
+                "rule_set was replaced by rule_group with file paths in rules",
+            ))
+        } else if map.contains_key(Value::String("global_limits".to_string())) {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct GlobalLimitsEntry {
@@ -301,10 +360,13 @@ mod tests {
 
     fn create_test_rule_config() -> RuleConfig {
         RuleConfig {
-            masks: OneOrSome::Some(vec![
-                NetLocationMask::from("192.168.0.0/16:80").unwrap(),
-                NetLocationMask::from("10.0.0.0/8:443").unwrap(),
-            ]),
+            criteria: super::super::rules::RuleCriteria {
+                expression: crate::rules::Expression::Legacy(OneOrSome::Some(vec![
+                    NetLocationMask::from("192.168.0.0/16:80").unwrap(),
+                    NetLocationMask::from("10.0.0.0/8:443").unwrap(),
+                ])),
+                ..Default::default()
+            },
             action: RuleActionConfig::Allow {
                 override_address: Some(NetLocation::from_ip_addr(
                     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
@@ -392,16 +454,58 @@ client_proxies:
     }
 
     #[test]
+    fn rule_group_members_determine_kind_not_action_presence() {
+        for yaml in [
+            "rule_group: policies\nrules: [{masks: example.com}]",
+            "rule_group: policies\nrule: {mask: example.com, action: block}",
+        ] {
+            let group: RuleConfigGroup = serde_yaml::from_str(yaml).unwrap();
+            let RuleGroupRules::Policies(_) = group.rules else {
+                panic!("expected policies")
+            };
+            let encoded = serde_yaml::to_string(&group).unwrap();
+            let group: RuleConfigGroup = serde_yaml::from_str(&encoded).unwrap();
+            assert!(matches!(group.rules, RuleGroupRules::Policies(_)));
+        }
+        for yaml in [
+            "rule_group: files\nrules: [a.srs, {path: b, format: srs}]",
+            "rule_group: files\nrule: a.srs",
+            "rule_group: files\nrule: [a.srs, {path: b, format: srs}]",
+            "rule_group: files\nrules: {path: a.txt, behavior: domain}",
+        ] {
+            let group: RuleConfigGroup = serde_yaml::from_str(yaml).unwrap();
+            assert!(matches!(group.rules, RuleGroupRules::Sources(_)));
+            let encoded = serde_yaml::to_string(&group).unwrap();
+            let group: RuleConfigGroup = serde_yaml::from_str(&encoded).unwrap();
+            assert!(matches!(group.rules, RuleGroupRules::Sources(_)));
+        }
+        for (rules, error) in [
+            ("[]", "cannot be empty"),
+            ("[a.srs, {masks: example.com}]", "cannot mix"),
+            ("[{masks: example.com}, {path: a.srs}]", "cannot mix"),
+            ("[{path: a.srs, action: block}]", "unknown field `action`"),
+            ("[{path: a.srs, fromat: srs}]", "unknown field `fromat`"),
+            ("[{rule_group: other}]", "unknown field `rule_group`"),
+        ] {
+            let result =
+                serde_yaml::from_str::<RuleConfigGroup>(&format!("rule_group: x\nrules: {rules}"));
+            assert!(result.unwrap_err().to_string().contains(error), "{rules}");
+        }
+        let error = serde_yaml::from_str::<Config>("rule_set: old\npath: a.srs").unwrap_err();
+        assert!(error.to_string().contains("replaced by rule_group"));
+    }
+
+    #[test]
     fn test_rule_config_group() {
         let original = vec![Config::RuleConfigGroup(RuleConfigGroup {
             rule_group: "test-rule-group".to_string(),
-            rules: OneOrSome::Some(vec![
+            rules: RuleGroupRules::Policies(Box::new(OneOrSome::Some(vec![
                 create_test_rule_config(),
                 RuleConfig {
-                    masks: OneOrSome::One(NetLocationMask::ANY),
+                    criteria: Default::default(),
                     action: RuleActionConfig::Block,
                 },
-            ]),
+            ]))),
         })];
 
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
@@ -412,10 +516,10 @@ client_proxies:
         if let Config::RuleConfigGroup(group) = &deserialized[0] {
             assert_eq!(group.rule_group, "test-rule-group");
             // Check that we have the correct number of rules by pattern matching
-            match &group.rules {
-                OneOrSome::Some(vec) => assert_eq!(vec.len(), 2),
-                OneOrSome::One(_) => panic!("Expected Some(vec), got One"),
-            }
+            let RuleGroupRules::Policies(rules) = &group.rules else {
+                panic!("Expected policies");
+            };
+            assert!(matches!(rules.as_ref(), OneOrSome::Some(values) if values.len() == 2));
         } else {
             panic!("Expected rule config group");
         }
@@ -690,7 +794,7 @@ client_proxies:
             };
 
             // Parse the YAML
-            let configs: Vec<Config> = match serde_yaml::from_str(&content) {
+            let mut configs: Vec<Config> = match serde_yaml::from_str(&content) {
                 Ok(c) => c,
                 Err(e) => {
                     failures.push(format!("- {file_name}: Failed to parse YAML: {e}"));
@@ -698,8 +802,32 @@ client_proxies:
                 }
             };
 
-            // Just test parsing, not full validation with file reads
-            // since certificate files don't exist in test environment
+            let mut compiler = crate::rules::Compiler::default();
+            let compiled = crate::rule_set::anchor(&mut configs, example_file)
+                .and_then(|()| crate::rule_set::load(&mut configs, &mut compiler))
+                .and_then(|()| crate::config::rule_visit::compile(&mut configs, &mut compiler));
+            if let Err(error) = compiled {
+                failures.push(format!("- {file_name}: invalid rules: {error}"));
+                continue;
+            }
+            if file_name == "mixed.yaml" {
+                let certificate =
+                    rcgen::generate_simple_self_signed(vec!["proxy.local".into()]).unwrap();
+                for config in &mut configs {
+                    if let Config::Server(server) = config
+                        && let crate::config::ServerProxyConfig::Tls { tls_targets, .. } =
+                            &mut server.protocol
+                    {
+                        for target in tls_targets.values_mut() {
+                            target.cert = certificate.cert.pem();
+                            target.key = certificate.signing_key.serialize_pem();
+                        }
+                    }
+                }
+                crate::config::create_server_configs(configs.clone())
+                    .expect("mixed example must pass full validation");
+            }
+            // Other examples contain deployment-specific certificates and keys.
             println!("  ✓ Parsed successfully ({} configs)", configs.len());
         }
 

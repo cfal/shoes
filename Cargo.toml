@@ -5,6 +5,7 @@ publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
 rust-version = "1.95"
 autotests = false
+autobenches = false
 license = "MIT"
 description = "A multi-protocol proxy server."
 homepage = "https://github.com/cfal/shoes/"
@@ -51,6 +52,10 @@ name = "process_contract"
 path = "tests/process_contract.rs"
 
 [[test]]
+name = "rule_allocation"
+path = "tests/rule_allocation.rs"
+
+[[test]]
 name = "integration"
 path = "tests/integration.rs"
 required-features = ["integration-tests"]
@@ -91,6 +96,7 @@ path = "tests/stress.rs"
 required-features = ["stress-tests"]
 
 [dependencies]
+aho-corasick = "1"
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
@@ -101,6 +107,10 @@ dashmap = "*"
 digest = "*"
 etherparse = "*"
 futures = "*"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+ruzstd = "0.9.1"
+prost = "0.14.4"
+yaml-rust2 = { version = "0.13", default-features = false }
 h2 = "*"
 h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn = "*"
@@ -128,6 +138,8 @@ rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 rust-argon2 = "*"
 rustc-hash = "*"
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "perf"] }
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"

@@ -1,0 +1,196 @@
+{
+  "baseline": {
+    "revision": "76df520c34b9c5052a4b0a14a1ee930900be734c",
+    "patch": "diff --git a/src/client_proxy_selector.rs b/src/client_proxy_selector.rs\nindex 1eca8db9..0441f4aa 100644\n--- a/src/client_proxy_selector.rs\n+++ b/src/client_proxy_selector.rs\n@@ -1,4 +1,8 @@\n use log::{debug, error};\n+\n+#[cfg(test)]\n+#[path = \"/shoes/.worktrees/review/benches/selector_measurement.rs\"]\n+mod measurement_bench;\n use lru::LruCache;\n use parking_lot::RwLock;\n use std::hash::Hash;",
+    "patch_sha256": "ba03c7324bcadfcb4e97c51f191e32442c9d484d9150ef85ef0565fb9805f7d3",
+    "reproduction_patch": {
+      "path": "benches/results/baseline-reproduction.patch",
+      "sha256": "8961ffa4ef1112ba5e5488c9f8b36bb30dd08f412be06b898dd952b07a504ab6",
+      "note": "Reconstructed after measurement: replace the original external absolute include with a relative include and embed the exact measured helper bytes from d8c44452. Not the patch used to build the retained executable."
+    },
+    "lockfile": {
+      "bytes": 90896,
+      "sha256": "a32ec108d9a3c430436ed81b864d28096f3ffc1815cee01ef4ec74766f26135a"
+    },
+    "patched_selector": {
+      "bytes": 104729,
+      "sha256": "54a43314b7805f39d3c569fc76adc0d04333eef6151efcaead06d0c9b081921a"
+    },
+    "build": "CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/shoes/target cargo test --release --lib measurement_bench --no-run"
+  },
+  "candidate": {
+    "revision": "d8c4445206828caea6f1bea0ba9da8c39af4f531",
+    "tree": "30dad3ca32a3e7ae86b83f94d08d5f251ad7e0d7",
+    "sources": {
+      "Cargo.lock": {
+        "bytes": 93417,
+        "sha256": "f1dacf0e4b1fe9ee91a0d93168630cb5633bdd2e0a9911646ecdcf51c1ecc386"
+      },
+      "Cargo.toml": {
+        "bytes": 5986,
+        "sha256": "4b70892dcccd948a17c5630bb78ec746bc08d5548fe9adff0fa38dafc7723f2e"
+      },
+      "benches/compare_selector.mjs": {
+        "bytes": 2317,
+        "sha256": "8e956454bb28ecb101799e0c4d0d12bd53c07a963f1c9862f9131306e6865ce1"
+      },
+      "benches/run_selector.sh": {
+        "bytes": 1292,
+        "sha256": "37159069b8c90bd46fd5b4c029f5b3cf94bcf47787d64bfb4c3b126a04d9f5d4"
+      },
+      "benches/selector_measurement.rs": {
+        "bytes": 6493,
+        "sha256": "37500360fb806a07be650207f6d92cfd5abaf630bcf54d915c9dbdf213ef5506"
+      },
+      "src/client_proxy_selector.rs": {
+        "bytes": 102832,
+        "sha256": "9e386f9c7d4cd29cfd3b4caae7ccfc335433511c30c62d861949c7df4d1cd268"
+      },
+      "src/config/mod.rs": {
+        "bytes": 3980,
+        "sha256": "2add6f245efea0f671180f73e24f97600f5d38d93793424db04c869ddb7c6095"
+      },
+      "src/config/rule_visit.rs": {
+        "bytes": 3605,
+        "sha256": "0c0067ced3fdef8fd5ee80218c3a054ed769ba204a68d76d6824904d62bb6659"
+      },
+      "src/config/types/groups.rs": {
+        "bytes": 28215,
+        "sha256": "050a13895f0b923185ae382465e8672a4cc36109c25a1a3713470a658fddba25"
+      },
+      "src/config/types/rules.rs": {
+        "bytes": 48439,
+        "sha256": "3160a007119c8b71b4e2f17cc1b78f56a9bd86f1940a4649de200c168edcae48"
+      },
+      "src/config/validate.rs": {
+        "bytes": 155620,
+        "sha256": "e533548a50dc9043787490310de6bdaa11676f19b707f587a7c6dcc2169eb711"
+      },
+      "src/ffi/common.rs": {
+        "bytes": 16045,
+        "sha256": "c41dfc2ec74d155848dd6547c63952b1ae37962c5e1de5fb9a033af6b2b9a5e1"
+      },
+      "src/lib.rs": {
+        "bytes": 3124,
+        "sha256": "c13c578bcd69fc94d5e5fc959a25bc40810abb772698112afd1d5b7571d05991"
+      },
+      "src/main.rs": {
+        "bytes": 12263,
+        "sha256": "45a8a34009c642ca1565a7a97c2a989d1ebfed7869f6ae590a807b200f55f2de"
+      },
+      "src/process.rs": {
+        "bytes": 31291,
+        "sha256": "8b4c6b7e3397266b712d95cd4c5023498ac9b28f8084689279069219dc28c8dd"
+      },
+      "src/rule_set/binary.rs": {
+        "bytes": 7757,
+        "sha256": "8dff4c221c57a484c5bcd78d7db4e082c9fc7f984f1cad629ad46305fda70e27"
+      },
+      "src/rule_set/geodata.rs": {
+        "bytes": 14132,
+        "sha256": "04bd1518315ab5bfb12fcc5f437387f694787b6e8b550daa29afe9344e5773da"
+      },
+      "src/rule_set/json.rs": {
+        "bytes": 4327,
+        "sha256": "26ca7da5e456d671a7baabe6d57569cba1c64f91bc87680f5b9a029bb84eb956"
+      },
+      "src/rule_set/mihomo.rs": {
+        "bytes": 8069,
+        "sha256": "fb6ea14c392e56edba08a8c778fc86228a548635aa9f09619fe275999c10faf5"
+      },
+      "src/rule_set/mod.rs": {
+        "bytes": 8527,
+        "sha256": "adfc45bef9f6908d463adbf007e637b337bca309048b12c7d149d65f3a72875a"
+      },
+      "src/rule_set/mrs.rs": {
+        "bytes": 8157,
+        "sha256": "450896f5fd6826c62d82dcc90c28706f90f9af9f40f87730555b39794e85e09a"
+      },
+      "src/rule_set/singbox.rs": {
+        "bytes": 8979,
+        "sha256": "5506c418b3edcaad025c87ad49b5226241a3604c4d1c0ec6d7ce5dfca16a867f"
+      },
+      "src/rule_set/srs.rs": {
+        "bytes": 10422,
+        "sha256": "81af09261cdb7e2e312d6679fa390936e45adc05d0dcf881a100958b3023e9a2"
+      },
+      "src/rules/compile.rs": {
+        "bytes": 21451,
+        "sha256": "f3f12c33d7922abecd1a438c793617373570264f85c99173e55debe07da27440"
+      },
+      "src/rules/domain.rs": {
+        "bytes": 4663,
+        "sha256": "1e6b69baf0bac25e99936ebd54a6bf11924eece979c11586cc3f0060f14071eb"
+      },
+      "src/rules/ip.rs": {
+        "bytes": 6088,
+        "sha256": "48bbcee9db721ed231865cd988ea75c62381c897afe1b6ebb74375e54ecf596b"
+      },
+      "src/rules/mod.rs": {
+        "bytes": 9253,
+        "sha256": "8e6a00e226032056d9dd3c4c210e79e42945ed668e20cdffdf3b53eadd606733"
+      },
+      "src/tcp/socket_connector_impl.rs": {
+        "bytes": 32588,
+        "sha256": "f1451a1683456e3560e06e80fe7c346d6c797a22251e90a34299a3a7383aecce"
+      },
+      "src/tcp/tcp_client_handler_factory.rs": {
+        "bytes": 16794,
+        "sha256": "33eea02c984d6e17c42d986fbc2d11bef14366cdce5ad245a8fd0dadc0e0d2d7"
+      },
+      "tests/cases/process_contract/rule_sets.rs": {
+        "bytes": 4827,
+        "sha256": "0cd8742924b83f25c145a2eb30057761dd4df89d0e42ec020b4692d8aee8baa6"
+      },
+      "tests/process_contract.rs": {
+        "bytes": 55047,
+        "sha256": "4216c18016cf6eaab56f3508429c072352300faa97fb08cd67710fa16678515d"
+      }
+    },
+    "build": "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR=/shoes/target taskset -c 0,1,3-7 cargo test --release --lib measurement_bench --no-run"
+  },
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1",
+  "cpu": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"46 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"8\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-7\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"AuthenticAMD\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"AMD Ryzen 9 3900 12-Core Processor\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"23\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"113\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"8\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"0\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"6200.00\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd ibpb stibp vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif umip rdpid arch_capabilities\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"AMD-V\"\n      },{\n         \"field\": \"Hypervisor vendor:\",\n         \"data\": \"KVM\"\n      },{\n         \"field\": \"Virtualization type:\",\n         \"data\": \"full\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"128 KiB (4 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"128 KiB (4 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"2 MiB (4 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"16 MiB (1 instance)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0-7\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Ghostwrite:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Indirect target selection:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Reg file data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Mitigation; untrained return thunk; SMT disabled\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Mitigation; SMT disabled\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Mitigation; Speculative Store Bypass disabled via prctl\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; Retpolines; IBPB conditional; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsa:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Vmscape:\",\n         \"data\": \"Not affected\"\n      }\n   ]\n}",
+  "allocator": "System (lib unit test; the server binary uses jemalloc)",
+  "profile": "release, fat LTO, default 16 codegen units, strip enabled, non-incremental, default features, RUSTFLAGS unset",
+  "metadata_correction": "The original generator incorrectly claimed codegen-units=1. Neither Cargo.toml nor the recorded commands override Cargo's non-incremental release default of 16. Original build commands and tooling hashes are retained as historical evidence.",
+  "run": "BENCH_CPU=2 BENCH_REPEATS=3 bash benches/run_selector.sh RESULTS/NAME-selector RESULTS/NAME.log",
+  "aggregate": "node benches/compare_selector.mjs RESULTS/old.log RESULTS/new.log",
+  "checks": "All 4096 queries per process verified before timing; counted stub DNS asserts exactly one lookup per measured DNS route.",
+  "artifacts": {
+    "old.log": {
+      "bytes": 112362,
+      "sha256": "b82391a8367717ada6e30eddd2a845d8c048e85db591472b4d7ab608b17ebdaa"
+    },
+    "new.log": {
+      "bytes": 119509,
+      "sha256": "d6228554bf35318bc42593ca9a78e90e10ba56b4ed00caa6ecbcc7e16e0ecf23"
+    },
+    "old-selector": {
+      "bytes": 36263496,
+      "sha256": "ce478760e863b47762495eebc9496752b39eeafcf61a2b6f99384af85f71ad8b"
+    },
+    "new-selector": {
+      "bytes": 37810280,
+      "sha256": "c9ce5cc1732927e6f6a4bcf7e6a955021b527e58eb2ca3793edece11fa825946"
+    },
+    "selector_measurement.rs": {
+      "bytes": 6493,
+      "sha256": "37500360fb806a07be650207f6d92cfd5abaf630bcf54d915c9dbdf213ef5506"
+    }
+  },
+  "tooling": {
+    "benches/run_selector.sh": {
+      "bytes": 1292,
+      "sha256": "37159069b8c90bd46fd5b4c029f5b3cf94bcf47787d64bfb4c3b126a04d9f5d4"
+    },
+    "benches/compare_selector.mjs": {
+      "bytes": 2317,
+      "sha256": "8e956454bb28ecb101799e0c4d0d12bd53c07a963f1c9862f9131306e6865ce1"
+    },
+    "benches/selector_manifest.mjs": {
+      "bytes": 2934,
+      "sha256": "f5fd91c2c44a3f02aaa1fa92f649eb57f45c91a1df4b9116055d657bfd5d76b5"
+    }
+  }
+}
