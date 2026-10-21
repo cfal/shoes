@@ -1,4 +1,5 @@
 use super::*;
+use crate::tcp::tcp_client_handler_factory::create_test_selector;
 use etherparse::PacketBuilder;
 use futures::FutureExt;
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, TcpPacket};
@@ -55,7 +56,7 @@ async fn raw_fd_tcp_sniffs_http_and_replays_through_packet_ingress() {
     ))
     .unwrap();
     let selector = Arc::new(
-        create_tcp_client_proxy_selector(vec![rule], resolver.clone())
+        create_test_selector(vec![rule], resolver.clone())
             .unwrap()
             .with_sniff(true),
     );

@@ -217,7 +217,7 @@ pub(crate) mod tests {
         .unwrap();
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let selector = Arc::new(
-            crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
+            crate::tcp::tcp_client_handler_factory::create_test_selector(
                 vec![rule],
                 resolver.clone(),
             )
@@ -368,15 +368,14 @@ pub(crate) mod tests {
                 NetLocation::from_str(TARGET, None).unwrap()
             };
             let rule = serde_yaml::from_str("masks: sniff.example:443\naction: allow").unwrap();
-            let selector =
-                crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
-                    vec![rule],
-                    resolver.clone(),
-                )
-                .unwrap()
-                .with_sniff(true)
-                .with_fake_dns_context(fake.then_some(context))
-                .unwrap();
+            let selector = crate::tcp::tcp_client_handler_factory::create_test_selector(
+                vec![rule],
+                resolver.clone(),
+            )
+            .unwrap()
+            .with_sniff(true)
+            .with_fake_dns_context(fake.then_some(context))
+            .unwrap();
             let bytes = b"GET / HTTP/1.1\r\nHost: SnIfF.Example.:80\r\n\r\n";
             for split in [0, 5, bytes.len()] {
                 let prepared =
@@ -423,12 +422,10 @@ pub(crate) mod tests {
         ));
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-        let selector = crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
-            rules,
-            resolver.clone(),
-        )
-        .unwrap()
-        .with_sniff(config.sniff);
+        let selector =
+            crate::tcp::tcp_client_handler_factory::create_test_selector(rules, resolver.clone())
+                .unwrap()
+                .with_sniff(config.sniff);
         for (target, blocked) in [
             ("0.0.0.0:80", true),
             ("[::]:80", true),
@@ -474,13 +471,12 @@ pub(crate) mod tests {
                 "- masks: sniff.example\n  action: block\n- masks: 0.0.0.0/0\n  action: allow",
             )
             .unwrap();
-            let selector =
-                crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
-                    rules,
-                    resolver.clone(),
-                )
-                .unwrap()
-                .with_sniff(enabled);
+            let selector = crate::tcp::tcp_client_handler_factory::create_test_selector(
+                rules,
+                resolver.clone(),
+            )
+            .unwrap()
+            .with_sniff(enabled);
             for (target, bytes, blocked) in [
                 (TARGET, crate::sniff::tests::http_request(), enabled),
                 (

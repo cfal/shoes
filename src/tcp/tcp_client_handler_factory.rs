@@ -414,12 +414,6 @@ pub fn create_tcp_client_proxy_selector(
     let rules = rules
         .into_iter()
         .map(|rule_config| {
-            #[cfg(test)]
-            let rule_config = {
-                let mut rule_config = rule_config;
-                rule_config.compile(&mut crate::rules::Compiler::default())?;
-                rule_config
-            };
             let RuleConfig {
                 criteria, action, ..
             } = rule_config;
@@ -447,4 +441,36 @@ pub fn create_tcp_client_proxy_selector(
         })
         .collect::<std::io::Result<Vec<_>>>()?;
     ClientProxySelector::new(rules).with_fake_dns_context(resolver.fake_dns_context())
+}
+
+#[cfg(test)]
+pub(crate) fn create_test_selector(
+    mut rules: Vec<RuleConfig>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<ClientProxySelector> {
+    for rule in &mut rules {
+        rule.compile(&mut crate::rules::Compiler::default())?;
+    }
+    create_tcp_client_proxy_selector(rules, resolver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selector_requires_precompiled_rules() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let mut rule = RuleConfig::default();
+        let error =
+            create_tcp_client_proxy_selector(vec![rule.clone()], resolver.clone()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "routing predicates must be compiled during config preparation"
+        );
+        rule.compile(&mut crate::rules::Compiler::default())
+            .unwrap();
+        create_tcp_client_proxy_selector(vec![rule], resolver).unwrap();
+    }
 }

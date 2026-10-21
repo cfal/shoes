@@ -8,12 +8,11 @@ use tokio::{
 };
 
 use super::{
-    fixture_settings,
+    compiled_server, fixture_settings,
     transports::{Tasks, echo, request},
 };
 use crate::{
-    async_stream::AsyncStream, config::ServerConfig, resolver::NativeResolver,
-    vless::encryption::ClientEncryption,
+    async_stream::AsyncStream, resolver::NativeResolver, vless::encryption::ClientEncryption,
 };
 
 const LIMIT: Duration = Duration::from_secs(10);
@@ -29,7 +28,7 @@ async fn port() -> u16 {
 }
 
 async fn listen(config: serde_json::Value) -> Tasks {
-    let config: ServerConfig = serde_json::from_value(config).unwrap();
+    let config = compiled_server(config);
     Tasks(
         crate::tcp::tcp_server::start_servers(
             crate::config::Config::Server(config),

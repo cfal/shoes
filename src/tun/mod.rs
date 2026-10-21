@@ -435,11 +435,22 @@ mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
 
+    fn compiled_config(yaml: &str) -> TunConfig {
+        let mut config: TunConfig = serde_yaml::from_str(yaml).unwrap();
+        for rule in config.rules.iter_mut() {
+            let ConfigSelection::Config(rule) = rule else {
+                panic!("test config contains an unexpanded rule group")
+            };
+            rule.compile(&mut crate::rules::Compiler::default())
+                .unwrap();
+        }
+        config
+    }
     #[tokio::test]
     async fn startup_acknowledges_initialization_and_returns_errors() {
         use std::os::fd::IntoRawFd;
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-        let invalid = serde_yaml::from_str("resource_limits: {tcp_buffer_size: 0}").unwrap();
+        let invalid = compiled_config("resource_limits: {tcp_buffer_size: 0}");
         assert_eq!(
             start_tun_server(invalid, resolver.clone())
                 .await
@@ -449,7 +460,7 @@ mod tests {
         );
         let (_peer, device) = std::os::unix::net::UnixDatagram::pair().unwrap();
         let fd = device.into_raw_fd();
-        let config = serde_yaml::from_str(&format!("device_fd: {fd}")).unwrap();
+        let config = compiled_config(&format!("device_fd: {fd}"));
         let task = start_tun_server(config, resolver).await.unwrap();
         assert!(!task.is_finished());
         assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
@@ -467,8 +478,13 @@ mod tests {
         ))
         .unwrap();
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-        let selector =
-            Arc::new(create_tcp_client_proxy_selector(vec![rule], resolver.clone()).unwrap());
+        let selector = Arc::new(
+            crate::tcp::tcp_client_handler_factory::create_test_selector(
+                vec![rule],
+                resolver.clone(),
+            )
+            .unwrap(),
+        );
         let control = Arc::new(tcp_conn::TcpConnectionControl::new(1024, 1024));
         let (wake, _wake_rx) = wake::Wake::new().unwrap();
         let connection = tcp_conn::TcpConnection::new(control.clone(), wake);
@@ -619,11 +635,10 @@ mod tests {
     #[tokio::test]
     async fn startup_propagates_required_offload_validation_failure() {
         let (_peer, device) = std::os::unix::net::UnixDatagram::pair().unwrap();
-        let config: TunConfig = serde_yaml::from_str(&format!(
+        let config = compiled_config(&format!(
             "device_fd: {}\nsegmentation_offload: true\n",
             device.as_raw_fd()
-        ))
-        .unwrap();
+        ));
         let result =
             start_tun_server(config, Arc::new(crate::resolver::NativeResolver::new())).await;
         match result {
@@ -640,11 +655,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn startup_propagates_device_creation_failure() {
-        let config: TunConfig = serde_yaml::from_str(&format!(
+        let config = compiled_config(&format!(
             "device_name: {}\nsegmentation_offload: true\n",
             "x".repeat(libc::IFNAMSIZ + 1)
-        ))
-        .unwrap();
+        ));
         let result =
             start_tun_server(config, Arc::new(crate::resolver::NativeResolver::new())).await;
         match result {
@@ -663,7 +677,7 @@ mod tests {
         let (mut peer, device) = std::os::unix::net::UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
         let fd = device.into_raw_fd();
-        let config: TunConfig = serde_yaml::from_str(&format!("device_fd: {fd}\n")).unwrap();
+        let config = compiled_config(&format!("device_fd: {fd}\n"));
         let handle = start_tun_server(config, Arc::new(crate::resolver::NativeResolver::new()))
             .await
             .unwrap();

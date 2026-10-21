@@ -8,10 +8,9 @@ use tokio::{
     time::timeout,
 };
 
-use super::fixture_settings;
+use super::{compiled_server, fixture_settings};
 use crate::{
-    config::ServerConfig, quic_stream::QuicStream, resolver::NativeResolver,
-    vless::encryption::ClientEncryption,
+    quic_stream::QuicStream, resolver::NativeResolver, vless::encryption::ClientEncryption,
 };
 
 const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -153,12 +152,11 @@ async fn legacy_and_native_address_forms_and_empty_udp_responses() {
             .local_addr()
             .unwrap()
             .port();
-        let config: ServerConfig = serde_json::from_value(json!({
+        let config = compiled_server(json!({
             "address":format!("0.0.0.0:{port}"),
             "protocol":{"type":"vless","user_id":UUID,"udp_enabled":true,
                 "decryption":if native {decryption.as_str()} else {"none"},"vision":vision}
-        }))
-        .unwrap();
+        }));
         let mut listeners = Tasks(
             crate::tcp::tcp_server::start_servers(
                 crate::config::Config::Server(config),
@@ -349,11 +347,10 @@ async fn h2mux_multiplexes_concurrent_streams_over_one_encrypted_connection() {
             .local_addr()
             .unwrap()
             .port();
-        let config: ServerConfig = serde_json::from_value(json!({
+        let config = compiled_server(json!({
             "address": format!("0.0.0.0:{port}"),
             "protocol": {"type": "vless", "user_id": UUID, "decryption": decryption},
-        }))
-        .unwrap();
+        }));
         let mut listeners = Tasks(
             crate::tcp::tcp_server::start_servers(
                 crate::config::Config::Server(config),
@@ -434,13 +431,13 @@ async fn raw_quic_bind_addresses_share_tickets_and_capacity() {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     drop(socket);
-    let config: ServerConfig = serde_json::from_value(json!({
+    let config = compiled_server(json!({
         "addresses": [format!("127.0.0.1:{port}"), format!("127.0.0.2:{port}")],
         "transport": "quic",
         "quic_settings": {"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem(), "num_endpoints": 1},
         "protocol": {"type": "vless", "user_id": UUID, "decryption": decryption,
             "encryption_limits": {"max_sessions": 100, "max_replays": 100, "max_replays_per_session": 1}},
-    })).unwrap();
+    }));
     let mut listeners = Tasks(
         crate::quic_server::start_quic_servers(config, Arc::new(NativeResolver::new()))
             .await
@@ -516,11 +513,10 @@ async fn encrypted_xudp_control_empty_and_multiple_sessions_and_udp_flow_rejecti
         .local_addr()
         .unwrap()
         .port();
-    let config: ServerConfig = serde_json::from_value(json!({
+    let config = compiled_server(json!({
         "address": format!("0.0.0.0:{port}"),
         "protocol": {"type": "vless", "user_id": UUID, "decryption": decryption, "vision": true},
-    }))
-    .unwrap();
+    }));
     let mut listeners = Tasks(
         crate::tcp::tcp_server::start_servers(
             crate::config::Config::Server(config),
