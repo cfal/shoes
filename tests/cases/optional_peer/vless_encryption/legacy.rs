@@ -109,8 +109,10 @@ async fn legacy_peers_assert_direct_end_and_eof_over_tls_and_reality() {
                     // sing-box's Vision wrapper has no CloseWrite. Clients close both sides on
                     // upload EOF; servers can reset TLS 1.2 replies when the target closes first.
                     // Upstream fix: https://github.com/SagerNet/sing-vmess/pull/16
-                    let half_close_before_reply = !mihomo_requires_reply_first
-                        && (peer != Kind::SingBox || (!peer_client && inner_tls12 != Some(true)));
+                    let singbox_requires_reply_first =
+                        peer == Kind::SingBox && (peer_client || inner_tls12 == Some(true));
+                    let half_close_before_reply =
+                        !mihomo_requires_reply_first && !singbox_requires_reply_first;
                     decision_case(
                         peer,
                         peer_client,

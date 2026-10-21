@@ -10,13 +10,7 @@ jobs:
   xray:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: v26.10.21
-            revision: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
-    name: Xray ${{ matrix.name }}
+    name: Xray v26.10.21
     env:
       CARGO_BUILD_JOBS: 1
       GOMAXPROCS: 1
@@ -30,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: XTLS/Xray-core
-          ref: ${{ matrix.revision }}
+          ref: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
           path: reality-peer
       - name: Cache Rust artifacts
         uses: actions/cache@v4

@@ -78,12 +78,6 @@ pub struct NewTcpConnection {
     pub remote_addr: SocketAddr,
 }
 
-/// Shared state for communication between main thread and stack thread.
-struct SharedState {
-    /// Channel for UDP responses to write to TUN
-    udp_response_rx: Option<Receiver<PacketBuffer>>,
-}
-
 struct StackChannels {
     udp: Sender<PacketBuffer>,
     tcp: mpsc::UnboundedSender<NewTcpConnection>,
@@ -104,8 +98,8 @@ pub struct TcpStackDirect {
     tcp_rx: Option<mpsc::UnboundedReceiver<NewTcpConnection>>,
     ready: Option<oneshot::Receiver<()>>,
     completion: oneshot::Receiver<io::Result<()>>,
-    /// Shared state with the stack thread
-    shared_state: Arc<Mutex<SharedState>>,
+    /// Receiver waiting for handoff to the stack thread.
+    pending_udp_response_rx: Arc<Mutex<Option<Receiver<PacketBuffer>>>>,
     /// TUN file descriptor (owned, will be closed on drop)
     _tun_fd: OwnedFd,
 }
@@ -167,13 +161,11 @@ impl TcpStackDirect {
         let (completion_tx, completion) = oneshot::channel();
 
         let running = Arc::new(AtomicBool::new(true));
-        let shared_state = Arc::new(Mutex::new(SharedState {
-            udp_response_rx: None,
-        }));
+        let pending_udp_response_rx = Arc::new(Mutex::new(None));
 
         let thread_handle = {
             let running = running.clone();
-            let shared_state = shared_state.clone();
+            let pending_udp_response_rx = pending_udp_response_rx.clone();
             let stack_wake = wake.clone();
 
             thread::Builder::new()
@@ -192,7 +184,7 @@ impl TcpStackDirect {
                                 ready: ready_tx,
                             },
                             running.clone(),
-                            shared_state,
+                            pending_udp_response_rx,
                             stack_wake,
                             wake_rx,
                         )
@@ -227,7 +219,7 @@ impl TcpStackDirect {
             tcp_rx: Some(tcp_rx),
             ready: Some(ready_rx),
             completion,
-            shared_state,
+            pending_udp_response_rx,
             _tun_fd: tun_fd,
         })
     }
@@ -262,8 +254,8 @@ impl TcpStackDirect {
 
     /// Set the channel for UDP responses to write back to TUN.
     pub fn set_udp_response_tx(&mut self, rx: Receiver<PacketBuffer>) {
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.udp_response_rx = Some(rx);
+        if let Ok(mut pending) = self.pending_udp_response_rx.lock() {
+            *pending = Some(rx);
         }
         self.wake.notify();
     }
@@ -483,7 +475,7 @@ fn run_direct_stack_thread(
     config: TunServerConfig,
     channels: StackChannels,
     running: Arc<AtomicBool>,
-    shared_state: Arc<Mutex<SharedState>>,
+    pending_udp_response_rx: Arc<Mutex<Option<Receiver<PacketBuffer>>>>,
     stack_wake: Wake,
     mut wake_rx: WakeReceiver,
 ) -> io::Result<()> {
@@ -541,8 +533,8 @@ fn run_direct_stack_thread(
 
     while running.load(Ordering::Relaxed) {
         wake_rx.drain()?;
-        if let Ok(mut state) = shared_state.lock()
-            && let Some(rx) = state.udp_response_rx.take()
+        if let Ok(mut pending) = pending_udp_response_rx.lock()
+            && let Some(rx) = pending.take()
         {
             udp_response_rx = Some(rx);
         }
