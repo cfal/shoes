@@ -1063,6 +1063,12 @@ fn write_framed_packet_with(
                 trace!("TUN interface down, packet dropped");
                 return Ok(false);
             }
+            // Apple netif-mode utun reports a full input queue as ENOSPC.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => {
+                trace!("TUN input queue full, packet dropped");
+                return Ok(false);
+            }
             Err(error)
                 if error.raw_os_error() == Some(libc::ENOBUFS)
                     || error.kind() == io::ErrorKind::WouldBlock =>
@@ -1113,6 +1119,23 @@ mod tests {
                 assert!(!result.unwrap());
             } else {
                 assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+            }
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
+    fn enospc_writes_are_packet_drops_only_on_apple_kernels() {
+        for header in [&[][..], &[0; 4][..], &[0; 10][..]] {
+            let mut attempts = 0;
+            let result = write_framed_packet_with(b"packet", header, |_, _| {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            });
+            if cfg!(any(target_os = "macos", target_os = "ios")) {
+                assert!(!result.unwrap());
+            } else {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOSPC));
             }
             assert_eq!(attempts, 1);
         }
