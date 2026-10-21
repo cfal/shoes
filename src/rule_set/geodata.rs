@@ -3,7 +3,7 @@ use std::io;
 use prost::Message;
 use prost::encoding::{WireType, decode_key, decode_varint};
 
-use crate::rules::{Compiler, Expression, IpRanges, invalid};
+use crate::rules::{Compiler, Expression, IpRanges, MAX_ENTRIES, MAX_STRING_BYTES, invalid};
 
 // Minimal bindings for Xray common/geodata/geodat.proto. Unknown enums remain
 // numeric until validation; absent enum values keep the proto3 substring default.
@@ -157,7 +157,7 @@ fn category_entries(
             (3, Field::Number(value)) if invert.is_none() => invert = Some(value != 0),
             (2, Field::Bytes(item)) => {
                 count += 1;
-                if count > super::binary::MAX_ENTRIES {
+                if count > MAX_ENTRIES {
                     return Err(invalid("DAT entry limit exceeded"));
                 }
                 budget.charge(item.len().saturating_mul(8).saturating_add(256), 1)?;
@@ -190,7 +190,7 @@ fn domain(
             (1, Field::Number(0..=3)) if !kind_seen => kind_seen = true,
             (2, Field::Bytes(value)) if !value_seen => {
                 value_seen = true;
-                if value.is_empty() || value.len() > 64 * 1024 {
+                if value.is_empty() || value.len() > MAX_STRING_BYTES {
                     return Err(invalid("invalid DAT domain value length"));
                 }
             }

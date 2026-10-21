@@ -2,7 +2,9 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use crate::rules::{Compiler, Expression, IpRanges, domain, invalid};
+use crate::rules::{
+    Compiler, Expression, IpRanges, MAX_ENTRIES, MAX_STRING_BYTES, domain, invalid,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -28,7 +30,7 @@ pub(super) fn decode(
             .map(str::trim)
             .filter(|s| !s.is_empty() && !s.starts_with('#') && !s.starts_with("//"))
             .map(|entry| {
-                if entry.len() > 64 * 1024 {
+                if entry.len() > MAX_STRING_BYTES {
                     return Err(invalid("provider entry exceeds 64 KiB"));
                 }
                 budget.charge(entry.len() * 4 + 256, 1)?;
@@ -36,7 +38,7 @@ pub(super) fn decode(
             })
             .collect::<io::Result<Vec<_>>>()?
     };
-    if entries.len() > super::binary::MAX_ENTRIES {
+    if entries.len() > MAX_ENTRIES {
         return Err(invalid("provider entry limit exceeded"));
     }
     let mut rules = Vec::with_capacity(entries.len());

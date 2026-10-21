@@ -1,8 +1,8 @@
 use std::io;
 
-use super::binary::{MAX_ENTRIES, Reader, inflate};
+use super::binary::{Reader, inflate};
 use super::singbox::{LiteralKind, Parts, literals, port_ranges};
-use crate::rules::{Compiler, Expression, IpRanges, invalid};
+use crate::rules::{Compiler, Expression, IpRanges, MAX_DEPTH, MAX_ENTRIES, invalid};
 
 pub fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Expression> {
     if bytes.len() < 4 || &bytes[..3] != b"SRS" || !(1..=5).contains(&bytes[3]) {
@@ -30,7 +30,7 @@ fn rule(
     depth: usize,
     remaining: &mut usize,
 ) -> io::Result<Expression> {
-    if depth > 100 || *remaining == 0 {
+    if depth > MAX_DEPTH || *remaining == 0 {
         return Err(invalid("SRS rule count/nesting limit exceeded"));
     }
     *remaining -= 1;

@@ -13,6 +13,10 @@ pub use compile::Compiler;
 use domain::{DomainKind, Names};
 pub use ip::IpRanges;
 
+pub(crate) const MAX_ENTRIES: usize = 2_000_000;
+pub(crate) const MAX_DEPTH: usize = 100;
+pub(crate) const MAX_STRING_BYTES: usize = 64 * 1024;
+
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }

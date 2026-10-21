@@ -1,8 +1,7 @@
 use std::io;
 
-use crate::rules::{Compiler, invalid};
+use crate::rules::{Compiler, MAX_ENTRIES, MAX_STRING_BYTES, invalid};
 
-pub(super) const MAX_ENTRIES: usize = 2_000_000;
 pub(super) const MAX_INFLATED: usize = 256 * 1024 * 1024;
 
 pub(super) fn inflate(bytes: &[u8], budget: &mut Compiler) -> io::Result<Vec<u8>> {
@@ -124,7 +123,7 @@ impl<'a> Reader<'a> {
         self.budget.charge(count * 32, count)?;
         let mut strings = Vec::with_capacity(count);
         for _ in 0..count {
-            let len = self.count(false, 64 * 1024, 1)?;
+            let len = self.count(false, MAX_STRING_BYTES, 1)?;
             self.charge(len * 2)?;
             let string = String::from_utf8(self.take(len)?.to_vec())
                 .map_err(|_| invalid("invalid UTF-8 rule string"))?;

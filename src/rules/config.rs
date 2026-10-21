@@ -2,7 +2,7 @@ use std::io;
 
 use serde_json::Value;
 
-use super::{Expression, compile::MAX_DEPTH, invalid};
+use super::{Expression, MAX_DEPTH, invalid};
 use crate::rule_set::RuleSource;
 
 impl Expression {

@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 
-use super::{Expression, IpRanges, Kind, Predicate, domain, invalid};
+use super::{
+    Expression, IpRanges, Kind, MAX_DEPTH, MAX_ENTRIES, MAX_STRING_BYTES, Predicate, domain,
+    invalid,
+};
 use crate::address::{Address, NetLocationMask};
 use domain::{DomainKind, Names};
 
-pub const MAX_ENTRIES: usize = 2_000_000;
 pub const MAX_BYTES: usize = 512 * 1024 * 1024;
-pub const MAX_DEPTH: usize = 100;
 const MAX_REGEX_MATCHER_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
@@ -61,7 +62,7 @@ impl Compiler {
 
     fn strings(&mut self, values: &[String]) -> io::Result<()> {
         for value in values {
-            if value.len() > 64 * 1024 || !value.is_ascii() {
+            if value.len() > MAX_STRING_BYTES || !value.is_ascii() {
                 return Err(invalid("rule strings must be ASCII and at most 64 KiB"));
             }
             self.charge(value.capacity().saturating_mul(4).saturating_add(96), 1)?;

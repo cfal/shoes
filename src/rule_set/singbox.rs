@@ -3,7 +3,7 @@ use std::io;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::rules::{Compiler, Expression, domain, invalid};
+use crate::rules::{Compiler, Expression, MAX_DEPTH, MAX_STRING_BYTES, domain, invalid};
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -73,7 +73,7 @@ pub fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Expression> {
 }
 
 fn rule(value: Value, depth: usize) -> io::Result<Expression> {
-    if depth > 100 {
+    if depth > MAX_DEPTH {
         return Err(invalid("rule nesting exceeds 100"));
     }
     if value.get("type").and_then(Value::as_str) == Some("logical") {
@@ -170,7 +170,7 @@ pub(super) fn literals(input: Vec<String>, kind: LiteralKind) -> io::Result<Expr
     let mut strict = Vec::new();
     let mut uppercase = 0;
     for value in input {
-        if !value.is_ascii() || value.is_empty() || value.len() > 64 * 1024 {
+        if !value.is_ascii() || value.is_empty() || value.len() > MAX_STRING_BYTES {
             return Err(invalid(
                 "sing-box literals must be nonempty ASCII strings of at most 64 KiB",
             ));

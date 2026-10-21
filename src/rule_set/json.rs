@@ -4,7 +4,7 @@ use std::io;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
-use crate::rules::{Compiler, invalid};
+use crate::rules::{Compiler, MAX_DEPTH, MAX_STRING_BYTES, invalid};
 
 pub(super) fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Value> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
@@ -30,7 +30,7 @@ impl<'de> DeserializeSeed<'de> for Seed<'_> {
     type Value = Value;
 
     fn deserialize<D: de::Deserializer<'de>>(mut self, decoder: D) -> Result<Value, D::Error> {
-        if self.depth > 100 {
+        if self.depth > MAX_DEPTH {
             return Err(de::Error::custom("rule-set JSON nesting exceeds 100"));
         }
         // Covers Value/vector capacity and the later typed expression while the
@@ -62,7 +62,7 @@ impl<'de> Visitor<'de> for Seed<'_> {
         Err(E::custom("rule-set numbers must be integers"))
     }
     fn visit_str<E: de::Error>(mut self, v: &str) -> Result<Value, E> {
-        if v.len() > 64 * 1024 {
+        if v.len() > MAX_STRING_BYTES {
             return Err(E::custom("rule string exceeds 64 KiB"));
         }
         self.charge(v.len() * 2 + 32, 1)?;

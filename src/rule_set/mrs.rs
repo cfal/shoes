@@ -1,8 +1,8 @@
 use std::io::{self, Read};
 
-use super::binary::{MAX_ENTRIES, Reader, append_inflated};
+use super::binary::{Reader, append_inflated};
 use super::mihomo::{Behavior, domain_entry};
-use crate::rules::{Compiler, Expression, IpRanges, invalid};
+use crate::rules::{Compiler, Expression, IpRanges, MAX_ENTRIES, invalid};
 
 const MAX_WINDOW: usize = 8 * 1024 * 1024;
 

@@ -5,7 +5,7 @@ use yaml_rust2::parser::{Event, Parser};
 use yaml_rust2::scanner::TScalarStyle;
 
 use super::YAML_PARSER_SCRATCH_BYTES as PARSER_SCRATCH;
-use crate::rules::{Compiler, invalid};
+use crate::rules::{Compiler, MAX_STRING_BYTES, invalid};
 
 const READ_AHEAD: usize = 128 * 1024;
 
@@ -63,7 +63,7 @@ pub(super) fn decode(bytes: &[u8], budget: &mut Compiler) -> io::Result<Vec<Stri
         match next()? {
             Event::SequenceEnd => break,
             Event::Scalar(value, style, 0, None) => {
-                if value.len() > 64 * 1024 {
+                if value.len() > MAX_STRING_BYTES {
                     return Err(invalid("provider entry exceeds 64 KiB"));
                 }
                 // Preserve YAML's distinction between plain numbers/bools/null
