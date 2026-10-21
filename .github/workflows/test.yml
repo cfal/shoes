@@ -140,8 +140,23 @@ jobs:
     - name: Run process contract tests
       run: cargo test -p shoes --locked --test process_contract --verbose -- --test-threads=1
 
+    - name: Run rule compilation allocation regression
+      run: cargo test -p shoes --locked --test rule_allocation --verbose
+
     - name: Run host FFI tests
       run: cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
+
+  benchmark-tooling:
+    name: Benchmark tooling
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - name: Test benchmark harness and manifests
+      run: node --test benches/*.test.mjs
 
   tun-macos:
     name: Rootless TUN (macOS)
@@ -169,6 +184,14 @@ jobs:
     - name: Run rootless WireGuard, FFI, and process lifecycle tests
       run: >-
         cargo test -p shoes --locked --lib --test process_contract --features ffi wireguard -- --test-threads=1
+
+    - name: Run FFI rule-source startup and packet tests
+      run: >-
+        cargo test -p shoes --locked --lib --features ffi ffi::common::rule_source_tests -- --test-threads=1
+
+    - name: Run rule-source routing and filesystem reload tests
+      run: >-
+        cargo test -p shoes --locked --test process_contract --features ffi rule_sets:: -- --test-threads=1
 
   integration-tests:
     name: Integration (${{ matrix.name }})
