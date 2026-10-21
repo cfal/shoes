@@ -134,12 +134,7 @@ fn visit_sources(
     }
     rule_visit::visit(
         configs,
-        &mut |rule| {
-            if let Some(expression) = &mut rule.criteria.expression {
-                expression.visit_sources(visitor)?;
-            }
-            Ok(())
-        },
+        &mut |rule| rule.criteria.expression.visit_sources(visitor),
         &mut |_| Ok(()),
     )
 }

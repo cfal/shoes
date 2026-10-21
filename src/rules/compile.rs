@@ -419,6 +419,18 @@ mod tests {
     use crate::rules::Outcome;
 
     #[test]
+    fn legacy_rule_config_keeps_its_compilation_budget() {
+        let mut rule: crate::config::RuleConfig =
+            serde_yaml::from_str("masks: 0.0.0.0/0\naction: block").unwrap();
+        let mut compiler = Compiler::default();
+        rule.compile(&mut compiler).unwrap();
+        assert_eq!(compiler.bytes, 256);
+        assert_eq!(compiler.entries, 0);
+        rule.compile(&mut compiler).unwrap();
+        assert_eq!(compiler.bytes, 256);
+    }
+
+    #[test]
     fn mixed_mask_lists_keep_legacy_entries_in_one_index() {
         let masks = ["example.com:443", "192.0.2.0/24", "0.0.0.0/0:80"];
         let mut expressions: Vec<_> = masks

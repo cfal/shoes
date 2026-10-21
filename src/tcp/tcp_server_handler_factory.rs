@@ -773,7 +773,12 @@ mod tests {
         );
         for (mask, should_sniff) in [("0.0.0.0/0", false), ("child.example", true)] {
             let rules = NoneOrSome::One(ConfigSelection::Config(RuleConfig {
-                masks: OneOrSome::One(NetLocationMask::from(mask).unwrap()),
+                criteria: crate::config::rules::RuleCriteria {
+                    expression: crate::rules::Expression::Legacy(OneOrSome::One(
+                        NetLocationMask::from(mask).unwrap(),
+                    )),
+                    ..Default::default()
+                },
                 ..Default::default()
             }));
             let child = create_override_selector(rules, &parent, &resolver).unwrap();

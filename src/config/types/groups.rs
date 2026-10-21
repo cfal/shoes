@@ -360,11 +360,13 @@ mod tests {
 
     fn create_test_rule_config() -> RuleConfig {
         RuleConfig {
-            criteria: Default::default(),
-            masks: OneOrSome::Some(vec![
-                NetLocationMask::from("192.168.0.0/16:80").unwrap(),
-                NetLocationMask::from("10.0.0.0/8:443").unwrap(),
-            ]),
+            criteria: super::super::rules::RuleCriteria {
+                expression: crate::rules::Expression::Legacy(OneOrSome::Some(vec![
+                    NetLocationMask::from("192.168.0.0/16:80").unwrap(),
+                    NetLocationMask::from("10.0.0.0/8:443").unwrap(),
+                ])),
+                ..Default::default()
+            },
             action: RuleActionConfig::Allow {
                 override_address: Some(NetLocation::from_ip_addr(
                     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
@@ -500,7 +502,6 @@ client_proxies:
             rules: RuleGroupRules::Policies(Box::new(OneOrSome::Some(vec![
                 create_test_rule_config(),
                 RuleConfig {
-                    masks: OneOrSome::One(NetLocationMask::ANY),
                     criteria: Default::default(),
                     action: RuleActionConfig::Block,
                 },

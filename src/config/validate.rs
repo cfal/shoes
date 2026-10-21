@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-use crate::address::NetLocationMask;
 use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
@@ -62,7 +61,6 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     rule_groups.insert(
         String::from("allow-all-direct"),
         vec![RuleConfig {
-            masks: OneOrSome::One(NetLocationMask::ANY),
             criteria: Default::default(),
             action: RuleActionConfig::Allow {
                 override_address: None,
@@ -73,7 +71,6 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     rule_groups.insert(
         String::from("block-all"),
         vec![RuleConfig {
-            masks: OneOrSome::One(NetLocationMask::ANY),
             criteria: Default::default(),
             action: RuleActionConfig::Block,
         }],
@@ -2875,7 +2872,6 @@ mod tests {
                 rule_group: "test-rules".to_string(),
                 rules: crate::config::RuleGroupRules::Policies(Box::new(OneOrSome::One(
                     RuleConfig {
-                        masks: OneOrSome::One(NetLocationMask::ANY),
                         criteria: Default::default(),
                         action: RuleActionConfig::Allow {
                             override_address: None,
