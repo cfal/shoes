@@ -1151,6 +1151,9 @@ one operator: `all`, `any`, `not`, or a leaf. The same forms work recursively in
 `all`/`any`/`not`; strings always remain legacy masks, never group names or paths.
 Lists inside a typed leaf are alternatives.
 
+Keep mixed legacy masks and imported groups in one OR list: splitting them into
+separate policies can change ordered DNS evaluation.
+
 ```yaml
 rules:
   - masks:
@@ -1397,14 +1400,6 @@ errors: actions are never discarded or invented. Group nesting is not supported.
     type: http
   rules: standard-rules        # Reference by name
 ```
-
-The unshipped `rule_set`, `rule_sets`, and `match` spellings are replaced, not
-aliases. Convert a named `rule_set` to `rule_group` with its source under `rules`;
-convert `rule_sets: [a, b]` to `masks: [{rule_group: a}, {rule_group: b}]`. Move typed
-`match` expressions under `masks`, replacing `{rule_set: a}` leaves with
-`{rule_group: a}`. Existing mask strings and action-bearing policy groups retain
-their semantics. Keep mixed legacy masks and imported groups in one OR list:
-splitting them into separate policies can change ordered DNS evaluation.
 
 ## Named PEMs
 
