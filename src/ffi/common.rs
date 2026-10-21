@@ -335,6 +335,10 @@ pub async fn start_from_config(
 mod wireguard_tests;
 
 #[cfg(all(test, unix))]
+#[path = "rule_source_tests.rs"]
+mod rule_source_tests;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
