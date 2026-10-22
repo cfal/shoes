@@ -10,6 +10,9 @@ use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::config::WebsocketPingType;
 use crate::util::allocate_vec;
 
+/// RFC 6455 limits control frame payloads to 125 bytes.
+const MAX_CONTROL_PAYLOAD_LEN: usize = 125;
+
 pub struct WebsocketStream {
     stream: Box<dyn AsyncStream>,
     is_client: bool,
@@ -69,6 +72,14 @@ impl OpCode {
             _ => OpCode::Unknown(code),
         }
     }
+
+    fn is_control(self) -> bool {
+        match self {
+            OpCode::Close | OpCode::Ping | OpCode::Pong => true,
+            OpCode::Unknown(code) => code >= 8,
+            OpCode::Continue | OpCode::Text | OpCode::Binary => false,
+        }
+    }
 }
 
 impl WebsocketStream {
@@ -81,7 +92,7 @@ impl WebsocketStream {
         let mut unprocessed_buf = allocate_vec(16384).into_boxed_slice();
         let mut unprocessed_end_offset = 0;
         let write_frame = allocate_vec(32768).into_boxed_slice();
-        let ping_data = allocate_vec(80).into_boxed_slice();
+        let ping_data = allocate_vec(MAX_CONTROL_PAYLOAD_LEN).into_boxed_slice();
 
         let pending_initial_data = if !unprocessed_data.is_empty() {
             unprocessed_buf[0..unprocessed_data.len()].copy_from_slice(unprocessed_data);
@@ -247,6 +258,14 @@ impl WebsocketStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::io::Result<()> {
+        if self.read_frame_opcode.is_control()
+            && self.read_frame_length > MAX_CONTROL_PAYLOAD_LEN as u64
+        {
+            return Err(std::io::Error::other(format!(
+                "control frame payload too large ({})",
+                self.read_frame_length
+            )));
+        }
         match self.read_frame_opcode {
             OpCode::Binary | OpCode::Continue => {
                 if self.read_frame_length == 0 {
@@ -268,13 +287,6 @@ impl WebsocketStream {
                     self.pending_write_pong = true;
                     self.step_init(cx, buf)
                 } else {
-                    if self.read_frame_length as usize > self.ping_data.len() {
-                        return Err(std::io::Error::other(format!(
-                            "cannot handle ping data length ({})",
-                            self.read_frame_length
-                        )));
-                    }
-
                     // Make sure we aren't writing pongs when we're reading new ping data.
                     self.pending_write_pong = false;
                     self.read_state = ReadState::ReadPingContent;
@@ -292,15 +304,14 @@ impl WebsocketStream {
                 // So it's hard to keep track of if a pong is "valid".
                 // https://www.rfc-editor.org/rfc/rfc6455.html#section-5.5.3
 
-                // Our ping frames are always with zero data.
-                if self.read_frame_length != 0 {
-                    return Err(std::io::Error::other(format!(
-                        "unexpected pong data length ({})",
-                        self.read_frame_length
-                    )));
+                // Unsolicited pongs are heartbeats and may carry any payload; skip it.
+                if self.read_frame_length == 0 {
+                    self.read_state = ReadState::Init;
+                    self.step_init(cx, buf)
+                } else {
+                    self.read_state = ReadState::SkipContent;
+                    self.step_skip_content(cx, buf)
                 }
-                self.read_state = ReadState::Init;
-                self.step_init(cx, buf)
             }
             // TODO: handle close frames
             _ => {
@@ -940,5 +951,38 @@ mod tests {
                 assert_eq!(buf.filled(), &[if pong { 0x8a } else { 0x89 }, 0]);
             }
         }
+    }
+
+    fn frame(first: u8, masked: bool, payload: &[u8]) -> Vec<u8> {
+        let mut output = vec![0; payload.len() + 14];
+        let len = pack_frame(first & 0x0f, masked, payload, &mut output);
+        output.truncate(len);
+        output[0] = first;
+        output
+    }
+
+    #[tokio::test]
+    async fn control_frames_at_the_size_limit_are_accepted() {
+        let ping = [0x5a; 125];
+        let mut frames = frame(0x89, true, &ping);
+        frames.extend(frame(0x8a, true, b"unsolicited heartbeat"));
+        frames.extend(frame(0x82, true, b"data"));
+        let (io, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(&frames).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut stream =
+            WebsocketStream::new(Box::new(io), false, WebsocketPingType::PingFrame, &[]);
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"data");
+        let wrote_pong = futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_ping(cx))
+            .await
+            .unwrap();
+        assert!(wrote_pong);
+        stream.flush().await.unwrap();
+        let mut pong = vec![0; 2 + ping.len()];
+        peer.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong[..2], &[0x8a, 125]);
+        assert_eq!(&pong[2..], ping);
     }
 }
