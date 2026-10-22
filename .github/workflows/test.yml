@@ -193,6 +193,10 @@ jobs:
       run: >-
         cargo test -p shoes --locked --test process_contract --features ffi rule_sets:: -- --test-threads=1
 
+    - name: Run process filesystem watcher unit tests
+      run: >-
+        cargo test -p shoes --locked --bin shoes process:: -- --test-threads=1
+
   integration-tests:
     name: Integration (${{ matrix.name }})
     needs: unit-tests
