@@ -1246,17 +1246,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_bad_requests_and_path_misses_return_plain_http_errors() {
+    async fn errors_are_plain_while_successes_keep_xhttp_headers() {
         tokio::time::timeout(Duration::from_secs(10), async {
             for version in [XhttpVersion::H1, XhttpVersion::H2, XhttpVersion::H3] {
-                for (path, status) in [
-                    ("/wrong", StatusCode::NOT_FOUND),
-                    ("/t/session", StatusCode::BAD_REQUEST),
+                for (method, path, status) in [
+                    ("GET", "/wrong".to_owned(), StatusCode::NOT_FOUND),
+                    ("GET", "/t/session".to_owned(), StatusCode::BAD_REQUEST),
+                    (
+                        "PUT",
+                        format!("/t/session/0?x_padding={}", "X".repeat(100)),
+                        StatusCode::METHOD_NOT_ALLOWED,
+                    ),
                 ] {
                     let (carrier, _server, _endpoint) = streaming_carrier(service(), version).await;
                     let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
                     let tasks = Tasks::new();
-                    let request = Request::get(format!("https://localhost{path}"))
+                    let request = Request::builder()
+                        .method(method)
+                        .uri(format!("https://localhost{path}"))
                         .header("origin", "https://probe.test")
                         .body(Body::Empty)
                         .unwrap();
@@ -1264,7 +1271,7 @@ mod tests {
                         .request(request, memory.clone(), &tasks, Duration::from_secs(1))
                         .await
                         .unwrap();
-                    assert_eq!(response.status(), status);
+                    assert_eq!(response.status(), status, "{version:?} {method} {path}");
                     for header in [
                         "x-padding",
                         "x-accel-buffering",
@@ -1287,6 +1294,8 @@ mod tests {
                             Request::builder()
                                 .method("OPTIONS")
                                 .uri("https://localhost/t/")
+                                .header("origin", "https://probe.test")
+                                .header("access-control-request-method", "POST")
                                 .body(Body::Empty)
                                 .unwrap(),
                             memory,
@@ -1296,7 +1305,12 @@ mod tests {
                         .await
                         .unwrap();
                     assert_eq!(response.status(), StatusCode::OK);
-                    assert!(response.headers().contains_key("x-padding"));
+                    let headers = response.headers();
+                    assert!(headers.contains_key("x-padding"));
+                    assert_eq!(headers["cache-control"], "no-store");
+                    assert_eq!(headers["access-control-allow-origin"], "https://probe.test");
+                    assert_eq!(headers["access-control-allow-methods"], "POST");
+                    assert_eq!(headers["access-control-allow-headers"], "*");
                 }
             }
         })
@@ -1638,14 +1652,17 @@ mod tests {
         let request = Request::builder()
             .method("OPTIONS")
             .uri("http://front.test/t/session")
+            .header("origin", "https://probe.test")
             .header("x-extra", "X".repeat(512))
             .body(())
             .unwrap();
         let (_, body) = pipe(state.new_memory());
+        let response = state.handle(request, body).await;
         assert_eq!(
-            state.handle(request, body).await.status(),
+            response.status(),
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
         );
+        assert!(response.headers().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -3737,9 +3754,8 @@ impl State {
         Ok(session)
     }
 
-    fn response(&self, status: StatusCode, body: Body, downstream: bool) -> Response<Body> {
+    fn response(&self, body: Body, downstream: bool) -> Response<Body> {
         let mut response = Response::builder()
-            .status(status)
             .header("cache-control", "no-store")
             .header("x-accel-buffering", "no")
             .header("access-control-allow-origin", "*")
@@ -4209,28 +4225,26 @@ impl State {
     }
 
     async fn handle(self: &Arc<Self>, request: Request<()>, body: Reader) -> Response<Body> {
-        let result = self.dispatch(&request, body).await;
-        let mut response = match result {
-            Ok((body, downstream)) => self.response(StatusCode::OK, body, downstream),
+        let (body, downstream) = match self.dispatch(&request, body).await {
+            Ok(result) => result,
             Err(Rejection::Full) => {
-                let mut response =
-                    self.response(StatusCode::SERVICE_UNAVAILABLE, Body::Empty, false);
-                response.extensions_mut().insert(Refused);
-                return response;
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .extension(Refused)
+                    .body(Body::Empty)
+                    .unwrap();
             }
             Err(Rejection::Status(status)) => {
                 if status != StatusCode::NOT_FOUND {
                     log::debug!("XHTTP request {} rejected: {status}", request.uri().path());
                 }
-                if matches!(status, StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST) {
-                    return Response::builder()
-                        .status(status)
-                        .body(Body::Empty)
-                        .unwrap();
-                }
-                self.response(status, Body::Empty, false)
+                return Response::builder()
+                    .status(status)
+                    .body(Body::Empty)
+                    .unwrap();
             }
         };
+        let mut response = self.response(body, downstream);
         if let Some(origin) = request
             .headers()
             .get("origin")
