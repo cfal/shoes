@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
@@ -679,6 +679,38 @@ async fn stalled_requests_release_shared_connection_budget() {
         api(fixture.api, "GET", "/version", Value::Null).await.0,
         200
     );
+    fixture.stop(&mut process).await;
+}
+
+#[tokio::test]
+async fn websocket_ping_before_first_frame_preserves_snapshot() {
+    use hyper_tungstenite::tungstenite::Message;
+    let fixture = Fixture::new().await;
+    let mut process = fixture.start().await;
+    let mut ws = websocket_path(fixture.api, "/connections").await;
+    ws.send(Message::Ping(b"before-first-frame".to_vec().into()))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        let mut pong = false;
+        let mut snapshot = false;
+        while !pong || !snapshot {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Pong(bytes) => {
+                    assert_eq!(&bytes[..], b"before-first-frame");
+                    pong = true;
+                }
+                Message::Text(bytes) => {
+                    let frame: Value = serde_json::from_str(&bytes).unwrap();
+                    assert!(frame["connections"].is_array());
+                    snapshot = true;
+                }
+                message => panic!("unexpected frame: {message:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
     fixture.stop(&mut process).await;
 }
 

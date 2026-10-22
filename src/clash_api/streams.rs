@@ -350,6 +350,32 @@ mod tests {
     use futures::FutureExt;
 
     #[tokio::test]
+    async fn cancelled_first_snapshot_stays_immediate() {
+        let service = ControlService::new(Default::default()).unwrap();
+        let (_sender, samples) = watch::channel(Arc::new(Sample::initial()));
+        let state = ApiState {
+            runtime: service.runtime.clone(),
+            samples,
+            tasks: Default::default(),
+            cancel: CancellationToken::new(),
+            snapshots: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let mut source = Source::new(
+            &state,
+            Subscription::parse("connections", &HashMap::new()).unwrap(),
+        );
+        assert!(source.next().now_or_never().is_none());
+        state.snapshots.add_permits(1);
+        let bytes = tokio::time::timeout(Duration::from_millis(500), source.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot["connections"], json!([]));
+        assert!(source.last_sequence > 0);
+    }
+
+    #[tokio::test]
     async fn initial_snapshot_fences_an_older_shared_snapshot_published_later() {
         let service = ControlService::new(Default::default()).unwrap();
         let (sender, samples) = watch::channel(Arc::new(Sample::initial()));
