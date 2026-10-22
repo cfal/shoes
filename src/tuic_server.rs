@@ -1451,3 +1451,128 @@ mod lifecycle_tests {
         assert!(weak.upgrade().is_none());
     }
 }
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::tcp::tcp_client_handler_factory::create_test_selector;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const UUID: [u8; 16] = [0x55; 16];
+    const PASSWORD: &str = "tuic-password";
+
+    struct Peer {
+        connection: quinn::Connection,
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
+        _endpoints: (quinn::Endpoint, quinn::Endpoint),
+    }
+
+    async fn connect(selector: Arc<ClientProxySelector>) -> Peer {
+        let (server, client) = crate::quic_endpoint::test_endpoints();
+        let address = server.local_addr().unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let accepting = server.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = accepting.accept().await.unwrap();
+            process_connection(
+                selector,
+                resolver,
+                Arc::from(UUID.as_slice()),
+                PASSWORD.into(),
+                incoming.accept().unwrap(),
+                false,
+            )
+            .await
+        });
+        let connection = client.connect(address, "localhost").unwrap().await.unwrap();
+        Peer {
+            connection,
+            server: server_task,
+            _endpoints: (server, client),
+        }
+    }
+
+    async fn send_uni(connection: &quinn::Connection, bytes: &[u8]) {
+        let mut stream = connection.open_uni().await.unwrap();
+        stream.write_all(bytes).await.unwrap();
+        stream.finish().unwrap();
+    }
+
+    fn authenticate_command(connection: &quinn::Connection, password: &str) -> Vec<u8> {
+        let mut token = [0; 32];
+        connection
+            .export_keying_material(&mut token, &UUID, password.as_bytes())
+            .unwrap();
+        let mut command = vec![5, COMMAND_TYPE_AUTHENTICATE];
+        command.extend_from_slice(&UUID);
+        command.extend_from_slice(&token);
+        command
+    }
+
+    #[tokio::test]
+    async fn authenticated_clients_can_connect_after_earlier_commands() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = echo.local_addr().unwrap().port();
+            let echo_task = tokio::spawn(async move {
+                let (mut socket, _) = echo.accept().await.unwrap();
+                let mut request = [0; 5];
+                socket.read_exact(&mut request).await.unwrap();
+                socket.write_all(&request).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let peer = connect(Arc::new(
+                create_test_selector(vec![crate::config::RuleConfig::default()], resolver).unwrap(),
+            ))
+            .await;
+
+            // Commands other than AUTHENTICATE may precede authentication and are ignored.
+            send_uni(&peer.connection, &[5, COMMAND_TYPE_DISSOCIATE, 0, 1]).await;
+            send_uni(
+                &peer.connection,
+                &authenticate_command(&peer.connection, PASSWORD),
+            )
+            .await;
+
+            let (mut send, mut recv) = peer.connection.open_bi().await.unwrap();
+            let mut connect = vec![5, COMMAND_TYPE_CONNECT, 0x01, 127, 0, 0, 1];
+            connect.extend_from_slice(&port.to_be_bytes());
+            connect.extend_from_slice(b"hello");
+            send.write_all(&connect).await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(1024).await.unwrap(), b"hello");
+            echo_task.await.unwrap();
+            assert!(!peer.server.is_finished());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_authentication_closes_the_connection() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for (case, version, uuid, password) in [
+                ("wrong uuid", 5, [0x66; 16], PASSWORD),
+                ("wrong password", 5, UUID, "wrong-password"),
+                ("unsupported version", 4, UUID, PASSWORD),
+            ] {
+                let peer = connect(Arc::new(ClientProxySelector::new(Vec::new()))).await;
+                // The token always binds UUID, so a wrong UUID is sent with a valid token.
+                let mut command = authenticate_command(&peer.connection, password);
+                command[0] = version;
+                command[2..18].copy_from_slice(&uuid);
+                send_uni(&peer.connection, &command).await;
+                match peer.connection.closed().await {
+                    quinn::ConnectionError::ApplicationClosed(close) => {
+                        assert_eq!(&close.reason[..], b"auth failed", "{case}");
+                    }
+                    other => panic!("{case}: unexpected close {other:?}"),
+                }
+                assert!(peer.server.await.unwrap().is_err(), "{case}");
+            }
+        })
+        .await
+        .unwrap();
+    }
+}

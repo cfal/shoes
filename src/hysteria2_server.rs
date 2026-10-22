@@ -1182,3 +1182,88 @@ mod tcp_tests {
         assert_eq!(parse_udp_packet(&packet).unwrap().location, location);
     }
 }
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn auth_request(uri: &str, method: &str, auth: Option<&[u8]>) -> http::Request<()> {
+        let mut request = http::Request::builder().uri(uri).method(method);
+        if let Some(auth) = auth {
+            request = request.header(
+                "hysteria-auth",
+                http::HeaderValue::from_bytes(auth).unwrap(),
+            );
+        }
+        request.body(()).unwrap()
+    }
+
+    #[test]
+    fn auth_requires_the_auth_endpoint_post_and_the_exact_password() {
+        let valid = auth_request("https://hysteria/auth", "POST", Some(b"secret"));
+        assert!(validate_auth_request(valid, "secret").is_ok());
+        for (uri, method, auth) in [
+            ("https://hysteria/auth", "POST", Some(&b"wrong"[..])),
+            ("https://hysteria/auth", "POST", Some(b"secre")),
+            ("https://hysteria/auth", "POST", Some(b"secret2")),
+            ("https://hysteria/auth", "POST", Some(b"")),
+            ("https://hysteria/auth", "POST", Some(b"secr\xc3\xa9t")),
+            ("https://hysteria/auth", "POST", None),
+            ("https://hysteria/auth", "GET", Some(b"secret")),
+            ("https://hysteria/other", "POST", Some(b"secret")),
+            ("https://example.com/auth", "POST", Some(b"secret")),
+        ] {
+            let request = auth_request(uri, method, auth);
+            assert!(
+                validate_auth_request(request, "secret").is_err(),
+                "{method} {uri} {auth:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_auth_gets_404_and_a_corrected_retry_is_accepted() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (server, client) = crate::quic_endpoint::test_endpoints();
+            let address = server.local_addr().unwrap();
+            let serving = tokio::spawn(async move {
+                let incoming = server.accept().await.unwrap();
+                process_connection(
+                    Arc::new(ClientProxySelector::new(Vec::new())),
+                    Arc::new(crate::resolver::NativeResolver::new()),
+                    "secret".into(),
+                    incoming.accept().unwrap(),
+                    true,
+                )
+                .await
+            });
+            let connection = client.connect(address, "localhost").unwrap().await.unwrap();
+            let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
+            let driving = tokio::spawn(async move {
+                let _ = futures::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            });
+            for (password, status) in [("wrong", 404), ("secret", 233)] {
+                let mut stream = sender
+                    .send_request(auth_request(
+                        "https://hysteria/auth",
+                        "POST",
+                        Some(password.as_bytes()),
+                    ))
+                    .await
+                    .unwrap();
+                stream.finish().await.unwrap();
+                let response = stream.recv_response().await.unwrap();
+                assert_eq!(response.status().as_u16(), status, "{password}");
+                if status == 233 {
+                    assert_eq!(response.headers()["hysteria-udp"], "true");
+                }
+            }
+            assert!(!serving.is_finished());
+            driving.abort();
+        })
+        .await
+        .unwrap();
+    }
+}
