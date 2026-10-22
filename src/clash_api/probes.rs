@@ -10,7 +10,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use crate::address::{NetLocation, ResolvedLocation};
+use crate::address::NetLocation;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::config::{ClientChainHop, ClientConfig, ConfigSelection};
 use crate::control::catalog::{Catalog, CatalogNode, MemberOrigin};
@@ -258,28 +258,18 @@ async fn request(
         ),
         None,
     )?;
-    let addresses =
-        crate::resolver::resolve_addresses(&generation.probes.resolver, &target).await?;
-    if addresses.is_empty()
-        || addresses.iter().any(|address| {
-            forbidden(address.ip())
-                || generation
-                    .probes
-                    .forbidden
-                    .iter()
-                    .any(|range| range.contains(address.ip().to_canonical()))
-        })
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "probe destination is not allowed",
-        ));
+    let resolver = ProbeResolver {
+        inner: generation.probes.resolver.clone(),
+        target: target.clone(),
+        forbidden_ranges: generation.probes.forbidden.clone(),
+        denied: forbidden,
+    };
+    if let Some(address) = target.to_socket_addr_nonblocking() {
+        resolver.check(&[address])?;
     }
-    let target = ResolvedLocation::with_resolved(target, addresses[0]);
+    let resolver: Arc<dyn Resolver> = Arc::new(resolver);
     let chain = generation.probes.connector(&generation.catalog, name)?;
-    let setup = chain
-        .connect_tcp(target, &generation.probes.resolver)
-        .await?;
+    let setup = chain.connect_tcp(target.into(), &resolver).await?;
     if setup
         .early_data
         .as_ref()
@@ -345,6 +335,54 @@ async fn request(
 trait ProbeIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ProbeIo for T {}
 
+#[derive(Debug)]
+struct ProbeResolver {
+    inner: Arc<dyn Resolver>,
+    target: NetLocation,
+    forbidden_ranges: Vec<ipnetwork::IpNetwork>,
+    denied: fn(IpAddr) -> bool,
+}
+
+impl ProbeResolver {
+    fn check(&self, addresses: &[std::net::SocketAddr]) -> io::Result<()> {
+        if addresses.is_empty()
+            || addresses.iter().any(|address| {
+                (self.denied)(address.ip())
+                    || self
+                        .forbidden_ranges
+                        .iter()
+                        .any(|range| range.contains(address.ip().to_canonical()))
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "probe destination is not allowed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Resolver for ProbeResolver {
+    fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
+        let resolve = self.inner.resolve_location(location);
+        if location != &self.target {
+            return resolve;
+        }
+        let policy = Self {
+            inner: self.inner.clone(),
+            target: self.target.clone(),
+            forbidden_ranges: self.forbidden_ranges.clone(),
+            denied: self.denied,
+        };
+        Box::pin(async move {
+            let addresses = resolve.await?;
+            policy.check(&addresses)?;
+            Ok(addresses)
+        })
+    }
+}
+
 fn forbidden(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -364,5 +402,74 @@ fn forbidden(ip: IpAddr) -> bool {
                     || ip.is_multicast()
                     || ip.is_unicast_link_local()
             }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Debug)]
+    struct Answers(Vec<SocketAddr>);
+    impl Resolver for Answers {
+        fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+            let addresses = self.0.clone();
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_direct_resolution_keeps_fallback_candidates() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let live = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+        let closed = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let refused = SocketAddr::from(([127, 0, 0, 1], closed.local_addr().unwrap().port()));
+        drop(closed);
+        let target = NetLocation::from_str("probe.invalid:80", None).unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(ProbeResolver {
+            inner: Arc::new(Answers(vec![refused, live])),
+            target: target.clone(),
+            forbidden_ranges: Vec::new(),
+            denied: |_| false,
+        });
+        let chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
+            OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                ClientConfig::default(),
+            ))),
+            resolver.clone(),
+        )
+        .unwrap();
+        let mut setup = tokio::time::timeout(
+            Duration::from_secs(2),
+            chain.connect_tcp(target.into(), &resolver),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (mut accepted, _) = listener.accept().await.unwrap();
+        setup.client_stream.write_all(b"ok").await.unwrap();
+        let mut response = [0; 2];
+        accepted.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"ok");
+    }
+
+    #[tokio::test]
+    async fn guarded_resolution_rejects_any_forbidden_candidate() {
+        let target = NetLocation::from_str("probe.invalid:80", None).unwrap();
+        let resolver = ProbeResolver {
+            inner: Arc::new(Answers(vec![
+                "192.0.2.1:80".parse().unwrap(),
+                "127.0.0.1:80".parse().unwrap(),
+            ])),
+            target: target.clone(),
+            forbidden_ranges: Vec::new(),
+            denied: forbidden,
+        };
+        assert_eq!(
+            resolver.resolve_location(&target).await.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 }
