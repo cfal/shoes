@@ -14,6 +14,7 @@ use crate::h2mux::H2MuxClientHandler;
 use crate::http_handler::HttpTcpClientHandler;
 use crate::naiveproxy::NaiveProxyTcpClientHandler;
 use crate::port_forward_handler::PortForwardClientHandler;
+use crate::reality::RealityClientHandler;
 use crate::resolver::Resolver;
 use crate::rustls_config_util::try_create_client_config;
 use crate::shadow_tls::ShadowTlsClientHandler;
@@ -285,7 +286,7 @@ pub fn create_tcp_client_handler(
                     .expect("Invalid user_id UUID")
                     .into_boxed_slice();
                 Box::new(
-                    crate::reality_client_handler::RealityClientHandler::new_vision_vless(
+                    RealityClientHandler::new_vision_vless(
                         public_key_bytes,
                         short_id_bytes,
                         server_name,
@@ -298,7 +299,7 @@ pub fn create_tcp_client_handler(
             } else {
                 let inner_handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
                 Box::new(
-                    crate::reality_client_handler::RealityClientHandler::new(
+                    RealityClientHandler::new(
                         public_key_bytes,
                         short_id_bytes,
                         server_name,

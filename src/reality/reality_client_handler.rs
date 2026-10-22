@@ -2,15 +2,15 @@
 
 use async_trait::async_trait;
 
+use super::{CipherSuite, Mldsa65VerifyKey, RealityClientConfig};
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncStream;
 use crate::crypto::{CryptoTlsStream, TlsReadMode};
-use crate::reality::{CipherSuite, RealityClientConfig};
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 #[derive(Debug)]
 pub struct RealityClientHandler {
-    mldsa65_verify: Option<crate::reality::Mldsa65VerifyKey>,
+    mldsa65_verify: Option<Mldsa65VerifyKey>,
     public_key: [u8; 32],
     short_id: [u8; 8],
     server_name: rustls::pki_types::ServerName<'static>,
@@ -62,7 +62,7 @@ impl RealityClientHandler {
         }
     }
 
-    pub fn with_mldsa65_verify(mut self, key: Option<crate::reality::Mldsa65VerifyKey>) -> Self {
+    pub fn with_mldsa65_verify(mut self, key: Option<Mldsa65VerifyKey>) -> Self {
         self.mldsa65_verify = key;
         self
     }

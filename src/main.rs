@@ -25,7 +25,6 @@ mod quic_endpoint;
 mod quic_server;
 mod quic_stream;
 mod reality;
-mod reality_client_handler;
 mod resolver;
 mod resources;
 mod routing;

@@ -104,14 +104,14 @@ pub fn generate_hmac_certificate(
 
 #[cfg(test)]
 mod tests {
+    use super::super::reality_certificate_verify::{
+        verify_certificate_hmac, verify_certificate_mldsa,
+    };
     use super::*;
     use aws_lc_rs::signature::KeyPair;
 
     #[test]
     fn malformed_mldsa_extensions_fail_even_with_valid_hmac() {
-        use super::super::reality_client_verify::{
-            verify_certificate_hmac, verify_certificate_mldsa,
-        };
         use super::super::reality_mldsa;
 
         let (seed, verify) = crate::reality::generate_mldsa65_keypair().unwrap();
@@ -170,23 +170,9 @@ mod tests {
         assert_eq!(extensions[0].oid.as_bytes(), [0]);
         assert!(!extensions[0].critical);
         assert_eq!(extensions[0].value.len(), 3309);
-        super::super::reality_client_verify::verify_certificate_hmac(cert.der(), &auth).unwrap();
-        super::super::reality_client_verify::verify_certificate_mldsa(
-            cert.der(),
-            &auth,
-            b"clientserver",
-            &key,
-        )
-        .unwrap();
-        assert!(
-            super::super::reality_client_verify::verify_certificate_mldsa(
-                cert.der(),
-                &auth,
-                b"Clientserver",
-                &key
-            )
-            .is_err()
-        );
+        verify_certificate_hmac(cert.der(), &auth).unwrap();
+        verify_certificate_mldsa(cert.der(), &auth, b"clientserver", &key).unwrap();
+        assert!(verify_certificate_mldsa(cert.der(), &auth, b"Clientserver", &key).is_err());
     }
 
     /// Find the signature bytes in a DER-encoded certificate.

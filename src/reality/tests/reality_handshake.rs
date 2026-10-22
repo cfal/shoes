@@ -5,11 +5,12 @@ use crate::crypto::TlsConnection;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use super::reality_key_exchange::RealityGroup;
-use super::reality_pq_tests::{
-    configs, separate_target_records, target_records, target_with_unknown_extension,
+use super::reality_fixtures::{
+    configs, established_pair, handshake, separate_target_records, target_records,
+    target_with_unknown_extension, write_record_header,
 };
-use super::*;
+use crate::reality::reality_hello::{RealityGroup, extract_client_key_shares};
+use crate::reality::{CipherSuite, DEFAULT_CIPHER_SUITES, reality_rustls_adapter};
 
 #[derive(Debug, Default)]
 struct Secrets(Mutex<std::collections::HashMap<String, Vec<u8>>>);
@@ -24,7 +25,7 @@ fn provider_preserves_cipher_defaults_order_and_duplicates() {
         ],
         vec![CipherSuite::AES_128_GCM_SHA256; 2],
     ] {
-        let provider = reality_rustls::provider(&suites);
+        let provider = reality_rustls_adapter::provider(&suites);
         let expected = if suites.is_empty() {
             DEFAULT_CIPHER_SUITES
         } else {
@@ -101,7 +102,7 @@ fn pending_pair(
     omit_ed25519: bool,
 ) -> (TlsConnection, TlsConnection, Vec<Bytes>) {
     let (cc, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
-    let crypto = reality_rustls::provider(&cc.cipher_suites);
+    let crypto = reality_rustls_adapter::provider(&cc.cipher_suites);
     let mut schemes = crypto.signature_verification_algorithms.supported_schemes();
     if omit_ed25519 {
         schemes.retain(|scheme| *scheme != rustls::SignatureScheme::ED25519);
@@ -247,7 +248,7 @@ fn certificate_verify_and_server_finished_must_verify() {
 
 #[test]
 fn client_hello_carries_authenticated_reality_metadata() {
-    use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
+    use crate::reality::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
 
     let (mut cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
     let short_id = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -260,7 +261,7 @@ fn client_hello_carries_authenticated_reality_metadata() {
     let mut client = cc.create_connection().unwrap();
     let mut hello = Vec::new();
     client.write_tls(&mut hello).unwrap();
-    let shares = super::reality_key_exchange::extract_client_key_shares(&hello).unwrap();
+    let shares = extract_client_key_shares(&hello).unwrap();
     let shared =
         perform_ecdh(&sc.private_key, shares.authentication_public_key().unwrap()).unwrap();
     let auth = derive_auth_key(&shared, &hello[11..31], b"REALITY").unwrap();
@@ -295,7 +296,7 @@ fn authentication_policy_and_client_share_variants() {
             "maximum" => sc.max_client_version = Some([1, 7, 9]),
             _ => {}
         }
-        let mut crypto = reality_rustls::provider(&cc.cipher_suites);
+        let mut crypto = reality_rustls_adapter::provider(&cc.cipher_suites);
         if case == "plain-only" {
             crypto.kx_groups.remove(0);
         }
@@ -312,8 +313,8 @@ fn authentication_policy_and_client_share_variants() {
             hello[11] ^= 1;
         }
         if case == "timestamp" {
-            use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
-            let shares = super::reality_key_exchange::extract_client_key_shares(&hello).unwrap();
+            use crate::reality::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
+            let shares = extract_client_key_shares(&hello).unwrap();
             let shared =
                 perform_ecdh(&sc.private_key, shares.authentication_public_key().unwrap()).unwrap();
             let auth = derive_auth_key(&shared, &hello[11..31], b"REALITY").unwrap();
@@ -484,12 +485,12 @@ fn rejected_templates_never_queue_synthetic_output() {
 
 #[test]
 fn authenticated_invalid_tls_shares_forward_before_commit() {
-    use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
+    use crate::reality::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
     let (cc, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
     let mut client = cc.create_connection().unwrap();
     let mut hello = Vec::new();
     client.write_tls(&mut hello).unwrap();
-    let shares = super::reality_key_exchange::extract_client_key_shares(&hello).unwrap();
+    let shares = extract_client_key_shares(&hello).unwrap();
     let shared =
         perform_ecdh(&sc.private_key, shares.authentication_public_key().unwrap()).unwrap();
     let auth = derive_auth_key(&shared, &hello[11..31], b"REALITY").unwrap();
@@ -549,4 +550,28 @@ fn tcp_eof_without_close_notify_is_not_clean_tls_eof() {
         server.reader().read(&mut request).unwrap_err().kind(),
         io::ErrorKind::UnexpectedEof
     );
+}
+
+#[test]
+fn reality_separate_and_observed_trailing_record_without_mldsa() {
+    for &cipher in DEFAULT_CIPHER_SUITES {
+        for group in [RealityGroup::X25519, RealityGroup::X25519MlKem768] {
+            let (cc, sc) = configs(cipher);
+            handshake(cc, sc, group, separate_target_records, 1);
+            let (cc, sc) = configs(cipher);
+            handshake(
+                cc,
+                sc,
+                group,
+                |group, cipher, session| {
+                    let mut records = separate_target_records(group, cipher, session);
+                    let mut trailing = write_record_header(23, 59);
+                    trailing.resize(64, 0);
+                    records.push(trailing.into());
+                    records
+                },
+                17,
+            );
+        }
+    }
 }

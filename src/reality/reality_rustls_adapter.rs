@@ -11,10 +11,10 @@ use rustls::{CertificateError, DigitallySignedStruct, Error, NamedGroup, Signatu
 use zeroize::Zeroizing;
 
 use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
-use super::reality_client_verify::{
+use super::reality_certificate_verify::{
     extract_ed25519_public_key, verify_certificate_hmac, verify_certificate_mldsa,
 };
-use super::reality_key_exchange::MLKEM_CIPHERTEXT_LEN;
+use super::reality_hello::MLKEM_CIPHERTEXT_LEN;
 use super::{CipherSuite, DEFAULT_CIPHER_SUITES, RealityClientConfig};
 
 pub(super) fn provider(suites: &[CipherSuite]) -> CryptoProvider {

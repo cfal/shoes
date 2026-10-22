@@ -173,10 +173,88 @@ pub fn validate_server_key_share(record: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Extracts ClientRandom from ClientHello
+///
+/// ClientHello structure (simplified):
+/// - TLS Header: 5 bytes
+/// - Handshake Type: 1 byte
+/// - Length: 3 bytes
+/// - Protocol Version: 2 bytes
+/// - ClientRandom: 32 bytes (starts at offset 11)
+pub fn extract_client_random(client_hello: &[u8]) -> io::Result<[u8; 32]> {
+    const TLS_HEADER_LEN: usize = 5;
+    const HANDSHAKE_HEADER_LEN: usize = 4; // type(1) + length(3)
+    const PROTOCOL_VERSION_LEN: usize = 2;
+    const RANDOM_OFFSET: usize = TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN;
+
+    if client_hello.len() < RANDOM_OFFSET + 32 {
+        return Err(invalid("ClientHello too short to extract random"));
+    }
+
+    let mut random = [0u8; 32];
+    random.copy_from_slice(&client_hello[RANDOM_OFFSET..RANDOM_OFFSET + 32]);
+    Ok(random)
+}
+
+/// Extracts SessionId slice from ClientHello without allocation
+///
+/// SessionId comes after ClientRandom and has a 1-byte length prefix.
+/// Returns a slice pointing into the original buffer.
+pub fn extract_session_id_slice(client_hello: &[u8]) -> io::Result<&[u8]> {
+    const TLS_HEADER_LEN: usize = 5;
+    const HANDSHAKE_HEADER_LEN: usize = 4;
+    const PROTOCOL_VERSION_LEN: usize = 2;
+    const RANDOM_LEN: usize = 32;
+    const SESSION_ID_LEN_OFFSET: usize =
+        TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN + RANDOM_LEN;
+
+    if client_hello.len() < SESSION_ID_LEN_OFFSET + 1 {
+        return Err(invalid("ClientHello too short to extract session ID"));
+    }
+
+    let session_id_len = client_hello[SESSION_ID_LEN_OFFSET] as usize;
+
+    if client_hello.len() < SESSION_ID_LEN_OFFSET + 1 + session_id_len {
+        return Err(invalid("ClientHello session ID extends past end"));
+    }
+
+    Ok(&client_hello[SESSION_ID_LEN_OFFSET + 1..SESSION_ID_LEN_OFFSET + 1 + session_id_len])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::test_tls::{construct_server_hello, write_record_header};
     use super::*;
+    use crate::reality::tests::reality_fixtures::{
+        configs, construct_server_hello, write_record_header,
+    };
+
+    #[test]
+    fn test_extract_client_random() {
+        // Create a minimal ClientHello with random
+        let mut client_hello = vec![0u8; 100];
+
+        // TLS Header
+        client_hello[0] = 0x16; // Handshake
+        client_hello[1] = 0x03; // Version major
+        client_hello[2] = 0x03; // Version minor (TLS 1.2)
+
+        // Handshake header
+        client_hello[5] = 0x01; // ClientHello type
+
+        // Protocol version in handshake
+        client_hello[9] = 0x03; // Major
+        client_hello[10] = 0x03; // Minor
+
+        // ClientRandom starts at offset 11
+        for i in 0..32 {
+            client_hello[11 + i] = (i + 1) as u8;
+        }
+
+        let random = extract_client_random(&client_hello).unwrap();
+        for (i, byte) in random.iter().enumerate() {
+            assert_eq!(*byte, (i + 1) as u8);
+        }
+    }
 
     fn share_vector(entries: &[(u16, &[u8])]) -> Vec<u8> {
         let mut data = vec![0, 0];
@@ -239,8 +317,7 @@ mod tests {
 
     #[test]
     fn hello_parsers_check_framing_and_retry() {
-        let (config, _) =
-            super::super::reality_pq_tests::configs(super::super::CipherSuite::AES_128_GCM_SHA256);
+        let (config, _) = configs(super::super::CipherSuite::AES_128_GCM_SHA256);
         let mut client = config.create_connection().unwrap();
         let mut record = Vec::new();
         client.write_tls(&mut record).unwrap();
