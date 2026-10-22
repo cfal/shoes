@@ -61,12 +61,6 @@ impl SlideBuffer {
         self.end - self.start
     }
 
-    /// Returns true if the buffer contains no data.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.start >= self.end
-    }
-
     /// Returns the remaining space available for writing.
     ///
     /// This is the space at the end of the buffer. To reclaim space
@@ -177,26 +171,6 @@ impl SlideBuffer {
             self.compact();
         }
     }
-
-    /// Returns a two-byte value at the given offset as big-endian u16.
-    #[inline]
-    pub fn get_u16_be(&self, offset: usize) -> Option<u16> {
-        if offset + 2 <= self.len() {
-            let idx = self.start + offset;
-            Some(u16::from_be_bytes([self.data[idx], self.data[idx + 1]]))
-        } else {
-            None
-        }
-    }
-
-    /// Get a mutable slice of the readable data for in-place modification.
-    ///
-    /// This allows callers to modify data in-place (e.g., for decryption)
-    /// without copying to a separate buffer.
-    #[inline]
-    pub fn slice_mut(&mut self, range: std::ops::Range<usize>) -> &mut [u8] {
-        &mut self.data[self.start + range.start..self.start + range.end]
-    }
 }
 
 impl Read for SlideBuffer {
@@ -266,23 +240,7 @@ mod tests {
     fn test_new_buffer() {
         let buf = SlideBuffer::new(1024);
         assert_eq!(buf.len(), 0);
-        assert!(buf.is_empty());
         assert_eq!(buf.remaining_capacity(), 1024);
-    }
-
-    #[test]
-    fn test_is_empty() {
-        let mut buf = SlideBuffer::new(1024);
-        assert!(buf.is_empty());
-
-        buf.extend_from_slice(b"hello");
-        assert!(!buf.is_empty());
-
-        buf.consume(3);
-        assert!(!buf.is_empty());
-
-        buf.consume(2);
-        assert!(buf.is_empty());
     }
 
     #[test]
@@ -410,16 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_u16_be() {
-        let mut buf = SlideBuffer::new(1024);
-        buf.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
-
-        assert_eq!(buf.get_u16_be(0), Some(0x1234));
-        assert_eq!(buf.get_u16_be(2), Some(0x5678));
-        assert_eq!(buf.get_u16_be(3), None);
-    }
-
-    #[test]
     fn test_multiple_extend_consume_cycles() {
         let mut buf = SlideBuffer::new(100);
 
@@ -445,25 +393,5 @@ mod tests {
         buf.compact();
         assert_eq!(buf.as_slice(), b"world!!!");
         assert_eq!(buf.remaining_capacity(), 100 - 8);
-    }
-
-    #[test]
-    fn test_slice_mut() {
-        let mut buf = SlideBuffer::new(100);
-        buf.extend_from_slice(b"hello world");
-
-        // Modify middle portion
-        let slice = buf.slice_mut(6..11);
-        assert_eq!(slice, b"world");
-        slice[0] = b'W';
-        slice[4] = b'D';
-
-        assert_eq!(buf.as_slice(), b"hello WorlD");
-
-        // Test after consume
-        buf.consume(6);
-        let slice = buf.slice_mut(0..5);
-        slice.copy_from_slice(b"EARTH");
-        assert_eq!(buf.as_slice(), b"EARTH");
     }
 }

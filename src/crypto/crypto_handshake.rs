@@ -45,7 +45,7 @@ pub(super) async fn perform_crypto_handshake<IO: AsyncStream>(
 mod tests {
     use super::*;
     use crate::crypto::tls_deframer::TlsDeframer;
-    use crate::crypto::{CryptoConnection, TlsReadMode, feed_crypto_connection};
+    use crate::crypto::{TlsConnection, TlsReadMode};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -74,20 +74,18 @@ mod tests {
         );
 
         for framed in [false, true] {
-            let mut client = CryptoConnection::new_rustls_client(
+            let mut client = TlsConnection::new(
                 rustls::ClientConnection::new(
                     client_config.clone(),
                     "localhost".try_into().unwrap(),
                 )
                 .unwrap(),
             );
-            let mut server = CryptoConnection::new_rustls_server(
-                rustls::ServerConnection::new(server_config.clone()).unwrap(),
-            );
+            let mut server =
+                TlsConnection::new(rustls::ServerConnection::new(server_config.clone()).unwrap());
             let mut hello = Vec::new();
             client.write_tls(&mut hello).unwrap();
-            feed_crypto_connection(&mut server, &hello).unwrap();
-            server.process_new_packets().unwrap();
+            server.feed(&hello).unwrap();
             let mut flight = Vec::new();
             while server.wants_write() {
                 server.write_tls(&mut flight).unwrap();
@@ -112,37 +110,5 @@ mod tests {
             .unwrap();
             assert!(!stream.session.is_handshaking());
         }
-    }
-
-    #[test]
-    fn test_rustls_connection_enum_exists() {
-        // Compile-time test that rustls::Connection exists
-        // This will fail to compile if rustls::Connection doesn't exist
-        fn _assert_connection_type(_: &rustls::Connection) {}
-    }
-
-    #[test]
-    fn test_connection_has_required_methods() {
-        // This test ensures rustls::Connection has the methods we need
-        // It won't compile if the methods don't exist
-        use std::sync::Arc;
-
-        let config = Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth(),
-        );
-
-        let server_name = rustls::pki_types::ServerName::try_from("example.com")
-            .unwrap()
-            .to_owned();
-
-        let client_conn = rustls::ClientConnection::new(config, server_name).unwrap();
-        let connection = rustls::Connection::Client(client_conn);
-
-        // These method calls will fail to compile if the methods don't exist
-        let _handshaking = connection.is_handshaking();
-        let _wants_read = connection.wants_read();
-        let _wants_write = connection.wants_write();
     }
 }

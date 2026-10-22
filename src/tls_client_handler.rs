@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
-use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
+use crate::crypto::{CryptoTlsStream, TlsConnection, TlsReadMode};
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 #[derive(Debug)]
@@ -83,7 +83,7 @@ impl TcpClientHandler for TlsClientHandler {
             client_conn.set_buffer_limit(Some(size));
         }
 
-        let connection = CryptoConnection::new_rustls_client(client_conn);
+        let connection = TlsConnection::new(client_conn);
         let mode = match self.handler {
             TlsInnerClientHandler::VisionVless { .. } => TlsReadMode::PreserveRecords,
             TlsInnerClientHandler::Default(_) => TlsReadMode::Stream,
@@ -133,7 +133,7 @@ impl TcpClientHandler for TlsClientHandler {
             client_conn.set_buffer_limit(Some(size));
         }
 
-        let connection = CryptoConnection::new_rustls_client(client_conn);
+        let connection = TlsConnection::new(client_conn);
         let tls_stream =
             CryptoTlsStream::handshake(client_stream, connection, TlsReadMode::Stream, &[]).await?;
 

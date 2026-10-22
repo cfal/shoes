@@ -1,21 +1,13 @@
-// REALITY client handler
-//
-// This file lives at src/ (not in reality/) for two reasons:
-// 1. Symmetry with tls_server_handler.rs which handles both TLS and REALITY server-side
-// 2. Avoids a dependency cycle: crypto → reality (core types), but this handler → crypto
+//! REALITY client setup using the shared rustls transport.
 
 use async_trait::async_trait;
 
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncStream;
-use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
-use crate::reality::{CipherSuite, RealityClientConfig, RealityClientConnection};
+use crate::crypto::{CryptoTlsStream, TlsReadMode};
+use crate::reality::{CipherSuite, RealityClientConfig};
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
-/// REALITY client handler using buffered Connection API
-///
-/// This handler establishes REALITY-obfuscated TLS connections using
-/// the buffered sans-I/O pattern with RealityClientConnection.
 #[derive(Debug)]
 pub struct RealityClientHandler {
     mldsa65_verify: Option<crate::reality::Mldsa65VerifyKey>,
@@ -80,8 +72,8 @@ impl RealityClientHandler {
         client_stream: Box<dyn AsyncStream>,
         mode: TlsReadMode,
     ) -> std::io::Result<CryptoTlsStream<Box<dyn AsyncStream>>> {
-        let server_name_str = match &self.server_name {
-            rustls::pki_types::ServerName::DnsName(name) => name.as_ref(),
+        match &self.server_name {
+            rustls::pki_types::ServerName::DnsName(_) => {}
             rustls::pki_types::ServerName::IpAddress(ip) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -96,21 +88,21 @@ impl RealityClientHandler {
             }
         };
 
-        log::debug!("REALITY CLIENT: Creating buffered RealityClientConnection");
+        log::debug!("REALITY CLIENT: Creating authenticated TLS connection");
         let reality_config = RealityClientConfig {
             mldsa65_verify: self.mldsa65_verify.clone(),
             public_key: self.public_key,
             short_id: self.short_id,
-            server_name: server_name_str.to_string(),
+            server_name: self.server_name.clone(),
             cipher_suites: self.cipher_suites.clone(),
         };
 
-        let reality_conn = RealityClientConnection::new(reality_config)?;
-
-        log::debug!("REALITY CLIENT: Creating Connection");
-        let connection = CryptoConnection::new_reality_client(reality_conn);
+        let connection = reality_config.create_connection()?;
         let stream = CryptoTlsStream::handshake(client_stream, connection, mode, &[]).await?;
-        log::debug!("REALITY CLIENT: Handshake completed successfully");
+        log::debug!(
+            "REALITY CLIENT: Handshake completed successfully, negotiated_group={:?}",
+            stream.negotiated_group()
+        );
 
         Ok(stream)
     }

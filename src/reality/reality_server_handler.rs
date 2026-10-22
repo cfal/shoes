@@ -10,7 +10,7 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_chain::ClientProxyChain;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::tls_deframer::TlsDeframer;
-use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
+use crate::crypto::{CryptoTlsStream, TlsReadMode};
 use crate::prepend_stream::PrependStream;
 use crate::resolver::Resolver;
 use crate::shadow_tls::{ParsedClientHello, parse_server_hello};
@@ -18,8 +18,8 @@ use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerSetupResult};
 use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
 
-use super::reality_key_exchange::extract_server_key_share;
-use super::{RealityServerConfig, RealityServerConnection};
+use super::RealityServerConfig;
+use super::reality_key_exchange::validate_server_key_share;
 
 #[derive(Debug)]
 pub struct RealityServerTarget {
@@ -119,127 +119,14 @@ pub async fn setup_reality_server_stream(
         cipher_suites: target.cipher_suites.clone(),
     };
 
-    let mut reality_conn = RealityServerConnection::new(reality_config)?;
+    let auth_result = reality_config.authenticate_client_hello(client_hello_frame);
 
-    let auth_result = reality_conn.validate_client_hello(client_hello_frame);
-
-    // Read dest response until we have enough records. Use 512-byte heuristic like XTLS/REALITY:
-    // first encrypted record > 512 bytes = combined mode, <= 512 bytes = separate mode
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut deframer = TlsDeframer::new();
-    let mut dest_records: Vec<Bytes> = Vec::new();
-    let mut buf = allocate_vec(8192).into_boxed_slice();
-    let mut dest_handshake_success = false;
-
-    loop {
-        let new_records = match timeout_at(deadline, dest_stream.read(&mut buf)).await {
-            Ok(Ok(0)) => {
-                return Err(std::io::Error::other(
-                    "REALITY: Dest connection closed during TLS handshake",
-                ));
-            }
-            Ok(Ok(n)) => {
-                deframer.feed(&buf[..n]);
-                match deframer.next_records() {
-                    Ok(records) => records,
-                    Err(e) => {
-                        log::error!("REALITY: Error parsing dest records: {}", e);
-                        break;
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                return Err(std::io::Error::other(format!(
-                    "REALITY: Error reading from dest: {}",
-                    e
-                )));
-            }
-            Err(_) => {
-                log::debug!("REALITY: Timeout reading from dest");
-                break;
-            }
-        };
-
-        // When we get the first record (ServerHello), check if dest supports TLS 1.3
-        if dest_records.is_empty() && !new_records.is_empty() {
-            match parse_server_hello(&new_records[0]) {
-                Ok(parsed) => {
-                    if !parsed.is_tls13 || extract_server_key_share(&new_records[0]).is_err() {
-                        log::log!(
-                            if auth_result.is_ok() {
-                                log::Level::Warn
-                            } else {
-                                log::Level::Debug
-                            },
-                            "REALITY: Dest {} has an unsupported TLS hello, forwarding transparently",
-                            target.dest
-                        );
-                        return Ok(start_forward_to_dest(
-                            server_stream,
-                            dest_stream,
-                            new_records,
-                            deframer.into_remaining_data(),
-                            client_pending,
-                        ));
-                    }
-                    log::debug!("REALITY: Dest confirmed TLS 1.3");
-                }
-                Err(e) => {
-                    log::log!(
-                        if auth_result.is_ok() {
-                            log::Level::Warn
-                        } else {
-                            log::Level::Debug
-                        },
-                        "REALITY: Failed to parse dest ServerHello: {}, forwarding transparently",
-                        e
-                    );
-                    return Ok(start_forward_to_dest(
-                        server_stream,
-                        dest_stream,
-                        new_records,
-                        deframer.into_remaining_data(),
-                        client_pending,
-                    ));
-                }
-            }
-        }
-
-        dest_records.extend(new_records);
-
-        // Separate mode: first encrypted record is small, need more records
-        // Keep reading until we have 6 records (SH + CCS + 4 encrypted) or timeout
-        // Note: Some servers send NewSessionTicket as a 7th record, but we don't need it
-        if dest_records.len() >= 6 {
-            log::debug!(
-                "REALITY: Separate mode detected, got {} records",
-                dest_records.len()
-            );
-            dest_handshake_success = true;
-            break;
-        } else if dest_records.len() >= 3 {
-            // Check if we have enough records using the 512-byte heuristic
-            // Records: [0]=ServerHello, [1]=CCS, [2..]=encrypted handshake
-            let first_encrypted = &dest_records[2];
-            if first_encrypted.len() > 512 {
-                // Combined mode: first encrypted record > 512 bytes contains all messages
-                log::debug!(
-                    "REALITY: Combined mode detected (first encrypted record {} bytes > 512)",
-                    first_encrypted.len()
-                );
-                dest_handshake_success = true;
-                break;
-            }
-        }
-    }
-
-    let remaining_data = deframer.into_remaining_data();
-
-    if !dest_handshake_success {
-        log::warn!(
-            "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
-            dest_records.len()
-        );
+    let TargetFlight {
+        records: dest_records,
+        remaining: remaining_data,
+        usable,
+    } = read_target_flight(&mut *dest_stream, &target.dest, auth_result.is_ok()).await?;
+    if !usable {
         return Ok(start_forward_to_dest(
             server_stream,
             dest_stream,
@@ -249,15 +136,8 @@ pub async fn setup_reality_server_stream(
         ));
     }
 
-    log::debug!(
-        "REALITY: Read {} records from dest ({} bytes remaining)",
-        dest_records.len(),
-        remaining_data.len()
-    );
-
-    // Branch based on auth result. We don't short circuit on permission denied before the
-    // read loop above so that the timing is always the same.
-    match auth_result {
+    // Delay authentication rejection until target collection so probes follow the same read path.
+    let authenticated = match auth_result {
         Err(e)
             if matches!(
                 e.kind(),
@@ -284,12 +164,13 @@ pub async fn setup_reality_server_stream(
             return Err(e);
         }
 
-        Ok(()) => {}
-    }
+        Ok(authenticated) => authenticated,
+    };
 
     log::debug!("REALITY: Auth succeeded, building response matching dest structure");
 
-    if should_forward_to_dest(reality_conn.build_server_response(&dest_records))? {
+    let Some(connection) = forward_unsupported(authenticated.into_connection(&dest_records))?
+    else {
         return Ok(start_forward_to_dest(
             server_stream,
             dest_stream,
@@ -297,17 +178,19 @@ pub async fn setup_reality_server_stream(
             remaining_data,
             client_pending,
         ));
-    }
+    };
     drop(dest_stream);
 
-    let connection = CryptoConnection::new_reality_server(reality_conn);
     let mode = match target.inner_protocol {
         InnerProtocol::VisionVless(_) => TlsReadMode::PreserveRecords,
         _ => TlsReadMode::Stream,
     };
     let tls_stream =
         CryptoTlsStream::handshake(server_stream, connection, mode, &client_pending).await?;
-    log::debug!("REALITY: TLS 1.3 handshake completed successfully");
+    log::debug!(
+        "REALITY: TLS 1.3 handshake completed successfully, negotiated_group={:?}",
+        tls_stream.negotiated_group()
+    );
 
     match &target.inner_protocol {
         InnerProtocol::Normal(handler) => handler.setup_server_stream(Box::new(tls_stream)).await,
@@ -334,13 +217,161 @@ pub async fn setup_reality_server_stream(
     }
 }
 
-fn should_forward_to_dest(response: std::io::Result<()>) -> std::io::Result<bool> {
+struct TargetFlight {
+    records: Vec<Bytes>,
+    remaining: Bytes,
+    usable: bool,
+}
+
+async fn read_target_flight(
+    dest_stream: &mut (impl tokio::io::AsyncRead + Unpin + ?Sized),
+    dest: &NetLocation,
+    authenticated: bool,
+) -> std::io::Result<TargetFlight> {
+    // Read dest response until we have enough records. Use 512-byte heuristic like XTLS/REALITY:
+    // first encrypted record > 512 bytes = combined mode, <= 512 bytes = separate mode
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut deframer = TlsDeframer::new();
+    let mut dest_records: Vec<Bytes> = Vec::new();
+    let mut buf = allocate_vec(8192).into_boxed_slice();
+    let mut dest_handshake_success = false;
+
+    'collect: loop {
+        let first_read = dest_records.is_empty();
+        match timeout_at(deadline, dest_stream.read(&mut buf)).await {
+            Ok(Ok(0)) => {
+                break;
+            }
+            Ok(Ok(n)) => {
+                deframer.feed(&buf[..n]);
+                loop {
+                    match deframer.next_record() {
+                        Ok(Some(record)) => {
+                            dest_records.push(record);
+                            if dest_records.len() > 7 {
+                                break 'collect;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::debug!("REALITY: Invalid target record: {e}");
+                            break 'collect;
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                return Err(std::io::Error::other(format!(
+                    "REALITY: Error reading from dest: {}",
+                    e
+                )));
+            }
+            Err(_) => {
+                log::debug!("REALITY: Timeout reading from dest");
+                break;
+            }
+        };
+
+        // When we get the first record (ServerHello), check if dest supports TLS 1.3
+        if first_read && !dest_records.is_empty() {
+            match parse_server_hello(&dest_records[0]) {
+                Ok(parsed) => {
+                    if !parsed.is_tls13 || validate_server_key_share(&dest_records[0]).is_err() {
+                        log::log!(
+                            if authenticated {
+                                log::Level::Warn
+                            } else {
+                                log::Level::Debug
+                            },
+                            "REALITY: Dest {} has an unsupported TLS hello, forwarding transparently",
+                            dest
+                        );
+                        return Ok(TargetFlight {
+                            records: dest_records,
+                            remaining: deframer.into_remaining_data(),
+                            usable: false,
+                        });
+                    }
+                    log::debug!("REALITY: Dest confirmed TLS 1.3");
+                }
+                Err(e) => {
+                    log::log!(
+                        if authenticated {
+                            log::Level::Warn
+                        } else {
+                            log::Level::Debug
+                        },
+                        "REALITY: Failed to parse dest ServerHello: {}, forwarding transparently",
+                        e
+                    );
+                    return Ok(TargetFlight {
+                        records: dest_records,
+                        remaining: deframer.into_remaining_data(),
+                        usable: false,
+                    });
+                }
+            }
+        }
+
+        // Separate mode: first encrypted record is small, need more records
+        // Keep reading until we have 6 records (SH + CCS + 4 encrypted) or timeout
+        // Mirror an already observed seventh record; do not add a target probe or wait for one.
+        if dest_records.len() >= 6 && dest_records[2].len() <= 512 {
+            // Finish an already observed optional record across TCP reads, without
+            // waiting for a record whose header has not arrived.
+            if dest_records.len() == 6 && deframer.pending_bytes() != 0 {
+                continue;
+            }
+            log::debug!(
+                "REALITY: Separate mode detected, got {} records",
+                dest_records.len()
+            );
+            dest_handshake_success = true;
+            break;
+        } else if dest_records.len() >= 3 {
+            // Check if we have enough records using the 512-byte heuristic
+            // Records: [0]=ServerHello, [1]=CCS, [2..]=encrypted handshake
+            let first_encrypted = &dest_records[2];
+            if first_encrypted.len() > 512 {
+                // Combined mode: first encrypted record > 512 bytes contains all messages
+                log::debug!(
+                    "REALITY: Combined mode detected (first encrypted record {} bytes > 512)",
+                    first_encrypted.len()
+                );
+                dest_handshake_success = true;
+                break;
+            }
+        }
+    }
+
+    let remaining_data = deframer.into_remaining_data();
+    let usable = dest_handshake_success && remaining_data.is_empty();
+    if !usable {
+        log::warn!(
+            "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
+            dest_records.len()
+        );
+    } else {
+        log::debug!(
+            "REALITY: Read {} records from dest ({} bytes remaining)",
+            dest_records.len(),
+            remaining_data.len()
+        );
+    }
+    Ok(TargetFlight {
+        records: dest_records,
+        remaining: remaining_data,
+        usable,
+    })
+}
+
+fn forward_unsupported<T>(response: std::io::Result<T>) -> std::io::Result<Option<T>> {
     match response {
-        Ok(()) => Ok(false),
+        Ok(connection) => Ok(Some(connection)),
         // Only explicitly classified target incompatibilities permit fallback.
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
             log::warn!("REALITY: Cannot synthesize target handshake ({e}), forwarding");
-            Ok(true)
+            Ok(None)
         }
         Err(e) => Err(e),
     }
@@ -420,39 +451,128 @@ fn start_forward_to_dest(
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    use crate::crypto::TlsConnection;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+    struct TargetReads {
+        chunks: std::collections::VecDeque<Bytes>,
+        reads: usize,
+    }
+
+    impl AsyncRead for TargetReads {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                // An open, idle target must not make collection wait for an unseen seventh record.
+                return Poll::Pending;
+            };
+            assert!(chunk.len() <= buffer.remaining());
+            buffer.put_slice(&chunk);
+            self.reads += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn target_collection_respects_observed_read_boundaries() {
+        use crate::reality::CipherSuite;
+        use crate::reality::reality_key_exchange::RealityGroup;
+        use crate::reality::reality_pq_tests::{configs, separate_target_records};
+
+        for case in ["six", "seven", "split-seven", "combined-trailing"] {
+            let (client_config, server_config) = configs(CipherSuite::AES_128_GCM_SHA256);
+            let mut client = client_config.create_connection().unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            let mut records = if case == "combined-trailing" {
+                crate::reality::default_target_records(&hello[44..76])
+            } else {
+                separate_target_records(
+                    RealityGroup::X25519MlKem768,
+                    CipherSuite::AES_128_GCM_SHA256,
+                    &hello[44..76],
+                )
+            };
+            if matches!(case, "seven" | "split-seven") {
+                let mut trailing = vec![23, 3, 3, 0, 59];
+                trailing.resize(64, 0);
+                records.push(trailing.into());
+            }
+            let mut wire = records.concat();
+            let remaining: &[u8] = if case == "combined-trailing" {
+                &[23, 3, 3]
+            } else {
+                &[]
+            };
+            wire.extend_from_slice(remaining);
+            let chunks = if case == "split-seven" {
+                let split = wire.len() - 61;
+                vec![
+                    Bytes::copy_from_slice(&wire[..split]),
+                    Bytes::copy_from_slice(&wire[split..]),
+                ]
+            } else {
+                vec![Bytes::copy_from_slice(&wire)]
+            };
+            let expected_reads = chunks.len();
+            let mut target = TargetReads {
+                chunks: chunks.into(),
+                reads: 0,
+            };
+            let flight = tokio::time::timeout(
+                Duration::from_secs(1),
+                read_target_flight(&mut target, &server_config.dest, true),
+            )
+            .await
+            .expect(case)
+            .unwrap();
+            assert_eq!(target.reads, expected_reads, "{case}");
+            assert_eq!(flight.records, records, "{case}");
+            assert_eq!(flight.remaining.as_ref(), remaining, "{case}");
+            assert_eq!(flight.usable, case != "combined-trailing", "{case}");
+            if flight.usable {
+                let mut server = server_config
+                    .authenticate_client_hello(&hello)
+                    .unwrap()
+                    .into_connection(&flight.records)
+                    .unwrap();
+                let mut wire = Vec::new();
+                server.write_tls(&mut wire).unwrap();
+                client.feed(&wire).unwrap();
+                wire.clear();
+                client.write_tls(&mut wire).unwrap();
+                server.feed(&wire).unwrap();
+                assert!(
+                    !client.is_handshaking() && !server.is_handshaking(),
+                    "{case}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn synthesis_failures_only_forward_explicit_incompatibilities() {
-        use crate::reality::reality_key_exchange::{
-            ClientKeyShares, RealityGroup, server_exchange,
-        };
-
-        assert!(!should_forward_to_dest(Ok(())).unwrap());
-        assert!(should_forward_to_dest(Err(io::ErrorKind::Unsupported.into())).unwrap());
+        assert_eq!(forward_unsupported(Ok(())).unwrap(), Some(()));
+        assert_eq!(
+            forward_unsupported::<()>(Err(io::ErrorKind::Unsupported.into())).unwrap(),
+            None
+        );
         for kind in [
             io::ErrorKind::InvalidData,
             io::ErrorKind::UnexpectedEof,
             io::ErrorKind::Other,
         ] {
             let error = io::Error::new(kind, "injected synthesis failure");
-            let propagated = should_forward_to_dest(Err(error)).unwrap_err();
+            let propagated = forward_unsupported::<()>(Err(error)).unwrap_err();
             assert_eq!(propagated.kind(), kind);
             assert_eq!(propagated.to_string(), "injected synthesis failure");
         }
-
-        // AWS-LC accepts the encoding but rejects this public key during encapsulation.
-        let shares = ClientKeyShares {
-            x25519: None,
-            hybrid: Some(Box::new([255; 1216])),
-        };
-        let result = server_exchange(RealityGroup::X25519MlKem768, &shares).map(|_| ());
-        let error = should_forward_to_dest(result).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert_eq!(error.to_string(), "ML-KEM encapsulation failed");
     }
 
     fn client_key_share_offsets(hello: &[u8]) -> Vec<usize> {
@@ -495,8 +615,10 @@ mod cleanup_tests {
         use crate::client_proxy_chain::InitialHopEntry;
         use crate::port_forward_handler::PortForwardServerHandler;
         use crate::reality::reality_key_exchange::RealityGroup;
-        use crate::reality::reality_pq_tests::{configs, separate_target_records};
-        use crate::reality::{CipherSuite, RealityClientConnection, mldsa65_signing_key};
+        use crate::reality::reality_pq_tests::{
+            configs, separate_target_records, target_with_unknown_extension,
+        };
+        use crate::reality::{CipherSuite, mldsa65_signing_key};
         use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 
         for case in [
@@ -506,91 +628,135 @@ mod cleanup_tests {
             "unsupported",
             "client-unknown-shares",
             "client-truncated-share",
+            "client-bad-auth",
+            "bad-late-record",
+            "bad-ccs",
+            "wrong-session",
+            "unknown-extension",
+            "combined-trailing",
         ] {
+            let capture = crate::logging::test_capture::Capture::new();
             let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
             let (seed, _) = crate::reality::generate_mldsa65_keypair().unwrap();
             sc.mldsa65_key = Some(mldsa65_signing_key(&seed).unwrap());
-            let mut client = RealityClientConnection::new(cc).unwrap();
+            let mut client = cc.create_connection().unwrap();
             let mut hello = Vec::new();
             client.write_tls(&mut hello).unwrap();
-            let mut response = if matches!(case, "client-unknown-shares" | "client-truncated-share")
-            {
-                let offsets = client_key_share_offsets(&hello);
-                assert_eq!(offsets.len(), 2);
-                let expected_error = if case == "client-unknown-shares" {
-                    for (offset, group) in offsets.into_iter().zip([0xfe30u16, 0xfe31]) {
-                        hello[offset..offset + 2].copy_from_slice(&group.to_be_bytes());
+            let auth_failure = matches!(
+                case,
+                "client-unknown-shares" | "client-truncated-share" | "client-bad-auth"
+            );
+            let mut response = match case {
+                "client-unknown-shares" | "client-truncated-share" | "client-bad-auth" => {
+                    let offsets = client_key_share_offsets(&hello);
+                    assert_eq!(offsets.len(), 2);
+                    let expected_error = match case {
+                        "client-unknown-shares" => {
+                            for (offset, group) in offsets.into_iter().zip([0xfe30u16, 0xfe31]) {
+                                hello[offset..offset + 2].copy_from_slice(&group.to_be_bytes());
+                            }
+                            io::ErrorKind::InvalidData
+                        }
+                        "client-truncated-share" => {
+                            // Keeps the TLS framing valid while overstating the last share's length.
+                            let offset = offsets[1] + 2;
+                            assert_eq!(&hello[offset..offset + 2], &[0, 32]);
+                            hello[offset..offset + 2].copy_from_slice(&33u16.to_be_bytes());
+                            io::ErrorKind::UnexpectedEof
+                        }
+                        _ => {
+                            hello[44] ^= 1;
+                            io::ErrorKind::PermissionDenied
+                        }
+                    };
+                    let check = sc.clone();
+                    assert_eq!(
+                        check.authenticate_client_hello(&hello).unwrap_err().kind(),
+                        expected_error
+                    );
+                    // A valid target flight reaches the admission-error branch, not hello fallback.
+                    crate::reality::default_target_records(&hello[44..76]).concat()
+                }
+                "small" | "small-separate" => {
+                    let (mut records, small_record) = if case == "small" {
+                        (crate::reality::default_target_records(&hello[44..76]), 2)
+                    } else {
+                        (
+                            separate_target_records(
+                                RealityGroup::X25519MlKem768,
+                                CipherSuite::AES_128_GCM_SHA256,
+                                &hello[44..76],
+                            ),
+                            3,
+                        )
+                    };
+                    let mut encrypted = vec![23, 3, 3, 2, 88];
+                    encrypted.resize(605, 0);
+                    records[small_record] = encrypted.into();
+                    let check = sc.clone();
+                    let authenticated = check.authenticate_client_hello(&hello).unwrap();
+                    assert_eq!(
+                        authenticated
+                            .into_connection(&records)
+                            .unwrap_err()
+                            .to_string(),
+                        "Unsupported REALITY target or insufficient capacity"
+                    );
+                    records.concat()
+                }
+                "bad-late-record" | "bad-ccs" | "wrong-session" | "unknown-extension"
+                | "combined-trailing" => {
+                    let mut records = crate::reality::default_target_records(&hello[44..76]);
+                    match case {
+                        "bad-ccs" => records[1] = Bytes::from_static(&[20, 3, 3, 0, 1, 0]),
+                        "wrong-session" => {
+                            let mut sh = records[0].to_vec();
+                            sh[44] ^= 1;
+                            records[0] = sh.into();
+                        }
+                        "unknown-extension" => {
+                            records[0] = target_with_unknown_extension(&records[0])
+                        }
+                        "combined-trailing" => {}
+                        "bad-late-record" => records.push(Bytes::from_static(&[255, 3, 3, 0, 0])),
+                        _ => unreachable!(),
                     }
-                    io::ErrorKind::InvalidData
-                } else {
-                    // Keeps the TLS framing valid while overstating the last share's length.
-                    let offset = offsets[1] + 2;
-                    assert_eq!(&hello[offset..offset + 2], &[0, 32]);
-                    hello[offset..offset + 2].copy_from_slice(&33u16.to_be_bytes());
-                    io::ErrorKind::UnexpectedEof
-                };
-                let mut check = RealityServerConnection::new(sc.clone()).unwrap();
-                assert_eq!(
-                    check.validate_client_hello(&hello).unwrap_err().kind(),
-                    expected_error
-                );
-                // A valid target flight reaches the admission-error branch, not hello fallback.
-                crate::reality::default_target_records(&hello[44..76]).concat()
-            } else if matches!(case, "small" | "small-separate") {
-                let (mut records, small_record) = if case == "small" {
-                    (crate::reality::default_target_records(&hello[44..76]), 2)
-                } else {
-                    (
-                        separate_target_records(
-                            RealityGroup::X25519MlKem768,
-                            CipherSuite::AES_128_GCM_SHA256,
-                            &hello[44..76],
-                        ),
-                        3,
-                    )
-                };
-                let mut encrypted = vec![23, 3, 3, 2, 88];
-                encrypted.resize(605, 0);
-                records[small_record] = encrypted.into();
-                let mut check = RealityServerConnection::new(sc.clone()).unwrap();
-                check.validate_client_hello(&hello).unwrap();
-                assert!(
-                    check
-                        .build_server_response(&records)
-                        .unwrap_err()
-                        .to_string()
-                        .contains("insufficient capacity")
-                );
-                records.concat()
-            } else {
-                let mut message = vec![2, 0, 0, 0, 3, 3];
-                if case == "retry" {
-                    let retry_random =
-                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"HelloRetryRequest");
-                    message.extend_from_slice(retry_random.as_ref());
-                } else {
-                    message.extend_from_slice(&[3; 32]);
+                    records.concat()
                 }
-                message.push(32);
-                message.extend_from_slice(&hello[44..76]);
-                message.extend_from_slice(&[0x13, 1, 0]);
-                let mut extensions = vec![0, 43, 0, 2, 3, 4];
-                if case == "retry" {
-                    extensions.extend_from_slice(&[0, 51, 0, 2, 0, 23]);
-                } else {
-                    extensions.extend_from_slice(&[0, 51, 0, 5, 0xfe, 0x30, 0, 1, 1]);
+                _ => {
+                    let mut message = vec![2, 0, 0, 0, 3, 3];
+                    if case == "retry" {
+                        let retry_random = aws_lc_rs::digest::digest(
+                            &aws_lc_rs::digest::SHA256,
+                            b"HelloRetryRequest",
+                        );
+                        message.extend_from_slice(retry_random.as_ref());
+                    } else {
+                        message.extend_from_slice(&[3; 32]);
+                    }
+                    message.push(32);
+                    message.extend_from_slice(&hello[44..76]);
+                    message.extend_from_slice(&[0x13, 1, 0]);
+                    let mut extensions = vec![0, 43, 0, 2, 3, 4];
+                    if case == "retry" {
+                        extensions.extend_from_slice(&[0, 51, 0, 2, 0, 23]);
+                    } else {
+                        extensions.extend_from_slice(&[0, 51, 0, 5, 0xfe, 0x30, 0, 1, 1]);
+                    }
+                    message.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+                    message.extend_from_slice(&extensions);
+                    let len = (message.len() - 4) as u32;
+                    message[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
+                    let mut record = vec![22, 3, 3];
+                    record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+                    record.extend_from_slice(&message);
+                    record
                 }
-                message.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
-                message.extend_from_slice(&extensions);
-                let len = (message.len() - 4) as u32;
-                message[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
-                let mut record = vec![22, 3, 3];
-                record.extend_from_slice(&(message.len() as u16).to_be_bytes());
-                record.extend_from_slice(&message);
-                record
             };
             // A partial trailing record exercises the deframer's retained bytes.
-            response.extend_from_slice(&[23, 3, 3]);
+            if matches!(case, "retry" | "unsupported" | "combined-trailing") {
+                response.extend_from_slice(&[23, 3, 3]);
+            }
 
             let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
             let dest = NetLocation::new(
@@ -668,6 +834,26 @@ mod cleanup_tests {
             })
             .await
             .unwrap_or_else(|_| panic!("transparent forwarding stalled for {case}"));
+            let logs = capture.finish();
+            if auth_failure {
+                assert!(logs.contains("REALITY: Auth failed"), "{case}: {logs}");
+            }
+            if matches!(case, "small" | "small-separate" | "unknown-extension") {
+                assert!(
+                    logs.contains("Auth succeeded, building response"),
+                    "{case}: {logs}"
+                );
+                assert!(
+                    logs.contains("REALITY: Cannot synthesize"),
+                    "{case}: {logs}"
+                );
+            }
+            if case == "combined-trailing" {
+                assert!(
+                    logs.contains("REALITY: Dest handshake failed"),
+                    "{case}: {logs}"
+                );
+            }
         }
     }
 
@@ -675,7 +861,7 @@ mod cleanup_tests {
     async fn authenticated_non_vision_oversized_preread_returns_error_without_panicking() {
         use crate::client_proxy_chain::InitialHopEntry;
         use crate::port_forward_handler::PortForwardServerHandler;
-        use crate::reality::{RealityClientConfig, RealityClientConnection};
+        use crate::reality::RealityClientConfig;
         use crate::tcp::socket_connector_impl::SocketConnectorImpl;
         use aws_lc_rs::agreement;
 
@@ -684,13 +870,14 @@ mod cleanup_tests {
             .unwrap()
             .compute_public_key()
             .unwrap();
-        let mut client = RealityClientConnection::new(RealityClientConfig {
+        let mut client = RealityClientConfig {
             mldsa65_verify: None,
             public_key: public_key.as_ref().try_into().unwrap(),
             short_id: [0; 8],
-            server_name: "localhost".into(),
+            server_name: "localhost".try_into().unwrap(),
             cipher_suites: Vec::new(),
-        })
+        }
+        .create_connection()
         .unwrap();
         let mut hello = Vec::new();
         client.write_tls(&mut hello).unwrap();
@@ -716,11 +903,9 @@ mod cleanup_tests {
                         .into(),
                 )
                 .unwrap();
-        let mut decoy = CryptoConnection::new_rustls_server(
-            rustls::ServerConnection::new(Arc::new(decoy_config)).unwrap(),
-        );
-        crate::crypto::feed_crypto_connection(&mut decoy, &hello).unwrap();
-        decoy.process_new_packets().unwrap();
+        let mut decoy =
+            TlsConnection::new(rustls::ServerConnection::new(Arc::new(decoy_config)).unwrap());
+        decoy.feed(&hello).unwrap();
         let mut response = Vec::new();
         decoy.write_tls(&mut response).unwrap();
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));

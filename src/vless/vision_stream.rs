@@ -869,22 +869,12 @@ mod tests {
     use crate::address::{Address, NetLocation};
     use crate::async_stream::AsyncPing;
     use crate::crypto::tls_deframer::TlsDeframer;
-    use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode, feed_crypto_connection};
-    use crate::reality::{
-        RealityClientConfig, RealityClientConnection, RealityServerConfig, RealityServerConnection,
-    };
+    use crate::crypto::{CryptoTlsStream, TlsConnection, TlsReadMode};
+    use crate::reality::{RealityClientConfig, RealityServerConfig};
     use futures::task::noop_waker_ref;
     use std::collections::VecDeque;
     use std::io::Write;
     use std::sync::Arc;
-
-    fn feed_and_process_crypto_connection(
-        session: &mut CryptoConnection,
-        data: &[u8],
-    ) -> io::Result<()> {
-        feed_crypto_connection(session, data)?;
-        session.process_new_packets().map(|_| ())
-    }
 
     struct ScriptedIo {
         reads: VecDeque<bytes::Bytes>,
@@ -1010,7 +1000,7 @@ mod tests {
 
     const BACKENDS: [Backend; 3] = [Backend::Tls12, Backend::Tls13, Backend::Reality];
 
-    fn new_connections(backend: Backend) -> (CryptoConnection, CryptoConnection) {
+    fn new_connections(backend: Backend) -> (TlsConnection, TlsConnection) {
         let version = match backend {
             Backend::Tls12 => &rustls::version::TLS12,
             Backend::Tls13 => &rustls::version::TLS13,
@@ -1031,34 +1021,33 @@ mod tests {
         let client_config = rustls::ClientConfig::builder_with_protocol_versions(&[version])
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let client = CryptoConnection::new_rustls_client(
+        let client = TlsConnection::new(
             rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
                 .unwrap(),
         );
-        let server = CryptoConnection::new_rustls_server(
-            rustls::ServerConnection::new(Arc::new(config)).unwrap(),
-        );
+        let server = TlsConnection::new(rustls::ServerConnection::new(Arc::new(config)).unwrap());
         (client, server)
     }
 
-    fn reality_connections() -> (CryptoConnection, CryptoConnection) {
+    fn reality_connections() -> (TlsConnection, TlsConnection) {
         use aws_lc_rs::agreement;
         let private_key = [1; 32];
         let public_key = agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key)
             .unwrap()
             .compute_public_key()
             .unwrap();
-        let mut client = RealityClientConnection::new(RealityClientConfig {
+        let mut client = RealityClientConfig {
             mldsa65_verify: None,
             public_key: public_key.as_ref().try_into().unwrap(),
             short_id: [0; 8],
-            server_name: "localhost".into(),
+            server_name: "localhost".try_into().unwrap(),
             cipher_suites: Vec::new(),
-        })
+        }
+        .create_connection()
         .unwrap();
         let mut hello = Vec::new();
         client.write_tls(&mut hello).unwrap();
-        let mut server = RealityServerConnection::new(RealityServerConfig {
+        let server = RealityServerConfig {
             mldsa65_key: None,
             private_key,
             short_ids: vec![[0; 8]],
@@ -1067,19 +1056,15 @@ mod tests {
             min_client_version: None,
             max_client_version: None,
             cipher_suites: Vec::new(),
-        })
+        }
+        .authenticate_client_hello(&hello)
+        .unwrap()
+        .into_connection(&crate::reality::default_target_records(&hello[44..76]))
         .unwrap();
-        server.validate_client_hello(&hello).unwrap();
-        server
-            .build_server_response(&crate::reality::default_target_records(&hello[44..76]))
-            .unwrap();
-        (
-            CryptoConnection::new_reality_client(client),
-            CryptoConnection::new_reality_server(server),
-        )
+        (client, server)
     }
 
-    fn connection_pair(backend: Backend) -> (CryptoConnection, CryptoConnection) {
+    fn connection_pair(backend: Backend) -> (TlsConnection, TlsConnection) {
         let (mut client, mut server) = new_connections(backend);
         for _ in 0..8 {
             transfer_tls(&mut client, &mut server);
@@ -1091,15 +1076,15 @@ mod tests {
         panic!("in-memory TLS handshake did not finish");
     }
 
-    fn transfer_tls(sender: &mut CryptoConnection, receiver: &mut CryptoConnection) {
+    fn transfer_tls(sender: &mut TlsConnection, receiver: &mut TlsConnection) {
         let mut bytes = Vec::new();
         sender.write_tls(&mut bytes).unwrap();
         if !bytes.is_empty() {
-            feed_and_process_crypto_connection(receiver, &bytes).unwrap();
+            receiver.feed(&bytes).unwrap();
         }
     }
 
-    fn encrypt(session: &mut CryptoConnection, plaintext: &[u8]) -> Vec<u8> {
+    fn encrypt(session: &mut TlsConnection, plaintext: &[u8]) -> Vec<u8> {
         session.writer().write_all(plaintext).unwrap();
         let mut ciphertext = Vec::new();
         session.write_tls(&mut ciphertext).unwrap();
@@ -1197,7 +1182,7 @@ mod tests {
                     .is_pending()
             );
             let ciphertext = gate.lock().unwrap().output.clone();
-            feed_and_process_crypto_connection(&mut peer, &ciphertext).unwrap();
+            peer.feed(&ciphertext).unwrap();
             let mut plaintext = [0; 34];
             peer.reader().read_exact(&mut plaintext).unwrap();
             assert_eq!(&plaintext, b"before handoff-final padded record");
@@ -1295,7 +1280,7 @@ mod tests {
                         Poll::Ready(Ok(()))
                     ));
                     let ciphertext = gate.lock().unwrap().output.clone();
-                    feed_and_process_crypto_connection(&mut peer, &ciphertext).unwrap();
+                    peer.feed(&ciphertext).unwrap();
                     let mut plaintext = Vec::new();
                     if let Err(error) = peer.reader().read_to_end(&mut plaintext) {
                         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
@@ -1520,7 +1505,7 @@ mod tests {
 
     #[test]
     fn closure_framed_tls_rejects_unclean_eof() {
-        for backend in [Backend::Tls12, Backend::Tls13] {
+        for backend in BACKENDS {
             for framed in [false, true] {
                 let (_, session) = connection_pair(backend);
                 let io = ScriptedIo {
@@ -1824,8 +1809,7 @@ mod tests {
             let mut initial = uuid.to_vec();
             initial.extend_from_slice(&[COMMAND_DIRECT, 0, 3, 0, 0]);
             initial.extend_from_slice(b"one");
-            feed_and_process_crypto_connection(&mut server, &encrypt(&mut client, b"-two"))
-                .unwrap();
+            server.feed(&encrypt(&mut client, b"-two")).unwrap();
             let mut deframer = TlsDeframer::new();
             deframer.feed(b"-three");
             let io = ScriptedIo {
@@ -1849,8 +1833,7 @@ mod tests {
             let mut initial = uuid.to_vec();
             initial.extend_from_slice(&[COMMAND_END, 0, 3, 0, 0]);
             initial.extend_from_slice(b"one");
-            feed_and_process_crypto_connection(&mut server, &encrypt(&mut client, b"-two"))
-                .unwrap();
+            server.feed(&encrypt(&mut client, b"-two")).unwrap();
             let mut deframer = TlsDeframer::new();
             deframer.feed(&encrypt(&mut client, b"-three"));
             let last = encrypt(&mut client, b"-four");
@@ -1912,38 +1895,18 @@ mod tests {
         }
     }
 
-    fn completed_reality_connection() -> CryptoConnection {
-        let config = RealityServerConfig {
-            mldsa65_key: None,
-            private_key: [0; 32],
-            short_ids: vec![[0; 8]],
-            dest: NetLocation::new(Address::UNSPECIFIED, 443),
-            max_time_diff: None,
-            min_client_version: None,
-            max_client_version: None,
-            cipher_suites: Vec::new(),
-        };
-        CryptoConnection::new_reality_server(
-            RealityServerConnection::new(config)
-                .unwrap()
-                .complete_for_test()
-                .unwrap(),
-        )
-    }
-
     fn assert_initial_mode_transition(command: UnpadCommand, session_plaintext: &[u8]) {
         let uuid = [7; 16];
         let mut initial = uuid.to_vec();
         initial.extend_from_slice(&[command as u8, 0, 3, 0, 2]);
         initial.extend_from_slice(b"one\0\0-two");
 
-        let mut session = completed_reality_connection();
+        let (mut peer, mut session) = crate::reality::established_pair();
         if !session_plaintext.is_empty() {
-            let mut peer = completed_reality_connection();
             peer.writer().write_all(session_plaintext).unwrap();
             let mut ciphertext = Vec::new();
             peer.write_tls(&mut ciphertext).unwrap();
-            feed_and_process_crypto_connection(&mut session, &ciphertext).unwrap();
+            session.feed(&ciphertext).unwrap();
         }
 
         let (io, _peer) = tokio::io::duplex(64);

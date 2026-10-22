@@ -206,7 +206,21 @@ fn key_shares(record: &[u8], client: bool) -> Vec<(u16, usize)> {
     panic!("key_share missing from captured hello");
 }
 
-type Capture = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+type Capture = Arc<Mutex<Vec<(Vec<u8>, Vec<Vec<u8>>)>>>;
+
+fn masked_server_hello(record: &[u8]) -> Vec<u8> {
+    let mut masked = record.to_vec();
+    let mut offset = 49 + record[43] as usize;
+    while offset < record.len() {
+        let id = u16::from_be_bytes([record[offset], record[offset + 1]]);
+        let len = u16::from_be_bytes([record[offset + 2], record[offset + 3]]) as usize;
+        if id == 51 {
+            masked[offset + 8..offset + 4 + len].fill(0);
+        }
+        offset += 4 + len;
+    }
+    masked
+}
 
 async fn start_tap(upstream: u16) -> (u16, Capture, TaskGuard) {
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -225,9 +239,12 @@ async fn start_tap(upstream: u16) -> (u16, Capture, TaskGuard) {
                             let hello = read_tls_record(&mut client).await?;
                             let mut server = TcpStream::connect(("127.0.0.1", upstream)).await?;
                             server.write_all(&hello).await?;
-                            let response = read_tls_record(&mut server).await?;
+                            let mut response = Vec::new();
+                            for _ in 0..3 {
+                                response.push(read_tls_record(&mut server).await?);
+                            }
                             captured.lock().unwrap().push((hello, response.clone()));
-                            client.write_all(&response).await?;
+                            client.write_all(&response.concat()).await?;
                             tokio::io::copy_bidirectional(&mut client, &mut server).await?;
                             Ok::<_, io::Error>(())
                         }).await;
@@ -418,6 +435,7 @@ async fn run_case(case: Case) {
     .unwrap();
     let verify_key = URL_SAFE_NO_PAD.encode(signing.public_key().as_ref());
     let (target_port, _target) = start_target(case.hybrid, case.padded).await;
+    let (target_port, target_captured, _target_tap) = start_tap(target_port).await;
     let app = start_local_http_server("0.0.0.0", 0).await.unwrap();
     let server_port = free_port().await;
     let server_config = case.server_config(
@@ -478,6 +496,7 @@ async fn run_case(case: Case) {
         );
         assert_eq!(echoed.stdout, payload);
         let captured = captured.lock().unwrap();
+        let targets = target_captured.lock().unwrap();
         assert!(!captured.is_empty());
         for (hello, response) in captured.iter() {
             let offered: Vec<_> = key_shares(hello, true)
@@ -486,12 +505,24 @@ async fn run_case(case: Case) {
                 .collect();
             assert_eq!(offered, [(0x11ec, 1216), (0x001d, 32)]);
             assert_eq!(
-                key_shares(response, false),
+                key_shares(&response[0], false),
                 if hybrid {
                     vec![(0x11ec, 1120)]
                 } else {
                     vec![(0x001d, 32)]
                 }
+            );
+            let (_, target) = targets
+                .iter()
+                .find(|(client, _)| client == hello)
+                .expect("forwarded ClientHello capture");
+            assert_eq!(
+                masked_server_hello(&response[0]),
+                masked_server_hello(&target[0])
+            );
+            assert_eq!(
+                response.iter().map(Vec::len).collect::<Vec<_>>(),
+                target.iter().map(Vec::len).collect::<Vec<_>>()
             );
         }
     }

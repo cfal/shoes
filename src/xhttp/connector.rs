@@ -6,7 +6,7 @@ use crate::{
     async_stream::AsyncStream,
     config::xhttp::{XhttpMode, XhttpVersion, invalid},
     config::{ClientConfig, ClientProxyConfig, GlobalLimits, Transport},
-    crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode},
+    crypto::{CryptoTlsStream, TlsConnection, TlsReadMode},
     resolver::Resolver,
     tcp::tcp_handler::TcpClientHandler,
 };
@@ -47,7 +47,7 @@ impl Security {
                 }
                 let stream = CryptoTlsStream::handshake(
                     stream,
-                    CryptoConnection::new_rustls_client(connection),
+                    TlsConnection::new(connection),
                     TlsReadMode::Stream,
                     &[],
                 )

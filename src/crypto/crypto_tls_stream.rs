@@ -8,8 +8,8 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use super::TlsConnection;
 use super::tls_deframer::TlsDeframer;
-use super::{CryptoConnection, feed_crypto_connection};
 use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::sync_adapter::{SyncReadAdapter, SyncWriteAdapter};
 
@@ -79,11 +79,10 @@ impl TlsState {
 
 pub struct CryptoTlsStream<IO> {
     io: IO,
-    pub(super) session: CryptoConnection,
+    pub(super) session: TlsConnection,
     state: TlsState,
     need_flush: bool,
     input: TlsInput,
-    transport_eof: bool,
     write_raw: bool,
     raw_write_prefix: Option<Bytes>,
 }
@@ -91,7 +90,7 @@ pub struct CryptoTlsStream<IO> {
 impl<IO: AsyncStream> CryptoTlsStream<IO> {
     pub async fn handshake(
         io: IO,
-        session: CryptoConnection,
+        session: TlsConnection,
         mode: TlsReadMode,
         preread: &[u8],
     ) -> io::Result<Self> {
@@ -108,21 +107,20 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
         Ok(stream)
     }
 
-    fn with_input(io: IO, session: CryptoConnection, input: TlsInput) -> Self {
+    fn with_input(io: IO, session: TlsConnection, input: TlsInput) -> Self {
         Self {
             io,
             session,
             state: TlsState::Stream,
             need_flush: false,
             input,
-            transport_eof: false,
             write_raw: false,
             raw_write_prefix: None,
         }
     }
 
     #[cfg(test)]
-    pub fn new(io: IO, session: CryptoConnection, deframer: Option<TlsDeframer>) -> Self {
+    pub fn new(io: IO, session: TlsConnection, deframer: Option<TlsDeframer>) -> Self {
         assert!(!session.is_handshaking());
         let input = match deframer {
             Some(deframer) => TlsInput::Records {
@@ -136,6 +134,10 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
 
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.session.alpn_protocol()
+    }
+
+    pub fn negotiated_group(&self) -> Option<rustls::NamedGroup> {
+        self.session.negotiated_group()
     }
 
     pub fn is_reality(&self) -> bool {
@@ -264,7 +266,9 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
                 self.release_empty_deframer();
                 match record {
                     Some(record) => {
-                        feed_crypto_connection(&mut self.session, &record)?;
+                        self.session
+                            .feed(&record)
+                            .map_err(|error| self.packet_error(error))?;
                         record.len()
                     }
                     // rustls must see physical EOF to report missing close_notify.
@@ -273,13 +277,32 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
             }
             TlsInput::Raw(_) => unreachable!("raw input bypasses TLS"),
         };
-        if n == 0 {
-            self.transport_eof = true;
-        } else {
-            let plaintext_len = self.session.process_new_packets()?;
+        if n != 0 {
+            let plaintext_len = self
+                .session
+                .process_new_packets()
+                .map_err(|error| self.packet_error(error))?;
             log::trace!("TLS received {n} bytes, {plaintext_len} plaintext bytes available");
         }
         Poll::Ready(Ok(n))
+    }
+
+    fn packet_error(&self, error: io::Error) -> io::Error {
+        if !self.session.is_reality() {
+            return error;
+        }
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "reality {} error processing new packets: {:?}",
+                if self.session.is_server() {
+                    "server"
+                } else {
+                    "client"
+                },
+                error
+            ),
+        )
     }
 
     fn poll_write_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
@@ -357,11 +380,6 @@ impl<IO: AsyncStream> AsyncRead for CryptoTlsStream<IO> {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => return Poll::Ready(Err(error)),
             }
-            if this.transport_eof {
-                this.state.shutdown_read();
-                return Poll::Ready(Ok(()));
-            }
-
             // Service post-handshake responses without blocking readable plaintext
             // on output backpressure. Both I/O directions register their wakers.
             if let Poll::Ready(Err(error)) = Pin::new(&mut *this).poll_flush(cx) {
@@ -471,12 +489,12 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.write_raw {
-            // REALITY encrypts lazily; send accepted application data before close_notify.
-            ready!(self.poll_drain_tls(cx))?;
             if self.state.writeable() {
                 self.session.send_close_notify();
                 self.state.shutdown_write();
             }
+            // A failed ordinary TLS session still has output to send before writer.flush fails.
+            ready!(self.poll_drain_tls(cx))?;
             ready!(self.as_mut().poll_flush(cx))?;
         } else {
             ready!(self.as_mut().poll_flush(cx))?;
@@ -521,8 +539,6 @@ impl<IO: AsyncStream> AsyncStream for CryptoTlsStream<IO> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::address::{Address, NetLocation};
-    use crate::reality::{RealityServerConfig, RealityServerConnection};
     use futures::task::noop_waker_ref;
 
     struct PendingWriteIo;
@@ -609,21 +625,100 @@ mod tests {
 
     impl AsyncStream for ZeroWriteIo {}
 
-    fn completed_reality_connection() -> RealityServerConnection {
-        let config = RealityServerConfig {
-            mldsa65_key: None,
-            private_key: [0; 32],
-            short_ids: vec![[0; 8]],
-            dest: NetLocation::new(Address::UNSPECIFIED, 443),
-            max_time_diff: None,
-            min_client_version: None,
-            max_client_version: None,
-            cipher_suites: Vec::new(),
-        };
-        RealityServerConnection::new(config)
+    fn completed_reality_connection() -> TlsConnection {
+        crate::reality::established_pair().1
+    }
+
+    #[tokio::test]
+    async fn reality_certificate_errors_match_across_read_modes() {
+        use aws_lc_rs::agreement;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let public_key = agreement::PrivateKey::from_private_key(&agreement::X25519, &[1; 32])
             .unwrap()
-            .complete_for_test()
-            .unwrap()
+            .compute_public_key()
+            .unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                        .into(),
+                )
+                .unwrap(),
+        );
+        for (mode, preread) in [
+            (TlsReadMode::Stream, false),
+            (TlsReadMode::PreserveRecords, false),
+            (TlsReadMode::Stream, true),
+        ] {
+            let mut client = crate::reality::RealityClientConfig {
+                mldsa65_verify: None,
+                public_key: public_key.as_ref().try_into().unwrap(),
+                short_id: [0; 8],
+                server_name: "localhost".try_into().unwrap(),
+                cipher_suites: Vec::new(),
+            }
+            .create_connection()
+            .unwrap();
+            let mut server =
+                TlsConnection::new(rustls::ServerConnection::new(server_config.clone()).unwrap());
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            server.feed(&hello).unwrap();
+            let mut flight = Vec::new();
+            server.write_tls(&mut flight).unwrap();
+            let (io, mut peer) = tokio::io::duplex(65536);
+            if !preread {
+                peer.write_all(&flight).await.unwrap();
+            }
+            let error =
+                CryptoTlsStream::handshake(io, client, mode, if preread { &flight } else { &[] })
+                    .await
+                    .err()
+                    .expect("a real target certificate must not authenticate REALITY");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("reality client error processing new packets:")
+            );
+            let mut output = Vec::new();
+            peer.read_to_end(&mut output).await.unwrap();
+            // Record-preserving reads may send a compatibility CCS before the certificate arrives.
+            assert!(
+                output.is_empty() || output == [20, 3, 3, 0, 1, 1],
+                "failed REALITY authentication must not send alerts: {output:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reality_shutdown_preserves_buffered_data_before_close_notify() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = crate::reality::established_pair();
+        let (io, peer) = tokio::io::duplex(16);
+        let mut sender = CryptoTlsStream::new(io, client, None);
+        let mut receiver = CryptoTlsStream::new(peer, server, None);
+        let payload = vec![42; 40_000];
+        sender.write_all(&payload).await.unwrap();
+        assert!(sender.session.wants_write());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(Pin::new(&mut sender).poll_shutdown(&mut cx).is_pending());
+
+        let mut received = Vec::new();
+        let (shutdown, read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(sender.shutdown(), receiver.read_to_end(&mut received))
+        })
+        .await
+        .unwrap();
+        shutdown.unwrap();
+        read.unwrap();
+        assert_eq!(received, payload);
     }
 
     #[cfg(target_os = "linux")]
@@ -638,7 +733,7 @@ mod tests {
             listener.accept()
         );
         let _peer = peer.unwrap();
-        let session = CryptoConnection::new_reality_server(completed_reality_connection());
+        let session = completed_reality_connection();
         let mut stream = CryptoTlsStream::new(socket.unwrap(), session, Some(TlsDeframer::new()));
         assert!(stream.plain_tcp().is_none());
         stream.start_raw_read().unwrap();
@@ -674,10 +769,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn vectored_tls_roundtrip_with_partial_transport_writes() {
+    fn ordinary_connections() -> (TlsConnection, TlsConnection) {
         use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
@@ -693,13 +786,80 @@ mod tests {
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let server = CryptoConnection::new_rustls_server(
-            rustls::ServerConnection::new(Arc::new(server_config)).unwrap(),
-        );
-        let client = CryptoConnection::new_rustls_client(
+        let server =
+            TlsConnection::new(rustls::ServerConnection::new(Arc::new(server_config)).unwrap());
+        let client = TlsConnection::new(
             rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
                 .unwrap(),
         );
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn ordinary_tls_shutdown_drains_data_and_fatal_alert_after_backpressure() {
+        use std::io::Read;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for fail_server in [false, true] {
+            let (mut client, mut server) = ordinary_connections();
+            for _ in 0..8 {
+                let mut wire = Vec::new();
+                client.write_tls(&mut wire).unwrap();
+                server.feed(&wire).unwrap();
+                wire.clear();
+                server.write_tls(&mut wire).unwrap();
+                client.feed(&wire).unwrap();
+                if !client.is_handshaking() && !server.is_handshaking() && !client.wants_write() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            assert!(!client.wants_write() && !server.wants_write());
+            let (sender, mut receiver) = if fail_server {
+                (server, client)
+            } else {
+                (client, server)
+            };
+            let (io, mut peer) = tokio::io::duplex(16);
+            let mut stream = CryptoTlsStream::new(io, sender, None);
+            let payload = [42; 1000];
+            stream.write_all(&payload).await.unwrap();
+            assert!(stream.session.wants_write());
+            peer.write_all(&[23, 3, 3, 0, 1, 0]).await.unwrap();
+            assert_eq!(
+                stream.read(&mut [0]).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(stream.session.wants_write());
+
+            let mut wire = Vec::new();
+            let (shutdown, read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    async move {
+                        let result = stream.shutdown().await;
+                        drop(stream);
+                        result
+                    },
+                    peer.read_to_end(&mut wire)
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(shutdown.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            read.unwrap();
+            let error = receiver.feed(&wire).unwrap_err();
+            assert!(error.to_string().contains("BadRecordMac"), "{error}");
+            let mut received = [0; 1000];
+            receiver.reader().read_exact(&mut received).unwrap();
+            assert_eq!(received, payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_tls_roundtrip_with_partial_transport_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = ordinary_connections();
         let (client_io, server_io) = tokio::io::duplex(256);
         let peer = tokio::spawn(async move {
             let mut stream =
@@ -744,11 +904,7 @@ mod tests {
 
     #[test]
     fn vectored_reality_fallback_accounts_for_accepted_plaintext_under_backpressure() {
-        let mut stream = CryptoTlsStream::new(
-            PendingWriteIo,
-            CryptoConnection::new_reality_server(completed_reality_connection()),
-            None,
-        );
+        let mut stream = CryptoTlsStream::new(PendingWriteIo, completed_reality_connection(), None);
         assert!(!stream.is_write_vectored());
         let mut cx = Context::from_waker(noop_waker_ref());
         let data = [7; 16384];
@@ -781,11 +937,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (io, mut peer) = tokio::io::duplex(8);
-        let mut stream = CryptoTlsStream::new(
-            io,
-            CryptoConnection::new_reality_server(completed_reality_connection()),
-            None,
-        );
+        let mut stream = CryptoTlsStream::new(io, completed_reality_connection(), None);
         stream.start_raw_write(b"last encrypted bytes").unwrap();
         let mut expected = stream.raw_write_prefix.as_ref().unwrap().to_vec();
         expected.extend_from_slice(b"raw bytes");
@@ -819,16 +971,15 @@ mod tests {
 
         let payload = vec![42; 40_000];
         for split in [0, 1, 4, 5, 10, 20_000, usize::MAX] {
-            let mut sender = completed_reality_connection();
+            let (mut sender, receiver) = crate::reality::established_pair();
             sender.writer().write_all(&payload).unwrap();
             let mut ciphertext = Vec::new();
             sender.write_tls(&mut ciphertext).unwrap();
             let split = split.min(ciphertext.len());
             let (io, mut peer) = tokio::io::duplex(65536);
             peer.write_all(&ciphertext[split..]).await.unwrap();
-            let session = CryptoConnection::new_reality_server(completed_reality_connection());
             let mut stream =
-                CryptoTlsStream::handshake(io, session, TlsReadMode::Stream, &ciphertext[..split])
+                CryptoTlsStream::handshake(io, receiver, TlsReadMode::Stream, &ciphertext[..split])
                     .await
                     .unwrap();
             let mut received = vec![0; payload.len()];
@@ -840,11 +991,7 @@ mod tests {
 
     #[test]
     fn reality_stream_stops_accepting_plaintext_when_tls_output_is_blocked() {
-        let mut stream = CryptoTlsStream::new(
-            PendingWriteIo,
-            CryptoConnection::new_reality_server(completed_reality_connection()),
-            None,
-        );
+        let mut stream = CryptoTlsStream::new(PendingWriteIo, completed_reality_connection(), None);
         let mut cx = Context::from_waker(noop_waker_ref());
         let data = [0u8; 16 * 1024];
         let mut accepted = 0;
@@ -865,11 +1012,7 @@ mod tests {
 
     #[test]
     fn reality_stream_rejects_write_zero_without_waiting_for_a_wake() {
-        let mut stream = CryptoTlsStream::new(
-            ZeroWriteIo,
-            CryptoConnection::new_reality_server(completed_reality_connection()),
-            None,
-        );
+        let mut stream = CryptoTlsStream::new(ZeroWriteIo, completed_reality_connection(), None);
         let mut cx = Context::from_waker(noop_waker_ref());
 
         let result = Pin::new(&mut stream).poll_write(&mut cx, &[0; 1024]);

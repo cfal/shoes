@@ -14,7 +14,7 @@ hyper = { version = "*", features = ["server", "http1", "http2"] }
 hyper-util = { version = "*", features = ["tokio", "server"] }
 rand = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-rustls = "*"
+rustls = "=0.23.46"
 serde_json = "*"
 tempfile = "*"
 tokio = { version = "*", features = [

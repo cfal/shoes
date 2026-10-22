@@ -2,35 +2,24 @@ use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::agreement;
 use aws_lc_rs::hkdf::{HKDF_SHA256, Salt};
 
-#[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
-
 /// Custom error type for REALITY cryptographic operations
 #[derive(Debug)]
 pub enum CryptoError {
-    InvalidKeyLength,
     InvalidNonceLength,
-    InvalidCiphertextLength,
     EncryptionFailed,
     DecryptionFailed,
     EcdhFailed,
     HkdfFailed,
-    CertificateGenerationFailed(String),
 }
 
 impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CryptoError::InvalidKeyLength => write!(f, "Invalid key length"),
             CryptoError::InvalidNonceLength => write!(f, "Invalid nonce length"),
-            CryptoError::InvalidCiphertextLength => write!(f, "Invalid ciphertext length"),
             CryptoError::EncryptionFailed => write!(f, "Encryption failed"),
             CryptoError::DecryptionFailed => write!(f, "Decryption failed"),
             CryptoError::EcdhFailed => write!(f, "ECDH key exchange failed"),
             CryptoError::HkdfFailed => write!(f, "HKDF derivation failed"),
-            CryptoError::CertificateGenerationFailed(e) => {
-                write!(f, "Certificate generation failed: {}", e)
-            }
         }
     }
 }
@@ -143,9 +132,9 @@ pub fn encrypt_session_id(
     let aad_obj = Aad::from(aad);
 
     // aws-lc-rs requires in-place encryption
-    let mut in_out = plaintext.to_vec();
+    let mut in_out = zeroize::Zeroizing::new(plaintext.to_vec());
     sealing_key
-        .seal_in_place_append_tag(nonce_obj, aad_obj, &mut in_out)
+        .seal_in_place_append_tag(nonce_obj, aad_obj, &mut *in_out)
         .map_err(|_| CryptoError::EncryptionFailed)?;
 
     if in_out.len() != 32 {
@@ -187,7 +176,7 @@ pub fn decrypt_session_id(
     let aad_obj = Aad::from(aad);
 
     // aws-lc-rs requires in-place decryption
-    let mut in_out = ciphertext_and_tag.to_vec();
+    let mut in_out = zeroize::Zeroizing::new(ciphertext_and_tag.to_vec());
     let plaintext = opening_key
         .open_in_place(nonce_obj, aad_obj, &mut in_out)
         .map_err(|_| CryptoError::DecryptionFailed)?;
@@ -199,29 +188,6 @@ pub fn decrypt_session_id(
     let mut result = [0u8; 16];
     result.copy_from_slice(plaintext);
     Ok(result)
-}
-
-#[cfg(test)]
-/// Creates a REALITY SessionId (test helper)
-fn create_session_id(version: [u8; 3], timestamp: u32, short_id: &[u8; 8]) -> [u8; 32] {
-    let mut session_id = [0u8; 32];
-    session_id[0] = version[0]; // Major version
-    session_id[1] = version[1]; // Minor version
-    session_id[2] = version[2]; // Patch version
-    // session_id[3] = 0 (reserved)
-    session_id[4..8].copy_from_slice(&timestamp.to_be_bytes());
-    session_id[8..16].copy_from_slice(short_id);
-    // session_id[16..32] remain zeros
-    session_id
-}
-
-#[cfg(test)]
-/// Gets current Unix timestamp (test helper)
-fn get_current_timestamp() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs() as u32
 }
 
 #[cfg(test)]
@@ -243,109 +209,14 @@ mod tests {
             agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key_b).unwrap();
         let pub_b = priv_b.compute_public_key().unwrap();
 
-        // Perform ECDH both ways
-        let mut shared_a_bytes = [0u8; 32];
-        agreement::agree(
-            &priv_a,
-            agreement::UnparsedPublicKey::new(&agreement::X25519, pub_b.as_ref()),
-            (),
-            |key_material| {
-                shared_a_bytes.copy_from_slice(key_material);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        let mut shared_b_bytes = [0u8; 32];
-        agreement::agree(
-            &priv_b,
-            agreement::UnparsedPublicKey::new(&agreement::X25519, pub_a.as_ref()),
-            (),
-            |key_material| {
-                shared_b_bytes.copy_from_slice(key_material);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(shared_a_bytes, shared_b_bytes);
-    }
-
-    #[test]
-    fn test_session_id_structure() {
-        // Test that session ID has the correct structure
-        let version = [1, 8, 1]; // major, minor, patch
-        let timestamp = get_current_timestamp();
-        let short_id = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
-
-        let session_id = create_session_id(version, timestamp, &short_id);
-
-        // Verify structure
-        assert_eq!(session_id[0], 1); // version major
-        assert_eq!(session_id[1], 8); // version minor
-        assert_eq!(session_id[2], 1); // version patch
-        assert_eq!(session_id[3], 0); // reserved
-
-        // Verify timestamp
-        let extracted_timestamp =
-            u32::from_be_bytes([session_id[4], session_id[5], session_id[6], session_id[7]]);
-        assert_eq!(extracted_timestamp, timestamp);
-
-        // Verify short_id
-        assert_eq!(&session_id[8..16], &short_id[..]);
-
-        // Verify remaining bytes are zero
-        for byte in &session_id[16..] {
-            assert_eq!(*byte, 0);
-        }
-    }
-
-    #[test]
-    fn test_version_comparison() {
-        // Test version comparison logic (same as used in reality_server_handler.rs)
-        let v1_8_1 = [1u8, 8, 1];
-        let v1_8_0 = [1u8, 8, 0];
-        let v1_9_0 = [1u8, 9, 0];
-        let v2_0_0 = [2u8, 0, 0];
-
-        assert!(v1_8_0 < v1_8_1);
-        assert!(v1_8_1 < v1_9_0);
-        assert!(v1_9_0 < v2_0_0);
-        assert!(v1_8_1 > v1_8_0);
-    }
-
-    #[test]
-    fn test_timestamp_validation_logic() {
-        // Test the timestamp validation logic used in reality_server_handler.rs
-        let now = get_current_timestamp();
-
-        // Test within bounds (60 seconds = 60000 milliseconds)
-        let max_diff_ms = 60000u64;
-        let max_diff_secs = max_diff_ms / 1000;
-
-        // Current time - should pass
-        let diff = now.abs_diff(now);
-        assert!((diff as u64) <= max_diff_secs);
-
-        // 30 seconds ago - should pass
-        let past_timestamp = now - 30;
-        let diff = now.abs_diff(past_timestamp);
-        assert!((diff as u64) <= max_diff_secs);
-
-        // 30 seconds future - should pass
-        let future_timestamp = now + 30;
-        let diff = now.abs_diff(future_timestamp);
-        assert!((diff as u64) <= max_diff_secs);
-
-        // 2 minutes ago - should fail
-        let old_timestamp = now.saturating_sub(120);
-        let diff = now.abs_diff(old_timestamp);
-        assert!((diff as u64) > max_diff_secs);
-
-        // 2 minutes future - should fail
-        let future_timestamp = now + 120;
-        let diff = now.abs_diff(future_timestamp);
-        assert!((diff as u64) > max_diff_secs);
+        let shared_a = perform_ecdh(&private_key_a, pub_b.as_ref().try_into().unwrap()).unwrap();
+        let shared_b = perform_ecdh(&private_key_b, pub_a.as_ref().try_into().unwrap()).unwrap();
+        assert_eq!(shared_a, shared_b);
+        assert_ne!(shared_a, [0; 32]);
+        assert!(matches!(
+            perform_ecdh(&private_key_a, &[0; 32]),
+            Err(CryptoError::EcdhFailed)
+        ));
     }
 
     #[test]
@@ -355,7 +226,10 @@ mod tests {
         let timestamp = 1234567890u32;
         let short_id = [0xAB; 8];
 
-        let session_id = create_session_id(version, timestamp, &short_id);
+        let mut plaintext = [0; 16];
+        plaintext[..3].copy_from_slice(&version);
+        plaintext[4..8].copy_from_slice(&timestamp.to_be_bytes());
+        plaintext[8..].copy_from_slice(&short_id);
 
         // Perform ECDH
         let client_private = [0x01; 32];
@@ -366,8 +240,6 @@ mod tests {
         let salt = [0x03; 20];
         let auth_key = derive_auth_key(&shared_secret, &salt, b"REALITY").unwrap();
 
-        // Encrypt session ID (first 16 bytes)
-        let plaintext: [u8; 16] = session_id[0..16].try_into().unwrap();
         let nonce = [0x04; 12];
         let aad = b"test additional authenticated data";
 
@@ -450,103 +322,5 @@ mod tests {
 
         let result = decrypt_session_id(&encrypted, &auth_key, &nonce, wrong_aad);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_session_id() {
-        let version = [1, 8, 1];
-        let timestamp = 1234567890u32;
-        let short_id = [0xAB; 8];
-
-        let session_id = create_session_id(version, timestamp, &short_id);
-
-        assert_eq!(session_id[0], 1);
-        assert_eq!(session_id[1], 8);
-        assert_eq!(session_id[2], 1);
-        assert_eq!(session_id[3], 0);
-
-        let ts = u32::from_be_bytes([session_id[4], session_id[5], session_id[6], session_id[7]]);
-        assert_eq!(ts, timestamp);
-
-        assert_eq!(&session_id[8..16], &short_id[..]);
-
-        // Verify remaining bytes are zeros
-        for byte in &session_id[16..] {
-            assert_eq!(*byte, 0);
-        }
-    }
-
-    #[test]
-    fn test_validation_scenarios() {
-        println!("\n=== REALITY Validation Test Scenarios ===\n");
-
-        // Scenario 1: Version validation
-        println!("Scenario 1: Version Validation");
-        println!("  Client version: [1, 8, 1]");
-        println!("  Min version: [1, 8, 0]");
-        println!("  Max version: [1, 9, 0]");
-        println!("  Expected: PASS ✓");
-
-        let client_version = [1u8, 8, 1];
-        let min_version = [1u8, 8, 0];
-        let max_version = [1u8, 9, 0];
-        assert!(client_version >= min_version);
-        assert!(client_version <= max_version);
-
-        // Scenario 2: Version below minimum
-        println!("\nScenario 2: Version Below Minimum");
-        println!("  Client version: [1, 7, 5]");
-        println!("  Min version: [1, 8, 0]");
-        println!("  Expected: FAIL ✗");
-
-        let old_client_version = [1u8, 7, 5];
-        assert!(old_client_version < min_version);
-
-        // Scenario 3: Version above maximum
-        println!("\nScenario 3: Version Above Maximum");
-        println!("  Client version: [2, 0, 0]");
-        println!("  Max version: [1, 9, 0]");
-        println!("  Expected: FAIL ✗");
-
-        let new_client_version = [2u8, 0, 0];
-        assert!(new_client_version > max_version);
-
-        // Scenario 4: Timestamp validation (within bounds)
-        println!("\nScenario 4: Timestamp Within Bounds");
-        let now = get_current_timestamp();
-        let client_timestamp = now - 30; // 30 seconds ago
-        let max_diff_ms = 60000u64; // 60 seconds
-
-        let diff = now.abs_diff(client_timestamp);
-        println!("  Server time: {}", now);
-        println!("  Client time: {} (30 seconds ago)", client_timestamp);
-        println!("  Max allowed: {} seconds", max_diff_ms / 1000);
-        println!("  Actual diff: {} seconds", diff);
-        println!("  Expected: PASS ✓");
-        assert!((diff as u64) <= (max_diff_ms / 1000));
-
-        // Scenario 5: Timestamp validation (out of bounds)
-        println!("\nScenario 5: Timestamp Out of Bounds");
-        let old_timestamp = now - 120; // 2 minutes ago
-        let diff = now.abs_diff(old_timestamp);
-        println!("  Server time: {}", now);
-        println!("  Client time: {} (2 minutes ago)", old_timestamp);
-        println!("  Max allowed: {} seconds", max_diff_ms / 1000);
-        println!("  Actual diff: {} seconds", diff);
-        println!("  Expected: FAIL ✗");
-        assert!((diff as u64) > (max_diff_ms / 1000));
-
-        // Scenario 6: Future timestamp validation
-        println!("\nScenario 6: Future Timestamp Validation");
-        let future_timestamp = now + 45; // 45 seconds in future
-        let diff = now.abs_diff(future_timestamp);
-        println!("  Server time: {}", now);
-        println!("  Client time: {} (45 seconds in future)", future_timestamp);
-        println!("  Max allowed: {} seconds", max_diff_ms / 1000);
-        println!("  Actual diff: {} seconds", diff);
-        println!("  Expected: PASS ✓");
-        assert!((diff as u64) <= (max_diff_ms / 1000));
-
-        println!("\n=== All Validation Scenarios Passed ===\n");
     }
 }

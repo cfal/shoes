@@ -834,10 +834,8 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::address::{Address, NetLocation};
+    use crate::crypto::CryptoTlsStream;
     use crate::crypto::tls_deframer::TlsDeframer;
-    use crate::crypto::{CryptoConnection, CryptoTlsStream};
-    use crate::reality::{RealityServerConfig, RealityServerConnection};
     use futures::task::noop_waker_ref;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -905,24 +903,9 @@ mod tests {
                     WebsocketPingType::PingFrame,
                     if pong { &[0x89, 0] } else { &[] },
                 );
-                let session = RealityServerConnection::new(RealityServerConfig {
-                    mldsa65_key: None,
-                    private_key: [0; 32],
-                    short_ids: vec![[0; 8]],
-                    dest: NetLocation::new(Address::UNSPECIFIED, 443),
-                    max_time_diff: None,
-                    min_client_version: None,
-                    max_client_version: None,
-                    cipher_suites: Vec::new(),
-                })
-                .unwrap()
-                .complete_for_test()
-                .unwrap();
-                let mut tls = CryptoTlsStream::new(
-                    websocket,
-                    CryptoConnection::new_reality_server(session),
-                    framed.then(TlsDeframer::new),
-                );
+                let session = crate::reality::established_pair().1;
+                let mut tls =
+                    CryptoTlsStream::new(websocket, session, framed.then(TlsDeframer::new));
                 tls.write_all(b"prior TLS traffic").await.unwrap();
                 tls.flush().await.unwrap();
 
