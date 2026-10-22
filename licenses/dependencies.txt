@@ -2700,7 +2700,7 @@ Repository: https://github.com/achanda/ipnetwork
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: crc32fast 1.5.2
+Package: crc32fast 1.5.3
 Repository: https://github.com/srijs/rust-crc32fast
 Package: env_filter 0.1.4
 Repository: https://github.com/rust-cli/env_logger
@@ -5241,7 +5241,7 @@ Package: blocking 1.7.0
 Repository: https://github.com/smol-rs/blocking
 Package: bumpalo 3.20.3
 Repository: https://github.com/fitzgen/bumpalo
-Package: cc 1.8.0
+Package: cc 1.9.0
 Repository: https://github.com/rust-lang/cc-rs
 Package: cfg-if 1.0.5
 Repository: https://github.com/rust-lang/cfg-if
@@ -5283,7 +5283,7 @@ Package: eyre 0.6.14
 Repository: https://github.com/eyre-rs/eyre
 Package: fastrand 2.5.0
 Repository: https://github.com/smol-rs/fastrand
-Package: find-msvc-tools 0.1.14
+Package: find-msvc-tools 0.1.15
 Repository: https://github.com/rust-lang/cc-rs
 Package: flate2 1.1.10
 Repository: https://github.com/rust-lang/flate2-rs
@@ -6079,7 +6079,7 @@ Package: keccak 0.2.2
 Repository: https://github.com/RustCrypto/sponges
 Package: md-5 0.11.0
 Repository: https://github.com/RustCrypto/hashes
-Package: ml-kem 0.3.2
+Package: ml-kem 0.3.3
 Repository: https://github.com/RustCrypto/KEMs
 Package: module-lattice 0.2.3
 Repository: https://github.com/RustCrypto/KEMs
@@ -6087,7 +6087,7 @@ Package: opaque-debug 0.3.1
 Repository: https://github.com/RustCrypto/utils
 Package: poly1305 0.8.0
 Repository: https://github.com/RustCrypto/universal-hashes
-Package: sha3 0.11.0
+Package: sha3 0.12.0
 Repository: https://github.com/RustCrypto/hashes
 Package: shake 0.1.0
 Repository: https://github.com/RustCrypto/XOFs
@@ -8120,7 +8120,7 @@ Package: jni 0.22.4
 Repository: https://github.com/jni-rs/jni-rs
 Package: kem 0.3.0
 Repository: https://github.com/RustCrypto/traits
-Package: libc 0.2.190
+Package: libc 0.2.191
 Repository: https://github.com/rust-lang/libc
 Package: miniz_oxide 0.9.1
 Repository: https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
@@ -10237,7 +10237,7 @@ THE SOFTWARE.
 
 
 License: MIT License (MIT)
-Package: schannel 0.1.29
+Package: schannel 0.1.30
 Repository: https://github.com/steffengy/schannel-rs
 
 Copyright (c) 2015 steffengy
@@ -10660,7 +10660,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 
 License: MIT License (MIT)
-Package: lru 0.18.5
+Package: lru 0.19.0
 Repository: https://github.com/jeromefroe/lru-rs.git
 
 MIT License
@@ -10866,7 +10866,7 @@ SOFTWARE.
 License: MIT License (MIT)
 Package: tokio-util 0.7.20
 Repository: https://github.com/tokio-rs/tokio
-Package: tokio 1.53.3
+Package: tokio 1.54.0
 Repository: https://github.com/tokio-rs/tokio
 
 MIT License
@@ -11261,7 +11261,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 License: Mozilla Public License 2.0 (MPL-2.0)
-Package: gotatun 0.10.1
+Package: gotatun 0.10.2
 Repository: https://github.com/mullvad/gotatun
 
 Mozilla Public License Version 2.0

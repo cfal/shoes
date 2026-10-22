@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use shoes_test_support::port_helper::PortHelper;
 use shoes_test_support::socks5::Socks5UdpAssociation;
 use shoes_test_support::test_fixture::ProcessGuard;
@@ -201,7 +202,7 @@ async fn hysteria2_control_streams_survive_small_application_caps()
 
     let (cert, key) = generate_test_cert_files()?;
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(std::fs::read(&cert)?)) {
+    for cert in CertificateDer::pem_file_iter(&cert)? {
         roots.add(cert?)?;
     }
     let mut tls = rustls::ClientConfig::builder()
@@ -312,7 +313,7 @@ async fn quic_reload_disconnects_old_connections_and_allows_reconnect()
     ports.wait_for_all_ports().await?;
 
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(std::fs::read(&cert)?)) {
+    for cert in CertificateDer::pem_file_iter(&cert)? {
         roots.add(cert?)?;
     }
     let mut tls = rustls::ClientConfig::builder()

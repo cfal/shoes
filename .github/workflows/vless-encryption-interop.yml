@@ -16,33 +16,33 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       GOMAXPROCS: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.27.3'
           cache: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: XTLS/Xray-core
           ref: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
           path: peers/xray
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: MetaCubeX/mihomo
           ref: 94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f
           path: peers/mihomo
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: SagerNet/sing-box
           ref: dfb80349bf5779ec0a3f834c9ec2794345bff8f0
           path: peers/sing-box
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: cfal/shoes
           ref: 001495285ac16e2121a539682d1a1f6a7c07c5ed
           path: peers/shoes-baseline
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry

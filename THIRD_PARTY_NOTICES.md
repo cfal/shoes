@@ -28,7 +28,7 @@ before distributing artifacts. Do not remove the bundle when redistributing.
 
 ## WireGuard Source
 
-Unix builds, including Android and iOS libraries, link GotaTun 0.10.1, an
+Unix builds, including Android and iOS libraries, link GotaTun 0.10.2, an
 implementation of the WireGuard protocol. GotaTun is copyright Mullvad VPN AB
 and incorporates work copyright Cloudflare, Inc. Its source files are covered
 by the Mozilla Public License 2.0 and the notices reproduced in
@@ -36,8 +36,8 @@ by the Mozilla Public License 2.0 and the notices reproduced in
 
 The unmodified corresponding source is available at:
 
-- https://crates.io/api/v1/crates/gotatun/0.10.1/download
-- https://github.com/mullvad/gotatun/tree/v0.10.1
+- https://crates.io/api/v1/crates/gotatun/0.10.2/download
+- https://github.com/mullvad/gotatun/tree/v0.10.2
 
 Recipients may obtain, modify, and redistribute the covered source under the
 MPL 2.0. Shoes does not modify GotaTun's source. Shoes' own source remains under

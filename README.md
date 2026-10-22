@@ -84,6 +84,12 @@ idle cancellation probes. The workspace patches cover direct and transitive
 dependencies, including DNS over HTTP/3. The experimental zero-copy change in
 [h3 #368](https://github.com/hyperium/h3/pull/368) is not included.
 
+The `blake3` patch pins our [binary-context fork](https://github.com/cfal/BLAKE3/tree/cd98c1c4112ed3b2cf2140e1844f266b3d665b53),
+rebased onto upstream buffer-alignment and AVX-512 soundness fixes. VLESS Encryption
+requires `derive_key_bytes` for contexts that are not valid UTF-8. Retain the patch
+until a registry release provides equivalent binary-context derivation; validate
+updates against the fork's tests and Shoes' Go-derived VLESS vectors.
+
 The `nix` patch pins an [upstream commit](https://github.com/nix-rust/nix/commit/3eae6d68ec6382fef7b38cd58f97458e59a71af9)
 containing [nix #2821](https://github.com/nix-rust/nix/pull/2821) for iOS socket
 compatibility. Retain it until adopting a registry release containing that fix.
