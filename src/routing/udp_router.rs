@@ -430,6 +430,7 @@ struct PendingSessionCreate {
 }
 
 struct PendingShutdown {
+    cancelled: Option<Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>>,
     _permit: Option<crate::resources::BudgetPermit>,
     stream: Box<dyn AsyncMessageStream>,
     deadline: Pin<Box<tokio::time::Sleep>>,
@@ -567,6 +568,13 @@ impl<'a> UdpRouter<'a> {
         let count = self.pending_shutdowns.len();
         for _ in 0..count {
             let mut pending = self.pending_shutdowns.pop_front().unwrap();
+            if pending
+                .cancelled
+                .as_mut()
+                .is_some_and(|cancelled| cancelled.as_mut().poll(cx).is_ready())
+            {
+                continue;
+            }
             if pending.deadline.as_mut().poll(cx).is_pending()
                 && Pin::new(&mut pending.stream)
                     .poll_shutdown_message(cx)
@@ -1264,6 +1272,9 @@ impl<'a> UdpRouter<'a> {
             self.pending_shutdowns.pop_front();
         }
         self.pending_shutdowns.push_back(PendingShutdown {
+            cancelled: stream
+                .flow()
+                .map(|flow| Box::pin(flow.cancel.clone().cancelled_owned())),
             _permit: permit,
             stream,
             deadline: Box::pin(tokio::time::sleep(SHUTDOWN_TIMEOUT)),
@@ -1783,6 +1794,69 @@ mod tests {
             Pin::new(&mut router).poll(&mut cx),
             Poll::Ready(Ok(()))
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_expired_session_drops_blocked_shutdown() {
+        use crate::control::flows::{FlowContext, FlowRegistry};
+        use crate::control::tracked_stream::TrackedMessageStream;
+        let registry = Arc::new(FlowRegistry::default());
+        let destination = NetLocation::from_str("192.0.2.1:53", None).unwrap();
+        let guard = FlowContext {
+            registry: registry.clone(),
+            generation: 1,
+            inbound: "test".into(),
+            scope: "root".into(),
+            protocol: "Socks5".into(),
+        }
+        .register(
+            "udp",
+            &destination.clone().into(),
+            vec!["DIRECT".into()],
+            "all",
+            Default::default(),
+        );
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let mut server =
+            ServerStream::Targeted(Box::new(crate::uot::UotV1ServerStream::new_uot(stream)));
+        let mut router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            false,
+        );
+        let state = Arc::new(RemoteState::default());
+        let mut session = RoutingSession::new(
+            destination.clone(),
+            0,
+            destination.clone(),
+            LookupKey::Destination(destination.clone()),
+            Box::new(TrackedMessageStream::new(
+                Box::new(RecordingRemote {
+                    state: state.clone(),
+                }),
+                guard,
+            )),
+        );
+        session.expiry_key = Some(router.expiry_queue.insert(0, Duration::from_secs(1)));
+        router.sessions.insert(0, session);
+        let SessionLookup::ByDestination(lookup) = &mut router.session_lookup else {
+            unreachable!()
+        };
+        lookup.insert(destination, KeyState::Active(0));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        router.process_expired(&mut cx);
+        router.drain_remote_shutdowns(&mut cx);
+        assert_eq!(router.pending_shutdowns.len(), 1);
+        assert_eq!(registry.snapshot(0).connections.len(), 1);
+        assert!(state.shutdown_polls.load(Ordering::SeqCst) > 0);
+        registry.cancel_all();
+        router.drain_remote_shutdowns(&mut cx);
+        assert!(router.pending_shutdowns.is_empty());
+        assert!(registry.snapshot(0).connections.is_empty());
+        assert_eq!(state.drops.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
