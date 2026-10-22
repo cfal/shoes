@@ -687,6 +687,10 @@ pub fn parse_validated_server_hello(
 }
 
 #[cfg(test)]
+#[path = "tests/client_hello.rs"]
+mod client_hello_tests;
+
+#[cfg(test)]
 #[path = "tests/server_hello.rs"]
 mod server_hello_tests;
 
