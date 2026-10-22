@@ -36,18 +36,21 @@ pub struct ControlRuntime {
 }
 
 type Reply = oneshot::Sender<io::Result<()>>;
+
+struct SelectionCommand {
+    generation: u64,
+    group: String,
+    member: String,
+    reply: Reply,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
 enum Command {
     Prepare(Arc<SelectionView>, Reply),
     Begin(Arc<SelectionView>, Reply),
     Publish(Arc<Generation>, Reply),
     Resume(Reply),
-    Select(
-        u64,
-        String,
-        String,
-        Reply,
-        tokio::sync::OwnedSemaphorePermit,
-    ),
+    Select(SelectionCommand),
 }
 
 pub struct ControlService {
@@ -126,8 +129,16 @@ impl ControlRuntime {
             .clone()
             .try_acquire_owned()
             .map_err(|_| unavailable())?;
-        self.request(|reply| Command::Select(generation, group, member, reply, permit))
-            .await
+        self.request(|reply| {
+            Command::Select(SelectionCommand {
+                generation,
+                group,
+                member,
+                reply,
+                _permit: permit,
+            })
+        })
+        .await
     }
     pub async fn begin_activation(&self, generation: &Arc<Generation>) -> io::Result<()> {
         self.request(|reply| Command::Begin(generation.catalog.selection.clone(), reply))
@@ -174,23 +185,18 @@ async fn run_owner(
     shutdown: CancellationToken,
 ) {
     let mut paused = false;
-    let mut pending = VecDeque::new();
+    let mut pending: VecDeque<SelectionCommand> = VecDeque::new();
     loop {
         if shutdown.is_cancelled() {
             break;
         }
-        let command = if !paused && !pending.is_empty() {
-            match pending.pop_front().unwrap() {
-                Command::Select(_, group, member, reply, permit) => {
-                    let generation = runtime
-                        .upgrade()
-                        .and_then(|runtime| runtime.generation().ok())
-                        .map(|generation| generation.id)
-                        .unwrap_or(0);
-                    Command::Select(generation, group, member, reply, permit)
-                }
-                _ => unreachable!("only selections are deferred during activation"),
-            }
+        let command = if !paused && let Some(mut selection) = pending.pop_front() {
+            selection.generation = runtime
+                .upgrade()
+                .and_then(|runtime| runtime.generation().ok())
+                .map(|generation| generation.id)
+                .unwrap_or(0);
+            Command::Select(selection)
         } else {
             let command = tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -231,10 +237,16 @@ async fn run_owner(
                 }
                 let _ = reply.send(Ok(()));
             }
-            Command::Select(generation, group, member, reply, permit) if paused => {
-                pending.push_back(Command::Select(generation, group, member, reply, permit));
+            Command::Select(selection) if paused => {
+                pending.push_back(selection);
             }
-            Command::Select(generation, group, member, reply, _permit) => {
+            Command::Select(SelectionCommand {
+                generation,
+                group,
+                member,
+                reply,
+                _permit,
+            }) => {
                 if !runtime.upgrade().is_some_and(|runtime| {
                     runtime
                         .generation()
