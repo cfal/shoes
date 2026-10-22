@@ -226,6 +226,7 @@ mod tests {
             for stream in &mut streams {
                 assert_eq!(stream.send.capacity(), 64);
                 stream.write_all(b"a").await.unwrap();
+                assert_eq!(stream.send.capacity(), 0, "surplus credit was not returned");
                 timeout(Duration::from_secs(1), stream.write_all(b"b"))
                     .await
                     .expect("write stalled despite unused capacity")
