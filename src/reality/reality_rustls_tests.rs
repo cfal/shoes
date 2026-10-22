@@ -5,7 +5,7 @@ use crate::crypto::TlsConnection;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use super::reality_key_exchange::RealityGroup;
+use super::reality_hello::RealityGroup;
 use super::reality_pq_tests::{
     configs, separate_target_records, target_records, target_with_unknown_extension,
 };
@@ -24,7 +24,7 @@ fn provider_preserves_cipher_defaults_order_and_duplicates() {
         ],
         vec![CipherSuite::AES_128_GCM_SHA256; 2],
     ] {
-        let provider = reality_rustls::provider(&suites);
+        let provider = reality_rustls_adapter::provider(&suites);
         let expected = if suites.is_empty() {
             DEFAULT_CIPHER_SUITES
         } else {
@@ -101,7 +101,7 @@ fn pending_pair(
     omit_ed25519: bool,
 ) -> (TlsConnection, TlsConnection, Vec<Bytes>) {
     let (cc, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
-    let crypto = reality_rustls::provider(&cc.cipher_suites);
+    let crypto = reality_rustls_adapter::provider(&cc.cipher_suites);
     let mut schemes = crypto.signature_verification_algorithms.supported_schemes();
     if omit_ed25519 {
         schemes.retain(|scheme| *scheme != rustls::SignatureScheme::ED25519);
@@ -260,7 +260,7 @@ fn client_hello_carries_authenticated_reality_metadata() {
     let mut client = cc.create_connection().unwrap();
     let mut hello = Vec::new();
     client.write_tls(&mut hello).unwrap();
-    let shares = super::reality_key_exchange::extract_client_key_shares(&hello).unwrap();
+    let shares = super::reality_hello::extract_client_key_shares(&hello).unwrap();
     let shared =
         perform_ecdh(&sc.private_key, shares.authentication_public_key().unwrap()).unwrap();
     let auth = derive_auth_key(&shared, &hello[11..31], b"REALITY").unwrap();
@@ -295,7 +295,7 @@ fn authentication_policy_and_client_share_variants() {
             "maximum" => sc.max_client_version = Some([1, 7, 9]),
             _ => {}
         }
-        let mut crypto = reality_rustls::provider(&cc.cipher_suites);
+        let mut crypto = reality_rustls_adapter::provider(&cc.cipher_suites);
         if case == "plain-only" {
             crypto.kx_groups.remove(0);
         }
@@ -313,7 +313,7 @@ fn authentication_policy_and_client_share_variants() {
         }
         if case == "timestamp" {
             use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
-            let shares = super::reality_key_exchange::extract_client_key_shares(&hello).unwrap();
+            let shares = super::reality_hello::extract_client_key_shares(&hello).unwrap();
             let shared =
                 perform_ecdh(&sc.private_key, shares.authentication_public_key().unwrap()).unwrap();
             let auth = derive_auth_key(&shared, &hello[11..31], b"REALITY").unwrap();
@@ -489,7 +489,7 @@ fn authenticated_invalid_tls_shares_forward_before_commit() {
     let mut client = cc.create_connection().unwrap();
     let mut hello = Vec::new();
     client.write_tls(&mut hello).unwrap();
-    let shares = super::reality_key_exchange::extract_client_key_shares(&hello).unwrap();
+    let shares = super::reality_hello::extract_client_key_shares(&hello).unwrap();
     let shared =
         perform_ecdh(&sc.private_key, shares.authentication_public_key().unwrap()).unwrap();
     let auth = derive_auth_key(&shared, &hello[11..31], b"REALITY").unwrap();

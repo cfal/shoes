@@ -4,7 +4,7 @@ use crate::crypto::TlsConnection;
 use aws_lc_rs::agreement;
 use bytes::Bytes;
 
-use super::reality_key_exchange::{RealityGroup, extract_client_key_shares};
+use super::reality_hello::{RealityGroup, extract_client_key_shares};
 use super::test_tls::{construct_server_hello, write_record_header};
 use super::*;
 
@@ -105,7 +105,7 @@ pub(super) fn target_with_unknown_extension(record: &Bytes) -> Bytes {
             .unwrap()
             .is_tls13
     );
-    super::reality_key_exchange::validate_server_key_share(&hello).unwrap();
+    super::reality_hello::validate_server_key_share(&hello).unwrap();
     hello.into()
 }
 

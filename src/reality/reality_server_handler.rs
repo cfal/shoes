@@ -19,7 +19,7 @@ use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
 
 use super::RealityServerConfig;
-use super::reality_key_exchange::validate_server_key_share;
+use super::reality_hello::validate_server_key_share;
 
 #[derive(Debug)]
 pub struct RealityServerTarget {
@@ -482,7 +482,7 @@ mod cleanup_tests {
     #[tokio::test]
     async fn target_collection_respects_observed_read_boundaries() {
         use crate::reality::CipherSuite;
-        use crate::reality::reality_key_exchange::RealityGroup;
+        use crate::reality::reality_hello::RealityGroup;
         use crate::reality::reality_pq_tests::{configs, separate_target_records};
 
         for case in ["six", "seven", "split-seven", "combined-trailing"] {
@@ -614,7 +614,7 @@ mod cleanup_tests {
     async fn incompatible_hellos_and_small_targets_forward_unchanged() {
         use crate::client_proxy_chain::InitialHopEntry;
         use crate::port_forward_handler::PortForwardServerHandler;
-        use crate::reality::reality_key_exchange::RealityGroup;
+        use crate::reality::reality_hello::RealityGroup;
         use crate::reality::reality_pq_tests::{
             configs, separate_target_records, target_with_unknown_extension,
         };

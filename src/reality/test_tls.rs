@@ -1,6 +1,6 @@
 //! Independent target-wire fixtures for REALITY admission and mirroring tests.
 
-use super::reality_key_exchange::RealityGroup;
+use super::reality_hello::RealityGroup;
 
 pub(super) fn construct_server_hello(
     random: &[u8; 32],

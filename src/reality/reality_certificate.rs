@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn malformed_mldsa_extensions_fail_even_with_valid_hmac() {
-        use super::super::reality_client_verify::{
+        use super::super::reality_certificate_verify::{
             verify_certificate_hmac, verify_certificate_mldsa,
         };
         use super::super::reality_mldsa;
@@ -170,8 +170,9 @@ mod tests {
         assert_eq!(extensions[0].oid.as_bytes(), [0]);
         assert!(!extensions[0].critical);
         assert_eq!(extensions[0].value.len(), 3309);
-        super::super::reality_client_verify::verify_certificate_hmac(cert.der(), &auth).unwrap();
-        super::super::reality_client_verify::verify_certificate_mldsa(
+        super::super::reality_certificate_verify::verify_certificate_hmac(cert.der(), &auth)
+            .unwrap();
+        super::super::reality_certificate_verify::verify_certificate_mldsa(
             cert.der(),
             &auth,
             b"clientserver",
@@ -179,7 +180,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            super::super::reality_client_verify::verify_certificate_mldsa(
+            super::super::reality_certificate_verify::verify_certificate_mldsa(
                 cert.der(),
                 &auth,
                 b"Clientserver",

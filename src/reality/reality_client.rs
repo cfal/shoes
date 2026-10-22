@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rustls::pki_types::ServerName;
 
 use super::CipherSuite;
-use super::reality_rustls::{client_authentication, provider};
+use super::reality_rustls_adapter::{client_authentication, provider};
 use crate::crypto::{TlsConnection, tls_error};
 
 #[derive(Clone)]

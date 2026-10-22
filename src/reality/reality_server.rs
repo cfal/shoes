@@ -8,10 +8,11 @@ use zeroize::Zeroizing;
 use super::CipherSuite;
 use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
 use super::reality_certificate::generate_hmac_certificate;
-use super::reality_key_exchange::extract_client_key_shares;
-use super::reality_rustls::{RealitySigningKey, provider};
-use super::reality_target_template::{flight_plan, verify_staged_flight};
-use super::reality_util::{extract_client_random, extract_session_id_slice};
+use super::reality_hello::{
+    extract_client_key_shares, extract_client_random, extract_session_id_slice,
+};
+use super::reality_rustls_adapter::{RealitySigningKey, provider};
+use super::reality_target_flight::{flight_plan, verify_staged_flight};
 use crate::address::{Address, NetLocation};
 use crate::crypto::{TlsConnection, tls_error};
 

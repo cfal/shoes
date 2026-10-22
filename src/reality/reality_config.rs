@@ -110,63 +110,6 @@ fn hex_char_to_value(c: u8) -> Result<u8, &'static str> {
     }
 }
 
-/// Extracts ClientRandom from ClientHello
-///
-/// ClientHello structure (simplified):
-/// - TLS Header: 5 bytes
-/// - Handshake Type: 1 byte
-/// - Length: 3 bytes
-/// - Protocol Version: 2 bytes
-/// - ClientRandom: 32 bytes (starts at offset 11)
-pub fn extract_client_random(client_hello: &[u8]) -> Result<[u8; 32], std::io::Error> {
-    const TLS_HEADER_LEN: usize = 5;
-    const HANDSHAKE_HEADER_LEN: usize = 4; // type(1) + length(3)
-    const PROTOCOL_VERSION_LEN: usize = 2;
-    const RANDOM_OFFSET: usize = TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN;
-
-    if client_hello.len() < RANDOM_OFFSET + 32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ClientHello too short to extract random",
-        ));
-    }
-
-    let mut random = [0u8; 32];
-    random.copy_from_slice(&client_hello[RANDOM_OFFSET..RANDOM_OFFSET + 32]);
-    Ok(random)
-}
-
-/// Extracts SessionId slice from ClientHello without allocation
-///
-/// SessionId comes after ClientRandom and has a 1-byte length prefix.
-/// Returns a slice pointing into the original buffer.
-pub fn extract_session_id_slice(client_hello: &[u8]) -> Result<&[u8], std::io::Error> {
-    const TLS_HEADER_LEN: usize = 5;
-    const HANDSHAKE_HEADER_LEN: usize = 4;
-    const PROTOCOL_VERSION_LEN: usize = 2;
-    const RANDOM_LEN: usize = 32;
-    const SESSION_ID_LEN_OFFSET: usize =
-        TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN + RANDOM_LEN;
-
-    if client_hello.len() < SESSION_ID_LEN_OFFSET + 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ClientHello too short to extract session ID",
-        ));
-    }
-
-    let session_id_len = client_hello[SESSION_ID_LEN_OFFSET] as usize;
-
-    if client_hello.len() < SESSION_ID_LEN_OFFSET + 1 + session_id_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ClientHello session ID extends past end",
-        ));
-    }
-
-    Ok(&client_hello[SESSION_ID_LEN_OFFSET + 1..SESSION_ID_LEN_OFFSET + 1 + session_id_len])
-}
-
 pub fn generate_keypair() -> std::io::Result<(String, String)> {
     // Generate 32 random bytes for private key
     let mut private_key_bytes = [0u8; 32];
@@ -210,34 +153,6 @@ mod tests {
         // Too long should error
         let result = decode_short_id("0123456789abcdef0");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_client_random() {
-        // Create a minimal ClientHello with random
-        let mut client_hello = vec![0u8; 100];
-
-        // TLS Header
-        client_hello[0] = 0x16; // Handshake
-        client_hello[1] = 0x03; // Version major
-        client_hello[2] = 0x03; // Version minor (TLS 1.2)
-
-        // Handshake header
-        client_hello[5] = 0x01; // ClientHello type
-
-        // Protocol version in handshake
-        client_hello[9] = 0x03; // Major
-        client_hello[10] = 0x03; // Minor
-
-        // ClientRandom starts at offset 11
-        for i in 0..32 {
-            client_hello[11 + i] = (i + 1) as u8;
-        }
-
-        let random = extract_client_random(&client_hello).unwrap();
-        for (i, byte) in random.iter().enumerate() {
-            assert_eq!(*byte, (i + 1) as u8);
-        }
     }
 
     #[test]
