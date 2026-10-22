@@ -21,21 +21,22 @@ use super::reality_key_exchange::generate_mlkem;
 use super::{CipherSuite, DEFAULT_CIPHER_SUITES, RealityClientConfig};
 
 pub(super) fn provider(suites: &[CipherSuite]) -> CryptoProvider {
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    let supported = provider.cipher_suites.clone();
-    provider.cipher_suites = if suites.is_empty() {
+    let suites = if suites.is_empty() {
         DEFAULT_CIPHER_SUITES
     } else {
         suites
-    }
-    .iter()
-    .filter_map(|suite| {
-        supported
-            .iter()
-            .find(|s| u16::from(s.suite()) == suite.id())
-            .copied()
-    })
-    .collect();
+    };
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.cipher_suites = suites
+        .iter()
+        .filter_map(|suite| {
+            provider
+                .cipher_suites
+                .iter()
+                .find(|supported| u16::from(supported.suite()) == suite.id())
+                .copied()
+        })
+        .collect();
     provider.kx_groups = vec![
         rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
         rustls::crypto::aws_lc_rs::kx_group::X25519,

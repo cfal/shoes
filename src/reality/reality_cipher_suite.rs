@@ -7,18 +7,10 @@ pub const DEFAULT_CIPHER_SUITES: &[CipherSuite] = &[
     CipherSuite::CHACHA20_POLY1305_SHA256,
 ];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct CipherSuite {
     id: u16,
 }
-
-impl PartialEq for CipherSuite {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for CipherSuite {}
 
 impl CipherSuite {
     pub const AES_128_GCM_SHA256: Self = Self { id: 0x1301 };

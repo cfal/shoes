@@ -12,6 +12,33 @@ use super::*;
 struct Secrets(Mutex<std::collections::HashMap<String, Vec<u8>>>);
 
 #[test]
+fn provider_preserves_cipher_defaults_order_and_duplicates() {
+    for suites in [
+        Vec::new(),
+        vec![
+            CipherSuite::CHACHA20_POLY1305_SHA256,
+            CipherSuite::AES_256_GCM_SHA384,
+        ],
+        vec![CipherSuite::AES_128_GCM_SHA256; 2],
+    ] {
+        let provider = reality_rustls::provider(&suites);
+        let expected = if suites.is_empty() {
+            DEFAULT_CIPHER_SUITES
+        } else {
+            &suites
+        };
+        assert_eq!(
+            provider
+                .cipher_suites
+                .iter()
+                .map(|suite| u16::from(suite.suite()))
+                .collect::<Vec<_>>(),
+            expected.iter().map(CipherSuite::id).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn interleaved_connections_do_not_share_authentication_state() {
     let pending: Vec<_> = (0..4).map(|_| pending_pair(Arc::default(), true)).collect();
     for (mut client, mut server, flight) in pending {
