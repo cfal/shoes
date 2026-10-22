@@ -31,7 +31,9 @@ impl AsyncRead for TargetReads {
 async fn target_collection_respects_observed_read_boundaries() {
     use crate::reality::CipherSuite;
     use crate::reality::reality_hello::RealityGroup;
-    use crate::reality::tests::reality_fixtures::{configs, separate_target_records};
+    use crate::reality::tests::reality_fixtures::{
+        configs, separate_target_records, write_record_header,
+    };
 
     for case in ["six", "seven", "split-seven", "combined-trailing"] {
         let (client_config, server_config) = configs(CipherSuite::AES_128_GCM_SHA256);
@@ -48,7 +50,7 @@ async fn target_collection_respects_observed_read_boundaries() {
             )
         };
         if matches!(case, "seven" | "split-seven") {
-            let mut trailing = vec![23, 3, 3, 0, 59];
+            let mut trailing = write_record_header(23, 59);
             trailing.resize(64, 0);
             records.push(trailing.into());
         }
@@ -164,7 +166,7 @@ async fn incompatible_hellos_and_small_targets_forward_unchanged() {
     use crate::port_forward_handler::PortForwardServerHandler;
     use crate::reality::reality_hello::RealityGroup;
     use crate::reality::tests::reality_fixtures::{
-        configs, separate_target_records, target_with_unknown_extension,
+        configs, separate_target_records, target_with_unknown_extension, write_record_header,
     };
     use crate::reality::{CipherSuite, mldsa65_signing_key};
     use crate::tcp::socket_connector_impl::SocketConnectorImpl;
@@ -238,7 +240,7 @@ async fn incompatible_hellos_and_small_targets_forward_unchanged() {
                         3,
                     )
                 };
-                let mut encrypted = vec![23, 3, 3, 2, 88];
+                let mut encrypted = write_record_header(23, 600);
                 encrypted.resize(605, 0);
                 records[small_record] = encrypted.into();
                 let check = sc.clone();
@@ -291,8 +293,7 @@ async fn incompatible_hellos_and_small_targets_forward_unchanged() {
                 message.extend_from_slice(&extensions);
                 let len = (message.len() - 4) as u32;
                 message[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
-                let mut record = vec![22, 3, 3];
-                record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+                let mut record = write_record_header(22, message.len() as u16);
                 record.extend_from_slice(&message);
                 record
             }

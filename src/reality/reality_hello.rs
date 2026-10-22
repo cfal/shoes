@@ -181,17 +181,14 @@ pub fn validate_server_key_share(record: &[u8]) -> io::Result<()> {
 /// - Length: 3 bytes
 /// - Protocol Version: 2 bytes
 /// - ClientRandom: 32 bytes (starts at offset 11)
-pub fn extract_client_random(client_hello: &[u8]) -> Result<[u8; 32], std::io::Error> {
+pub fn extract_client_random(client_hello: &[u8]) -> io::Result<[u8; 32]> {
     const TLS_HEADER_LEN: usize = 5;
     const HANDSHAKE_HEADER_LEN: usize = 4; // type(1) + length(3)
     const PROTOCOL_VERSION_LEN: usize = 2;
     const RANDOM_OFFSET: usize = TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN;
 
     if client_hello.len() < RANDOM_OFFSET + 32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ClientHello too short to extract random",
-        ));
+        return Err(invalid("ClientHello too short to extract random"));
     }
 
     let mut random = [0u8; 32];
@@ -203,7 +200,7 @@ pub fn extract_client_random(client_hello: &[u8]) -> Result<[u8; 32], std::io::E
 ///
 /// SessionId comes after ClientRandom and has a 1-byte length prefix.
 /// Returns a slice pointing into the original buffer.
-pub fn extract_session_id_slice(client_hello: &[u8]) -> Result<&[u8], std::io::Error> {
+pub fn extract_session_id_slice(client_hello: &[u8]) -> io::Result<&[u8]> {
     const TLS_HEADER_LEN: usize = 5;
     const HANDSHAKE_HEADER_LEN: usize = 4;
     const PROTOCOL_VERSION_LEN: usize = 2;
@@ -212,19 +209,13 @@ pub fn extract_session_id_slice(client_hello: &[u8]) -> Result<&[u8], std::io::E
         TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN + RANDOM_LEN;
 
     if client_hello.len() < SESSION_ID_LEN_OFFSET + 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ClientHello too short to extract session ID",
-        ));
+        return Err(invalid("ClientHello too short to extract session ID"));
     }
 
     let session_id_len = client_hello[SESSION_ID_LEN_OFFSET] as usize;
 
     if client_hello.len() < SESSION_ID_LEN_OFFSET + 1 + session_id_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ClientHello session ID extends past end",
-        ));
+        return Err(invalid("ClientHello session ID extends past end"));
     }
 
     Ok(&client_hello[SESSION_ID_LEN_OFFSET + 1..SESSION_ID_LEN_OFFSET + 1 + session_id_len])
