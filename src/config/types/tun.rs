@@ -161,6 +161,8 @@ fn default_mtu() -> u16 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "super::common::is_false")]
     pub sniff: bool,
     /// Automatic for owned Linux devices. False disables TCPv4 transmit offload.

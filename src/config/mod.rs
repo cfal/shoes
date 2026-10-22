@@ -13,7 +13,7 @@
 //! - [`create_server_configs`]: Validate and create final server configs
 //! - [`singbox::convert_singbox_config`]: Convert sing-box configs to shoes format
 
-mod client_visit;
+pub(crate) mod client_visit;
 mod fake_dns;
 mod pem;
 pub(crate) mod rule_visit;

@@ -415,6 +415,7 @@ mod tests {
         rule.compile(&mut crate::rules::Compiler::default())
             .unwrap();
         let config = ServerConfig {
+            name: None,
             sniff: false,
             bind_location: BindLocation::Address(OneOrSome::Some(
                 [first_addr, occupied_addr]

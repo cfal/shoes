@@ -17,6 +17,7 @@ pub struct RuleConfig {
 
 #[derive(Debug, Clone)]
 pub struct RuleCriteria {
+    pub description: Option<std::sync::Arc<crate::control::catalog::RuleDescription>>,
     pub expression: Expression,
     pub no_resolve: bool,
     pub compiled: Option<std::sync::Arc<crate::rules::Predicate>>,
@@ -25,6 +26,7 @@ pub struct RuleCriteria {
 impl Default for RuleCriteria {
     fn default() -> Self {
         Self {
+            description: None,
             expression: Expression::Legacy(OneOrSome::One(NetLocationMask::ANY)),
             no_resolve: false,
             compiled: None,
@@ -249,6 +251,7 @@ impl<'de> Deserialize<'de> for RuleConfig {
 
         let expression = Expression::from_config(temp.masks).map_err(D::Error::custom)?;
         let criteria = RuleCriteria {
+            description: None,
             expression,
             no_resolve: temp.no_resolve,
             compiled: None,
@@ -675,6 +678,7 @@ mod tests {
     fn create_test_rule_config() -> RuleConfig {
         RuleConfig {
             criteria: RuleCriteria {
+                description: None,
                 expression: Expression::Legacy(OneOrSome::Some(vec![
                     NetLocationMask::from("192.168.0.0/16:80").unwrap(),
                     NetLocationMask::from("10.0.0.0/8:443").unwrap(),

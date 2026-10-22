@@ -20,8 +20,20 @@ use super::tun::TunConfig;
 #[serde(deny_unknown_fields)]
 pub struct ClientConfigGroup {
     pub client_group: String,
+    #[serde(default)]
+    pub strategy: GroupStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
     #[serde(alias = "client_proxy")]
     pub client_proxies: OneOrSome<ConfigSelection<ClientConfig>>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GroupStrategy {
+    #[default]
+    RoundRobin,
+    Selector,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -361,6 +373,8 @@ mod tests {
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig {
+            name: None,
+            control: None,
             bind_interface: crate::option_util::NoneOrOne::One("eth0".to_string()),
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
             protocol: ClientProxyConfig::Socks {
@@ -376,6 +390,7 @@ mod tests {
     fn create_test_rule_config() -> RuleConfig {
         RuleConfig {
             criteria: super::super::rules::RuleCriteria {
+                description: None,
                 expression: crate::rules::Expression::Legacy(OneOrSome::Some(vec![
                     NetLocationMask::from("192.168.0.0/16:80").unwrap(),
                     NetLocationMask::from("10.0.0.0/8:443").unwrap(),
@@ -399,10 +414,14 @@ mod tests {
     #[test]
     fn test_client_config_group() {
         let original = vec![Config::ClientConfigGroup(ClientConfigGroup {
+            strategy: Default::default(),
+            default: None,
             client_group: "test-client-group".to_string(),
             client_proxies: OneOrSome::Some(vec![
                 ConfigSelection::Config(create_test_client_config()),
                 ConfigSelection::Config(ClientConfig {
+                    name: None,
+                    control: None,
                     bind_interface: crate::option_util::NoneOrOne::None,
                     address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
                     protocol: ClientProxyConfig::Http {

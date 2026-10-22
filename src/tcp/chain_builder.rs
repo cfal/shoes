@@ -137,6 +137,10 @@ pub(crate) fn build_client_proxy_chain_with_limits(
         .collect::<std::io::Result<_>>()?;
 
     // Build proxy connectors for subsequent hops (1+)
+    let origins = hops
+        .iter()
+        .map(|pool| pool.iter().map(|client| client.control.clone()).collect())
+        .collect();
     let subsequent_hops: Vec<Vec<Box<dyn ProxyConnector>>> = hops
         .into_iter()
         .skip(1) // Skip hop 0, already processed as initial_hop
@@ -168,7 +172,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
         })
         .collect::<std::io::Result<_>>()?;
 
-    Ok(ClientProxyChain::new(initial_hop, subsequent_hops))
+    Ok(ClientProxyChain::new(initial_hop, subsequent_hops).with_origins(origins))
 }
 
 /// Find the first proxy address in the chain (for socket connector target).

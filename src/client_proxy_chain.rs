@@ -26,6 +26,7 @@ use log::debug;
 
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
+use crate::control::catalog::MemberOrigin;
 use crate::resolver::Resolver;
 use crate::tcp::carrier_dialer::{CarrierDialer, QuicCarrier, RouteKey};
 use crate::tcp::proxy_connector::ProxyConnector;
@@ -80,6 +81,7 @@ impl InitialHopEntry {
 /// - `initial_hop`: Pool of InitialHopEntry for hop 0 (socket + optional proxy paired)
 /// - `subsequent_hops`: Protocol connectors for hops 1+ (no socket creation needed)
 pub struct ClientProxyChain {
+    origins: Vec<Vec<Option<MemberOrigin>>>,
     /// Initial hop pool: each entry is either Direct or Proxy.
     /// Socket and proxy are paired and selected together.
     initial_hop: Vec<Arc<InitialHopEntry>>,
@@ -128,32 +130,13 @@ impl ClientProxyChain {
             || self.subsequent_hops.iter().flatten().any(|proxy| proxy.needs_carrier_dialer())
     }
 
-    fn selected_route(&self, resolver: &Arc<dyn Resolver>, udp: bool) -> SelectedRoute {
-        let udp_index = || {
-            let index = self
-                .udp_final_hop_next_index
-                .fetch_add(1, Ordering::Relaxed) as usize;
-            self.udp_final_hop_indices[index % self.udp_final_hop_indices.len()]
-        };
-        let initial_index = if udp && self.udp_uses_initial_hop {
-            udp_index()
-        } else {
-            self.initial_hop_next_index.fetch_add(1, Ordering::Relaxed) as usize
-                % self.initial_hop.len()
-        };
+    fn selected_route(&self, resolver: &Arc<dyn Resolver>, indices: &[usize]) -> SelectedRoute {
+        let initial_index = indices[0];
         let subsequent = self
             .subsequent_hops
             .iter()
             .enumerate()
-            .map(|(i, hop)| {
-                let index = if udp && i + 1 == self.subsequent_hops.len() {
-                    udp_index()
-                } else {
-                    self.subsequent_next_indices[i].fetch_add(1, Ordering::Relaxed) as usize
-                        % hop.len()
-                };
-                hop[index].clone()
-            })
+            .map(|(i, hop)| hop[indices[i + 1]].clone())
             .collect();
         SelectedRoute {
             socket: match self.initial_hop[initial_index].as_ref() {
@@ -165,6 +148,73 @@ impl ClientProxyChain {
             subsequent,
             resolver: resolver.clone(),
         }
+    }
+
+    pub(crate) fn with_origins(mut self, origins: Vec<Vec<Option<MemberOrigin>>>) -> Self {
+        self.origins = origins;
+        self
+    }
+
+    fn select_indices(&self, udp: bool) -> std::io::Result<Vec<usize>> {
+        let choices = self
+            .origins
+            .iter()
+            .flatten()
+            .flatten()
+            .next()
+            .map(|origin| origin.selection.snapshot());
+        (0..self.num_hops())
+            .map(|hop| {
+                let final_udp = udp && hop + 1 == self.num_hops();
+                let length = if hop == 0 {
+                    self.initial_hop.len()
+                } else {
+                    self.subsequent_hops[hop - 1].len()
+                };
+                let allowed = |index: &usize| {
+                    (!final_udp || self.udp_final_hop_indices.contains(index))
+                        && choices.as_ref().is_none_or(|choices| {
+                            self.origins
+                                .get(hop)
+                                .and_then(|pool| pool.get(*index))
+                                .and_then(Option::as_ref)
+                                .is_none_or(|origin| origin.allowed(choices))
+                        })
+                };
+                let count = (0..length).filter(allowed).count();
+                if count == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "selected branch cannot carry this flow",
+                    ));
+                }
+                let counter = if final_udp {
+                    &self.udp_final_hop_next_index
+                } else if hop == 0 {
+                    &self.initial_hop_next_index
+                } else {
+                    &self.subsequent_next_indices[hop - 1]
+                };
+                let ordinal = counter.fetch_add(1, Ordering::Relaxed) as usize % count;
+                Ok((0..length).filter(allowed).nth(ordinal).unwrap())
+            })
+            .collect()
+    }
+
+    fn route_names(&self, indices: &[usize]) -> Vec<String> {
+        indices
+            .iter()
+            .enumerate()
+            .rev()
+            .flat_map(|(hop, index)| {
+                self.origins
+                    .get(hop)
+                    .and_then(|pool| pool.get(*index))
+                    .and_then(Option::as_ref)
+                    .into_iter()
+                    .flat_map(MemberOrigin::chains)
+            })
+            .collect()
     }
 
     /// Create a new chain from initial hop entries and subsequent hop pools.
@@ -212,6 +262,7 @@ impl ClientProxyChain {
         let subsequent_next_indices = subsequent_hops.iter().map(|_| AtomicU32::new(0)).collect();
 
         Self {
+            origins: Vec::new(),
             initial_hop: initial_hop.into_iter().map(Arc::new).collect(),
             initial_hop_next_index: AtomicU32::new(0),
             subsequent_hops: subsequent_hops
@@ -226,7 +277,6 @@ impl ClientProxyChain {
     }
 
     /// Returns the total number of hops.
-    #[cfg(test)]
     pub fn num_hops(&self) -> usize {
         1 + self.subsequent_hops.len()
     }
@@ -263,30 +313,11 @@ impl ClientProxyChain {
             })
     }
 
-    /// Select an initial hop entry (round-robin).
-    fn select_initial_hop_entry(&self) -> &InitialHopEntry {
-        if self.initial_hop.len() == 1 {
-            &self.initial_hop[0]
-        } else {
-            let idx = self.initial_hop_next_index.fetch_add(1, Ordering::Relaxed) as usize;
-            &self.initial_hop[idx % self.initial_hop.len()]
-        }
-    }
-
-    /// Select proxy connectors for subsequent hops (round-robin per hop).
-    fn select_subsequent_proxies(&self) -> Vec<&dyn ProxyConnector> {
+    fn select_subsequent_proxies(&self, indices: &[usize]) -> Vec<&dyn ProxyConnector> {
         self.subsequent_hops
             .iter()
             .enumerate()
-            .map(|(i, hop)| {
-                if hop.len() == 1 {
-                    hop[0].as_ref()
-                } else {
-                    let idx =
-                        self.subsequent_next_indices[i].fetch_add(1, Ordering::Relaxed) as usize;
-                    hop[idx % hop.len()].as_ref()
-                }
-            })
+            .map(|(i, hop)| hop[indices[i + 1]].as_ref())
             .collect()
     }
 
@@ -296,17 +327,29 @@ impl ClientProxyChain {
         remote_location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
+        self.connect_tcp_observed(remote_location, resolver, &mut Vec::new())
+            .await
+    }
+
+    async fn connect_tcp_observed(
+        &self,
+        remote_location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        path: &mut Vec<String>,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let indices = self.select_indices(false)?;
+        *path = self.route_names(&indices);
         if self.needs_carrier_dialer() {
             return self
-                .selected_route(resolver, false)
+                .selected_route(resolver, &indices)
                 .connect(remote_location)
                 .await;
         }
         // Select initial hop entry (socket + optional proxy paired)
-        let entry = self.select_initial_hop_entry();
+        let entry = self.initial_hop[indices[0]].as_ref();
 
         // Select proxy connectors for subsequent hops
-        let subsequent_proxies = self.select_subsequent_proxies();
+        let subsequent_proxies = self.select_subsequent_proxies(&indices);
 
         debug!(
             "Chain TCP connect: 1 initial + {} subsequent hop(s) -> {}",
@@ -406,6 +449,16 @@ impl ClientProxyChain {
         resolver: &Arc<dyn Resolver>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        self.connect_udp_observed(resolver, target, &mut Vec::new())
+            .await
+    }
+
+    async fn connect_udp_observed(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+        target: ResolvedLocation,
+        path: &mut Vec<String>,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         // Check if UDP is supported
         if self.udp_final_hop_indices.is_empty() {
             return Err(std::io::Error::new(
@@ -414,8 +467,10 @@ impl ClientProxyChain {
             ));
         }
 
+        let indices = self.select_indices(true)?;
+        *path = self.route_names(&indices);
         if self.needs_carrier_dialer() {
-            let route = self.selected_route(resolver, true);
+            let route = self.selected_route(resolver, &indices);
             return match route.last_proxy() {
                 Some(proxy) => {
                     proxy
@@ -437,10 +492,7 @@ impl ClientProxyChain {
         if self.udp_uses_initial_hop {
             // Case 1: No subsequent hops - initial hop IS the final hop
             // Select from UDP-capable initial hop entries
-            let idx = self
-                .udp_final_hop_next_index
-                .fetch_add(1, Ordering::Relaxed) as usize;
-            let pool_idx = self.udp_final_hop_indices[idx % self.udp_final_hop_indices.len()];
+            let pool_idx = indices[0];
             let entry = self.initial_hop[pool_idx].as_ref();
 
             debug!(
@@ -468,7 +520,7 @@ impl ClientProxyChain {
             // select intermediate hops normally, select final hop from UDP-capable
 
             // Select initial hop normally (ALL entries work - they just do TCP)
-            let entry = self.select_initial_hop_entry();
+            let entry = self.initial_hop[indices[0]].as_ref();
 
             // Select intermediate hops normally (ALL entries work - they just do TCP)
             let intermediate_proxies: Vec<&dyn ProxyConnector> = self
@@ -476,23 +528,12 @@ impl ClientProxyChain {
                 .iter()
                 .enumerate()
                 .take(self.subsequent_hops.len() - 1) // All but last
-                .map(|(i, hop)| {
-                    if hop.len() == 1 {
-                        hop[0].as_ref()
-                    } else {
-                        let idx = self.subsequent_next_indices[i].fetch_add(1, Ordering::Relaxed)
-                            as usize;
-                        hop[idx % hop.len()].as_ref()
-                    }
-                })
+                .map(|(i, hop)| hop[indices[i + 1]].as_ref())
                 .collect();
 
             // Select final hop from UDP-capable entries
             let final_hop_pool = self.subsequent_hops.last().unwrap();
-            let idx = self
-                .udp_final_hop_next_index
-                .fetch_add(1, Ordering::Relaxed) as usize;
-            let pool_idx = self.udp_final_hop_indices[idx % self.udp_final_hop_indices.len()];
+            let pool_idx = *indices.last().unwrap();
             let final_proxy = final_hop_pool[pool_idx].as_ref();
 
             debug!(
@@ -668,6 +709,55 @@ mod carrier_tests {
     use crate::async_stream::AsyncStream;
     use std::sync::Mutex;
 
+    #[test]
+    fn selectors_filter_all_hops_without_changing_flattened_weights() {
+        let yaml = "
+- client_group: leaves
+  client_proxies:
+    - name: http
+      address: 127.0.0.1:8000
+      protocol: {type: http}
+    - name: udp
+      address: 127.0.0.1:8001
+      protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
+- client_group: weighted
+  client_proxies: [leaves, leaves, direct]
+- client_group: choose
+  strategy: selector
+  client_proxies: [weighted, direct]
+- address: 127.0.0.1:1080
+  protocol: {type: socks}
+  rules: [{mask: 0.0.0.0/0, action: allow, client_chain: choose}]
+";
+        let mut validated = crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
+        let catalog = validated.catalog.take().unwrap();
+        let crate::config::Config::Server(server) = validated.configs.remove(0) else { panic!() };
+        let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else { panic!() };
+        let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else { panic!() };
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let group = crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver).unwrap();
+        let chain = &group.chains[0];
+        for index in 0..10 { assert_eq!(chain.select_indices(false).unwrap(), [index % 5]); }
+        for index in [1, 3, 4, 1, 3, 4] { assert_eq!(chain.select_indices(true).unwrap(), [index]); }
+        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+        owner.activate(catalog.selection.clone()).unwrap();
+        owner.select("choose", "DIRECT").unwrap();
+        assert_eq!(chain.select_indices(false).unwrap(), [5]);
+        assert_eq!(chain.select_indices(true).unwrap(), [5]);
+
+        let definitions = std::collections::BTreeMap::from([("leaves".into(), crate::control::selection::SelectorDefinition { members: vec!["http".into(), "udp".into()], default: Some("http".into()) })]);
+        let view = owner.prepare(definitions).unwrap();
+        let mut chain = group.chains.into_iter().next().unwrap();
+        for origin in chain.origins.iter_mut().flatten().flatten() { origin.selection = view.clone(); }
+        owner.activate(view).unwrap();
+        // A hop containing only this selector must fail, not choose a different leaf.
+        chain.initial_hop.truncate(2);
+        chain.udp_final_hop_indices = vec![1];
+        assert!(chain.select_indices(true).is_err());
+        owner.select("leaves", "udp").unwrap();
+        assert_eq!(chain.select_indices(true).unwrap(), [1]);
+    }
+
     #[derive(Debug)]
     struct Socket(usize, Arc<Mutex<Vec<String>>>);
     #[async_trait::async_trait]
@@ -802,11 +892,13 @@ mod carrier_tests {
         );
         let initial = Arc::downgrade(&chain.initial_hop[0]);
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-        let prefix = chain.selected_route(&resolver, false).prefix(
-            NetLocation::from_str("xhttp.test:443", None)
-                .unwrap()
-                .into(),
-        );
+        let prefix = chain
+            .selected_route(&resolver, &chain.select_indices(false).unwrap())
+            .prefix(
+                NetLocation::from_str("xhttp.test:443", None)
+                    .unwrap()
+                    .into(),
+            );
         drop(chain);
         assert!(initial.upgrade().is_none());
         assert_eq!(prefix.route_key().0.len(), 1);
@@ -1323,7 +1415,7 @@ mod tests {
         // Select entries multiple times and verify pairing
         // Round-robin should cycle: 0, 1, 2, 0, 1, 2, ...
         for iteration in 0..6 {
-            let entry = chain.select_initial_hop_entry();
+            let entry = chain.initial_hop[chain.select_indices(false).unwrap()[0]].as_ref();
             let expected_idx = iteration % 3;
 
             match (expected_idx, entry) {
@@ -1435,7 +1527,7 @@ mod tests {
         // We can't easily test this without calling connect_udp_bidirectional(), but we can verify
         // that the normal round-robin will cycle through both
         for i in 0..4 {
-            let entry = chain.select_initial_hop_entry();
+            let entry = chain.initial_hop[chain.select_indices(false).unwrap()[0]].as_ref();
             let expected_idx = i % 2;
             match (expected_idx, entry) {
                 (0, InitialHopEntry::Proxy { proxy, .. }) => {

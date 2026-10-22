@@ -36,7 +36,15 @@ impl ClientRegistry {
         }
         // Compares effective carrier socket defaults without rewriting ordinary clients.
         let mut settings = client.clone();
+        let mut selection_paths = Vec::new();
         visit_client(&mut settings, &mut |carrier| {
+            selection_paths.push(
+                carrier
+                    .control
+                    .as_ref()
+                    .map(crate::control::catalog::MemberOrigin::selector_path)
+                    .unwrap_or_default(),
+            );
             if carrier.bind_interface.is_unspecified() {
                 carrier.bind_interface = NoneOrOne::None;
             }
@@ -50,7 +58,7 @@ impl ClientRegistry {
             Ok(())
         })?;
         // Serialization excludes generation-local IDs and prepared connectors.
-        let settings = serde_yaml::to_value(settings)
+        let settings = serde_yaml::to_value((settings, selection_paths))
             .map_err(|_| invalid("cannot compare WireGuard client settings"))?;
         let ClientProxyConfig::Wireguard(config) = &mut client.protocol else {
             unreachable!("checked WireGuard protocol")

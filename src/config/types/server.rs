@@ -158,6 +158,8 @@ pub fn direct_allow_rule() -> NoneOrSome<ConfigSelection<RuleConfig>> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub sniff: bool,
     #[serde(flatten)]
@@ -198,6 +200,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .ok_or_else(|| Error::custom("ServerConfig must be a YAML mapping"))?;
 
         const VALID_FIELDS: &[&str] = &[
+            "name",
             "address",
             "addresses",
             "path", // BindLocation (flattened)
@@ -329,6 +332,11 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .unwrap_or(false);
 
         Ok(ServerConfig {
+            name: map
+                .get("name")
+                .map(|v| serde_yaml::from_value(v.clone()))
+                .transpose()
+                .map_err(Error::custom)?,
             sniff,
             bind_location,
             protocol,
@@ -956,6 +964,7 @@ mod tests {
 
     fn create_test_server_config_http() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
                 .into(),
@@ -973,6 +982,7 @@ mod tests {
 
     fn create_test_server_config_socks() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1080)
                 .into(),
@@ -991,6 +1001,7 @@ mod tests {
 
     fn create_test_server_config_shadowsocks() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: BindLocation::Path(PathBuf::from("/tmp/ss.sock")),
             protocol: ServerProxyConfig::Shadowsocks {
@@ -1010,6 +1021,7 @@ mod tests {
 
     fn create_test_server_config_vless() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: NetLocation::from_ip_addr(
                 IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
@@ -1043,6 +1055,7 @@ mod tests {
 
     fn create_test_server_config_trojan() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: NetLocation::from_ip_addr(
                 IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
@@ -1087,6 +1100,7 @@ mod tests {
         ServerConfig {
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8443)
                 .into(),
+            name: None,
             sniff: false,
             protocol: ServerProxyConfig::Tls {
                 tls_targets,
@@ -1118,6 +1132,7 @@ mod tests {
 
     fn create_test_server_config_vmess() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: NetLocation::from_ip_addr(
                 IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
@@ -1139,6 +1154,7 @@ mod tests {
 
     fn create_test_server_config_websocket() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
                 .into(),
@@ -1164,6 +1180,7 @@ mod tests {
 
     fn create_test_server_config_port_forward() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090)
                 .into(),
@@ -1183,6 +1200,7 @@ mod tests {
 
     fn create_test_server_config_hysteria2() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443)
                 .into(),
@@ -1208,6 +1226,7 @@ mod tests {
 
     fn create_test_server_config_tuic() -> ServerConfig {
         ServerConfig {
+            name: None,
             sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8443)
                 .into(),
