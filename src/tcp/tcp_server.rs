@@ -380,10 +380,26 @@ pub async fn run_udp_copy(
         _ = crate::control::tracked_stream::wait_cancel(client_flow.as_deref()) => Err(crate::control::tracked_stream::cancelled()),
     };
 
-    futures::join!(
-        crate::util::shutdown_message_stream(&mut server_stream),
-        crate::util::shutdown_message_stream(&mut client_stream),
-    );
+    let shutdown = async {
+        futures::join!(
+            crate::util::shutdown_message_stream(&mut server_stream),
+            crate::util::shutdown_message_stream(&mut client_stream),
+        );
+    };
+    tokio::pin!(shutdown);
+    let cancelled = async {
+        tokio::select! {
+            _ = crate::control::tracked_stream::wait_cancel(server_flow.as_deref()) => {},
+            _ = crate::control::tracked_stream::wait_cancel(client_flow.as_deref()) => {},
+        }
+    };
+    tokio::select! {
+        _ = &mut shutdown => {},
+        _ = cancelled => {
+            // A protocol FIN may flush queued data; cancellation cannot wait for backpressure.
+            let _ = tokio::time::timeout(Duration::from_millis(250), shutdown).await;
+        }
+    }
 
     copy_result
 }

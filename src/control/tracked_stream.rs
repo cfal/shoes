@@ -247,7 +247,7 @@ mod tests {
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
         ) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            Poll::Pending
         }
     }
     impl AsyncPing for BackpressuredMessages {
