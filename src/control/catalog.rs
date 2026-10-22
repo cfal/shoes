@@ -257,7 +257,13 @@ impl Catalog {
                         group.client_group.clone(),
                         SelectorDefinition {
                             members: members.clone(),
-                            default: group.default.clone(),
+                            default: group.default.as_ref().map(|name| {
+                                if members.contains(name) {
+                                    name.clone()
+                                } else {
+                                    api_group(name).to_owned()
+                                }
+                            }),
                         },
                     );
                 }
@@ -403,6 +409,28 @@ mod tests {
         owner.select("outbound", "DIRECT").unwrap();
         assert!(!origins[0].allowed(&catalog.selection.snapshot()));
         assert!(origins[2].allowed(&catalog.selection.snapshot()));
+    }
+
+    #[test]
+    fn selector_default_uses_declared_direct_name() {
+        let yaml = CONFIG.replace("default: child", "default: direct");
+        for (yaml, expected) in [
+            (yaml.clone(), "DIRECT"),
+            (
+                yaml.replace(
+                    "[child, direct]",
+                    "[child, {name: direct, protocol: {type: direct}}]",
+                ),
+                "direct",
+            ),
+        ] {
+            let validated =
+                crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
+            assert_eq!(
+                validated.catalog.unwrap().selection.snapshot()["outbound"],
+                expected
+            );
+        }
     }
 
     #[test]
