@@ -135,6 +135,34 @@ async fn proxy_ready(address: SocketAddr, name: &str) {
     .unwrap();
 }
 
+async fn forwarding_ready(socks: SocketAddr, target: SocketAddr, process: &mut ProcessGuard) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Mihomo publishes its catalog/listeners before the tunnel leaves its loading state.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(
+                process.try_wait().unwrap().is_none(),
+                "Mihomo exited during activation"
+            );
+            let attempt = tokio::time::timeout(Duration::from_secs(1), async {
+                let mut stream =
+                    shoes_test_support::wireguard::connect(socks.port(), target).await?;
+                stream.write_all(b"ready").await?;
+                let mut reply = [0; 5];
+                stream.read_exact(&mut reply).await?;
+                Ok::<_, std::io::Error>(reply == *b"ready")
+            })
+            .await;
+            if matches!(attempt, Ok(Ok(true))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Mihomo forwarding activation timed out");
+}
+
 #[tokio::test]
 async fn clash_api_pinned_mihomo_contract() {
     let binary = std::env::var_os("SHOES_TEST_MIHOMO_BIN").expect(
@@ -255,6 +283,10 @@ async fn clash_api_quic_tcp_udp_accounting_and_stream_cancellation() {
     let tcp = shoes_test_support::test_servers::start_tcp_stream_echo_server("0.0.0.0", 0)
         .await
         .unwrap();
+    let readiness = shoes_test_support::test_servers::start_tcp_stream_echo_server("0.0.0.0", 0)
+        .await
+        .unwrap();
+    let readiness_target = SocketAddr::from(([127, 0, 0, 1], readiness.local_addr().port()));
     let udp =
         shoes_test_support::test_servers::start_udp_echo_server_with_suffix("0.0.0.0", 0, b"")
             .await
@@ -280,7 +312,7 @@ async fn clash_api_quic_tcp_udp_accounting_and_stream_cancellation() {
             {"clash_api_address":format!("0.0.0.0:{}", controller.port()), "secret":SECRET},
             {"name":protocol, "address":format!("0.0.0.0:{}", remote.port()), "transport":"quic", "quic_settings":{"cert":certificate.cert.pem(), "key":certificate.signing_key.serialize_pem(), "alpn_protocols":["h3"], "num_endpoints":1}, "protocol":server, "rules":"allow-all-direct"}
         ])).unwrap()).unwrap();
-        std::fs::write(&mihomo_path, serde_yaml::to_string(&json!({"external-controller":format!("0.0.0.0:{}",mihomo_api.port()), "secret":SECRET, "socks-port":socks.port(), "allow-lan":true, "bind-address":"*", "log-level":"error", "proxies":[proxy], "rules":["MATCH,quic-out"]})).unwrap()).unwrap();
+        std::fs::write(&mihomo_path, serde_yaml::to_string(&json!({"external-controller":format!("0.0.0.0:{}",mihomo_api.port()), "secret":SECRET, "socks-port":socks.port(), "allow-lan":true, "bind-address":"*", "log-level":"error", "proxies":[proxy], "rules":[format!("AND,((NETWORK,TCP),(DST-PORT,{})),DIRECT",readiness_target.port()),"MATCH,quic-out"]})).unwrap()).unwrap();
         let mut shoes = start_shoes(&shoes_path).await;
         let mut client = ProcessGuard::new(
             Command::new(&binary)
@@ -297,6 +329,7 @@ async fn clash_api_quic_tcp_udp_accounting_and_stream_cancellation() {
         ready(socks, &mut client).await;
         ready(mihomo_api, &mut client).await;
         proxy_ready(mihomo_api, "quic-out").await;
+        forwarding_ready(socks, readiness_target, &mut client).await;
         let mut streams = Vec::new();
         for _ in 0..2 {
             let mut stream = tokio::time::timeout(
