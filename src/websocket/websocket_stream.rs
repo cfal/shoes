@@ -368,6 +368,11 @@ impl WebsocketStream {
         self.ping_data[self.ping_data_size..self.ping_data_size + read_amount]
             .copy_from_slice(content_bytes);
         self.ping_data_size += read_amount;
+        self.unprocessed_start_offset += read_amount;
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+        }
         self.read_frame_length -= read_amount as u64;
 
         if self.read_frame_length == 0 {
@@ -834,7 +839,60 @@ mod tests {
     use crate::crypto::{CryptoConnection, CryptoTlsStream};
     use crate::reality::{RealityServerConfig, RealityServerConnection};
     use futures::task::noop_waker_ref;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn nonempty_ping_preserves_following_payload_and_pong() {
+        for masked in [false, true] {
+            let ping_payload = b"ping-data";
+            let payload = b"application data";
+            let mut frames = [0; 128];
+            let ping_len = pack_frame(0x09, masked, ping_payload, &mut frames);
+            let binary_len = pack_frame(0x02, masked, payload, &mut frames[ping_len..]);
+            let frames = &frames[..ping_len + binary_len];
+            for split in (0..=ping_len).chain(std::iter::once(frames.len())) {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    let (io, mut peer) = tokio::io::duplex(1024);
+                    let mut stream = WebsocketStream::new(
+                        Box::new(io),
+                        false,
+                        WebsocketPingType::PingFrame,
+                        &frames[..split],
+                    );
+                    if split < frames.len() {
+                        let mut cx = Context::from_waker(noop_waker_ref());
+                        let mut bytes = [0; 1];
+                        let mut buf = ReadBuf::new(&mut bytes);
+                        assert!(
+                            Pin::new(&mut stream)
+                                .poll_read(&mut cx, &mut buf)
+                                .is_pending()
+                        );
+                        assert!(buf.filled().is_empty());
+                        peer.write_all(&frames[split..]).await.unwrap();
+                    }
+                    peer.shutdown().await.unwrap();
+                    for expected in payload {
+                        assert_eq!(stream.read_u8().await.unwrap(), *expected);
+                    }
+                    assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+
+                    let wrote_pong =
+                        futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_ping(cx))
+                            .await
+                            .unwrap();
+                    assert!(wrote_pong);
+                    stream.flush().await.unwrap();
+                    let mut pong = vec![0; 2 + ping_payload.len()];
+                    peer.read_exact(&mut pong).await.unwrap();
+                    assert_eq!(&pong[..2], &[0x8a, ping_payload.len() as u8]);
+                    assert_eq!(&pong[2..], ping_payload);
+                })
+                .await
+                .unwrap_or_else(|_| panic!("masked={masked}, split={split}"));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn idle_tls_transport_flushes_websocket_ping_and_pong() {
