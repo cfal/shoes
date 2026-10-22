@@ -18,21 +18,9 @@
 //!
 //! # Mobile Integration
 //!
-//! For Android, use the FFI module:
-//!
-//! ```kotlin
-//! // Load native library
-//! System.loadLibrary("shoes")
-//!
-//! // Initialize
-//! ShoesNative.init("info")
-//!
-//! // Start VPN with TUN fd from VpnService
-//! val handle = ShoesNative.startTun(tunFd, configYaml, protectCallback)
-//!
-//! // Stop VPN
-//! ShoesNative.stop(handle)
-//! ```
+//! Android apps supply their own JNI declarations matching `src/ffi/android.rs`
+//! and manage the VPN service and socket-protection callback. See the README's
+//! Mobile Embedding section for the native build and integration contract.
 //!
 //! For iOS, use the C FFI module from Swift:
 //!

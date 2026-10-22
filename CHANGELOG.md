@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed payload loss after fragmented VLESS response headers, WebSocket framing after nonempty Ping frames, and preread-byte loss in ShadowTLS authentication fallback. Added deterministic regressions and handler-level AnyTLS authentication and fallback coverage.
+- Added server-first TCP half-close and same-name kernel TUN reload coverage, hardened isolated-test selection checks, and enabled macOS process-watcher unit tests.
 - Fixed Naive HTTP/2 writes stalling on already available flow-control credit after a pending write is cancelled and retried with a smaller buffer. The historical sing-box interoperability timeout remains unconfirmed; its test now reports per-stream progress and carrier-forwarder failures.
 - Switched Mihomo REALITY/TLS 1.2 interoperability coverage to reply-first sequencing while retaining early half-close as an opt-in regression for the pinned peer's full-close limitation. No Shoes TLS errors are suppressed and no peer patch is applied.
 - Fixed TUN startup resets for queued TCP connections, rejected SYN admission, and stale passive listeners after handshake resets. TUN and WireGuard now defer inbound routing and hostname sniffing until TCP establishment; half-open TUN connections expire after 30 seconds instead of retaining the established-connection timeout.
@@ -12,7 +14,8 @@
 - Released Fake DNS snapshot locks explicitly on owner teardown so concurrently starting subprocesses cannot delay reopening the state file.
 - Updated Rust dependencies, including GotaTun 0.10.2, Tokio 1.54.0, LRU 0.19.0, and ML-KEM 0.3.3, which removes secret-dependent table lookups. Existing Web PKI compromise protections are retained.
 - Refreshed the BLAKE3 fork with upstream buffer-alignment and AVX-512 soundness fixes while retaining the binary-context key derivation API.
-- Updated Android and CI build dependencies; Android source builds now require Gradle 9.6.0 or newer with Java 17.
+- Updated CI build dependencies.
+- Removed the standalone Android Kotlin/Gradle wrapper, AAR and iOS XCFramework packaging, and mobile SDK release artifacts from this repository. Mobile embedding remains supported through the Rust JNI/C interfaces and native libraries; Android and iOS cross-compilation checks remain in CI.
 - XHTTP server `matching_headers` values may now be lists. A request must still send exactly one value, which may match any listed value, so secrets can rotate without downtime. XHTTP client `headers` now reject names that differ only in case, which previously sent every value and always failed a server's `matching_headers`, and values with leading or trailing whitespace, which receivers strip or reject.
 - Removed XHTTP server `close_on_http1_error`; configurations that still set it fail to load. HTTP/1 header and path mismatches now return the same plain 404 as HTTP/2 and HTTP/3. All XHTTP error responses now omit XHTTP padding, caching, and CORS headers, not only 400 and 404; successful responses are unchanged.
 
