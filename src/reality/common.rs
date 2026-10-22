@@ -14,6 +14,4 @@ pub const HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS: u8 = 8;
 #[cfg(test)]
 pub const HANDSHAKE_TYPE_CERTIFICATE: u8 = 11;
 #[cfg(test)]
-pub const HANDSHAKE_TYPE_CERTIFICATE_VERIFY: u8 = 15;
-#[cfg(test)]
 pub const HANDSHAKE_TYPE_FINISHED: u8 = 20;

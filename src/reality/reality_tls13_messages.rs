@@ -3,12 +3,10 @@
 // Construct TLS 1.3 handshake messages for REALITY protocol
 
 use super::common::{
-    HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
-    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, HANDSHAKE_TYPE_SERVER_HELLO,
-    VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
+    HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED,
+    HANDSHAKE_TYPE_SERVER_HELLO, VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
 };
 use super::reality_key_exchange::{KeyShareRef, RealityGroup};
-use aws_lc_rs::signature::Ed25519KeyPair;
 use std::io::Result;
 
 /// Construct ServerHello message
@@ -185,59 +183,6 @@ pub fn construct_certificate(cert: rcgen::Certificate) -> Result<Vec<u8>> {
     Ok(certificate)
 }
 
-/// Construct CertificateVerify message
-///
-/// # Arguments
-/// * `signing_key` - Ed25519 signing key
-/// * `handshake_hash` - Hash of all handshake messages up to this point (32 or 48 bytes depending on cipher suite)
-pub fn construct_certificate_verify(
-    signing_key: &Ed25519KeyPair,
-    handshake_hash: &[u8],
-) -> Result<Vec<u8>> {
-    let mut certificate_verify = Vec::new();
-
-    // CertificateVerify structure:
-    // - handshake_type (1 byte) = 15
-    // - length (3 bytes)
-    // - signature_algorithm (2 bytes) = 0x0807 for Ed25519
-    // - signature (2 bytes length + data)
-
-    // Construct the signed content
-    // TLS 1.3 uses a specific prefix for CertificateVerify:
-    // "  " * 64 + "TLS 1.3, server CertificateVerify" + 0x00 + handshake_hash
-    let mut signed_content = Vec::new();
-    signed_content.extend_from_slice(&[0x20u8; 64]); // 64 spaces
-    signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-    signed_content.push(0x00);
-    signed_content.extend_from_slice(handshake_hash);
-
-    // Sign the content
-    let signature = signing_key.sign(&signed_content);
-    let signature_bytes = signature.as_ref();
-
-    let mut payload = Vec::new();
-
-    // Signature algorithm: Ed25519 (0x0807)
-    payload.extend_from_slice(&[0x08, 0x07]);
-
-    // Signature length and data
-    payload.extend_from_slice(&(signature_bytes.len() as u16).to_be_bytes());
-    payload.extend_from_slice(signature_bytes);
-
-    // Handshake header
-    certificate_verify.push(HANDSHAKE_TYPE_CERTIFICATE_VERIFY);
-
-    // Payload length (3 bytes)
-    certificate_verify.extend_from_slice(&[
-        ((payload.len() >> 16) & 0xff) as u8,
-        ((payload.len() >> 8) & 0xff) as u8,
-        (payload.len() & 0xff) as u8,
-    ]);
-    certificate_verify.extend_from_slice(&payload);
-
-    Ok(certificate_verify)
-}
-
 /// Construct Finished message
 ///
 /// # Arguments
@@ -263,9 +208,6 @@ pub fn construct_finished(verify_data: &[u8]) -> Result<Vec<u8>> {
 
     Ok(finished)
 }
-
-/// Default ALPN protocols for REALITY client (matches browser fingerprints)
-pub const DEFAULT_ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
 
 /// Construct TLS 1.3 ClientHello message
 ///
