@@ -83,7 +83,6 @@ pub struct CryptoTlsStream<IO> {
     state: TlsState,
     need_flush: bool,
     input: TlsInput,
-    transport_eof: bool,
     write_raw: bool,
     raw_write_prefix: Option<Bytes>,
 }
@@ -115,7 +114,6 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
             state: TlsState::Stream,
             need_flush: false,
             input,
-            transport_eof: false,
             write_raw: false,
             raw_write_prefix: None,
         }
@@ -279,9 +277,7 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
             }
             TlsInput::Raw(_) => unreachable!("raw input bypasses TLS"),
         };
-        if n == 0 {
-            self.transport_eof = true;
-        } else {
+        if n != 0 {
             let plaintext_len = self
                 .session
                 .process_new_packets()
@@ -384,11 +380,6 @@ impl<IO: AsyncStream> AsyncRead for CryptoTlsStream<IO> {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => return Poll::Ready(Err(error)),
             }
-            if this.transport_eof {
-                this.state.shutdown_read();
-                return Poll::Ready(Ok(()));
-            }
-
             // Service post-handshake responses without blocking readable plaintext
             // on output backpressure. Both I/O directions register their wakers.
             if let Poll::Ready(Err(error)) = Pin::new(&mut *this).poll_flush(cx) {

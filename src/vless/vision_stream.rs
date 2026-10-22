@@ -1505,7 +1505,7 @@ mod tests {
 
     #[test]
     fn closure_framed_tls_rejects_unclean_eof() {
-        for backend in [Backend::Tls12, Backend::Tls13] {
+        for backend in BACKENDS {
             for framed in [false, true] {
                 let (_, session) = connection_pair(backend);
                 let io = ScriptedIo {
