@@ -22,6 +22,7 @@ struct ApiState {
     samples: watch::Receiver<Arc<streams::Sample>>,
     tasks: TaskTracker,
     cancel: CancellationToken,
+    snapshots: Arc<tokio::sync::Semaphore>,
 }
 
 pub struct ApiService {
@@ -38,6 +39,7 @@ impl ApiService {
             runtime,
             samples,
             tasks: TaskTracker::new(),
+            snapshots: Arc::new(tokio::sync::Semaphore::new(2)),
         });
         state.runtime.logs.install();
         state.tasks.spawn(streams::sample(state.clone(), sender));

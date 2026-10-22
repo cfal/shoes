@@ -336,18 +336,16 @@ async fn route(
         (&Method::GET, ["providers", "proxies" | "rules"]) => {
             super::json(StatusCode::OK, &json!({"providers":{}}))
         }
-        (&Method::GET, ["connections"]) => {
-            match super::json_bytes(&state.runtime.flows.snapshot(state.samples.borrow().rss)) {
-                Ok(bytes) => Response::builder()
-                    .header("content-type", "application/json")
-                    .body(full(bytes))
-                    .unwrap(),
-                Err(_) => error(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "connection snapshot exceeds 32 MiB",
-                ),
-            }
-        }
+        (&Method::GET, ["connections"]) => match streams::connections(state).await {
+            Ok(bytes) => Response::builder()
+                .header("content-type", "application/json")
+                .body(full(bytes))
+                .unwrap(),
+            Err(_) => error(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "connection snapshot exceeds 32 MiB",
+            ),
+        },
         (&Method::DELETE, ["connections"]) => {
             state.runtime.flows.cancel_all();
             no_content()

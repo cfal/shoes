@@ -32,6 +32,33 @@ impl Sample {
     }
 }
 
+async fn snapshot(
+    flows: Arc<crate::control::flows::FlowRegistry>,
+    gate: Arc<tokio::sync::Semaphore>,
+    rss: u64,
+) -> io::Result<(Result<Bytes, String>, u64, u64)> {
+    let permit = gate.acquire_owned().await.map_err(io::Error::other)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let snapshot = flows.snapshot(rss);
+        (
+            json_bytes(&snapshot).map_err(|error| error.to_string()),
+            snapshot.upload_total,
+            snapshot.download_total,
+        )
+    })
+    .await
+    .map_err(io::Error::other)
+}
+
+pub(super) async fn connections(state: &ApiState) -> io::Result<Bytes> {
+    let rss = state.samples.borrow().rss;
+    snapshot(state.runtime.flows.clone(), state.snapshots.clone(), rss)
+        .await?
+        .0
+        .map_err(io::Error::other)
+}
+
 pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Arc<Sample>>) {
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(1),
@@ -55,12 +82,15 @@ pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Arc<Sample>>) {
             }
             None => {}
         }
-        let snapshot = state.runtime.flows.snapshot(rss);
+        let Ok((connections, upload_total, download_total)) =
+            snapshot(state.runtime.flows.clone(), state.snapshots.clone(), rss).await
+        else {
+            return;
+        };
         let elapsed = previous.elapsed().as_secs_f64();
         previous = Instant::now();
-        let traffic = json_bytes(&json!({"up":((snapshot.upload_total.saturating_sub(up)) as f64 / elapsed) as u64,"down":((snapshot.download_total.saturating_sub(down)) as f64 / elapsed) as u64,"upTotal":snapshot.upload_total,"downTotal":snapshot.download_total})).expect("bounded traffic DTO");
-        (up, down) = (snapshot.upload_total, snapshot.download_total);
-        let connections = json_bytes(&snapshot).map_err(|error| error.to_string());
+        let traffic = json_bytes(&json!({"up":((upload_total.saturating_sub(up)) as f64 / elapsed) as u64,"down":((download_total.saturating_sub(down)) as f64 / elapsed) as u64,"upTotal":upload_total,"downTotal":download_total})).expect("bounded traffic DTO");
+        (up, down) = (upload_total, download_total);
         if connections.is_err() && !oversized {
             log::warn!(
                 "Clash API connection snapshot exceeds response limit; retaining complete tracking"
@@ -138,6 +168,7 @@ struct Source {
     samples: watch::Receiver<Arc<Sample>>,
     logs: Option<tokio::sync::broadcast::Receiver<crate::control::logs::LogEvent>>,
     interval: tokio::time::Interval,
+    snapshots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Source {
@@ -146,13 +177,16 @@ impl Source {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let logs =
             matches!(subscription.kind, Kind::Logs).then(|| state.runtime.logs.sender.subscribe());
+        let mut samples = state.samples.clone();
+        samples.borrow_and_update();
         Self {
             runtime: state.runtime.clone(),
             first: true,
             subscription,
-            samples: state.samples.clone(),
+            samples,
             logs,
             interval,
+            snapshots: state.snapshots.clone(),
         }
     }
 
@@ -173,19 +207,28 @@ impl Source {
                 }
             },
             Kind::Connections => {
-                self.interval.tick().await;
                 if std::mem::take(&mut self.first)
                     || self.subscription.interval != Duration::from_secs(1)
                 {
-                    return json_bytes(&self.runtime.flows.snapshot(self.samples.borrow().rss));
+                    self.interval.tick().await;
+                    let rss = self.samples.borrow().rss;
+                    return snapshot(self.runtime.flows.clone(), self.snapshots.clone(), rss)
+                        .await?
+                        .0
+                        .map_err(io::Error::other);
                 }
+                self.samples.changed().await.map_err(io::Error::other)?;
                 self.samples
-                    .borrow()
+                    .borrow_and_update()
                     .connections
                     .clone()
                     .map_err(io::Error::other)
             }
             Kind::Traffic | Kind::Memory => {
+                if std::mem::take(&mut self.first) && matches!(self.subscription.kind, Kind::Memory)
+                {
+                    return Ok(Sample::initial().memory);
+                }
                 self.samples.changed().await.map_err(io::Error::other)?;
                 let sample = self.samples.borrow_and_update();
                 Ok(match self.subscription.kind {
