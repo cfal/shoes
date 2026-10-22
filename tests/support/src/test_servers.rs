@@ -692,7 +692,7 @@ pub fn reality_tls_template_config() -> std::io::Result<Arc<ServerConfig>> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider.cipher_suites = vec![cipher_suite::TLS13_AES_128_GCM_SHA256];
     provider.kx_groups = vec![kx_group::X25519];
-    let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
+    let config = ServerConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(std::io::Error::other)?
         .with_no_client_auth()
@@ -701,14 +701,11 @@ pub fn reality_tls_template_config() -> std::io::Result<Arc<ServerConfig>> {
             rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
         )
         .map_err(std::io::Error::other)?;
-    // Keeps ServerHello whole but fragments the encrypted flight into at least four
-    // records below REALITY's 512-byte separate-mode threshold.
-    config.max_fragment_size = Some(128);
     Ok(Arc::new(config))
 }
 
 pub async fn start_reality_tls_template() -> std::io::Result<TestServer> {
-    let acceptor = TlsAcceptor::from(reality_tls_template_config()?);
+    let config = reality_tls_template_config()?;
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let address = listener.local_addr()?;
     let task = tokio::spawn(async move {
@@ -716,12 +713,43 @@ pub async fn start_reality_tls_template() -> std::io::Result<TestServer> {
         loop {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => {
-                        let acceptor = acceptor.clone();
+                    Ok((mut stream, _)) => {
+                        let config = config.clone();
                         connections.spawn(async move {
-                            // REALITY drops the template after the server flight, before
-                            // sending client Finished. An incomplete handshake is expected.
-                            let _ = acceptor.accept(stream).await;
+                            let result = async {
+                                let mut header = [0; 5];
+                                stream.read_exact(&mut header).await?;
+                                let mut hello = header.to_vec();
+                                hello.resize(5 + usize::from(u16::from_be_bytes([header[3], header[4]])), 0);
+                                stream.read_exact(&mut hello[5..]).await?;
+                                let mut target = rustls::ServerConnection::new(config.clone()).map_err(std::io::Error::other)?;
+                                let mut input = hello.as_slice();
+                                while !input.is_empty() {
+                                    target.read_tls(&mut input)?;
+                                    target.process_new_packets().map_err(std::io::Error::other)?;
+                                }
+                                let mut wire = Vec::new(); target.write_tls(&mut wire)?;
+                                let len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+                                // Unlike arbitrary TLS fragmentation, each admitted record must hold
+                                // its complete replacement message, including the REALITY certificate.
+                                let prepared = rustls::reality::PreparedServerHello::new(&hello[5..], &wire[5..5 + len], config.crypto_provider())
+                                    .map_err(std::io::Error::other)?
+                                    .with_flight_plan(rustls::reality::FlightPlan::new(&[64, 4096, 128, 96], Some(64)).map_err(std::io::Error::other)?);
+                                let mut target = rustls::ServerConnection::new_reality(config, prepared).map_err(std::io::Error::other)?;
+                                let mut input = hello.as_slice();
+                                while !input.is_empty() {
+                                    target.read_tls(&mut input)?;
+                                    target.process_new_packets().map_err(std::io::Error::other)?;
+                                }
+                                wire.clear(); target.write_tls(&mut wire)?;
+                                let split = wire.len() - 61;
+                                stream.write_all(&wire[..split]).await?;
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                stream.write_all(&wire[split..]).await?;
+                                tokio::io::copy(&mut stream, &mut tokio::io::sink()).await?;
+                                Ok::<_, std::io::Error>(())
+                            }.await;
+                            if let Err(error) = result { eprintln!("[TEST_SERVER] TLS template: {error}"); }
                         });
                     }
                     Err(error) => {

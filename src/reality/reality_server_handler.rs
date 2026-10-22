@@ -131,20 +131,27 @@ pub async fn setup_reality_server_stream(
     let mut buf = allocate_vec(8192).into_boxed_slice();
     let mut dest_handshake_success = false;
 
-    loop {
-        let new_records = match timeout_at(deadline, dest_stream.read(&mut buf)).await {
+    'collect: loop {
+        let first_read = dest_records.is_empty();
+        match timeout_at(deadline, dest_stream.read(&mut buf)).await {
             Ok(Ok(0)) => {
-                return Err(std::io::Error::other(
-                    "REALITY: Dest connection closed during TLS handshake",
-                ));
+                break;
             }
             Ok(Ok(n)) => {
                 deframer.feed(&buf[..n]);
-                match deframer.next_records() {
-                    Ok(records) => records,
-                    Err(e) => {
-                        log::error!("REALITY: Error parsing dest records: {}", e);
-                        break;
+                loop {
+                    match deframer.next_record() {
+                        Ok(Some(record)) => {
+                            dest_records.push(record);
+                            if dest_records.len() > 7 {
+                                break 'collect;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::debug!("REALITY: Invalid target record: {e}");
+                            break 'collect;
+                        }
                     }
                 }
             }
@@ -161,10 +168,10 @@ pub async fn setup_reality_server_stream(
         };
 
         // When we get the first record (ServerHello), check if dest supports TLS 1.3
-        if dest_records.is_empty() && !new_records.is_empty() {
-            match parse_server_hello(&new_records[0]) {
+        if first_read && !dest_records.is_empty() {
+            match parse_server_hello(&dest_records[0]) {
                 Ok(parsed) => {
-                    if !parsed.is_tls13 || extract_server_key_share(&new_records[0]).is_err() {
+                    if !parsed.is_tls13 || extract_server_key_share(&dest_records[0]).is_err() {
                         log::log!(
                             if auth_result.is_ok() {
                                 log::Level::Warn
@@ -177,7 +184,7 @@ pub async fn setup_reality_server_stream(
                         return Ok(start_forward_to_dest(
                             server_stream,
                             dest_stream,
-                            new_records,
+                            dest_records,
                             deframer.into_remaining_data(),
                             client_pending,
                         ));
@@ -197,7 +204,7 @@ pub async fn setup_reality_server_stream(
                     return Ok(start_forward_to_dest(
                         server_stream,
                         dest_stream,
-                        new_records,
+                        dest_records,
                         deframer.into_remaining_data(),
                         client_pending,
                     ));
@@ -205,12 +212,15 @@ pub async fn setup_reality_server_stream(
             }
         }
 
-        dest_records.extend(new_records);
-
         // Separate mode: first encrypted record is small, need more records
         // Keep reading until we have 6 records (SH + CCS + 4 encrypted) or timeout
-        // Note: Some servers send NewSessionTicket as a 7th record, but we don't need it
-        if dest_records.len() >= 6 {
+        // Mirror an already observed seventh record; do not add a target probe or wait for one.
+        if dest_records.len() >= 6 && dest_records[2].len() <= 512 {
+            // Finish an already observed optional record across TCP reads, without
+            // waiting for a record whose header has not arrived.
+            if dest_records.len() == 6 && deframer.pending_bytes() != 0 {
+                continue;
+            }
             log::debug!(
                 "REALITY: Separate mode detected, got {} records",
                 dest_records.len()
@@ -235,7 +245,7 @@ pub async fn setup_reality_server_stream(
 
     let remaining_data = deframer.into_remaining_data();
 
-    if !dest_handshake_success {
+    if !dest_handshake_success || !remaining_data.is_empty() {
         log::warn!(
             "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
             dest_records.len()
@@ -506,6 +516,10 @@ mod cleanup_tests {
             "unsupported",
             "client-unknown-shares",
             "client-truncated-share",
+            "bad-late-record",
+            "bad-ccs",
+            "wrong-session",
+            "unknown-extension",
         ] {
             let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
             let (seed, _) = crate::reality::generate_mldsa65_keypair().unwrap();
@@ -562,6 +576,22 @@ mod cleanup_tests {
                         .contains("insufficient capacity")
                 );
                 records.concat()
+            } else if matches!(
+                case,
+                "bad-late-record" | "bad-ccs" | "wrong-session" | "unknown-extension"
+            ) {
+                let mut records = crate::reality::default_target_records(&hello[44..76]);
+                match case {
+                    "bad-ccs" => records[1] = Bytes::from_static(&[20, 3, 3, 0, 1, 0]),
+                    "wrong-session" | "unknown-extension" => {
+                        let mut sh = records[0].to_vec();
+                        sh[if case == "wrong-session" { 44 } else { 81 }] ^= 1;
+                        records[0] = sh.into();
+                    }
+                    "bad-late-record" => records.push(Bytes::from_static(&[255, 3, 3, 0, 0])),
+                    _ => unreachable!(),
+                }
+                records.concat()
             } else {
                 let mut message = vec![2, 0, 0, 0, 3, 3];
                 if case == "retry" {
@@ -590,7 +620,16 @@ mod cleanup_tests {
                 record
             };
             // A partial trailing record exercises the deframer's retained bytes.
-            response.extend_from_slice(&[23, 3, 3]);
+            if !matches!(
+                case,
+                "bad-late-record"
+                    | "bad-ccs"
+                    | "wrong-session"
+                    | "unknown-extension"
+                    | "small-separate"
+            ) {
+                response.extend_from_slice(&[23, 3, 3]);
+            }
 
             let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
             let dest = NetLocation::new(
