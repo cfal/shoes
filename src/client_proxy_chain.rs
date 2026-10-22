@@ -410,8 +410,11 @@ impl ClientProxyChain {
                 }
             }
             InitialHopEntry::Proxy { socket, proxy } => {
+                let target = proxy
+                    .prepare_target(first_subsequent_target, resolver)
+                    .await?;
                 if subsequent_proxies.is_empty()
-                    && let Some(result) = proxy.try_reuse_tcp_stream(&remote_location).await?
+                    && let Some(result) = proxy.try_reuse_tcp_stream(&target).await?
                 {
                     return Ok(result);
                 }
@@ -419,14 +422,12 @@ impl ClientProxyChain {
                 debug!(
                     "Initial hop: Proxy {} -> {}",
                     proxy.proxy_location(),
-                    first_subsequent_target.location()
+                    target.location()
                 );
                 let proxy_loc = proxy.proxy_location().into();
                 let stream = socket.connect(resolver, &proxy_loc).await?;
                 // Protocol setup targeting first subsequent proxy (or final target)
-                proxy
-                    .setup_tcp_stream(stream, &first_subsequent_target)
-                    .await?
+                proxy.setup_tcp_stream(stream, &target).await?
             }
         };
 
@@ -436,6 +437,7 @@ impl ClientProxyChain {
                 .get(i + 1)
                 .map(|p| p.proxy_location().into())
                 .unwrap_or_else(|| remote_location.clone());
+            let target = proxy.prepare_target(target, resolver).await?;
 
             debug!(
                 "Subsequent hop {}/{}: {} -> {}",
@@ -594,6 +596,7 @@ impl ClientProxyChain {
                             .get(i + 1)
                             .map(|p| p.proxy_location().into())
                             .unwrap_or_else(|| final_proxy.proxy_location().into());
+                        let next_target = proxy.prepare_target(next_target, resolver).await?;
                         debug!(
                             "Chain UDP intermediate hop {}/{}: {} -> {} (TCP)",
                             i + 1,
@@ -627,6 +630,7 @@ impl ClientProxyChain {
                         first_target.location()
                     );
                     let proxy_loc = proxy.proxy_location().into();
+                    let first_target = proxy.prepare_target(first_target, resolver).await?;
                     let stream = socket.connect(resolver, &proxy_loc).await?;
                     let result = proxy.setup_tcp_stream(stream, &first_target).await?;
                     let mut stream = result.client_stream;
@@ -637,6 +641,7 @@ impl ClientProxyChain {
                             .get(i + 1)
                             .map(|p| p.proxy_location().into())
                             .unwrap_or_else(|| final_proxy.proxy_location().into());
+                        let next_target = proxy.prepare_target(next_target, resolver).await?;
                         debug!(
                             "Chain UDP intermediate hop {}/{}: {} -> {} (TCP)",
                             i + 1,
@@ -709,6 +714,7 @@ impl SelectedRoute {
     async fn connect(&self, target: ResolvedLocation) -> std::io::Result<TcpClientSetupResult> {
         match self.last_proxy() {
             Some(proxy) => {
+                let target = proxy.prepare_target(target, &self.resolver).await?;
                 if self.subsequent.is_empty()
                     && !proxy.needs_carrier_dialer()
                     && let Some(result) = proxy.try_reuse_tcp_stream(&target).await?

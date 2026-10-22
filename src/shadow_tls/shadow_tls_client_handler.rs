@@ -195,6 +195,14 @@ impl ShadowTlsClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for ShadowTlsClientHandler {
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        resolver: &std::sync::Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        self.handler.prepare_target(target, resolver).await
+    }
+
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,

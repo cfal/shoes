@@ -420,6 +420,218 @@ mod tests {
         }
     }
 
+    fn generation(catalog: Catalog, resolver: Arc<dyn Resolver>) -> Generation {
+        Generation {
+            id: 1,
+            catalog,
+            rules: Vec::new(),
+            probes: ProbeState::new(resolver, Vec::new()),
+            udp: HashMap::new(),
+        }
+    }
+
+    fn catalog() -> Catalog {
+        Catalog {
+            nodes: IndexMap::from([("DIRECT".into(), CatalogNode::Leaf(Box::default()))]),
+            selection: crate::control::selection::SelectionOwner::new(None)
+                .unwrap()
+                .prepare(Default::default())
+                .unwrap(),
+        }
+    }
+
+    fn query() -> ProbeQuery {
+        ProbeQuery::parse(
+            &HashMap::from([
+                ("url".into(), "http://probe.invalid/".into()),
+                ("timeout".into(), "1000".into()),
+            ]),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inactive_wireguard_member_only_fails_when_selected() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let proxy = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let peer = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let config = json!([
+                {"clash_api_address":"127.0.0.1:0","secret":"test-secret"},
+                crate::wireguard::test_support::client(peer.local_addr().unwrap().port()),
+                {"client_group":"outbound","strategy":"selector","default":"http","client_proxies":[
+                    "wg", {"name":"http","address":proxy,"protocol":{"type":"http"}}
+                ]},
+                {"address":"127.0.0.1:0","protocol":{"type":"socks"},"rules":"allow-all-direct"}
+            ]);
+            let mut validated =
+                crate::config::create_server_configs(serde_json::from_value(config).unwrap())
+                    .unwrap();
+            assert!(validated.wireguard_endpoints.is_empty());
+            let _prepared = crate::wireguard::Prepared::new(&mut validated)
+                .await
+                .unwrap();
+            assert!(validated.wireguard_endpoints.is_empty());
+            let generation = generation(
+                validated.catalog.take().unwrap(),
+                Arc::new(Answers(Vec::new())),
+            );
+            let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+            owner
+                .activate(generation.catalog.selection.clone())
+                .unwrap();
+            let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(stream.read_u8().await.unwrap());
+                    }
+                    assert!(header.starts_with(b"CONNECT probe.invalid:80 HTTP/1.1\r\n"));
+                    stream
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    header.clear();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(stream.read_u8().await.unwrap());
+                    }
+                    assert!(header.starts_with(b"HEAD / HTTP/1.1\r\n"));
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+            }));
+            assert!(request(&generation, "outbound", &query()).await.unwrap().0 > 0);
+            owner.select("outbound", "wg").unwrap();
+            let error = request(&generation, "outbound", &query())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+            assert!(error.to_string().contains("not active"));
+            owner.select("outbound", "http").unwrap();
+            assert!(request(&generation, "outbound", &query()).await.unwrap().0 > 0);
+            server.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), peer.recv(&mut [0; 2048]))
+                    .await
+                    .is_err()
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_connectors_reject_forbidden_hostname_candidates() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let local = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+        let resolver: Arc<dyn Resolver> =
+            Arc::new(Answers(vec!["192.0.2.1:80".parse().unwrap(), local]));
+        let mut catalog = catalog();
+        catalog.nodes.insert(
+            "http".into(),
+            CatalogNode::Leaf(Box::new(
+                serde_json::from_value(json!({
+                    "address":local.to_string(),
+                    "protocol":{"type":"http","resolve_hostname":true},
+                }))
+                .unwrap(),
+            )),
+        );
+        let generation = generation(catalog, resolver);
+        for name in ["DIRECT", "http"] {
+            let cached = generation
+                .probes
+                .connector(&generation.catalog, name)
+                .unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    tokio::time::timeout(
+                        Duration::from_secs(1),
+                        request(&generation, name, &query())
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+                assert!(Arc::ptr_eq(
+                    &cached,
+                    &generation
+                        .probes
+                        .connector(&generation.catalog, name)
+                        .unwrap()
+                ));
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_http2_reuse_checks_each_requests_resolver() {
+        #[derive(Debug)]
+        struct ChangingAnswers(Arc<Mutex<Vec<SocketAddr>>>);
+        impl Resolver for ChangingAnswers {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                let addresses = self.0.lock().clone();
+                Box::pin(async move { Ok(addresses) })
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let local = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+            let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = accepted.clone();
+            let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(stream).await.unwrap();
+                let mut tasks = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        incoming = connection.accept() => {
+                            let Some(Ok((request, mut respond))) = incoming else { break };
+                            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            assert_eq!(request.uri().authority().unwrap(), "192.0.2.1:80");
+                            let send = respond.send_response(http::Response::new(()), false).unwrap();
+                            tasks.spawn(async move {
+                                let mut stream = crate::http2::stream::H2MultiStream::new(send, request.into_body());
+                                let mut header = Vec::new();
+                                while !header.ends_with(b"\r\n\r\n") { header.push(stream.read_u8().await.unwrap()); }
+                                assert!(header.starts_with(b"HEAD / HTTP/1.1\r\n"));
+                                stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
+                                stream.shutdown().await.unwrap();
+                            });
+                        }
+                        _ = tasks.join_next(), if !tasks.is_empty() => {}
+                    }
+                }
+            }));
+            let answers = Arc::new(Mutex::new(vec!["192.0.2.1:80".parse().unwrap()]));
+            let mut catalog = catalog();
+            // Cleartext transport isolates HTTP/2 reuse from the TLS handshake in this fixture.
+            catalog.nodes.insert("http".into(), CatalogNode::Leaf(Box::new(serde_json::from_value(json!({
+                "address":local.to_string(),
+                "protocol":{"type":"http","resolve_hostname":true,"http_version":"h2"},
+            })).unwrap())));
+            let generation = generation(catalog, Arc::new(ChangingAnswers(answers.clone())));
+            for _ in 0..2 { assert!(request(&generation, "http", &query()).await.unwrap().0 > 0); }
+            assert_eq!(accepted.load(std::sync::atomic::Ordering::Relaxed), 2);
+            answers.lock().push("127.0.0.1:80".parse().unwrap());
+            assert_eq!(request(&generation, "http", &query()).await.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(accepted.load(std::sync::atomic::Ordering::Relaxed), 2);
+            server.abort();
+        }).await.unwrap();
+    }
+
     #[tokio::test]
     async fn guarded_direct_resolution_keeps_fallback_candidates() {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -428,8 +640,9 @@ mod tests {
         let refused = SocketAddr::from(([127, 0, 0, 1], closed.local_addr().unwrap().port()));
         drop(closed);
         let target = NetLocation::from_str("probe.invalid:80", None).unwrap();
+        let base: Arc<dyn Resolver> = Arc::new(Answers(vec![refused, live]));
         let resolver: Arc<dyn Resolver> = Arc::new(ProbeResolver {
-            inner: Arc::new(Answers(vec![refused, live])),
+            inner: base.clone(),
             target: target.clone(),
             forbidden_ranges: Vec::new(),
             denied: |_| false,
@@ -438,7 +651,7 @@ mod tests {
             OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
                 ClientConfig::default(),
             ))),
-            resolver.clone(),
+            base,
         )
         .unwrap();
         let mut setup = tokio::time::timeout(

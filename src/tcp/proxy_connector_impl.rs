@@ -69,6 +69,14 @@ impl ProxyConnectorImpl {
 
 #[async_trait]
 impl ProxyConnector for ProxyConnectorImpl {
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        self.client_handler.prepare_target(target, resolver).await
+    }
+
     fn needs_carrier_dialer(&self) -> bool {
         self.xhttp.is_some()
     }
