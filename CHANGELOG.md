@@ -13,7 +13,7 @@
 - Updated Rust dependencies, including GotaTun 0.10.2, Tokio 1.54.0, LRU 0.19.0, and ML-KEM 0.3.3, which removes secret-dependent table lookups. Existing Web PKI compromise protections are retained.
 - Refreshed the BLAKE3 fork with upstream buffer-alignment and AVX-512 soundness fixes while retaining the binary-context key derivation API.
 - Updated Android and CI build dependencies; Android source builds now require Gradle 9.6.0 or newer with Java 17.
-- XHTTP server `matching_headers` values may now be lists. A request must still send exactly one value, which may match any listed value, so secrets can rotate without downtime. XHTTP client `headers` now reject names that differ only in case. Such configs previously sent every value, which a server with `matching_headers` always rejects.
+- XHTTP server `matching_headers` values may now be lists. A request must still send exactly one value, which may match any listed value, so secrets can rotate without downtime. XHTTP client `headers` now reject names that differ only in case, which previously sent every value and always failed a server's `matching_headers`, and values with leading or trailing whitespace, which receivers strip or reject.
 - Removed XHTTP server `close_on_http1_error`; configurations that still set it fail to load. HTTP/1 header and path mismatches now return the same plain 404 as HTTP/2 and HTTP/3. All XHTTP error responses now omit XHTTP padding, caching, and CORS headers, not only 400 and 404; successful responses are unchanged.
 
 ## v0.3.4

@@ -129,6 +129,23 @@ fn validate_header_names<'a>(
     Ok(())
 }
 
+fn validate_header_values<'a>(
+    field: &str,
+    values: impl IntoIterator<Item = &'a String>,
+) -> io::Result<()> {
+    for value in values {
+        http::HeaderValue::try_from(value).map_err(io::Error::other)?;
+        // HTTP/1 receivers strip edge whitespace and HTTP/2 and HTTP/3 forbid it,
+        // so such a value never arrives as configured.
+        if value.starts_with([' ', '\t']) || value.ends_with([' ', '\t']) {
+            return Err(invalid(&format!(
+                "XHTTP {field} values cannot start or end with whitespace"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct XhttpLimits {
@@ -339,9 +356,7 @@ impl XhttpClientConfig {
             return Err(invalid("direct cannot be an XHTTP inner protocol"));
         }
         validate_header_names("headers", self.headers.keys())?;
-        for value in self.headers.values() {
-            http::HeaderValue::try_from(value).map_err(io::Error::other)?;
-        }
+        validate_header_values("headers", self.headers.values())?;
         Ok(())
     }
 }
@@ -380,14 +395,10 @@ impl XhttpServerConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
         validate_header_names("matching_headers", self.matching_headers.keys())?;
-        for value in self.matching_headers.values().flat_map(OneOrSome::iter) {
-            http::HeaderValue::try_from(value).map_err(io::Error::other)?;
-            if value.starts_with([' ', '\t']) || value.ends_with([' ', '\t']) {
-                return Err(invalid(
-                    "XHTTP matching header values cannot start or end with whitespace",
-                ));
-            }
-        }
+        validate_header_values(
+            "matching_headers",
+            self.matching_headers.values().flat_map(OneOrSome::iter),
+        )?;
         if contains_server(&self.protocol) {
             return Err(invalid("nested XHTTP is not supported"));
         }
@@ -652,6 +663,11 @@ mod tests {
             (serde_json::json!({"x-token": "a\r\nx-injected: b"}), false),
             (serde_json::json!({"Host": "front.test"}), false),
             (serde_json::json!({"Connection": "keep-alive"}), false),
+            (serde_json::json!({"x-token": "a b\tc"}), true),
+            (serde_json::json!({"x-token": " a"}), false),
+            (serde_json::json!({"x-token": "a "}), false),
+            (serde_json::json!({"x-token": "\ta"}), false),
+            (serde_json::json!({"x-token": "a\t"}), false),
         ] {
             let config: XhttpClientConfig = serde_json::from_value(serde_json::json!({
                 "headers": headers, "protocol": {"type": "socks"}
