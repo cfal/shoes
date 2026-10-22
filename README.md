@@ -438,10 +438,11 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   other requests sharing an H2/H3 connection are unaffected. Configure the
   client's `headers` with the same values, for example
   `matching_headers: { X-Tunnel-Key: "replace-me" }` on the server and
-  `headers: { X-Tunnel-Key: "replace-me" }` on the client. A value may also be
-  a list, such as `X-Tunnel-Key: [old, new]`, to accept any one of them while
-  rotating secrets. Use `host`, not `matching_headers`, to match
-  Host/`:authority`.
+  `headers: { X-Tunnel-Key: "replace-me" }` on the client. Xray clients that
+  set `extra` must put `headers` inside `extra`; Xray ignores top-level
+  `headers` when `extra` is present. A value may also be a list, such as
+  `X-Tunnel-Key: [old, new]`, to accept any one of them while rotating
+  secrets. Use `host`, not `matching_headers`, to match Host/`:authority`.
 - XHTTP error responses are plain: a status code and an empty body, without
   padding, caching, or CORS headers.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
