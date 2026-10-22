@@ -91,7 +91,13 @@ fn private_options() -> OpenOptions {
         use std::os::unix::fs::OpenOptionsExt;
         options
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     options
 }
@@ -121,6 +127,16 @@ pub fn valid_name(name: &str) -> bool {
 impl SelectionStore {
     pub fn open(path: &Path) -> io::Result<(Self, ExplicitSelections)> {
         let path = absolute_path(path)?;
+        for target in [&path, &lock_path(&path)] {
+            match std::fs::symlink_metadata(target) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    return Err(invalid("selection cache and lock must be regular files"));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
         let lock = private_options()
             .read(true)
             .write(true)
@@ -242,6 +258,17 @@ mod tests {
 
     fn choices(value: &str) -> ExplicitSelections {
         BTreeMap::from([("outbound".into(), value.into())])
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_cache_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.db");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(SelectionStore::open(&path).is_err());
     }
 
     #[test]
