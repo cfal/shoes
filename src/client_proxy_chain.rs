@@ -330,21 +330,6 @@ impl ClientProxyChain {
             .all(|entry| matches!(entry.as_ref(), InitialHopEntry::Direct(_)))
     }
 
-    /// Returns the bind_interface from a direct-only chain.
-    /// Returns None if not direct-only or if no bind_interface is configured.
-    pub fn get_bind_interface(&self) -> Option<&str> {
-        if !self.is_direct_only() {
-            return None;
-        }
-        // All entries should have the same bind_interface, return from the first.
-        self.initial_hop
-            .first()
-            .and_then(|entry| match entry.as_ref() {
-                InitialHopEntry::Direct(socket) => socket.bind_interface(),
-                InitialHopEntry::Proxy { .. } | InitialHopEntry::Wireguard(_) => None,
-            })
-    }
-
     fn select_subsequent_proxies(&self, indices: &[usize]) -> Vec<&dyn ProxyConnector> {
         self.subsequent_hops
             .iter()
@@ -1164,16 +1149,21 @@ impl ClientChainGroup {
         self.chains.iter().all(|chain| chain.is_direct_only())
     }
 
-    /// Returns the bind_interface if all chains are direct-only and share
-    /// the same bind_interface (or all have None).
-    pub fn get_bind_interface(&self) -> Option<&str> {
+    /// Selects the interface for a new direct UDP/QUIC DNS socket.
+    pub fn select_bind_interface(&self) -> std::io::Result<Option<&str>> {
         if !self.is_direct_only() {
-            return None;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "UDP DNS requires a direct chain",
+            ));
         }
-        // Return bind_interface from first chain (all should be the same in a group).
-        self.chains
-            .first()
-            .and_then(|chain| chain.get_bind_interface())
+        let index = self.next_udp_index.fetch_add(1, Ordering::Relaxed) as usize;
+        let chain = &self.chains[index % self.chains.len()];
+        let indices = chain.select_indices(true)?;
+        let InitialHopEntry::Direct(socket) = chain.initial_hop[indices[0]].as_ref() else {
+            unreachable!("direct-only chain checked above")
+        };
+        Ok(socket.bind_interface())
     }
 }
 
