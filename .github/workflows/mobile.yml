@@ -55,9 +55,6 @@ jobs:
         with:
           tool: cbindgen@0.29.4
 
-      - name: Verify C header
-        run: cbindgen --verify --config cbindgen.toml --output include/shoes.h
-
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -85,3 +82,7 @@ jobs:
             -- build --release --lib --locked
           test -s target/aarch64-linux-android/release/libshoes.so
           test -s target/armv7-linux-androideabi/release/libshoes.so
+
+      # cbindgen can update Cargo.lock, so the locked builds must run first.
+      - name: Verify C header
+        run: cbindgen --verify --config cbindgen.toml --output include/shoes.h
