@@ -1,8 +1,12 @@
 use std::io;
 
-use aws_lc_rs::{agreement, kem};
+#[cfg(test)]
+use aws_lc_rs::agreement;
+use aws_lc_rs::kem;
+#[cfg(test)]
 use rand::Rng;
 
+#[cfg(test)]
 use super::reality_auth::perform_ecdh;
 use crate::buf_reader::BufReader;
 
@@ -25,13 +29,7 @@ pub enum RealityGroup {
 }
 
 impl RealityGroup {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::X25519 => "X25519",
-            Self::X25519MlKem768 => "X25519MLKEM768",
-        }
-    }
-
+    #[cfg(test)]
     pub fn secret_len(self) -> usize {
         match self {
             Self::X25519 => 32,
@@ -56,6 +54,7 @@ impl RealityGroup {
     }
 }
 
+#[cfg(test)]
 pub struct KeyShareRef<'a> {
     pub group: RealityGroup,
     pub data: &'a [u8],
@@ -78,6 +77,7 @@ impl ClientKeyShares {
             .ok_or_else(|| invalid("Missing REALITY authentication key share"))
     }
 
+    #[cfg(test)]
     pub fn get(&self, group: RealityGroup) -> io::Result<&[u8]> {
         match group {
             RealityGroup::X25519 => self.x25519.as_ref().map(|k| k.as_slice()),
@@ -194,16 +194,16 @@ fn parse_client_shares(data: &[u8]) -> io::Result<ClientKeyShares> {
     Ok(shares)
 }
 
-pub fn extract_server_key_share(record: &[u8]) -> io::Result<KeyShareRef<'_>> {
+pub fn extract_server_key_share(record: &[u8]) -> io::Result<()> {
     let mut reader = BufReader::new(key_share_extension(record, false)?);
     let group = RealityGroup::from_id(reader.read_u16_be()?)
         .ok_or_else(|| invalid("Unsupported REALITY server key share"))?;
     let len = reader.read_u16_be()? as usize;
-    let data = reader.read_slice(len)?;
+    reader.skip(len)?;
     if !reader.is_consumed() || len != group.share_len(false) {
         return Err(invalid("Invalid server key share length"));
     }
-    Ok(KeyShareRef { group, data })
+    Ok(())
 }
 
 pub fn generate_mlkem() -> io::Result<(kem::DecapsulationKey, Vec<u8>)> {
@@ -216,6 +216,7 @@ pub fn generate_mlkem() -> io::Result<(kem::DecapsulationKey, Vec<u8>)> {
     Ok((private, public.as_ref().to_vec()))
 }
 
+#[cfg(test)]
 pub fn complete_client_exchange(
     private: &[u8; 32],
     mlkem: &kem::DecapsulationKey,
@@ -243,6 +244,7 @@ pub fn complete_client_exchange(
     Ok(secret)
 }
 
+#[cfg(test)]
 pub fn server_exchange(
     group: RealityGroup,
     shares: &ClientKeyShares,

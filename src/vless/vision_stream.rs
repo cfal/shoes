@@ -1912,34 +1912,16 @@ mod tests {
         }
     }
 
-    fn completed_reality_connection() -> CryptoConnection {
-        let config = RealityServerConfig {
-            mldsa65_key: None,
-            private_key: [0; 32],
-            short_ids: vec![[0; 8]],
-            dest: NetLocation::new(Address::UNSPECIFIED, 443),
-            max_time_diff: None,
-            min_client_version: None,
-            max_client_version: None,
-            cipher_suites: Vec::new(),
-        };
-        CryptoConnection::new_reality_server(
-            RealityServerConnection::new(config)
-                .unwrap()
-                .complete_for_test()
-                .unwrap(),
-        )
-    }
-
     fn assert_initial_mode_transition(command: UnpadCommand, session_plaintext: &[u8]) {
         let uuid = [7; 16];
         let mut initial = uuid.to_vec();
         initial.extend_from_slice(&[command as u8, 0, 3, 0, 2]);
         initial.extend_from_slice(b"one\0\0-two");
 
-        let mut session = completed_reality_connection();
+        let (peer, session) = crate::reality::established_pair();
+        let mut peer = CryptoConnection::new_reality_client(peer);
+        let mut session = CryptoConnection::new_reality_server(session);
         if !session_plaintext.is_empty() {
-            let mut peer = completed_reality_connection();
             peer.writer().write_all(session_plaintext).unwrap();
             let mut ciphertext = Vec::new();
             peer.write_tls(&mut ciphertext).unwrap();

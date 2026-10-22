@@ -3,6 +3,7 @@
 use std::io;
 
 use aws_lc_rs::hmac;
+#[cfg(test)]
 use aws_lc_rs::signature::{ED25519, UnparsedPublicKey};
 use subtle::ConstantTimeEq;
 use x509_parser::certificate::X509Certificate;
@@ -56,6 +57,7 @@ pub fn verify_certificate_mldsa(
 ///   - extensions data
 ///
 #[inline]
+#[cfg(test)]
 pub fn extract_certificate_der(certificate_message: &[u8]) -> io::Result<&[u8]> {
     // Skip handshake header (type + 3-byte length)
     if certificate_message.len() < 4 {
@@ -125,13 +127,19 @@ pub fn extract_certificate_der(certificate_message: &[u8]) -> io::Result<&[u8]> 
 /// Uses x509-parser for robust extraction.
 #[inline]
 pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Result<()> {
-    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
+    let (remaining, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Failed to parse X.509 certificate: {}", e),
         )
     })?;
 
+    if !remaining.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Trailing certificate bytes",
+        ));
+    }
     let spki = cert.public_key();
     let pubkey_data: &[u8] = &spki.subject_public_key.data;
     let signature: &[u8] = &cert.signature_value.data;
@@ -243,6 +251,7 @@ pub fn extract_ed25519_public_key(cert_der: &[u8]) -> io::Result<[u8; 32]> {
 ///
 /// Returns the signature bytes.
 #[inline]
+#[cfg(test)]
 pub fn extract_certificate_verify_signature(cert_verify_message: &[u8]) -> io::Result<Vec<u8>> {
     // Minimum: 1 (type) + 3 (len) + 2 (alg) + 2 (sig len) + 64 (ed25519 sig) = 72
     if cert_verify_message.len() < 72 {
@@ -317,6 +326,7 @@ pub fn extract_certificate_verify_signature(cert_verify_message: &[u8]) -> io::R
 /// * `signature` - The signature from CertificateVerify message (64 bytes)
 /// * `transcript_hash` - Hash of handshake messages up to (but not including) CertificateVerify
 #[inline]
+#[cfg(test)]
 pub fn verify_certificate_verify_signature(
     public_key: &[u8; 32],
     signature: &[u8],

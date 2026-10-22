@@ -114,21 +114,56 @@ fn handshake(
     for (actual, expected) in records.iter().zip(&target) {
         assert_eq!(actual.len(), expected.len());
     }
+    let share_start = target[0].len() - group.share_len(false);
+    assert_eq!(&records[0][..share_start], &target[0][..share_start]);
     for chunk in response.chunks(fragment) {
-        client.read_tls(&mut &chunk[..]).unwrap();
-        client.process_new_packets().unwrap();
+        feed_reality_client_connection(&mut client, chunk).unwrap();
     }
     let mut finished = Vec::new();
     client.write_tls(&mut finished).unwrap();
     for chunk in finished.chunks(fragment) {
-        server.read_tls(&mut &chunk[..]).unwrap();
-        server.process_new_packets().unwrap();
+        feed_reality_server_connection(&mut server, chunk).unwrap();
     }
     assert!(!client.is_handshaking());
     assert!(!server.is_handshaking());
     assert_eq!(client.negotiated_group(), Some(group));
     assert_eq!(server.negotiated_group(), Some(group));
     (client, server)
+}
+
+pub(crate) fn established_pair() -> (RealityClientConnection, RealityServerConnection) {
+    let (client, server) = configs(CipherSuite::AES_128_GCM_SHA256);
+    handshake(
+        client,
+        server,
+        RealityGroup::X25519MlKem768,
+        target_records,
+        37,
+    )
+}
+
+#[test]
+fn reality_separate_and_observed_trailing_record_without_mldsa() {
+    for &cipher in DEFAULT_CIPHER_SUITES {
+        for group in [RealityGroup::X25519, RealityGroup::X25519MlKem768] {
+            let (cc, sc) = configs(cipher);
+            handshake(cc, sc, group, separate_target_records, 1);
+            let (cc, sc) = configs(cipher);
+            handshake(
+                cc,
+                sc,
+                group,
+                |group, cipher, session| {
+                    let mut records = separate_target_records(group, cipher, session);
+                    let mut trailing = write_record_header(23, 59);
+                    trailing.resize(64, 0);
+                    records.push(trailing.into());
+                    records
+                },
+                17,
+            );
+        }
+    }
 }
 
 #[test]
@@ -147,8 +182,7 @@ fn reality_pq_handshake_and_data_all_suites() {
             }
             let mut actual = Vec::new();
             for chunk in wire.chunks(1024) {
-                server.read_tls(&mut &chunk[..]).unwrap();
-                server.process_new_packets().unwrap();
+                feed_reality_server_connection(&mut server, chunk).unwrap();
                 let mut buffer = [0; 16384];
                 loop {
                     match server.reader().read(&mut buffer) {
@@ -163,16 +197,14 @@ fn reality_pq_handshake_and_data_all_suites() {
             server.writer().write_all(b"response").unwrap();
             wire.clear();
             server.write_tls(&mut wire).unwrap();
-            client.read_tls(&mut wire.as_slice()).unwrap();
-            client.process_new_packets().unwrap();
+            feed_reality_client_connection(&mut client, &wire).unwrap();
             let mut response = [0; 8];
             client.reader().read_exact(&mut response).unwrap();
             assert_eq!(&response, b"response");
             client.send_close_notify();
             wire.clear();
             client.write_tls(&mut wire).unwrap();
-            server.read_tls(&mut wire.as_slice()).unwrap();
-            server.process_new_packets().unwrap();
+            feed_reality_server_connection(&mut server, &wire).unwrap();
             assert_eq!(server.reader().read(&mut response).unwrap(), 0);
         }
     }
@@ -215,9 +247,10 @@ fn reality_pq_mldsa_required_fails_closed() {
             .unwrap();
         let mut flight = Vec::new();
         server.write_tls(&mut flight).unwrap();
-        client.read_tls(&mut flight.as_slice()).unwrap();
         assert_eq!(
-            client.process_new_packets().unwrap_err().kind(),
+            feed_reality_client_connection(&mut client, &flight)
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::PermissionDenied
         );
         assert!(client.is_handshaking());

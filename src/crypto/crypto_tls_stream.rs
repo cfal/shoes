@@ -521,8 +521,7 @@ impl<IO: AsyncStream> AsyncStream for CryptoTlsStream<IO> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::address::{Address, NetLocation};
-    use crate::reality::{RealityServerConfig, RealityServerConnection};
+    use crate::reality::RealityServerConnection;
     use futures::task::noop_waker_ref;
 
     struct PendingWriteIo;
@@ -610,20 +609,7 @@ mod tests {
     impl AsyncStream for ZeroWriteIo {}
 
     fn completed_reality_connection() -> RealityServerConnection {
-        let config = RealityServerConfig {
-            mldsa65_key: None,
-            private_key: [0; 32],
-            short_ids: vec![[0; 8]],
-            dest: NetLocation::new(Address::UNSPECIFIED, 443),
-            max_time_diff: None,
-            min_client_version: None,
-            max_client_version: None,
-            cipher_suites: Vec::new(),
-        };
-        RealityServerConnection::new(config)
-            .unwrap()
-            .complete_for_test()
-            .unwrap()
+        crate::reality::established_pair().1
     }
 
     #[cfg(target_os = "linux")]
@@ -819,14 +805,14 @@ mod tests {
 
         let payload = vec![42; 40_000];
         for split in [0, 1, 4, 5, 10, 20_000, usize::MAX] {
-            let mut sender = completed_reality_connection();
+            let (mut sender, receiver) = crate::reality::established_pair();
             sender.writer().write_all(&payload).unwrap();
             let mut ciphertext = Vec::new();
             sender.write_tls(&mut ciphertext).unwrap();
             let split = split.min(ciphertext.len());
             let (io, mut peer) = tokio::io::duplex(65536);
             peer.write_all(&ciphertext[split..]).await.unwrap();
-            let session = CryptoConnection::new_reality_server(completed_reality_connection());
+            let session = CryptoConnection::new_reality_server(receiver);
             let mut stream =
                 CryptoTlsStream::handshake(io, session, TlsReadMode::Stream, &ciphertext[..split])
                     .await
