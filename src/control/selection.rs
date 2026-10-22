@@ -67,9 +67,14 @@ impl SelectionOwner {
     }
 
     pub fn activate(&mut self, candidate: Arc<SelectionView>) -> io::Result<()> {
+        self.reconcile(&candidate)?;
+        self.active = candidate;
+        Ok(())
+    }
+
+    pub fn reconcile(&self, candidate: &SelectionView) -> io::Result<()> {
         self.check_capacity(&candidate.definitions)?;
         *candidate.choices.write() = Arc::new(effective(&candidate.definitions, &self.explicit));
-        self.active = candidate;
         Ok(())
     }
 

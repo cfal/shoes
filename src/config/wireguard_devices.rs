@@ -211,6 +211,20 @@ pub(super) fn collect_devices(
         }
     }
     validated.visit_clients(&mut |client| clients.register(client))?;
+    if !validated.control.listeners.is_empty()
+        && let Some(mut catalog) = validated.catalog.take()
+    {
+        for group in groups.values() {
+            for client in group {
+                catalog.update_client(client);
+            }
+        }
+        validated.visit_clients(&mut |client| {
+            catalog.update_client(client);
+            Ok(())
+        })?;
+        validated.catalog = Some(catalog);
+    }
     let referenced_dns: HashSet<_> = validated
         .configs
         .iter()
@@ -237,6 +251,21 @@ pub(super) fn collect_devices(
         }
         Ok(())
     })?;
+    // Visible standalone nodes are also real probe subjects, even when no rule uses them.
+    if !validated.control.listeners.is_empty()
+        && let Some(catalog) = &mut validated.catalog
+    {
+        for node in catalog.nodes.values_mut() {
+            if let crate::control::catalog::CatalogNode::Leaf(client) = node {
+                visit_client(client, &mut |client| {
+                    if let ClientProxyConfig::Wireguard(config) = &client.protocol {
+                        used.insert(config.endpoint_id.clone());
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+    }
     validated.wireguard_endpoints = clients
         .devices
         .into_iter()

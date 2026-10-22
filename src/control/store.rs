@@ -162,6 +162,7 @@ impl SelectionStore {
         Ok((store, selected))
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

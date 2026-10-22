@@ -251,7 +251,7 @@ impl Prepared {
             connectors.insert(config.id.clone(), connector.clone());
             pending.push((peers, connector));
         }
-        validated.visit_clients(&mut |client| {
+        let mut attach = |client: &mut crate::config::ClientConfig| {
             if let ClientProxyConfig::Wireguard(reference) = &mut client.protocol {
                 reference.connector = Some(
                     connectors
@@ -261,7 +261,17 @@ impl Prepared {
                 );
             }
             Ok(())
-        })?;
+        };
+        validated.visit_clients(&mut attach)?;
+        if !validated.control.listeners.is_empty()
+            && let Some(catalog) = &mut validated.catalog
+        {
+            for node in catalog.nodes.values_mut() {
+                if let crate::control::catalog::CatalogNode::Leaf(client) = node {
+                    crate::config::client_visit::visit_client(client, &mut attach)?;
+                }
+            }
+        }
         // Endpoint chains share the prepared handles used by ordinary listeners and DNS.
         let mut endpoints = Vec::with_capacity(pending.len());
         for ((peers, connector), config) in pending.into_iter().zip(&validated.wireguard_endpoints)

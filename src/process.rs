@@ -24,6 +24,7 @@ async fn load_validated(
 }
 
 struct PreparedServers {
+    generation: Option<std::sync::Arc<crate::control::runtime::Generation>>,
     validated: ValidatedConfigs,
     dns: DnsRegistry,
     #[cfg(unix)]
@@ -32,15 +33,34 @@ struct PreparedServers {
 
 #[cfg(test)]
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
-    prepare_tracking(paths, previous, &mut |_| {}).await
+    prepare_tracking(paths, previous, &mut |_| {}, &mut None).await
 }
 
 async fn prepare_tracking(
     paths: &[String],
     previous: Option<&DnsRegistry>,
     discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
+    control: &mut Option<crate::control::runtime::ControlService>,
 ) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths, discovered).await?;
+    if control.is_none() && validated.catalog.is_some() {
+        if previous.is_some()
+            && (!validated.control.listeners.is_empty()
+                || validated.control.cache_file_path.is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "enabling controller or cache_file_path requires a restart",
+            ));
+        }
+        *control = Some(crate::control::runtime::ControlService::new(
+            validated.control.clone(),
+        )?);
+    }
+    let control_generation = match control {
+        Some(control) => Some(control.runtime.prepare(&mut validated).await?),
+        None => None,
+    };
     if let Some(previous) = previous {
         validated
             .validate_network_endpoints(previous.forbidden_ranges())
@@ -96,7 +116,14 @@ async fn prepare_tracking(
         server.bind_location = BindLocation::Address(OneOrSome::Some(resolved));
     }
     let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated.configs).collect();
-    let dns = dns::build_dns_registry_for_runtime(
+    if let Some(mut catalog) = validated.catalog.take() {
+        validated.visit_clients(&mut |client| {
+            catalog.update_client(client);
+            Ok(())
+        })?;
+        validated.catalog = Some(catalog);
+    }
+    let mut dns = dns::build_dns_registry_for_runtime(
         std::mem::take(&mut validated.dns_groups),
         validated.global_limits,
         previous,
@@ -114,7 +141,27 @@ async fn prepare_tracking(
             ))
         }
     })?;
+    let generation = if let (Some((id, rules)), Some(catalog)) =
+        (control_generation, validated.catalog.take())
+    {
+        let udp = crate::clash_api::dto::capabilities(&catalog)?;
+        let generation = std::sync::Arc::new(crate::control::runtime::Generation {
+            id,
+            catalog,
+            rules,
+            udp,
+            probes: crate::clash_api::probes::ProbeState::new(
+                dns.get_or_create_default(),
+                dns.forbidden_ranges().to_vec(),
+            ),
+        });
+        crate::clash_api::json_bytes(&crate::clash_api::dto::proxies(&generation, false))?;
+        Some(generation)
+    } else {
+        None
+    };
     Ok(PreparedServers {
+        generation,
         validated,
         dns,
         #[cfg(unix)]
@@ -496,8 +543,32 @@ impl ReloadSignal {
 }
 
 pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Result<()> {
+    let mut control = None;
+    let mut api = None;
+    let result = run_inner(paths, dry_run, no_reload, &mut control, &mut api).await;
+    if let Some(api) = &mut api {
+        api.shutdown().await;
+    }
+    drop(api);
+    if let Some(control) = &mut control {
+        control.shutdown().await;
+    }
+    drop(control);
+    result
+}
+
+async fn run_inner(
+    paths: Vec<String>,
+    dry_run: bool,
+    no_reload: bool,
+    control: &mut Option<crate::control::runtime::ControlService>,
+    api: &mut Option<crate::clash_api::ApiService>,
+) -> io::Result<()> {
     if dry_run {
-        load_validated(&paths, &mut |_| {}).await?;
+        let validated = load_validated(&paths, &mut |_| {}).await?;
+        if validated.catalog.is_some() {
+            crate::control::validation::validate_resources(&validated)?;
+        }
         println!("Configuration valid");
         return Ok(());
     }
@@ -509,10 +580,17 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = prepare_tracking(&paths, None, &mut discovered) => result?,
+        result = prepare_tracking(&paths, None, &mut discovered, control) => result?,
     };
     watches.activated(&prepared.validated.rule_files);
     let mut running = RunningServers::default();
+    if let (Some(control), Some(generation)) = (control.as_ref(), prepared.generation.as_ref()) {
+        control.runtime.begin_activation(generation).await?;
+        control.runtime.publish(generation.clone()).await?;
+        if !control.runtime.config.listeners.is_empty() {
+            *api = Some(crate::clash_api::ApiService::start(control.runtime.clone()).await?);
+        }
+    }
     tokio::select! {
         biased;
         _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
@@ -520,6 +598,9 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             let _ = running.shutdown(&[&prepared.dns]).await;
             return Err(error);
         },
+    }
+    if let Some(control) = control.as_ref() {
+        control.runtime.resume().await?;
     }
     loop {
         let debounce = tokio::select! {
@@ -557,7 +638,7 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
                 let _ = running.shutdown(&[&prepared.dns]).await;
                 return Err(error);
             },
-            result = prepare_tracking(&paths, Some(&prepared.dns), &mut discovered) => result,
+            result = prepare_tracking(&paths, Some(&prepared.dns), &mut discovered, control) => result,
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
@@ -566,6 +647,12 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
                 continue;
             }
         };
+        if let (Some(control), Some(generation)) = (control.as_ref(), candidate.generation.as_ref())
+            && let Err(error) = control.runtime.begin_activation(generation).await
+        {
+            eprintln!("Reload rejected; current servers retained: {error}");
+            continue;
+        }
         running.stop().await;
         if let Err(error) = prepared.dns.checkpoint().await {
             log::warn!("Reload Fake DNS checkpoint failed; continuing reload: {error}");
@@ -579,6 +666,10 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             },
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        if let (Some(control), Some(generation)) = (control.as_ref(), candidate.generation.as_ref())
+        {
+            control.runtime.publish(generation.clone()).await?;
+        }
         loop {
             let result = tokio::select! {
                 biased;
@@ -612,6 +703,9 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             }
         }
         watches.activated(&candidate.validated.rule_files);
+        if let Some(control) = control.as_ref() {
+            control.runtime.resume().await?;
+        }
         drop(std::mem::replace(&mut prepared, candidate));
     }
 }

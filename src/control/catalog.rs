@@ -156,10 +156,11 @@ fn rule_target(action: &RuleActionConfig) -> String {
 impl Catalog {
     pub fn capture(configs: &mut [Config]) -> io::Result<Option<Self>> {
         for config in configs.iter() {
-            if let Config::ClientConfigGroup(group) = config {
-                if group.strategy != GroupStrategy::Selector && group.default.is_some() {
-                    return Err(invalid("default is only valid for selector groups"));
-                }
+            if let Config::ClientConfigGroup(group) = config
+                && group.strategy != GroupStrategy::Selector
+                && group.default.is_some()
+            {
+                return Err(invalid("default is only valid for selector groups"));
             }
         }
         let enabled = configs.iter().any(|config| matches!(config, Config::ClashApi(_) | Config::CacheFile(_)) || matches!(config, Config::ClientConfigGroup(g) if g.strategy == GroupStrategy::Selector));
@@ -293,12 +294,12 @@ impl Catalog {
     }
 
     pub fn update_client(&mut self, client: &ClientConfig) {
-        if let Some(origin) = &client.control {
-            if let Some(CatalogNode::Leaf(config)) = self.nodes.get_mut(origin.name.as_ref()) {
-                **config = client.clone();
-                if let Some(origin) = &mut config.control {
-                    origin.path.clear();
-                }
+        if let Some(origin) = &client.control
+            && let Some(CatalogNode::Leaf(config)) = self.nodes.get_mut(origin.name.as_ref())
+        {
+            **config = client.clone();
+            if let Some(origin) = &mut config.control {
+                origin.path.clear();
             }
         }
     }

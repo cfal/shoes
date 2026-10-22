@@ -10,6 +10,21 @@ use std::io::Write;
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
+static DEFAULT_LEVEL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn default_level() -> LevelFilter {
+    let value = DEFAULT_LEVEL.load(std::sync::atomic::Ordering::Relaxed);
+    [
+        LevelFilter::Off,
+        LevelFilter::Error,
+        LevelFilter::Warn,
+        LevelFilter::Info,
+        LevelFilter::Debug,
+        LevelFilter::Trace,
+    ][value]
+        .min(log::STATIC_MAX_LEVEL)
+}
+
 /// Receives pre-formatted log lines. Implementations handle one output destination.
 pub trait LogWriter: Send + Sync {
     /// Writes a pre-formatted log line. `formatted` does NOT include a trailing newline.
@@ -194,6 +209,14 @@ impl Log for MultiLogger {
 /// Directives are sorted by name length; `log::set_max_level` is set to the
 /// maximum level across all directives so records reach our `log()` method.
 pub fn init_multi_logger(writers: Vec<Box<dyn LogWriter>>, mut directives: Vec<Directive>) {
+    DEFAULT_LEVEL.store(
+        directives
+            .iter()
+            .rev()
+            .find(|directive| directive.name.is_none())
+            .map_or(LevelFilter::Off, |directive| directive.level) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     directives.sort_by_key(|d| d.name.as_ref().map_or(0, |n| n.len()));
     let max_level = directives
         .iter()

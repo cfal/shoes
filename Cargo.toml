@@ -121,6 +121,8 @@ http-body-util = "*"
 httparse = "*"
 hyper = { version = "*", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "*", features = ["tokio", "server"] }
+hyper-tungstenite = "0.30.0"
+memory-stats = "1.2.0"
 indexmap = "*"
 ipnetwork = "0.21"
 libc = "*"
@@ -143,7 +145,7 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "perf"] }
 rustls = "=0.23.46"
 serde = { version = "*", features = ["derive", "std"] }
-serde_json = "*"
+serde_json = { version = "*", features = ["preserve_order"] }
 serde_yaml = "*"
 shake = "*"
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "segmentation-offload"] }
