@@ -14,14 +14,9 @@ mod reality_server;
 mod reality_server_handler;
 mod reality_target_flight;
 #[cfg(test)]
-mod test_tls;
-
+mod tests;
 #[cfg(test)]
-mod reality_pq_tests;
-#[cfg(test)]
-mod reality_rustls_tests;
-#[cfg(test)]
-pub(crate) use reality_pq_tests::{default_target_records, established_pair};
+pub(crate) use tests::reality_fixtures::{default_target_records, established_pair};
 
 pub use reality_cipher_suite::{CipherSuite, DEFAULT_CIPHER_SUITES};
 pub(crate) use reality_config::parse_server_name;

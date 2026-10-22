@@ -232,8 +232,10 @@ pub fn extract_session_id_slice(client_hello: &[u8]) -> Result<&[u8], std::io::E
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_tls::{construct_server_hello, write_record_header};
     use super::*;
+    use crate::reality::tests::reality_fixtures::{
+        configs, construct_server_hello, write_record_header,
+    };
 
     #[test]
     fn test_extract_client_random() {
@@ -324,8 +326,7 @@ mod tests {
 
     #[test]
     fn hello_parsers_check_framing_and_retry() {
-        let (config, _) =
-            super::super::reality_pq_tests::configs(super::super::CipherSuite::AES_128_GCM_SHA256);
+        let (config, _) = configs(super::super::CipherSuite::AES_128_GCM_SHA256);
         let mut client = config.create_connection().unwrap();
         let mut record = Vec::new();
         client.write_tls(&mut record).unwrap();
