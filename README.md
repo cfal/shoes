@@ -117,6 +117,49 @@ After updating the H3 pins, run the empty-DATA and idle-stream regressions:
 CARGO_BUILD_JOBS=1 cargo test --locked --lib --features ffi h3_ -- --test-threads=1
 ```
 
+### Mobile Embedding
+
+Android and iOS embedding remains supported through the Rust JNI/C interfaces.
+This repository does not ship Kotlin wrappers, AARs, or XCFrameworks. Applications
+own their platform glue and packaging, including Android `VpnService` or iOS
+Network Extension setup.
+
+For Android, install `cargo-ndk`, set `ANDROID_NDK_HOME` to an installed Android
+NDK, and build the native libraries:
+
+```sh
+rustup target add aarch64-linux-android armv7-linux-androideabi
+CARGO_BUILD_JOBS=1 cargo ndk -t arm64-v8a -t armeabi-v7a -P 21 -- build --release --lib --locked
+```
+
+The resulting `target/<target>/release/libshoes.so` files expose the JNI methods
+in `src/ffi/android.rs`. The app supplies the matching
+`com.shoesproxy.ShoesNative` declarations and socket-protection callback.
+The callback object must expose `protect(fd: Int): Boolean`, delegating to
+`VpnService.protect`; a plain Kotlin lambda does not satisfy this JNI contract.
+
+For iOS, build on macOS with Xcode installed. These commands match CI's deployment
+target; set it to match the consuming app when integrating:
+
+```sh
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+export IPHONEOS_DEPLOYMENT_TARGET=16.0
+CARGO_BUILD_JOBS=1 cargo build --release --lib --locked --target aarch64-apple-ios
+CARGO_BUILD_JOBS=1 cargo build --release --lib --locked --target aarch64-apple-ios-sim
+```
+
+Link `target/<target>/release/libshoes.a` using `include/shoes.h` through the app's
+bridging header or module map. After changing the C interface, use cbindgen 0.29.4
+to regenerate the header with
+`cbindgen --config cbindgen.toml --output include/shoes.h`. CI verifies the header
+matches the Rust interface.
+
+On both platforms, the app supplies `device_fd` in the TUN configuration and
+retains ownership of that descriptor until the native service has stopped.
+Distribute [the dependency notices and source information](THIRD_PARTY_NOTICES.md)
+with the app. CI cross-compiles the native libraries without packaging or
+publishing a mobile SDK.
+
 ### WireGuard Kernel Interoperability
 
 Linux kernel peer tests require kernel WireGuard support, network/PID namespaces,
