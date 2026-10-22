@@ -966,28 +966,181 @@ mod tests {
         output
     }
 
-    #[tokio::test]
-    async fn control_frames_at_the_size_limit_are_accepted() {
-        let ping = [0x5a; 125];
-        let mut frames = frame(0x89, true, &ping);
-        frames.extend(frame(0x8a, true, b"unsolicited heartbeat"));
-        frames.extend(frame(0x82, true, b"data"));
-        let (io, mut peer) = tokio::io::duplex(1024);
-        peer.write_all(&frames).await.unwrap();
-        peer.shutdown().await.unwrap();
+    /// Delivers `frames` through a pipe that holds at most `chunk` bytes, so every read
+    /// sees at most `chunk` bytes.
+    async fn read_all(frames: Vec<u8>, chunk: usize) -> std::io::Result<Vec<u8>> {
+        let (io, mut peer) = tokio::io::duplex(chunk);
+        // Rejected frames leave the writer blocked until `stream` drops, so it isn't awaited.
+        tokio::spawn(async move {
+            if peer.write_all(&frames).await.is_ok() {
+                let _ = peer.shutdown().await;
+            }
+        });
         let mut stream =
             WebsocketStream::new(Box::new(io), false, WebsocketPingType::PingFrame, &[]);
         let mut received = Vec::new();
-        stream.read_to_end(&mut received).await.unwrap();
-        assert_eq!(received, b"data");
-        let wrote_pong = futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_ping(cx))
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut received),
+        )
+        .await
+        .expect("WebSocket reads must finish at EOF or on a protocol error")
+        .map(|_| received)
+    }
+
+    #[tokio::test]
+    async fn every_length_encoding_survives_split_delivery() {
+        for len in [1, 125, 126, 127, 65535, 65536, 70_000] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            for masked in [false, true] {
+                let frames = frame(0x82, masked, &payload);
+                let length_header_len = match len {
+                    0..=125 => 2,
+                    126..=65535 => 4,
+                    _ => 10,
+                };
+                let mask_len = if masked { 4 } else { 0 };
+                assert_eq!(frames.len() - payload.len(), length_header_len + mask_len);
+                for chunk in [1, 3, 4096] {
+                    // Byte-at-a-time delivery of large frames adds runtime without new states.
+                    if chunk == 1 && len > 4096 {
+                        continue;
+                    }
+                    assert_eq!(
+                        read_all(frames.clone(), chunk).await.unwrap(),
+                        payload,
+                        "len={len} masked={masked} chunk={chunk}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Later headers arrive in reads that add no payload while `read_to_end`'s buffer already
+    /// holds data, which must not look like EOF.
+    #[tokio::test]
+    async fn fragmented_binary_frames_concatenate() {
+        let mut frames = frame(0x02, true, b"first ");
+        frames.extend(frame(0x00, true, b"second "));
+        frames.extend(frame(0x80, true, b"third"));
+        assert_eq!(read_all(frames, 2).await.unwrap(), b"first second third");
+    }
+
+    #[tokio::test]
+    async fn written_frames_are_readable_in_the_opposite_role() {
+        let payload: Vec<u8> = (0..100_000).map(|i| (i % 253) as u8).collect();
+        for writer_is_client in [true, false] {
+            let (writer_io, reader_io) = tokio::io::duplex(8192);
+            let mut writer = WebsocketStream::new(
+                Box::new(writer_io),
+                writer_is_client,
+                WebsocketPingType::PingFrame,
+                &[],
+            );
+            let mut reader = WebsocketStream::new(
+                Box::new(reader_io),
+                !writer_is_client,
+                WebsocketPingType::PingFrame,
+                &[],
+            );
+            let expected = payload.clone();
+            let write = tokio::spawn(async move {
+                writer.write_all(&expected).await.unwrap();
+                writer.flush().await.unwrap();
+                writer.shutdown().await.unwrap();
+            });
+            let mut received = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_to_end(&mut received),
+            )
             .await
+            .unwrap()
             .unwrap();
-        assert!(wrote_pong);
-        stream.flush().await.unwrap();
-        let mut pong = vec![0; 2 + ping.len()];
-        peer.read_exact(&mut pong).await.unwrap();
-        assert_eq!(&pong[..2], &[0x8a, 125]);
-        assert_eq!(&pong[2..], ping);
+            write.await.unwrap();
+            assert_eq!(received, payload, "writer_is_client={writer_is_client}");
+        }
+    }
+
+    #[tokio::test]
+    async fn control_frames_at_the_size_limit_are_accepted() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for masked in [false, true] {
+                let ping = [0x5a; MAX_CONTROL_PAYLOAD_LEN];
+                let mut frames = frame(0x89, masked, &ping);
+                frames.extend(frame(0x8a, masked, &[0xa5; MAX_CONTROL_PAYLOAD_LEN]));
+                frames.extend(frame(0x82, masked, b"data"));
+                let (io, mut peer) = tokio::io::duplex(1024);
+                peer.write_all(&frames).await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut stream =
+                    WebsocketStream::new(Box::new(io), false, WebsocketPingType::PingFrame, &[]);
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, b"data", "masked={masked}");
+                let wrote_pong =
+                    futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_ping(cx))
+                        .await
+                        .unwrap();
+                assert!(wrote_pong, "masked={masked}");
+                stream.flush().await.unwrap();
+                let mut pong = vec![0; 2 + ping.len()];
+                peer.read_exact(&mut pong).await.unwrap();
+                assert_eq!(&pong[..2], &[0x8a, 125], "masked={masked}");
+                assert_eq!(&pong[2..], ping, "masked={masked}");
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_read_buffers_keep_pending_payload() {
+        let (io, mut peer) = tokio::io::duplex(64);
+        peer.write_all(&frame(0x82, false, b"abc")).await.unwrap();
+        let mut stream =
+            WebsocketStream::new(Box::new(io), false, WebsocketPingType::PingFrame, &[]);
+        let mut storage = [0; 1];
+        let mut buf = ReadBuf::new(&mut storage);
+        for _ in 0..2 {
+            futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_read(cx, &mut buf))
+                .await
+                .unwrap();
+            assert_eq!(buf.filled(), b"a");
+        }
+        let mut rest = [0; 2];
+        stream.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"bc");
+    }
+
+    #[tokio::test]
+    async fn unknown_and_text_frames_are_skipped() {
+        let mut frames = frame(0x81, true, b"text is not tunnel data");
+        frames.extend(frame(0x83, false, &[1; 300]));
+        frames.extend(frame(0x8a, true, b"unsolicited heartbeat"));
+        frames.extend(frame(0x82, true, b"binary"));
+        assert_eq!(read_all(frames, 5).await.unwrap(), b"binary");
+    }
+
+    #[tokio::test]
+    async fn invalid_frames_are_rejected() {
+        let mut oversized_length = frame(0x82, false, &[]);
+        oversized_length[1] = 127;
+        oversized_length.extend_from_slice(&[0x80, 0, 0, 0, 0, 0, 0, 0]);
+        for (name, frames) in [
+            ("oversized ping", frame(0x89, false, &[0; 126])),
+            ("oversized pong", frame(0x8a, true, &[0; 126])),
+            ("oversized close", frame(0x88, false, &[0; 126])),
+            (
+                "oversized reserved control frame",
+                frame(0x8b, false, &[0; 126]),
+            ),
+            ("fragmented ping", frame(0x09, false, b"ping")),
+            ("fragmented text", frame(0x01, false, b"text")),
+            ("fragmented close", frame(0x08, false, &[])),
+            ("64-bit length with the high bit set", oversized_length),
+        ] {
+            assert!(read_all(frames, 1).await.is_err(), "{name} was accepted");
+        }
     }
 }
