@@ -67,6 +67,7 @@ pub struct Fixture {
     pub server_request_limit: Option<usize>,
     pub server_packet_timeout_secs: Option<u64>,
     pub h2_window_bytes: Option<usize>,
+    pub matching_headers: Option<Value>,
     pub pressure: bool,
     cert: PathBuf,
     key: PathBuf,
@@ -214,6 +215,7 @@ impl Fixture {
             server_request_limit: None,
             server_packet_timeout_secs: None,
             h2_window_bytes: None,
+            matching_headers: None,
             pressure: false,
             cert,
             key,
@@ -245,6 +247,9 @@ impl Fixture {
         }
         if !client && let Some(timeout) = self.server_packet_timeout_secs {
             xhttp["limits"]["packet_timeout_secs"] = json!(timeout);
+        }
+        if !client && let Some(headers) = &self.matching_headers {
+            xhttp["matching_headers"] = headers.clone();
         }
         if let Some(window) = self.h2_window_bytes {
             xhttp["limits"]["h2_stream_window_bytes"] = json!(window);
