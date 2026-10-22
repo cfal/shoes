@@ -443,8 +443,7 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   rotating secrets. Use `host`, not `matching_headers`, to match
   Host/`:authority`.
 - XHTTP error responses are plain: a status code and an empty body, without
-  padding, caching, or CORS headers. `close_on_http1_error` is deprecated and
-  ignored.
+  padding, caching, or CORS headers.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
   padding, path/query handling, packet sizing/pacing, and stream-up keepalives
   follow modern Xray. `limits` can bound sessions, buffered bytes and requests;

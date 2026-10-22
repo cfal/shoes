@@ -1543,67 +1543,60 @@ mod tests {
     #[tokio::test]
     async fn h1_rejection_never_reads_the_body_or_discloses_xhttp_headers() {
         tokio::time::timeout(Duration::from_secs(2), async {
-            // The deprecated close_on_http1_error must not change H1 rejections.
-            for close_on_http1_error in [false, true] {
-                for request_limit_reached in [false, true] {
-                    for (path, token_header) in
-                        [("/t/session/0", ""), ("/wrong", "X-Token: secret\r\n")]
-                    {
-                        let mut state = service();
-                        let config = &mut Arc::get_mut(&mut state).unwrap().config;
-                        config.close_on_http1_error = close_on_http1_error;
-                        config.matching_headers = [("x-token".into(), "secret".into())].into();
-                        let held = if request_limit_reached {
-                            Some(
-                                state
-                                    .requests
-                                    .acquire(state.config.limits.max_requests.unwrap())
-                                    .unwrap(),
-                            )
-                        } else {
-                            None
-                        };
-                        let (mut client, server) = tokio::io::duplex(8192);
-                        let serving = state.clone().serve_h1(
-                            Box::new(server),
-                            tokio::time::Instant::now() + Duration::from_secs(1),
+            for request_limit_reached in [false, true] {
+                for (path, token_header) in
+                    [("/t/session/0", ""), ("/wrong", "X-Token: secret\r\n")]
+                {
+                    let mut state = service();
+                    Arc::get_mut(&mut state).unwrap().config.matching_headers =
+                        [("x-token".into(), "secret".into())].into();
+                    let held = if request_limit_reached {
+                        Some(
+                            state
+                                .requests
+                                .acquire(state.config.limits.max_requests.unwrap())
+                                .unwrap(),
+                        )
+                    } else {
+                        None
+                    };
+                    let (mut client, server) = tokio::io::duplex(8192);
+                    let serving = state.clone().serve_h1(
+                        Box::new(server),
+                        tokio::time::Instant::now() + Duration::from_secs(1),
+                    );
+                    let probe = async {
+                        let request = format!(
+                            "POST {path} HTTP/1.1\r\n\
+                             Host: localhost\r\n\
+                             {token_header}Content-Length: 16\r\n\
+                             Expect: 100-continue\r\n\r\n"
                         );
-                        let probe = async {
-                            let request = format!(
-                                "POST {path} HTTP/1.1\r\n\
-                                 Host: localhost\r\n\
-                                 {token_header}Content-Length: 16\r\n\
-                                 Expect: 100-continue\r\n\r\n"
-                            );
-                            client.write_all(request.as_bytes()).await.unwrap();
-                            let mut response = Vec::new();
-                            client.read_to_end(&mut response).await.unwrap();
-                            if request_limit_reached {
-                                assert!(
-                                    response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n")
-                                );
-                            } else {
-                                assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
-                            }
-                            let response =
-                                String::from_utf8(response).unwrap().to_ascii_lowercase();
-                            for forbidden in [
-                                "100 continue",
-                                "x-padding:",
-                                "access-control-",
-                                "cache-control:",
-                                "x-accel-buffering:",
-                            ] {
-                                assert!(!response.contains(forbidden), "{forbidden}");
-                            }
-                        };
-                        let (result, ()) = tokio::join!(serving, probe);
-                        result.unwrap();
-                        drop(held);
-                        assert!(state.sessions.lock().is_empty());
-                        assert_eq!(state.requests.snapshot().active, 0);
-                        assert_eq!(state.memory.snapshot().peak, 0);
-                    }
+                        client.write_all(request.as_bytes()).await.unwrap();
+                        let mut response = Vec::new();
+                        client.read_to_end(&mut response).await.unwrap();
+                        if request_limit_reached {
+                            assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+                        } else {
+                            assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+                        }
+                        let response = String::from_utf8(response).unwrap().to_ascii_lowercase();
+                        for forbidden in [
+                            "100 continue",
+                            "x-padding:",
+                            "access-control-",
+                            "cache-control:",
+                            "x-accel-buffering:",
+                        ] {
+                            assert!(!response.contains(forbidden), "{forbidden}");
+                        }
+                    };
+                    let (result, ()) = tokio::join!(serving, probe);
+                    result.unwrap();
+                    drop(held);
+                    assert!(state.sessions.lock().is_empty());
+                    assert_eq!(state.requests.snapshot().active, 0);
+                    assert_eq!(state.memory.snapshot().peak, 0);
                 }
             }
         })
@@ -3407,12 +3400,6 @@ impl XhttpServer {
         bind_ip: Option<IpAddr>,
     ) -> io::Result<Self> {
         config.validate()?;
-        if config.close_on_http1_error {
-            log::warn!(
-                "XHTTP close_on_http1_error is deprecated and ignored; HTTP/1 header and path \
-                 mismatches return a plain 404 like HTTP/2 and HTTP/3. Remove it from the configuration."
-            );
-        }
         let inner = crate::tcp::tcp_server_handler_factory::create_tcp_server_handler(
             *config.protocol.clone(),
             selector,

@@ -351,9 +351,6 @@ impl XhttpClientConfig {
 pub struct XhttpServerConfig {
     #[serde(default)]
     pub path: String,
-    // Deprecated and ignored; still accepted so v0.3.4 configurations parse.
-    #[serde(default)]
-    pub close_on_http1_error: bool,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -577,7 +574,7 @@ mod tests {
     #[test]
     fn server_request_filters_defaults_and_round_trip() {
         let mut config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
-            "close_on_http1_error": true, "protocol": {"type": "socks"}
+            "protocol": {"type": "socks"}
         }))
         .unwrap();
         assert!(config.matching_headers.is_empty());
