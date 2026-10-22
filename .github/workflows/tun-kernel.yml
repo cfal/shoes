@@ -40,5 +40,5 @@ jobs:
 
     - name: Run kernel TUN tests
       run: >-
-        cargo test -p shoes --locked --features privileged-tests
+        .github/require-tests.sh cargo test -p shoes --locked --features privileged-tests
         --test privileged tun_kernel:: --verbose -- --test-threads=1

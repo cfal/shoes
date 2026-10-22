@@ -73,21 +73,21 @@ jobs:
         run: cargo test --locked --features optional-peer-tests --test vless_encryption_interop -- --test-threads=1
       - name: Cross-language cryptography vectors
         run: |
-          cargo test --locked --lib vless::encryption:: -- --test-threads=1
-          VLESS_RUST_VECTORS="$RUNNER_TEMP/vless-rust.json" cargo test --locked --lib export_rust_encapsulations -- --ignored
+          .github/require-tests.sh cargo test --locked --lib vless::encryption:: -- --test-threads=1
+          VLESS_RUST_VECTORS="$RUNNER_TEMP/vless-rust.json" .github/require-tests.sh cargo test --locked --lib export_rust_encapsulations -- --ignored
           cd peers/xray
           go run -p 1 ../../tests/fixtures/vless_encryption/generate.go --verify-rust "$RUNNER_TEMP/vless-rust.json"
       - name: Bounded native VLESS stress
-        run: cargo test --locked --features stress-tests --test stress vless_encryption -- --test-threads=1
+        run: .github/require-tests.sh cargo test --locked --features stress-tests --test stress vless_encryption -- --test-threads=1
       - name: Legacy baseline comparison
         env:
           XRAY_BINARY: ${{ runner.temp }}/xray
           SHOES_BASELINE_BINARY: ${{ runner.temp }}/shoes-baseline
-        run: cargo test --locked --features optional-peer-tests --test vless_encryption_interop legacy_baseline_matches_backpressure_and_half_close -- --ignored --test-threads=1
+        run: .github/require-tests.sh cargo test --locked --features optional-peer-tests --test vless_encryption_interop legacy_baseline_matches_backpressure_and_half_close -- --ignored --test-threads=1
       - name: Legacy VLESS regression
         env:
           SHOES_TEST_SING_BOX_BIN: ${{ runner.temp }}/sing-box
-        run: cargo test --locked --features integration-tests --test integration vless -- --test-threads=1
+        run: .github/require-tests.sh cargo test --locked --features integration-tests --test integration vless -- --test-threads=1
       - name: Legacy REALITY regression
         env:
           XRAY_BINARY: ${{ runner.temp }}/xray
@@ -97,6 +97,6 @@ jobs:
           SHOES_TEST_XRAY_BIN: ${{ runner.temp }}/xray
           SHOES_TEST_MIHOMO_BIN: ${{ runner.temp }}/mihomo
         run: |
-          cargo test --locked --features integration-tests --test xhttp_interop shoes_to_shoes_modes_and_transports -- --test-threads=1
-          cargo test --locked --features integration-tests --test xhttp_interop all_modes_and_versions -- --test-threads=1
-          cargo test --locked --features integration-tests --test xhttp_interop mihomo_alpha -- --test-threads=1
+          .github/require-tests.sh cargo test --locked --features integration-tests --test xhttp_interop shoes_to_shoes_modes_and_transports -- --test-threads=1
+          .github/require-tests.sh cargo test --locked --features integration-tests --test xhttp_interop all_modes_and_versions -- --test-threads=1
+          .github/require-tests.sh cargo test --locked --features integration-tests --test xhttp_interop mihomo_alpha -- --test-threads=1
