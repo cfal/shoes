@@ -586,6 +586,11 @@ impl AsyncRead for WebsocketStream {
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        // Callers such as tokio's read_to_end pass buffers that already hold data.
+        let filled_before = buf.filled().len();
 
         // If there is unprocessed data and we are reading content, it must be because there
         // is data still to be read, but the passed in `buf` from the previous iteration
@@ -595,7 +600,7 @@ impl AsyncRead for WebsocketStream {
             if read_result.is_err() {
                 return Poll::Ready(read_result);
             }
-            assert!(!buf.filled().is_empty());
+            assert!(buf.filled().len() > filled_before);
             return Poll::Ready(Ok(()));
         }
 
@@ -648,7 +653,7 @@ impl AsyncRead for WebsocketStream {
                 return Poll::Ready(read_result);
             }
 
-            if !buf.filled().is_empty() {
+            if buf.filled().len() > filled_before {
                 return Poll::Ready(Ok(()));
             }
         }
