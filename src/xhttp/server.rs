@@ -2133,6 +2133,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn h3_upload_only_reset_releases_request_without_response_read() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let state = service();
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.cert.der().clone()).unwrap();
+            let config = quinn::ServerConfig::with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+            let server = quinn::Endpoint::server(config, "0.0.0.0:0".parse().unwrap()).unwrap();
+            let mut client = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+            let mut config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+            let mut transport = quinn::TransportConfig::default();
+            transport.stream_receive_window(1u32.into());
+            config.transport_config(Arc::new(transport));
+            client.set_default_client_config(config);
+            let address = ([127, 0, 0, 1], server.local_addr().unwrap().port()).into();
+            let (outgoing, incoming) =
+                tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                    server.accept().await.unwrap().await.unwrap()
+                });
+            let tasks = Tasks::new();
+            let serving = state.clone();
+            tasks.spawn(async move {
+                let _ = XhttpServer { state: serving }.serve_h3(incoming).await;
+            });
+            let (mut driver, mut sender) =
+                h3::client::new(h3_quinn::Connection::new(outgoing.unwrap()))
+                    .await
+                    .unwrap();
+            tasks.spawn(async move {
+                let _ = futures::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            });
+            let packet = Request::post("https://localhost/t/session/0")
+                .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                .header("content-length", "16")
+                .body(())
+                .unwrap();
+            // Keep the unread receive half: dropping it would send STOP_SENDING.
+            let (mut send, _receive) = sender.send_request(packet).await.unwrap().split();
+            send.send_data(Bytes::from_static(b"partial"))
+                .await
+                .unwrap();
+            while state.memory.snapshot().active == 0 {
+                tokio::task::yield_now().await;
+            }
+            send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+            while state.requests.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(state.admission.snapshot().active, 0);
+            assert_eq!(state.memory.snapshot().active, 0);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn h2_library_body_resets_remain_stream_local_in_strict_mode() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut state = service();
@@ -3579,6 +3640,8 @@ impl XhttpServer {
                     Ok(Kind::One | Kind::Upload(_))
                 );
                 let response = state.handle(request, reader).await;
+                // A response to a reset upload can block on flow control until the peer reads or
+                // sends STOP_SENDING, holding the request permit.
                 if peer_reset.is_cancelled() {
                     send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
                     return;
