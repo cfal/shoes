@@ -87,6 +87,16 @@ class ReleaseNoticesTests(unittest.TestCase):
         metadata = json.loads(subprocess.check_output([
             "cargo", "metadata", *cargo_options, "--format-version", "1",
         ]))
+        gotatun_versions = [p["version"] for p in metadata["packages"] if p["name"] == "gotatun"]
+        self.assertEqual(len(gotatun_versions), 1)
+        version = gotatun_versions[0]
+        source_notice = (NOTICES.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
+        for required in [
+            f"GotaTun {version},",
+            f"https://crates.io/api/v1/crates/gotatun/{version}/download",
+            f"https://github.com/mullvad/gotatun/tree/v{version}",
+        ]:
+            self.assertIn(required, source_notice)
         bundle = (NOTICES.ROOT / "licenses/dependencies.txt").read_text()
         original_notices = {
             "curve25519-dalek": ["LICENSE"], "x25519-dalek": ["LICENSE"],

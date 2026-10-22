@@ -12,10 +12,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, pkcs8_private_keys};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, pem::PemObject};
 use std::convert::Infallible;
 use std::fs::File;
-use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -530,15 +529,13 @@ fn create_tls_config(
 ) -> std::io::Result<Arc<ServerConfig>> {
     // Load certificate
     let cert_file = File::open(cert_path)?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<_> = certs(&mut cert_reader)
+    let certs: Vec<_> = CertificateDer::pem_reader_iter(cert_file)
         .collect::<Result<_, _>>()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // Load private key
     let key_file = File::open(key_path)?;
-    let mut key_reader = BufReader::new(key_file);
-    let keys = pkcs8_private_keys(&mut key_reader)
+    let keys = PrivatePkcs8KeyDer::pem_reader_iter(key_file)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 

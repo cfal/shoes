@@ -9,10 +9,6 @@ tasks.register<Sync>("dependencyNotices") {
     into(layout.buildDirectory.dir("generated/notices/META-INF/shoes"))
 }
 
-// AGP 9 rejects Provider values in SourceSet configuration.
-android.sourceSets.getByName("main").resources.srcDir(
-    layout.buildDirectory.dir("generated/notices").get().asFile,
-)
 tasks.named("preBuild").configure { dependsOn("dependencyNotices") }
 
 android {
@@ -37,8 +33,11 @@ android {
 
     sourceSets {
         getByName("main") {
+            resources.directories.add(
+                layout.buildDirectory.dir("generated/notices").get().asFile.absolutePath,
+            )
             // JNI .so files built by cargo-ndk / build-android.sh
-            jniLibs.srcDirs("src/main/jniLibs")
+            jniLibs.directories.add("src/main/jniLibs")
         }
     }
 }
