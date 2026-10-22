@@ -222,6 +222,13 @@ impl<T> Iterator for SingleItemIter<T> {
     }
 }
 
+#[cfg(test)]
+impl From<&str> for OneOrSome<String> {
+    fn from(value: &str) -> Self {
+        OneOrSome::One(value.into())
+    }
+}
+
 impl<T> TryFrom<Vec<T>> for OneOrSome<T> {
     type Error = std::io::Error;
     fn try_from(vec: Vec<T>) -> std::io::Result<Self> {

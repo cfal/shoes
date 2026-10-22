@@ -6,6 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{ClientProxyConfig, GlobalLimits, ServerProxyConfig};
+use crate::option_util::OneOrSome;
 
 pub(crate) const MAX_PADDING_BYTES: u32 = 65536;
 
@@ -355,7 +356,7 @@ pub struct XhttpServerConfig {
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
-    pub matching_headers: BTreeMap<String, String>,
+    pub matching_headers: BTreeMap<String, OneOrSome<String>>,
     #[serde(default)]
     pub mode: XhttpMode,
     #[serde(default)]
@@ -381,7 +382,7 @@ impl XhttpServerConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
         validate_header_names("matching_headers", self.matching_headers.keys())?;
-        for value in self.matching_headers.values() {
+        for value in self.matching_headers.values().flat_map(OneOrSome::iter) {
             http::HeaderValue::try_from(value).map_err(io::Error::other)?;
             if value.starts_with([' ', '\t']) || value.ends_with([' ', '\t']) {
                 return Err(invalid(
@@ -584,9 +585,7 @@ mod tests {
         config
             .matching_headers
             .insert("X-Token".into(), "Secret".into());
-        config
-            .matching_headers
-            .insert("X-Empty".into(), String::new());
+        config.matching_headers.insert("X-Empty".into(), "".into());
         config.validate().unwrap();
         let encoded = serde_json::to_value(&config).unwrap();
         assert_eq!(encoded["close_on_http1_error"], true);
@@ -618,6 +617,8 @@ mod tests {
             serde_json::json!({"x-token": "secret "}),
             serde_json::json!({"x-token": "\tsecret"}),
             serde_json::json!({"x-token": "secret\t"}),
+            serde_json::json!({"x-token": ["secret", "secret "]}),
+            serde_json::json!({"x-token": ["secret", "a\r\nb"]}),
         ] {
             let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
                 "matching_headers": headers, "protocol": {"type": "socks"}
@@ -625,6 +626,26 @@ mod tests {
             .unwrap();
             assert!(config.validate().is_err(), "{headers}");
         }
+    }
+
+    #[test]
+    fn server_matching_headers_accept_value_lists() {
+        let headers = serde_json::json!({"X-Single": "one", "X-Token": ["old", "new"]});
+        let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+            "matching_headers": headers, "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["matching_headers"],
+            headers
+        );
+        assert!(
+            serde_json::from_value::<XhttpServerConfig>(serde_json::json!({
+                "matching_headers": {"X-Token": []}, "protocol": {"type": "socks"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

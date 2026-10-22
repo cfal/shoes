@@ -443,6 +443,8 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   `matching_headers: { X-Tunnel-Key: "replace-me" }` on the server and
   `headers: { X-Tunnel-Key: "replace-me" }` on the client. An empty map (default)
   adds no requirements; an empty value requires a present, empty header.
+  A value may also be a list, such as `X-Tunnel-Key: [old, new]`, to accept any
+  one of them while rotating secrets.
   Use `host`, not `matching_headers`, to match Host/`:authority` across versions.
   Transport-managed headers and values with leading/trailing spaces or tabs
   are rejected at startup.

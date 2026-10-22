@@ -111,10 +111,11 @@ pub enum Kind {
 pub fn check_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> bool {
     config.matching_headers.iter().all(|(name, expected)| {
         let mut values = headers.get_all(name.as_str()).iter();
-        values
-            .next()
-            .is_some_and(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes())))
-            && values.next().is_none()
+        values.next().is_some_and(|value| {
+            expected
+                .iter()
+                .any(|expected| bool::from(value.as_bytes().ct_eq(expected.as_bytes())))
+        }) && values.next().is_none()
     })
 }
 
@@ -305,9 +306,7 @@ mod tests {
         config
             .matching_headers
             .insert("X-Token".into(), "Secret".into());
-        config
-            .matching_headers
-            .insert("X-Empty".into(), String::new());
+        config.matching_headers.insert("X-Empty".into(), "".into());
         config.validate().unwrap();
 
         let mut headers = HeaderMap::new();
@@ -331,6 +330,34 @@ mod tests {
                 headers.append("x-token", value.parse().unwrap());
             }
             assert!(!check_matching_headers(&config, &headers));
+        }
+    }
+
+    #[test]
+    fn matching_headers_accept_one_of_the_configured_values() {
+        let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+            "matching_headers": {"X-Token": ["old", "new"]}, "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        for (values, matched) in [
+            (vec!["old"], true),
+            (vec!["new"], true),
+            (vec![], false),
+            (vec!["other"], false),
+            (vec!["old, new"], false),
+            (vec!["old", "new"], false),
+            (vec!["new", "new"], false),
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in &values {
+                headers.append("x-token", value.parse().unwrap());
+            }
+            assert_eq!(
+                check_matching_headers(&config, &headers),
+                matched,
+                "{values:?}"
+            );
         }
     }
 

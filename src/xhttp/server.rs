@@ -3284,6 +3284,28 @@ mod tests {
         assert!(weak.upgrade().is_none());
         assert_eq!(memory.snapshot().active, 0);
     }
+
+    #[tokio::test]
+    async fn matching_headers_accept_any_configured_value() {
+        let mut state = service();
+        Arc::get_mut(&mut state).unwrap().config.matching_headers = [(
+            "x-token".into(),
+            crate::option_util::OneOrSome::Some(vec!["old".into(), "new".into()]),
+        )]
+        .into();
+        for (value, status) in [
+            ("old", StatusCode::OK),
+            ("new", StatusCode::OK),
+            ("other", StatusCode::NOT_FOUND),
+        ] {
+            let request = Request::options("http://localhost/t/")
+                .header("x-token", value)
+                .body(())
+                .unwrap();
+            let (_writer, body) = pipe(state.new_memory());
+            assert_eq!(state.handle(request, body).await.status(), status);
+        }
+    }
 }
 
 struct State {
