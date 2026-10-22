@@ -268,7 +268,14 @@ impl Prepared {
         {
             for node in catalog.nodes.values_mut() {
                 if let crate::control::catalog::CatalogNode::Leaf(client) = node {
-                    crate::config::client_visit::visit_client(client, &mut attach)?;
+                    crate::config::client_visit::visit_client(client, &mut |client| {
+                        if let ClientProxyConfig::Wireguard(reference) = &mut client.protocol {
+                            reference.connector = connectors
+                                .get(&reference.endpoint_id)
+                                .map(|connector| connector.clone() as Arc<dyn SocketConnector>);
+                        }
+                        Ok(())
+                    })?;
                 }
             }
         }

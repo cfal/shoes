@@ -367,7 +367,8 @@ successive byte counters. Process/GeoIP data is not fabricated.
 
 Delay tests send HTTP HEAD through actual outbounds, verify HTTPS certificates,
 and never follow redirects. A leaf test is standalone, not a test of every chain
-containing that leaf. Direct probe destinations cannot be loopback, link-local,
+containing that leaf. Unused WireGuard nodes remain inactive and cannot be probed
+until referenced by a forwarding or DNS rule. Direct probe destinations cannot be loopback, link-local,
 unspecified, multicast, or synthetic fake-IP addresses. Remote proxies may resolve
 names differently: this is authenticated administrative network access, not an
 API for untrusted users.
