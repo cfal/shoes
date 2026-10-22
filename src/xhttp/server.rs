@@ -1987,22 +1987,29 @@ mod tests {
 
     #[tokio::test]
     async fn h3_upload_only_reset_releases_request_without_response_read() {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             let state = service();
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
             let mut roots = rustls::RootCertStore::empty();
             roots.add(cert.cert.der().clone()).unwrap();
-            let config = quinn::ServerConfig::with_single_cert(
+            let mut config = quinn::ServerConfig::with_single_cert(
                 vec![cert.cert.der().clone()],
                 rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
                     .into(),
             )
             .unwrap();
+            // Without idle timeouts, a regression holds the request until the deadline
+            // instead of being released when the connection idles out.
+            Arc::get_mut(&mut config.transport)
+                .unwrap()
+                .max_idle_timeout(None);
             let server = quinn::Endpoint::server(config, "0.0.0.0:0".parse().unwrap()).unwrap();
             let mut client = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
             let mut config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
             let mut transport = quinn::TransportConfig::default();
-            transport.stream_receive_window(1u32.into());
+            transport
+                .stream_receive_window(1u32.into())
+                .max_idle_timeout(None);
             config.transport_config(Arc::new(transport));
             client.set_default_client_config(config);
             let address = ([127, 0, 0, 1], server.local_addr().unwrap().port()).into();
