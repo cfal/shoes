@@ -4435,7 +4435,6 @@ impl State {
         let mut requests = tokio::task::JoinSet::new();
         loop {
             let request = tokio::select! {
-                biased;
                 request = connection.accept() => request,
                 _ = requests.join_next(), if !requests.is_empty() => continue,
             };
@@ -4475,6 +4474,8 @@ impl State {
                 });
                 let handle = state.handle(request, reader);
                 tokio::pin!(handle);
+                // Poll the reset first so a packet whose admission becomes ready in the same
+                // wakeup sees RequestReset and withdraws instead of closing its session.
                 let response = tokio::select! {
                     biased;
                     _ = futures::future::poll_fn(|cx| respond.poll_reset(cx)) => {
@@ -4484,11 +4485,6 @@ impl State {
                     },
                     response = &mut handle => response,
                 };
-                // A reset can arrive after select polls it but before handle completes.
-                if futures::poll!(futures::future::poll_fn(|cx| respond.poll_reset(cx))).is_ready()
-                {
-                    return;
-                }
                 if response.extensions().get::<Refused>().is_some() {
                     respond.send_reset(h2::Reason::REFUSED_STREAM);
                     return;
