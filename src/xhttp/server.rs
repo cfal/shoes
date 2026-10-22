@@ -4413,10 +4413,7 @@ impl State {
         if !wire::check_matching_headers(&self.config, request.headers()) {
             return Err(io::Error::other("XHTTP request headers do not match"));
         }
-        if !percent_encoding::percent_decode_str(request.uri().path())
-            .take(self.path.base.len())
-            .eq(self.path.base.bytes())
-        {
+        if self.path.suffix(request.uri().path()).is_none() {
             return Err(io::Error::other("XHTTP request path does not match"));
         }
         Ok(())
