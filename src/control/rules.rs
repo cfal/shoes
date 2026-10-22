@@ -49,7 +49,14 @@ impl Builder {
                     protocol: protocol.into(),
                 }));
             }
-            self.rules.push(serde_json::json!({"index":self.rules.len(),"type":"Shoes","payload":format!("{inbound} ({scope}): {}",description.payload),"proxy":description.proxy,"size":-1,"shoes":{"inbound":inbound,"scope":scope}}));
+            self.rules.push(serde_json::json!({
+                "index": self.rules.len(),
+                "type": "Shoes",
+                "payload": format!("{inbound} ({scope}): {}", description.payload),
+                "proxy": description.proxy,
+                "size": -1,
+                "shoes": {"inbound": inbound, "scope": scope},
+            }));
             rule.criteria.description = Some(Arc::new(description));
         }
     }

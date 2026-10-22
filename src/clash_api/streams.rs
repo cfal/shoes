@@ -80,7 +80,7 @@ pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Arc<Sample>>) {
         Duration::from_secs(1),
     );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let (mut up, mut down, mut rss) = (0, 0, 0);
+    let (mut previous_upload, mut previous_download, mut rss) = (0, 0, 0);
     let mut previous = Instant::now();
     let mut oversized = false;
     let mut rss_failed = false;
@@ -108,8 +108,17 @@ pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Arc<Sample>>) {
         };
         let elapsed = previous.elapsed().as_secs_f64();
         previous = Instant::now();
-        let traffic = json_bytes(&json!({"up":((upload_total.saturating_sub(up)) as f64 / elapsed) as u64,"down":((download_total.saturating_sub(down)) as f64 / elapsed) as u64,"upTotal":upload_total,"downTotal":download_total})).expect("bounded traffic DTO");
-        (up, down) = (upload_total, download_total);
+        let upload_rate = (upload_total.saturating_sub(previous_upload) as f64 / elapsed) as u64;
+        let download_rate =
+            (download_total.saturating_sub(previous_download) as f64 / elapsed) as u64;
+        let traffic = json_bytes(&json!({
+            "up": upload_rate,
+            "down": download_rate,
+            "upTotal": upload_total,
+            "downTotal": download_total,
+        }))
+        .expect("bounded traffic DTO");
+        (previous_upload, previous_download) = (upload_total, download_total);
         if connections.is_err() && !oversized {
             log::warn!(
                 "Clash API connection snapshot exceeds response limit; retaining complete tracking"

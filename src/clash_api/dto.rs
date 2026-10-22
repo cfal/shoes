@@ -9,24 +9,20 @@ use crate::control::selection::Choices;
 use crate::option_util::OneOrSome;
 
 pub fn capabilities(catalog: &Catalog) -> io::Result<HashMap<String, bool>> {
-    catalog
-        .nodes
-        .iter()
-        .filter_map(|(name, node)| {
-            if let CatalogNode::Leaf(client) = node {
-                Some(
-                    crate::tcp::chain_builder::supports_udp_offline(&ClientChain {
-                        hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                            (**client).clone(),
-                        ))),
-                    })
-                    .map(|udp| (name.clone(), udp)),
-                )
-            } else {
-                None
-            }
-        })
-        .collect()
+    let mut capabilities = HashMap::new();
+    for (name, node) in &catalog.nodes {
+        let CatalogNode::Leaf(client) = node else {
+            continue;
+        };
+        let chain = ClientChain {
+            hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                (**client).clone(),
+            ))),
+        };
+        let udp = crate::tcp::chain_builder::supports_udp_offline(&chain)?;
+        capabilities.insert(name.clone(), udp);
+    }
+    Ok(capabilities)
 }
 
 pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<Value> {
@@ -38,7 +34,16 @@ pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<V
         }
         CatalogNode::Reject => json!({"name":name,"type":"Reject","udp":false}),
         CatalogNode::Group { members, strategy } => {
-            let mut value = json!({"name":name,"type":if *strategy == GroupStrategy::Selector { "Selector" } else { "LoadBalance" },"all":members,"udp":udp});
+            let proxy_type = match strategy {
+                GroupStrategy::Selector => "Selector",
+                GroupStrategy::RoundRobin => "LoadBalance",
+            };
+            let mut value = json!({
+                "name": name,
+                "type": proxy_type,
+                "all": members,
+                "udp": udp,
+            });
             if let Some(selected) = choices.get(name) {
                 value["now"] = json!(selected);
             }
@@ -72,7 +77,14 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str, depth: u
 pub fn proxies(generation: &Generation, groups_only: bool) -> Value {
     let choices = generation.catalog.selection.snapshot();
     if groups_only {
-        json!({"proxies":generation.catalog.nodes.iter().filter(|(_,node)| matches!(node,CatalogNode::Group { .. })).map(|(name,_)| proxy(generation,&choices,name).unwrap()).collect::<Vec<_>>()})
+        let groups: Vec<_> = generation
+            .catalog
+            .nodes
+            .iter()
+            .filter(|(_, node)| matches!(node, CatalogNode::Group { .. }))
+            .map(|(name, _)| proxy(generation, &choices, name).unwrap())
+            .collect();
+        json!({"proxies": groups})
     } else {
         let nodes: serde_json::Map<_, _> = generation
             .catalog

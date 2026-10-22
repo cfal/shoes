@@ -163,7 +163,11 @@ impl Catalog {
                 return Err(invalid("default is only valid for selector groups"));
             }
         }
-        let enabled = configs.iter().any(|config| matches!(config, Config::ClashApi(_) | Config::CacheFile(_)) || matches!(config, Config::ClientConfigGroup(g) if g.strategy == GroupStrategy::Selector));
+        let enabled = configs.iter().any(|config| match config {
+            Config::ClashApi(_) | Config::CacheFile(_) => true,
+            Config::ClientConfigGroup(group) => group.strategy == GroupStrategy::Selector,
+            _ => false,
+        });
         if !enabled {
             return Ok(None);
         }
@@ -243,7 +247,10 @@ impl Catalog {
             if let Config::ClientConfigGroup(group) = config {
                 let members: Vec<_> = group.client_proxies.iter().map(member_name).collect();
                 if group.strategy == GroupStrategy::Selector {
-                    if group.client_proxies.iter().any(|member| matches!(member, ConfigSelection::Config(client) if client.name.is_none())) {
+                    let has_unnamed_member = group.client_proxies.iter().any(|member| {
+                        matches!(member, ConfigSelection::Config(client) if client.name.is_none())
+                    });
+                    if has_unnamed_member {
                         return Err(invalid("inline selector members require explicit names"));
                     }
                     definitions.insert(
@@ -253,8 +260,6 @@ impl Catalog {
                             default: group.default.clone(),
                         },
                     );
-                } else if group.default.is_some() {
-                    return Err(invalid("default is only valid for selector groups"));
                 }
                 nodes.insert(
                     group.client_group.clone(),
