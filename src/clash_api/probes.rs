@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::StreamExt;
 use http_body_util::Empty;
 use indexmap::IndexMap;
 use parking_lot::Mutex;
@@ -87,8 +88,7 @@ impl ProbeState {
     }
 
     fn connector(&self, catalog: &Catalog, name: &str) -> io::Result<Arc<ClientChainGroup>> {
-        let mut connectors = self.connectors.lock();
-        if let Some(connector) = connectors.get(name) {
+        if let Some(connector) = self.connectors.lock().get(name) {
             return Ok(connector.clone());
         }
         let mut clients = Vec::new();
@@ -100,8 +100,12 @@ impl ProbeState {
             self.resolver.clone(),
         )?;
         let connector = Arc::new(ClientChainGroup::new(vec![chain]));
-        connectors.insert(name.into(), connector.clone());
-        Ok(connector)
+        Ok(self
+            .connectors
+            .lock()
+            .entry(name.into())
+            .or_insert(connector)
+            .clone())
     }
 }
 
@@ -223,8 +227,78 @@ pub async fn probe(
         .clone()
         .try_acquire_owned()
         .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "probe limit reached"))?;
+    probe_until(
+        runtime,
+        generation,
+        name,
+        query,
+        tokio::time::Instant::now() + query.timeout,
+    )
+    .await
+}
+
+pub async fn probe_group(
+    runtime: &ControlRuntime,
+    generation: &Generation,
+    members: &[String],
+    query: &ProbeQuery,
+) -> io::Result<serde_json::Map<String, Value>> {
+    let deadline = tokio::time::Instant::now() + query.timeout;
+    let mut results =
+        futures::stream::iter(members.iter().cloned().map(|name: String| async move {
+            let activating = || {
+                runtime
+                    .activating
+                    .load(std::sync::atomic::Ordering::Acquire)
+            };
+            if activating() || tokio::time::Instant::now() >= deadline {
+                return (name, None);
+            }
+            let permit = tokio::select! {
+                _ = runtime.shutdown.cancelled() => return (name, None),
+                permit = tokio::time::timeout_at(deadline, runtime.probes.acquire()) => permit,
+            };
+            let Ok(Ok(_permit)) = permit else {
+                return (name, None);
+            };
+            if activating() || tokio::time::Instant::now() >= deadline {
+                return (name, None);
+            }
+            let result = probe_until(runtime, generation, &name, query, deadline).await;
+            (name, Some(result))
+        }))
+        .buffer_unordered(16);
+    let mut started = false;
+    let mut successes = serde_json::Map::new();
+    while let Some((name, result)) = results.next().await {
+        if let Some(result) = result {
+            started = true;
+            if let Ok(delay) = result {
+                successes.insert(name.clone(), json!(delay));
+            }
+        }
+    }
+    if !successes.is_empty() {
+        Ok(successes)
+    } else if started {
+        Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "group probes unavailable",
+        ))
+    }
+}
+
+async fn probe_until(
+    runtime: &ControlRuntime,
+    generation: &Generation,
+    name: &str,
+    query: &ProbeQuery,
+    deadline: tokio::time::Instant,
+) -> io::Result<u16> {
     let result = tokio::select! {
-        result = tokio::time::timeout(query.timeout, request(generation, name, query)) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout")).and_then(|result| result),
+        result = tokio::time::timeout_at(deadline, request(generation, name, query)) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout")).and_then(|result| result),
         _ = runtime.shutdown.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "controller stopped")),
     };
     let (delay, satisfied) = result.as_ref().copied().unwrap_or((0, false));
@@ -449,6 +523,79 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    #[derive(Debug, Default)]
+    struct PendingAnswers(std::sync::atomic::AtomicUsize);
+
+    impl Resolver for PendingAnswers {
+        fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn group_deadline_includes_members_waiting_for_capacity() {
+        let service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        service
+            .runtime
+            .activating
+            .store(false, std::sync::atomic::Ordering::Release);
+        let resolver = Arc::new(PendingAnswers::default());
+        let mut catalog = catalog();
+        let members: Vec<_> = (0..32).map(|index| format!("direct-{index}")).collect();
+        for name in &members {
+            catalog
+                .nodes
+                .insert(name.clone(), CatalogNode::Leaf(Box::default()));
+        }
+        let generation = generation(catalog, resolver.clone());
+        let start = tokio::time::Instant::now();
+        let error = probe_group(&service.runtime, &generation, &members, &query())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert_eq!(resolver.0.load(std::sync::atomic::Ordering::Relaxed), 16);
+        assert_eq!(generation.probes.history.lock().len(), 16);
+        assert_eq!(service.runtime.probes.available_permits(), 16);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn group_capacity_exhaustion_does_not_record_probe_failures() {
+        let service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        service
+            .runtime
+            .activating
+            .store(false, std::sync::atomic::Ordering::Release);
+        let resolver = Arc::new(PendingAnswers::default());
+        let generation = generation(catalog(), resolver.clone());
+        let members = vec!["DIRECT".into(), "DIRECT".into()];
+        let permits = service.runtime.probes.acquire_many(16).await.unwrap();
+        let start = tokio::time::Instant::now();
+        let error = probe_group(&service.runtime, &generation, &members, &query())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert_eq!(resolver.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(generation.probes.history.lock().is_empty());
+        drop(permits);
+        service
+            .runtime
+            .activating
+            .store(true, std::sync::atomic::Ordering::Release);
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            probe_group(&service.runtime, &generation, &members, &query())
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(generation.probes.history.lock().is_empty());
     }
 
     #[cfg(unix)]

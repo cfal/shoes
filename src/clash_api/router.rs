@@ -3,7 +3,6 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
 use http_body_util::BodyExt;
 use hyper::{Method, Request, Response, StatusCode, body::Incoming};
 use serde_json::json;
@@ -275,34 +274,9 @@ async fn route(
                 if members.len() > 1024 {
                     return error(StatusCode::BAD_REQUEST, "group exceeds probe member limit");
                 }
-                if state
-                    .runtime
-                    .activating
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    return error(StatusCode::SERVICE_UNAVAILABLE, "generation is activating");
-                }
-                let generation = &generation;
-                let query = &query;
-                let results = futures::stream::iter(members.clone().into_iter().map(
-                    |name: String| async move {
-                        let result = probes::probe(&state.runtime, generation, &name, query).await;
-                        (name, result)
-                    },
-                ))
-                .buffer_unordered(16)
-                .collect::<Vec<_>>()
-                .await;
-                let successes: serde_json::Map<_, _> = results
-                    .into_iter()
-                    .filter_map(|(name, result)| {
-                        result.ok().map(|delay| (name.clone(), json!(delay)))
-                    })
-                    .collect();
-                if successes.is_empty() {
-                    error(StatusCode::GATEWAY_TIMEOUT, "Timeout")
-                } else {
-                    super::json(StatusCode::OK, &successes)
+                match probes::probe_group(&state.runtime, &generation, members, &query).await {
+                    Ok(successes) => super::json(StatusCode::OK, &successes),
+                    Err(error_value) => io_error(error_value),
                 }
             } else {
                 match probes::probe(&state.runtime, &generation, name, &query).await {
@@ -382,6 +356,7 @@ fn io_error(error_value: std::io::Error) -> Response<Body> {
         std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
         std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
         std::io::ErrorKind::WouldBlock => StatusCode::SERVICE_UNAVAILABLE,
+        std::io::ErrorKind::TimedOut => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     error(status, &error_value.to_string())
