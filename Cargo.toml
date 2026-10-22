@@ -19,6 +19,7 @@ members = ["tests/support"]
 resolver = "3"
 
 [patch.crates-io]
+rustls = { git = "https://github.com/cfal/rustls", rev = "d17d0fc304c03fe6e2c96ade6cd39c33b951c3af" }
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "cd98c1c4112ed3b2cf2140e1844f266b3d665b53" }
 h3 = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
 h3-quinn = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
@@ -140,7 +141,7 @@ rust-argon2 = "*"
 rustc-hash = "*"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "perf"] }
-rustls = "*"
+rustls = "=0.23.46"
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"
 serde_yaml = "*"
