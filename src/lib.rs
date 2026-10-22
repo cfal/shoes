@@ -67,7 +67,6 @@ mod quic_endpoint;
 mod quic_server;
 mod quic_stream;
 mod reality;
-mod reality_client_handler;
 pub mod resolver;
 pub mod resources;
 mod routing;

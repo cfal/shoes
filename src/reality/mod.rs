@@ -5,6 +5,7 @@ mod reality_certificate;
 mod reality_certificate_verify;
 mod reality_cipher_suite;
 mod reality_client;
+mod reality_client_handler;
 mod reality_config;
 mod reality_hello;
 mod reality_mldsa;
@@ -36,5 +37,6 @@ pub use reality_config::{
 };
 
 pub use reality_client::RealityClientConfig;
+pub use reality_client_handler::RealityClientHandler;
 pub use reality_server::RealityServerConfig;
 pub use reality_server_handler::{RealityServerTarget, setup_reality_server_stream};

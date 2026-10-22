@@ -181,7 +181,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_default_tls_and_reality_handlers_forward_reuse() {
-        use crate::reality_client_handler::RealityClientHandler;
+        use crate::reality::RealityClientHandler;
         let config = Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore::empty())
