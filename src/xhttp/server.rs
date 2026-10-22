@@ -3907,9 +3907,10 @@ impl State {
         request: &Request<()>,
         body: Reader,
     ) -> Result<(Body, bool), Rejection> {
-        wire::check_matching_headers(&self.config, request.headers())
-            .inspect_err(|error| log::debug!("XHTTP request rejected: {error}"))
-            .map_err(|_| StatusCode::NOT_FOUND)?;
+        if !wire::check_matching_headers(&self.config, request.headers()) {
+            log::debug!("XHTTP request rejected: headers do not match");
+            return Err(StatusCode::NOT_FOUND.into());
+        }
         match wire::classify(&self.config, &self.path, request)? {
             Kind::Options => Ok((Body::Empty, false)),
             Kind::One => self.stream_one(body).map_err(Into::into),
@@ -4387,7 +4388,9 @@ impl State {
         if !self.config.close_on_http1_error {
             return Ok(());
         }
-        wire::check_matching_headers(&self.config, request.headers())?;
+        if !wire::check_matching_headers(&self.config, request.headers()) {
+            return Err(io::Error::other("XHTTP request headers do not match"));
+        }
         if !percent_encoding::percent_decode_str(request.uri().path())
             .take(self.path.base.len())
             .eq(self.path.base.bytes())

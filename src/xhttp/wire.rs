@@ -108,21 +108,14 @@ pub enum Kind {
     Packet(String, u64),
 }
 
-pub fn check_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> io::Result<()> {
-    for (name, expected) in &config.matching_headers {
+pub fn check_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> bool {
+    config.matching_headers.iter().all(|(name, expected)| {
         let mut values = headers.get_all(name.as_str()).iter();
-        let matches = values
+        values
             .next()
             .is_some_and(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes())))
-            && values.next().is_none();
-        if !matches {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "XHTTP request headers do not match",
-            ));
-        }
-    }
-    Ok(())
+            && values.next().is_none()
+    })
 }
 
 fn query_padding(query: &str) -> Option<String> {
@@ -308,7 +301,7 @@ mod tests {
             "protocol": {"type": "socks"}
         }))
         .unwrap();
-        assert!(check_matching_headers(&config, &HeaderMap::new()).is_ok());
+        assert!(check_matching_headers(&config, &HeaderMap::new()));
         config
             .matching_headers
             .insert("X-Token".into(), "Secret".into());
@@ -319,10 +312,10 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-token", "Secret".parse().unwrap());
-        assert!(check_matching_headers(&config, &headers).is_err());
+        assert!(!check_matching_headers(&config, &headers));
         headers.insert("x-empty", "".parse().unwrap());
         headers.insert("x-extra", "allowed".parse().unwrap());
-        assert!(check_matching_headers(&config, &headers).is_ok());
+        assert!(check_matching_headers(&config, &headers));
         for values in [
             vec![],
             vec![""],
@@ -337,12 +330,7 @@ mod tests {
             for value in values {
                 headers.append("x-token", value.parse().unwrap());
             }
-            assert_eq!(
-                check_matching_headers(&config, &headers)
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::PermissionDenied
-            );
+            assert!(!check_matching_headers(&config, &headers));
         }
     }
 
