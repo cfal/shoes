@@ -502,6 +502,8 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
                 self.session.send_close_notify();
                 self.state.shutdown_write();
             }
+            // A failed ordinary TLS session still has output to send before writer.flush fails.
+            ready!(self.poll_drain_tls(cx))?;
             ready!(self.as_mut().poll_flush(cx))?;
         } else {
             ready!(self.as_mut().poll_flush(cx))?;
@@ -776,10 +778,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn vectored_tls_roundtrip_with_partial_transport_writes() {
+    fn ordinary_connections() -> (TlsConnection, TlsConnection) {
         use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
@@ -801,6 +801,74 @@ mod tests {
             rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
                 .unwrap(),
         );
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn ordinary_tls_shutdown_drains_data_and_fatal_alert_after_backpressure() {
+        use std::io::Read;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for fail_server in [false, true] {
+            let (mut client, mut server) = ordinary_connections();
+            for _ in 0..8 {
+                let mut wire = Vec::new();
+                client.write_tls(&mut wire).unwrap();
+                server.feed(&wire).unwrap();
+                wire.clear();
+                server.write_tls(&mut wire).unwrap();
+                client.feed(&wire).unwrap();
+                if !client.is_handshaking() && !server.is_handshaking() && !client.wants_write() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            assert!(!client.wants_write() && !server.wants_write());
+            let (sender, mut receiver) = if fail_server {
+                (server, client)
+            } else {
+                (client, server)
+            };
+            let (io, mut peer) = tokio::io::duplex(16);
+            let mut stream = CryptoTlsStream::new(io, sender, None);
+            let payload = [42; 1000];
+            stream.write_all(&payload).await.unwrap();
+            assert!(stream.session.wants_write());
+            peer.write_all(&[23, 3, 3, 0, 1, 0]).await.unwrap();
+            assert_eq!(
+                stream.read(&mut [0]).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(stream.session.wants_write());
+
+            let mut wire = Vec::new();
+            let (shutdown, read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    async move {
+                        let result = stream.shutdown().await;
+                        drop(stream);
+                        result
+                    },
+                    peer.read_to_end(&mut wire)
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(shutdown.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            read.unwrap();
+            let error = receiver.feed(&wire).unwrap_err();
+            assert!(error.to_string().contains("BadRecordMac"), "{error}");
+            let mut received = [0; 1000];
+            receiver.reader().read_exact(&mut received).unwrap();
+            assert_eq!(received, payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_tls_roundtrip_with_partial_transport_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = ordinary_connections();
         let (client_io, server_io) = tokio::io::duplex(256);
         let peer = tokio::spawn(async move {
             let mut stream =
