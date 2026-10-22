@@ -519,113 +519,110 @@ mod cleanup_tests {
                 case,
                 "client-unknown-shares" | "client-truncated-share" | "client-bad-auth"
             );
-            let mut response = if auth_failure {
-                let offsets = client_key_share_offsets(&hello);
-                assert_eq!(offsets.len(), 2);
-                let expected_error = if case == "client-unknown-shares" {
-                    for (offset, group) in offsets.into_iter().zip([0xfe30u16, 0xfe31]) {
-                        hello[offset..offset + 2].copy_from_slice(&group.to_be_bytes());
+            let mut response = match case {
+                "client-unknown-shares" | "client-truncated-share" | "client-bad-auth" => {
+                    let offsets = client_key_share_offsets(&hello);
+                    assert_eq!(offsets.len(), 2);
+                    let expected_error = match case {
+                        "client-unknown-shares" => {
+                            for (offset, group) in offsets.into_iter().zip([0xfe30u16, 0xfe31]) {
+                                hello[offset..offset + 2].copy_from_slice(&group.to_be_bytes());
+                            }
+                            io::ErrorKind::InvalidData
+                        }
+                        "client-truncated-share" => {
+                            // Keeps the TLS framing valid while overstating the last share's length.
+                            let offset = offsets[1] + 2;
+                            assert_eq!(&hello[offset..offset + 2], &[0, 32]);
+                            hello[offset..offset + 2].copy_from_slice(&33u16.to_be_bytes());
+                            io::ErrorKind::UnexpectedEof
+                        }
+                        _ => {
+                            hello[44] ^= 1;
+                            io::ErrorKind::PermissionDenied
+                        }
+                    };
+                    let mut check = RealityServerConnection::new(sc.clone()).unwrap();
+                    assert_eq!(
+                        check.validate_client_hello(&hello).unwrap_err().kind(),
+                        expected_error
+                    );
+                    // A valid target flight reaches the admission-error branch, not hello fallback.
+                    crate::reality::default_target_records(&hello[44..76]).concat()
+                }
+                "small" | "small-separate" => {
+                    let (mut records, small_record) = if case == "small" {
+                        (crate::reality::default_target_records(&hello[44..76]), 2)
+                    } else {
+                        (
+                            separate_target_records(
+                                RealityGroup::X25519MlKem768,
+                                CipherSuite::AES_128_GCM_SHA256,
+                                &hello[44..76],
+                            ),
+                            3,
+                        )
+                    };
+                    let mut encrypted = vec![23, 3, 3, 2, 88];
+                    encrypted.resize(605, 0);
+                    records[small_record] = encrypted.into();
+                    let mut check = RealityServerConnection::new(sc.clone()).unwrap();
+                    check.validate_client_hello(&hello).unwrap();
+                    assert!(
+                        check
+                            .build_server_response(&records)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("insufficient capacity")
+                    );
+                    records.concat()
+                }
+                "bad-late-record" | "bad-ccs" | "wrong-session" | "unknown-extension" => {
+                    let mut records = crate::reality::default_target_records(&hello[44..76]);
+                    match case {
+                        "bad-ccs" => records[1] = Bytes::from_static(&[20, 3, 3, 0, 1, 0]),
+                        "wrong-session" | "unknown-extension" => {
+                            let mut sh = records[0].to_vec();
+                            sh[if case == "wrong-session" { 44 } else { 81 }] ^= 1;
+                            records[0] = sh.into();
+                        }
+                        "bad-late-record" => records.push(Bytes::from_static(&[255, 3, 3, 0, 0])),
+                        _ => unreachable!(),
                     }
-                    io::ErrorKind::InvalidData
-                } else if case == "client-truncated-share" {
-                    // Keeps the TLS framing valid while overstating the last share's length.
-                    let offset = offsets[1] + 2;
-                    assert_eq!(&hello[offset..offset + 2], &[0, 32]);
-                    hello[offset..offset + 2].copy_from_slice(&33u16.to_be_bytes());
-                    io::ErrorKind::UnexpectedEof
-                } else {
-                    hello[44] ^= 1;
-                    io::ErrorKind::PermissionDenied
-                };
-                let mut check = RealityServerConnection::new(sc.clone()).unwrap();
-                assert_eq!(
-                    check.validate_client_hello(&hello).unwrap_err().kind(),
-                    expected_error
-                );
-                // A valid target flight reaches the admission-error branch, not hello fallback.
-                crate::reality::default_target_records(&hello[44..76]).concat()
-            } else if matches!(case, "small" | "small-separate") {
-                let (mut records, small_record) = if case == "small" {
-                    (crate::reality::default_target_records(&hello[44..76]), 2)
-                } else {
-                    (
-                        separate_target_records(
-                            RealityGroup::X25519MlKem768,
-                            CipherSuite::AES_128_GCM_SHA256,
-                            &hello[44..76],
-                        ),
-                        3,
-                    )
-                };
-                let mut encrypted = vec![23, 3, 3, 2, 88];
-                encrypted.resize(605, 0);
-                records[small_record] = encrypted.into();
-                let mut check = RealityServerConnection::new(sc.clone()).unwrap();
-                check.validate_client_hello(&hello).unwrap();
-                assert!(
-                    check
-                        .build_server_response(&records)
-                        .unwrap_err()
-                        .to_string()
-                        .contains("insufficient capacity")
-                );
-                records.concat()
-            } else if matches!(
-                case,
-                "bad-late-record" | "bad-ccs" | "wrong-session" | "unknown-extension"
-            ) {
-                let mut records = crate::reality::default_target_records(&hello[44..76]);
-                match case {
-                    "bad-ccs" => records[1] = Bytes::from_static(&[20, 3, 3, 0, 1, 0]),
-                    "wrong-session" | "unknown-extension" => {
-                        let mut sh = records[0].to_vec();
-                        sh[if case == "wrong-session" { 44 } else { 81 }] ^= 1;
-                        records[0] = sh.into();
+                    records.concat()
+                }
+                _ => {
+                    let mut message = vec![2, 0, 0, 0, 3, 3];
+                    if case == "retry" {
+                        let retry_random = aws_lc_rs::digest::digest(
+                            &aws_lc_rs::digest::SHA256,
+                            b"HelloRetryRequest",
+                        );
+                        message.extend_from_slice(retry_random.as_ref());
+                    } else {
+                        message.extend_from_slice(&[3; 32]);
                     }
-                    "bad-late-record" => records.push(Bytes::from_static(&[255, 3, 3, 0, 0])),
-                    _ => unreachable!(),
+                    message.push(32);
+                    message.extend_from_slice(&hello[44..76]);
+                    message.extend_from_slice(&[0x13, 1, 0]);
+                    let mut extensions = vec![0, 43, 0, 2, 3, 4];
+                    if case == "retry" {
+                        extensions.extend_from_slice(&[0, 51, 0, 2, 0, 23]);
+                    } else {
+                        extensions.extend_from_slice(&[0, 51, 0, 5, 0xfe, 0x30, 0, 1, 1]);
+                    }
+                    message.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+                    message.extend_from_slice(&extensions);
+                    let len = (message.len() - 4) as u32;
+                    message[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
+                    let mut record = vec![22, 3, 3];
+                    record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+                    record.extend_from_slice(&message);
+                    record
                 }
-                records.concat()
-            } else {
-                let mut message = vec![2, 0, 0, 0, 3, 3];
-                if case == "retry" {
-                    let retry_random =
-                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"HelloRetryRequest");
-                    message.extend_from_slice(retry_random.as_ref());
-                } else {
-                    message.extend_from_slice(&[3; 32]);
-                }
-                message.push(32);
-                message.extend_from_slice(&hello[44..76]);
-                message.extend_from_slice(&[0x13, 1, 0]);
-                let mut extensions = vec![0, 43, 0, 2, 3, 4];
-                if case == "retry" {
-                    extensions.extend_from_slice(&[0, 51, 0, 2, 0, 23]);
-                } else {
-                    extensions.extend_from_slice(&[0, 51, 0, 5, 0xfe, 0x30, 0, 1, 1]);
-                }
-                message.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
-                message.extend_from_slice(&extensions);
-                let len = (message.len() - 4) as u32;
-                message[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
-                let mut record = vec![22, 3, 3];
-                record.extend_from_slice(&(message.len() as u16).to_be_bytes());
-                record.extend_from_slice(&message);
-                record
             };
             // A partial trailing record exercises the deframer's retained bytes.
-            if !matches!(
-                case,
-                "bad-late-record"
-                    | "bad-ccs"
-                    | "wrong-session"
-                    | "unknown-extension"
-                    | "small-separate"
-                    | "small"
-                    | "client-unknown-shares"
-                    | "client-truncated-share"
-                    | "client-bad-auth"
-            ) {
+            if matches!(case, "retry" | "unsupported") {
                 response.extend_from_slice(&[23, 3, 3]);
             }
 

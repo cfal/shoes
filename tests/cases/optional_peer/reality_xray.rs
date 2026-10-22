@@ -240,7 +240,9 @@ async fn start_tap(upstream: u16) -> (u16, Capture, TaskGuard) {
                             let mut server = TcpStream::connect(("127.0.0.1", upstream)).await?;
                             server.write_all(&hello).await?;
                             let mut response = Vec::new();
-                            for _ in 0..3 { response.push(read_tls_record(&mut server).await?); }
+                            for _ in 0..3 {
+                                response.push(read_tls_record(&mut server).await?);
+                            }
                             captured.lock().unwrap().push((hello, response.clone()));
                             client.write_all(&response.concat()).await?;
                             tokio::io::copy_bidirectional(&mut client, &mut server).await?;
