@@ -272,7 +272,7 @@ impl Drop for FlowGuard {
 }
 
 #[cfg(test)]
-pub(super) fn test_guard() -> FlowGuard {
+pub(crate) fn test_guard() -> FlowGuard {
     FlowContext {
         registry: Arc::new(FlowRegistry::default()),
         generation: 1,

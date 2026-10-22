@@ -69,8 +69,15 @@ async fn native_direct_splices_only_unmasked_tcp_and_preserves_half_close() {
                         let s = VisionStream::new_server(b.unwrap(), [7; 16], b"")
                             .unwrap()
                             .with_write_error_policy(VisionWriteErrorPolicy::AcknowledgeAccepted);
-                        let (mut peer, mut relay_io) = if server_relay { (c, s) } else { (s, c) };
-                        let (mut remote, mut target) = tcp_pair().await;
+                        let (mut peer, relay_io) = if server_relay { (c, s) } else { (s, c) };
+                        let (remote, mut target) = tcp_pair().await;
+                        let guard = crate::control::flows::test_guard();
+                        let flow = guard.entry.clone();
+                        let (mut relay_io, mut remote): (Box<dyn AsyncStream>, Box<dyn AsyncStream>) = if server_relay {
+                            (Box::new(relay_io), Box::new(crate::control::tracked_stream::TrackedStream::new(Box::new(remote), guard)))
+                        } else {
+                            (Box::new(crate::control::tracked_stream::TrackedStream::new(Box::new(relay_io), guard)), Box::new(remote))
+                        };
                         let relay = tokio::spawn(async move {
                             copy_bidirectional(&mut relay_io, &mut remote, false, false).await
                         });
@@ -115,6 +122,14 @@ async fn native_direct_splices_only_unmasked_tcp_and_preserves_half_close() {
                         target.shutdown().await.unwrap();
                         assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
                         relay.await.unwrap().unwrap();
+                        let mut upload = hello.len() + APPLICATION.len() + payload.len();
+                        let mut download = flight.len() + payload.len();
+                        if server_relay {
+                            download += b"response after EOF".len();
+                        } else {
+                            upload += b"response after EOF".len();
+                        }
+                        assert_eq!(flow.counters.totals(), (upload as u64, download as u64), "{mode}, server={server_relay}, hidden={hide_tcp}, resumed={resumed}");
                     }
                 }
             }
