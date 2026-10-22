@@ -5215,6 +5215,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 License: Apache License 2.0 (Apache-2.0)
+Package: rustls 0.23.46
+Repository: https://github.com/rustls/rustls
 Package: arrayvec 0.7.8
 Repository: https://github.com/bluss/arrayvec
 Package: asn1-rs-derive 0.6.0
@@ -5367,8 +5369,6 @@ Package: rusticata-macros 4.1.0
 Repository: https://github.com/rusticata/rusticata-macros.git
 Package: rustls-native-certs 0.8.5
 Repository: https://github.com/rustls/rustls-native-certs
-Package: rustls 0.23.46
-Repository: https://github.com/rustls/rustls
 Package: scopeguard 1.2.0
 Repository: https://github.com/bluss/scopeguard
 Package: security-framework-sys 2.17.0
