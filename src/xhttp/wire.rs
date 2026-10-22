@@ -59,15 +59,6 @@ impl Path {
         }
         path
     }
-    /// Decoded remainder of a request path under the base. The remainder is not yet
-    /// UTF-8 validated, so callers can tell malformed suffixes from paths outside the base.
-    pub fn suffix<'a>(&self, request_path: &'a str) -> Option<percent_encoding::PercentDecode<'a>> {
-        let mut decoded = percent_encoding::percent_decode_str(request_path);
-        self.base
-            .bytes()
-            .all(|byte| decoded.next() == Some(byte))
-            .then_some(decoded)
-    }
 }
 
 pub fn sample(range: (u32, u32)) -> u32 {
@@ -152,11 +143,12 @@ pub fn classify(
             return Err(StatusCode::NOT_FOUND);
         }
     }
-    let suffix = path
-        .suffix(request.uri().path())
-        .ok_or(StatusCode::NOT_FOUND)?
+    let decoded_path = percent_encoding::percent_decode_str(request.uri().path())
         .decode_utf8()
         .map_err(|_| StatusCode::NOT_FOUND)?;
+    let suffix = decoded_path
+        .strip_prefix(&path.base)
+        .ok_or(StatusCode::NOT_FOUND)?;
     if request
         .headers()
         .iter()
