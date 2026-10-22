@@ -8,29 +8,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Custom error type for REALITY cryptographic operations
 #[derive(Debug)]
 pub enum CryptoError {
-    InvalidKeyLength,
     InvalidNonceLength,
-    InvalidCiphertextLength,
     EncryptionFailed,
     DecryptionFailed,
     EcdhFailed,
     HkdfFailed,
-    CertificateGenerationFailed(String),
 }
 
 impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CryptoError::InvalidKeyLength => write!(f, "Invalid key length"),
             CryptoError::InvalidNonceLength => write!(f, "Invalid nonce length"),
-            CryptoError::InvalidCiphertextLength => write!(f, "Invalid ciphertext length"),
             CryptoError::EncryptionFailed => write!(f, "Encryption failed"),
             CryptoError::DecryptionFailed => write!(f, "Decryption failed"),
             CryptoError::EcdhFailed => write!(f, "ECDH key exchange failed"),
             CryptoError::HkdfFailed => write!(f, "HKDF derivation failed"),
-            CryptoError::CertificateGenerationFailed(e) => {
-                write!(f, "Certificate generation failed: {}", e)
-            }
         }
     }
 }

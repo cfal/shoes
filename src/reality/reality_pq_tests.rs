@@ -25,7 +25,7 @@ pub(super) fn configs(cipher: CipherSuite) -> (RealityClientConfig, RealityServe
             mldsa65_verify: None,
             public_key: public_key(&private),
             short_id: [1; 8],
-            server_name: "cover.test".into(),
+            server_name: "cover.test".try_into().unwrap(),
             cipher_suites: vec![cipher],
         },
         RealityServerConfig {
@@ -105,7 +105,7 @@ pub(super) fn target_with_unknown_extension(record: &Bytes) -> Bytes {
             .unwrap()
             .is_tls13
     );
-    super::reality_key_exchange::extract_server_key_share(&hello).unwrap();
+    super::reality_key_exchange::validate_server_key_share(&hello).unwrap();
     hello.into()
 }
 

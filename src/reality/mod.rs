@@ -1,6 +1,4 @@
-// Server parts not used by library's public API
-
-// REALITY protocol: TLS obfuscation using X25519, HKDF-SHA256, AES-256-GCM, HMAC-SHA512
+//! REALITY authentication, certificate policy, and target mirroring over rustls.
 
 mod reality_auth;
 mod reality_certificate;

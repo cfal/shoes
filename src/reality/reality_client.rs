@@ -1,6 +1,8 @@
 use std::io;
 use std::sync::Arc;
 
+use rustls::pki_types::ServerName;
+
 use super::CipherSuite;
 use super::reality_rustls::{client_authentication, provider};
 use crate::crypto::{TlsConnection, tls_error};
@@ -10,7 +12,7 @@ pub struct RealityClientConfig {
     pub mldsa65_verify: Option<super::reality_mldsa::VerifyKey>,
     pub public_key: [u8; 32],
     pub short_id: [u8; 8],
-    pub server_name: String,
+    pub server_name: ServerName<'static>,
     pub cipher_suites: Vec<CipherSuite>,
 }
 
@@ -37,11 +39,8 @@ impl RealityClientConfig {
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         tls.cert_decompressors.clear();
         tls.key_log = key_log;
-        let name = self.server_name.try_into().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Invalid REALITY server name")
-        })?;
         let connection =
-            rustls::ClientConnection::new_reality(Arc::new(tls), name, Box::new(hooks))
+            rustls::ClientConnection::new_reality(Arc::new(tls), self.server_name, Box::new(hooks))
                 .map_err(tls_error)?;
         Ok(TlsConnection::new_reality(connection))
     }

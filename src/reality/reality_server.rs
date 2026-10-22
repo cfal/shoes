@@ -10,7 +10,7 @@ use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
 use super::reality_certificate::generate_hmac_certificate;
 use super::reality_key_exchange::extract_client_key_shares;
 use super::reality_rustls::{RealitySigningKey, provider};
-use super::reality_target_template::flight_plan;
+use super::reality_target_template::{flight_plan, verify_staged_flight};
 use super::reality_util::{extract_client_random, extract_session_id_slice};
 use crate::address::{Address, NetLocation};
 use crate::crypto::{TlsConnection, tls_error};
@@ -150,7 +150,7 @@ impl AuthenticatedClientHello {
                 return Err(io::ErrorKind::WriteZero.into());
             }
         }
-        super::reality_target_template::verify_staged_flight(&wire, records, &expected_hello)?;
+        verify_staged_flight(&wire, records, &expected_hello)?;
         staged.set_staged_output(wire.into());
         Ok(staged)
     }

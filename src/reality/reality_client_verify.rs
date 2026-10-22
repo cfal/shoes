@@ -38,19 +38,19 @@ pub fn verify_certificate_mldsa(
             "Invalid REALITY ML-DSA-65 extension",
         ));
     }
-    let public = extract_ed25519_public_key(cert_der)?;
+    let public = ed25519_public_key(&cert)?;
     let message = super::reality_mldsa::certificate_message(auth_key, &public, &[hellos]);
     super::reality_mldsa::verify(verify_key, &message, ext.value)
 }
 
-/// Verify the HMAC signature embedded in the REALITY certificate
+/// Verifies the certificate HMAC and returns the authenticated Ed25519 public key.
 ///
 /// In REALITY protocol, the server embeds HMAC-SHA512(auth_key, ed25519_public_key)
 /// in the signature field of the certificate.
 ///
 /// Uses x509-parser for robust extraction.
 #[inline]
-pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Result<()> {
+pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Result<[u8; 32]> {
     let (remaining, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -74,16 +74,7 @@ pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Resu
         signature.len()
     );
 
-    // Verify this is an Ed25519 public key (32 bytes)
-    if pubkey_data.len() != 32 || spki.algorithm.algorithm.to_id_string() != "1.3.101.112" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Expected Ed25519 public key (32 bytes), got {} bytes",
-                pubkey_data.len()
-            ),
-        ));
-    }
+    let public_key = ed25519_public_key(&cert)?;
 
     // Verify signature is exactly 64 bytes (HMAC-SHA512 output)
     if signature.len() != 64 {
@@ -131,7 +122,7 @@ pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Resu
     }
 
     log::debug!("REALITY CLIENT: Certificate HMAC verified successfully");
-    Ok(())
+    Ok(public_key)
 }
 
 /// Extract the Ed25519 public key from a DER-encoded certificate
@@ -146,6 +137,10 @@ pub fn extract_ed25519_public_key(cert_der: &[u8]) -> io::Result<[u8; 32]> {
         )
     })?;
 
+    ed25519_public_key(&cert)
+}
+
+fn ed25519_public_key(cert: &X509Certificate<'_>) -> io::Result<[u8; 32]> {
     let spki = cert.public_key();
     let pubkey_data: &[u8] = &spki.subject_public_key.data;
 
@@ -206,8 +201,8 @@ mod tests {
         cert_der[sig_offset..sig_offset + 64].copy_from_slice(hmac_tag.as_ref());
 
         // Now verify
-        let result = verify_certificate_hmac(&cert_der, &auth_key);
-        assert!(result.is_ok(), "HMAC verification should succeed");
+        let authenticated_key = verify_certificate_hmac(&cert_der, &auth_key).unwrap();
+        assert_eq!(authenticated_key, public_key_bytes);
     }
 
     /// Test HMAC verification with invalid signature

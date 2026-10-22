@@ -57,9 +57,3 @@ impl std::fmt::Display for CipherSuite {
         write!(f, "{}", self.name())
     }
 }
-
-impl std::fmt::LowerHex for CipherSuite {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::LowerHex::fmt(&self.id, f)
-    }
-}

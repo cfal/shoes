@@ -19,7 +19,7 @@ use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
 
 use super::RealityServerConfig;
-use super::reality_key_exchange::extract_server_key_share;
+use super::reality_key_exchange::validate_server_key_share;
 
 #[derive(Debug)]
 pub struct RealityServerTarget {
@@ -276,7 +276,7 @@ async fn read_target_flight(
         if first_read && !dest_records.is_empty() {
             match parse_server_hello(&dest_records[0]) {
                 Ok(parsed) => {
-                    if !parsed.is_tls13 || extract_server_key_share(&dest_records[0]).is_err() {
+                    if !parsed.is_tls13 || validate_server_key_share(&dest_records[0]).is_err() {
                         log::log!(
                             if authenticated {
                                 log::Level::Warn
@@ -874,7 +874,7 @@ mod cleanup_tests {
             mldsa65_verify: None,
             public_key: public_key.as_ref().try_into().unwrap(),
             short_id: [0; 8],
-            server_name: "localhost".into(),
+            server_name: "localhost".try_into().unwrap(),
             cipher_suites: Vec::new(),
         }
         .create_connection()

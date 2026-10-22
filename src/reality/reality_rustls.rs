@@ -14,7 +14,7 @@ use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
 use super::reality_client_verify::{
     extract_ed25519_public_key, verify_certificate_hmac, verify_certificate_mldsa,
 };
-use super::reality_key_exchange::generate_mlkem;
+use super::reality_key_exchange::MLKEM_CIPHERTEXT_LEN;
 use super::{CipherSuite, DEFAULT_CIPHER_SUITES, RealityClientConfig};
 
 pub(super) fn provider(suites: &[CipherSuite]) -> CryptoProvider {
@@ -41,11 +41,11 @@ pub(super) fn provider(suites: &[CipherSuite]) -> CryptoProvider {
     provider
 }
 
-fn crypto_error(_: impl fmt::Display) -> Error {
+fn crypto_error() -> Error {
     Error::General("REALITY key exchange failed".into())
 }
 
-fn verification_error(_: impl fmt::Display) -> Error {
+fn verification_error() -> Error {
     Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
 }
 
@@ -112,7 +112,7 @@ struct ClientExchange {
 impl ActiveKeyExchange for ClientExchange {
     fn complete(self: Box<Self>, peer: &[u8]) -> Result<SharedSecret, Error> {
         let offset = if self.group == NamedGroup::X25519MLKEM768 {
-            1088
+            MLKEM_CIPHERTEXT_LEN
         } else {
             0
         };
@@ -123,16 +123,13 @@ impl ActiveKeyExchange for ClientExchange {
                     rustls::PeerMisbehaved::InvalidKeyShare,
                 ))?;
         let x25519 =
-            Zeroizing::new(perform_ecdh(&self.private, x25519_peer).map_err(crypto_error)?);
+            Zeroizing::new(perform_ecdh(&self.private, x25519_peer).map_err(|_| crypto_error())?);
         let mut shared = Zeroizing::new(Vec::with_capacity(64));
         if offset != 0 {
-            let kem = self
-                .mlkem
-                .as_ref()
-                .ok_or_else(|| crypto_error("missing KEM"))?;
+            let kem = self.mlkem.as_ref().ok_or_else(crypto_error)?;
             let secret = kem
                 .decapsulate(kem::Ciphertext::from(&peer[..offset]))
-                .map_err(crypto_error)?;
+                .map_err(|_| crypto_error())?;
             shared.extend_from_slice(secret.as_ref());
         }
         shared.extend_from_slice(x25519.as_ref());
@@ -153,8 +150,8 @@ impl ActiveKeyExchange for ClientExchange {
     }
 
     fn complete_hybrid_component(self: Box<Self>, peer: &[u8]) -> Result<SharedSecret, Error> {
-        let peer = peer.try_into().map_err(crypto_error)?;
-        let shared = Zeroizing::new(perform_ecdh(&self.private, peer).map_err(crypto_error)?);
+        let peer = peer.try_into().map_err(|_| crypto_error())?;
+        let shared = Zeroizing::new(perform_ecdh(&self.private, peer).map_err(|_| crypto_error())?);
         Ok(SharedSecret::from(shared.as_ref()))
     }
 }
@@ -165,19 +162,24 @@ impl rustls::reality::ClientHooks for ClientAuthentication {
         kx: &'static dyn SupportedKxGroup,
     ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
         if !matches!(kx.name(), NamedGroup::X25519 | NamedGroup::X25519MLKEM768) {
-            return Err(crypto_error("unsupported group"));
+            return Err(crypto_error());
         }
         let mut private = Zeroizing::new([0; 32]);
         rand::rng().fill_bytes(private.as_mut());
         let key = agreement::PrivateKey::from_private_key(&agreement::X25519, private.as_ref())
-            .map_err(crypto_error)?;
-        let public = key.compute_public_key().map_err(crypto_error)?;
+            .map_err(|_| crypto_error())?;
+        let public = key.compute_public_key().map_err(|_| crypto_error())?;
         self.shared = Some(Zeroizing::new(
-            perform_ecdh(&private, &self.server_key).map_err(crypto_error)?,
+            perform_ecdh(&private, &self.server_key).map_err(|_| crypto_error())?,
         ));
         let (mlkem, mut share) = if kx.name() == NamedGroup::X25519MLKEM768 {
-            let (key, public) = generate_mlkem().map_err(crypto_error)?;
-            (Some(key), public)
+            let key =
+                kem::DecapsulationKey::generate(&kem::ML_KEM_768).map_err(|_| crypto_error())?;
+            let public = key
+                .encapsulation_key()
+                .and_then(|key| key.key_bytes())
+                .map_err(|_| crypto_error())?;
+            (Some(key), public.as_ref().to_vec())
         } else {
             (None, Vec::new())
         };
@@ -191,15 +193,10 @@ impl rustls::reality::ClientHooks for ClientAuthentication {
     }
 
     fn session_id(&mut self, hello: &[u8]) -> Result<[u8; 32], Error> {
-        let shared = self
-            .shared
-            .take()
-            .ok_or_else(|| crypto_error("missing authentication exchange"))?;
-        let random = hello
-            .get(6..38)
-            .ok_or_else(|| crypto_error("short hello"))?;
+        let shared = self.shared.take().ok_or_else(crypto_error)?;
+        let random = hello.get(6..38).ok_or_else(crypto_error)?;
         let auth = Zeroizing::new(
-            derive_auth_key(&shared, &random[..20], b"REALITY").map_err(crypto_error)?,
+            derive_auth_key(&shared, &random[..20], b"REALITY").map_err(|_| crypto_error())?,
         );
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -210,11 +207,9 @@ impl rustls::reality::ClientHooks for ClientAuthentication {
         plaintext[4..8].copy_from_slice(&timestamp.to_be_bytes());
         plaintext[8..].copy_from_slice(&self.short_id);
         let mut aad = hello.to_vec();
-        aad.get_mut(39..71)
-            .ok_or_else(|| crypto_error("short session ID"))?
-            .fill(0);
-        let id =
-            encrypt_session_id(&plaintext, &auth, &random[20..], &aad).map_err(crypto_error)?;
+        aad.get_mut(39..71).ok_or_else(crypto_error)?.fill(0);
+        let id = encrypt_session_id(&plaintext, &auth, &random[20..], &aad)
+            .map_err(|_| crypto_error())?;
         self.context.lock().auth = Some(auth);
         Ok(id)
     }
@@ -237,22 +232,17 @@ impl ServerCertVerifier for RealityVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
         let mut context = self.context.lock();
-        let auth = context
-            .auth
-            .take()
-            .ok_or_else(|| verification_error("missing authentication"))?;
+        let auth = context.auth.take().ok_or_else(verification_error)?;
         if !intermediates.is_empty() || context.hellos.is_empty() {
-            return Err(verification_error(
-                "unexpected certificate chain or missing hellos",
-            ));
+            return Err(verification_error());
         }
-        verify_certificate_hmac(end_entity, &auth).map_err(verification_error)?;
+        let public =
+            verify_certificate_hmac(end_entity, &auth).map_err(|_| verification_error())?;
         if let Some(key) = &self.mldsa {
             verify_certificate_mldsa(end_entity, &auth, &context.hellos, key)
-                .map_err(verification_error)?;
+                .map_err(|_| verification_error())?;
         }
-        context.public_key =
-            Some(extract_ed25519_public_key(end_entity).map_err(verification_error)?);
+        context.public_key = Some(public);
         context.hellos.clear();
         Ok(ServerCertVerified::assertion())
     }
@@ -263,7 +253,7 @@ impl ServerCertVerifier for RealityVerifier {
         _: &CertificateDer<'_>,
         _: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        Err(verification_error("TLS 1.2 is not REALITY"))
+        Err(verification_error())
     }
 
     fn verify_tls13_signature(
@@ -273,17 +263,15 @@ impl ServerCertVerifier for RealityVerifier {
         signature: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
         let context = self.context.lock();
-        let public = context
-            .public_key
-            .ok_or_else(|| verification_error("unauthenticated certificate"))?;
+        let public = context.public_key.ok_or_else(verification_error)?;
         if signature.scheme != SignatureScheme::ED25519
-            || extract_ed25519_public_key(cert).map_err(verification_error)? != public
+            || extract_ed25519_public_key(cert).map_err(|_| verification_error())? != public
         {
-            return Err(verification_error("unexpected signing key"));
+            return Err(verification_error());
         }
         signature::UnparsedPublicKey::new(&signature::ED25519, public)
             .verify(message, signature.signature())
-            .map_err(verification_error)?;
+            .map_err(|_| verification_error())?;
         Ok(HandshakeSignatureValid::assertion())
     }
 

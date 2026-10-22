@@ -72,8 +72,8 @@ impl RealityClientHandler {
         client_stream: Box<dyn AsyncStream>,
         mode: TlsReadMode,
     ) -> std::io::Result<CryptoTlsStream<Box<dyn AsyncStream>>> {
-        let server_name_str = match &self.server_name {
-            rustls::pki_types::ServerName::DnsName(name) => name.as_ref(),
+        match &self.server_name {
+            rustls::pki_types::ServerName::DnsName(_) => {}
             rustls::pki_types::ServerName::IpAddress(ip) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -93,7 +93,7 @@ impl RealityClientHandler {
             mldsa65_verify: self.mldsa65_verify.clone(),
             public_key: self.public_key,
             short_id: self.short_id,
-            server_name: server_name_str.to_string(),
+            server_name: self.server_name.clone(),
             cipher_suites: self.cipher_suites.clone(),
         };
 

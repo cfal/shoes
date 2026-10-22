@@ -1040,7 +1040,7 @@ mod tests {
             mldsa65_verify: None,
             public_key: public_key.as_ref().try_into().unwrap(),
             short_id: [0; 8],
-            server_name: "localhost".into(),
+            server_name: "localhost".try_into().unwrap(),
             cipher_suites: Vec::new(),
         }
         .create_connection()

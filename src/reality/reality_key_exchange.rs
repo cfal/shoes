@@ -1,11 +1,9 @@
 use std::io;
 
-use aws_lc_rs::kem;
-
 use crate::buf_reader::BufReader;
 
 const MLKEM_PUBLIC_LEN: usize = 1184;
-const MLKEM_CIPHERTEXT_LEN: usize = 1088;
+pub(super) const MLKEM_CIPHERTEXT_LEN: usize = 1088;
 const HELLO_RETRY_RANDOM: [u8; 32] = [
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
     0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
@@ -40,19 +38,18 @@ impl RealityGroup {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct ClientKeyShares {
-    pub x25519: Option<[u8; 32]>,
-    pub hybrid: Option<Box<[u8; 1216]>>,
+#[derive(Default)]
+pub struct ClientKeyShares<'a> {
+    pub x25519: Option<&'a [u8; 32]>,
+    pub hybrid: Option<&'a [u8; 1216]>,
 }
 
-impl ClientKeyShares {
-    pub fn authentication_public_key(&self) -> io::Result<&[u8; 32]> {
-        if let Some(key) = &self.x25519 {
+impl<'a> ClientKeyShares<'a> {
+    pub fn authentication_public_key(&self) -> io::Result<&'a [u8; 32]> {
+        if let Some(key) = self.x25519 {
             return Ok(key);
         }
         self.hybrid
-            .as_ref()
             .map(|key| key[MLKEM_PUBLIC_LEN..].try_into().unwrap())
             .ok_or_else(|| invalid("Missing REALITY authentication key share"))
     }
@@ -129,11 +126,11 @@ fn key_share_extension(record: &[u8], client: bool) -> io::Result<&[u8]> {
     share.ok_or_else(|| invalid("Missing key_share extension"))
 }
 
-pub fn extract_client_key_shares(record: &[u8]) -> io::Result<ClientKeyShares> {
+pub fn extract_client_key_shares(record: &[u8]) -> io::Result<ClientKeyShares<'_>> {
     parse_client_shares(key_share_extension(record, true)?)
 }
 
-fn parse_client_shares(data: &[u8]) -> io::Result<ClientKeyShares> {
+fn parse_client_shares(data: &[u8]) -> io::Result<ClientKeyShares<'_>> {
     let mut reader = BufReader::new(data);
     let length = reader.read_u16_be()? as usize;
     if length != reader.remaining() {
@@ -152,10 +149,9 @@ fn parse_client_shares(data: &[u8]) -> io::Result<ClientKeyShares> {
         }
         let duplicate = match group {
             RealityGroup::X25519 => shares.x25519.replace(data.try_into().unwrap()).is_some(),
-            RealityGroup::X25519MlKem768 => shares
-                .hybrid
-                .replace(Box::new(data.try_into().unwrap()))
-                .is_some(),
+            RealityGroup::X25519MlKem768 => {
+                shares.hybrid.replace(data.try_into().unwrap()).is_some()
+            }
         };
         if duplicate {
             return Err(invalid("Duplicate client key share"));
@@ -165,7 +161,7 @@ fn parse_client_shares(data: &[u8]) -> io::Result<ClientKeyShares> {
     Ok(shares)
 }
 
-pub fn extract_server_key_share(record: &[u8]) -> io::Result<()> {
+pub fn validate_server_key_share(record: &[u8]) -> io::Result<()> {
     let mut reader = BufReader::new(key_share_extension(record, false)?);
     let group = RealityGroup::from_id(reader.read_u16_be()?)
         .ok_or_else(|| invalid("Unsupported REALITY server key share"))?;
@@ -175,16 +171,6 @@ pub fn extract_server_key_share(record: &[u8]) -> io::Result<()> {
         return Err(invalid("Invalid server key share length"));
     }
     Ok(())
-}
-
-pub fn generate_mlkem() -> io::Result<(kem::DecapsulationKey, Vec<u8>)> {
-    let private = kem::DecapsulationKey::generate(&kem::ML_KEM_768)
-        .map_err(|_| io::Error::other("ML-KEM key generation failed"))?;
-    let public = private
-        .encapsulation_key()
-        .and_then(|key| key.key_bytes())
-        .map_err(|_| io::Error::other("ML-KEM public key encoding failed"))?;
-    Ok((private, public.as_ref().to_vec()))
 }
 
 #[cfg(test)]
@@ -213,7 +199,15 @@ mod tests {
             if standalone {
                 entries.push((0x001d, &classic));
             }
-            let shares = parse_client_shares(&share_vector(&entries)).unwrap();
+            let data = share_vector(&entries);
+            let shares = parse_client_shares(&data).unwrap();
+            assert_eq!(shares.hybrid.unwrap().as_ptr(), data[6..].as_ptr());
+            if standalone {
+                assert_eq!(
+                    shares.x25519.unwrap().as_ptr(),
+                    data[data.len() - 32..].as_ptr()
+                );
+            }
             assert_eq!(
                 shares.authentication_public_key().unwrap(),
                 if standalone {
@@ -266,6 +260,6 @@ mod tests {
         .unwrap();
         let mut retry = write_record_header(22, hello.len() as u16);
         retry.extend_from_slice(&hello);
-        assert!(extract_server_key_share(&retry).is_err());
+        assert!(validate_server_key_share(&retry).is_err());
     }
 }

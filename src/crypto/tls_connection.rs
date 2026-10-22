@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use super::tls_reader_writer::{TlsReader, TlsWriter};
 
-/// A rustls connection with optional REALITY output and authentication policy.
+/// A rustls connection with REALITY plaintext gating and staged-output handling.
 #[derive(Debug)]
 pub struct TlsConnection {
     inner: Option<rustls::Connection>,
