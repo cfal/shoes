@@ -162,7 +162,6 @@ impl ControlRuntime {
                 "controller listeners, credentials, origins, and cache_file_path require a restart",
             ));
         }
-        super::validation::validate_resources(validated)?;
         if let Some(catalog) = &validated.catalog {
             self.request(|reply| Command::Prepare(catalog.selection.clone(), reply))
                 .await?;

@@ -20,24 +20,32 @@ pub(super) async fn bind(configs: &[ClashApiConfig]) -> io::Result<Vec<Bound>> {
         let config = Arc::new(config.clone());
         match &config.bind {
             BindLocation::Address(addresses) => {
-                for address in addresses.iter() {
-                    for socket in address.to_socket_addrs()? {
-                        if bound.len() == 16 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "Clash API exceeds 16 sockets",
-                            ));
-                        }
-                        if !socket.ip().is_loopback() {
-                            log::warn!(
-                                "Clash API is exposed on plaintext TCP at {socket}; use a firewall and TLS termination"
-                            );
-                        }
-                        bound.push(Bound::Tcp(
-                            tokio::net::TcpListener::bind(socket).await?,
-                            config.clone(),
+                let addresses = addresses.clone();
+                let sockets = tokio::task::spawn_blocking(move || {
+                    let mut sockets = Vec::new();
+                    for address in addresses.iter() {
+                        sockets.extend(address.to_socket_addrs()?);
+                    }
+                    Ok::<_, io::Error>(sockets)
+                })
+                .await
+                .map_err(io::Error::other)??;
+                for socket in sockets {
+                    if bound.len() == 16 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Clash API exceeds 16 sockets",
                         ));
                     }
+                    if !socket.ip().is_loopback() {
+                        log::warn!(
+                            "Clash API is exposed on plaintext TCP at {socket}; use a firewall and TLS termination"
+                        );
+                    }
+                    bound.push(Bound::Tcp(
+                        tokio::net::TcpListener::bind(socket).await?,
+                        config.clone(),
+                    ));
                 }
             }
             #[cfg(unix)]

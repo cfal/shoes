@@ -42,7 +42,15 @@ async fn prepare_tracking(
     discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
     control: &mut Option<crate::control::runtime::ControlService>,
 ) -> io::Result<PreparedServers> {
-    let mut validated = load_validated(paths, discovered).await?;
+    let validated = load_validated(paths, discovered).await?;
+    let mut validated = tokio::task::spawn_blocking(move || {
+        if validated.catalog.is_some() {
+            crate::control::validation::validate_resources(&validated)?;
+        }
+        Ok::<_, io::Error>(validated)
+    })
+    .await
+    .map_err(io::Error::other)??;
     if control.is_none() && validated.catalog.is_some() {
         if previous.is_some()
             && (!validated.control.listeners.is_empty()
@@ -566,9 +574,14 @@ async fn run_inner(
 ) -> io::Result<()> {
     if dry_run {
         let validated = load_validated(&paths, &mut |_| {}).await?;
-        if validated.catalog.is_some() {
-            crate::control::validation::validate_resources(&validated)?;
-        }
+        tokio::task::spawn_blocking(move || {
+            if validated.catalog.is_some() {
+                crate::control::validation::validate_resources(&validated)?;
+            }
+            Ok::<_, io::Error>(())
+        })
+        .await
+        .map_err(io::Error::other)??;
         println!("Configuration valid");
         return Ok(());
     }
