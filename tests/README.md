@@ -66,6 +66,29 @@ fixtures additionally use `XRAY_BINARY` and `MIHOMO_BINARY`; their fixture guide
 and workflow specify the exact pins. Requested but unavailable peers should
 fail, not silently skip.
 
+## Measuring Coverage
+
+CI does not collect coverage. To measure it locally with
+[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov), collect the unit,
+integration, and process-contract suites into one profile set and report once:
+
+```sh
+export CARGO_BUILD_JOBS=1 SHOES_TEST_GRACEFUL_STOP=1
+export SHOES_TEST_SING_BOX_BIN=/absolute/path/to/sing-box
+cargo llvm-cov clean --workspace
+cargo llvm-cov --no-report --workspace --lib --bins --locked -- --test-threads=2
+cargo llvm-cov --no-report --locked --features integration-tests \
+  --test integration --test process_contract -- --test-threads=1
+cargo llvm-cov report --summary-only
+```
+
+On Linux, `SHOES_TEST_GRACEFUL_STOP` makes test guards send SIGTERM before
+SIGKILL, so instrumented Shoes subprocesses write their profiles. Without it,
+and on other platforms, which ignore it, code reached only through integration
+subprocesses is reported as uncovered. Totals include test modules and
+test-support code, so compare per-file figures rather than the headline
+percentage.
+
 ## CI And Remaining Gaps
 
 The workflows run Linux unit, process, FFI, local-protocol, external-network,
@@ -83,8 +106,11 @@ fixture-task failures rather than accepting a timeout as proof of rejection.
 
 Important remaining limitations:
 
-- No measured whole-project line or branch coverage is maintained by these
-  workflows; passing suites do not establish exhaustive coverage.
+- CI does not measure coverage; see [Measuring Coverage](#measuring-coverage).
+  Passing suites do not establish exhaustive coverage.
+- `src/main.rs` declares the library's module tree again, so `--lib --bins`
+  compiles the crate twice and runs the shared unit tests twice. Building the
+  binary on the library crate would remove the duplication.
 - Android/iOS device execution and macOS Network Extension kernel-device behavior
   remain separate from host-side tests and cross-compilation.
 - Windows build entries are disabled; ARM and musl builds do not establish
@@ -96,14 +122,14 @@ Important remaining limitations:
   explicit shutdown policy and regression. Error-path cleanup already has a
   deadline; changing the graceful path is not merely a test improvement. The
   association idle timer also lacks deterministic paused-clock coverage.
-- Pre-auth ClientHello negative cases, credential rejection for VLESS fallback,
-  Hysteria2 and TUIC, and broader WebSocket length/control-frame boundaries need
-  focused tests. Multi-record ClientHello support and extension-length handling
-  need separate protocol review.
+- The shared ShadowTLS/REALITY ClientHello parser rejects multi-record
+  ClientHellos and does not bound SNI and `supported_versions` parsing by the
+  declared extension length; both need protocol review. WebSocket close frames
+  are skipped rather than answered.
 - The legacy `privileged` target's `tun::` cases are not selected by CI; the
   `tun_kernel::` cases are. Native Naive and most sustained multi-GiB stress tests
-  remain manual. Several local ShadowTLS handshake cases still live in the
-  Internet-dependent target.
+  remain manual. ShadowTLS sing-box interoperability cases depend on
+  www.cloudflare.com as the handshake server.
 - Filtered CI invocations can still select zero tests after a rename. The
   resource-limit and raw-descriptor subprocess tests explicitly require one
   passed child test, but that guard is not applied to every workflow filter.
