@@ -88,7 +88,6 @@ mod tls_server_handler;
 mod trojan_handler;
 mod tuic_server;
 mod udp_fragments;
-mod udp_message_stream;
 mod uot;
 mod util;
 mod uuid_util;
