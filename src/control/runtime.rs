@@ -180,7 +180,17 @@ async fn run_owner(
             break;
         }
         let command = if !paused && !pending.is_empty() {
-            pending.pop_front().unwrap()
+            match pending.pop_front().unwrap() {
+                Command::Select(_, group, member, reply, permit) => {
+                    let generation = runtime
+                        .upgrade()
+                        .and_then(|runtime| runtime.generation().ok())
+                        .map(|generation| generation.id)
+                        .unwrap_or(0);
+                    Command::Select(generation, group, member, reply, permit)
+                }
+                _ => unreachable!("only selections are deferred during activation"),
+            }
         } else {
             let command = tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -323,9 +333,9 @@ mod tests {
             runtime.publish(candidate.clone()).await.unwrap();
             runtime.resume().await.unwrap();
             while let Some(result) = requests.join_next().await {
-                assert!(result.unwrap().is_err());
+                assert!(result.unwrap().is_ok());
             }
-            assert_eq!(candidate.catalog.selection.snapshot()["outbound"], "west");
+            assert_eq!(candidate.catalog.selection.snapshot()["outbound"], "east");
             assert_eq!(runtime.selections.available_permits(), 64);
             service.shutdown().await;
         })

@@ -60,7 +60,14 @@ pub(super) async fn serve(bound: Bound, state: Arc<ApiState>) {
     match bound {
         Bound::Tcp(listener, config) => loop {
             let accepted = tokio::select! { _ = state.cancel.cancelled() => break, result = listener.accept() => result };
-            let Ok((stream, _)) = accepted else { break };
+            let (stream, _) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    log::warn!("Clash API TCP accept failed: {error}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let Ok(permit) = state.runtime.connections.clone().try_acquire_owned() else {
                 continue;
             };
@@ -71,7 +78,14 @@ pub(super) async fn serve(bound: Bound, state: Arc<ApiState>) {
         #[cfg(unix)]
         Bound::Unix(listener, config, _owner) => loop {
             let accepted = tokio::select! { _ = state.cancel.cancelled() => break, result = listener.accept() => result };
-            let Ok((stream, _)) = accepted else { break };
+            let (stream, _) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    log::warn!("Clash API Unix accept failed: {error}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let Ok(permit) = state.runtime.connections.clone().try_acquire_owned() else {
                 continue;
             };

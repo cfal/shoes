@@ -68,6 +68,20 @@ impl SelectionOwner {
 
     pub fn activate(&mut self, candidate: Arc<SelectionView>) -> io::Result<()> {
         self.reconcile(&candidate)?;
+        let stale = candidate
+            .definitions
+            .iter()
+            .filter(|(name, definition)| {
+                self.explicit
+                    .get(*name)
+                    .is_some_and(|member| !definition.members.contains(member))
+            })
+            .count();
+        if stale != 0 {
+            log::warn!(
+                "Ignoring {stale} saved selector choices whose members are no longer configured"
+            );
+        }
         self.active = candidate;
         Ok(())
     }
