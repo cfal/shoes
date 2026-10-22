@@ -83,6 +83,22 @@ fn real_target_certificate_never_authenticates_reality() {
     assert!(client.is_handshaking() && !client.wants_write());
 }
 
+#[test]
+fn ordinary_tls_client_hello_is_denied() {
+    let (_, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let mut client =
+        rustls::ClientConnection::new(Arc::new(config), "cover.test".try_into().unwrap()).unwrap();
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello).unwrap();
+    assert_eq!(
+        sc.authenticate_client_hello(&hello).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+}
+
 impl rustls::KeyLog for Secrets {
     fn log(&self, label: &str, _: &[u8], secret: &[u8]) {
         self.0.lock().insert(label.into(), secret.to_vec());
