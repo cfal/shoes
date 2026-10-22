@@ -280,7 +280,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
 /// # Arguments
 /// * `_env` - JNI environment (unused)
 /// * `_class` - Java class (unused)
-/// * `handle` - Handle returned by startTun (currently unused, we use global state)
+/// * `handle` - Handle returned by start (currently unused, we use global state)
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_shoesproxy_ShoesNative_stop(
     _env: EnvUnowned,

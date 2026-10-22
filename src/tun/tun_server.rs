@@ -14,9 +14,6 @@
 //! ## Android
 //! On Android, you must provide the FD from `VpnService.Builder.establish()`:
 //! ```ignore
-//! // In Kotlin/Java:
-//! // val fd = vpnService.builder.establish()?.detachFd() ?: return
-//!
 //! let config = TunServerConfig::new()
 //!     .raw_fd(fd)
 //!     .mtu(1500);
