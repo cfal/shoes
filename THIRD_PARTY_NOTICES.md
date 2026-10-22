@@ -3,9 +3,9 @@
 `licenses/dependencies.txt` reproduces the license texts and attributions for
 Shoes' production and build dependencies, including transitive dependencies
 across all target platforms. A given binary may link only a subset of them.
-The release tarballs, Android AAR (`classes.jar/META-INF/shoes`) and iOS
-XCFramework include this bundle and the additional GotaTun and anytls-rs
-notices below.
+The release tarballs include this bundle and the additional GotaTun and
+anytls-rs notices below. Applications embedding Shoes' native libraries must
+also distribute these notices and corresponding source information.
 
 Regenerate the bundle after changing Cargo.lock, using cargo-about 0.9.2:
 
@@ -23,8 +23,8 @@ clarifications, without replacing the existing bundle.
 `about.toml` records the license choices and verified clarifications. CI checks
 that regeneration is clean and that every production/build dependency appears.
 `scripts/check-release-notices.py <artifact>` checks the exact notice bytes in
-a release tarball, AAR, or XCFramework directory; release scripts invoke it
-before distributing artifacts. Do not remove the bundle when redistributing.
+a release tarball. The binary release workflow (`.github/workflows/build.yml`)
+invokes it before uploading tarballs. Do not remove the bundle when redistributing.
 
 ## WireGuard Source
 

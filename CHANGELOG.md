@@ -14,7 +14,8 @@
 - Released Fake DNS snapshot locks explicitly on owner teardown so concurrently starting subprocesses cannot delay reopening the state file.
 - Updated Rust dependencies, including GotaTun 0.10.2, Tokio 1.54.0, LRU 0.19.0, and ML-KEM 0.3.3, which removes secret-dependent table lookups. Existing Web PKI compromise protections are retained.
 - Refreshed the BLAKE3 fork with upstream buffer-alignment and AVX-512 soundness fixes while retaining the binary-context key derivation API.
-- Updated Android and CI build dependencies; Android source builds now require Gradle 9.6.0 or newer with Java 17.
+- Updated CI build dependencies.
+- Removed the standalone Android Kotlin/Gradle wrapper, AAR and iOS XCFramework packaging, and mobile SDK release artifacts from this repository. Mobile embedding remains supported through the Rust JNI/C interfaces and native libraries; Android and iOS cross-compilation checks remain in CI.
 
 ## v0.3.4
 

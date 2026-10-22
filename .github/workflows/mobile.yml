@@ -1,4 +1,4 @@
-name: Build Mobile Libraries
+name: Check Mobile Builds
 
 on:
   push:
@@ -12,12 +12,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ──────────────────────────────────────────────────────────────────────────
-  # iOS — universal XCFramework (device arm64 + simulator arm64/x86_64)
-  # ──────────────────────────────────────────────────────────────────────────
   ios:
-    name: Build iOS XCFramework
+    name: Build iOS native libraries
     runs-on: macos-latest
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: '16.0'
 
     steps:
       - uses: actions/checkout@v7
@@ -32,24 +31,15 @@ jobs:
         with:
           key: ios
 
-      - name: Install cbindgen
-        run: cargo install cbindgen
+      - name: Build native libraries
+        run: |
+          cargo build --release --lib --locked --target aarch64-apple-ios
+          cargo build --release --lib --locked --target aarch64-apple-ios-sim
+          test -s target/aarch64-apple-ios/release/libshoes.a
+          test -s target/aarch64-apple-ios-sim/release/libshoes.a
 
-      - name: Build XCFramework
-        run: bash scripts/build-ios.sh
-
-      - name: Upload XCFramework
-        uses: actions/upload-artifact@v7
-        with:
-          name: Shoes.xcframework
-          path: output/ios/Shoes.xcframework
-          if-no-files-found: error
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # Android — AAR with JNI .so for arm64-v8a, armeabi-v7a, x86_64, x86
-  # ──────────────────────────────────────────────────────────────────────────
   android:
-    name: Build Android AAR
+    name: Build Android native libraries
     runs-on: ubuntu-latest
 
     steps:
@@ -59,6 +49,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Install cbindgen
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cbindgen@0.29.4
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -75,18 +70,6 @@ jobs:
       - name: Install cargo-ndk
         run: command -v cargo-ndk || cargo install cargo-ndk
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6.4.0
-        with:
-          gradle-version: '9.8.2'
-          cache-provider: basic
-
       - name: Set NDK path
         run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
 
@@ -96,50 +79,10 @@ jobs:
             -t arm64-v8a \
             -t armeabi-v7a \
             -P 21 \
-            -o android/src/main/jniLibs \
             -- build --release --lib --locked
+          test -s target/aarch64-linux-android/release/libshoes.so
+          test -s target/armv7-linux-androideabi/release/libshoes.so
 
-      - name: Build AAR
-        working-directory: android
-        run: gradle assembleRelease --no-daemon
-
-      - name: Verify AAR dependency notices
-        run: python3 scripts/check-release-notices.py android/build/outputs/aar/shoes-release.aar
-
-      - name: Upload AAR
-        uses: actions/upload-artifact@v7
-        with:
-          name: shoes-android
-          path: android/build/outputs/aar/shoes-release.aar
-          if-no-files-found: error
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # Release — attach artifacts to GitHub releases on tag pushes
-  # ──────────────────────────────────────────────────────────────────────────
-  release:
-    name: Attach to Release
-    needs: [ ios, android ]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-
-      - name: Zip XCFramework
-        run: |
-          cd artifacts
-          zip -r Shoes.xcframework.zip Shoes.xcframework/
-
-      - name: Attach to release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            artifacts/Shoes.xcframework.zip
-            artifacts/shoes-android/shoes-release.aar
-          draft: true
-          generate_release_notes: false
+      # cbindgen can update Cargo.lock, so the locked builds must run first.
+      - name: Verify C header
+        run: cbindgen --verify --config cbindgen.toml --output include/shoes.h

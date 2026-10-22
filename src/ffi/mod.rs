@@ -5,19 +5,9 @@
 //!
 //! # Android Usage
 //!
-//! ```kotlin
-//! // Load native library
-//! System.loadLibrary("shoes")
-//!
-//! // Declare native methods
-//! external fun shoesInit(logLevel: String): Int
-//! external fun shoesStartTun(
-//!     fd: Int,
-//!     configYaml: String,
-//!     protectCallback: (Int) -> Boolean
-//! ): Long
-//! external fun shoesStop(handle: Long)
-//! ```
+//! Apps supply `com.shoesproxy.ShoesNative` declarations matching the JNI exports
+//! in `android.rs`. The `start` method takes YAML containing the TUN `device_fd`
+//! and a callback object exposing `protect(fd: Int): Boolean`.
 //!
 //! # iOS Usage
 //!
@@ -35,7 +25,7 @@
 //! # Thread Safety
 //!
 //! - `shoes_init` must be called once before any other function
-//! - `shoes_start` / `shoes_start_tun` starts a background thread for the TUN service
+//! - `shoes_start` / Android `start` starts a background runtime for the TUN service
 //! - `shoes_stop` signals shutdown and waits for cleanup
 
 // Common utilities shared between iOS and Android

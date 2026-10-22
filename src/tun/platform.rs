@@ -13,19 +13,8 @@
 //! excludes a socket from VPN routing. The [`SocketProtector`] trait allows the
 //! Android app to provide this functionality to the Rust code.
 //!
-//! # Example (Android via JNI)
-//!
-//! ```ignore
-//! // In Kotlin, implement a callback that calls VpnService.protect()
-//! class SocketProtectorImpl(private val vpnService: VpnService) {
-//!     fun protect(fd: Int): Boolean {
-//!         return vpnService.protect(fd)
-//!     }
-//! }
-//!
-//! // Pass to Rust via FFI
-//! shoesStartTun(config, tunFd, socketProtector)
-//! ```
+//! The JNI bridge accepts an app-owned callback object exposing
+//! `protect(fd: Int): Boolean` and adapts it to [`SocketProtector`].
 
 use std::io;
 #[cfg(unix)]

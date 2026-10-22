@@ -71,8 +71,9 @@ fail, not silently skip.
 The workflows run Linux unit, process, FFI, local-protocol, external-network,
 kernel TUN/WireGuard, and pinned-peer suites. macOS runs rootless TUN, WireGuard,
 process-watcher unit tests, and selected FFI/process contracts. Android and iOS
-jobs build artifacts but do not exercise device VPN lifecycles. Only selected bounded stress cases run in CI;
-long-duration and performance tests remain explicit opt-ins.
+jobs cross-compile the native libraries but do not exercise device VPN lifecycles.
+Only selected bounded stress cases run in CI; long-duration and performance tests
+remain explicit opt-ins.
 
 Retain the existing suite boundaries. Prefer deterministic in-process tests for
 fragmentation, cancellation, credit accounting, and parser rejection; use
