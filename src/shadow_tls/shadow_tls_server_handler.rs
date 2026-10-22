@@ -187,6 +187,7 @@ fn validate_shadowtls_client_hello(
 async fn shadowtls_fallback_to_handshake_server(
     mut client_stream: Box<dyn AsyncStream>,
     client_hello_bytes: &[u8],
+    preread_data: &[u8],
     location: &NetLocation,
     client_chain: &ClientProxyChain,
     resolver: &Arc<dyn Resolver>,
@@ -221,6 +222,7 @@ async fn shadowtls_fallback_to_handshake_server(
     );
 
     write_all(&mut handshake_stream, client_hello_bytes).await?;
+    write_all(&mut handshake_stream, preread_data).await?;
     handshake_stream.flush().await?;
 
     log::debug!("SHADOWTLS FALLBACK: ClientHello forwarded, spawning bidirectional copy");
@@ -272,6 +274,7 @@ pub async fn setup_shadowtls_server_stream(
                 return shadowtls_fallback_to_handshake_server(
                     server_stream,
                     &parsed_client_hello.client_hello_frame,
+                    parsed_client_hello.client_reader.unparsed_data(),
                     location,
                     client_chain,
                     resolver,
@@ -686,6 +689,10 @@ pub fn parse_validated_server_hello(
 #[cfg(test)]
 #[path = "tests/server_hello.rs"]
 mod server_hello_tests;
+
+#[cfg(test)]
+#[path = "tests/fallback.rs"]
+mod fallback_tests;
 
 #[cfg(test)]
 #[path = "tests/local_handshake.rs"]
