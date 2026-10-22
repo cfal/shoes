@@ -216,6 +216,7 @@ pub async fn start_from_config(
     }
 
     let mut validated = crate::config::compile_configs(configs).await?;
+    validated.control.reject_ffi()?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
     let crate::config::ValidatedConfigs {

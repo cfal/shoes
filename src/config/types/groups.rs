@@ -205,6 +205,8 @@ impl Serialize for NamedPem {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Config {
+    ClashApi(super::ClashApiConfig),
+    CacheFile(super::CacheFileConfig),
     GlobalLimits(GlobalLimits),
     Server(ServerConfig),
     /// TUN device server - accepts IP packets from a TUN device.
@@ -231,6 +233,17 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let map = value.as_mapping().ok_or_else(|| {
             Error::custom("Expected a YAML mapping for Config, but found a different type")
         })?;
+
+        if map.contains_key("clash_api_address") || map.contains_key("clash_api_path") {
+            return serde_yaml::from_value(value)
+                .map(Config::ClashApi)
+                .map_err(Error::custom);
+        }
+        if map.contains_key("cache_file_path") {
+            return serde_yaml::from_value(value)
+                .map(Config::CacheFile)
+                .map_err(Error::custom);
+        }
 
         // Look for discriminating fields
         let has_client_group = map.contains_key(Value::String("client_group".to_string()));
@@ -317,6 +330,8 @@ impl serde::ser::Serialize for Config {
         S: serde::ser::Serializer,
     {
         match self {
+            Config::ClashApi(config) => config.serialize(serializer),
+            Config::CacheFile(config) => config.serialize(serializer),
             Config::GlobalLimits(limits) => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(1))?;

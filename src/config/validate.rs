@@ -26,6 +26,7 @@ const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 /// Result of config validation containing server configs and expanded DNS groups.
 /// DNS resolvers are built at runtime from the expanded groups.
 pub struct ValidatedConfigs {
+    pub control: super::ControlConfig,
     pub rule_files: Vec<std::path::PathBuf>,
     pub global_limits: GlobalLimits,
     pub configs: Vec<Config>,
@@ -44,6 +45,7 @@ pub struct ValidatedConfigs {
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
 pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    let mut control = super::ControlConfig::default();
     let mut compiler = crate::rules::Compiler::default();
     let rule_files = crate::rule_set::dependencies(&mut all_configs)?;
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
@@ -83,6 +85,19 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
 
     for config in all_configs.into_iter() {
         match config {
+            Config::ClashApi(config) => control.listeners.push(config),
+            Config::CacheFile(config) => {
+                if control
+                    .cache_file_path
+                    .replace(config.cache_file_path)
+                    .is_some()
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "cache_file_path may only be specified once across all config files",
+                    ));
+                }
+            }
             Config::GlobalLimits(limits) => {
                 if global_limits.replace(limits).is_some() {
                     return Err(std::io::Error::new(
@@ -312,6 +327,7 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
     let mut validated = ValidatedConfigs {
+        control,
         rule_files,
         global_limits,
         configs: result,
