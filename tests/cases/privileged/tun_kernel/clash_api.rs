@@ -90,7 +90,7 @@ async fn clash_api_tun_counts_payload_and_cancels_destinations_independently() {
             .iter()
             .find(|flow| {
                 flow["metadata"]["network"] == network
-                    && flow["metadata"]["destinationPort"] == port
+                    && flow["metadata"]["destinationPort"].as_str() == Some(&port.to_string())
             })
             .unwrap();
         assert_eq!(flow["metadata"]["sourceIP"], tun.source.to_string());

@@ -510,7 +510,7 @@ async fn udp_payload_totals_and_destination_cancellation_are_isolated() {
     assert_eq!(snapshot["downloadTotal"], 11);
     let id = connections
         .iter()
-        .find(|flow| flow["metadata"]["destinationPort"] == a.port())
+        .find(|flow| flow["metadata"]["destinationPort"].as_str() == Some(&a.port().to_string()))
         .unwrap()["id"]
         .as_str()
         .unwrap();

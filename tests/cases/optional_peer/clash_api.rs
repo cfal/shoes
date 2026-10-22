@@ -1,4 +1,6 @@
+use std::io::BufRead;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -84,6 +86,36 @@ async fn ready(address: SocketAddr, process: &mut ProcessGuard) {
     .unwrap();
 }
 
+async fn start_shoes(path: &Path) -> ProcessGuard {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+        .args(["-t", "1", "--no-reload"])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let process = ProcessGuard::new(child, "Clash API Shoes");
+    let (ready, started) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut ready = Some(ready);
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.contains("Servers ready")
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), started)
+        .await
+        .expect("Shoes forwarding activation timed out")
+        .expect("Shoes exited before forwarding activation");
+    process
+}
+
 async fn proxy_ready(address: SocketAddr, name: &str) {
     tokio::time::timeout(Duration::from_secs(10), async {
         while request(
@@ -133,15 +165,7 @@ async fn clash_api_pinned_mihomo_contract() {
         .unwrap(),
     )
     .unwrap();
-    let mut shoes_process = ProcessGuard::new(
-        Command::new(env!("CARGO_BIN_EXE_shoes"))
-            .args(["-t", "1", "--no-reload"])
-            .arg(&shoes_config)
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap(),
-        "Clash API Shoes",
-    );
+    let mut shoes_process = start_shoes(&shoes_config).await;
     let mut mihomo_process = ProcessGuard::new(
         Command::new(binary)
             .arg("-d")
@@ -257,15 +281,7 @@ async fn clash_api_quic_tcp_udp_accounting_and_stream_cancellation() {
             {"name":protocol, "address":format!("0.0.0.0:{}", remote.port()), "transport":"quic", "quic_settings":{"cert":certificate.cert.pem(), "key":certificate.signing_key.serialize_pem(), "alpn_protocols":["h3"], "num_endpoints":1}, "protocol":server, "rules":"allow-all-direct"}
         ])).unwrap()).unwrap();
         std::fs::write(&mihomo_path, serde_yaml::to_string(&json!({"external-controller":format!("0.0.0.0:{}",mihomo_api.port()), "secret":SECRET, "socks-port":socks.port(), "allow-lan":true, "bind-address":"*", "log-level":"error", "proxies":[proxy], "rules":["MATCH,quic-out"]})).unwrap()).unwrap();
-        let mut shoes = ProcessGuard::new(
-            Command::new(env!("CARGO_BIN_EXE_shoes"))
-                .args(["-t", "1", "--no-reload"])
-                .arg(&shoes_path)
-                .stdout(Stdio::null())
-                .spawn()
-                .unwrap(),
-            "Clash API QUIC server",
-        );
+        let mut shoes = start_shoes(&shoes_path).await;
         let mut client = ProcessGuard::new(
             Command::new(&binary)
                 .arg("-d")
