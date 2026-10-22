@@ -216,6 +216,10 @@ impl AnyTlsStream {
         self.id
     }
 
+    pub(super) fn close_read(&mut self) {
+        self.data_rx.close();
+    }
+
     /// Best-effort FIN send for Drop (cannot block in Drop)
     ///
     /// This is only used when the stream is dropped without being properly shutdown.
