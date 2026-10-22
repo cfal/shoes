@@ -695,12 +695,12 @@ mod cleanup_tests {
                     records[small_record] = encrypted.into();
                     let check = sc.clone();
                     let authenticated = check.authenticate_client_hello(&hello).unwrap();
-                    assert!(
+                    assert_eq!(
                         authenticated
                             .into_connection(&records)
                             .unwrap_err()
-                            .to_string()
-                            .contains("insufficient capacity")
+                            .to_string(),
+                        "Unsupported REALITY target or insufficient capacity"
                     );
                     records.concat()
                 }

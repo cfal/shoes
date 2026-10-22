@@ -295,10 +295,14 @@ fn reality_pq_mldsa_small_target_does_not_emit_synthetic_bytes() {
     client.write_tls(&mut hello).unwrap();
     let authenticated = sc.authenticate_client_hello(&hello).unwrap();
     let mut records = default_target_records(&hello[44..76]);
-    records[2] = vec![0; 600].into();
+    let mut small = write_record_header(23, 595);
+    small.resize(600, 0);
+    records[2] = small.into();
+    let error = authenticated.into_connection(&records).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     assert_eq!(
-        authenticated.into_connection(&records).unwrap_err().kind(),
-        std::io::ErrorKind::Unsupported
+        error.to_string(),
+        "Unsupported REALITY target or insufficient capacity"
     );
 }
 
@@ -321,7 +325,10 @@ fn reality_pq_mldsa_separate_records_each_require_capacity() {
             records[small_record] = small.into();
             let error = authenticated.into_connection(&records).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-            assert!(error.to_string().contains("insufficient capacity"));
+            assert_eq!(
+                error.to_string(),
+                "Unsupported REALITY target or insufficient capacity"
+            );
         }
     }
 }

@@ -246,6 +246,35 @@ fn certificate_verify_and_server_finished_must_verify() {
 }
 
 #[test]
+fn client_hello_carries_authenticated_reality_metadata() {
+    use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
+
+    let (mut cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+    let short_id = [1, 2, 3, 4, 5, 6, 7, 8];
+    cc.short_id = short_id;
+    sc.short_ids = vec![[0; 8], short_id, [255; 8]];
+    sc.min_client_version = Some([1, 8, 0]);
+    sc.max_client_version = Some([1, 8, 0]);
+    sc.max_time_diff = Some(60_000);
+
+    let mut client = cc.create_connection().unwrap();
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello).unwrap();
+    let shares = super::reality_key_exchange::extract_client_key_shares(&hello).unwrap();
+    let shared =
+        perform_ecdh(&sc.private_key, shares.authentication_public_key().unwrap()).unwrap();
+    let auth = derive_auth_key(&shared, &hello[11..31], b"REALITY").unwrap();
+    assert_eq!(hello[43], 32);
+    let session = hello[44..76].try_into().unwrap();
+    let mut aad = hello[5..].to_vec();
+    aad[39..71].fill(0);
+    let metadata = decrypt_session_id(session, &auth, &hello[31..43], &aad).unwrap();
+    assert_eq!(metadata[..4], [1, 8, 0, 0]);
+    assert_eq!(metadata[8..], short_id);
+    sc.authenticate_client_hello(&hello).unwrap();
+}
+
+#[test]
 fn authentication_policy_and_client_share_variants() {
     for case in [
         "valid",
