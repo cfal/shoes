@@ -255,6 +255,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn raw_splice_keeps_live_payload_counts_and_cancellation() {
+        crate::splice::TEST_SPLICED_BYTES.set(0);
         async fn pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
             let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -294,6 +295,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entry.counters.totals(), (payload.len() as u64, 5));
+        assert!(crate::splice::TEST_SPLICED_BYTES.get() > 0);
         entry.cancel.cancel();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), relay)

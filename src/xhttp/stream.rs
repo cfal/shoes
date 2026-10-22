@@ -848,6 +848,7 @@ pub struct Stream {
     pub read: Reader,
     pub write: Writer,
     pub _tasks: Arc<Tasks>,
+    pub peer: Option<std::net::SocketAddr>,
 }
 impl AsyncRead for Stream {
     fn poll_read(
@@ -881,7 +882,11 @@ impl AsyncPing for Stream {
         Poll::Ready(Ok(false))
     }
 }
-impl AsyncStream for Stream {}
+impl AsyncStream for Stream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer
+    }
+}
 
 pub struct Upload {
     pub activity: Arc<Activity>,

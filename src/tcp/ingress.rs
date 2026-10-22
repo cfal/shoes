@@ -120,12 +120,12 @@ impl PreparedTcp {
             (None, self.prefix)
         };
         let mut info = crate::control::flows::FlowInfo::default();
-        if selector.tracks_flows() {
-            if let IngressTarget::Forward(target) = &self.target {
-                info = target.flow_info();
-                info.source = self.source;
-                info.sniff_host = hostname.clone();
-            }
+        if selector.tracks_flows()
+            && let IngressTarget::Forward(target) = &self.target
+        {
+            info = target.flow_info();
+            info.source = self.source;
+            info.sniff_host = hostname.clone();
         }
         let (wire_destination, target) = match self.target {
             IngressTarget::LocalDns {

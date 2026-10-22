@@ -246,7 +246,11 @@ mod tests {
     fn replies_keep_full_queue_drops_and_closed_queue_errors() {
         let (_tx, input) = mpsc::channel(QUEUE_SIZE);
         let (output, mut rx) = mpsc::channel(QUEUE_SIZE);
-        let mut stream = ChannelStream { input, output, peer: None };
+        let mut stream = ChannelStream {
+            input,
+            output,
+            peer: None,
+        };
         let source = NetLocation::from_str("[::1]:53", None).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for i in 0..=QUEUE_SIZE {

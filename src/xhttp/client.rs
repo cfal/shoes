@@ -404,6 +404,7 @@ impl Client {
             }
         });
         Ok(Stream {
+            peer: None,
             read,
             write,
             _tasks: tasks,

@@ -1039,6 +1039,9 @@ impl ClientChainGroup {
         let mut result = chain
             .connect_tcp_observed(remote_location.clone(), resolver, &mut path)
             .await?;
+        if path.last() != Some(&description.proxy) {
+            path.push(description.proxy.clone());
+        }
         let guard = description.context.as_ref().unwrap().register(
             "tcp",
             &remote_location,
@@ -1080,6 +1083,9 @@ impl ClientChainGroup {
         let stream = chain
             .connect_udp_observed(resolver, target.clone(), &mut path)
             .await?;
+        if path.last() != Some(&description.proxy) {
+            path.push(description.proxy.clone());
+        }
         let guard = description.context.as_ref().unwrap().register(
             "udp",
             &target,
