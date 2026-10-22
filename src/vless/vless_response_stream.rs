@@ -28,10 +28,10 @@ where
     }
 
     fn poll_read_response(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // Need to read at least 2 bytes for the response header
         while self.response_buffer.len() < 2 {
             let mut buf = [0u8; 2];
-            let mut read_buf = ReadBuf::new(&mut buf);
+            let remaining = 2 - self.response_buffer.len();
+            let mut read_buf = ReadBuf::new(&mut buf[..remaining]);
             ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read_buf))?;
 
             let filled = read_buf.filled();
@@ -146,3 +146,67 @@ where
 }
 
 impl<IO> AsyncStream for VlessResponseStream<IO> where IO: AsyncStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::task::noop_waker_ref;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn fragmented_response_headers_preserve_payload() {
+        for addon_length in [0, 4, 255] {
+            let mut header = vec![0, addon_length];
+            header.extend(std::iter::repeat_n(42, addon_length as usize));
+            for split in 1..header.len() {
+                let (io, mut peer) = tokio::io::duplex(1024);
+                let mut stream = VlessResponseStream::new(io);
+                peer.write_all(&header[..split]).await.unwrap();
+                let mut cx = Context::from_waker(noop_waker_ref());
+                let mut bytes = [0; 32];
+                let mut buf = ReadBuf::new(&mut bytes);
+                assert!(
+                    Pin::new(&mut stream)
+                        .poll_read(&mut cx, &mut buf)
+                        .is_pending()
+                );
+                assert!(buf.filled().is_empty());
+
+                let mut remainder = header[split..].to_vec();
+                remainder.extend_from_slice(b"payload");
+                peer.write_all(&remainder).await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, b"payload", "addons={addon_length}, split={split}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_response_headers_and_addons_are_errors() {
+        let header = [0, 4, 1, 2, 3, 4];
+        for len in 0..header.len() {
+            let (io, mut peer) = tokio::io::duplex(32);
+            peer.write_all(&header[..len]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut stream = VlessResponseStream::new(io);
+            let error = stream.read(&mut [0; 1]).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "len={len}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_response_version_is_rejected() {
+        let (io, mut peer) = tokio::io::duplex(32);
+        peer.write_all(&[1, 0]).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let error = VlessResponseStream::new(io).read_u8().await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            error
+                .to_string()
+                .contains("invalid server protocol version")
+        );
+    }
+}

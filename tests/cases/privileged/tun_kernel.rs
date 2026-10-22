@@ -52,6 +52,22 @@ impl KernelTun {
         Self::start_options(ipv6, None, 1500, 32768).await
     }
 
+    async fn start_reloadable(ipv6: bool, offload: bool) -> io::Result<Self> {
+        Self::start_with(ipv6, Some(offload), 1500, 4096, |config| {
+            let file = tempfile::NamedTempFile::new()?;
+            std::fs::write(file.path(), config)?;
+            let process = shoes_test_support::process::spawn_privileged_process(
+                std::path::Path::new(env!("CARGO_BIN_EXE_shoes")),
+                "reloadable-tun",
+                |command| {
+                    command.args(["-t", "2"]).arg(file.path());
+                },
+            )?;
+            Ok((process, file))
+        })
+        .await
+    }
+
     async fn start_options(
         ipv6: bool,
         offload: Option<bool>,
@@ -275,19 +291,7 @@ async fn reload_removes_tun_and_active_upstreams_without_exiting() -> io::Result
             for offload in [false, true] {
                 let listener =
                     TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).await?;
-                let tun = KernelTun::start_with(ipv6, Some(offload), 1500, 4096, |config| {
-                    let file = tempfile::NamedTempFile::new()?;
-                    std::fs::write(file.path(), config)?;
-                    let process = shoes_test_support::process::spawn_privileged_process(
-                        std::path::Path::new(env!("CARGO_BIN_EXE_shoes")),
-                        "reloadable-tun",
-                        |command| {
-                            command.args(["-t", "2"]).arg(file.path());
-                        },
-                    )?;
-                    Ok((process, file))
-                })
-                .await?;
+                let tun = KernelTun::start_reloadable(ipv6, offload).await?;
                 let mut client = tun.connect_tcp(listener.local_addr()?.port()).await?;
                 client.write_all(b"active").await?;
                 let (mut upstream, _) = listener.accept().await?;
@@ -331,6 +335,100 @@ async fn reload_removes_tun_and_active_upstreams_without_exiting() -> io::Result
                 let mut greeting = [0; 2];
                 replacement.read_exact(&mut greeting).await?;
                 assert_eq!(greeting, [5, 0]);
+            }
+        }
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn reload_recreates_same_named_tun_and_routes_new_connections() -> io::Result<()> {
+    timeout(TEST_TIMEOUT, async {
+        for ipv6 in [false, true] {
+            for offload in [false, true] {
+                let listener = TcpListener::bind(if ipv6 { "[::]:0" } else { "0.0.0.0:0" }).await?;
+                let tun = KernelTun::start_reloadable(ipv6, offload).await?;
+                let mut client = tun.connect_tcp(listener.local_addr()?.port()).await?;
+                client.write_all(b"before").await?;
+                let (mut upstream, _) = listener.accept().await?;
+                let mut data = [0; 6];
+                upstream.read_exact(&mut data).await?;
+                assert_eq!(&data, b"before");
+
+                let before: serde_json::Value =
+                    serde_json::from_str(&run_ip(&["-j", "link", "show", "dev", &tun.name])?)?;
+                let mut config: serde_yaml::Value =
+                    serde_yaml::from_str(&std::fs::read_to_string(tun._config.path())?)
+                        .map_err(io::Error::other)?;
+                config[0]["mtu"] = 1280.into();
+                std::fs::write(
+                    tun._config.path(),
+                    serde_yaml::to_string(&config).map_err(io::Error::other)?,
+                )?;
+
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        if let Ok(addresses) =
+                            run_ip(&["-j", "-4", "address", "show", "dev", &tun.name])
+                        {
+                            let devices: serde_json::Value = serde_json::from_str(&addresses)?;
+                            if devices[0]["ifindex"] != before[0]["ifindex"]
+                                && devices[0]["mtu"] == 1280
+                                && devices[0]["flags"]
+                                    .as_array()
+                                    .is_some_and(|flags| flags.iter().any(|flag| flag == "UP"))
+                                && devices[0]["addr_info"]
+                                    .as_array()
+                                    .is_some_and(|addresses| !addresses.is_empty())
+                            {
+                                return io::Result::Ok(());
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await??;
+                match upstream.read(&mut data).await {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    result => panic!("upstream not closed on TUN replacement: {result:?}"),
+                }
+                drop(client);
+
+                // Recreating the device removes addresses and routes installed by the fixture.
+                if ipv6 {
+                    run_ip(&[
+                        "-6",
+                        "address",
+                        "add",
+                        &format!("{}/128", tun.source),
+                        "dev",
+                        &tun.name,
+                        "nodad",
+                    ])?;
+                }
+                run_ip(&[
+                    if ipv6 { "-6" } else { "-4" },
+                    "route",
+                    "add",
+                    &format!("{}/{}", tun.target, if ipv6 { 128 } else { 32 }),
+                    "dev",
+                    &tun.name,
+                ])?;
+                let echo =
+                    start_tcp_stream_echo_server(if ipv6 { "::" } else { "0.0.0.0" }, 0).await?;
+                bulk_echo(tun.connect_tcp(echo.local_addr().port()).await?, 65537, 9).await?;
+                let peer =
+                    start_udp_echo_server_with_suffix(if ipv6 { "::" } else { "0.0.0.0" }, 0, b"")
+                        .await?;
+                let socket = UdpSocket::bind(SocketAddr::new(tun.source, 0)).await?;
+                udp_exchange(
+                    &socket,
+                    SocketAddr::new(tun.target, peer.local_addr().port()),
+                    b"after reload",
+                )
+                .await?;
             }
         }
         Ok(())

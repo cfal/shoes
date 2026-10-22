@@ -471,15 +471,21 @@ mod tests {
     fn invalid_raw_descriptors_return_errors_without_aborting() {
         const CHILD: &str = "SHOES_INVALID_TUN_FD_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "tun::tests::invalid_raw_descriptors_return_errors_without_aborting",
                 ])
                 .env(CHILD, "1")
-                .status()
+                .output()
                 .unwrap();
-            assert!(status.success());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "raw descriptor test failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         tokio::runtime::Builder::new_current_thread()
