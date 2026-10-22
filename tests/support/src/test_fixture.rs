@@ -539,7 +539,8 @@ pub enum ProxyType {
     },
     ShoesShadowTlsRemoteServer {
         password: String,
-        handshake_server: String,
+        server_name: String,
+        handshake_address: String,
     },
     ShoesShadowTlsClient {
         upstream_ip: String,
@@ -2306,9 +2307,24 @@ impl ProxyTestFixture {
 
     /// Add a shoes ShadowTLS server with remote TLS handshake
     pub fn with_shoes_shadowtls_remote_server(
-        mut self,
+        self,
         password: &str,
         handshake_server: &str,
+    ) -> Self {
+        self.with_shoes_shadowtls_remote_server_at(
+            password,
+            handshake_server,
+            &format!("{handshake_server}:443"),
+        )
+    }
+
+    /// Add a shoes ShadowTLS server for `server_name` that relays its handshake to
+    /// `handshake_address`
+    pub fn with_shoes_shadowtls_remote_server_at(
+        mut self,
+        password: &str,
+        server_name: &str,
+        handshake_address: &str,
     ) -> Self {
         let (ip, port) = self.ports.get_listener_port();
         let role = if self.proxies.is_empty() {
@@ -2320,7 +2336,8 @@ impl ProxyTestFixture {
             ip,
             proxy_type: ProxyType::ShoesShadowTlsRemoteServer {
                 password: password.to_string(),
-                handshake_server: handshake_server.to_string(),
+                server_name: server_name.to_string(),
+                handshake_address: handshake_address.to_string(),
             },
             port,
             role,
@@ -3689,7 +3706,8 @@ impl ProxyTestFixture {
                 }
                 ProxyType::ShoesShadowTlsRemoteServer {
                     password,
-                    handshake_server,
+                    server_name,
+                    handshake_address,
                 } => Some(format!(
                     r#"- address: "{}:{}"
   protocol:
@@ -3698,12 +3716,12 @@ impl ProxyTestFixture {
       "{}":
         password: "{}"
         handshake:
-          address: "{}:443"
+          address: "{}"
         protocol:
           type: vless
           user_id: "{}"
           udp_enabled: false"#,
-                    proxy.ip, proxy.port, handshake_server, password, handshake_server, TEST_UUID
+                    proxy.ip, proxy.port, server_name, password, handshake_address, TEST_UUID
                 )),
                 ProxyType::ShoesShadowTlsClient {
                     upstream_ip,
