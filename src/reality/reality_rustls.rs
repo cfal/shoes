@@ -1,5 +1,4 @@
 use std::fmt;
-use std::io;
 use std::sync::Arc;
 
 use aws_lc_rs::{agreement, kem, signature};
@@ -15,8 +14,6 @@ use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
 use super::reality_client_verify::{
     extract_ed25519_public_key, verify_certificate_hmac, verify_certificate_mldsa,
 };
-#[cfg(test)]
-use super::reality_key_exchange::RealityGroup;
 use super::reality_key_exchange::generate_mlkem;
 use super::{CipherSuite, DEFAULT_CIPHER_SUITES, RealityClientConfig};
 
@@ -44,35 +41,12 @@ pub(super) fn provider(suites: &[CipherSuite]) -> CryptoProvider {
     provider
 }
 
-pub(super) fn io_error(error: Error) -> io::Error {
-    let kind = match &error {
-        Error::InvalidCertificate(_) => io::ErrorKind::PermissionDenied,
-        Error::PeerIncompatible(rustls::PeerIncompatible::RealityUnsupported) => {
-            io::ErrorKind::Unsupported
-        }
-        Error::FailedToGetCurrentTime | Error::FailedToGetRandomBytes | Error::General(_) => {
-            io::ErrorKind::Other
-        }
-        _ => io::ErrorKind::InvalidData,
-    };
-    io::Error::new(kind, error)
-}
-
 fn crypto_error(_: impl fmt::Display) -> Error {
     Error::General("REALITY key exchange failed".into())
 }
 
 fn verification_error(_: impl fmt::Display) -> Error {
     Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
-}
-
-#[cfg(test)]
-pub(super) fn group(group: NamedGroup) -> Option<RealityGroup> {
-    match group {
-        NamedGroup::X25519 => Some(RealityGroup::X25519),
-        NamedGroup::X25519MLKEM768 => Some(RealityGroup::X25519MlKem768),
-        _ => None,
-    }
 }
 
 #[derive(Default)]

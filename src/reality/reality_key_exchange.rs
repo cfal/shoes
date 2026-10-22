@@ -40,12 +40,6 @@ impl RealityGroup {
     }
 }
 
-#[cfg(test)]
-pub struct KeyShareRef<'a> {
-    pub group: RealityGroup,
-    pub data: &'a [u8],
-}
-
 #[derive(Clone, Default)]
 pub struct ClientKeyShares {
     pub x25519: Option<[u8; 32]>,
@@ -195,9 +189,7 @@ pub fn generate_mlkem() -> io::Result<(kem::DecapsulationKey, Vec<u8>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::reality_tls13_messages::{
-        construct_client_hello, construct_server_hello, write_record_header,
-    };
+    use super::super::test_tls::{construct_server_hello, write_record_header};
     use super::*;
 
     fn share_vector(entries: &[(u16, &[u8])]) -> Vec<u8> {
@@ -253,20 +245,11 @@ mod tests {
 
     #[test]
     fn hello_parsers_check_framing_and_retry() {
-        let hello = construct_client_hello(
-            &[0; 32],
-            &[0; 32],
-            &[KeyShareRef {
-                group: RealityGroup::X25519,
-                data: &[1; 32],
-            }],
-            "cover.test",
-            &[0x1301],
-            &[],
-        )
-        .unwrap();
-        let mut record = write_record_header(22, hello.len() as u16);
-        record.extend_from_slice(&hello);
+        let (config, _) =
+            super::super::reality_pq_tests::configs(super::super::CipherSuite::AES_128_GCM_SHA256);
+        let mut client = config.create_connection().unwrap();
+        let mut record = Vec::new();
+        client.write_tls(&mut record).unwrap();
         assert!(extract_client_key_shares(&record).is_ok());
         for end in 0..record.len() {
             assert!(extract_client_key_shares(&record[..end]).is_err());

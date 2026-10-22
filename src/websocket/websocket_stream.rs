@@ -834,8 +834,8 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::CryptoTlsStream;
     use crate::crypto::tls_deframer::TlsDeframer;
-    use crate::crypto::{CryptoConnection, CryptoTlsStream};
     use futures::task::noop_waker_ref;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -904,11 +904,8 @@ mod tests {
                     if pong { &[0x89, 0] } else { &[] },
                 );
                 let session = crate::reality::established_pair().1;
-                let mut tls = CryptoTlsStream::new(
-                    websocket,
-                    CryptoConnection::new_reality_server(session),
-                    framed.then(TlsDeframer::new),
-                );
+                let mut tls =
+                    CryptoTlsStream::new(websocket, session, framed.then(TlsDeframer::new));
                 tls.write_all(b"prior TLS traffic").await.unwrap();
                 tls.flush().await.unwrap();
 

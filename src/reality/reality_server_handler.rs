@@ -10,7 +10,7 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_chain::ClientProxyChain;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::tls_deframer::TlsDeframer;
-use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
+use crate::crypto::{CryptoTlsStream, TlsReadMode};
 use crate::prepend_stream::PrependStream;
 use crate::resolver::Resolver;
 use crate::shadow_tls::{ParsedClientHello, parse_server_hello};
@@ -18,8 +18,8 @@ use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerSetupResult};
 use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
 
+use super::RealityServerConfig;
 use super::reality_key_exchange::extract_server_key_share;
-use super::{RealityServerConfig, RealityServerConnection};
 
 #[derive(Debug)]
 pub struct RealityServerTarget {
@@ -119,10 +119,115 @@ pub async fn setup_reality_server_stream(
         cipher_suites: target.cipher_suites.clone(),
     };
 
-    let mut reality_conn = RealityServerConnection::new(reality_config)?;
+    let auth_result = reality_config.authenticate_client_hello(client_hello_frame);
 
-    let auth_result = reality_conn.validate_client_hello(client_hello_frame);
+    let TargetFlight {
+        records: dest_records,
+        remaining: remaining_data,
+        usable,
+    } = read_target_flight(&mut *dest_stream, &target.dest, auth_result.is_ok()).await?;
+    if !usable {
+        return Ok(start_forward_to_dest(
+            server_stream,
+            dest_stream,
+            dest_records,
+            remaining_data,
+            client_pending,
+        ));
+    }
 
+    // Delay authentication rejection until target collection so probes follow the same read path.
+    let authenticated = match auth_result {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            log::warn!(
+                "REALITY: Auth failed ({}), forwarding to dest transparently",
+                e
+            );
+            return Ok(start_forward_to_dest(
+                server_stream,
+                dest_stream,
+                dest_records,
+                remaining_data,
+                client_pending,
+            ));
+        }
+
+        Err(e) => {
+            log::error!("REALITY: Unexpected error during auth: {}", e);
+            return Err(e);
+        }
+
+        Ok(authenticated) => authenticated,
+    };
+
+    log::debug!("REALITY: Auth succeeded, building response matching dest structure");
+
+    let Some(connection) = forward_unsupported(authenticated.into_connection(&dest_records))?
+    else {
+        return Ok(start_forward_to_dest(
+            server_stream,
+            dest_stream,
+            dest_records,
+            remaining_data,
+            client_pending,
+        ));
+    };
+    drop(dest_stream);
+
+    let mode = match target.inner_protocol {
+        InnerProtocol::VisionVless(_) => TlsReadMode::PreserveRecords,
+        _ => TlsReadMode::Stream,
+    };
+    let tls_stream =
+        CryptoTlsStream::handshake(server_stream, connection, mode, &client_pending).await?;
+    log::debug!(
+        "REALITY: TLS 1.3 handshake completed successfully, negotiated_group={:?}",
+        tls_stream.negotiated_group()
+    );
+
+    match &target.inner_protocol {
+        InnerProtocol::Normal(handler) => handler.setup_server_stream(Box::new(tls_stream)).await,
+        InnerProtocol::VisionVless(vision_cfg) => {
+            crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
+                tls_stream,
+                &vision_cfg.user_id,
+                vision_cfg.udp_enabled,
+                target.effective_selector.clone(),
+                resolver,
+                vision_cfg.fallback.clone(),
+            )
+            .await
+        }
+        InnerProtocol::Naive(naive_cfg) => {
+            crate::naiveproxy::setup_naive_server_stream(
+                tls_stream,
+                naive_cfg,
+                target.effective_selector.clone(),
+                resolver.clone(),
+            )
+            .await
+        }
+    }
+}
+
+struct TargetFlight {
+    records: Vec<Bytes>,
+    remaining: Bytes,
+    usable: bool,
+}
+
+async fn read_target_flight(
+    dest_stream: &mut (impl tokio::io::AsyncRead + Unpin + ?Sized),
+    dest: &NetLocation,
+    authenticated: bool,
+) -> std::io::Result<TargetFlight> {
     // Read dest response until we have enough records. Use 512-byte heuristic like XTLS/REALITY:
     // first encrypted record > 512 bytes = combined mode, <= 512 bytes = separate mode
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -173,27 +278,25 @@ pub async fn setup_reality_server_stream(
                 Ok(parsed) => {
                     if !parsed.is_tls13 || extract_server_key_share(&dest_records[0]).is_err() {
                         log::log!(
-                            if auth_result.is_ok() {
+                            if authenticated {
                                 log::Level::Warn
                             } else {
                                 log::Level::Debug
                             },
                             "REALITY: Dest {} has an unsupported TLS hello, forwarding transparently",
-                            target.dest
+                            dest
                         );
-                        return Ok(start_forward_to_dest(
-                            server_stream,
-                            dest_stream,
-                            dest_records,
-                            deframer.into_remaining_data(),
-                            client_pending,
-                        ));
+                        return Ok(TargetFlight {
+                            records: dest_records,
+                            remaining: deframer.into_remaining_data(),
+                            usable: false,
+                        });
                     }
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
                 }
                 Err(e) => {
                     log::log!(
-                        if auth_result.is_ok() {
+                        if authenticated {
                             log::Level::Warn
                         } else {
                             log::Level::Debug
@@ -201,13 +304,11 @@ pub async fn setup_reality_server_stream(
                         "REALITY: Failed to parse dest ServerHello: {}, forwarding transparently",
                         e
                     );
-                    return Ok(start_forward_to_dest(
-                        server_stream,
-                        dest_stream,
-                        dest_records,
-                        deframer.into_remaining_data(),
-                        client_pending,
-                    ));
+                    return Ok(TargetFlight {
+                        records: dest_records,
+                        remaining: deframer.into_remaining_data(),
+                        usable: false,
+                    });
                 }
             }
         }
@@ -244,113 +345,33 @@ pub async fn setup_reality_server_stream(
     }
 
     let remaining_data = deframer.into_remaining_data();
-
-    if !dest_handshake_success || !remaining_data.is_empty() {
+    let usable = dest_handshake_success && remaining_data.is_empty();
+    if !usable {
         log::warn!(
             "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
             dest_records.len()
         );
-        return Ok(start_forward_to_dest(
-            server_stream,
-            dest_stream,
-            dest_records,
-            remaining_data,
-            client_pending,
-        ));
+    } else {
+        log::debug!(
+            "REALITY: Read {} records from dest ({} bytes remaining)",
+            dest_records.len(),
+            remaining_data.len()
+        );
     }
-
-    log::debug!(
-        "REALITY: Read {} records from dest ({} bytes remaining)",
-        dest_records.len(),
-        remaining_data.len()
-    );
-
-    // Branch based on auth result. We don't short circuit on permission denied before the
-    // read loop above so that the timing is always the same.
-    match auth_result {
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::InvalidData
-                    | std::io::ErrorKind::UnexpectedEof
-            ) =>
-        {
-            log::warn!(
-                "REALITY: Auth failed ({}), forwarding to dest transparently",
-                e
-            );
-            return Ok(start_forward_to_dest(
-                server_stream,
-                dest_stream,
-                dest_records,
-                remaining_data,
-                client_pending,
-            ));
-        }
-
-        Err(e) => {
-            log::error!("REALITY: Unexpected error during auth: {}", e);
-            return Err(e);
-        }
-
-        Ok(()) => {}
-    }
-
-    log::debug!("REALITY: Auth succeeded, building response matching dest structure");
-
-    if should_forward_to_dest(reality_conn.build_server_response(&dest_records))? {
-        return Ok(start_forward_to_dest(
-            server_stream,
-            dest_stream,
-            dest_records,
-            remaining_data,
-            client_pending,
-        ));
-    }
-    drop(dest_stream);
-
-    let connection = CryptoConnection::new_reality_server(reality_conn);
-    let mode = match target.inner_protocol {
-        InnerProtocol::VisionVless(_) => TlsReadMode::PreserveRecords,
-        _ => TlsReadMode::Stream,
-    };
-    let tls_stream =
-        CryptoTlsStream::handshake(server_stream, connection, mode, &client_pending).await?;
-    log::debug!("REALITY: TLS 1.3 handshake completed successfully");
-
-    match &target.inner_protocol {
-        InnerProtocol::Normal(handler) => handler.setup_server_stream(Box::new(tls_stream)).await,
-        InnerProtocol::VisionVless(vision_cfg) => {
-            crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
-                tls_stream,
-                &vision_cfg.user_id,
-                vision_cfg.udp_enabled,
-                target.effective_selector.clone(),
-                resolver,
-                vision_cfg.fallback.clone(),
-            )
-            .await
-        }
-        InnerProtocol::Naive(naive_cfg) => {
-            crate::naiveproxy::setup_naive_server_stream(
-                tls_stream,
-                naive_cfg,
-                target.effective_selector.clone(),
-                resolver.clone(),
-            )
-            .await
-        }
-    }
+    Ok(TargetFlight {
+        records: dest_records,
+        remaining: remaining_data,
+        usable,
+    })
 }
 
-fn should_forward_to_dest(response: std::io::Result<()>) -> std::io::Result<bool> {
+fn forward_unsupported<T>(response: std::io::Result<T>) -> std::io::Result<Option<T>> {
     match response {
-        Ok(()) => Ok(false),
+        Ok(connection) => Ok(Some(connection)),
         // Only explicitly classified target incompatibilities permit fallback.
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
             log::warn!("REALITY: Cannot synthesize target handshake ({e}), forwarding");
-            Ok(true)
+            Ok(None)
         }
         Err(e) => Err(e),
     }
@@ -430,22 +451,125 @@ fn start_forward_to_dest(
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    use crate::crypto::TlsConnection;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+    struct TargetReads {
+        chunks: std::collections::VecDeque<Bytes>,
+        reads: usize,
+    }
+
+    impl AsyncRead for TargetReads {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                // An open, idle target must not make collection wait for an unseen seventh record.
+                return Poll::Pending;
+            };
+            assert!(chunk.len() <= buffer.remaining());
+            buffer.put_slice(&chunk);
+            self.reads += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn target_collection_respects_observed_read_boundaries() {
+        use crate::reality::CipherSuite;
+        use crate::reality::reality_key_exchange::RealityGroup;
+        use crate::reality::reality_pq_tests::{configs, separate_target_records};
+
+        for case in ["six", "seven", "split-seven", "combined-trailing"] {
+            let (client_config, server_config) = configs(CipherSuite::AES_128_GCM_SHA256);
+            let mut client = client_config.create_connection().unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            let mut records = if case == "combined-trailing" {
+                crate::reality::default_target_records(&hello[44..76])
+            } else {
+                separate_target_records(
+                    RealityGroup::X25519MlKem768,
+                    CipherSuite::AES_128_GCM_SHA256,
+                    &hello[44..76],
+                )
+            };
+            if matches!(case, "seven" | "split-seven") {
+                let mut trailing = vec![23, 3, 3, 0, 59];
+                trailing.resize(64, 0);
+                records.push(trailing.into());
+            }
+            let mut wire = records.concat();
+            let remaining: &[u8] = if case == "combined-trailing" {
+                &[23, 3, 3]
+            } else {
+                &[]
+            };
+            wire.extend_from_slice(remaining);
+            let chunks = if case == "split-seven" {
+                let split = wire.len() - 61;
+                vec![
+                    Bytes::copy_from_slice(&wire[..split]),
+                    Bytes::copy_from_slice(&wire[split..]),
+                ]
+            } else {
+                vec![Bytes::copy_from_slice(&wire)]
+            };
+            let expected_reads = chunks.len();
+            let mut target = TargetReads {
+                chunks: chunks.into(),
+                reads: 0,
+            };
+            let flight = tokio::time::timeout(
+                Duration::from_secs(1),
+                read_target_flight(&mut target, &server_config.dest, true),
+            )
+            .await
+            .expect(case)
+            .unwrap();
+            assert_eq!(target.reads, expected_reads, "{case}");
+            assert_eq!(flight.records, records, "{case}");
+            assert_eq!(flight.remaining.as_ref(), remaining, "{case}");
+            assert_eq!(flight.usable, case != "combined-trailing", "{case}");
+            if flight.usable {
+                let mut server = server_config
+                    .authenticate_client_hello(&hello)
+                    .unwrap()
+                    .into_connection(&flight.records)
+                    .unwrap();
+                let mut wire = Vec::new();
+                server.write_tls(&mut wire).unwrap();
+                client.feed(&wire).unwrap();
+                wire.clear();
+                client.write_tls(&mut wire).unwrap();
+                server.feed(&wire).unwrap();
+                assert!(
+                    !client.is_handshaking() && !server.is_handshaking(),
+                    "{case}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn synthesis_failures_only_forward_explicit_incompatibilities() {
-        assert!(!should_forward_to_dest(Ok(())).unwrap());
-        assert!(should_forward_to_dest(Err(io::ErrorKind::Unsupported.into())).unwrap());
+        assert_eq!(forward_unsupported(Ok(())).unwrap(), Some(()));
+        assert_eq!(
+            forward_unsupported::<()>(Err(io::ErrorKind::Unsupported.into())).unwrap(),
+            None
+        );
         for kind in [
             io::ErrorKind::InvalidData,
             io::ErrorKind::UnexpectedEof,
             io::ErrorKind::Other,
         ] {
             let error = io::Error::new(kind, "injected synthesis failure");
-            let propagated = should_forward_to_dest(Err(error)).unwrap_err();
+            let propagated = forward_unsupported::<()>(Err(error)).unwrap_err();
             assert_eq!(propagated.kind(), kind);
             assert_eq!(propagated.to_string(), "injected synthesis failure");
         }
@@ -491,8 +615,10 @@ mod cleanup_tests {
         use crate::client_proxy_chain::InitialHopEntry;
         use crate::port_forward_handler::PortForwardServerHandler;
         use crate::reality::reality_key_exchange::RealityGroup;
-        use crate::reality::reality_pq_tests::{configs, separate_target_records};
-        use crate::reality::{CipherSuite, RealityClientConnection, mldsa65_signing_key};
+        use crate::reality::reality_pq_tests::{
+            configs, separate_target_records, target_with_unknown_extension,
+        };
+        use crate::reality::{CipherSuite, mldsa65_signing_key};
         use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 
         for case in [
@@ -507,12 +633,13 @@ mod cleanup_tests {
             "bad-ccs",
             "wrong-session",
             "unknown-extension",
+            "combined-trailing",
         ] {
             let capture = crate::logging::test_capture::Capture::new();
             let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
             let (seed, _) = crate::reality::generate_mldsa65_keypair().unwrap();
             sc.mldsa65_key = Some(mldsa65_signing_key(&seed).unwrap());
-            let mut client = RealityClientConnection::new(cc).unwrap();
+            let mut client = cc.create_connection().unwrap();
             let mut hello = Vec::new();
             client.write_tls(&mut hello).unwrap();
             let auth_failure = matches!(
@@ -542,9 +669,9 @@ mod cleanup_tests {
                             io::ErrorKind::PermissionDenied
                         }
                     };
-                    let mut check = RealityServerConnection::new(sc.clone()).unwrap();
+                    let check = sc.clone();
                     assert_eq!(
-                        check.validate_client_hello(&hello).unwrap_err().kind(),
+                        check.authenticate_client_hello(&hello).unwrap_err().kind(),
                         expected_error
                     );
                     // A valid target flight reaches the admission-error branch, not hello fallback.
@@ -566,26 +693,31 @@ mod cleanup_tests {
                     let mut encrypted = vec![23, 3, 3, 2, 88];
                     encrypted.resize(605, 0);
                     records[small_record] = encrypted.into();
-                    let mut check = RealityServerConnection::new(sc.clone()).unwrap();
-                    check.validate_client_hello(&hello).unwrap();
+                    let check = sc.clone();
+                    let authenticated = check.authenticate_client_hello(&hello).unwrap();
                     assert!(
-                        check
-                            .build_server_response(&records)
+                        authenticated
+                            .into_connection(&records)
                             .unwrap_err()
                             .to_string()
                             .contains("insufficient capacity")
                     );
                     records.concat()
                 }
-                "bad-late-record" | "bad-ccs" | "wrong-session" | "unknown-extension" => {
+                "bad-late-record" | "bad-ccs" | "wrong-session" | "unknown-extension"
+                | "combined-trailing" => {
                     let mut records = crate::reality::default_target_records(&hello[44..76]);
                     match case {
                         "bad-ccs" => records[1] = Bytes::from_static(&[20, 3, 3, 0, 1, 0]),
-                        "wrong-session" | "unknown-extension" => {
+                        "wrong-session" => {
                             let mut sh = records[0].to_vec();
-                            sh[if case == "wrong-session" { 44 } else { 81 }] ^= 1;
+                            sh[44] ^= 1;
                             records[0] = sh.into();
                         }
+                        "unknown-extension" => {
+                            records[0] = target_with_unknown_extension(&records[0])
+                        }
+                        "combined-trailing" => {}
                         "bad-late-record" => records.push(Bytes::from_static(&[255, 3, 3, 0, 0])),
                         _ => unreachable!(),
                     }
@@ -622,7 +754,7 @@ mod cleanup_tests {
                 }
             };
             // A partial trailing record exercises the deframer's retained bytes.
-            if matches!(case, "retry" | "unsupported") {
+            if matches!(case, "retry" | "unsupported" | "combined-trailing") {
                 response.extend_from_slice(&[23, 3, 3]);
             }
 
@@ -706,9 +838,19 @@ mod cleanup_tests {
             if auth_failure {
                 assert!(logs.contains("REALITY: Auth failed"), "{case}: {logs}");
             }
-            if matches!(case, "small" | "small-separate") {
+            if matches!(case, "small" | "small-separate" | "unknown-extension") {
                 assert!(
                     logs.contains("Auth succeeded, building response"),
+                    "{case}: {logs}"
+                );
+                assert!(
+                    logs.contains("REALITY: Cannot synthesize"),
+                    "{case}: {logs}"
+                );
+            }
+            if case == "combined-trailing" {
+                assert!(
+                    logs.contains("REALITY: Dest handshake failed"),
                     "{case}: {logs}"
                 );
             }
@@ -719,7 +861,7 @@ mod cleanup_tests {
     async fn authenticated_non_vision_oversized_preread_returns_error_without_panicking() {
         use crate::client_proxy_chain::InitialHopEntry;
         use crate::port_forward_handler::PortForwardServerHandler;
-        use crate::reality::{RealityClientConfig, RealityClientConnection};
+        use crate::reality::RealityClientConfig;
         use crate::tcp::socket_connector_impl::SocketConnectorImpl;
         use aws_lc_rs::agreement;
 
@@ -728,13 +870,14 @@ mod cleanup_tests {
             .unwrap()
             .compute_public_key()
             .unwrap();
-        let mut client = RealityClientConnection::new(RealityClientConfig {
+        let mut client = RealityClientConfig {
             mldsa65_verify: None,
             public_key: public_key.as_ref().try_into().unwrap(),
             short_id: [0; 8],
             server_name: "localhost".into(),
             cipher_suites: Vec::new(),
-        })
+        }
+        .create_connection()
         .unwrap();
         let mut hello = Vec::new();
         client.write_tls(&mut hello).unwrap();
@@ -760,11 +903,9 @@ mod cleanup_tests {
                         .into(),
                 )
                 .unwrap();
-        let mut decoy = CryptoConnection::new_rustls_server(
-            rustls::ServerConnection::new(Arc::new(decoy_config)).unwrap(),
-        );
-        crate::crypto::feed_crypto_connection(&mut decoy, &hello).unwrap();
-        decoy.process_new_packets().unwrap();
+        let mut decoy =
+            TlsConnection::new(rustls::ServerConnection::new(Arc::new(decoy_config)).unwrap());
+        decoy.feed(&hello).unwrap();
         let mut response = Vec::new();
         decoy.write_tls(&mut response).unwrap();
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));

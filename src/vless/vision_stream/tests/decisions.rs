@@ -38,10 +38,10 @@ pub(super) fn server_hello(cipher: u16, session_id_len: u8, extensions: &[u8]) -
     record(0x16, &handshake)
 }
 
-fn decrypt_output(peer: &mut CryptoConnection, ciphertext: &[u8]) -> Vec<u8> {
+fn decrypt_output(peer: &mut TlsConnection, ciphertext: &[u8]) -> Vec<u8> {
     use std::io::Read;
 
-    feed_and_process_crypto_connection(peer, ciphertext).unwrap();
+    peer.feed(ciphertext).unwrap();
     let mut plaintext = Vec::new();
     if let Err(error) = peer.reader().read_to_end(&mut plaintext) {
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
@@ -621,7 +621,7 @@ fn legacy_pending_hello_write_preserves_decision_and_resubmitted_tail() {
                             assert_eq!(output, raw_tail);
                         } else {
                             assert_eq!(stream.write_mode, VisionMode::Tls);
-                            feed_and_process_crypto_connection(&mut peer, &output).unwrap();
+                            peer.feed(&output).unwrap();
                             let mut received = vec![0; raw_tail.len()];
                             peer.reader().read_exact(&mut received).unwrap();
                             assert_eq!(received, raw_tail);

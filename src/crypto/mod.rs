@@ -1,14 +1,11 @@
-// Unified cryptographic connection abstraction
-//
-// This module provides a common interface for different TLS-like protocols,
-// allowing rustls and REALITY to be used interchangeably throughout the codebase.
+//! Shared rustls transport, including record-preserving Vision transitions.
 
-mod crypto_connection;
 mod crypto_handshake;
-mod crypto_reader_writer;
 mod crypto_tls_stream;
+mod tls_connection;
 pub mod tls_deframer;
+mod tls_reader_writer;
 
-// Re-export core types
-pub use crypto_connection::{CryptoConnection, feed_crypto_connection};
 pub use crypto_tls_stream::{CryptoTlsStream, TlsReadMode};
+pub use tls_connection::TlsConnection;
+pub(crate) use tls_connection::tls_error;

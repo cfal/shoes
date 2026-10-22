@@ -317,19 +317,17 @@ fn default_and_mixed_lists_preserve_tls12_compatibility() {
 
 #[tokio::test]
 async fn crypto_stream_handles_fragmented_hybrid_handshakes() {
-    use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
+    use crate::crypto::{CryptoTlsStream, TlsConnection, TlsReadMode};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         for name in ["X25519MLKEM768", "SecP256r1MLKEM768"] {
             let (client, mut server) = configs(name, name);
             // Keep this tiny duplex focused on handshake fragmentation, not post-handshake tickets.
             server.send_tls13_tickets = 0;
-            let client = CryptoConnection::new_rustls_client(
+            let client = TlsConnection::new(
                 ClientConnection::new(Arc::new(client), "localhost".try_into().unwrap()).unwrap(),
             );
-            let server = CryptoConnection::new_rustls_server(
-                ServerConnection::new(Arc::new(server)).unwrap(),
-            );
+            let server = TlsConnection::new(ServerConnection::new(Arc::new(server)).unwrap());
             let (client_io, server_io) = tokio::io::duplex(43);
             let (mut client, mut server) = tokio::try_join!(
                 CryptoTlsStream::handshake(client_io, client, TlsReadMode::Stream, &[]),

@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
+use crate::crypto::{CryptoTlsStream, TlsConnection, TlsReadMode};
 use crate::naiveproxy::UserLookup;
 use crate::reality::{RealityServerTarget, setup_reality_server_stream};
 use crate::resolver::Resolver;
@@ -160,7 +160,7 @@ impl TcpServerHandler for TlsServerHandler {
                     InnerProtocol::VisionVless(_) => TlsReadMode::PreserveRecords,
                     _ => TlsReadMode::Stream,
                 };
-                let connection = CryptoConnection::new_rustls_server(server_conn);
+                let connection = TlsConnection::new(server_conn);
                 let tls_stream = CryptoTlsStream::handshake(
                     server_stream,
                     connection,

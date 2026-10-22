@@ -1,11 +1,14 @@
 use std::io::{self, BufRead, Read, Write};
 use std::sync::Arc;
 
+use crate::crypto::TlsConnection;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
 use super::reality_key_exchange::RealityGroup;
-use super::reality_pq_tests::{configs, separate_target_records, target_records};
+use super::reality_pq_tests::{
+    configs, separate_target_records, target_records, target_with_unknown_extension,
+};
 use super::*;
 
 #[derive(Debug, Default)]
@@ -42,10 +45,10 @@ fn provider_preserves_cipher_defaults_order_and_duplicates() {
 fn interleaved_connections_do_not_share_authentication_state() {
     let pending: Vec<_> = (0..4).map(|_| pending_pair(Arc::default(), true)).collect();
     for (mut client, mut server, flight) in pending {
-        feed_reality_client_connection(&mut client, &flight.concat()).unwrap();
+        client.feed(&flight.concat()).unwrap();
         let mut wire = Vec::new();
         client.write_tls(&mut wire).unwrap();
-        feed_reality_server_connection(&mut server, &wire).unwrap();
+        server.feed(&wire).unwrap();
         assert!(!client.is_handshaking() && !server.is_handshaking());
     }
 }
@@ -62,7 +65,7 @@ fn real_target_certificate_never_authenticates_reality() {
         )
         .unwrap();
     let mut server = rustls::ServerConnection::new(Arc::new(config)).unwrap();
-    let mut client = RealityClientConnection::new(cc).unwrap();
+    let mut client = cc.create_connection().unwrap();
     let mut wire = Vec::new();
     client.write_tls(&mut wire).unwrap();
     let mut input = wire.as_slice();
@@ -73,9 +76,7 @@ fn real_target_certificate_never_authenticates_reality() {
     wire.clear();
     server.write_tls(&mut wire).unwrap();
     assert_eq!(
-        feed_reality_client_connection(&mut client, &wire)
-            .unwrap_err()
-            .kind(),
+        client.feed(&wire).unwrap_err().kind(),
         io::ErrorKind::PermissionDenied
     );
     assert!(client.is_handshaking() && !client.wants_write());
@@ -98,24 +99,25 @@ fn records(wire: &[u8]) -> Vec<Bytes> {
 fn pending_pair(
     secrets: Arc<Secrets>,
     omit_ed25519: bool,
-) -> (RealityClientConnection, RealityServerConnection, Vec<Bytes>) {
+) -> (TlsConnection, TlsConnection, Vec<Bytes>) {
     let (cc, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
     let crypto = reality_rustls::provider(&cc.cipher_suites);
     let mut schemes = crypto.signature_verification_algorithms.supported_schemes();
     if omit_ed25519 {
         schemes.retain(|scheme| *scheme != rustls::SignatureScheme::ED25519);
     }
-    let mut client = RealityClientConnection::with_options(cc, crypto, schemes, secrets).unwrap();
-    let mut server = RealityServerConnection::new(sc).unwrap();
+    let mut client = cc
+        .create_connection_with_options(crypto, schemes, secrets)
+        .unwrap();
     let mut hello = Vec::new();
     client.write_tls(&mut hello).unwrap();
-    server.validate_client_hello(&hello).unwrap();
+    let authenticated = sc.authenticate_client_hello(&hello).unwrap();
     let target = separate_target_records(
         RealityGroup::X25519MlKem768,
         CipherSuite::AES_128_GCM_SHA256,
         &hello[44..76],
     );
-    server.build_server_response(&target).unwrap();
+    let mut server = authenticated.into_connection(&target).unwrap();
     let mut wire = Vec::new();
     server.write_tls(&mut wire).unwrap();
     (client, server, records(&wire))
@@ -182,25 +184,25 @@ fn mutate_record(
 #[test]
 fn authenticated_unadvertised_ed25519_and_key_updates() {
     let (mut client, mut server, flight) = pending_pair(Arc::default(), true);
-    feed_reality_client_connection(&mut client, &flight.concat()).unwrap();
+    client.feed(&flight.concat()).unwrap();
     let mut wire = Vec::new();
     client.write_tls(&mut wire).unwrap();
-    feed_reality_server_connection(&mut server, &wire).unwrap();
+    server.feed(&wire).unwrap();
     assert!(!client.is_handshaking() && !server.is_handshaking());
     for _ in 0..3 {
-        client.transport.refresh_traffic_keys().unwrap();
+        client.refresh_traffic_keys().unwrap();
         client.writer().write_all(b"updated client").unwrap();
         wire.clear();
         client.write_tls(&mut wire).unwrap();
-        feed_reality_server_connection(&mut server, &wire).unwrap();
+        server.feed(&wire).unwrap();
         let mut data = [0; 14];
         server.reader().read_exact(&mut data).unwrap();
         assert_eq!(&data, b"updated client");
-        server.transport.refresh_traffic_keys().unwrap();
+        server.refresh_traffic_keys().unwrap();
         server.writer().write_all(b"updated server").unwrap();
         wire.clear();
         server.write_tls(&mut wire).unwrap();
-        feed_reality_client_connection(&mut client, &wire).unwrap();
+        client.feed(&wire).unwrap();
         client.reader().read_exact(&mut data).unwrap();
         assert_eq!(&data, b"updated server");
     }
@@ -217,7 +219,7 @@ fn certificate_verify_and_server_finished_must_verify() {
         let secrets = Arc::new(Secrets::default());
         let (mut client, _, flight) = pending_pair(secrets.clone(), true);
         for record in &flight[..index] {
-            feed_reality_client_connection(&mut client, record).unwrap();
+            client.feed(record).unwrap();
         }
         let secret = secrets.0.lock()["SERVER_HANDSHAKE_TRAFFIC_SECRET"].clone();
         let bad = mutate_record(&flight[index], &secret, (index - 2) as u64, |plaintext| {
@@ -231,7 +233,7 @@ fn certificate_verify_and_server_finished_must_verify() {
             plaintext[offset] ^= 1;
         });
         let mutated_flight = [bad, flight[index + 1..].concat()].concat();
-        let error = feed_reality_client_connection(&mut client, &mutated_flight).unwrap_err();
+        let error = client.feed(&mutated_flight).unwrap_err();
         assert_eq!(error.kind(), kind);
         assert!(client.is_handshaking());
         assert!(client.reader().fill_buf().is_err());
@@ -272,13 +274,9 @@ fn authentication_policy_and_client_share_variants() {
             crypto.kx_groups.pop();
         }
         let schemes = crypto.signature_verification_algorithms.supported_schemes();
-        let mut client = RealityClientConnection::with_options(
-            cc,
-            crypto,
-            schemes,
-            Arc::new(rustls::NoKeyLog {}),
-        )
-        .unwrap();
+        let mut client = cc
+            .create_connection_with_options(crypto, schemes, Arc::new(rustls::NoKeyLog {}))
+            .unwrap();
         let mut hello = Vec::new();
         client.write_tls(&mut hello).unwrap();
         if case == "tampered-hello" {
@@ -299,17 +297,16 @@ fn authentication_policy_and_client_share_variants() {
             hello[44..76].copy_from_slice(&session);
             sc.max_time_diff = Some(60_000);
         }
-        let mut server = RealityServerConnection::new(sc).unwrap();
-        let result = server.validate_client_hello(&hello);
+        let result = sc.authenticate_client_hello(&hello);
         if matches!(case, "valid" | "plain-only" | "hybrid-only") {
-            result.unwrap();
+            let authenticated = result.unwrap();
             let group = if case == "plain-only" {
                 RealityGroup::X25519
             } else {
                 RealityGroup::X25519MlKem768
             };
-            server
-                .build_server_response(&target_records(
+            let mut server = authenticated
+                .into_connection(&target_records(
                     group,
                     CipherSuite::AES_128_GCM_SHA256,
                     &hello[44..76],
@@ -317,10 +314,10 @@ fn authentication_policy_and_client_share_variants() {
                 .unwrap();
             let mut flight = Vec::new();
             server.write_tls(&mut flight).unwrap();
-            feed_reality_client_connection(&mut client, &flight).unwrap();
+            client.feed(&flight).unwrap();
             flight.clear();
             client.write_tls(&mut flight).unwrap();
-            feed_reality_server_connection(&mut server, &flight).unwrap();
+            server.feed(&flight).unwrap();
             assert!(!server.is_handshaking());
         } else {
             assert_eq!(
@@ -328,7 +325,6 @@ fn authentication_policy_and_client_share_variants() {
                 io::ErrorKind::PermissionDenied,
                 "{case}"
             );
-            assert!(!server.wants_write());
         }
     }
 }
@@ -337,17 +333,17 @@ fn authentication_policy_and_client_share_variants() {
 fn rejected_client_finished_never_completes_handshake() {
     let secrets = Arc::new(Secrets::default());
     let (mut client, mut server, flight) = pending_pair(secrets.clone(), false);
-    feed_reality_client_connection(&mut client, &flight.concat()).unwrap();
+    client.feed(&flight.concat()).unwrap();
     let mut wire = Vec::new();
     client.write_tls(&mut wire).unwrap();
     let secret = secrets.0.lock()["CLIENT_HANDSHAKE_TRAFFIC_SECRET"].clone();
     for record in records(&wire) {
         if record[0] == 20 {
-            feed_reality_server_connection(&mut server, &record).unwrap();
+            server.feed(&record).unwrap();
             continue;
         }
         let bad = mutate_record(&record, &secret, 0, |plaintext| plaintext[4] ^= 1);
-        let error = feed_reality_server_connection(&mut server, &bad).unwrap_err();
+        let error = server.feed(&bad).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(server.is_handshaking());
         assert!(server.reader().fill_buf().is_err());
@@ -362,7 +358,7 @@ fn server_hello_must_echo_session_and_select_offered_cipher() {
         let (mut client, _, flight) = pending_pair(Arc::default(), false);
         let mut hello = flight[0].to_vec();
         hello[offset] ^= 1;
-        assert!(feed_reality_client_connection(&mut client, &hello).is_err());
+        assert!(client.feed(&hello).is_err());
         assert!(client.is_handshaking());
         assert!(!client.wants_write());
     }
@@ -376,28 +372,26 @@ fn target_selection_is_an_allowlist_not_local_preference() {
         if allowed {
             sc.cipher_suites = cc.cipher_suites.clone();
         }
-        let mut client = RealityClientConnection::new(cc).unwrap();
-        let mut server = RealityServerConnection::new(sc).unwrap();
+        let mut client = cc.create_connection().unwrap();
         let mut hello = Vec::new();
         client.write_tls(&mut hello).unwrap();
-        server.validate_client_hello(&hello).unwrap();
+        let authenticated = sc.authenticate_client_hello(&hello).unwrap();
         let target = target_records(
             RealityGroup::X25519,
             CipherSuite::AES_256_GCM_SHA384,
             &hello[44..76],
         );
-        let result = server.build_server_response(&target);
+        let result = authenticated.into_connection(&target);
         if allowed {
-            result.unwrap();
+            let mut server = result.unwrap();
             let mut wire = Vec::new();
             server.write_tls(&mut wire).unwrap();
             // This fixture has supported_versions before key_share; preserve every byte preceding the share.
             assert_eq!(&wire[..90], &target[0][..90]);
-            feed_reality_client_connection(&mut client, &wire).unwrap();
+            client.feed(&wire).unwrap();
             assert!(!client.is_handshaking());
         } else {
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
-            assert!(!server.wants_write());
         }
     }
 }
@@ -415,46 +409,47 @@ fn rejected_templates_never_queue_synthetic_output() {
         "unknown-extension",
     ] {
         let (cc, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
-        let mut client = RealityClientConnection::new(cc).unwrap();
-        let mut server = RealityServerConnection::new(sc).unwrap();
+        let mut client = cc.create_connection().unwrap();
         let mut hello = Vec::new();
         client.write_tls(&mut hello).unwrap();
-        server.validate_client_hello(&hello).unwrap();
+        let authenticated = sc.authenticate_client_hello(&hello).unwrap();
         let mut target = separate_target_records(
             RealityGroup::X25519,
             CipherSuite::AES_128_GCM_SHA256,
             &hello[44..76],
         );
-        let (index, offset) = match case {
-            "ccs" => (1, 5),
-            "version" => (2, 2),
-            "type" => (2, 0),
-            "length" => (3, 4),
-            "session" => (0, 44),
-            "unknown-extension" => (0, 81),
+        let mutation = match case {
+            "ccs" => Some((1, 5)),
+            "version" => Some((2, 2)),
+            "type" => Some((2, 0)),
+            "length" => Some((3, 4)),
+            "session" => Some((0, 44)),
+            "unknown-extension" => {
+                target[0] = target_with_unknown_extension(&target[0]);
+                None
+            }
             "short" => {
                 target[3] = Bytes::from_static(&[
                     23, 3, 3, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ]);
-                (3, 5)
+                Some((3, 5))
             }
             "extra" => {
                 target.extend([target[5].clone(), target[5].clone()]);
-                (7, 5)
+                Some((7, 5))
             }
             _ => unreachable!(),
         };
-        let mut bad = target[index].to_vec();
-        bad[offset] ^= 1;
-        target[index] = bad.into();
+        if let Some((index, offset)) = mutation {
+            let mut bad = target[index].to_vec();
+            bad[offset] ^= 1;
+            target[index] = bad.into();
+        }
         assert_eq!(
-            server.build_server_response(&target).unwrap_err().kind(),
+            authenticated.into_connection(&target).unwrap_err().kind(),
             io::ErrorKind::Unsupported,
             "{case}"
         );
-        let mut output = Vec::new();
-        server.write_tls(&mut output).unwrap();
-        assert!(output.is_empty(), "{case}");
     }
 }
 
@@ -462,7 +457,7 @@ fn rejected_templates_never_queue_synthetic_output() {
 fn authenticated_invalid_tls_shares_forward_before_commit() {
     use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
     let (cc, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
-    let mut client = RealityClientConnection::new(cc).unwrap();
+    let mut client = cc.create_connection().unwrap();
     let mut hello = Vec::new();
     client.write_tls(&mut hello).unwrap();
     let shares = super::reality_key_exchange::extract_client_key_shares(&hello).unwrap();
@@ -488,18 +483,13 @@ fn authenticated_invalid_tls_shares_forward_before_commit() {
         payload[8..].fill(1);
         let session = encrypt_session_id(&payload, &auth, &hello[31..43], &aad).unwrap();
         hello[44..76].copy_from_slice(&session);
-        let mut server = RealityServerConnection::new(sc.clone()).unwrap();
-        server.validate_client_hello(&hello).unwrap();
-        let result = server.build_server_response(&target_records(
+        let authenticated = sc.clone().authenticate_client_hello(&hello).unwrap();
+        let result = authenticated.into_connection(&target_records(
             RealityGroup::X25519MlKem768,
             CipherSuite::AES_128_GCM_SHA256,
             &session,
         ));
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
-        assert!(!server.wants_write());
-        let mut output = Vec::new();
-        server.write_tls(&mut output).unwrap();
-        assert!(output.is_empty());
     }
 }
 
@@ -510,10 +500,10 @@ fn tcp_eof_without_close_notify_is_not_clean_tls_eof() {
     server.writer().write_all(b"response").unwrap();
     let mut wire = Vec::new();
     client.write_tls(&mut wire).unwrap();
-    feed_reality_server_connection(&mut server, &wire).unwrap();
+    server.feed(&wire).unwrap();
     wire.clear();
     server.write_tls(&mut wire).unwrap();
-    feed_reality_client_connection(&mut client, &wire).unwrap();
+    client.feed(&wire).unwrap();
     assert_eq!(client.read_tls(&mut io::empty()).unwrap(), 0);
     assert_eq!(server.read_tls(&mut io::empty()).unwrap(), 0);
     let mut response = [0; 8];
