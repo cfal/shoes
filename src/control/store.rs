@@ -366,7 +366,7 @@ mod tests {
         symlink(&target, &path).unwrap();
         assert!(SelectionStore::open(&path).is_err());
         std::fs::remove_file(&path).unwrap();
-        std::fs::remove_file(lock_path(&path)).unwrap();
+        assert!(!lock_path(&path).exists());
         symlink(&target, lock_path(&path)).unwrap();
         assert!(SelectionStore::open(&path).is_err());
         assert!(!target.exists());

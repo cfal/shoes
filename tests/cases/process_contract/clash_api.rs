@@ -14,6 +14,69 @@ use tokio_util::task::AbortOnDropHandle;
 
 const SECRET: &str = "controller-test-secret";
 
+#[tokio::test]
+async fn controller_accept_recovers_after_descriptor_exhaustion() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let address = available_address();
+    let socket = directory.path().join("api.sock");
+    let config = directory.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        serde_yaml::to_string(&json!([
+            {"clash_api_address":format!("0.0.0.0:{}",address.port()),"secret":SECRET},
+            {"clash_api_path":socket,"secret":SECRET}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shoes"));
+    command
+        .args(["-t", "1", "--no-reload"])
+        .arg(&config)
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 48,
+                rlim_max: 48,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut process = Process::from_child(command.spawn().unwrap());
+    process.wait_for("Servers ready").await;
+    let mut tcp = Vec::new();
+    for _ in 0..64 {
+        tcp.push(TcpStream::connect(address).await.unwrap());
+    }
+    process.wait_for("Clash API TCP accept failed").await;
+    let unix = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    process.wait_for("Clash API Unix accept failed").await;
+    drop(tcp);
+    drop(unix);
+    assert_eq!(api(address, "GET", "/version", Value::Null).await.0, 200);
+    let (status, _, _) = request_io(
+        tokio::net::UnixStream::connect(&socket).await.unwrap(),
+        "GET",
+        "/version",
+        Value::Null,
+        &[("Authorization", &format!("Bearer {SECRET}"))],
+    )
+    .await;
+    assert_eq!(status, 200);
+    process.signal(libc::SIGTERM);
+    assert!(process.exit().await.success());
+}
+
 async fn request_io<T>(
     stream: T,
     method: &str,
@@ -330,8 +393,23 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
 
 #[tokio::test]
 async fn auth_errors_rules_providers_and_outbound_probes() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
+    let mut unused = super::wireguard_support::client(51820);
+    unused["client_proxies"][0]["name"] = json!("inactive-wireguard");
+    unused["client_proxies"][0]["address"] = json!("unresolvable.invalid:51820");
+    fixture.config.as_array_mut().unwrap().push(unused);
     let mut process = fixture.start().await;
+    assert_eq!(
+        api(
+            fixture.api,
+            "GET",
+            "/proxies/inactive-wireguard/delay?url=http%3A%2F%2F192.0.2.1%2F&timeout=1000",
+            Value::Null
+        )
+        .await
+        .0,
+        503
+    );
     for path in [
         "/",
         "/proxies",
@@ -423,7 +501,7 @@ async fn auth_errors_rules_providers_and_outbound_probes() {
     let (status, delays) = api(
         fixture.api,
         "GET",
-        "/group/outbound/delay?url=http%3A%2F%2F192.0.2.100%2F&timeout=1000",
+        "/group/outbound/delay?url=http%3A%2F%2Fproxy-only.invalid%2F&timeout=1000",
         Value::Null,
     )
     .await;
@@ -619,6 +697,7 @@ async fn shared_rates_live_connection_snapshots_and_ndjson_streams() {
     assert_eq!(rate, frame(&mut other_rates).await);
     assert_eq!(rate["upTotal"], 8);
     assert!(rate["up"].as_u64().unwrap() > 0);
+    assert_eq!(frame(&mut memory).await["inuse"], 0);
     assert!(frame(&mut memory).await["inuse"].as_u64().unwrap() > 0);
     let snapshot = frame(&mut connections).await;
     assert_eq!(snapshot["connections"][0]["upload"], 8);
