@@ -25,141 +25,9 @@ pub async fn serve(
         Err(status) => return Ok(error(status, "Origin is not allowed")),
     };
     let mut response = if request.method() == Method::OPTIONS {
-        match auth::preflight(&request, &config) {
-            Ok(()) => {
-                let mut response = no_content();
-                response.headers_mut().insert(
-                    "access-control-allow-methods",
-                    "GET, POST, PUT, PATCH, DELETE".parse().unwrap(),
-                );
-                response.headers_mut().insert(
-                    "access-control-allow-headers",
-                    "Authorization, Content-Type".parse().unwrap(),
-                );
-                response
-                    .headers_mut()
-                    .insert("access-control-max-age", "300".parse().unwrap());
-                if config.allow_private_network {
-                    response.headers_mut().insert(
-                        "access-control-allow-private-network",
-                        "true".parse().unwrap(),
-                    );
-                }
-                response
-            }
-            Err(status) => error(status, "CORS preflight rejected"),
-        }
+        preflight(&request, &config)
     } else {
-        let segments = segments(request.uri().path());
-        let supported_stream = segments.as_ref().is_ok_and(|parts| {
-            parts.len() == 1
-                && ["connections", "traffic", "memory", "logs"].contains(&parts[0].as_str())
-        });
-        let websocket = request.method() == Method::GET
-            && supported_stream
-            && hyper_tungstenite::is_upgrade_request(&request);
-        if !auth::authenticated(&request, &config, websocket) {
-            error(StatusCode::UNAUTHORIZED, "Unauthorized")
-        } else {
-            let body = tokio::time::timeout(
-                Duration::from_secs(10),
-                http_body_util::Limited::new(request.body_mut(), 64 * 1024).collect(),
-            )
-            .await;
-            let body = match body {
-                Ok(Ok(body)) => body.to_bytes(),
-                result => {
-                    let mut response = match result {
-                        Err(_) => error(
-                            StatusCode::REQUEST_TIMEOUT,
-                            "request body deadline exceeded",
-                        ),
-                        _ => error(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "request body exceeds 64 KiB or is incomplete",
-                        ),
-                    };
-                    auth::cors(response.headers_mut(), origin.as_deref());
-                    response
-                        .headers_mut()
-                        .insert("connection", "close".parse().unwrap());
-                    return Ok(response);
-                }
-            };
-            let query = url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes())
-                .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                .collect::<HashMap<_, _>>();
-            match segments {
-                Err(()) => error(StatusCode::BAD_REQUEST, "invalid path encoding"),
-                Ok(parts)
-                    if supported_stream
-                        && request.method() == Method::GET
-                        && (websocket || parts[0] != "connections") =>
-                {
-                    match streams::Subscription::parse(&parts[0], &query) {
-                        Err(error_value) => {
-                            error(StatusCode::BAD_REQUEST, &error_value.to_string())
-                        }
-                        Ok(subscription) => {
-                            match state.runtime.subscribers.clone().try_acquire_owned() {
-                                Err(_) => error(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    "subscription limit reached",
-                                ),
-                                Ok(permit) if websocket => {
-                                    let mut websocket_config = hyper_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-                                    websocket_config.max_message_size = Some(64 * 1024);
-                                    websocket_config.max_frame_size = Some(64 * 1024);
-                                    match hyper_tungstenite::upgrade(
-                                        &mut request,
-                                        Some(websocket_config),
-                                    ) {
-                                        Ok((response, websocket)) => {
-                                            state.tasks.spawn(streams::websocket(
-                                                state.clone(),
-                                                websocket,
-                                                subscription,
-                                                permit,
-                                                connection_permit,
-                                            ));
-                                            response.map(|body| {
-                                                body.map_err(|never| match never {}).boxed_unsync()
-                                            })
-                                        }
-                                        Err(_) => error(
-                                            StatusCode::BAD_REQUEST,
-                                            "invalid WebSocket upgrade",
-                                        ),
-                                    }
-                                }
-                                Ok(permit) => {
-                                    let (sender, receiver) = tokio::sync::mpsc::channel(1);
-                                    state.tasks.spawn(streams::http(
-                                        state.clone(),
-                                        sender,
-                                        subscription,
-                                        connection,
-                                        permit,
-                                    ));
-                                    let stream =
-                                        futures::stream::unfold(receiver, |mut receiver| async {
-                                            receiver.recv().await.map(|frame| (frame, receiver))
-                                        });
-                                    Response::builder()
-                                        .header("content-type", "application/json")
-                                        .header("cache-control", "no-cache")
-                                        .body(
-                                            http_body_util::StreamBody::new(stream).boxed_unsync(),
-                                        )
-                                        .unwrap()
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(parts) => route(request.method(), &parts, &query, &body, &state).await,
-            }
-        }
+        dispatch(&mut request, &config, &state, connection, connection_permit).await
     };
     auth::cors(response.headers_mut(), origin.as_deref());
     if response.status().is_client_error()
@@ -171,6 +39,133 @@ pub async fn serve(
             .insert("connection", "close".parse().unwrap());
     }
     Ok(response)
+}
+
+fn preflight<B>(request: &Request<B>, config: &ClashApiConfig) -> Response<Body> {
+    if let Err(status) = auth::preflight(request, config) {
+        return error(status, "CORS preflight rejected");
+    }
+    let mut response = no_content();
+    response.headers_mut().insert(
+        "access-control-allow-methods",
+        "GET, POST, PUT, PATCH, DELETE".parse().unwrap(),
+    );
+    response.headers_mut().insert(
+        "access-control-allow-headers",
+        "Authorization, Content-Type".parse().unwrap(),
+    );
+    response
+        .headers_mut()
+        .insert("access-control-max-age", "300".parse().unwrap());
+    if config.allow_private_network {
+        response.headers_mut().insert(
+            "access-control-allow-private-network",
+            "true".parse().unwrap(),
+        );
+    }
+    response
+}
+
+async fn dispatch(
+    request: &mut Request<Incoming>,
+    config: &ClashApiConfig,
+    state: &Arc<ApiState>,
+    connection: CancellationToken,
+    connection_permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Response<Body> {
+    let segments = segments(request.uri().path());
+    let supported_stream = segments.as_ref().is_ok_and(|parts| {
+        parts.len() == 1
+            && ["connections", "traffic", "memory", "logs"].contains(&parts[0].as_str())
+    });
+    let websocket = request.method() == Method::GET
+        && supported_stream
+        && hyper_tungstenite::is_upgrade_request(request);
+    if !auth::authenticated(request, config, websocket) {
+        return error(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    let body = tokio::time::timeout(
+        Duration::from_secs(10),
+        http_body_util::Limited::new(request.body_mut(), 64 * 1024).collect(),
+    )
+    .await;
+    let body = match body {
+        Ok(Ok(body)) => body.to_bytes(),
+        Err(_) => {
+            return error(
+                StatusCode::REQUEST_TIMEOUT,
+                "request body deadline exceeded",
+            );
+        }
+        Ok(Err(_)) => {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds 64 KiB or is incomplete",
+            );
+        }
+    };
+    let query = url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<HashMap<_, _>>();
+    let parts = match segments {
+        Ok(parts) => parts,
+        Err(()) => return error(StatusCode::BAD_REQUEST, "invalid path encoding"),
+    };
+    let is_subscription = supported_stream
+        && request.method() == Method::GET
+        && (websocket || parts[0] != "connections");
+    if !is_subscription {
+        return route(request.method(), &parts, &query, &body, state).await;
+    }
+    let subscription = match streams::Subscription::parse(&parts[0], &query) {
+        Ok(subscription) => subscription,
+        Err(error_value) => return error(StatusCode::BAD_REQUEST, &error_value.to_string()),
+    };
+    let permit = match state.runtime.subscribers.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "subscription limit reached",
+            );
+        }
+    };
+    if websocket {
+        let mut websocket_config =
+            hyper_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        websocket_config.max_message_size = Some(64 * 1024);
+        websocket_config.max_frame_size = Some(64 * 1024);
+        match hyper_tungstenite::upgrade(request, Some(websocket_config)) {
+            Ok((response, websocket)) => {
+                state.tasks.spawn(streams::websocket(
+                    state.clone(),
+                    websocket,
+                    subscription,
+                    permit,
+                    connection_permit,
+                ));
+                response.map(|body| body.map_err(|never| match never {}).boxed_unsync())
+            }
+            Err(_) => error(StatusCode::BAD_REQUEST, "invalid WebSocket upgrade"),
+        }
+    } else {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        state.tasks.spawn(streams::http(
+            state.clone(),
+            sender,
+            subscription,
+            connection,
+            permit,
+        ));
+        let stream = futures::stream::unfold(receiver, |mut receiver| async {
+            receiver.recv().await.map(|frame| (frame, receiver))
+        });
+        Response::builder()
+            .header("content-type", "application/json")
+            .header("cache-control", "no-cache")
+            .body(http_body_util::StreamBody::new(stream).boxed_unsync())
+            .unwrap()
+    }
 }
 
 fn segments(path: &str) -> Result<Vec<String>, ()> {

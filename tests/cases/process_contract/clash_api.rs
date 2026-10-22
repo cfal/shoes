@@ -526,6 +526,103 @@ async fn auth_errors_rules_providers_and_outbound_probes() {
 }
 
 #[tokio::test]
+async fn controller_dispatch_preserves_preflight_and_error_ordering() {
+    let fixture = Fixture::new().await;
+    let mut process = fixture.start().await;
+    let origin = "https://dashboard.example";
+    for (method, status) in [("PUT", 204), ("TRACE", 403)] {
+        let (actual, headers, _) = request_io(
+            TcpStream::connect(fixture.api).await.unwrap(),
+            "OPTIONS",
+            "/proxies/outbound",
+            Value::Null,
+            &[
+                ("Origin", origin),
+                ("Access-Control-Request-Method", method),
+            ],
+        )
+        .await;
+        assert_eq!(actual, status);
+        assert_eq!(headers["access-control-allow-origin"], origin);
+        assert_eq!(headers["connection"], "close");
+        if status == 204 {
+            assert_eq!(
+                headers["access-control-allow-methods"],
+                "GET, POST, PUT, PATCH, DELETE"
+            );
+            assert_eq!(
+                headers["access-control-allow-headers"],
+                "Authorization, Content-Type"
+            );
+            assert_eq!(headers["access-control-max-age"], "300");
+        }
+    }
+
+    let authorization = format!("Bearer {SECRET}");
+    for (path, authenticated, status, message) in [
+        ("/%FF", false, 401, "Unauthorized"),
+        ("/%FF", true, 400, "invalid path encoding"),
+        (
+            "/version?token=controller-test-secret",
+            false,
+            401,
+            "Unauthorized",
+        ),
+        (
+            "/traffic?interval=invalid",
+            true,
+            400,
+            "invalid stream parameters",
+        ),
+    ] {
+        let mut headers = vec![("Origin", origin)];
+        if authenticated {
+            headers.push(("Authorization", authorization.as_str()));
+        }
+        let (actual, headers, body) = request_io(
+            TcpStream::connect(fixture.api).await.unwrap(),
+            "GET",
+            path,
+            Value::Null,
+            &headers,
+        )
+        .await;
+        assert_eq!(actual, status, "{path}");
+        assert_eq!(body["message"], message);
+        assert_eq!(headers["access-control-allow-origin"], origin);
+        assert_eq!(headers["connection"], "close");
+    }
+
+    let (status, headers, body) = request_io(
+        TcpStream::connect(fixture.api).await.unwrap(),
+        "PUT",
+        "/%FF",
+        json!({"name": "x".repeat(65 * 1024)}),
+        &[("Origin", origin), ("Authorization", &authorization)],
+    )
+    .await;
+    assert_eq!(status, 413);
+    assert_eq!(
+        body["message"],
+        "request body exceeds 64 KiB or is incomplete"
+    );
+    assert_eq!(headers["access-control-allow-origin"], origin);
+    assert_eq!(headers["connection"], "close");
+    assert_eq!(
+        api(
+            fixture.api,
+            "GET",
+            "/connections?interval=invalid",
+            Value::Null
+        )
+        .await
+        .0,
+        200
+    );
+    fixture.stop(&mut process).await;
+}
+
+#[tokio::test]
 async fn defaults_follow_config_without_cache_writes_and_controller_changes_reject_reload() {
     let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
