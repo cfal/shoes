@@ -119,7 +119,8 @@ pub async fn setup_reality_server_stream(
         cipher_suites: target.cipher_suites.clone(),
     };
 
-    let auth_result = reality_config.authenticate_client_hello(client_hello_frame);
+    let auth_result =
+        reality_config.authenticate_client_hello(&parsed_client_hello.client_hello_record);
 
     let TargetFlight {
         records: dest_records,

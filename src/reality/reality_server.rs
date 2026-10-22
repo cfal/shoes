@@ -135,7 +135,14 @@ impl AuthenticatedClientHello {
             rustls::ServerConnection::new_reality(Arc::new(config), prepared).map_err(tls_error)?;
         // Stage the complete flight without socket access. On failure even queued alerts are discarded.
         let mut staged = TlsConnection::new_reality(server);
-        staged.feed(&self.record).map_err(|error| {
+        // A ClientHello reassembled from several records can exceed one record's limit.
+        let mut hello_records = Vec::with_capacity(self.record.len() + 5 * (hello.len() / 16384));
+        for fragment in hello.chunks(16384) {
+            hello_records.extend_from_slice(&self.record[..3]);
+            hello_records.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
+            hello_records.extend_from_slice(fragment);
+        }
+        staged.feed(&hello_records).map_err(|error| {
             if error.kind() == io::ErrorKind::Unsupported {
                 io::Error::new(
                     io::ErrorKind::Unsupported,

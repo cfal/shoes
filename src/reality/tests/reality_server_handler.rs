@@ -474,31 +474,35 @@ async fn authenticated_non_vision_oversized_preread_returns_error_without_panick
         ),
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-    let (io, mut peer) = tokio::io::duplex(65540);
-    let mut flight = hello.clone();
-    flight.extend_from_slice(&[0x17, 0x03, 0x03, 0, 1, 0].repeat(6000));
-    peer.write_all(&flight).await.unwrap();
-    let mut io: Box<dyn AsyncStream> = Box::new(io);
-    let parsed = crate::shadow_tls::read_client_hello(&mut io).await.unwrap();
-    assert!(parsed.client_reader.unparsed_data().len() > 33290);
+    // A ClientHello split across records authenticates like a single-record one, while
+    // dest still receives the client's records unchanged.
+    for wire_hello in [hello.clone(), crate::sniff::tests::records(&hello, 100)] {
+        let (io, mut peer) = tokio::io::duplex(65540);
+        let mut flight = wire_hello.clone();
+        flight.extend_from_slice(&[0x17, 0x03, 0x03, 0, 1, 0].repeat(6000));
+        peer.write_all(&flight).await.unwrap();
+        let mut io: Box<dyn AsyncStream> = Box::new(io);
+        let parsed = crate::shadow_tls::read_client_hello(&mut io).await.unwrap();
+        assert!(parsed.client_reader.unparsed_data().len() > 33290);
 
-    let decoy_io = async {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut forwarded_hello = vec![0; hello.len()];
-        socket.read_exact(&mut forwarded_hello).await.unwrap();
-        assert_eq!(forwarded_hello, hello);
-        socket.write_all(&response).await.unwrap();
-    };
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::join!(
-            setup_reality_server_stream(io, &target, parsed, &resolver),
-            decoy_io,
-        )
-    })
-    .await
-    .unwrap();
-    let error = result.err().expect("invalid encrypted records must fail");
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        let decoy_io = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut forwarded_hello = vec![0; wire_hello.len()];
+            socket.read_exact(&mut forwarded_hello).await.unwrap();
+            assert_eq!(forwarded_hello, wire_hello);
+            socket.write_all(&response).await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                setup_reality_server_stream(io, &target, parsed, &resolver),
+                decoy_io,
+            )
+        })
+        .await
+        .unwrap();
+        let error = result.err().expect("invalid encrypted records must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
 }
 
 #[tokio::test]

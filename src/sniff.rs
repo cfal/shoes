@@ -151,7 +151,7 @@ pub(crate) mod tests {
         bytes
     }
 
-    fn records(bytes: &[u8], chunk: usize) -> Vec<u8> {
+    pub(crate) fn records(bytes: &[u8], chunk: usize) -> Vec<u8> {
         let mut handshake = Vec::new();
         let mut remaining = bytes;
         while !remaining.is_empty() {
@@ -168,7 +168,7 @@ pub(crate) mod tests {
         result
     }
 
-    fn extend_hello(mut bytes: Vec<u8>, extensions: &[u8]) -> Vec<u8> {
+    pub(crate) fn extend_hello(mut bytes: Vec<u8>, extensions: &[u8]) -> Vec<u8> {
         assert_eq!(
             bytes.len(),
             5 + u16::from_be_bytes([bytes[3], bytes[4]]) as usize

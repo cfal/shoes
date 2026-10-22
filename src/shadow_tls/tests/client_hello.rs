@@ -2,9 +2,6 @@ use super::*;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-const SNI: u16 = 0x0000;
-const SUPPORTED_VERSIONS: u16 = 0x002b;
-
 fn extension(kind: u16, data: &[u8]) -> Vec<u8> {
     let mut bytes = kind.to_be_bytes().to_vec();
     bytes.extend_from_slice(&u16::try_from(data.len()).unwrap().to_be_bytes());
@@ -18,13 +15,13 @@ fn server_name(name_type: u8, name: &[u8]) -> Vec<u8> {
     entry.extend_from_slice(name);
     let mut list = u16::try_from(entry.len()).unwrap().to_be_bytes().to_vec();
     list.extend_from_slice(&entry);
-    extension(SNI, &list)
+    extension(TLS_EXT_SERVER_NAME, &list)
 }
 
 fn supported_versions(versions: &[[u8; 2]]) -> Vec<u8> {
     let mut list = vec![u8::try_from(versions.len() * 2).unwrap()];
     list.extend(versions.iter().flatten());
-    extension(SUPPORTED_VERSIONS, &list)
+    extension(TLS_EXT_SUPPORTED_VERSIONS, &list)
 }
 
 fn handshake_body(session_id: &[u8], extensions: &[u8]) -> Vec<u8> {
@@ -176,6 +173,20 @@ async fn malformed_hellos_are_rejected() {
     let mut short_session_id = vec![3, 3];
     short_session_id.extend_from_slice(&[0x11; 32]);
     short_session_id.extend_from_slice(&[32, 1, 2, 3]);
+    let set_extension_len = |mut bytes: Vec<u8>, len: usize| {
+        bytes[2..4].copy_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+        bytes
+    };
+    let name = server_name(0, b"front.example");
+    let name_overrun = set_extension_len(name.clone(), name.len() - 4 - 4);
+    let mut name_trailing = name.clone();
+    name_trailing.push(0);
+    let name_trailing = set_extension_len(name_trailing, name.len() - 4 + 1);
+    let mut versions_overrun = extension(TLS_EXT_SUPPORTED_VERSIONS, &[4, 3, 4]);
+    versions_overrun.extend(extension(0xff01, &[0]));
+    let mut versions_trailing = supported_versions(&[[3, 4]]);
+    versions_trailing.push(0);
+    let versions_trailing = set_extension_len(versions_trailing, 4);
 
     let cases = [
         ("wrong content type", wrong_content_type),
@@ -201,11 +212,31 @@ async fn malformed_hellos_are_rejected() {
         ),
         (
             "odd supported_versions length",
-            client_hello(&[], &extension(SUPPORTED_VERSIONS, &odd_versions)),
+            client_hello(&[], &extension(TLS_EXT_SUPPORTED_VERSIONS, &odd_versions)),
         ),
         (
             "session id overruns the hello",
             record(HANDSHAKE_TYPE_CLIENT_HELLO, &short_session_id),
+        ),
+        (
+            "server name overruns its extension",
+            client_hello(&[], &name_overrun),
+        ),
+        (
+            "server name extension with trailing bytes",
+            client_hello(&[], &name_trailing),
+        ),
+        (
+            "empty server name list",
+            client_hello(&[], &extension(TLS_EXT_SERVER_NAME, &[0, 0])),
+        ),
+        (
+            "supported_versions overruns its extension",
+            client_hello(&[], &versions_overrun),
+        ),
+        (
+            "supported_versions with trailing bytes",
+            client_hello(&[], &versions_trailing),
         ),
     ];
     for (name, bytes) in cases {
@@ -218,5 +249,57 @@ async fn truncated_records_are_rejected_at_eof() {
     let hello = client_hello(&[7; 32], &server_name(0, b"front.example"));
     for len in [0, 1, TLS_HEADER_LEN, TLS_HEADER_LEN + 1, hello.len() - 1] {
         assert!(parse(&hello[..len]).await.is_err(), "{len}-byte prefix");
+    }
+}
+
+#[tokio::test]
+async fn hellos_split_across_records_are_reassembled() {
+    let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+    for chunk in [1, 2, 3, 4, 137] {
+        let split = crate::sniff::tests::records(&hello, chunk);
+        let parsed = parse(&split).await.unwrap();
+        assert_eq!(parsed.client_hello_frame, split, "chunk={chunk}");
+        assert_eq!(parsed.client_hello_record, hello, "chunk={chunk}");
+        assert_eq!(
+            parsed.requested_server_name.as_deref(),
+            Some("sniff.example")
+        );
+        assert!(parsed.supports_tls13);
+        // ShadowTLS authenticates its digest within a single record.
+        assert!(parsed.parsed_digest.is_none(), "chunk={chunk}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_record_framing_is_rejected() {
+    let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+    let split = crate::sniff::tests::records(&hello, 100);
+    let mut interleaved = split[..105].to_vec();
+    interleaved.extend_from_slice(&[0x14, 3, 3, 0, 1, 1]);
+    interleaved.extend_from_slice(&split[105..]);
+    let mut empty_record = split[..105].to_vec();
+    empty_record.extend_from_slice(&[CONTENT_TYPE_HANDSHAKE, 3, 1, 0, 0]);
+    empty_record.extend_from_slice(&split[105..]);
+    let mut trailing = hello.clone();
+    trailing.push(HANDSHAKE_TYPE_CLIENT_HELLO);
+    let record_len = u16::from_be_bytes([trailing[3], trailing[4]]) + 1;
+    trailing[3..5].copy_from_slice(&record_len.to_be_bytes());
+    for (name, bytes) in [
+        ("non-handshake record inside the hello", interleaved),
+        ("empty handshake record", empty_record),
+        ("handshake data after the hello", trailing),
+        (
+            "hello longer than one record can carry",
+            vec![CONTENT_TYPE_HANDSHAKE, 3, 1, 0, 4, 1, 1, 0, 0],
+        ),
+    ] {
+        let Err(error) = parse(&bytes).await else {
+            panic!("{name} was accepted");
+        };
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "{name}: {error}"
+        );
     }
 }
