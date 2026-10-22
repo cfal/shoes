@@ -818,22 +818,31 @@ impl AnyTlsSession {
                         result = &mut synack => result?,
                         _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => {
                             drop(client_stream);
-                            drop(stream);
                             // Finish the bounded control write; truncating a shared frame corrupts siblings.
                             let _ = synack.await;
+                            let _ = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
                             return Err(crate::control::tracked_stream::cancelled());
                         }
                     }
                 }
                 if let Some(data) = client_result.early_data {
-                    crate::control::tracked_stream::during_flow(
+                    if let Err(error) = crate::control::tracked_stream::during_flow(
                         flow.as_deref(),
                         setup_timeout(async {
                             stream.write_all(&data).await?;
                             stream.flush().await
                         }),
                     )
-                    .await?;
+                    .await
+                    {
+                        drop(client_stream);
+                        if flow.as_ref().is_some_and(|flow| flow.cancel.is_cancelled()) {
+                            let _ =
+                                tokio::time::timeout(Duration::from_millis(250), stream.shutdown())
+                                    .await;
+                        }
+                        return Err(error);
+                    }
                 }
                 if !routed.prefix.is_empty() {
                     setup_timeout(async {
@@ -1494,6 +1503,12 @@ mod tests {
                 None,
             );
             session.peer_version.store(2, Ordering::Relaxed);
+            while session.outgoing_tx.capacity() > 0 {
+                session
+                    .outgoing_tx
+                    .try_send((2, Bytes::from_static(b"queued")))
+                    .unwrap();
+            }
             let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
             let target = NetLocation::from_str(
                 &format!("127.0.0.1:{}", listener.local_addr().unwrap().port()),
@@ -1528,6 +1543,19 @@ mod tests {
                 header.as_slice(),
                 Frame::control(Command::SynAck, 1).encode().as_ref()
             );
+            let mut outgoing = session.outgoing_rx.lock().await;
+            loop {
+                let (id, data) = outgoing.recv().await.unwrap();
+                if id == 1 {
+                    assert!(
+                        data.is_empty(),
+                        "cancelled stream must queue FIN after SYNACK"
+                    );
+                    break;
+                }
+                assert_eq!((id, data), (2, Bytes::from_static(b"queued")));
+            }
+            drop(outgoing);
             assert_eq!(
                 forwarding.await.unwrap().unwrap_err().kind(),
                 io::ErrorKind::ConnectionAborted
