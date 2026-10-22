@@ -887,6 +887,16 @@ mod tests {
         assert!(session.memory.reserve_packet(64, 0).is_some());
     }
 
+    const XHTTP_SUCCESS_HEADERS: [&str; 7] = [
+        "access-control-allow-origin",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+        "cache-control",
+        "content-type",
+        "x-accel-buffering",
+        "x-padding",
+    ];
+
     #[tokio::test]
     async fn header_and_path_mismatches_return_plain_404s_on_every_version() {
         tokio::time::timeout(Duration::from_secs(20), async {
@@ -937,15 +947,7 @@ mod tests {
                             StatusCode::NOT_FOUND,
                             "{version:?} {method} {path}"
                         );
-                        for name in [
-                            "access-control-allow-origin",
-                            "access-control-allow-methods",
-                            "access-control-allow-headers",
-                            "cache-control",
-                            "content-type",
-                            "x-accel-buffering",
-                            "x-padding",
-                        ] {
+                        for name in XHTTP_SUCCESS_HEADERS {
                             assert!(!response.headers().contains_key(name), "{name}");
                         }
                         assert_eq!(
@@ -1272,15 +1274,7 @@ mod tests {
                         .await
                         .unwrap();
                     assert_eq!(response.status(), status, "{version:?} {method} {path}");
-                    for header in [
-                        "x-padding",
-                        "x-accel-buffering",
-                        "access-control-allow-origin",
-                        "access-control-allow-methods",
-                        "access-control-allow-headers",
-                        "cache-control",
-                        "content-type",
-                    ] {
+                    for header in XHTTP_SUCCESS_HEADERS {
                         assert!(
                             !response.headers().contains_key(header),
                             "{version:?}: {header}"
@@ -3754,7 +3748,7 @@ impl State {
         Ok(session)
     }
 
-    fn response(&self, body: Body, downstream: bool) -> Response<Body> {
+    fn success_response(&self, body: Body, downstream: bool) -> Response<Body> {
         let mut response = Response::builder()
             .header("cache-control", "no-store")
             .header("x-accel-buffering", "no")
@@ -4244,7 +4238,7 @@ impl State {
                     .unwrap();
             }
         };
-        let mut response = self.response(body, downstream);
+        let mut response = self.success_response(body, downstream);
         if let Some(origin) = request
             .headers()
             .get("origin")
