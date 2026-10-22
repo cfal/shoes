@@ -77,7 +77,19 @@ pub fn validate_resources(validated: &ValidatedConfigs) -> io::Result<()> {
         if let Config::Server(server) = config {
             match &server.bind_location {
                 BindLocation::Path(path) if !paths.is_empty() => {
-                    if paths.contains(&absolute_path(path)?) {
+                    let parent = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or(std::path::Path::new("."));
+                    let parent = match parent.canonicalize() {
+                        Ok(parent) => parent,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if path
+                        .file_name()
+                        .is_some_and(|name| paths.contains(&parent.join(name)))
+                    {
                         return Err(io::Error::new(
                             io::ErrorKind::AddrInUse,
                             "proxy socket overlaps controller or state path",
@@ -131,7 +143,32 @@ mod tests {
             )
             .unwrap();
             let validated = crate::config::create_server_configs(configs).unwrap();
-            assert!(validate_resources(&validated).is_err());
+            let error = validate_resources(&validated).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+            assert_eq!(
+                error.to_string(),
+                "proxy socket overlaps controller or state path"
+            );
+        }
+    }
+
+    #[test]
+    fn state_reservations_do_not_restrict_unrelated_proxy_socket_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        for socket in [
+            directory.path().join("proxy.lock"),
+            directory.path().join("missing/proxy.sock"),
+        ] {
+            let configs = serde_yaml::from_str(
+                &serde_json::json!([
+                    {"cache_file_path":directory.path().join("cache.db")},
+                    {"path":socket,"protocol":{"type":"socks"},"rules":"allow-all-direct"}
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            let validated = crate::config::create_server_configs(configs).unwrap();
+            validate_resources(&validated).unwrap();
         }
     }
 }
