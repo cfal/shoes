@@ -24,6 +24,7 @@ pub(crate) async fn serve(
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
+    let peer = stream.peer_addr();
     let limit = resources::limits().max_streams_per_connection;
     let budget = Arc::new(Budget::new(limit));
     let mut connection = crate::util::timeout_stream_setup(async {
@@ -54,7 +55,8 @@ pub(crate) async fn serve(
             }
             accepted = connection.accept() => {
                 let Some(accepted) = accepted else { break };
-                let (request, mut respond) = accepted.map_err(io::Error::other)?;
+                let (mut request, mut respond) = accepted.map_err(io::Error::other)?;
+                if let Some(peer) = peer { request.extensions_mut().insert(peer); }
                 if auth_failed {
                     let _ = reject(&mut respond, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
                     continue;
@@ -167,7 +169,9 @@ async fn tunnel(
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
     let prepared = match PreparedTcp::new(&selector, target, Vec::new()) {
-        Ok(prepared) => prepared,
+        Ok(prepared) => {
+            prepared.with_source(request.extensions().get::<std::net::SocketAddr>().copied())
+        }
         Err(_) => return reject(&mut respond, StatusCode::BAD_GATEWAY),
     };
     if prepared.needs_sniff_read() {

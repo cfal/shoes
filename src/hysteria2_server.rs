@@ -528,9 +528,11 @@ async fn run_udp_local_to_remote_loop(
                         None
                     }
                 };
-                let Ok(client_socket) =
-                    UdpRelay::new(client_proxy_selector.clone(), resolver.clone())
-                else {
+                let Ok(client_socket) = UdpRelay::new_from(
+                    client_proxy_selector.clone(),
+                    resolver.clone(),
+                    Some(connection.remote_address()),
+                ) else {
                     continue;
                 };
 
@@ -592,10 +594,17 @@ async fn run_tcp_loop(
         };
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
+        let peer = connection.remote_address();
         tasks.spawn(async move {
             let _permit = permit;
-            if let Err(e) =
-                process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
+            if let Err(e) = process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                send_stream,
+                recv_stream,
+                peer,
+            )
+            .await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -721,6 +730,7 @@ async fn process_tcp_stream(
     resolver: Arc<dyn Resolver>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
     let (remote_location, stream_reader) =
         match timeout_stream_setup(handle_tcp_header(&mut recv)).await {
@@ -732,7 +742,7 @@ async fn process_tcp_stream(
         };
 
     relay_tcp_stream(
-        Box::new(QuicStream::from(send, recv)),
+        Box::new(QuicStream::from(send, recv).with_peer(peer)),
         remote_location,
         stream_reader.into_unparsed_data(),
         client_proxy_selector,
@@ -756,7 +766,8 @@ async fn relay_tcp_stream(
                 &client_proxy_selector,
                 remote_location.clone(),
                 initial_data,
-            )?;
+            )?
+            .with_source(server_stream.peer_addr());
             if prepared.needs_sniff_read() {
                 // A partial success write must never be followed by a failure frame.
                 success_sent = true;

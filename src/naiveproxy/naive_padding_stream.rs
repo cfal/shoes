@@ -509,7 +509,11 @@ impl<S: AsyncPing> AsyncPing for NaivePaddingStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncStream for NaivePaddingStream<S> {}
+impl<S: AsyncStream> AsyncStream for NaivePaddingStream<S> {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.peer_addr()
+    }
+}
 
 #[cfg(test)]
 mod tests {

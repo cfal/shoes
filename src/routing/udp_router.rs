@@ -24,7 +24,7 @@ use tokio::io::ReadBuf;
 use tokio::time::Instant;
 use tokio_util::time::{DelayQueue, delay_queue};
 
-use super::ingress::connect_prepared_udp;
+use super::ingress::connect_prepared_udp_from;
 use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncReadSessionMessage,
@@ -301,6 +301,12 @@ pub enum ServerStream {
 }
 
 impl ServerStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::Targeted(stream) => stream.peer_addr(),
+            Self::Session(stream) => stream.peer_addr(),
+        }
+    }
     fn supports_hostname_source(&self) -> bool {
         match self {
             Self::Targeted(stream) => stream.supports_hostname_source(),
@@ -1197,9 +1203,11 @@ impl<'a> UdpRouter<'a> {
         let require_ip_reply =
             !selector.fake_dns_enabled() || !self.server.supports_hostname_source();
 
+        let source = self.server.peer_addr();
         let future: SessionCreateFuture = Box::pin(async move {
             let setup =
-                connect_prepared_udp(&selector, prepared, &resolver, require_ip_reply).await?;
+                connect_prepared_udp_from(&selector, prepared, &resolver, require_ip_reply, source)
+                    .await?;
             Ok(SessionCreateResult {
                 permit,
                 remote: setup.stream,

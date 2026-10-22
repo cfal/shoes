@@ -75,6 +75,7 @@ impl Drop for SocketInfo {
 /// Information about a new TCP connection from the stack.
 pub struct NewTcpConnection {
     pub connection: TcpConnection,
+    pub source_addr: SocketAddr,
     pub remote_addr: SocketAddr,
 }
 
@@ -788,6 +789,7 @@ fn create_tcp_connection(
         handle,
         connection: NewTcpConnection {
             connection,
+            source_addr: src_addr,
             remote_addr: dst_addr,
         },
         control,

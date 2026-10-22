@@ -923,7 +923,11 @@ impl AsyncPing for VmessStream {
     }
 }
 
-impl AsyncStream for VmessStream {}
+impl AsyncStream for VmessStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
+}
 
 impl AsyncReadMessage for VmessStream {
     fn poll_read_message(

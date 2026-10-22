@@ -96,6 +96,9 @@ impl AsyncPing for TrackedStream {
 }
 
 impl AsyncStream for TrackedStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.peer_addr()
+    }
     fn flow(&self) -> Option<&Arc<FlowEntry>> {
         Some(&self.guard.entry)
     }
@@ -202,8 +205,8 @@ impl AsyncMessageStream for TrackedMessageStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn buffered_counts_partial_io_and_wakes_idle_cancellation() {
@@ -213,20 +216,39 @@ mod tests {
         let mut tracked = TrackedStream::new(Box::new(outbound), guard);
         let (mut inbound, mut client) = tokio::io::duplex(4);
         let relay = tokio::spawn(async move {
-            crate::copy_bidirectional::copy_bidirectional(&mut inbound, &mut tracked, false, false).await
+            crate::copy_bidirectional::copy_bidirectional(&mut inbound, &mut tracked, false, false)
+                .await
         });
         let exchange = async {
-            let send = async { client.write_all(b"upload-payload").await.unwrap(); };
-            let receive = async { let mut bytes = [0;14]; remote.read_exact(&mut bytes).await.unwrap(); assert_eq!(&bytes, b"upload-payload"); };
+            let send = async {
+                client.write_all(b"upload-payload").await.unwrap();
+            };
+            let receive = async {
+                let mut bytes = [0; 14];
+                remote.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"upload-payload");
+            };
             tokio::join!(send, receive);
-            let send = async { remote.write_all(b"reply-payload").await.unwrap(); };
-            let receive = async { let mut bytes = [0;13]; client.read_exact(&mut bytes).await.unwrap(); assert_eq!(&bytes, b"reply-payload"); };
+            let send = async {
+                remote.write_all(b"reply-payload").await.unwrap();
+            };
+            let receive = async {
+                let mut bytes = [0; 13];
+                client.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"reply-payload");
+            };
             tokio::join!(send, receive);
         };
-        tokio::time::timeout(Duration::from_secs(2), exchange).await.unwrap();
-        assert_eq!(entry.counters.totals(), (14,13));
+        tokio::time::timeout(Duration::from_secs(2), exchange)
+            .await
+            .unwrap();
+        assert_eq!(entry.counters.totals(), (14, 13));
         entry.cancel.cancel();
-        let error = tokio::time::timeout(Duration::from_secs(1), relay).await.unwrap().unwrap().unwrap_err();
+        let error = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
     }
 
@@ -236,7 +258,10 @@ mod tests {
         async fn pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
             let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)), listener.accept());
+            let (client, accepted) = tokio::join!(
+                tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+                listener.accept()
+            );
             (client.unwrap(), accepted.unwrap().0)
         }
         let (mut client, mut inbound) = pair().await;
@@ -246,21 +271,38 @@ mod tests {
         let mut tracked = TrackedStream::new(Box::new(outbound), guard);
         assert!(tracked.plain_tcp().is_some());
         let relay = tokio::spawn(async move {
-            crate::copy_bidirectional::copy_bidirectional(&mut inbound, &mut tracked, false, false).await
+            crate::copy_bidirectional::copy_bidirectional(&mut inbound, &mut tracked, false, false)
+                .await
         });
         let payload = vec![37; 1024 * 1024];
         let exchange = async {
-            let send = async { client.write_all(&payload).await.unwrap(); };
-            let receive = async { let mut bytes = vec![0;payload.len()]; remote.read_exact(&mut bytes).await.unwrap(); assert_eq!(bytes, payload); };
+            let send = async {
+                client.write_all(&payload).await.unwrap();
+            };
+            let receive = async {
+                let mut bytes = vec![0; payload.len()];
+                remote.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(bytes, payload);
+            };
             tokio::join!(send, receive);
             remote.write_all(b"reply").await.unwrap();
-            let mut reply = [0;5];
+            let mut reply = [0; 5];
             client.read_exact(&mut reply).await.unwrap();
-            assert_eq!(&reply,b"reply");
+            assert_eq!(&reply, b"reply");
         };
-        tokio::time::timeout(Duration::from_secs(5), exchange).await.unwrap();
-        assert_eq!(entry.counters.totals(), (payload.len() as u64,5));
+        tokio::time::timeout(Duration::from_secs(5), exchange)
+            .await
+            .unwrap();
+        assert_eq!(entry.counters.totals(), (payload.len() as u64, 5));
         entry.cancel.cancel();
-        assert_eq!(tokio::time::timeout(Duration::from_secs(1), relay).await.unwrap().unwrap().unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionAborted
+        );
     }
 }

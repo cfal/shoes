@@ -104,6 +104,7 @@ pub struct AnyTlsSession {
 
     /// Authenticated user name for logging
     user_name: String,
+    peer: Option<std::net::SocketAddr>,
 
     /// Initial data buffered during auth (to be prepended to first read)
     /// Uses std::sync::Mutex since it's only accessed once with no await points
@@ -124,14 +125,16 @@ impl AnyTlsSession {
         initial_data: Option<Box<[u8]>>,
     ) -> Arc<Self>
     where
-        IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        IO: crate::async_stream::AsyncStream + 'static,
     {
+        let peer = conn.peer_addr();
         let (reader, writer) = tokio::io::split(conn);
         // Use bounded channel for outgoing data to provide backpressure
         // Buffer size is per-session, shared across all streams
         let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
 
         Arc::new(Self {
+            peer,
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
@@ -166,7 +169,7 @@ impl AnyTlsSession {
     #[cfg(test)]
     pub fn new_server_test<IO>(conn: IO, padding: Arc<PaddingFactory>) -> Arc<Self>
     where
-        IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        IO: crate::async_stream::AsyncStream + 'static,
     {
         use crate::client_proxy_selector::ConnectRule;
         use crate::resolver::NativeResolver;
@@ -204,6 +207,7 @@ impl AnyTlsSession {
             proxy_provider,
             udp_enabled: false,
             user_name: String::new(),
+            peer: None,
             initial_data: std::sync::Mutex::new(None),
         })
     }
@@ -416,12 +420,13 @@ impl AnyTlsSession {
                         Entry::Vacant(entry) => {
                             // Create new stream with bounded channel for backpressure
                             let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-                            let stream = AnyTlsStream::new(
+                            let mut stream = AnyTlsStream::new(
                                 stream_id,
                                 data_rx,
                                 self.outgoing_tx.clone(),
                                 Arc::clone(&self.is_closed),
                             );
+                            stream.peer = self.peer;
                             entry.insert(data_tx);
                             Some(stream)
                         }
@@ -771,7 +776,7 @@ impl AnyTlsSession {
             destination.clone(),
             Vec::new(),
         ) {
-            Ok(prepared) => prepared,
+            Ok(prepared) => prepared.with_source(self.peer),
             Err(error) => {
                 let message = format!("connect failed: {error}");
                 let _ = self.send_synack(stream_id, Some(&message)).await;
@@ -940,7 +945,7 @@ impl AnyTlsSession {
         ))
         .await
         {
-            Ok(route) => route,
+            Ok(route) => route.with_source(self.peer),
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 let _ = self
                     .send_synack(stream_id, Some("UDP blocked by rules"))

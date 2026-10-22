@@ -836,6 +836,9 @@ impl<S: VisionTransport> crate::async_stream::AsyncPing for VisionStream<S> {
 }
 
 impl<S: VisionTransport> AsyncStream for VisionStream<S> {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.tls.peer_addr()
+    }
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&tokio::net::TcpStream> {
         if self.read_mode != VisionMode::Direct

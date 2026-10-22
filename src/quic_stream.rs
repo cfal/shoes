@@ -9,6 +9,7 @@ use crate::async_stream::{AsyncPing, AsyncStream};
 pub struct QuicStream {
     send_stream: SendStream,
     recv_stream: RecvStream,
+    peer: Option<std::net::SocketAddr>,
 }
 
 impl QuicStream {
@@ -16,7 +17,13 @@ impl QuicStream {
         Self {
             send_stream,
             recv_stream,
+            peer: None,
         }
+    }
+
+    pub fn with_peer(mut self, peer: std::net::SocketAddr) -> Self {
+        self.peer = Some(peer);
+        self
     }
 }
 
@@ -66,4 +73,8 @@ impl AsyncPing for QuicStream {
     }
 }
 
-impl AsyncStream for QuicStream {}
+impl AsyncStream for QuicStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer
+    }
+}

@@ -24,6 +24,7 @@ pub struct H2MuxServerStream {
     inner: H2MuxStream,
     /// Whether we've written the status response
     response_written: bool,
+    pub(super) peer: Option<std::net::SocketAddr>,
 }
 
 impl H2MuxServerStream {
@@ -32,6 +33,7 @@ impl H2MuxServerStream {
         Self {
             inner,
             response_written: false,
+            peer: None,
         }
     }
 
@@ -128,7 +130,11 @@ impl AsyncPing for H2MuxServerStream {
 
 impl Unpin for H2MuxServerStream {}
 
-impl AsyncStream for H2MuxServerStream {}
+impl AsyncStream for H2MuxServerStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer
+    }
+}
 
 #[cfg(test)]
 mod tests {

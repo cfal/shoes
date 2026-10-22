@@ -189,9 +189,14 @@ async fn run_tun_server_inner(
 
                     debug!("Handling TCP connection to {:?}", target);
 
-                    if let Err(e) =
-                        handle_tcp_connection(new_conn.connection, target, proxy_selector, resolver)
-                            .await
+                    if let Err(e) = handle_tcp_connection_from(
+                        new_conn.connection,
+                        target,
+                        proxy_selector,
+                        resolver,
+                        Some(new_conn.source_addr),
+                    )
+                    .await
                     {
                         debug!("TCP connection to {} failed: {}", remote_addr, e);
                     }
@@ -255,15 +260,27 @@ fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
 }
 
 /// Handle a TCP connection by forwarding it through the proxy chain.
+#[cfg(test)]
 pub(crate) async fn handle_tcp_connection(
-    mut connection: tcp_conn::TcpConnection,
+    connection: tcp_conn::TcpConnection,
     target: NetLocation,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
+    handle_tcp_connection_from(connection, target, proxy_selector, resolver, None).await
+}
+
+pub(crate) async fn handle_tcp_connection_from(
+    mut connection: tcp_conn::TcpConnection,
+    target: NetLocation,
+    proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    source: Option<std::net::SocketAddr>,
+) -> std::io::Result<()> {
     let _permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
     let prepared =
-        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, target.clone(), Vec::new())?;
+        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, target.clone(), Vec::new())?
+            .with_source(source);
     let route = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         prepared.route(&mut connection, &proxy_selector, &resolver),

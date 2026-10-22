@@ -190,6 +190,9 @@ impl AsyncShutdownMessage for UdpSocket {
 }
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
     /// Semantic outbound accounting that raw-socket fast paths must preserve.
     fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
         None
@@ -232,6 +235,9 @@ pub trait AsyncTargetedMessageStream:
     + Unpin
     + Send
 {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
 }
 
 /// Client stream trait connected directly to targets or to proxy servers, where received messages
@@ -258,6 +264,9 @@ pub trait AsyncSessionMessageStream:
     + Unpin
     + Send
 {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
 }
 
 impl AsyncPing for TcpStream {
@@ -271,6 +280,9 @@ impl AsyncPing for TcpStream {
 }
 
 impl AsyncStream for TcpStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        TcpStream::peer_addr(self).ok()
+    }
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&TcpStream> {
         Some(self)
@@ -525,7 +537,12 @@ impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for 
 }
 
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
-    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> { (**self).flow() }
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        (**self).peer_addr()
+    }
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
+        (**self).flow()
+    }
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&TcpStream> {
         (**self).plain_tcp()
@@ -536,7 +553,12 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
     }
 }
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
-    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> { (**self).flow() }
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        (**self).peer_addr()
+    }
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
+        (**self).flow()
+    }
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&TcpStream> {
         (**self).plain_tcp()
@@ -548,14 +570,26 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
 }
 
 impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for Box<T> {
-    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> { (**self).flow() }
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
+        (**self).flow()
+    }
 }
 impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for &mut T {
-    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> { (**self).flow() }
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
+        (**self).flow()
+    }
 }
 
-impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream for Box<T> {}
-impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream for &mut T {}
+impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream for Box<T> {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        (**self).peer_addr()
+    }
+}
+impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream for &mut T {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        (**self).peer_addr()
+    }
+}
 
 impl<T: ?Sized + AsyncSourcedMessageStream + Unpin> AsyncSourcedMessageStream for Box<T> {}
 impl<T: ?Sized + AsyncSourcedMessageStream + Unpin> AsyncSourcedMessageStream for &mut T {}
@@ -612,8 +646,16 @@ impl<T: ?Sized + AsyncWriteSessionMessage + Unpin> AsyncWriteSessionMessage for 
     }
 }
 
-impl<T: ?Sized + AsyncSessionMessageStream + Unpin> AsyncSessionMessageStream for Box<T> {}
-impl<T: ?Sized + AsyncSessionMessageStream + Unpin> AsyncSessionMessageStream for &mut T {}
+impl<T: ?Sized + AsyncSessionMessageStream + Unpin> AsyncSessionMessageStream for Box<T> {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        (**self).peer_addr()
+    }
+}
+impl<T: ?Sized + AsyncSessionMessageStream + Unpin> AsyncSessionMessageStream for &mut T {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        (**self).peer_addr()
+    }
+}
 
 #[cfg(test)]
 pub mod test_streams {

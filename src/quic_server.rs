@@ -103,8 +103,9 @@ async fn process_connection(
         }
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
+        let peer = connection.remote_address();
         tasks.spawn(async move {
-            if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream).await {
+            if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream, peer).await {
                 error!("Failed to process streams: {e}");
             }
         });
@@ -117,9 +118,14 @@ async fn process_streams(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
-    crate::tcp::tcp_server::process_stream(QuicStream::from(send, recv), server_handler, resolver)
-        .await
+    crate::tcp::tcp_server::process_stream(
+        QuicStream::from(send, recv).with_peer(peer),
+        server_handler,
+        resolver,
+    )
+    .await
 }
 
 pub async fn start_quic_servers(

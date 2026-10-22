@@ -151,6 +151,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
     _permit: crate::resources::BudgetPermit,
     setup_timeout: Duration,
 ) -> std::io::Result<()> {
+    let source = stream.peer_addr();
     let setup_server_stream_future =
         timeout(setup_timeout, setup_server_stream(stream, server_handler));
 
@@ -185,7 +186,8 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                         &proxy_selector,
                         remote_location.clone(),
                         initial_remote_data.map_or_else(Vec::new, |data| data.into_vec()),
-                    )?;
+                    )?
+                    .with_source(source);
                     if prepared.needs_sniff_read() {
                         crate::util::timeout_stream_setup(async {
                             let response = connection_success_response.take();
@@ -284,18 +286,23 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             proxy_selector,
         } => {
             let setup = crate::util::timeout_stream_setup(async {
-                crate::routing::ingress::connect_udp(&proxy_selector, remote_location, &resolver)
-                    .await
-                    .map_err(|error| {
-                        if crate::routing::ingress::is_policy_block(&error) {
-                            std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                "Blocked bidirectional udp forward",
-                            )
-                        } else {
-                            error
-                        }
-                    })
+                crate::routing::ingress::connect_udp_from(
+                    &proxy_selector,
+                    remote_location,
+                    &resolver,
+                    source,
+                )
+                .await
+                .map_err(|error| {
+                    if crate::routing::ingress::is_policy_block(&error) {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "Blocked bidirectional udp forward",
+                        )
+                    } else {
+                        error
+                    }
+                })
             })
             .await;
             let client_stream = match setup {

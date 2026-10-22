@@ -749,7 +749,11 @@ impl AsyncPing for WebsocketStream {
     }
 }
 
-impl AsyncStream for WebsocketStream {}
+impl AsyncStream for WebsocketStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
+}
 
 #[inline]
 fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> usize {

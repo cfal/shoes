@@ -980,6 +980,11 @@ impl std::fmt::Debug for ClientChainGroup {
 }
 
 impl ClientChainGroup {
+    pub(crate) fn tracks_flows(&self) -> bool {
+        self.description
+            .as_ref()
+            .is_some_and(|description| description.context.is_some())
+    }
     pub(crate) fn with_description(
         mut self,
         description: Option<Arc<crate::control::catalog::RuleDescription>>,
@@ -1015,6 +1020,16 @@ impl ClientChainGroup {
         remote_location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
+        self.connect_tcp_with_info(remote_location, resolver, Default::default())
+            .await
+    }
+
+    pub(crate) async fn connect_tcp_with_info(
+        &self,
+        remote_location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        info: crate::control::flows::FlowInfo,
+    ) -> std::io::Result<TcpClientSetupResult> {
         let idx = self.next_tcp_index.fetch_add(1, Ordering::Relaxed) as usize;
         let chain = &self.chains[idx % self.chains.len()];
         let Some(description) = self.description.as_ref().filter(|d| d.context.is_some()) else {
@@ -1029,6 +1044,7 @@ impl ClientChainGroup {
             &remote_location,
             path,
             &description.payload,
+            info,
         );
         guard
             .entry
@@ -1041,10 +1057,11 @@ impl ClientChainGroup {
         Ok(result)
     }
 
-    pub async fn connect_udp_bidirectional(
+    pub(crate) async fn connect_udp_with_info(
         &self,
         resolver: &Arc<dyn Resolver>,
         target: ResolvedLocation,
+        info: crate::control::flows::FlowInfo,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         if self.udp_chain_indices.is_empty() {
             return Err(std::io::Error::new(
@@ -1068,6 +1085,7 @@ impl ClientChainGroup {
             &target,
             path,
             &description.payload,
+            info,
         );
         Ok(Box::new(
             crate::control::tracked_stream::TrackedMessageStream::new(stream, guard),

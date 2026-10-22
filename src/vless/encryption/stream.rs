@@ -613,6 +613,9 @@ impl<S: AsyncStream> AsyncPing for EncryptionStream<S> {
 }
 
 impl<S: AsyncStream> AsyncStream for EncryptionStream<S> {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.peer_addr()
+    }
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&tokio::net::TcpStream> {
         if !self.read_raw

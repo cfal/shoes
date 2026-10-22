@@ -386,7 +386,11 @@ impl AsyncPing for Socks5UdpRelayStream {
     }
 }
 
-impl AsyncTargetedMessageStream for Socks5UdpRelayStream {}
+impl AsyncTargetedMessageStream for Socks5UdpRelayStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.client_addr
+    }
+}
 
 impl Drop for Socks5UdpRelayStream {
     fn drop(&mut self) {

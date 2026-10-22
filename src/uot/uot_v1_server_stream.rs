@@ -309,7 +309,11 @@ impl<S: AsyncStream> AsyncPing for PacketAddrStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncTargetedMessageStream for PacketAddrStream<S> {}
+impl<S: AsyncStream> AsyncTargetedMessageStream for PacketAddrStream<S> {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
+}
 
 pub type UotV1ServerStream<S> = PacketAddrStream<S>;
 pub type SocksPacketAddrStream<S> = PacketAddrStream<S>;

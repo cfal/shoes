@@ -48,7 +48,10 @@ use super::user_lookup::UserLookup;
 ///
 /// This is needed because `TokioIo<Upgraded>` doesn't implement `AsyncStream`
 /// (which requires `Sync`), but we need `AsyncStream` for UoT stream wrappers.
-struct HyperUpgradedStream(Mutex<TokioIo<hyper::upgrade::Upgraded>>);
+struct HyperUpgradedStream(
+    Mutex<TokioIo<hyper::upgrade::Upgraded>>,
+    Option<std::net::SocketAddr>,
+);
 
 impl tokio::io::AsyncRead for HyperUpgradedStream {
     fn poll_read(
@@ -164,7 +167,11 @@ impl crate::async_stream::AsyncPing for HyperUpgradedStream {
     }
 }
 
-impl AsyncStream for HyperUpgradedStream {}
+impl AsyncStream for HyperUpgradedStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.1
+    }
+}
 
 #[derive(Clone)]
 struct ConnectionExecutor(Weak<Mutex<JoinSet<()>>>);
@@ -249,6 +256,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
     resolver: Arc<dyn Resolver>,
     use_h2: bool,
 ) -> io::Result<TcpServerSetupResult> {
+    let peer = tls_stream.peer_addr();
     let io = TokioIo::new(tls_stream);
     let tasks = Arc::new(Mutex::new(JoinSet::new()));
     let executor = ConnectionExecutor(Arc::downgrade(&tasks));
@@ -270,7 +278,10 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         // HTTP/2 for NaiveProxy clients
         Ok(TcpServerSetupResult::Session(Box::pin(async move {
             let _tasks = tasks;
-            let service = hyper::service::service_fn(move |req| {
+            let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                if let Some(peer) = peer {
+                    req.extensions_mut().insert(peer);
+                }
                 let config = service_config.clone();
                 async move { naive_service(req, config).await }
             });
@@ -447,7 +458,9 @@ async fn naive_service(
             destination.clone(),
             Vec::new(),
         ) {
-            Ok(prepared) => Some(prepared),
+            Ok(prepared) => {
+                Some(prepared.with_source(req.extensions().get::<std::net::SocketAddr>().copied()))
+            }
             Err(_) => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
@@ -459,6 +472,7 @@ async fn naive_service(
 
     // Get upgrade future before moving the request
     let on_upgrade = hyper::upgrade::on(&mut req);
+    let peer = req.extensions().get::<std::net::SocketAddr>().copied();
     let resolver = config.resolver.clone();
     let proxy_selector = config.proxy_selector.clone();
     let udp_enabled = config.udp_enabled;
@@ -467,7 +481,7 @@ async fn naive_service(
         let _permits = permits;
         match on_upgrade.await {
             Ok(upgraded) => {
-                let io = HyperUpgradedStream(Mutex::new(TokioIo::new(upgraded)));
+                let io = HyperUpgradedStream(Mutex::new(TokioIo::new(upgraded)), peer);
 
                 if padding_type != PaddingType::None {
                     let stream =
@@ -872,6 +886,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             );
 
             if is_connect == 1 {
+                let peer = stream.peer_addr();
                 let uot_v2_stream = UotV2Stream::new(stream);
 
                 let route = crate::util::timeout_stream_setup(crate::routing::ingress::route_udp(
@@ -887,7 +902,9 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                         error
                     }
                 })?;
-                let setup = crate::util::timeout_stream_setup(route.connect(&resolver)).await?;
+                let setup =
+                    crate::util::timeout_stream_setup(route.with_source(peer).connect(&resolver))
+                        .await?;
                 return run_udp_copy(Box::new(uot_v2_stream), setup.stream, false, false).await;
             } else {
                 // V2 non-connect mode (same as V1)

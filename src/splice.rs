@@ -306,6 +306,7 @@ fn at_urgent_mark(fd: RawFd) -> io::Result<bool> {
         .map(|marked| marked != 0)
 }
 
+#[cfg(test)]
 pub(crate) async fn copy_bidirectional(a: &TcpStream, b: &TcpStream) -> io::Result<()> {
     copy_bidirectional_tracked(a, b, None, None).await
 }

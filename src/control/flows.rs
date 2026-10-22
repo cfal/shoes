@@ -38,6 +38,15 @@ pub struct FlowContext {
     pub protocol: String,
 }
 
+#[derive(Debug, Default)]
+pub struct FlowInfo {
+    pub source: Option<std::net::SocketAddr>,
+    pub original: Option<NetLocation>,
+    pub restored_host: Option<String>,
+    pub sniff_host: Option<String>,
+    pub fake_dns: bool,
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowMetadata {
@@ -57,6 +66,7 @@ pub struct FlowMetadata {
     pub process: String,
     pub process_path: String,
     pub remote_destination: String,
+    pub shoes_original_destination: String,
 }
 
 #[derive(Debug)]
@@ -120,6 +130,7 @@ impl FlowContext {
         target: &ResolvedLocation,
         chains: Vec<String>,
         rule_payload: &str,
+        info: FlowInfo,
     ) -> FlowGuard {
         let destination: &NetLocation = target.location();
         let hostname = destination.address().hostname();
@@ -129,6 +140,14 @@ impl FlowContext {
             start: chrono::Utc::now().to_rfc3339(),
             metadata: FlowMetadata {
                 network: network.into(),
+                source_ip: info
+                    .source
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+                source_port: info
+                    .source
+                    .map(|addr| addr.port().to_string())
+                    .unwrap_or_default(),
                 protocol: self.protocol.clone(),
                 destination_ip: target
                     .resolved_addr()
@@ -141,9 +160,18 @@ impl FlowContext {
                         }
                     }),
                 destination_port: destination.port().to_string(),
-                host: hostname.unwrap_or("").to_owned(),
+                host: info
+                    .restored_host
+                    .unwrap_or_else(|| hostname.unwrap_or("").to_owned()),
+                sniff_host: info.sniff_host.unwrap_or_default(),
+                remote_destination: destination.to_string(),
+                shoes_original_destination: info
+                    .original
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
                 inbound_name: self.inbound.clone(),
-                dns_mode: "normal".into(),
+                dns_mode: if info.fake_dns { "fake-ip" } else { "normal" }.into(),
                 ..Default::default()
             },
             chains: if chains.is_empty() {
@@ -247,12 +275,46 @@ pub(super) fn test_guard() -> FlowGuard {
             .into(),
         vec!["DIRECT".into()],
         "all",
+        FlowInfo::default(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_keeps_wire_restored_sniffed_and_effective_targets_separate() {
+        let context = FlowContext {
+            registry: Arc::new(FlowRegistry::default()),
+            generation: 1,
+            inbound: "local".into(),
+            scope: "tls/default".into(),
+            protocol: "Socks5".into(),
+        };
+        let guard = context.register(
+            "tcp",
+            &NetLocation::from_str("override.example:8443", None)
+                .unwrap()
+                .into(),
+            vec!["exit".into(), "outbound".into()],
+            "match all",
+            FlowInfo {
+                source: Some("192.0.2.1:1234".parse().unwrap()),
+                original: Some(NetLocation::from_str("198.18.0.1:443", None).unwrap()),
+                restored_host: Some("restored.example".into()),
+                sniff_host: Some("sniffed.example".into()),
+                fake_dns: true,
+            },
+        );
+        let metadata = &guard.entry.metadata;
+        assert_eq!(metadata.source_ip, "192.0.2.1");
+        assert_eq!(metadata.source_port, "1234");
+        assert_eq!(metadata.shoes_original_destination, "198.18.0.1:443");
+        assert_eq!(metadata.host, "restored.example");
+        assert_eq!(metadata.sniff_host, "sniffed.example");
+        assert_eq!(metadata.remote_destination, "override.example:8443");
+        assert_eq!(metadata.dns_mode, "fake-ip");
+    }
     #[test]
     fn close_transfers_totals_and_cancel_all_does_not_block_new_flows() {
         let guard = test_guard();
@@ -282,6 +344,7 @@ mod tests {
                 .into(),
             Vec::new(),
             "all",
+            FlowInfo::default(),
         );
         assert!(!new.entry.cancel.is_cancelled());
     }
