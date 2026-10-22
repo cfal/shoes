@@ -99,6 +99,8 @@ pub struct ConnectionSnapshot {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionsSnapshot {
+    #[serde(skip)]
+    pub sequence: u64,
     pub upload_total: u64,
     pub download_total: u64,
     pub memory: u64,
@@ -107,6 +109,7 @@ pub struct ConnectionsSnapshot {
 
 #[derive(Debug, Default)]
 struct RegistryState {
+    snapshot_sequence: u64,
     entries: BTreeMap<String, Arc<FlowEntry>>,
     closed_upload: u64,
     closed_download: u64,
@@ -211,18 +214,26 @@ impl FlowRegistry {
     }
 
     pub fn snapshot(&self, memory: u64) -> ConnectionsSnapshot {
-        let (entries, mut upload_total, mut download_total) = {
-            let state = self.state.lock();
+        let (sequence, entries, mut upload_total, mut download_total) = {
+            let mut state = self.state.lock();
+            state.snapshot_sequence += 1;
             (
-                state.entries.values().cloned().collect::<Vec<_>>(),
+                state.snapshot_sequence,
+                state
+                    .entries
+                    .values()
+                    .map(|entry| {
+                        let (upload, download) = entry.counters.totals();
+                        (entry.clone(), upload, download)
+                    })
+                    .collect::<Vec<_>>(),
                 state.closed_upload,
                 state.closed_download,
             )
         };
         let connections = entries
             .into_iter()
-            .map(|entry| {
-                let (upload, download) = entry.counters.totals();
+            .map(|(entry, upload, download)| {
                 upload_total += upload;
                 download_total += download;
                 ConnectionSnapshot {
@@ -240,6 +251,7 @@ impl FlowRegistry {
             })
             .collect();
         ConnectionsSnapshot {
+            sequence,
             upload_total,
             download_total,
             memory,

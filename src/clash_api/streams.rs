@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use super::{ApiState, json_bytes};
 
 pub struct Sample {
+    sequence: u64,
     pub connections: Result<Bytes, String>,
     pub traffic: Bytes,
     pub memory: Bytes,
@@ -22,6 +23,7 @@ pub struct Sample {
 impl Sample {
     pub fn initial() -> Self {
         Self {
+            sequence: 0,
             connections: Ok(Bytes::from_static(
                 b"{\"uploadTotal\":0,\"downloadTotal\":0,\"memory\":0,\"connections\":[]}",
             )),
@@ -32,20 +34,33 @@ impl Sample {
     }
 }
 
+struct SerializedConnections {
+    sequence: u64,
+    bytes: Result<Bytes, String>,
+    upload_total: u64,
+    download_total: u64,
+}
+
+impl SerializedConnections {
+    fn new(snapshot: crate::control::flows::ConnectionsSnapshot) -> Self {
+        Self {
+            sequence: snapshot.sequence,
+            bytes: json_bytes(&snapshot).map_err(|error| error.to_string()),
+            upload_total: snapshot.upload_total,
+            download_total: snapshot.download_total,
+        }
+    }
+}
+
 async fn snapshot(
     flows: Arc<crate::control::flows::FlowRegistry>,
     gate: Arc<tokio::sync::Semaphore>,
     rss: u64,
-) -> io::Result<(Result<Bytes, String>, u64, u64)> {
+) -> io::Result<SerializedConnections> {
     let permit = gate.acquire_owned().await.map_err(io::Error::other)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let snapshot = flows.snapshot(rss);
-        (
-            json_bytes(&snapshot).map_err(|error| error.to_string()),
-            snapshot.upload_total,
-            snapshot.download_total,
-        )
+        SerializedConnections::new(flows.snapshot(rss))
     })
     .await
     .map_err(io::Error::other)
@@ -55,7 +70,7 @@ pub(super) async fn connections(state: &ApiState) -> io::Result<Bytes> {
     let rss = state.samples.borrow().rss;
     snapshot(state.runtime.flows.clone(), state.snapshots.clone(), rss)
         .await?
-        .0
+        .bytes
         .map_err(io::Error::other)
 }
 
@@ -82,8 +97,12 @@ pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Arc<Sample>>) {
             }
             None => {}
         }
-        let Ok((connections, upload_total, download_total)) =
-            snapshot(state.runtime.flows.clone(), state.snapshots.clone(), rss).await
+        let Ok(SerializedConnections {
+            sequence,
+            bytes: connections,
+            upload_total,
+            download_total,
+        }) = snapshot(state.runtime.flows.clone(), state.snapshots.clone(), rss).await
         else {
             return;
         };
@@ -98,6 +117,7 @@ pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Arc<Sample>>) {
         }
         oversized = connections.is_err();
         sender.send_replace(Arc::new(Sample {
+            sequence,
             connections,
             traffic,
             memory: json_bytes(&json!({"inuse":rss,"oslimit":0})).unwrap(),
@@ -164,6 +184,7 @@ impl Subscription {
 struct Source {
     runtime: Arc<crate::control::runtime::ControlRuntime>,
     first: bool,
+    last_sequence: u64,
     subscription: Subscription,
     samples: watch::Receiver<Arc<Sample>>,
     logs: Option<tokio::sync::broadcast::Receiver<crate::control::logs::LogEvent>>,
@@ -173,7 +194,10 @@ struct Source {
 
 impl Source {
     fn new(state: &ApiState, subscription: Subscription) -> Self {
-        let mut interval = tokio::time::interval(subscription.interval);
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + subscription.interval,
+            subscription.interval,
+        );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let logs =
             matches!(subscription.kind, Kind::Logs).then(|| state.runtime.logs.sender.subscribe());
@@ -182,6 +206,7 @@ impl Source {
         Self {
             runtime: state.runtime.clone(),
             first: true,
+            last_sequence: 0,
             subscription,
             samples,
             logs,
@@ -207,22 +232,26 @@ impl Source {
                 }
             },
             Kind::Connections => {
-                if std::mem::take(&mut self.first)
-                    || self.subscription.interval != Duration::from_secs(1)
-                {
-                    self.interval.tick().await;
+                if self.first || self.subscription.interval != Duration::from_secs(1) {
+                    if !self.first {
+                        self.interval.tick().await;
+                    }
                     let rss = self.samples.borrow().rss;
-                    return snapshot(self.runtime.flows.clone(), self.snapshots.clone(), rss)
-                        .await?
-                        .0
-                        .map_err(io::Error::other);
+                    let snapshot =
+                        snapshot(self.runtime.flows.clone(), self.snapshots.clone(), rss).await?;
+                    self.first = false;
+                    self.last_sequence = snapshot.sequence;
+                    return snapshot.bytes.map_err(io::Error::other);
                 }
-                self.samples.changed().await.map_err(io::Error::other)?;
-                self.samples
-                    .borrow_and_update()
-                    .connections
-                    .clone()
-                    .map_err(io::Error::other)
+                loop {
+                    self.samples.changed().await.map_err(io::Error::other)?;
+                    let sample = self.samples.borrow_and_update();
+                    // A shared snapshot may finish serializing after a newer first frame.
+                    if sample.sequence > self.last_sequence {
+                        self.last_sequence = sample.sequence;
+                        return sample.connections.clone().map_err(io::Error::other);
+                    }
+                }
             }
             Kind::Traffic | Kind::Memory => {
                 if std::mem::take(&mut self.first) && matches!(self.subscription.kind, Kind::Memory)
@@ -252,21 +281,31 @@ pub async fn websocket(
     };
     let (mut sink, mut incoming) = websocket.split();
     let mut source = Source::new(&state, subscription);
-    loop {
-        let message = tokio::select! {
-            _ = state.cancel.cancelled() => break,
-            data = source.next() => match data { Ok(data) => Message::Text(String::from_utf8(data.to_vec()).expect("JSON UTF8").into()), Err(_) => break },
-            received = incoming.next() => match received {
-                Some(Ok(Message::Ping(bytes))) => Message::Pong(bytes),
-                Some(Ok(Message::Pong(_))) => continue,
-                _ => break,
-            },
-        };
-        if !matches!(
-            tokio::time::timeout(Duration::from_secs(5), sink.send(message)).await,
-            Ok(Ok(()))
-        ) {
-            break;
+    'stream: loop {
+        let next = source.next();
+        tokio::pin!(next);
+        loop {
+            let (message, data_frame) = tokio::select! {
+                _ = state.cancel.cancelled() => break 'stream,
+                data = &mut next => match data {
+                    Ok(data) => (Message::Text(String::from_utf8(data.to_vec()).expect("JSON UTF8").into()), true),
+                    Err(_) => break 'stream,
+                },
+                received = incoming.next() => match received {
+                    Some(Ok(Message::Ping(bytes))) => (Message::Pong(bytes), false),
+                    Some(Ok(Message::Pong(_))) => continue,
+                    _ => break 'stream,
+                },
+            };
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(5), sink.send(message)).await,
+                Ok(Ok(()))
+            ) {
+                break 'stream;
+            }
+            if data_frame {
+                break;
+            }
         }
     }
     let _ = tokio::time::timeout(Duration::from_millis(250), sink.close()).await;
@@ -301,4 +340,75 @@ pub async fn http(
         }
     }
     connection.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::flows::{FlowContext, FlowInfo};
+    use crate::control::runtime::ControlService;
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn initial_snapshot_fences_an_older_shared_snapshot_published_later() {
+        let service = ControlService::new(Default::default()).unwrap();
+        let (sender, samples) = watch::channel(Arc::new(Sample::initial()));
+        let state = ApiState {
+            runtime: service.runtime.clone(),
+            samples,
+            tasks: Default::default(),
+            cancel: CancellationToken::new(),
+            snapshots: Arc::new(tokio::sync::Semaphore::new(2)),
+        };
+        let mut source = Source::new(
+            &state,
+            Subscription::parse("connections", &HashMap::new()).unwrap(),
+        );
+        let guard = FlowContext {
+            registry: state.runtime.flows.clone(),
+            generation: 1,
+            inbound: "test".into(),
+            scope: "root".into(),
+            protocol: "Socks5".into(),
+        }
+        .register(
+            "tcp",
+            &crate::address::NetLocation::from_str("example.com:80", None)
+                .unwrap()
+                .into(),
+            Vec::new(),
+            "all",
+            FlowInfo::default(),
+        );
+        guard.entry.counters.upload(10);
+        let older = state.runtime.flows.snapshot(0);
+        guard.entry.counters.upload(20);
+        drop(guard);
+
+        let first: serde_json::Value =
+            serde_json::from_slice(&source.next().await.unwrap()).unwrap();
+        assert_eq!(first["uploadTotal"], 30);
+        assert_eq!(first["connections"], json!([]));
+        assert!(first.get("sequence").is_none());
+
+        // Hold serialization/publication of the shared sample until after the first frame.
+        let older = SerializedConnections::new(older);
+        sender.send_replace(Arc::new(Sample {
+            sequence: older.sequence,
+            connections: older.bytes,
+            ..Sample::initial()
+        }));
+        let next = source.next();
+        tokio::pin!(next);
+        assert!(next.as_mut().now_or_never().is_none());
+
+        let newer = SerializedConnections::new(state.runtime.flows.snapshot(0));
+        sender.send_replace(Arc::new(Sample {
+            sequence: newer.sequence,
+            connections: newer.bytes,
+            ..Sample::initial()
+        }));
+        let second: serde_json::Value = serde_json::from_slice(&next.await.unwrap()).unwrap();
+        assert_eq!(first, second);
+    }
 }
