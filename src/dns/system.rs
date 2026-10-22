@@ -183,9 +183,8 @@ mod tests {
         };
         use tokio::io::AsyncReadExt;
 
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = tcp.local_addr().unwrap();
-        let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
+        let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+        let addr = udp.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut bytes = [0; 2048];
             let (len, peer) = udp.recv_from(&mut bytes).await.unwrap();

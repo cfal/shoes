@@ -1388,10 +1388,8 @@ mod tests {
         use hickory_resolver::proto::rr::{Name, RecordType};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let tcp = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-        let mut address = tcp.local_addr().unwrap();
-        address.set_ip("127.0.0.1".parse().unwrap());
-        let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+        let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+        let address = udp.local_addr().unwrap();
         let mut groups = fake_groups(true);
         let mut tcp_spec = make_spec(&format!("tcp://{address}"));
         tcp_spec.attempts = 2;
