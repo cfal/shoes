@@ -82,6 +82,8 @@ impl InitialHopEntry {
 /// - `subsequent_hops`: Protocol connectors for hops 1+ (no socket creation needed)
 pub struct ClientProxyChain {
     origins: Vec<Vec<Option<MemberOrigin>>>,
+    selection: Option<Arc<crate::control::selection::SelectionView>>,
+    selector_hops: Vec<bool>,
     /// Initial hop pool: each entry is either Direct or Proxy.
     /// Socket and proxy are paired and selected together.
     initial_hop: Vec<Arc<InitialHopEntry>>,
@@ -151,37 +153,61 @@ impl ClientProxyChain {
     }
 
     pub(crate) fn with_origins(mut self, origins: Vec<Vec<Option<MemberOrigin>>>) -> Self {
+        self.selector_hops = origins
+            .iter()
+            .map(|pool| {
+                pool.iter()
+                    .flatten()
+                    .any(|origin| !origin.selector_path().is_empty())
+            })
+            .collect();
+        self.selection = origins
+            .iter()
+            .flatten()
+            .flatten()
+            .find(|origin| !origin.selector_path().is_empty())
+            .map(|origin| origin.selection.clone());
         self.origins = origins;
         self
     }
 
     fn select_indices(&self, udp: bool) -> std::io::Result<Vec<usize>> {
         let choices = self
-            .origins
-            .iter()
-            .flatten()
-            .flatten()
-            .next()
-            .map(|origin| origin.selection.snapshot());
+            .selection
+            .as_ref()
+            .map(|selection| selection.snapshot());
         (0..self.num_hops())
             .map(|hop| {
                 let final_udp = udp && hop + 1 == self.num_hops();
-                let length = if hop == 0 {
+                let length = if final_udp {
+                    self.udp_final_hop_indices.len()
+                } else if hop == 0 {
                     self.initial_hop.len()
                 } else {
                     self.subsequent_hops[hop - 1].len()
                 };
-                let allowed = |index: &usize| {
-                    (!final_udp || self.udp_final_hop_indices.contains(index))
-                        && choices.as_ref().is_none_or(|choices| {
-                            self.origins
-                                .get(hop)
-                                .and_then(|pool| pool.get(*index))
-                                .and_then(Option::as_ref)
-                                .is_none_or(|origin| origin.allowed(choices))
-                        })
+                let candidate = |index: usize| {
+                    if final_udp {
+                        self.udp_final_hop_indices[index]
+                    } else {
+                        index
+                    }
                 };
-                let count = (0..length).filter(allowed).count();
+                let choices = choices.as_ref().filter(|_| self.selector_hops[hop]);
+                let allowed = |index: &usize| {
+                    choices.is_none_or(|choices| {
+                        self.origins
+                            .get(hop)
+                            .and_then(|pool| pool.get(candidate(*index)))
+                            .and_then(Option::as_ref)
+                            .is_none_or(|origin| origin.allowed(choices))
+                    })
+                };
+                let count = if choices.is_some() {
+                    (0..length).filter(allowed).count()
+                } else {
+                    length
+                };
                 if count == 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
@@ -196,7 +222,11 @@ impl ClientProxyChain {
                     &self.subsequent_next_indices[hop - 1]
                 };
                 let ordinal = counter.fetch_add(1, Ordering::Relaxed) as usize % count;
-                Ok((0..length).filter(allowed).nth(ordinal).unwrap())
+                Ok(candidate(if choices.is_some() {
+                    (0..length).filter(allowed).nth(ordinal).unwrap()
+                } else {
+                    ordinal
+                }))
             })
             .collect()
     }
@@ -263,6 +293,8 @@ impl ClientProxyChain {
 
         Self {
             origins: Vec::new(),
+            selection: None,
+            selector_hops: Vec::new(),
             initial_hop: initial_hop.into_iter().map(Arc::new).collect(),
             initial_hop_next_index: AtomicU32::new(0),
             subsequent_hops: subsequent_hops
@@ -710,6 +742,22 @@ mod carrier_tests {
     use std::sync::Mutex;
 
     #[test]
+    fn unselected_large_pools_keep_constant_time_round_robin() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let chain = ClientProxyChain::new(
+            (0..10_000)
+                .map(|index| InitialHopEntry::Direct(Arc::new(Socket(index, events.clone()))))
+                .collect(),
+            Vec::new(),
+        );
+        assert!(chain.selection.is_none());
+        for index in 0..20_000 {
+            assert_eq!(chain.select_indices(false).unwrap(), [index % 10_000]);
+            assert_eq!(chain.select_indices(true).unwrap(), [index % 10_000]);
+        }
+    }
+
+    #[test]
     fn selectors_filter_all_hops_without_changing_flattened_weights() {
         let yaml = "
 - client_group: leaves
@@ -770,6 +818,8 @@ mod carrier_tests {
         for origin in chain.origins.iter_mut().flatten().flatten() {
             origin.selection = view.clone();
         }
+        let origins = std::mem::take(&mut chain.origins);
+        chain = chain.with_origins(origins);
         owner.activate(view).unwrap();
         // A hop containing only this selector must fail, not choose a different leaf.
         chain.initial_hop.truncate(2);
@@ -1039,7 +1089,7 @@ impl ClientChainGroup {
         let mut result = chain
             .connect_tcp_observed(remote_location.clone(), resolver, &mut path)
             .await?;
-        if path.last() != Some(&description.proxy) {
+        if !path.contains(&description.proxy) {
             path.push(description.proxy.clone());
         }
         let guard = description.context.as_ref().unwrap().register(
@@ -1083,7 +1133,7 @@ impl ClientChainGroup {
         let stream = chain
             .connect_udp_observed(resolver, target.clone(), &mut path)
             .await?;
-        if path.last() != Some(&description.proxy) {
+        if !path.contains(&description.proxy) {
             path.push(description.proxy.clone());
         }
         let guard = description.context.as_ref().unwrap().register(

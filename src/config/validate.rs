@@ -441,7 +441,9 @@ fn resolve_client_groups_topologically(
                 ConfigSelection::Config(config) => {
                     let mut config = config.clone();
                     expand_peer_chains(&mut config, &resolved)?;
-                    if let Some(origin) = &mut config.control {
+                    if group_name != "direct"
+                        && let Some(origin) = &mut config.control
+                    {
                         origin
                             .path
                             .insert(0, (group_name.clone(), origin.name.to_string()));
