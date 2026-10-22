@@ -196,7 +196,7 @@ jobs:
 
     - name: Run process filesystem watcher unit tests
       run: >-
-        cargo test -p shoes --locked --bin shoes process:: -- --test-threads=1
+        cargo test -p shoes --locked --lib process:: -- --test-threads=1
 
   integration-tests:
     name: Integration (${{ matrix.name }})

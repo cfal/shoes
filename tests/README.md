@@ -108,9 +108,6 @@ Important remaining limitations:
 
 - CI does not measure coverage; see [Measuring Coverage](#measuring-coverage).
   Passing suites do not establish exhaustive coverage.
-- `src/main.rs` declares the library's module tree again, so `--lib --bins`
-  compiles the crate twice and runs the shared unit tests twice. Building the
-  binary on the library crate would remove the duplication.
 - Android/iOS device execution and macOS Network Extension kernel-device behavior
   remain separate from host-side tests and cross-compilation.
 - Windows build entries are disabled; ARM and musl builds do not establish
