@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use hyper_tungstenite::tungstenite::Message;
+use hyper_tungstenite::tungstenite::{
+    Message,
+    protocol::{CloseFrame, frame::coding::CloseCode},
+};
 use serde_json::json;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -14,7 +17,7 @@ use super::{ApiState, json_bytes};
 
 pub struct Sample {
     sequence: u64,
-    pub connections: Result<Bytes, String>,
+    pub connections: Result<Bytes, Arc<io::Error>>,
     pub traffic: Bytes,
     pub memory: Bytes,
     pub rss: u64,
@@ -36,7 +39,7 @@ impl Sample {
 
 struct SerializedConnections {
     sequence: u64,
-    bytes: Result<Bytes, String>,
+    bytes: Result<Bytes, Arc<io::Error>>,
     upload_total: u64,
     download_total: u64,
 }
@@ -45,7 +48,7 @@ impl SerializedConnections {
     fn new(snapshot: crate::control::flows::ConnectionsSnapshot) -> Self {
         Self {
             sequence: snapshot.sequence,
-            bytes: json_bytes(&snapshot).map_err(|error| error.to_string()),
+            bytes: json_bytes(&snapshot).map_err(Arc::new),
             upload_total: snapshot.upload_total,
             download_total: snapshot.download_total,
         }
@@ -71,7 +74,7 @@ pub(super) async fn connections(state: &ApiState) -> io::Result<Bytes> {
     snapshot(state.runtime.flows.clone(), state.snapshots.clone(), rss)
         .await?
         .bytes
-        .map_err(io::Error::other)
+        .map_err(|error| io::Error::new(error.kind(), error))
 }
 
 pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Arc<Sample>>) {
@@ -250,7 +253,9 @@ impl Source {
                         snapshot(self.runtime.flows.clone(), self.snapshots.clone(), rss).await?;
                     self.first = false;
                     self.last_sequence = snapshot.sequence;
-                    return snapshot.bytes.map_err(io::Error::other);
+                    return snapshot
+                        .bytes
+                        .map_err(|error| io::Error::new(error.kind(), error));
                 }
                 loop {
                     self.samples.changed().await.map_err(io::Error::other)?;
@@ -258,7 +263,10 @@ impl Source {
                     // A shared snapshot may finish serializing after a newer first frame.
                     if sample.sequence > self.last_sequence {
                         self.last_sequence = sample.sequence;
-                        return sample.connections.clone().map_err(io::Error::other);
+                        return sample
+                            .connections
+                            .clone()
+                            .map_err(|error| io::Error::new(error.kind(), error));
                     }
                 }
             }
@@ -288,6 +296,16 @@ pub async fn websocket(
     let Ok(websocket) = websocket.await else {
         return;
     };
+    serve_websocket(state, websocket, subscription).await;
+}
+
+async fn serve_websocket<S>(
+    state: Arc<ApiState>,
+    websocket: hyper_tungstenite::WebSocketStream<S>,
+    subscription: Subscription,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut sink, mut incoming) = websocket.split();
     let mut source = Source::new(&state, subscription);
     'stream: loop {
@@ -298,6 +316,10 @@ pub async fn websocket(
                 _ = state.cancel.cancelled() => break 'stream,
                 data = &mut next => match data {
                     Ok(data) => (Message::Text(String::from_utf8(data.to_vec()).expect("JSON UTF8").into()), true),
+                    Err(error) if error.kind() == io::ErrorKind::FileTooLarge => (Message::Close(Some(CloseFrame {
+                        code: CloseCode::Size,
+                        reason: "response exceeds 32 MiB".into(),
+                    })), true),
                     Err(_) => break 'stream,
                 },
                 received = incoming.next() => match received {
@@ -306,10 +328,14 @@ pub async fn websocket(
                     _ => break 'stream,
                 },
             };
+            let closing = message.is_close();
             if !matches!(
                 tokio::time::timeout(Duration::from_secs(5), sink.send(message)).await,
                 Ok(Ok(()))
             ) {
+                break 'stream;
+            }
+            if closing {
                 break 'stream;
             }
             if data_frame {
@@ -357,6 +383,55 @@ mod tests {
     use crate::control::flows::{FlowContext, FlowInfo};
     use crate::control::runtime::ControlService;
     use futures::FutureExt;
+
+    #[tokio::test]
+    async fn oversized_snapshot_closes_websocket_with_size_reason() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let error = json_bytes(&"x".repeat(32 * 1024 * 1024)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+            let service = ControlService::new(Default::default()).unwrap();
+            let (sender, samples) = watch::channel(Arc::new(Sample::initial()));
+            let state = Arc::new(ApiState {
+                runtime: service.runtime.clone(),
+                samples,
+                tasks: Default::default(),
+                cancel: CancellationToken::new(),
+                snapshots: Arc::new(tokio::sync::Semaphore::new(2)),
+            });
+            let (client, server) = tokio::io::duplex(4096);
+            let server = hyper_tungstenite::WebSocketStream::from_raw_socket(
+                server,
+                hyper_tungstenite::tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await;
+            let mut client = hyper_tungstenite::WebSocketStream::from_raw_socket(
+                client,
+                hyper_tungstenite::tungstenite::protocol::Role::Client,
+                None,
+            )
+            .await;
+            let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(serve_websocket(
+                state,
+                server,
+                Subscription::parse("connections", &HashMap::new()).unwrap(),
+            )));
+            assert!(client.next().await.unwrap().unwrap().is_text());
+            sender.send_replace(Arc::new(Sample {
+                sequence: u64::MAX,
+                connections: Err(Arc::new(error)),
+                ..Sample::initial()
+            }));
+            let Message::Close(Some(frame)) = client.next().await.unwrap().unwrap() else {
+                panic!("expected a close frame")
+            };
+            assert_eq!(frame.code, CloseCode::Size);
+            assert_eq!(frame.reason, "response exceeds 32 MiB");
+            task.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn cancelled_first_snapshot_stays_immediate() {

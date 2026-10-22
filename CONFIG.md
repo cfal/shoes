@@ -386,6 +386,9 @@ a limit of 64, subscriptions 16, probes 16, and bound sockets 16. Request heads
 must finish within 15 seconds of accept or the preceding response; ordinary
 request bodies have a 10-second deadline and 64 KiB limit. Established subscriptions
 are exempt from header idle expiry and have bounded queues/write deadlines.
+Responses are limited to 32 MiB. An oversized connection snapshot closes its
+WebSocket with code 1009 and reason `response exceeds 32 MiB`; tracking continues
+without truncating the connection list.
 
 ## Server Config
 

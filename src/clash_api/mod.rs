@@ -79,7 +79,10 @@ pub(crate) fn json_bytes(value: &impl serde::Serialize) -> io::Result<Bytes> {
     impl io::Write for Bounded {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if self.0.len().saturating_add(bytes.len()) > 32 * 1024 * 1024 {
-                return Err(io::Error::other("response exceeds 32 MiB"));
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "response exceeds 32 MiB",
+                ));
             }
             self.0.extend_from_slice(bytes);
             Ok(bytes.len())
@@ -89,7 +92,9 @@ pub(crate) fn json_bytes(value: &impl serde::Serialize) -> io::Result<Bytes> {
         }
     }
     let mut bytes = Bounded(Vec::new());
-    serde_json::to_writer(&mut bytes, value).map_err(io::Error::other)?;
+    serde_json::to_writer(&mut bytes, value).map_err(|error| {
+        io::Error::new(error.io_error_kind().unwrap_or(io::ErrorKind::Other), error)
+    })?;
     Ok(bytes.0.into())
 }
 
