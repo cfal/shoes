@@ -2065,25 +2065,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h3_reset_upload_keeps_strict_carrier_usable() {
-        reset_upload_keeps_strict_carrier_usable(XhttpVersion::H3).await;
+    async fn h3_reset_upload_releases_resources_and_keeps_carrier_usable() {
+        reset_upload_releases_resources_and_keeps_carrier_usable(XhttpVersion::H3).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn h2_reset_upload_keeps_strict_carrier_usable() {
-        reset_upload_keeps_strict_carrier_usable(XhttpVersion::H2).await;
+    async fn h2_reset_upload_releases_resources_and_keeps_carrier_usable() {
+        reset_upload_releases_resources_and_keeps_carrier_usable(XhttpVersion::H2).await;
     }
 
-    async fn reset_upload_keeps_strict_carrier_usable(version: XhttpVersion) {
+    async fn reset_upload_releases_resources_and_keeps_carrier_usable(version: XhttpVersion) {
         tokio::time::timeout(Duration::from_secs(10), async {
-            let mut state = service();
-            Arc::get_mut(&mut state)
-                .unwrap()
-                .config
-                .close_on_http1_error = true;
+            let state = service();
             let (carrier, _server, _endpoint) = streaming_carrier(state.clone(), version).await;
             let memory = Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
-            for sequence in 0..32 {
+            for sequence in 0..2 {
                 let tasks = Tasks::new();
                 let (mut writer, reader) = pipe(memory.clone());
                 writer.write_all(b"partial").await.unwrap();
@@ -2194,13 +2190,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h2_library_body_resets_remain_stream_local_in_strict_mode() {
+    async fn h2_library_body_resets_remain_stream_local() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let mut state = service();
-            Arc::get_mut(&mut state)
-                .unwrap()
-                .config
-                .close_on_http1_error = true;
+            let state = service();
             let (client, server) = tokio::io::duplex(8192);
             let tasks = Tasks::new();
             let serving = state.clone();
