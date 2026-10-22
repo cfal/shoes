@@ -717,32 +717,21 @@ impl AsyncWrite for WebsocketStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
-        if this.write_frame_end_offset == 0 {
-            return Pin::new(&mut this.stream).poll_flush(cx);
-        }
-
-        // Create a new write frame when flush is called when we don't have one.
-        while this.write_frame_end_offset > 0 {
-            match this.do_write_frame(cx) {
-                Ok(()) => {
-                    if this.write_frame_end_offset > 0 {
-                        return Poll::Pending;
-                    }
-                }
-                Err(e) => {
-                    return Poll::Ready(Err(e));
-                }
+        if this.write_frame_end_offset > 0 {
+            this.do_write_frame(cx)?;
+            if this.write_frame_end_offset > 0 {
+                return Poll::Pending;
             }
-            ready!(Pin::new(&mut this.stream).poll_flush(cx))?;
         }
 
-        Poll::Ready(Ok(()))
+        Pin::new(&mut this.stream).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        ready!(self.as_mut().poll_flush(cx))?;
         Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
@@ -1142,5 +1131,33 @@ mod tests {
         ] {
             assert!(read_all(frames, 1).await.is_err(), "{name} was accepted");
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_buffered_frames_and_keeps_reading() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (io, mut peer) = tokio::io::duplex(64);
+            let mut stream =
+                WebsocketStream::new(Box::new(io), false, WebsocketPingType::PingFrame, &[]);
+            // The pipe holds 64 bytes, so most of this frame is still buffered at shutdown.
+            let payload = [0x42; 1000];
+            stream.write_all(&payload).await.unwrap();
+            let (shutdown, sent) = tokio::join!(stream.shutdown(), async {
+                let mut sent = Vec::new();
+                peer.read_to_end(&mut sent).await.unwrap();
+                sent
+            });
+            shutdown.unwrap();
+            assert_eq!(sent, frame(0x82, false, &payload));
+
+            // The shutdown is a half-close, so replies are still read.
+            peer.write_all(&frame(0x82, true, b"reply")).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, b"reply");
+        })
+        .await
+        .unwrap();
     }
 }
