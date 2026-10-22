@@ -54,6 +54,8 @@ pub struct WireguardPeer {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WireguardInbound {
+    #[serde(skip)]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "super::common::is_false")]
     pub sniff: bool,
     pub rules: NoneOrSome<ConfigSelection<RuleConfig>>,
@@ -213,6 +215,7 @@ impl WireguardServerConfig {
             peer_client_chain: self.peer_client_chain.clone(),
             mtu: self.mtu,
             inbound: Some(WireguardInbound {
+                name: server.name.clone(),
                 sniff: server.sniff,
                 rules: server.rules.clone(),
                 dns: server.dns.clone(),
