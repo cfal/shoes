@@ -9,6 +9,21 @@ pub(crate) async fn shutdown_stream<T: AsyncWriteExt + Unpin + ?Sized>(stream: &
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, stream.shutdown()).await;
 }
 
+pub(crate) async fn shutdown_stream_pair<
+    A: crate::async_stream::AsyncStream + ?Sized,
+    B: crate::async_stream::AsyncStream + ?Sized,
+>(
+    a: &mut A,
+    b: &mut B,
+) {
+    let a_flow = a.flow().cloned();
+    let b_flow = b.flow().cloned();
+    crate::control::tracked_stream::finish_shutdown(a_flow.as_deref(), b_flow.as_deref(), async {
+        futures::join!(shutdown_stream(a), shutdown_stream(b));
+    })
+    .await;
+}
+
 pub(crate) async fn shutdown_message_stream<T: AsyncShutdownMessageExt + Unpin + ?Sized>(
     stream: &mut T,
 ) {

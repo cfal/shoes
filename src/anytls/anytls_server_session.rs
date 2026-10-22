@@ -809,15 +809,30 @@ impl AnyTlsSession {
         match routed.setup {
             Some(client_result) => {
                 let mut client_stream = client_result.client_stream;
+                let flow = client_stream.flow().cloned();
 
                 if !optimistic {
-                    self.send_synack(stream_id, None).await?;
+                    let synack = self.send_synack(stream_id, None);
+                    tokio::pin!(synack);
+                    tokio::select! {
+                        result = &mut synack => result?,
+                        _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => {
+                            drop(client_stream);
+                            drop(stream);
+                            // Finish the bounded control write; truncating a shared frame corrupts siblings.
+                            let _ = synack.await;
+                            return Err(crate::control::tracked_stream::cancelled());
+                        }
+                    }
                 }
                 if let Some(data) = client_result.early_data {
-                    setup_timeout(async {
-                        stream.write_all(&data).await?;
-                        stream.flush().await
-                    })
+                    crate::control::tracked_stream::during_flow(
+                        flow.as_deref(),
+                        setup_timeout(async {
+                            stream.write_all(&data).await?;
+                            stream.flush().await
+                        }),
+                    )
                     .await?;
                 }
                 if !routed.prefix.is_empty() {
@@ -835,9 +850,12 @@ impl AnyTlsSession {
                 let result =
                     copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
-                let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, async {
-                    let _ = stream.shutdown().await;
-                    let _ = client_stream.shutdown().await;
+                crate::control::tracked_stream::finish_shutdown(flow.as_deref(), None, async {
+                    let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, async {
+                        let _ = stream.shutdown().await;
+                        let _ = client_stream.shutdown().await;
+                    })
+                    .await;
                 })
                 .await;
 
@@ -1430,6 +1448,102 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_tcp_drops_egress_without_truncating_shared_synack() {
+        timeout(Duration::from_secs(3), async {
+            use crate::client_proxy_chain::ClientChainGroup;
+            use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+            use crate::control::catalog::RuleDescription;
+            use crate::control::flows::{FlowContext, FlowRegistry};
+            let registry = Arc::new(FlowRegistry::default());
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver);
+            let chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
+                crate::option_util::OneOrSome::One(crate::config::ClientChainHop::Single(
+                    crate::config::ConfigSelection::Config(crate::config::ClientConfig::default()),
+                )),
+                resolver.clone(),
+            )
+            .unwrap();
+            let group = ClientChainGroup::new(vec![chain]).with_description(Some(Arc::new(
+                RuleDescription {
+                    payload: "all".into(),
+                    proxy: "DIRECT".into(),
+                    context: Some(Arc::new(FlowContext {
+                        registry: registry.clone(),
+                        generation: 1,
+                        inbound: "test".into(),
+                        scope: "root".into(),
+                        protocol: "AnyTLS".into(),
+                    })),
+                },
+            )));
+            let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+                vec![crate::address::NetLocationMask::ANY],
+                ConnectAction::new_allow(None, group),
+            )]));
+            let (transport, mut peer) = duplex(1);
+            let session = AnyTlsSession::new_server_with_initial_data(
+                transport,
+                PaddingFactory::default_factory(),
+                resolver,
+                selector,
+                false,
+                "test".into(),
+                None,
+            );
+            session.peer_version.store(2, Ordering::Relaxed);
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let target = NetLocation::from_str(
+                &format!("127.0.0.1:{}", listener.local_addr().unwrap().port()),
+                None,
+            )
+            .unwrap();
+            let (_sender, receiver) = mpsc::channel(1);
+            let stream = AnyTlsStream::new(
+                1,
+                receiver,
+                session.outgoing_tx.clone(),
+                session.is_closed.clone(),
+            );
+            let handler = session.clone();
+            let forwarding =
+                tokio::spawn(async move { handler.handle_tcp_forward(stream, target).await });
+            let (mut egress, _) = listener.accept().await.unwrap();
+            let mut header = [0; 7];
+            peer.read_exact(&mut header[..1]).await.unwrap();
+            registry.cancel_all();
+            timeout(Duration::from_secs(1), async {
+                while !registry.snapshot(0).connections.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(egress.read(&mut [0; 1]).await.unwrap(), 0);
+            assert!(!forwarding.is_finished());
+            peer.read_exact(&mut header[1..]).await.unwrap();
+            assert_eq!(
+                header.as_slice(),
+                Frame::control(Command::SynAck, 1).encode().as_ref()
+            );
+            assert_eq!(
+                forwarding.await.unwrap().unwrap_err().kind(),
+                io::ErrorKind::ConnectionAborted
+            );
+            let (result, read) =
+                tokio::join!(session.send_synack(2, None), peer.read_exact(&mut header));
+            result.unwrap();
+            read.unwrap();
+            assert_eq!(
+                header.as_slice(),
+                Frame::control(Command::SynAck, 2).encode().as_ref()
+            );
+            assert!(!session.is_closed());
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]

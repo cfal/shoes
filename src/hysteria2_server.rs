@@ -689,15 +689,19 @@ async fn finish_tcp_setup(
             client_stream,
             early_data,
         })) => {
-            timeout_stream_setup(async {
-                if !success_sent {
-                    write_all(server, &tcp_response(true, "")).await?;
-                }
-                if let Some(data) = early_data {
-                    write_all(server, &data).await?;
-                }
-                server.flush().await
-            })
+            let flow = client_stream.flow().cloned();
+            crate::control::tracked_stream::during_flow(
+                flow.as_deref(),
+                timeout_stream_setup(async {
+                    if !success_sent {
+                        write_all(server, &tcp_response(true, "")).await?;
+                    }
+                    if let Some(data) = early_data {
+                        write_all(server, &data).await?;
+                    }
+                    server.flush().await
+                }),
+            )
             .await?;
             Ok(Some(client_stream))
         }
@@ -817,10 +821,7 @@ async fn relay_tcp_stream(
     )
     .await;
 
-    futures::join!(
-        crate::util::shutdown_stream(&mut server_stream),
-        crate::util::shutdown_stream(&mut client_stream),
-    );
+    crate::util::shutdown_stream_pair(&mut server_stream, &mut client_stream).await;
 
     copy_result?;
     Ok(())

@@ -933,11 +933,15 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     let routed = crate::util::timeout_stream_setup(route.connect(&resolver)).await?;
     let mut client_stream: Box<dyn AsyncStream> = match routed.setup {
         Some(result) => {
+            let flow = result.client_stream.flow().cloned();
             if let Some(data) = result.early_data {
-                crate::util::timeout_stream_setup(async {
-                    tokio::io::AsyncWriteExt::write_all(&mut stream, &data).await?;
-                    tokio::io::AsyncWriteExt::flush(&mut stream).await
-                })
+                crate::control::tracked_stream::during_flow(
+                    flow.as_deref(),
+                    crate::util::timeout_stream_setup(async {
+                        tokio::io::AsyncWriteExt::write_all(&mut stream, &data).await?;
+                        tokio::io::AsyncWriteExt::flush(&mut stream).await
+                    }),
+                )
                 .await?;
             }
             result.client_stream
@@ -968,10 +972,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     )
     .await;
 
-    futures::join!(
-        crate::util::shutdown_stream(&mut stream),
-        crate::util::shutdown_stream(&mut client_stream),
-    );
+    crate::util::shutdown_stream_pair(&mut stream, &mut client_stream).await;
 
     match result {
         Ok(()) => {

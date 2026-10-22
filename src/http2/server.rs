@@ -233,11 +233,12 @@ async fn relay(
     prefix: Vec<u8>,
 ) -> io::Result<()> {
     let reset = stream.reset();
+    let flow = upstream.client_stream.flow().cloned();
     tokio::select! {
         biased;
         _ = reset => Ok(()),
         result = async {
-            crate::util::timeout_stream_setup(async {
+            crate::control::tracked_stream::during_flow(flow.as_deref(), crate::util::timeout_stream_setup(async {
                 if let Some(data) = upstream.early_data.take() {
                     stream.write_all(&data).await?;
                     stream.flush().await?;
@@ -247,7 +248,7 @@ async fn relay(
                     upstream.client_stream.flush().await?;
                 }
                 Ok(())
-            }).await?;
+            })).await?;
             drop(prefix);
             let result = crate::copy_bidirectional::copy_bidirectional(
                 &mut stream,
@@ -256,10 +257,7 @@ async fn relay(
                 false,
             ).await;
             if result.is_ok() {
-                tokio::join!(
-                    crate::util::shutdown_stream(&mut stream),
-                    crate::util::shutdown_stream(&mut upstream.client_stream),
-                );
+                crate::util::shutdown_stream_pair(&mut stream, &mut upstream.client_stream).await;
             }
             result.map(|_| ())
         } => result,

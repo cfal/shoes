@@ -46,6 +46,38 @@ pub async fn wait_cancel(flow: Option<&FlowEntry>) {
     }
 }
 
+pub async fn during_flow<T>(
+    flow: Option<&FlowEntry>,
+    future: impl Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    tokio::select! {
+        biased;
+        _ = wait_cancel(flow) => Err(cancelled()),
+        result = future => result,
+    }
+}
+
+pub async fn finish_shutdown(
+    a: Option<&FlowEntry>,
+    b: Option<&FlowEntry>,
+    shutdown: impl Future<Output = ()>,
+) {
+    tokio::pin!(shutdown);
+    let cancelled = async {
+        tokio::select! {
+            _ = wait_cancel(a) => {},
+            _ = wait_cancel(b) => {},
+        }
+    };
+    tokio::select! {
+        _ = &mut shutdown => {},
+        _ = cancelled => {
+            // Protocol FINs can flush queued data; cancellation cannot wait for backpressure.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(250), shutdown).await;
+        }
+    }
+}
+
 impl AsyncRead for TrackedStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -208,9 +240,86 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    struct StalledShutdown;
+    impl AsyncRead for StalledShutdown {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl AsyncWrite for StalledShutdown {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl AsyncPing for StalledShutdown {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncStream for StalledShutdown {}
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_shutdown_observes_cancellation_before_and_during_cleanup() {
+        use futures::FutureExt;
+        for cancel_before in [true, false] {
+            let guard = super::super::flows::test_guard();
+            let entry = guard.entry.clone();
+            let mut outbound = TrackedStream::new(Box::new(StalledShutdown), guard);
+            let mut inbound = StalledShutdown;
+            if cancel_before {
+                entry.cancel.cancel();
+            }
+            let cleanup = crate::util::shutdown_stream_pair(&mut inbound, &mut outbound);
+            tokio::pin!(cleanup);
+            assert!(cleanup.as_mut().now_or_never().is_none());
+            if !cancel_before {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                entry.cancel.cancel();
+            }
+            let start = tokio::time::Instant::now();
+            cleanup.await;
+            assert_eq!(start.elapsed(), Duration::from_millis(250));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_interrupts_initial_inbound_writes() {
+        use futures::FutureExt;
+        let guard = super::super::flows::test_guard();
+        let mut inbound = StalledShutdown;
+        let setup = during_flow(Some(&guard.entry), inbound.write_all(b"early data"));
+        tokio::pin!(setup);
+        assert!(setup.as_mut().now_or_never().is_none());
+        guard.entry.cancel.cancel();
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            setup.await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
     struct BackpressuredMessages {
         payload: Option<Vec<u8>>,
         blocked: Arc<tokio::sync::Notify>,
+        fail_read: bool,
     }
     impl AsyncReadMessage for BackpressuredMessages {
         fn poll_read_message(
@@ -218,6 +327,9 @@ mod tests {
             _: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
+            if self.fail_read {
+                return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+            }
             match self.payload.take() {
                 Some(payload) => {
                     buf.put_slice(&payload);
@@ -247,6 +359,7 @@ mod tests {
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
         ) -> Poll<io::Result<()>> {
+            self.blocked.notify_one();
             Poll::Pending
         }
     }
@@ -268,11 +381,13 @@ mod tests {
         let inbound = Box::new(BackpressuredMessages {
             payload: None,
             blocked: blocked.clone(),
+            fail_read: false,
         });
         let outbound = Box::new(TrackedMessageStream::new(
             Box::new(BackpressuredMessages {
                 payload: Some(b"payload".to_vec()),
                 blocked: blocked.clone(),
+                fail_read: false,
             }),
             guard,
         ));
@@ -290,6 +405,39 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[tokio::test]
+    async fn fixed_udp_cancellation_interrupts_shutdown_already_in_progress() {
+        let guard = super::super::flows::test_guard();
+        let entry = guard.entry.clone();
+        let shutdown_started = Arc::new(tokio::sync::Notify::new());
+        let inbound = Box::new(BackpressuredMessages {
+            payload: None,
+            blocked: shutdown_started.clone(),
+            fail_read: true,
+        });
+        let outbound = Box::new(TrackedMessageStream::new(
+            Box::new(BackpressuredMessages {
+                payload: None,
+                blocked: shutdown_started.clone(),
+                fail_read: false,
+            }),
+            guard,
+        ));
+        let relay = tokio::spawn(crate::tcp::tcp_server::run_udp_copy(
+            inbound, outbound, false, false,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), shutdown_started.notified())
+            .await
+            .unwrap();
+        entry.cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     }
 
     #[tokio::test]

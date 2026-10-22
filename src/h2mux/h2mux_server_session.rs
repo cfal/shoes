@@ -497,12 +497,16 @@ async fn handle_h2mux_tcp(
                 routed.wire_destination
             );
             let mut client_stream = client_result.client_stream;
+            let flow = client_stream.flow().cloned();
 
             if let Some(data) = client_result.early_data {
-                timeout_stream_setup(async {
-                    stream.write_all(&data).await?;
-                    stream.flush().await
-                })
+                crate::control::tracked_stream::during_flow(
+                    flow.as_deref(),
+                    timeout_stream_setup(async {
+                        stream.write_all(&data).await?;
+                        stream.flush().await
+                    }),
+                )
                 .await?;
             }
             if !routed.prefix.is_empty() {
@@ -516,10 +520,7 @@ async fn handle_h2mux_tcp(
             drop(routed.prefix);
             let result = copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
-            futures::join!(
-                shutdown_stream(&mut stream),
-                shutdown_stream(&mut client_stream),
-            );
+            crate::util::shutdown_stream_pair(&mut stream, &mut client_stream).await;
 
             result
         }

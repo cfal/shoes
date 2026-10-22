@@ -293,14 +293,19 @@ pub(crate) async fn handle_tcp_connection_from(
         let Some(mut setup) = routed.setup else {
             return Ok(None);
         };
-        if let Some(data) = setup.early_data.take() {
-            connection.write_all(&data).await?;
-            connection.flush().await?;
-        }
-        if !routed.prefix.is_empty() {
-            setup.client_stream.write_all(&routed.prefix).await?;
-            setup.client_stream.flush().await?;
-        }
+        let flow = setup.client_stream.flow().cloned();
+        crate::control::tracked_stream::during_flow(flow.as_deref(), async {
+            if let Some(data) = setup.early_data.take() {
+                connection.write_all(&data).await?;
+                connection.flush().await?;
+            }
+            if !routed.prefix.is_empty() {
+                setup.client_stream.write_all(&routed.prefix).await?;
+                setup.client_stream.flush().await?;
+            }
+            Ok(())
+        })
+        .await?;
         drop(routed.prefix);
         Ok::<_, std::io::Error>(Some((setup.client_stream, routed.wire_destination)))
     })
