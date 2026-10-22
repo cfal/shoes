@@ -94,12 +94,38 @@ fn can_fallback(error: &io::Error) -> bool {
     )
 }
 
-async fn write_all(socket: &TcpStream, mut data: &[u8]) -> io::Result<()> {
+#[derive(Clone, Copy, Default)]
+struct Accounting<'a> {
+    source: Option<&'a crate::control::flows::FlowEntry>,
+    destination: Option<&'a crate::control::flows::FlowEntry>,
+}
+
+impl Accounting<'_> {
+    fn read(self, bytes: usize) {
+        if let Some(flow) = self.source {
+            flow.counters.download(bytes);
+        }
+    }
+    fn wrote(self, bytes: usize) {
+        if let Some(flow) = self.destination {
+            flow.counters.upload(bytes);
+        }
+    }
+}
+
+async fn write_all(
+    socket: &TcpStream,
+    mut data: &[u8],
+    accounting: Accounting<'_>,
+) -> io::Result<()> {
     while !data.is_empty() {
         socket.writable().await?;
         match socket.try_write(data) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => data = &data[n..],
+            Ok(n) => {
+                accounting.wrote(n);
+                data = &data[n..];
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
@@ -121,6 +147,7 @@ async fn copy_buffered(
     destination: &TcpStream,
     mut copied: usize,
     mut buffer: Vec<u8>,
+    accounting: Accounting<'_>,
 ) -> io::Result<()> {
     loop {
         source.readable().await?;
@@ -128,7 +155,8 @@ async fn copy_buffered(
         match source.try_read(&mut buffer[..length]) {
             Ok(0) => return shutdown_write(destination),
             Ok(n) => {
-                write_all(destination, &buffer[..n]).await?;
+                accounting.read(n);
+                write_all(destination, &buffer[..n], accounting).await?;
                 account(&mut copied, n).await;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
@@ -144,6 +172,7 @@ async fn drain_buffered(
     mut pending: usize,
     copied: &mut usize,
     buffer: &mut [u8],
+    accounting: Accounting<'_>,
 ) -> io::Result<()> {
     while pending != 0 {
         let len = pending
@@ -157,17 +186,18 @@ async fn drain_buffered(
         if n == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        write_all(destination, &buffer[..n]).await?;
+        write_all(destination, &buffer[..n], accounting).await?;
         pending -= n;
         account(copied, n).await;
     }
     Ok(())
 }
 
-async fn copy_direction(
+async fn copy_direction_tracked(
     source: &TcpStream,
     destination: &TcpStream,
     operations: &impl Operations,
+    accounting: Accounting<'_>,
 ) -> io::Result<()> {
     let mut copied = 0;
     let mut buffer = vec![0; BUFFER_SIZE];
@@ -182,7 +212,8 @@ async fn copy_direction(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        write_all(destination, &buffer[..n]).await?;
+        accounting.read(n);
+        write_all(destination, &buffer[..n], accounting).await?;
         account(&mut copied, n).await;
         if n < buffer.len() {
             continue;
@@ -219,6 +250,7 @@ async fn copy_direction(
                 Err(error) if can_fallback(&error) => break 'bursts,
                 Err(error) => return Err(error),
             };
+            accounting.read(pending);
             while pending != 0 {
                 destination.writable().await?;
                 match destination.try_io(Interest::WRITABLE, || {
@@ -228,6 +260,7 @@ async fn copy_direction(
                 }) {
                     Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                     Ok(n) => {
+                        accounting.wrote(n);
                         #[cfg(test)]
                         TEST_SPLICED_BYTES.update(|bytes| bytes + n);
                         pending -= n;
@@ -237,8 +270,15 @@ async fn copy_direction(
                     Err(error) if can_fallback(&error) => {
                         // The source already consumed these bytes. Recover them
                         // before switching this direction permanently to copying.
-                        drain_buffered(&pipe, destination, pending, &mut copied, &mut buffer)
-                            .await?;
+                        drain_buffered(
+                            &pipe,
+                            destination,
+                            pending,
+                            &mut copied,
+                            &mut buffer,
+                            accounting,
+                        )
+                        .await?;
                         break 'bursts;
                     }
                     Err(error) => return Err(error),
@@ -246,7 +286,7 @@ async fn copy_direction(
             }
         }
     }
-    copy_buffered(source, destination, copied, buffer).await
+    copy_buffered(source, destination, copied, buffer, accounting).await
 }
 
 fn shutdown_write(socket: &TcpStream) -> io::Result<()> {
@@ -267,8 +307,45 @@ fn at_urgent_mark(fd: RawFd) -> io::Result<bool> {
 }
 
 pub(crate) async fn copy_bidirectional(a: &TcpStream, b: &TcpStream) -> io::Result<()> {
-    tokio::try_join!(copy_direction(a, b, &Native), copy_direction(b, a, &Native))?;
+    copy_bidirectional_tracked(a, b, None, None).await
+}
+
+pub(crate) async fn copy_bidirectional_tracked(
+    a: &TcpStream,
+    b: &TcpStream,
+    a_flow: Option<&crate::control::flows::FlowEntry>,
+    b_flow: Option<&crate::control::flows::FlowEntry>,
+) -> io::Result<()> {
+    tokio::try_join!(
+        copy_direction_tracked(
+            a,
+            b,
+            &Native,
+            Accounting {
+                source: a_flow,
+                destination: b_flow
+            }
+        ),
+        copy_direction_tracked(
+            b,
+            a,
+            &Native,
+            Accounting {
+                source: b_flow,
+                destination: a_flow
+            }
+        ),
+    )?;
     Ok(())
+}
+
+#[cfg(test)]
+async fn copy_direction(
+    source: &TcpStream,
+    destination: &TcpStream,
+    operations: &impl Operations,
+) -> io::Result<()> {
+    copy_direction_tracked(source, destination, operations, Accounting::default()).await
 }
 
 #[cfg(test)]
@@ -765,8 +842,14 @@ mod tests {
         let mut copied = MAX_COPY_BYTES_PER_POLL - 100;
         let mut buffer = [0; 120];
         {
-            let draining =
-                drain_buffered(&pipe, &destination, data.len(), &mut copied, &mut buffer);
+            let draining = drain_buffered(
+                &pipe,
+                &destination,
+                data.len(),
+                &mut copied,
+                &mut buffer,
+                Accounting::default(),
+            );
             tokio::pin!(draining);
             assert!(futures::poll!(draining.as_mut()).is_pending());
             let mut received = [0; 100];

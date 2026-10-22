@@ -729,26 +729,47 @@ mod carrier_tests {
   protocol: {type: socks}
   rules: [{mask: 0.0.0.0/0, action: allow, client_chain: choose}]
 ";
-        let mut validated = crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
+        let mut validated =
+            crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
         let catalog = validated.catalog.take().unwrap();
-        let crate::config::Config::Server(server) = validated.configs.remove(0) else { panic!() };
-        let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else { panic!() };
-        let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else { panic!() };
+        let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+            panic!()
+        };
+        let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
+            panic!()
+        };
+        let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+            panic!()
+        };
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-        let group = crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver).unwrap();
+        let group =
+            crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver)
+                .unwrap();
         let chain = &group.chains[0];
-        for index in 0..10 { assert_eq!(chain.select_indices(false).unwrap(), [index % 5]); }
-        for index in [1, 3, 4, 1, 3, 4] { assert_eq!(chain.select_indices(true).unwrap(), [index]); }
+        for index in 0..10 {
+            assert_eq!(chain.select_indices(false).unwrap(), [index % 5]);
+        }
+        for index in [1, 3, 4, 1, 3, 4] {
+            assert_eq!(chain.select_indices(true).unwrap(), [index]);
+        }
         let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
         owner.activate(catalog.selection.clone()).unwrap();
         owner.select("choose", "DIRECT").unwrap();
         assert_eq!(chain.select_indices(false).unwrap(), [5]);
         assert_eq!(chain.select_indices(true).unwrap(), [5]);
 
-        let definitions = std::collections::BTreeMap::from([("leaves".into(), crate::control::selection::SelectorDefinition { members: vec!["http".into(), "udp".into()], default: Some("http".into()) })]);
+        let definitions = std::collections::BTreeMap::from([(
+            "leaves".into(),
+            crate::control::selection::SelectorDefinition {
+                members: vec!["http".into(), "udp".into()],
+                default: Some("http".into()),
+            },
+        )]);
         let view = owner.prepare(definitions).unwrap();
         let mut chain = group.chains.into_iter().next().unwrap();
-        for origin in chain.origins.iter_mut().flatten().flatten() { origin.selection = view.clone(); }
+        for origin in chain.origins.iter_mut().flatten().flatten() {
+            origin.selection = view.clone();
+        }
         owner.activate(view).unwrap();
         // A hop containing only this selector must fail, not choose a different leaf.
         chain.initial_hop.truncate(2);
@@ -942,6 +963,7 @@ impl CarrierDialer for PrefixDialer {
 
 /// A group of proxy chains for round-robin selection.
 pub struct ClientChainGroup {
+    description: Option<Arc<crate::control::catalog::RuleDescription>>,
     chains: Vec<ClientProxyChain>,
     next_tcp_index: AtomicU32,
     pub(crate) udp_chain_indices: Vec<usize>,
@@ -958,6 +980,14 @@ impl std::fmt::Debug for ClientChainGroup {
 }
 
 impl ClientChainGroup {
+    pub(crate) fn with_description(
+        mut self,
+        description: Option<Arc<crate::control::catalog::RuleDescription>>,
+    ) -> Self {
+        self.description = description;
+        self
+    }
+
     pub fn new(chains: Vec<ClientProxyChain>) -> Self {
         assert!(
             !chains.is_empty(),
@@ -972,6 +1002,7 @@ impl ClientChainGroup {
             .collect();
 
         Self {
+            description: None,
             chains,
             next_tcp_index: AtomicU32::new(0),
             udp_chain_indices,
@@ -986,7 +1017,28 @@ impl ClientChainGroup {
     ) -> std::io::Result<TcpClientSetupResult> {
         let idx = self.next_tcp_index.fetch_add(1, Ordering::Relaxed) as usize;
         let chain = &self.chains[idx % self.chains.len()];
-        chain.connect_tcp(remote_location, resolver).await
+        let Some(description) = self.description.as_ref().filter(|d| d.context.is_some()) else {
+            return chain.connect_tcp(remote_location, resolver).await;
+        };
+        let mut path = Vec::new();
+        let mut result = chain
+            .connect_tcp_observed(remote_location.clone(), resolver, &mut path)
+            .await?;
+        let guard = description.context.as_ref().unwrap().register(
+            "tcp",
+            &remote_location,
+            path,
+            &description.payload,
+        );
+        guard
+            .entry
+            .counters
+            .download(result.early_data.as_ref().map_or(0, Vec::len));
+        result.client_stream = Box::new(crate::control::tracked_stream::TrackedStream::new(
+            result.client_stream,
+            guard,
+        ));
+        Ok(result)
     }
 
     pub async fn connect_udp_bidirectional(
@@ -1004,7 +1056,22 @@ impl ClientChainGroup {
         let idx = self.next_udp_index.fetch_add(1, Ordering::Relaxed) as usize;
         let chain_idx = self.udp_chain_indices[idx % self.udp_chain_indices.len()];
         let chain = &self.chains[chain_idx];
-        chain.connect_udp_bidirectional(resolver, target).await
+        let Some(description) = self.description.as_ref().filter(|d| d.context.is_some()) else {
+            return chain.connect_udp_bidirectional(resolver, target).await;
+        };
+        let mut path = Vec::new();
+        let stream = chain
+            .connect_udp_observed(resolver, target.clone(), &mut path)
+            .await?;
+        let guard = description.context.as_ref().unwrap().register(
+            "udp",
+            &target,
+            path,
+            &description.payload,
+        );
+        Ok(Box::new(
+            crate::control::tracked_stream::TrackedMessageStream::new(stream, guard),
+        ))
     }
 
     #[cfg(test)]

@@ -190,6 +190,10 @@ impl AsyncShutdownMessage for UdpSocket {
 }
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {
+    /// Semantic outbound accounting that raw-socket fast paths must preserve.
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
+        None
+    }
     /// All remaining I/O is raw socket I/O, with no buffered bytes or wrapper side effects.
     /// May become available after a protocol transition and its buffered I/O have drained.
     #[cfg(target_os = "linux")]
@@ -212,6 +216,9 @@ pub trait AsyncMessageStream:
     + Unpin
     + Send
 {
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
+        None
+    }
 }
 
 /// Server stream trait connected to proxy clients, where received messages have a target address,
@@ -518,6 +525,7 @@ impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for 
 }
 
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> { (**self).flow() }
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&TcpStream> {
         (**self).plain_tcp()
@@ -528,6 +536,7 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
     }
 }
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> { (**self).flow() }
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&TcpStream> {
         (**self).plain_tcp()
@@ -538,8 +547,12 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
     }
 }
 
-impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for Box<T> {}
-impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for &mut T {}
+impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for Box<T> {
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> { (**self).flow() }
+}
+impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for &mut T {
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> { (**self).flow() }
+}
 
 impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream for Box<T> {}
 impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream for &mut T {}

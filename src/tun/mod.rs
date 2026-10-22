@@ -296,7 +296,11 @@ pub(crate) async fn handle_tcp_connection(
         debug!("TCP connection blocked by rules");
         return Ok(());
     };
-    let result = tokio::io::copy_bidirectional(&mut connection, &mut remote).await;
+    let flow = remote.flow().cloned();
+    let result = tokio::select! {
+        result = tokio::io::copy_bidirectional(&mut connection, &mut remote) => result,
+        _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => Err(crate::control::tracked_stream::cancelled()),
+    };
     match result {
         Ok((sent, received)) => debug!(
             "TCP connection to {} completed: {} bytes sent, {} bytes received",

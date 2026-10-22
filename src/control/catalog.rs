@@ -64,6 +64,7 @@ pub fn chain_selection_key(
 pub struct RuleDescription {
     pub payload: String,
     pub proxy: String,
+    pub context: Option<Arc<super::flows::FlowContext>>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +280,7 @@ impl Catalog {
                 rule.criteria.description = Some(Arc::new(RuleDescription {
                     payload,
                     proxy: rule_target(&rule.action),
+                    context: None,
                 }));
                 Ok(())
             },

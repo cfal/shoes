@@ -151,6 +151,7 @@ enum SessionLookup {
 
 /// A routing session (one per unique flow)
 struct RoutingSession {
+    cancelled: Option<Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>>,
     permit: Option<crate::resources::BudgetPermit>,
     /// The destination this session routes to
     destination: NetLocation,
@@ -200,7 +201,11 @@ impl RoutingSession {
         lookup_key: LookupKey,
         remote: Box<dyn AsyncMessageStream>,
     ) -> Self {
+        let cancelled = remote
+            .flow()
+            .map(|flow| Box::pin(flow.cancel.clone().cancelled_owned()));
         Self {
+            cancelled,
             permit: None,
             destination,
             session_id,
@@ -1399,6 +1404,20 @@ impl<'a> Future for UdpRouter<'a> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+
+        let cancelled: Vec<_> = this
+            .sessions
+            .iter_mut()
+            .filter_map(|(id, session)| {
+                session
+                    .cancelled
+                    .as_mut()
+                    .and_then(|cancelled| cancelled.as_mut().poll(cx).is_ready().then_some(*id))
+            })
+            .collect();
+        for id in cancelled {
+            this.cancel_session(id);
+        }
 
         this.expiry_iteration = this.expiry_iteration.wrapping_add(1);
 
