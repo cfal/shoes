@@ -859,14 +859,20 @@ impl AnyTlsSession {
                 let result =
                     copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
-                crate::control::tracked_stream::finish_shutdown(flow.as_deref(), None, async {
-                    let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, async {
+                let cancelled = tokio::select! {
+                    biased;
+                    _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => true,
+                    _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, async {
                         let _ = stream.shutdown().await;
                         let _ = client_stream.shutdown().await;
-                    })
-                    .await;
-                })
-                .await;
+                    }) => false,
+                };
+                if cancelled {
+                    drop(client_stream);
+                    stream.close_read();
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+                }
 
                 if let Err(e) = &result {
                     log::debug!("AnyTLS stream {} ended: {}", stream_id, e);
@@ -960,7 +966,7 @@ impl AnyTlsSession {
     /// Uses connect_udp for proper proxy chaining support.
     async fn handle_uot_v2_connect(
         &self,
-        stream: AnyTlsStream,
+        mut stream: AnyTlsStream,
         destination: NetLocation,
     ) -> io::Result<()> {
         let stream_id = stream.id();
@@ -998,7 +1004,20 @@ impl AnyTlsSession {
                 return Err(error);
             }
         };
-        self.send_synack(stream_id, None).await?;
+        let flow = setup.stream.flow().cloned();
+        let synack = self.send_synack(stream_id, None);
+        tokio::pin!(synack);
+        tokio::select! {
+            result = &mut synack => result?,
+            _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => {
+                drop(setup.stream);
+                stream.close_read();
+                // A partially written shared control frame must finish before FIN.
+                let _ = synack.await;
+                let _ = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+                return Err(crate::control::tracked_stream::cancelled());
+            }
+        }
         run_udp_copy(
             Box::new(VlessMessageStream::new(stream)),
             setup.stream,
@@ -1459,9 +1478,42 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TcpDatagramConnector(std::net::SocketAddr);
+
+    #[async_trait::async_trait]
+    impl crate::tcp::socket_connector::SocketConnector for TcpDatagramConnector {
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: &crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
+            unreachable!("datagram fixture")
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
+            let stream = tokio::net::TcpStream::connect(self.0).await?;
+            Ok(Box::new(VlessMessageStream::new(stream)))
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
     #[tokio::test]
-    async fn cancelled_setup_releases_reads_and_egress_before_bounded_fin() {
-        for (early_data, drain) in [(false, true), (false, false), (true, true), (true, false)] {
+    async fn cancelled_flows_release_reads_and_egress_before_bounded_fin() {
+        for (phase, drain) in ["synack", "early-data", "copy", "udp-synack"]
+            .into_iter()
+            .flat_map(|phase| [true, false].map(|drain| (phase, drain)))
+        {
+            let early_data = phase == "early-data";
+            let established = phase == "copy";
+            let udp = phase == "udp-synack";
             timeout(Duration::from_secs(3), async {
                 use crate::client_proxy_chain::ClientChainGroup;
                 use crate::client_proxy_selector::{ConnectAction, ConnectRule};
@@ -1483,13 +1535,25 @@ mod tests {
                 } else {
                     crate::config::ClientConfig::default()
                 };
-                let chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
-                    crate::option_util::OneOrSome::One(crate::config::ClientChainHop::Single(
-                        crate::config::ConfigSelection::Config(client),
-                    )),
-                    resolver.clone(),
-                )
-                .unwrap();
+                let chain = if udp {
+                    crate::client_proxy_chain::ClientProxyChain::new(
+                        vec![crate::client_proxy_chain::InitialHopEntry::Direct(
+                            Arc::new(TcpDatagramConnector(std::net::SocketAddr::from((
+                                [127, 0, 0, 1],
+                                listener.local_addr().unwrap().port(),
+                            )))),
+                        )],
+                        Vec::new(),
+                    )
+                } else {
+                    crate::tcp::chain_builder::try_build_client_proxy_chain(
+                        crate::option_util::OneOrSome::One(crate::config::ClientChainHop::Single(
+                            crate::config::ConfigSelection::Config(client),
+                        )),
+                        resolver.clone(),
+                    )
+                    .unwrap()
+                };
                 let group = ClientChainGroup::new(vec![chain]).with_description(Some(Arc::new(
                     RuleDescription {
                         payload: "all".into(),
@@ -1507,7 +1571,8 @@ mod tests {
                     vec![crate::address::NetLocationMask::ANY],
                     ConnectAction::new_allow(None, group),
                 )]));
-                let (transport, mut peer) = duplex(if early_data { 8192 } else { 1 });
+                let (transport, mut peer) =
+                    duplex(if early_data || established { 8192 } else { 1 });
                 let session = AnyTlsSession::new_server_with_initial_data(
                     transport,
                     PaddingFactory::default_factory(),
@@ -1525,9 +1590,11 @@ mod tests {
                         .unwrap();
                 }
                 let (sender, receiver) = mpsc::channel(1);
-                sender
-                    .try_send(Bytes::from_static(b"queued upload"))
-                    .unwrap();
+                if !established {
+                    sender
+                        .try_send(Bytes::from_static(b"queued upload"))
+                        .unwrap();
+                }
                 let stream = AnyTlsStream::new(
                     1,
                     receiver,
@@ -1535,8 +1602,13 @@ mod tests {
                     session.is_closed.clone(),
                 );
                 let handler = session.clone();
-                let forwarding =
-                    tokio::spawn(async move { handler.handle_tcp_forward(stream, target).await });
+                let forwarding = tokio::spawn(async move {
+                    if udp {
+                        handler.handle_uot_v2_connect(stream, target).await
+                    } else {
+                        handler.handle_tcp_forward(stream, target).await
+                    }
+                });
                 let (mut egress, _) = listener.accept().await.unwrap();
                 if early_data {
                     let mut request = Vec::new();
@@ -1550,7 +1622,7 @@ mod tests {
                         .unwrap();
                 }
                 let mut header = [0; 7];
-                let initial = if early_data { 7 } else { 1 };
+                let initial = if early_data || established { 7 } else { 1 };
                 peer.read_exact(&mut header[..initial]).await.unwrap();
                 if early_data {
                     assert_eq!(
@@ -1559,9 +1631,20 @@ mod tests {
                         "fixture must return early data before copying starts"
                     );
                 }
+                if established {
+                    egress.write_all(b"download").await.unwrap();
+                    while registry.snapshot(0).connections[0].download == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
                 tokio::task::yield_now().await;
                 registry.cancel_all();
-                timeout(Duration::from_secs(1), async {
+                if established {
+                    sender
+                        .try_send(Bytes::from_static(b"queued upload"))
+                        .unwrap();
+                }
+                timeout(Duration::from_millis(100), async {
                     while !registry.snapshot(0).connections.is_empty() {
                         tokio::task::yield_now().await;
                     }
