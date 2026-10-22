@@ -102,6 +102,32 @@ fn conflicts_with_framing(name: &http::HeaderName) -> bool {
     )
 }
 
+fn validate_header_names<'a>(
+    field: &str,
+    names: impl IntoIterator<Item = &'a String>,
+) -> io::Result<()> {
+    let mut seen = HashSet::new();
+    for name in names {
+        let name = http::HeaderName::try_from(name).map_err(io::Error::other)?;
+        if name == http::header::HOST {
+            return Err(invalid(&format!(
+                "XHTTP {field} cannot include Host; use host instead"
+            )));
+        }
+        if conflicts_with_framing(&name) {
+            return Err(invalid(&format!(
+                "XHTTP {field} cannot include transport framing headers"
+            )));
+        }
+        if !seen.insert(name) {
+            return Err(invalid(&format!(
+                "XHTTP {field} cannot repeat a header name"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct XhttpLimits {
@@ -311,14 +337,9 @@ impl XhttpClientConfig {
         if self.protocol.is_direct() {
             return Err(invalid("direct cannot be an XHTTP inner protocol"));
         }
-        for (name, value) in &self.headers {
-            let name = http::HeaderName::try_from(name).map_err(io::Error::other)?;
+        validate_header_names("headers", self.headers.keys())?;
+        for value in self.headers.values() {
             http::HeaderValue::try_from(value).map_err(io::Error::other)?;
-            if conflicts_with_framing(&name) {
-                return Err(invalid(
-                    "XHTTP custom header conflicts with transport framing",
-                ));
-            }
         }
         Ok(())
     }
@@ -359,28 +380,12 @@ pub struct XhttpServerConfig {
 impl XhttpServerConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
-        let mut names = HashSet::new();
-        for (name, value) in &self.matching_headers {
-            let name = http::HeaderName::try_from(name).map_err(io::Error::other)?;
+        validate_header_names("matching_headers", self.matching_headers.keys())?;
+        for value in self.matching_headers.values() {
             http::HeaderValue::try_from(value).map_err(io::Error::other)?;
-            if name == http::header::HOST {
-                return Err(invalid(
-                    "XHTTP matching_headers cannot include Host; use host instead",
-                ));
-            }
-            if conflicts_with_framing(&name) {
-                return Err(invalid(
-                    "XHTTP matching header conflicts with transport framing",
-                ));
-            }
             if value.starts_with([' ', '\t']) || value.ends_with([' ', '\t']) {
                 return Err(invalid(
                     "XHTTP matching header values cannot start or end with whitespace",
-                ));
-            }
-            if !names.insert(name) {
-                return Err(invalid(
-                    "XHTTP matching_headers contains duplicate header names",
                 ));
             }
         }
@@ -619,6 +624,25 @@ mod tests {
             }))
             .unwrap();
             assert!(config.validate().is_err(), "{headers}");
+        }
+    }
+
+    #[test]
+    fn client_rejects_invalid_headers() {
+        for (headers, valid) in [
+            (serde_json::json!({"X-Token": "a", "X-Other": "a"}), true),
+            (serde_json::json!({"X-Token": "a", "x-token": "b"}), false),
+            (serde_json::json!({"X-Token": "a", "X-TOKEN": "a"}), false),
+            (serde_json::json!({"bad name": "value"}), false),
+            (serde_json::json!({"x-token": "a\r\nx-injected: b"}), false),
+            (serde_json::json!({"Host": "front.test"}), false),
+            (serde_json::json!({"Connection": "keep-alive"}), false),
+        ] {
+            let config: XhttpClientConfig = serde_json::from_value(serde_json::json!({
+                "headers": headers, "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            assert_eq!(config.validate().is_ok(), valid, "{headers}");
         }
     }
 

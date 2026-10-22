@@ -13,6 +13,7 @@
 - Updated Rust dependencies, including GotaTun 0.10.2, Tokio 1.54.0, LRU 0.19.0, and ML-KEM 0.3.3, which removes secret-dependent table lookups. Existing Web PKI compromise protections are retained.
 - Refreshed the BLAKE3 fork with upstream buffer-alignment and AVX-512 soundness fixes while retaining the binary-context key derivation API.
 - Updated Android and CI build dependencies; Android source builds now require Gradle 9.6.0 or newer with Java 17.
+- XHTTP client `headers` now reject names that differ only in case. Such configs previously sent every value, which a server with `matching_headers` always rejects.
 
 ## v0.3.4
 
