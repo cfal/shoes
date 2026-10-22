@@ -243,8 +243,12 @@ impl AnyTlsServerHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::Address;
+    use crate::resolver::NativeResolver;
+    use std::io::ErrorKind;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
 
-    /// Helper to compute password hash the same way the handler does
     fn compute_password_hash(password: &str) -> [u8; 32] {
         let hash_result = digest(&SHA256, password.as_bytes());
         let mut hash = [0u8; 32];
@@ -252,67 +256,123 @@ mod tests {
         hash
     }
 
-    #[test]
-    fn test_password_hashing() {
-        let hash = compute_password_hash("secret123");
-
-        let expected = digest(&SHA256, b"secret123");
-        let mut expected_bytes = [0u8; 32];
-        expected_bytes.copy_from_slice(expected.as_ref());
-
-        assert_eq!(hash, expected_bytes);
+    fn handler(fallback: Option<NetLocation>) -> AnyTlsServerHandler {
+        AnyTlsServerHandler::new(
+            vec![("alice".into(), "secret123".into())],
+            PaddingFactory::default_factory(),
+            Arc::new(NativeResolver::new()),
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            false,
+            fallback,
+        )
     }
 
-    #[test]
-    fn test_different_passwords_different_hashes() {
-        let hash1 = compute_password_hash("pass1");
-        let hash2 = compute_password_hash("pass2");
-
-        assert_ne!(hash1, hash2);
+    #[tokio::test]
+    async fn invalid_credentials_are_rejected_at_both_authentication_stages() {
+        for corrupt_index in [0, 8] {
+            let mut auth = compute_password_hash("secret123");
+            auth[corrupt_index] ^= 1;
+            let (io, mut peer) = tokio::io::duplex(1024);
+            let offered = if corrupt_index == 0 { 8 } else { 32 };
+            peer.write_all(&auth[..offered]).await.unwrap();
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                handler(None).setup_server_stream(Box::new(io)),
+            )
+            .await
+            .expect("authentication waited for more bytes")
+            .err()
+            .expect("invalid credentials created a session");
+            assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        }
     }
 
-    #[test]
-    fn test_hash_map_and_prefix_construction() {
-        // Test that the handler correctly builds user map and prefix set
-        let users = vec![
-            ("alice".to_string(), "password1".to_string()),
-            ("bob".to_string(), "password2".to_string()),
-        ];
-
-        // Compute expected hashes
-        let hash1 = compute_password_hash("password1");
-        let hash2 = compute_password_hash("password2");
-
-        // Build the maps the same way the handler does
-        let mut user_map = HashMap::with_capacity(users.len());
-        let mut hash_prefixes = HashSet::with_capacity(users.len());
-
-        for (name, password) in users {
-            let hash = compute_password_hash(&password);
-            let prefix: [u8; 8] = hash[..8].try_into().unwrap();
-            hash_prefixes.insert(prefix);
-            user_map.insert(hash, name);
+    #[tokio::test]
+    async fn complete_authentication_and_padding_are_required_for_a_session() {
+        let mut auth = compute_password_hash("secret123").to_vec();
+        auth.extend_from_slice(&[0, 3, 1, 2, 3]);
+        for len in 0..auth.len() {
+            let (io, mut peer) = tokio::io::duplex(1024);
+            peer.write_all(&auth[..len]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let error = handler(None)
+                .setup_server_stream(Box::new(io))
+                .await
+                .err()
+                .expect("truncated authentication created a session");
+            assert_eq!(error.kind(), ErrorKind::ConnectionAborted, "len={len}");
         }
 
-        assert_eq!(user_map.len(), 2);
-        assert_eq!(hash_prefixes.len(), 2);
+        let (io, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(&auth).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            handler(None).setup_server_stream(Box::new(io)),
+        )
+        .await
+        .expect("complete authentication stalled")
+        .unwrap();
+        let TcpServerSetupResult::Session(session) = result else {
+            panic!("valid credentials did not create a session");
+        };
+        drop(session);
+        let read = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut [0; 1]))
+            .await
+            .expect("unpolled session retained the stream");
+        assert_eq!(read.unwrap(), 0);
+    }
 
-        // Verify slice lookups work via Borrow<[u8]>
-        let prefix1_slice: &[u8] = &hash1[..8];
-        let prefix2_slice: &[u8] = &hash2[..8];
-        assert!(hash_prefixes.contains(prefix1_slice));
-        assert!(hash_prefixes.contains(prefix2_slice));
+    #[tokio::test]
+    async fn fallback_preserves_bytes_and_session_owns_both_connections() {
+        for corrupt_index in [0, 8] {
+            for start_session in [false, true] {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+                    let fallback = NetLocation::new(
+                        Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                        listener.local_addr().unwrap().port(),
+                    );
+                    let mut flight = compute_password_hash("secret123").to_vec();
+                    flight[corrupt_index] ^= 1;
+                    flight.extend_from_slice(b"buffered");
+                    let (io, mut peer) = tokio::io::duplex(1024);
+                    peer.write_all(&flight).await.unwrap();
+                    let result = handler(Some(fallback))
+                        .setup_server_stream(Box::new(io))
+                        .await
+                        .unwrap();
+                    let TcpServerSetupResult::Session(mut session) = result else {
+                        panic!("expected fallback session");
+                    };
+                    let (mut remote, _) = listener.accept().await.unwrap();
+                    let mut received = vec![0; flight.len()];
+                    remote.read_exact(&mut received).await.unwrap();
+                    assert_eq!(received, flight);
 
-        // Verify a random prefix is NOT in the set
-        let random_prefix: &[u8] = &[0x47, 0x45, 0x54, 0x20, 0x2f, 0x20, 0x48, 0x54]; // "GET / HT"
-        assert!(!hash_prefixes.contains(random_prefix));
-
-        // Verify full hash lookup returns correct name
-        let hash1_slice: &[u8] = &hash1[..];
-        assert!(user_map.contains_key(hash1_slice));
-        assert_eq!(user_map.get(hash1_slice).unwrap(), "alice");
-
-        let hash2_slice: &[u8] = &hash2[..];
-        assert_eq!(user_map.get(hash2_slice).unwrap(), "bob");
+                    if start_session {
+                        let exchange = async {
+                            peer.write_all(b"live").await.unwrap();
+                            let mut received = [0; 4];
+                            remote.read_exact(&mut received).await.unwrap();
+                            assert_eq!(&received, b"live");
+                            remote.write_all(b"back").await.unwrap();
+                            peer.read_exact(&mut received).await.unwrap();
+                            assert_eq!(&received, b"back");
+                        };
+                        tokio::select! {
+                            () = &mut session => panic!("fallback ended before the exchange"),
+                            () = exchange => {},
+                        }
+                    }
+                    drop(session);
+                    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+                    assert_eq!(remote.read(&mut [0; 1]).await.unwrap(), 0);
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("corrupt_index={corrupt_index}, running={start_session}")
+                });
+            }
+        }
     }
 }

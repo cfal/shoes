@@ -382,16 +382,22 @@ mod tests {
     #[test]
     fn yaml_limits_apply_in_a_fresh_process() {
         if std::env::var_os("SHOES_RESOURCE_TEST_CHILD").is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "resources::tests::yaml_limits_apply_in_a_fresh_process",
                     "--quiet",
                 ])
                 .env("SHOES_RESOURCE_TEST_CHILD", "1")
-                .status()
+                .output()
                 .unwrap();
-            assert!(status.success());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "resource limit test failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
 

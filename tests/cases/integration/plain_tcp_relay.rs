@@ -128,6 +128,54 @@ async fn pipelined_payload_banner_and_delayed_response_after_half_close() -> io:
 }
 
 #[tokio::test]
+async fn server_half_close_preserves_later_client_upload() -> io::Result<()> {
+    timeout(Duration::from_secs(30), async {
+        for protocol in ["forward", "socks", "http"] {
+            let peer = TcpListener::bind("0.0.0.0:0").await?;
+            let peer_port = peer.local_addr()?.port();
+            let mut ports = PortHelper::new();
+            let (_, port) = ports.get_localhost_listener_port();
+            let target = if protocol == "forward" {
+                format!("    target: '127.0.0.1:{peer_port}'\n")
+            } else {
+                String::new()
+            };
+            let (_process, _config) = start_shoes_server(&format!(
+                "- address: '0.0.0.0:{port}'\n  protocol:\n    type: {protocol}\n{target}"
+            ))?;
+            ports.wait_for_all_ports().await?;
+            if protocol == "forward" {
+                let (mut probe, _) = peer.accept().await?;
+                assert_eq!(probe.read(&mut [0]).await?, 0);
+            }
+            let data: Vec<_> = (0..1_000_007usize).map(|i| (i ^ (i >> 8)) as u8).collect();
+            let server = async {
+                let (mut socket, _) = peer.accept().await?;
+                socket.write_all(b"banner").await?;
+                socket.shutdown().await?;
+                let mut received = Vec::new();
+                socket.read_to_end(&mut received).await?;
+                assert_eq!(received, data, "{protocol}: upload after server EOF");
+                io::Result::Ok(())
+            };
+            let client = async {
+                let mut socket = TcpStream::connect(("127.0.0.1", port)).await?;
+                request(&mut socket, protocol, peer_port, b"").await?;
+                let mut banner = Vec::new();
+                socket.read_to_end(&mut banner).await?;
+                assert_eq!(banner, b"banner", "{protocol}");
+                // Observing EOF fences the upload behind the peer's write-half close.
+                socket.write_all(&data).await?;
+                socket.shutdown().await
+            };
+            tokio::try_join!(server, client)?;
+        }
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
 async fn upstream_handshake_banner_follows_inbound_success_response() -> io::Result<()> {
     timeout(Duration::from_secs(10), async {
         let peer = TcpListener::bind("0.0.0.0:0").await?;
