@@ -96,7 +96,8 @@ kernel TUN/WireGuard, and pinned-peer suites. macOS runs rootless TUN, WireGuard
 process-watcher unit tests, and selected FFI/process contracts. Android and iOS
 jobs cross-compile the native libraries but do not exercise device VPN lifecycles.
 Only selected bounded stress cases run in CI; long-duration and performance tests
-remain explicit opt-ins.
+remain explicit opt-ins. Filtered test steps run through
+`.github/require-tests.sh`, which fails a step whose filter selects no tests.
 
 Retain the existing suite boundaries. Prefer deterministic in-process tests for
 fragmentation, cancellation, credit accounting, and parser rejection; use
@@ -112,24 +113,9 @@ Important remaining limitations:
   remain separate from host-side tests and cross-compilation.
 - Windows build entries are disabled; ARM and musl builds do not establish
   runtime coverage. macOS does not run the full Linux protocol and IP-stack suite.
-- Global resource-budget changes across rejected and accepted reload generations
-  need a combined process contract; separate budget and reload tests do not cover
-  their interaction.
-- Graceful message-stream EOF with a permanently pending shutdown needs an
-  explicit shutdown policy and regression. Error-path cleanup already has a
-  deadline; changing the graceful path is not merely a test improvement. The
-  association idle timer also lacks deterministic paused-clock coverage.
-- The shared ShadowTLS/REALITY ClientHello parser rejects multi-record
-  ClientHellos and does not bound SNI and `supported_versions` parsing by the
-  declared extension length; both need protocol review. WebSocket close frames
-  are skipped rather than answered.
 - The legacy `privileged` target's `tun::` cases are not selected by CI; the
   `tun_kernel::` cases are. Native Naive and most sustained multi-GiB stress tests
-  remain manual. ShadowTLS sing-box interoperability cases depend on
-  www.cloudflare.com as the handshake server.
-- Filtered CI invocations can still select zero tests after a rename. The
-  resource-limit and raw-descriptor subprocess tests explicitly require one
-  passed child test, but that guard is not applied to every workflow filter.
+  remain manual.
 - The historical Naive/sing-box idle timeout remains unattributed. Progress
   diagnostics and deterministic H2 credit tests do not prove its cause.
 - Mihomo and sing-box early-half-close limitations retain ignored strict tests.
