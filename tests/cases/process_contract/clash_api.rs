@@ -687,7 +687,7 @@ async fn websocket_ping_before_first_frame_preserves_snapshot() {
     use hyper_tungstenite::tungstenite::Message;
     let fixture = Fixture::new().await;
     let mut process = fixture.start().await;
-    let mut ws = websocket_path(fixture.api, "/connections").await;
+    let mut ws = websocket_path(fixture.api, "/connections?interval=60000").await;
     ws.send(Message::Ping(b"before-first-frame".to_vec().into()))
         .await
         .unwrap();

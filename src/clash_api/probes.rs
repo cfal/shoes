@@ -598,10 +598,14 @@ mod tests {
             .unwrap();
         for _ in 0..2 {
             assert_eq!(
-                request(&generation, "outbound", &query())
-                    .await
-                    .unwrap_err()
-                    .kind(),
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    request(&generation, "outbound", &query())
+                )
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
                 io::ErrorKind::PermissionDenied
             );
             assert!(Arc::ptr_eq(
