@@ -16,6 +16,8 @@
 - Refreshed the BLAKE3 fork with upstream buffer-alignment and AVX-512 soundness fixes while retaining the binary-context key derivation API.
 - Updated CI build dependencies.
 - Removed the standalone Android Kotlin/Gradle wrapper, AAR and iOS XCFramework packaging, and mobile SDK release artifacts from this repository. Mobile embedding remains supported through the Rust JNI/C interfaces and native libraries; Android and iOS cross-compilation checks remain in CI.
+- XHTTP server `matching_headers` values may now be lists. A request must still send exactly one value, which may match any listed value, so secrets can rotate without downtime. XHTTP client `headers` now reject names that differ only in case, which previously sent every value and always failed a server's `matching_headers`, and values with leading or trailing whitespace, which receivers strip or reject.
+- Removed XHTTP server `close_on_http1_error`; configurations that still set it fail to load. HTTP/1 header and path mismatches now return the same plain 404 as HTTP/2 and HTTP/3. All XHTTP error responses now omit XHTTP padding, caching, and CORS headers, not only 400 and 404; successful responses are unchanged.
 
 ## v0.3.4
 

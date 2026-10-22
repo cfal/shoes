@@ -61,6 +61,8 @@ local-only coverage without external peers.
 - A single POST trickles at about 5 KiB/s for four seconds with a two-second
   inactivity timeout. Stalled bodies must time out and release admission.
 - Wrong UUIDs must fail without dialing the destination; matching controls pass.
+  Xray and Mihomo client `headers` satisfy Shoes `matching_headers` in all three modes
+  on H2 and in H1/H3 packet-up; missing or wrong values fail the same way.
   Existing TLS/QUIC allowlist and REALITY ML-DSA verification cases remain enabled.
 - SOCKS -> XHTTP and QUIC XHTTP -> VLESS chains carry TCP/UDP and fail closed when
   a hop disappears.

@@ -6,6 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{ClientProxyConfig, GlobalLimits, ServerProxyConfig};
+use crate::option_util::OneOrSome;
 
 pub(crate) const MAX_PADDING_BYTES: u32 = 65536;
 
@@ -100,6 +101,49 @@ fn conflicts_with_framing(name: &http::HeaderName) -> bool {
             | "trailer"
             | "referer"
     )
+}
+
+fn validate_header_names<'a>(
+    field: &str,
+    names: impl IntoIterator<Item = &'a String>,
+) -> io::Result<()> {
+    let mut seen = HashSet::new();
+    for name in names {
+        let name = http::HeaderName::try_from(name).map_err(io::Error::other)?;
+        if name == http::header::HOST {
+            return Err(invalid(&format!(
+                "XHTTP {field} cannot include Host; use host instead"
+            )));
+        }
+        if conflicts_with_framing(&name) {
+            return Err(invalid(&format!(
+                "XHTTP {field} cannot include transport framing headers"
+            )));
+        }
+        if !seen.insert(name) {
+            return Err(invalid(&format!(
+                "XHTTP {field} cannot repeat a header name"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_header_values<'a>(
+    field: &str,
+    values: impl IntoIterator<Item = &'a String>,
+) -> io::Result<()> {
+    for value in values {
+        http::HeaderValue::try_from(value).map_err(io::Error::other)?;
+        // HTTP/1 receivers strip edge whitespace and HTTP/2 and HTTP/3 forbid it,
+        // so such a value never arrives as configured.
+        if value.starts_with([' ', '\t']) || value.ends_with([' ', '\t']) {
+            return Err(invalid(&format!(
+                "XHTTP {field} values cannot start or end with whitespace"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -311,15 +355,8 @@ impl XhttpClientConfig {
         if self.protocol.is_direct() {
             return Err(invalid("direct cannot be an XHTTP inner protocol"));
         }
-        for (name, value) in &self.headers {
-            let name = http::HeaderName::try_from(name).map_err(io::Error::other)?;
-            http::HeaderValue::try_from(value).map_err(io::Error::other)?;
-            if conflicts_with_framing(&name) {
-                return Err(invalid(
-                    "XHTTP custom header conflicts with transport framing",
-                ));
-            }
-        }
+        validate_header_names("headers", self.headers.keys())?;
+        validate_header_values("headers", self.headers.values())?;
         Ok(())
     }
 }
@@ -330,11 +367,9 @@ pub struct XhttpServerConfig {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
-    pub close_on_http1_error: bool,
-    #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
-    pub matching_headers: BTreeMap<String, String>,
+    pub matching_headers: BTreeMap<String, OneOrSome<String>>,
     #[serde(default)]
     pub mode: XhttpMode,
     #[serde(default)]
@@ -359,31 +394,11 @@ pub struct XhttpServerConfig {
 impl XhttpServerConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
-        let mut names = HashSet::new();
-        for (name, value) in &self.matching_headers {
-            let name = http::HeaderName::try_from(name).map_err(io::Error::other)?;
-            http::HeaderValue::try_from(value).map_err(io::Error::other)?;
-            if name == http::header::HOST {
-                return Err(invalid(
-                    "XHTTP matching_headers cannot include Host; use host instead",
-                ));
-            }
-            if conflicts_with_framing(&name) {
-                return Err(invalid(
-                    "XHTTP matching header conflicts with transport framing",
-                ));
-            }
-            if value.starts_with([' ', '\t']) || value.ends_with([' ', '\t']) {
-                return Err(invalid(
-                    "XHTTP matching header values cannot start or end with whitespace",
-                ));
-            }
-            if !names.insert(name) {
-                return Err(invalid(
-                    "XHTTP matching_headers contains duplicate header names",
-                ));
-            }
-        }
+        validate_header_names("matching_headers", self.matching_headers.keys())?;
+        validate_header_values(
+            "matching_headers",
+            self.matching_headers.values().flat_map(OneOrSome::iter),
+        )?;
         if contains_server(&self.protocol) {
             return Err(invalid("nested XHTTP is not supported"));
         }
@@ -574,20 +589,14 @@ mod tests {
         }))
         .unwrap();
         assert!(config.matching_headers.is_empty());
-        assert!(!config.close_on_http1_error);
-        config.close_on_http1_error = true;
         config
             .matching_headers
             .insert("X-Token".into(), "Secret".into());
-        config
-            .matching_headers
-            .insert("X-Empty".into(), String::new());
+        config.matching_headers.insert("X-Empty".into(), "".into());
         config.validate().unwrap();
         let encoded = serde_json::to_value(&config).unwrap();
-        assert_eq!(encoded["close_on_http1_error"], true);
         let decoded: XhttpServerConfig = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.matching_headers, config.matching_headers);
-        assert!(decoded.close_on_http1_error);
         decoded.validate().unwrap();
     }
 
@@ -613,12 +622,58 @@ mod tests {
             serde_json::json!({"x-token": "secret "}),
             serde_json::json!({"x-token": "\tsecret"}),
             serde_json::json!({"x-token": "secret\t"}),
+            serde_json::json!({"x-token": ["secret", "secret "]}),
+            serde_json::json!({"x-token": ["secret", "a\r\nb"]}),
         ] {
             let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
                 "matching_headers": headers, "protocol": {"type": "socks"}
             }))
             .unwrap();
             assert!(config.validate().is_err(), "{headers}");
+        }
+    }
+
+    #[test]
+    fn server_matching_headers_accept_value_lists() {
+        let headers = serde_json::json!({"X-Single": "one", "X-Token": ["old", "new"]});
+        let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+            "matching_headers": headers, "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["matching_headers"],
+            headers
+        );
+        assert!(
+            serde_json::from_value::<XhttpServerConfig>(serde_json::json!({
+                "matching_headers": {"X-Token": []}, "protocol": {"type": "socks"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn client_rejects_invalid_headers() {
+        for (headers, valid) in [
+            (serde_json::json!({"X-Token": "a", "X-Other": "a"}), true),
+            (serde_json::json!({"X-Token": "a", "x-token": "b"}), false),
+            (serde_json::json!({"X-Token": "a", "X-TOKEN": "a"}), false),
+            (serde_json::json!({"bad name": "value"}), false),
+            (serde_json::json!({"x-token": "a\r\nx-injected: b"}), false),
+            (serde_json::json!({"Host": "front.test"}), false),
+            (serde_json::json!({"Connection": "keep-alive"}), false),
+            (serde_json::json!({"x-token": "a b\tc"}), true),
+            (serde_json::json!({"x-token": " a"}), false),
+            (serde_json::json!({"x-token": "a "}), false),
+            (serde_json::json!({"x-token": "\ta"}), false),
+            (serde_json::json!({"x-token": "a\t"}), false),
+        ] {
+            let config: XhttpClientConfig = serde_json::from_value(serde_json::json!({
+                "headers": headers, "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            assert_eq!(config.validate().is_ok(), valid, "{headers}");
         }
     }
 

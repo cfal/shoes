@@ -108,21 +108,19 @@ pub enum Kind {
     Packet(String, u64),
 }
 
-pub fn check_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> io::Result<()> {
-    for (name, expected) in &config.matching_headers {
+pub fn has_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> bool {
+    config.matching_headers.iter().all(|(name, accepted)| {
         let mut values = headers.get_all(name.as_str()).iter();
-        let matches = values
-            .next()
-            .is_some_and(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes())))
-            && values.next().is_none();
-        if !matches {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "XHTTP request headers do not match",
-            ));
+        let Some(value) = values.next() else {
+            return false;
+        };
+        if values.next().is_some() {
+            return false;
         }
-    }
-    Ok(())
+        accepted
+            .iter()
+            .any(|candidate| bool::from(value.as_bytes().ct_eq(candidate.as_bytes())))
+    })
 }
 
 fn query_padding(query: &str) -> Option<String> {
@@ -308,21 +306,19 @@ mod tests {
             "protocol": {"type": "socks"}
         }))
         .unwrap();
-        assert!(check_matching_headers(&config, &HeaderMap::new()).is_ok());
+        assert!(has_matching_headers(&config, &HeaderMap::new()));
         config
             .matching_headers
             .insert("X-Token".into(), "Secret".into());
-        config
-            .matching_headers
-            .insert("X-Empty".into(), String::new());
+        config.matching_headers.insert("X-Empty".into(), "".into());
         config.validate().unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert("x-token", "Secret".parse().unwrap());
-        assert!(check_matching_headers(&config, &headers).is_err());
+        assert!(!has_matching_headers(&config, &headers));
         headers.insert("x-empty", "".parse().unwrap());
         headers.insert("x-extra", "allowed".parse().unwrap());
-        assert!(check_matching_headers(&config, &headers).is_ok());
+        assert!(has_matching_headers(&config, &headers));
         for values in [
             vec![],
             vec![""],
@@ -337,11 +333,34 @@ mod tests {
             for value in values {
                 headers.append("x-token", value.parse().unwrap());
             }
+            assert!(!has_matching_headers(&config, &headers));
+        }
+    }
+
+    #[test]
+    fn matching_headers_accept_one_of_the_configured_values() {
+        let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+            "matching_headers": {"X-Token": ["old", "new"]}, "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        for (values, matched) in [
+            (vec!["old"], true),
+            (vec!["new"], true),
+            (vec![], false),
+            (vec!["other"], false),
+            (vec!["old, new"], false),
+            (vec!["old", "new"], false),
+            (vec!["new", "new"], false),
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in &values {
+                headers.append("x-token", value.parse().unwrap());
+            }
             assert_eq!(
-                check_matching_headers(&config, &headers)
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::PermissionDenied
+                has_matching_headers(&config, &headers),
+                matched,
+                "{values:?}"
             );
         }
     }

@@ -474,37 +474,20 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
 - H1/H2 preserve selected upstream proxy chains. H3 must be the first proxy hop;
   it reuses the existing QUIC/H3 dependencies, not Hysteria2 framing.
 - Server `matching_headers` requires every configured header on every request,
-  including OPTIONS. Names are case-insensitive; values must match exactly and
-  occur only once. Missing, wrong, or repeated values return a plain HTTP 404
-  before session admission or body processing, unless H1 silent rejection is
-  enabled with `close_on_http1_error`. Other requests sharing an H2/H3
-  connection are unaffected. Request-admission limits take precedence over
-  header validation: exhausted H2/H3 request slots refuse the individual stream,
-  while H1 returns a plain 503 and closes that connection. H1 silent rejection,
-  when enabled, checks both headers and paths before request admission.
-  Configure the client's `headers` with the same values, for example
+  including OPTIONS, so browser preflights without them are rejected. Names are
+  case-insensitive; values must match exactly and occur only once, and an empty
+  value requires a present, empty header. Requests that fail the check get a
+  plain 404 on every HTTP version, without session admission or body reads;
+  other requests sharing an H2/H3 connection are unaffected. Configure the
+  client's `headers` with the same values, for example
   `matching_headers: { X-Tunnel-Key: "replace-me" }` on the server and
-  `headers: { X-Tunnel-Key: "replace-me" }` on the client. An empty map (default)
-  adds no requirements; an empty value requires a present, empty header.
-  Use `host`, not `matching_headers`, to match Host/`:authority` across versions.
-  Transport-managed headers and values with leading/trailing spaces or tabs
-  are rejected at startup.
-  Browser preflights without the required headers are also rejected.
-- Server `close_on_http1_error: true` silently closes an H1 connection for
-  required-header mismatches or URLs outside the configured XHTTP path prefix.
-  It has no effect on H2/H3: those requests return plain 404s, subject to
-  request-admission limits, without terminating sibling streams. The actual
-  carrier version determines the behavior, including with `http_version: auto`.
-  Prefix matching uses the same percent-decoding and trailing slash
-  normalization as XHTTP routing; malformed suffixes within a recognized prefix
-  do not trigger silent closure. Other errors retain normal HTTP responses and
-  stream refusals, including wrong hosts, invalid methods or padding, conflicts,
-  timeouts, oversized bodies, and resource exhaustion. Routine XHTTP session
-  teardown and late packets do not trigger this option.
-  The default is `false`, returning HTTP errors for header and path mismatches
-  on H1 too. 400 and 404 responses omit XHTTP-specific and CORS headers.
-  HTTP-library parsing/protocol errors before XHTTP receives a request, and body
-  failures after a successful response has started, retain their existing handling.
+  `headers: { X-Tunnel-Key: "replace-me" }` on the client. Xray clients that
+  set `extra` must put `headers` inside `extra`; Xray ignores top-level
+  `headers` when `extra` is present. A value may also be a list, such as
+  `X-Tunnel-Key: [old, new]`, to accept any one of them while rotating
+  secrets. Use `host`, not `matching_headers`, to match Host/`:authority`.
+- XHTTP error responses are plain: a status code and an empty body, without
+  padding, caching, or CORS headers.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
   padding, path/query handling, packet sizing/pacing, and stream-up keepalives
   follow modern Xray. `limits` can bound sessions, buffered bytes and requests;

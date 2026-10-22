@@ -79,7 +79,7 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
             let port = reserved.local_addr().unwrap().port();
             let address = format!("127.0.0.1:{port}");
             let server_protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version,
-                "matching_headers":{"X-Tunnel-Key":"test-secret"}, "close_on_http1_error":true,
+                "matching_headers":{"X-Tunnel-Key":"test-secret"},
                 "limits":{"max_requests_per_connection":peer_limit},
                 "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
             let concurrent_packets =

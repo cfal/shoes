@@ -902,6 +902,78 @@ async fn wrong_credentials_never_reach_the_destination() -> fixture::Result {
 }
 
 #[tokio::test]
+async fn xray_client_matching_headers() -> fixture::Result {
+    client_matching_headers(Peer::Xray).await
+}
+
+#[tokio::test]
+async fn mihomo_alpha_client_matching_headers() -> fixture::Result {
+    client_matching_headers(Peer::Mihomo).await
+}
+
+async fn client_matching_headers(peer: Peer) -> fixture::Result {
+    let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
+    let target: SocketAddr = ([127, 0, 0, 1], echo.local_addr().port()).into();
+    let mut fixture = Fixture::new(peer)?;
+    fixture.matching_headers = Some(json!({"X-Tunnel-Key":"test-secret"}));
+    let start = |version, mode, key: Option<&'static str>| {
+        fixture.start_with_client_patch(
+            fixture::Case {
+                peer,
+                shoes_client: false,
+                protocol: "vless",
+                version,
+                mode,
+            },
+            move |client| {
+                let Some(key) = key else { return };
+                let headers = json!({"X-Tunnel-Key":key});
+                if peer == Peer::Xray {
+                    // With extra set, Xray keeps only host/path/mode from top-level xhttpSettings.
+                    client["outbounds"][0]["streamSettings"]["xhttpSettings"]["extra"]["headers"] =
+                        headers;
+                } else {
+                    client["proxies"][0]["xhttp-opts"]["headers"] = headers;
+                }
+            },
+        )
+    };
+    for (version, mode) in [
+        ("h2", "packet-up"),
+        ("h2", "stream-up"),
+        ("h2", "stream-one"),
+        ("h1", "packet-up"),
+        ("h3", "packet-up"),
+    ] {
+        eprintln!("XHTTP matching headers: {peer:?} {version} {mode}");
+        let pair = start(version, mode, Some("test-secret")).await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::try_join!(
+                exchange(pair.socks, target, 0),
+                exchange(pair.socks, target, 1),
+            )?;
+            exchange(pair.socks, target, 2).await
+        })
+        .await??;
+    }
+    for key in [None, Some("wrong-secret")] {
+        let destination = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let target = ([127, 0, 0, 1], destination.local_addr()?.port()).into();
+        let pair = start("h2", "packet-up", key).await?;
+        assert_rejected(pair.socks, target)
+            .await
+            .map_err(|error| format!("{peer:?}, header {key:?}: {error}"))?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), destination.accept())
+                .await
+                .is_err(),
+            "{peer:?}, header {key:?}: rejected request dialed the target"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn shoes_client_xray_server_all_modes_and_versions() -> Result<(), Box<dyn std::error::Error>>
 {
     matrix_peer(
