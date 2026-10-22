@@ -1,13 +1,7 @@
 use std::io;
 
-#[cfg(test)]
-use aws_lc_rs::agreement;
 use aws_lc_rs::kem;
-#[cfg(test)]
-use rand::Rng;
 
-#[cfg(test)]
-use super::reality_auth::perform_ecdh;
 use crate::buf_reader::BufReader;
 
 const MLKEM_PUBLIC_LEN: usize = 1184;
@@ -29,14 +23,6 @@ pub enum RealityGroup {
 }
 
 impl RealityGroup {
-    #[cfg(test)]
-    pub fn secret_len(self) -> usize {
-        match self {
-            Self::X25519 => 32,
-            Self::X25519MlKem768 => 64,
-        }
-    }
-
     pub fn share_len(self, client: bool) -> usize {
         match self {
             Self::X25519 => 32,
@@ -75,15 +61,6 @@ impl ClientKeyShares {
             .as_ref()
             .map(|key| key[MLKEM_PUBLIC_LEN..].try_into().unwrap())
             .ok_or_else(|| invalid("Missing REALITY authentication key share"))
-    }
-
-    #[cfg(test)]
-    pub fn get(&self, group: RealityGroup) -> io::Result<&[u8]> {
-        match group {
-            RealityGroup::X25519 => self.x25519.as_ref().map(|k| k.as_slice()),
-            RealityGroup::X25519MlKem768 => self.hybrid.as_ref().map(|k| k.as_slice()),
-        }
-        .ok_or_else(|| invalid("Server selected a key share absent from ClientHello"))
     }
 }
 
@@ -217,88 +194,11 @@ pub fn generate_mlkem() -> io::Result<(kem::DecapsulationKey, Vec<u8>)> {
 }
 
 #[cfg(test)]
-pub fn complete_client_exchange(
-    private: &[u8; 32],
-    mlkem: &kem::DecapsulationKey,
-    share: &KeyShareRef<'_>,
-) -> io::Result<Vec<u8>> {
-    let kem_ciphertext_len = if share.group == RealityGroup::X25519MlKem768 {
-        MLKEM_CIPHERTEXT_LEN
-    } else {
-        0
-    };
-    let peer = share
-        .data
-        .get(kem_ciphertext_len..)
-        .and_then(|p| p.try_into().ok())
-        .ok_or_else(|| invalid("Invalid server X25519 share"))?;
-    let x25519 = perform_ecdh(private, peer).map_err(|_| invalid("Invalid server X25519 key"))?;
-    let mut secret = Vec::with_capacity(share.group.secret_len());
-    if share.group == RealityGroup::X25519MlKem768 {
-        let kem_secret = mlkem
-            .decapsulate(kem::Ciphertext::from(&share.data[..kem_ciphertext_len]))
-            .map_err(|_| invalid("ML-KEM decapsulation failed"))?;
-        secret.extend_from_slice(kem_secret.as_ref());
-    }
-    secret.extend_from_slice(&x25519);
-    Ok(secret)
-}
-
-#[cfg(test)]
-pub fn server_exchange(
-    group: RealityGroup,
-    shares: &ClientKeyShares,
-) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let client = shares
-        .get(group)
-        .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))?;
-    let mut private_bytes = [0; 32];
-    rand::rng().fill_bytes(&mut private_bytes);
-    let private = agreement::PrivateKey::from_private_key(&agreement::X25519, &private_bytes)
-        .map_err(|_| io::Error::other("X25519 key generation failed"))?;
-    let x25519_public = private
-        .compute_public_key()
-        .map_err(|_| io::Error::other("X25519 public key failed"))?;
-    let kem_public_len = if group == RealityGroup::X25519MlKem768 {
-        MLKEM_PUBLIC_LEN
-    } else {
-        0
-    };
-    let peer = client[kem_public_len..].try_into().unwrap();
-    let x25519 = perform_ecdh(&private_bytes, peer)
-        .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "Invalid client X25519 key"))?;
-    let mut response = Vec::with_capacity(group.share_len(false));
-    let mut secret = Vec::with_capacity(group.secret_len());
-    if group == RealityGroup::X25519MlKem768 {
-        let kem_public = kem::EncapsulationKey::new(&kem::ML_KEM_768, &client[..kem_public_len])
-            .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "Invalid ML-KEM public key"))?;
-        let (ciphertext, kem_secret) = kem_public
-            .encapsulate()
-            .map_err(|_| io::Error::other("ML-KEM encapsulation failed"))?;
-        response.extend_from_slice(ciphertext.as_ref());
-        secret.extend_from_slice(kem_secret.as_ref());
-    }
-    response.extend_from_slice(x25519_public.as_ref());
-    secret.extend_from_slice(&x25519);
-    Ok((response, secret))
-}
-
-#[cfg(test)]
 mod tests {
     use super::super::reality_tls13_messages::{
         construct_client_hello, construct_server_hello, write_record_header,
     };
     use super::*;
-
-    fn public(private: &[u8; 32]) -> [u8; 32] {
-        agreement::PrivateKey::from_private_key(&agreement::X25519, private)
-            .unwrap()
-            .compute_public_key()
-            .unwrap()
-            .as_ref()
-            .try_into()
-            .unwrap()
-    }
 
     fn share_vector(entries: &[(u16, &[u8])]) -> Vec<u8> {
         let mut data = vec![0, 0];
@@ -313,11 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_keys_and_authentication_are_independent() {
-        let (kem, mut hybrid) = generate_mlkem().unwrap();
-        let hybrid_private = [7; 32];
-        hybrid.extend_from_slice(&public(&hybrid_private));
-        let classic = public(&[8; 32]);
+    fn standalone_share_takes_precedence_for_authentication() {
+        let hybrid = [7; 1216];
+        let classic = [8; 32];
         for standalone in [false, true] {
             let mut entries = vec![(0x11ec, hybrid.as_slice())];
             if standalone {
@@ -332,31 +230,6 @@ mod tests {
                     hybrid[1184..].try_into().unwrap()
                 }
             );
-            let (response, server_secret) =
-                server_exchange(RealityGroup::X25519MlKem768, &shares).unwrap();
-            let client_secret = complete_client_exchange(
-                &hybrid_private,
-                &kem,
-                &KeyShareRef {
-                    group: RealityGroup::X25519MlKem768,
-                    data: &response,
-                },
-            )
-            .unwrap();
-            assert_eq!(server_secret, client_secret);
-            assert_eq!(server_secret.len(), 64);
-            let mut corrupted = response;
-            corrupted[0] ^= 1;
-            let corrupt_secret = complete_client_exchange(
-                &hybrid_private,
-                &kem,
-                &KeyShareRef {
-                    group: RealityGroup::X25519MlKem768,
-                    data: &corrupted,
-                },
-            )
-            .unwrap();
-            assert_ne!(server_secret, corrupt_secret);
         }
     }
 
@@ -376,27 +249,6 @@ mod tests {
             let refs: Vec<_> = entries.iter().map(|(g, d)| (*g, d.as_slice())).collect();
             assert!(parse_client_shares(&share_vector(&refs)).is_err());
         }
-        let zero = ClientKeyShares {
-            x25519: Some([0; 32]),
-            hybrid: None,
-        };
-        assert_eq!(
-            server_exchange(RealityGroup::X25519, &zero)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Unsupported
-        );
-        assert_eq!(
-            server_exchange(RealityGroup::X25519MlKem768, &zero)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Unsupported
-        );
-        let bad_kem = ClientKeyShares {
-            x25519: None,
-            hybrid: Some(Box::new([255; 1216])),
-        };
-        assert!(server_exchange(RealityGroup::X25519MlKem768, &bad_kem).is_err());
     }
 
     #[test]

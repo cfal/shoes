@@ -437,10 +437,6 @@ mod cleanup_tests {
 
     #[test]
     fn synthesis_failures_only_forward_explicit_incompatibilities() {
-        use crate::reality::reality_key_exchange::{
-            ClientKeyShares, RealityGroup, server_exchange,
-        };
-
         assert!(!should_forward_to_dest(Ok(())).unwrap());
         assert!(should_forward_to_dest(Err(io::ErrorKind::Unsupported.into())).unwrap());
         for kind in [
@@ -453,16 +449,6 @@ mod cleanup_tests {
             assert_eq!(propagated.kind(), kind);
             assert_eq!(propagated.to_string(), "injected synthesis failure");
         }
-
-        // AWS-LC accepts the encoding but rejects this public key during encapsulation.
-        let shares = ClientKeyShares {
-            x25519: None,
-            hybrid: Some(Box::new([255; 1216])),
-        };
-        let result = server_exchange(RealityGroup::X25519MlKem768, &shares).map(|_| ());
-        let error = should_forward_to_dest(result).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert_eq!(error.to_string(), "ML-KEM encapsulation failed");
     }
 
     fn client_key_share_offsets(hello: &[u8]) -> Vec<usize> {
@@ -516,19 +502,24 @@ mod cleanup_tests {
             "unsupported",
             "client-unknown-shares",
             "client-truncated-share",
+            "client-bad-auth",
             "bad-late-record",
             "bad-ccs",
             "wrong-session",
             "unknown-extension",
         ] {
+            let capture = crate::logging::test_capture::Capture::new();
             let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
             let (seed, _) = crate::reality::generate_mldsa65_keypair().unwrap();
             sc.mldsa65_key = Some(mldsa65_signing_key(&seed).unwrap());
             let mut client = RealityClientConnection::new(cc).unwrap();
             let mut hello = Vec::new();
             client.write_tls(&mut hello).unwrap();
-            let mut response = if matches!(case, "client-unknown-shares" | "client-truncated-share")
-            {
+            let auth_failure = matches!(
+                case,
+                "client-unknown-shares" | "client-truncated-share" | "client-bad-auth"
+            );
+            let mut response = if auth_failure {
                 let offsets = client_key_share_offsets(&hello);
                 assert_eq!(offsets.len(), 2);
                 let expected_error = if case == "client-unknown-shares" {
@@ -536,12 +527,15 @@ mod cleanup_tests {
                         hello[offset..offset + 2].copy_from_slice(&group.to_be_bytes());
                     }
                     io::ErrorKind::InvalidData
-                } else {
+                } else if case == "client-truncated-share" {
                     // Keeps the TLS framing valid while overstating the last share's length.
                     let offset = offsets[1] + 2;
                     assert_eq!(&hello[offset..offset + 2], &[0, 32]);
                     hello[offset..offset + 2].copy_from_slice(&33u16.to_be_bytes());
                     io::ErrorKind::UnexpectedEof
+                } else {
+                    hello[44] ^= 1;
+                    io::ErrorKind::PermissionDenied
                 };
                 let mut check = RealityServerConnection::new(sc.clone()).unwrap();
                 assert_eq!(
@@ -627,6 +621,10 @@ mod cleanup_tests {
                     | "wrong-session"
                     | "unknown-extension"
                     | "small-separate"
+                    | "small"
+                    | "client-unknown-shares"
+                    | "client-truncated-share"
+                    | "client-bad-auth"
             ) {
                 response.extend_from_slice(&[23, 3, 3]);
             }
@@ -707,6 +705,16 @@ mod cleanup_tests {
             })
             .await
             .unwrap_or_else(|_| panic!("transparent forwarding stalled for {case}"));
+            let logs = capture.finish();
+            if auth_failure {
+                assert!(logs.contains("REALITY: Auth failed"), "{case}: {logs}");
+            }
+            if matches!(case, "small" | "small-separate") {
+                assert!(
+                    logs.contains("Auth succeeded, building response"),
+                    "{case}: {logs}"
+                );
+            }
         }
     }
 

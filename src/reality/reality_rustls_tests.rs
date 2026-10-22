@@ -432,7 +432,7 @@ fn rejected_templates_never_queue_synthetic_output() {
 }
 
 #[test]
-fn authenticated_non_contributory_tls_share_forwards_before_commit() {
+fn authenticated_invalid_tls_shares_forward_before_commit() {
     use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
     let (cc, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
     let mut client = RealityClientConnection::new(cc).unwrap();
@@ -447,21 +447,60 @@ fn authenticated_non_contributory_tls_share_forwards_before_commit() {
         .windows(hybrid.len())
         .position(|bytes| bytes == hybrid.as_slice())
         .unwrap();
-    hello[position + 1184..position + 1216].fill(0);
-    let mut aad = hello[5..].to_vec();
-    aad[39..71].fill(0);
-    let mut payload = [0; 16];
-    payload[..3].copy_from_slice(&[1, 8, 0]);
-    payload[8..].fill(1);
-    let session = encrypt_session_id(&payload, &auth, &hello[31..43], &aad).unwrap();
-    hello[44..76].copy_from_slice(&session);
-    let mut server = RealityServerConnection::new(sc).unwrap();
-    server.validate_client_hello(&hello).unwrap();
-    let result = server.build_server_response(&target_records(
-        RealityGroup::X25519MlKem768,
-        CipherSuite::AES_128_GCM_SHA256,
-        &session,
-    ));
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
-    assert!(!server.wants_write());
+    for invalid_mlkem in [false, true] {
+        let mut hello = hello.clone();
+        if invalid_mlkem {
+            hello[position..position + 1184].fill(255);
+        } else {
+            hello[position + 1184..position + 1216].fill(0);
+        }
+        let mut aad = hello[5..].to_vec();
+        aad[39..71].fill(0);
+        let mut payload = [0; 16];
+        payload[..3].copy_from_slice(&[1, 8, 0]);
+        payload[8..].fill(1);
+        let session = encrypt_session_id(&payload, &auth, &hello[31..43], &aad).unwrap();
+        hello[44..76].copy_from_slice(&session);
+        let mut server = RealityServerConnection::new(sc.clone()).unwrap();
+        server.validate_client_hello(&hello).unwrap();
+        let result = server.build_server_response(&target_records(
+            RealityGroup::X25519MlKem768,
+            CipherSuite::AES_128_GCM_SHA256,
+            &session,
+        ));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert!(!server.wants_write());
+        let mut output = Vec::new();
+        server.write_tls(&mut output).unwrap();
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn tcp_eof_without_close_notify_is_not_clean_tls_eof() {
+    let (mut client, mut server) = established_pair();
+    client.writer().write_all(b"request").unwrap();
+    server.writer().write_all(b"response").unwrap();
+    let mut wire = Vec::new();
+    client.write_tls(&mut wire).unwrap();
+    feed_reality_server_connection(&mut server, &wire).unwrap();
+    wire.clear();
+    server.write_tls(&mut wire).unwrap();
+    feed_reality_client_connection(&mut client, &wire).unwrap();
+    assert_eq!(client.read_tls(&mut io::empty()).unwrap(), 0);
+    assert_eq!(server.read_tls(&mut io::empty()).unwrap(), 0);
+    let mut response = [0; 8];
+    client.reader().read_exact(&mut response).unwrap();
+    assert_eq!(&response, b"response");
+    let mut request = [0; 7];
+    server.reader().read_exact(&mut request).unwrap();
+    assert_eq!(&request, b"request");
+    assert_eq!(
+        client.reader().read(&mut response).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(
+        server.reader().read(&mut request).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
 }
