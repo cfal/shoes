@@ -108,14 +108,18 @@ pub enum Kind {
     Packet(String, u64),
 }
 
-pub fn check_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> bool {
-    config.matching_headers.iter().all(|(name, expected)| {
+pub fn has_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> bool {
+    config.matching_headers.iter().all(|(name, accepted)| {
         let mut values = headers.get_all(name.as_str()).iter();
-        values.next().is_some_and(|value| {
-            expected
-                .iter()
-                .any(|expected| bool::from(value.as_bytes().ct_eq(expected.as_bytes())))
-        }) && values.next().is_none()
+        let Some(value) = values.next() else {
+            return false;
+        };
+        if values.next().is_some() {
+            return false;
+        }
+        accepted
+            .iter()
+            .any(|candidate| bool::from(value.as_bytes().ct_eq(candidate.as_bytes())))
     })
 }
 
@@ -302,7 +306,7 @@ mod tests {
             "protocol": {"type": "socks"}
         }))
         .unwrap();
-        assert!(check_matching_headers(&config, &HeaderMap::new()));
+        assert!(has_matching_headers(&config, &HeaderMap::new()));
         config
             .matching_headers
             .insert("X-Token".into(), "Secret".into());
@@ -311,10 +315,10 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-token", "Secret".parse().unwrap());
-        assert!(!check_matching_headers(&config, &headers));
+        assert!(!has_matching_headers(&config, &headers));
         headers.insert("x-empty", "".parse().unwrap());
         headers.insert("x-extra", "allowed".parse().unwrap());
-        assert!(check_matching_headers(&config, &headers));
+        assert!(has_matching_headers(&config, &headers));
         for values in [
             vec![],
             vec![""],
@@ -329,7 +333,7 @@ mod tests {
             for value in values {
                 headers.append("x-token", value.parse().unwrap());
             }
-            assert!(!check_matching_headers(&config, &headers));
+            assert!(!has_matching_headers(&config, &headers));
         }
     }
 
@@ -354,7 +358,7 @@ mod tests {
                 headers.append("x-token", value.parse().unwrap());
             }
             assert_eq!(
-                check_matching_headers(&config, &headers),
+                has_matching_headers(&config, &headers),
                 matched,
                 "{values:?}"
             );

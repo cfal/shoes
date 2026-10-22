@@ -3804,7 +3804,7 @@ impl State {
         request: &Request<()>,
         body: Reader,
     ) -> Result<(Body, bool), Rejection> {
-        if !wire::check_matching_headers(&self.config, request.headers()) {
+        if !wire::has_matching_headers(&self.config, request.headers()) {
             log::debug!("XHTTP request rejected: headers do not match");
             return Err(StatusCode::NOT_FOUND.into());
         }
