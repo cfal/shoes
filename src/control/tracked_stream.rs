@@ -208,6 +208,90 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    struct BackpressuredMessages {
+        payload: Option<Vec<u8>>,
+        blocked: Arc<tokio::sync::Notify>,
+    }
+    impl AsyncReadMessage for BackpressuredMessages {
+        fn poll_read_message(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.payload.take() {
+                Some(payload) => {
+                    buf.put_slice(&payload);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+    impl AsyncWriteMessage for BackpressuredMessages {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<()>> {
+            self.blocked.notify_one();
+            Poll::Pending
+        }
+    }
+    impl AsyncFlushMessage for BackpressuredMessages {
+        fn poll_flush_message(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncShutdownMessage for BackpressuredMessages {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncPing for BackpressuredMessages {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncMessageStream for BackpressuredMessages {}
+
+    #[tokio::test]
+    async fn fixed_udp_cancellation_interrupts_a_blocked_inbound_writer() {
+        let guard = super::super::flows::test_guard();
+        let entry = guard.entry.clone();
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let inbound = Box::new(BackpressuredMessages {
+            payload: None,
+            blocked: blocked.clone(),
+        });
+        let outbound = Box::new(TrackedMessageStream::new(
+            Box::new(BackpressuredMessages {
+                payload: Some(b"payload".to_vec()),
+                blocked: blocked.clone(),
+            }),
+            guard,
+        ));
+        let relay = tokio::spawn(crate::tcp::tcp_server::run_udp_copy(
+            inbound, outbound, false, false,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), blocked.notified())
+            .await
+            .unwrap();
+        assert_eq!(entry.counters.totals(), (0, 7));
+        entry.cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
     #[tokio::test]
     async fn buffered_counts_partial_io_and_wakes_idle_cancellation() {
         let guard = super::super::flows::test_guard();
