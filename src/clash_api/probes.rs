@@ -577,6 +577,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn carrier_probe_checks_http_hostname_before_connecting() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let local = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+        let config = json!([
+            {"client_group":"outbound","strategy":"selector","default":"http","client_proxies":[
+                {"name":"http","address":local.to_string(),"protocol":{"type":"http","resolve_hostname":true}},
+                {"name":"xhttp","address":local.to_string(),"protocol":{"type":"xhttp","protocol":{"type":"socks"}}}
+            ]}
+        ]);
+        let mut validated =
+            crate::config::create_server_configs(serde_json::from_value(config).unwrap()).unwrap();
+        let generation = generation(
+            validated.catalog.take().unwrap(),
+            Arc::new(Answers(vec!["192.0.2.1:80".parse().unwrap(), local])),
+        );
+        let cached = generation
+            .probes
+            .connector(&generation.catalog, "outbound")
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                request(&generation, "outbound", &query())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert!(Arc::ptr_eq(
+                &cached,
+                &generation
+                    .probes
+                    .connector(&generation.catalog, "outbound")
+                    .unwrap()
+            ));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn cached_http2_reuse_checks_each_requests_resolver() {
         #[derive(Debug)]
         struct ChangingAnswers(Arc<Mutex<Vec<SocketAddr>>>);
