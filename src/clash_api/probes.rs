@@ -224,8 +224,7 @@ pub async fn probe(
     }
     let _permit = runtime
         .probes
-        .clone()
-        .try_acquire_owned()
+        .try_acquire()
         .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "probe limit reached"))?;
     probe_until(
         runtime,
@@ -349,7 +348,7 @@ async fn request(
             "unsolicited probe data",
         ));
     }
-    let stream: Box<dyn ProbeIo> = if query.url.scheme() == "https" {
+    let stream: Box<dyn crate::async_stream::AsyncStream> = if query.url.scheme() == "https" {
         let server =
             rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(io::Error::other)?;
         let connection = rustls::ClientConnection::new(
@@ -360,14 +359,14 @@ async fn request(
         Box::new(
             crate::crypto::CryptoTlsStream::handshake(
                 setup.client_stream,
-                crate::crypto::CryptoConnection::new_rustls_client(connection),
+                crate::crypto::TlsConnection::new(connection),
                 crate::crypto::TlsReadMode::Stream,
                 &[],
             )
             .await?,
         )
     } else {
-        Box::new(setup.client_stream)
+        setup.client_stream
     };
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
@@ -400,9 +399,6 @@ async fn request(
         satisfied,
     ))
 }
-
-trait ProbeIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ProbeIo for T {}
 
 #[derive(Debug, Clone)]
 struct ProbeResolver {
@@ -679,6 +675,78 @@ mod tests {
                 tokio::time::timeout(Duration::from_millis(20), peer.recv(&mut [0; 2048]))
                     .await
                     .is_err()
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn https_probe_rejects_untrusted_certificates_through_proxy() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let proxy = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let certificate =
+                rcgen::generate_simple_self_signed(vec!["probe.invalid".into()]).unwrap();
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certificate.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    certificate.signing_key.serialize_der(),
+                )
+                .into(),
+            )
+            .unwrap();
+            let server = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(stream.read_u8().await.unwrap());
+                }
+                assert!(header.starts_with(b"CONNECT probe.invalid:443 HTTP/1.1\r\n"));
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let connection = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+                assert!(
+                    crate::crypto::CryptoTlsStream::handshake(
+                        stream,
+                        crate::crypto::TlsConnection::new(connection),
+                        crate::crypto::TlsReadMode::Stream,
+                        &[],
+                    )
+                    .await
+                    .is_err()
+                );
+            };
+            let mut catalog = catalog();
+            catalog.nodes.insert(
+                "http".into(),
+                CatalogNode::Leaf(Box::new(
+                    serde_json::from_value(json!({
+                        "address": proxy,
+                        "protocol": {"type": "http"},
+                    }))
+                    .unwrap(),
+                )),
+            );
+            let generation = generation(catalog, Arc::new(Answers(Vec::new())));
+            let mut query = query();
+            query.url = url::Url::parse("https://probe.invalid/").unwrap();
+            let (result, ()) = tokio::join!(request(&generation, "http", &query), server);
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("InvalidCertificate(UnknownIssuer)"),
+                "{error}"
             );
         })
         .await
