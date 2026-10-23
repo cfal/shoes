@@ -8,8 +8,8 @@ use crate::control::runtime::Generation;
 use crate::control::selection::Choices;
 use crate::option_util::OneOrSome;
 
-pub fn capabilities(catalog: &Catalog) -> io::Result<HashMap<String, bool>> {
-    let mut capabilities = HashMap::new();
+pub fn leaf_udp_support(catalog: &Catalog) -> io::Result<HashMap<String, bool>> {
+    let mut support = HashMap::new();
     for (name, node) in &catalog.nodes {
         let CatalogNode::Leaf(client) = node else {
             continue;
@@ -20,9 +20,9 @@ pub fn capabilities(catalog: &Catalog) -> io::Result<HashMap<String, bool>> {
             ))),
         };
         let udp = crate::tcp::chain_builder::supports_udp_offline(&chain)?;
-        capabilities.insert(name.clone(), udp);
+        support.insert(name.clone(), udp);
     }
-    Ok(capabilities)
+    Ok(support)
 }
 
 pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<Value> {
@@ -70,28 +70,33 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str, depth: u
                     .any(|name| supports_udp(generation, choices, name, depth + 1))
             }
         }
-        _ => generation.udp.get(name).copied().unwrap_or(false),
+        _ => generation
+            .leaf_udp_support
+            .get(name)
+            .copied()
+            .unwrap_or(false),
     }
 }
 
-pub fn proxies(generation: &Generation, groups_only: bool) -> Value {
+pub fn proxies(generation: &Generation) -> Value {
     let choices = generation.catalog.selection.snapshot();
-    if groups_only {
-        let groups: Vec<_> = generation
-            .catalog
-            .nodes
-            .iter()
-            .filter(|(_, node)| matches!(node, CatalogNode::Group { .. }))
-            .map(|(name, _)| proxy(generation, &choices, name).unwrap())
-            .collect();
-        json!({"proxies": groups})
-    } else {
-        let nodes: serde_json::Map<_, _> = generation
-            .catalog
-            .nodes
-            .keys()
-            .map(|name| (name.clone(), proxy(generation, &choices, name).unwrap()))
-            .collect();
-        json!({"proxies":nodes})
-    }
+    let nodes: serde_json::Map<_, _> = generation
+        .catalog
+        .nodes
+        .keys()
+        .map(|name| (name.clone(), proxy(generation, &choices, name).unwrap()))
+        .collect();
+    json!({"proxies":nodes})
+}
+
+pub fn groups(generation: &Generation) -> Value {
+    let choices = generation.catalog.selection.snapshot();
+    let groups: Vec<_> = generation
+        .catalog
+        .nodes
+        .iter()
+        .filter(|(_, node)| matches!(node, CatalogNode::Group { .. }))
+        .map(|(name, _)| proxy(generation, &choices, name).unwrap())
+        .collect();
+    json!({"proxies": groups})
 }

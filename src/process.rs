@@ -152,18 +152,18 @@ async fn prepare_tracking(
     let generation = if let (Some((id, rules)), Some(catalog)) =
         (control_generation, validated.catalog.take())
     {
-        let udp = crate::clash_api::dto::capabilities(&catalog)?;
+        let leaf_udp_support = crate::clash_api::dto::leaf_udp_support(&catalog)?;
         let generation = std::sync::Arc::new(crate::control::runtime::Generation {
             id,
             catalog,
             rules,
-            udp,
+            leaf_udp_support,
             probes: crate::clash_api::probes::ProbeState::new(
                 dns.get_or_create_default(),
                 dns.forbidden_ranges().to_vec(),
             ),
         });
-        crate::clash_api::json_bytes(&crate::clash_api::dto::proxies(&generation, false))?;
+        crate::clash_api::json_bytes(&crate::clash_api::dto::proxies(&generation))?;
         Some(generation)
     } else {
         None

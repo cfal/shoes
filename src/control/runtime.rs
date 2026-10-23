@@ -17,7 +17,7 @@ pub struct Generation {
     pub catalog: Catalog,
     pub rules: Vec<serde_json::Value>,
     pub probes: crate::clash_api::probes::ProbeState,
-    pub udp: std::collections::HashMap<String, bool>,
+    pub leaf_udp_support: std::collections::HashMap<String, bool>,
 }
 
 pub struct ControlRuntime {
@@ -300,7 +300,7 @@ mod tests {
                 Arc::new(crate::resolver::NativeResolver::new()),
                 Vec::new(),
             ),
-            udp: Default::default(),
+            leaf_udp_support: Default::default(),
         })
     }
 

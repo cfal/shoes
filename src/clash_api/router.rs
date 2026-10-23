@@ -208,10 +208,8 @@ async fn route(
             StatusCode::OK,
             &json!({"mode":"rule","mode-list":["rule"],"log-level":crate::control::logs::level_name(crate::logging::default_level())}),
         ),
-        (&Method::GET, ["proxies"]) => {
-            super::json(StatusCode::OK, &dto::proxies(&generation, false))
-        }
-        (&Method::GET, ["group"]) => super::json(StatusCode::OK, &dto::proxies(&generation, true)),
+        (&Method::GET, ["proxies"]) => super::json(StatusCode::OK, &dto::proxies(&generation)),
+        (&Method::GET, ["group"]) => super::json(StatusCode::OK, &dto::groups(&generation)),
         (&Method::GET, [kind, name]) if *kind == "proxies" || *kind == "group" => {
             if *kind == "group"
                 && !matches!(

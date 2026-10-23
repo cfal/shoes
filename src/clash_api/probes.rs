@@ -512,7 +512,7 @@ mod tests {
             catalog,
             rules: Vec::new(),
             probes: ProbeState::new(resolver, Vec::new()),
-            udp: HashMap::new(),
+            leaf_udp_support: HashMap::new(),
         }
     }
 
