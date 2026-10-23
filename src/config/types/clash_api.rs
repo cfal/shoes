@@ -160,8 +160,7 @@ pub struct ControlConfig {
 }
 
 impl ControlConfig {
-    #[cfg(any(feature = "ffi", test))]
-    #[allow(dead_code)] // The CLI and FFI compile these shared modules separately.
+    #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi", test))]
     pub fn reject_ffi(&self) -> std::io::Result<()> {
         if !self.listeners.is_empty() || self.cache_file_path.is_some() {
             return Err(std::io::Error::new(
