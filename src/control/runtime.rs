@@ -304,6 +304,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparation_only_attaches_flow_tracking_when_a_listener_is_configured() {
+        for mode in ["selector", "cache", "listener"] {
+            let directory = tempfile::tempdir().unwrap();
+            let cache = directory.path().join("cache.db");
+            let mut configs = serde_json::json!([
+                {"client_group":"outbound", "strategy":if mode == "selector" { "selector" } else { "round-robin" }, "client_proxies":[
+                    {"name":"proxy", "address":"proxy.invalid:8080", "protocol":{"type":"http"}}
+                ]},
+                {"name":"entry", "address":"127.0.0.1:0", "protocol":{"type":"socks"}, "rules":[
+                    {"mask":"0.0.0.0/0", "action":"allow", "client_chain":"outbound"}
+                ]}
+            ]);
+            if mode == "cache" {
+                configs
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"cache_file_path":cache}));
+            } else if mode == "listener" {
+                configs
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"clash_api_address":"127.0.0.1:0", "secret":"test"}));
+            }
+            let mut validated =
+                crate::config::create_server_configs(serde_json::from_value(configs).unwrap())
+                    .unwrap();
+            assert!(validated.catalog.is_some(), "{mode}");
+            let mut service = ControlService::new(validated.control.clone()).unwrap();
+            let (id, rules) = service.runtime.prepare(&mut validated).await.unwrap();
+            assert_eq!(rules.len(), 1, "{mode}");
+            assert_eq!(rules[0]["proxy"], "outbound", "{mode}");
+            let crate::config::Config::Server(server) = &validated.configs[0] else {
+                panic!("{mode}")
+            };
+            let crate::config::ConfigSelection::Config(rule) = server.rules.iter().next().unwrap()
+            else {
+                panic!("{mode}")
+            };
+            let description = rule.criteria.description.as_ref().unwrap();
+            assert_eq!(description.proxy, "outbound", "{mode}");
+            if mode == "listener" {
+                let context = description.context.as_ref().unwrap();
+                assert_eq!(context.generation, id);
+                assert_eq!(context.inbound, "entry");
+                assert_eq!(context.scope, "root");
+                assert_eq!(context.protocol, "Socks5");
+                assert!(Arc::ptr_eq(&context.registry, &service.runtime.flows));
+            } else {
+                assert!(description.context.is_none(), "{mode}");
+            }
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn activation_reconciles_latest_selection_and_saturation_cannot_block_publication() {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let mut service = ControlService::new(ControlConfig::default()).unwrap();

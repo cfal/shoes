@@ -100,3 +100,84 @@ pub fn groups(generation: &Generation) -> Value {
         .collect();
     json!({"proxies": groups})
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::selection::SelectionOwner;
+    use std::sync::Arc;
+
+    #[test]
+    fn catalog_dtos_preserve_group_types_members_and_selected_udp_support() {
+        let configs = serde_json::from_value(json!([
+            {"client_group":"child", "client_proxies":[
+                {"name":"east", "address":"east.invalid:1080", "protocol":{"type":"socks"}},
+                "direct"
+            ]},
+            {"client_group":"outbound", "strategy":"selector", "default":"child", "client_proxies":[
+                "child",
+                {"name":"west", "address":"west.invalid:1080", "protocol":{"type":"socks"}}
+            ]}
+        ]))
+        .unwrap();
+        let catalog = crate::config::create_server_configs(configs)
+            .unwrap()
+            .catalog
+            .unwrap();
+        let generation = Generation {
+            id: 1,
+            leaf_udp_support: leaf_udp_support(&catalog).unwrap(),
+            catalog,
+            rules: Vec::new(),
+            probes: super::super::probes::ProbeState::new(
+                Arc::new(crate::resolver::NativeResolver::new()),
+                Vec::new(),
+            ),
+        };
+        let mut owner = SelectionOwner::new(None).unwrap();
+        owner
+            .activate(generation.catalog.selection.clone())
+            .unwrap();
+        let nodes = proxies(&generation);
+        for (name, kind, udp) in [
+            ("DIRECT", "Direct", true),
+            ("REJECT", "Reject", false),
+            ("east", "Socks5", false),
+            ("west", "Socks5", false),
+        ] {
+            assert_eq!(
+                nodes["proxies"][name],
+                json!({"name":name, "type":kind, "udp":udp, "alive":true, "history":[]})
+            );
+        }
+        assert_eq!(
+            nodes["proxies"]["child"],
+            json!({"name":"child", "type":"LoadBalance", "all":["east","DIRECT"], "udp":true, "alive":true, "history":[]})
+        );
+        assert_eq!(
+            nodes["proxies"]["outbound"],
+            json!({"name":"outbound", "type":"Selector", "all":["child","west"], "now":"child", "udp":true, "alive":true, "history":[]})
+        );
+        assert_eq!(
+            groups(&generation),
+            json!({"proxies":[nodes["proxies"]["child"], nodes["proxies"]["outbound"]]})
+        );
+        assert!(
+            proxy(
+                &generation,
+                &generation.catalog.selection.snapshot(),
+                "missing"
+            )
+            .is_none()
+        );
+        owner.select("outbound", "west").unwrap();
+        let selected = proxies(&generation);
+        assert_eq!(selected["proxies"]["outbound"]["now"], "west");
+        assert_eq!(selected["proxies"]["outbound"]["udp"], false);
+        assert_eq!(selected["proxies"]["child"], nodes["proxies"]["child"]);
+        assert_eq!(
+            groups(&generation)["proxies"][1],
+            selected["proxies"]["outbound"]
+        );
+    }
+}

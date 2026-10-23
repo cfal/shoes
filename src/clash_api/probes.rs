@@ -317,6 +317,21 @@ async fn request(
     name: &str,
     query: &ProbeQuery,
 ) -> io::Result<(u16, bool)> {
+    request_with_tls_config(
+        generation,
+        name,
+        query,
+        crate::rustls_config_util::create_dns_client_config,
+    )
+    .await
+}
+
+async fn request_with_tls_config(
+    generation: &Generation,
+    name: &str,
+    query: &ProbeQuery,
+    tls_config: impl FnOnce() -> rustls::ClientConfig,
+) -> io::Result<(u16, bool)> {
     let started = Instant::now();
     let host = query
         .url
@@ -351,11 +366,8 @@ async fn request(
     let stream: Box<dyn crate::async_stream::AsyncStream> = if query.url.scheme() == "https" {
         let server =
             rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(io::Error::other)?;
-        let connection = rustls::ClientConnection::new(
-            Arc::new(crate::rustls_config_util::create_dns_client_config()),
-            server,
-        )
-        .map_err(io::Error::other)?;
+        let connection = rustls::ClientConnection::new(Arc::new(tls_config()), server)
+            .map_err(io::Error::other)?;
         Box::new(
             crate::crypto::CryptoTlsStream::handshake(
                 setup.client_stream,
@@ -467,6 +479,145 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn query_validation_preserves_url_timeout_and_status_boundaries() {
+        let valid = HashMap::from([
+            ("url".into(), "https://probe.invalid/".into()),
+            ("timeout".into(), "1000".into()),
+        ]);
+        for missing in ["url", "timeout"] {
+            let mut query = valid.clone();
+            query.remove(missing);
+            assert_eq!(
+                ProbeQuery::parse(&query, false).err().unwrap().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let prefix = "https://probe.invalid/";
+        let longest = format!("{prefix}{}", "x".repeat(2048 - prefix.len()));
+        for (url, accepted) in [
+            ("http://probe.invalid/", true),
+            ("https://[2001:db8::1]:8443/path?x=1", true),
+            (longest.as_str(), true),
+            (&format!("{longest}x"), false),
+            ("not a URL", false),
+            ("ftp://probe.invalid/", false),
+            ("https://user@probe.invalid/", false),
+            ("https://:password@probe.invalid/", false),
+            ("https://probe.invalid/#fragment", false),
+            ("https://", false),
+        ] {
+            let mut query = valid.clone();
+            query.insert("url".into(), url.into());
+            assert_eq!(ProbeQuery::parse(&query, false).is_ok(), accepted, "{url}");
+        }
+        for (timeout, single, group) in [
+            ("0", false, false),
+            ("1", true, true),
+            ("32767", true, true),
+            ("32768", false, true),
+            ("60000", false, true),
+            ("60001", false, false),
+            ("-1", false, false),
+            ("invalid", false, false),
+        ] {
+            let mut query = valid.clone();
+            query.insert("timeout".into(), timeout.into());
+            for (is_group, accepted) in [(false, single), (true, group)] {
+                assert_eq!(
+                    ProbeQuery::parse(&query, is_group).is_ok(),
+                    accepted,
+                    "timeout={timeout}, group={is_group}"
+                );
+            }
+        }
+        for (expected, ranges) in [
+            ("", vec![]),
+            (" * ", vec![]),
+            ("200/204", vec![(200, 200), (204, 204)]),
+            (" 200-299 , 304 ", vec![(200, 299), (304, 304)]),
+        ] {
+            let mut query = valid.clone();
+            query.insert("expected".into(), expected.into());
+            let parsed = ProbeQuery::parse(&query, false).unwrap();
+            assert_eq!(parsed.expected, ranges, "{expected}");
+            assert_eq!(parsed.timeout, Duration::from_secs(1));
+        }
+        for expected in ["204-200", "invalid", "200-", "65536"] {
+            let mut query = valid.clone();
+            query.insert("expected".into(), expected.into());
+            assert_eq!(
+                ProbeQuery::parse(&query, false).err().unwrap().kind(),
+                io::ErrorKind::InvalidInput,
+                "{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn history_bounds_samples_and_urls_without_conflating_reachability_with_status() {
+        let state = ProbeState::new(Arc::new(Answers(Vec::new())), Vec::new());
+        let mut value = json!({});
+        state.decorate("proxy", &mut value);
+        assert_eq!(value, json!({"alive":true, "history":[]}));
+        for delay in 1..=12 {
+            state.record("proxy", "https://probe.invalid/0", delay, true);
+        }
+        state.decorate("proxy", &mut value);
+        let delays = |samples: &Value| {
+            samples
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|sample| sample["delay"].as_u64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(delays(&value["history"]), (3..=12).collect::<Vec<_>>());
+        assert_eq!(
+            value["extra"]["https://probe.invalid/0"]["history"],
+            value["history"]
+        );
+        for index in 1..8 {
+            state.record("proxy", &format!("https://probe.invalid/{index}"), 20, true);
+        }
+        state.record("proxy", "https://probe.invalid/0", 30, false);
+        state.record("proxy", "https://probe.invalid/8", 40, true);
+        state.decorate("proxy", &mut value);
+        let extra = value["extra"].as_object().unwrap();
+        assert_eq!(
+            extra.keys().cloned().collect::<Vec<_>>(),
+            [2, 3, 4, 5, 6, 7, 0, 8].map(|index| format!("https://probe.invalid/{index}"))
+        );
+        assert_eq!(
+            delays(&extra["https://probe.invalid/0"]["history"]),
+            (4..=12).chain([0]).collect::<Vec<_>>()
+        );
+        assert_eq!(extra["https://probe.invalid/0"]["alive"], false);
+        state.record("proxy", "https://probe.invalid/8", 50, false);
+        state.decorate("proxy", &mut value);
+        assert_eq!(value["alive"], true);
+        assert_eq!(value["history"].as_array().unwrap().len(), 10);
+        assert_eq!(
+            value["history"].as_array().unwrap().last().unwrap()["delay"],
+            50
+        );
+        assert_eq!(value["extra"]["https://probe.invalid/8"]["alive"], false);
+        assert_eq!(
+            value["extra"]["https://probe.invalid/8"]["history"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["delay"],
+            0
+        );
+        state.record("proxy", "https://probe.invalid/8", 0, false);
+        state.decorate("proxy", &mut value);
+        assert_eq!(value["alive"], false);
+        let mut untouched = json!({});
+        state.decorate("other", &mut untouched);
+        assert_eq!(untouched, json!({"alive":true, "history":[]}));
+    }
 
     #[test]
     fn destination_policy_preserves_ipv4_and_ipv6_boundaries() {
@@ -676,6 +827,128 @@ mod tests {
                     .await
                     .is_err()
             );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn trusted_https_probe_sends_head_and_checks_status_without_following_redirects() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let certificate =
+                rcgen::generate_simple_self_signed(vec!["probe.invalid".into()]).unwrap();
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(certificate.cert.der().clone()).unwrap();
+            let tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let config = rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![certificate.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(
+                        certificate.signing_key.serialize_der(),
+                    )
+                    .into(),
+                )
+                .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let cases = [
+                (204, "*", true),
+                (204, "200", false),
+                (204, "200-299", true),
+                (302, "300-399", true),
+            ];
+            let server = async {
+                for (status, _, _) in cases {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(stream.read_u8().await.unwrap());
+                        assert!(header.len() < 4096);
+                    }
+                    assert!(header.starts_with(b"CONNECT probe.invalid:8443 HTTP/1.1\r\n"));
+                    stream
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut stream = acceptor.accept(stream).await.unwrap();
+                    assert_eq!(stream.get_ref().1.server_name(), Some("probe.invalid"));
+                    header.clear();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(stream.read_u8().await.unwrap());
+                        assert!(header.len() < 4096);
+                    }
+                    let mut headers = [httparse::EMPTY_HEADER; 16];
+                    let mut request = httparse::Request::new(&mut headers);
+                    assert!(request.parse(&header).unwrap().is_complete());
+                    assert_eq!(request.method, Some("HEAD"));
+                    assert_eq!(request.path, Some("/generate_204?x=1"));
+                    assert_eq!(request.version, Some(1));
+                    for (name, value) in [
+                        ("host", b"probe.invalid:8443".as_slice()),
+                        ("connection", b"close".as_slice()),
+                    ] {
+                        assert_eq!(
+                            request
+                                .headers
+                                .iter()
+                                .find(|header| header.name.eq_ignore_ascii_case(name))
+                                .unwrap()
+                                .value,
+                            value
+                        );
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\n\
+                        Location: https://redirect.invalid/\r\n\
+                        Connection: close\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                }
+            };
+            let mut catalog = catalog();
+            catalog.nodes.insert(
+                "http".into(),
+                CatalogNode::Leaf(Box::new(
+                    serde_json::from_value(json!({
+                        "address":format!("127.0.0.1:{}", listener.local_addr().unwrap().port()),
+                        "protocol":{"type":"http"}
+                    }))
+                    .unwrap(),
+                )),
+            );
+            let generation = generation(catalog, Arc::new(Answers(Vec::new())));
+            let client = async {
+                for (_, expected, satisfied) in cases {
+                    let query = ProbeQuery::parse(
+                        &HashMap::from([
+                            (
+                                "url".into(),
+                                "https://probe.invalid:8443/generate_204?x=1".into(),
+                            ),
+                            ("timeout".into(), "1000".into()),
+                            ("expected".into(), expected.into()),
+                        ]),
+                        false,
+                    )
+                    .unwrap();
+                    let (delay, actual) =
+                        request_with_tls_config(&generation, "http", &query, || tls.clone())
+                            .await
+                            .unwrap();
+                    assert!(delay > 0);
+                    assert_eq!(actual, satisfied, "expected={expected}");
+                }
+            };
+            tokio::join!(server, client);
         })
         .await
         .unwrap();
