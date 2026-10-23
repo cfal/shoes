@@ -380,6 +380,15 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
         Err(_) | Ok(Ok(_))
     ));
     check_flow(&mut new, b'W').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let source_port = new.local_addr().unwrap().port().to_string();
+    let before_reload = snapshot["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["metadata"]["sourcePort"] == source_port)
+        .unwrap()
+        .clone();
     let mut ws = websocket(fixture.api).await;
     frame(&mut ws).await;
     assert_eq!(fixture.outbound_mut()["default"], "east");
@@ -387,7 +396,62 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
     process.signal(libc::SIGHUP);
     process.wait_for("Servers ready").await;
     assert_eq!(fixture.selected().await, "west");
-    flow(fixture.entry, b'W').await;
+    check_flow(&mut new, b'W').await;
+    let mut reopened = flow(fixture.entry, b'W').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let connections = snapshot["connections"].as_array().unwrap();
+    let retained = connections
+        .iter()
+        .find(|entry| entry["id"] == before_reload["id"])
+        .unwrap();
+    assert_eq!(
+        retained["shoesGeneration"],
+        before_reload["shoesGeneration"]
+    );
+    let reopened_port = reopened.local_addr().unwrap().port().to_string();
+    let after_reload = connections
+        .iter()
+        .find(|entry| entry["metadata"]["sourcePort"] == reopened_port)
+        .unwrap();
+    assert!(
+        after_reload["shoesGeneration"].as_u64().unwrap()
+            > before_reload["shoesGeneration"].as_u64().unwrap()
+    );
+    let retained_id = before_reload["id"].as_str().unwrap();
+    assert_eq!(
+        api(
+            fixture.api,
+            "DELETE",
+            &format!("/connections/{retained_id}"),
+            Value::Null
+        )
+        .await
+        .0,
+        204
+    );
+    assert!(
+        timeout(Duration::from_secs(3), new.read_u8())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+            if snapshot["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["id"] != retained_id)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    check_flow(&mut reopened, b'W').await;
     frame(&mut ws).await;
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -403,7 +467,6 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
     );
     fixture.stop(&mut process).await;
     assert!(!fixture.directory.path().join("api.sock").exists());
-    fixture.outbound_mut()["default"] = json!("east");
     let mut process = fixture.start().await;
     assert_eq!(fixture.selected().await, "west");
     flow(fixture.entry, b'W').await;
@@ -530,6 +593,33 @@ async fn auth_errors_rules_providers_and_outbound_probes() {
     assert_eq!(delays.as_object().unwrap().len(), 2);
     assert_eq!(
         api(fixture.api, "GET", "/connections", Value::Null).await.1["uploadTotal"],
+        0
+    );
+    let url = "http://192.0.2.100/";
+    let (status, delay) = api(
+        fixture.api,
+        "GET",
+        "/proxies/east/delay?url=http%3A%2F%2F192.0.2.100%2F&timeout=1000&expected=200",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{delay}");
+    assert!(delay["delay"].as_u64().unwrap() > 0);
+    let proxy = api(fixture.api, "GET", "/proxies/east", Value::Null)
+        .await
+        .1;
+    assert_eq!(proxy["alive"], true);
+    assert_eq!(
+        proxy["history"].as_array().unwrap().last().unwrap()["delay"],
+        delay["delay"]
+    );
+    assert_eq!(proxy["extra"][url]["alive"], false);
+    assert_eq!(
+        proxy["extra"][url]["history"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["delay"],
         0
     );
     assert_eq!(
@@ -1084,6 +1174,7 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
         client.wait_for("Servers ready").await;
         let payload = vec![b'x'; 4096];
         let mut streams = Vec::new();
+        let mut first_id = None;
         for _ in 0..2 {
             let mut stream = timeout(
                 Duration::from_secs(5),
@@ -1100,6 +1191,12 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
                 .unwrap();
             assert_eq!(bytes, payload, "{name}");
             streams.push(stream);
+            if first_id.is_none() {
+                let snapshot = api(controller, "GET", "/connections", Value::Null).await.1;
+                let connections = snapshot["connections"].as_array().unwrap();
+                assert_eq!(connections.len(), 1, "{name}: {snapshot}");
+                first_id = Some(connections[0]["id"].as_str().unwrap().to_owned());
+            }
         }
         let snapshot = api(controller, "GET", "/connections", Value::Null).await.1;
         let connections = snapshot["connections"].as_array().unwrap();
@@ -1112,7 +1209,7 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
                 .all(|flow| flow["metadata"]["sourceIP"] == "127.0.0.1"),
             "{name}: {snapshot}"
         );
-        let id = connections[0]["id"].as_str().unwrap();
+        let id = first_id.unwrap();
         assert_eq!(
             api(
                 controller,
@@ -1124,20 +1221,42 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
             .0,
             204
         );
-        let mut alive = 0;
-        for stream in &mut streams {
-            if stream.write_all(&payload).await.is_ok() {
-                let mut bytes = vec![0; payload.len()];
-                if matches!(
-                    timeout(Duration::from_secs(2), stream.read_exact(&mut bytes)).await,
-                    Ok(Ok(_))
-                ) {
-                    assert_eq!(bytes, payload, "{name}");
-                    alive += 1;
+        assert!(
+            timeout(Duration::from_secs(3), streams[0].read_u8())
+                .await
+                .unwrap_or_else(|_| panic!("{name}: cancelled stream did not close"))
+                .is_err(),
+            "{name}: cancelled stream delivered unexpected data"
+        );
+        let remaining = timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = api(controller, "GET", "/connections", Value::Null).await.1;
+                if snapshot["connections"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|flow| flow["id"] != id)
+                {
+                    break snapshot;
                 }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }
-        assert_eq!(alive, 1, "{name}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name}: cancelled flow remained registered"));
+        assert_eq!(
+            remaining["connections"].as_array().unwrap().len(),
+            1,
+            "{name}"
+        );
+        timeout(Duration::from_secs(3), async {
+            streams[1].write_all(&payload).await.unwrap();
+            let mut bytes = vec![0; payload.len()];
+            streams[1].read_exact(&mut bytes).await.unwrap();
+            assert_eq!(bytes, payload, "{name}: sibling payload");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name}: sibling stopped relaying"));
         assert_eq!(
             api(controller, "DELETE", "/connections", Value::Null)
                 .await

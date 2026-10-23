@@ -331,6 +331,7 @@ async fn clash_api_quic_tcp_udp_accounting_and_stream_cancellation() {
         proxy_ready(mihomo_api, "quic-out").await;
         forwarding_ready(socks, readiness_target, &mut client).await;
         let mut streams = Vec::new();
+        let mut first_id = None;
         for _ in 0..2 {
             let mut stream = tokio::time::timeout(
                 Duration::from_secs(10),
@@ -347,6 +348,13 @@ async fn clash_api_quic_tcp_udp_accounting_and_stream_cancellation() {
                 .unwrap();
             assert_eq!(&reply, b"payload", "{protocol}");
             streams.push(stream);
+            if first_id.is_none() {
+                let (_, snapshot) =
+                    request(controller, "GET", "/connections", Value::Null, true).await;
+                let flows = snapshot["connections"].as_array().unwrap();
+                assert_eq!(flows.len(), 1, "{protocol}: {snapshot}");
+                first_id = Some(flows[0]["id"].as_str().unwrap().to_owned());
+            }
         }
         let association = Socks5UdpAssociation::connect("127.0.0.1", socks.port())
             .await
@@ -373,12 +381,7 @@ async fn clash_api_quic_tcp_udp_accounting_and_stream_cancellation() {
                 .all(|flow| flow["metadata"]["sourceIP"] == "127.0.0.1"),
             "{protocol}: {snapshot}"
         );
-        let id = flows
-            .iter()
-            .find(|flow| flow["metadata"]["network"] == "tcp")
-            .unwrap()["id"]
-            .as_str()
-            .unwrap();
+        let id = first_id.unwrap();
         assert_eq!(
             request(
                 controller,
@@ -391,19 +394,43 @@ async fn clash_api_quic_tcp_udp_accounting_and_stream_cancellation() {
             .0,
             204
         );
-        let mut survivors = 0;
-        for stream in &mut streams {
-            if stream.write_all(b"payload").await.is_ok()
-                && matches!(
-                    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut [0; 7]))
-                        .await,
-                    Ok(Ok(_))
-                )
-            {
-                survivors += 1;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), streams[0].read_u8())
+                .await
+                .unwrap_or_else(|_| panic!("{protocol}: cancelled stream did not close"))
+                .is_err(),
+            "{protocol}: cancelled stream delivered unexpected data"
+        );
+        let remaining = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (_, snapshot) =
+                    request(controller, "GET", "/connections", Value::Null, true).await;
+                if snapshot["connections"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|flow| flow["id"] != id)
+                {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }
-        assert_eq!(survivors, 1, "{protocol}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{protocol}: cancelled flow remained registered"));
+        assert_eq!(
+            remaining["connections"].as_array().unwrap().len(),
+            2,
+            "{protocol}"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            streams[1].write_all(b"payload").await.unwrap();
+            let mut reply = [0; 7];
+            streams[1].read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"payload", "{protocol}: sibling payload");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{protocol}: sibling stopped relaying"));
         assert_eq!(
             association.send_to(udp_target, b"survivor").await.unwrap(),
             b"survivor"
