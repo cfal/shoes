@@ -353,3 +353,38 @@ fn io_error(error_value: std::io::Error) -> Response<Body> {
     };
     error(status, &error_value.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_network_preflight_requires_explicit_permission() {
+        let mut config: ClashApiConfig = serde_yaml::from_str(
+            "clash_api_address: '127.0.0.1:9090'\nsecret: test\ncors_origins: ['https://dashboard.example']",
+        ).unwrap();
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/proxies")
+            .header("origin", "https://dashboard.example")
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-private-network", "true")
+            .body(())
+            .unwrap();
+        assert!(!config.allow_private_network);
+        let response = preflight(&request, &config);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-private-network")
+        );
+        config.allow_private_network = true;
+        let response = preflight(&request, &config);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()["access-control-allow-private-network"],
+            "true"
+        );
+    }
+}

@@ -290,19 +290,21 @@ pub async fn websocket(
     state: Arc<ApiState>,
     websocket: hyper_tungstenite::HyperWebsocket,
     subscription: Subscription,
-    _permit: OwnedSemaphorePermit,
-    _connection_permit: Arc<OwnedSemaphorePermit>,
+    permit: OwnedSemaphorePermit,
+    connection_permit: Arc<OwnedSemaphorePermit>,
 ) {
     let Ok(websocket) = websocket.await else {
         return;
     };
-    serve_websocket(state, websocket, subscription).await;
+    serve_websocket(state, websocket, subscription, permit, connection_permit).await;
 }
 
 async fn serve_websocket<S>(
     state: Arc<ApiState>,
     websocket: hyper_tungstenite::WebSocketStream<S>,
     subscription: Subscription,
+    _permit: OwnedSemaphorePermit,
+    _connection_permit: Arc<OwnedSemaphorePermit>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -385,6 +387,85 @@ mod tests {
     use crate::control::runtime::ControlService;
     use futures::FutureExt;
 
+    #[tokio::test(start_paused = true)]
+    async fn websocket_write_deadline_releases_subscription_and_connection() {
+        let service = ControlService::new(Default::default()).unwrap();
+        let runtime = service.runtime.clone();
+        let subscriptions = runtime.subscribers.available_permits();
+        let connections = runtime.connections.available_permits();
+        let (_sender, samples) = watch::channel(Sample::initial());
+        let state = Arc::new(ApiState {
+            runtime: runtime.clone(),
+            samples,
+            tasks: Default::default(),
+            cancel: CancellationToken::new(),
+            snapshots: Arc::new(tokio::sync::Semaphore::new(2)),
+        });
+        let (_client, server) = tokio::io::duplex(1);
+        let server = hyper_tungstenite::WebSocketStream::from_raw_socket(
+            server,
+            hyper_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let task = serve_websocket(
+            state,
+            server,
+            Subscription::parse("memory", &HashMap::new()).unwrap(),
+            runtime.subscribers.clone().try_acquire_owned().unwrap(),
+            Arc::new(runtime.connections.clone().try_acquire_owned().unwrap()),
+        );
+        tokio::pin!(task);
+        assert!(task.as_mut().now_or_never().is_none());
+        assert_eq!(runtime.subscribers.available_permits(), subscriptions - 1);
+        assert_eq!(runtime.connections.available_permits(), connections - 1);
+        tokio::time::advance(Duration::from_millis(4999)).await;
+        assert!(task.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(task.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert!(task.as_mut().now_or_never().is_some());
+        assert_eq!(runtime.subscribers.available_permits(), subscriptions);
+        assert_eq!(runtime.connections.available_permits(), connections);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_write_deadline_releases_subscription_and_cancels_connection() {
+        let service = ControlService::new(Default::default()).unwrap();
+        let runtime = service.runtime.clone();
+        let subscriptions = runtime.subscribers.available_permits();
+        let (samples_sender, samples) = watch::channel(Sample::initial());
+        let state = Arc::new(ApiState {
+            runtime: runtime.clone(),
+            samples,
+            tasks: Default::default(),
+            cancel: CancellationToken::new(),
+            snapshots: Arc::new(tokio::sync::Semaphore::new(2)),
+        });
+        let (sender, receiver) = mpsc::channel(1);
+        let connection = CancellationToken::new();
+        let task = http(
+            state,
+            sender,
+            Subscription::parse("memory", &HashMap::new()).unwrap(),
+            connection.clone(),
+            runtime.subscribers.clone().try_acquire_owned().unwrap(),
+        );
+        tokio::pin!(task);
+        assert!(task.as_mut().now_or_never().is_none());
+        assert_eq!(receiver.len(), 1);
+        samples_sender.send_replace(Sample::initial());
+        assert!(task.as_mut().now_or_never().is_none());
+        assert_eq!(runtime.subscribers.available_permits(), subscriptions - 1);
+        tokio::time::advance(Duration::from_millis(4999)).await;
+        assert!(task.as_mut().now_or_never().is_none());
+        assert!(!connection.is_cancelled());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(task.as_mut().now_or_never().is_some());
+        assert_eq!(runtime.subscribers.available_permits(), subscriptions);
+        assert!(connection.is_cancelled());
+    }
+
     #[tokio::test]
     async fn oversized_snapshot_closes_websocket_with_size_reason() {
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -416,6 +497,20 @@ mod tests {
                 state,
                 server,
                 Subscription::parse("connections", &HashMap::new()).unwrap(),
+                service
+                    .runtime
+                    .subscribers
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap(),
+                Arc::new(
+                    service
+                        .runtime
+                        .connections
+                        .clone()
+                        .try_acquire_owned()
+                        .unwrap(),
+                ),
             )));
             assert!(client.next().await.unwrap().unwrap().is_text());
             sender.send_replace(Sample {

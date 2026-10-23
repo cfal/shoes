@@ -382,11 +382,12 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
     check_flow(&mut new, b'W').await;
     let mut ws = websocket(fixture.api).await;
     frame(&mut ws).await;
-    fixture.outbound_mut()["default"] = json!("west");
+    assert_eq!(fixture.outbound_mut()["default"], "east");
     fixture.write();
     process.signal(libc::SIGHUP);
     process.wait_for("Servers ready").await;
     assert_eq!(fixture.selected().await, "west");
+    flow(fixture.entry, b'W').await;
     frame(&mut ws).await;
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -842,13 +843,37 @@ async fn shared_rates_live_connection_snapshots_and_ndjson_streams() {
     let mut other_rates = websocket_path(fixture.api, "/traffic").await;
     let mut memory = websocket_path(fixture.api, "/memory").await;
     check_flow(&mut live, b'E').await;
-    let rate = frame(&mut rates).await;
-    assert_eq!(rate, frame(&mut other_rates).await);
+    let mut samples = Vec::new();
+    for socket in [&mut rates, &mut other_rates] {
+        samples.push(
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let sample = frame(socket).await;
+                    if sample["upTotal"] == 8 {
+                        break sample;
+                    }
+                }
+            })
+            .await
+            .unwrap(),
+        );
+    }
+    let rate = &samples[0];
+    assert_eq!(rate, &samples[1]);
     assert_eq!(rate["upTotal"], 8);
     assert!(rate["up"].as_u64().unwrap() > 0);
     assert_eq!(frame(&mut memory).await["inuse"], 0);
     assert!(frame(&mut memory).await["inuse"].as_u64().unwrap() > 0);
-    let snapshot = frame(&mut connections).await;
+    let snapshot = timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = frame(&mut connections).await;
+            if snapshot["uploadTotal"] == 8 && snapshot["downloadTotal"] == 8 {
+                break snapshot;
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(snapshot["connections"][0]["upload"], 8);
     assert_eq!(snapshot["connections"][0]["download"], 8);
     let stream = TcpStream::connect(fixture.api).await.unwrap();

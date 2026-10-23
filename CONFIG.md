@@ -389,6 +389,12 @@ are exempt from header idle expiry and have bounded queues/write deadlines.
 Responses are limited to 32 MiB. An oversized connection snapshot closes its
 WebSocket with code 1009 and reason `response exceeds 32 MiB`; tracking continues
 without truncating the connection list.
+Configuring a controller, `cache_file_path`, or any selector group enables the
+catalog and its 16,384-node limit. Names must be nonempty, unique, at most 256
+bytes, and contain no control characters. `DIRECT`, `REJECT`, and
+`GLOBAL` are reserved. Configuration preparation rejects `/rules` or base
+`/proxies` responses larger than 32 MiB. Group delay requests support at most
+1,024 immediate members.
 
 ## Server Config
 
