@@ -31,7 +31,7 @@ pub(super) async fn bind(configs: &[ClashApiConfig]) -> io::Result<Vec<Bound>> {
                 .await
                 .map_err(io::Error::other)??;
                 for socket in sockets {
-                    if bound.len() == 16 {
+                    if bound.len() >= 16 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "Clash API exceeds 16 sockets",
@@ -50,6 +50,12 @@ pub(super) async fn bind(configs: &[ClashApiConfig]) -> io::Result<Vec<Bound>> {
             }
             #[cfg(unix)]
             BindLocation::Path(path) => {
+                if bound.len() >= 16 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Clash API exceeds 16 sockets",
+                    ));
+                }
                 let (listener, owner) = SocketOwner::bind(path).await?;
                 bound.push(Bound::Unix(listener, config.clone(), owner));
             }
@@ -231,6 +237,27 @@ impl Drop for SocketOwner {
 mod tests {
     use super::*;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    #[tokio::test]
+    async fn bind_enforces_socket_limit_for_unix_after_tcp() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("api.sock");
+        let tcp: ClashApiConfig =
+            serde_yaml::from_str("clash_api_address: '127.0.0.1:0'\nsecret: test").unwrap();
+        let unix = ClashApiConfig {
+            bind: BindLocation::Path(path.clone()),
+            ..tcp.clone()
+        };
+        let mut configs = vec![tcp; 16];
+        configs.push(unix);
+        let error = bind(&configs)
+            .await
+            .err()
+            .expect("17 sockets must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!path.exists());
+    }
 
     #[tokio::test]
     async fn unix_socket_ownership_preserves_files_and_reclaims_only_stale_sockets() {

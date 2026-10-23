@@ -120,14 +120,66 @@ pub fn validate_resources(validated: &ValidatedConfigs) -> io::Result<()> {
 }
 
 fn overlaps(a: SocketAddr, b: SocketAddr) -> bool {
-    a.port() != 0
-        && a.port() == b.port()
-        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+    if a.port() == 0 || a.port() != b.port() {
+        return false;
+    }
+    let a = a.ip().to_canonical();
+    let b = b.ip().to_canonical();
+    match (a, b) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+            a == b || a.is_unspecified() || b.is_unspecified()
+        }
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+            a == b || a.is_unspecified() || b.is_unspecified()
+        }
+        // IPv6 wildcard listeners may also accept IPv4 connections.
+        (std::net::IpAddr::V6(v6), _) | (_, std::net::IpAddr::V6(v6)) => v6.is_unspecified(),
+    }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_overlap_respects_address_families_and_dual_stack_wildcards() {
+        for (a, b, expected) in [
+            ("0.0.0.0:9090", "[::1]:9090", false),
+            ("0.0.0.0:9090", "127.0.0.1:9090", true),
+            ("[::]:9090", "127.0.0.1:9090", true),
+            ("[::]:9090", "0.0.0.0:9090", true),
+            ("[::]:9090", "[::1]:9090", true),
+            ("127.0.0.1:9090", "[::ffff:127.0.0.1]:9090", true),
+            ("0.0.0.0:9090", "[::ffff:127.0.0.1]:9090", true),
+            ("127.0.0.1:9090", "[::1]:9090", false),
+            ("0.0.0.0:9090", "127.0.0.1:9091", false),
+            ("0.0.0.0:0", "0.0.0.0:0", false),
+        ] {
+            let a = a.parse().unwrap();
+            let b = b.parse().unwrap();
+            assert_eq!(overlaps(a, b), expected, "{a}, {b}");
+            assert_eq!(overlaps(b, a), expected, "{b}, {a}");
+        }
+    }
+
+    #[test]
+    fn ipv4_controller_wildcard_allows_ipv6_loopback_listeners() {
+        use serde_json::json;
+        for second in [
+            json!({"clash_api_address":"[::1]:9090", "secret":"test"}),
+            json!({"address":"[::1]:9090", "protocol":{"type":"socks"}, "rules":"allow-all-direct"}),
+        ] {
+            let configs = serde_yaml::from_str(
+                &json!([
+                    {"clash_api_address":"0.0.0.0:9090", "secret":"test"}, second
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            let validated = crate::config::create_server_configs(configs).unwrap();
+            validate_resources(&validated).unwrap();
+        }
+    }
 
     #[test]
     fn cache_only_configuration_reserves_state_and_lock_paths() {
