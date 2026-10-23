@@ -8,7 +8,7 @@ use crate::shadowsocks::ShadowsocksCipher;
 use crate::thread_util::set_num_threads;
 use crate::{logging, process, uuid_util};
 
-fn print_usage_and_exit(arg0: String) {
+fn print_usage_and_exit(arg0: String) -> ! {
     eprintln!("{arg0} [OPTIONS] <config.yaml> [config.yaml...]");
     eprintln!();
     eprintln!("OPTIONS:");
@@ -67,42 +67,37 @@ pub fn main() {
     let mut log_files: Vec<String> = Vec::new();
 
     while !args.is_empty() && args[0].starts_with("-") {
-        if args[0] == "--threads" || args[0] == "-t" {
-            args.remove(0);
-            if args.is_empty() {
-                eprintln!("Missing threads argument.");
-                print_usage_and_exit(arg0);
-                return;
-            }
-            num_threads = match args.remove(0).parse::<usize>() {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("Invalid thread count: {e}");
+        match args.remove(0).as_str() {
+            "--threads" | "-t" => {
+                if args.is_empty() {
+                    eprintln!("Missing threads argument.");
                     print_usage_and_exit(arg0);
-                    return;
                 }
-            };
-        } else if args[0] == "--log-file" || args[0] == "-l" {
-            args.remove(0);
-            if args.is_empty() {
-                eprintln!("Missing log-file argument.");
-                print_usage_and_exit(arg0);
+                num_threads = match args.remove(0).parse::<usize>() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("Invalid thread count: {e}");
+                        print_usage_and_exit(arg0);
+                    }
+                };
+            }
+            "--log-file" | "-l" => {
+                if args.is_empty() {
+                    eprintln!("Missing log-file argument.");
+                    print_usage_and_exit(arg0);
+                }
+                log_files.push(args.remove(0));
+            }
+            "--dry-run" | "-d" => dry_run = true,
+            "--no-reload" => no_reload = true,
+            "--version" | "-V" => {
+                println!("shoes {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
-            log_files.push(args.remove(0));
-        } else if args[0] == "--dry-run" || args[0] == "-d" {
-            args.remove(0);
-            dry_run = true;
-        } else if args[0] == "--no-reload" {
-            args.remove(0);
-            no_reload = true;
-        } else if args[0] == "--version" || args[0] == "-V" {
-            println!("shoes {}", env!("CARGO_PKG_VERSION"));
-            return;
-        } else {
-            eprintln!("Invalid argument: {}", args[0]);
-            print_usage_and_exit(arg0);
-            return;
+            other => {
+                eprintln!("Invalid argument: {other}");
+                print_usage_and_exit(arg0);
+            }
         }
     }
 
