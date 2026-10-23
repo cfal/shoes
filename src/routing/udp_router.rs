@@ -1135,7 +1135,15 @@ impl<'a> UdpRouter<'a> {
                         buf: PendingWriteBuffer::Startup(packet),
                     });
                 }
+                // Creation can finish after this poll's cancellation sweep.
+                let cancelled = session
+                    .cancelled
+                    .as_mut()
+                    .is_some_and(|cancelled| cancelled.as_mut().poll(cx).is_ready());
                 self.sessions.insert(id, session);
+                if cancelled {
+                    self.cancel_session(id);
+                }
                 true
             }
             Err(e) => {
@@ -1860,6 +1868,126 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn new_session_cancellation_wakes_behind_a_blocked_sibling_response() {
+        use crate::control::flows::{FlowContext, FlowRegistry};
+        use crate::control::tracked_stream::TrackedMessageStream;
+
+        #[derive(Default)]
+        struct WakeFlag(AtomicBool);
+        impl futures::task::ArcWake for WakeFlag {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for cancel_before_ready in [true, false] {
+            let started = tokio::time::Instant::now();
+            let source = PacketSource::default();
+            source.block_writes.store(true, Ordering::SeqCst);
+            let mut server = ServerStream::Targeted(Box::new(source));
+            let mut router = test_router(&mut server);
+            let sibling = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+            let sibling_state = Arc::new(RemoteState::default());
+            seed_pending(
+                &mut router,
+                LookupKey::Destination(sibling.clone()),
+                b"sibling",
+            );
+            finish_setup(&mut router, sibling_state.clone());
+            router.sessions.get_mut(&0).unwrap().in_server_write_queue = 1;
+            let mut response = router.server_write_pool.acquire().unwrap();
+            response[..5].copy_from_slice(b"reply");
+            router.server_write_queue.push_back(PendingResponse {
+                id: 0,
+                buf: response,
+                len: 5,
+                source: sibling,
+                session_id: 0,
+            });
+
+            let destination = NetLocation::from_str("192.0.2.1:53", None).unwrap();
+            let registry = Arc::new(FlowRegistry::default());
+            let guard = FlowContext {
+                registry: registry.clone(),
+                generation: 1,
+                inbound: "test".into(),
+                scope: "root".into(),
+                protocol: "Socks5".into(),
+            }
+            .register(
+                "udp",
+                &destination.clone().into(),
+                vec!["DIRECT".into()],
+                "all",
+                Default::default(),
+            );
+            let state = Arc::new(RemoteState::default());
+            let remote = TrackedMessageStream::new(
+                Box::new(RecordingRemote {
+                    state: state.clone(),
+                }),
+                guard,
+            );
+            seed_pending(
+                &mut router,
+                LookupKey::Destination(destination.clone()),
+                b"new",
+            );
+            let (ready, pending) = tokio::sync::oneshot::channel();
+            router.pending_creates[0].future = Box::pin(async move { pending.await.unwrap() });
+            let wake = Arc::new(WakeFlag::default());
+            let waker = futures::task::waker(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+            wake.0.store(false, Ordering::SeqCst);
+            if cancel_before_ready {
+                registry.cancel_all();
+            }
+            assert!(
+                ready
+                    .send(Ok(SessionCreateResult {
+                        permit: crate::resources::try_stream().unwrap(),
+                        remote: Box::new(remote),
+                        reply_identity: destination.clone(),
+                    }))
+                    .is_ok()
+            );
+            assert!(wake.0.swap(false, Ordering::SeqCst));
+            assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+            if !cancel_before_ready {
+                assert_eq!(router.sessions.len(), 2);
+                registry.cancel_all();
+            }
+            for _ in 0..8 {
+                if !wake.0.swap(false, Ordering::SeqCst) {
+                    break;
+                }
+                assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+            }
+            assert_eq!(
+                router.sessions.len(),
+                1,
+                "cancel_before_ready={cancel_before_ready}"
+            );
+            assert!(registry.snapshot(0).connections.is_empty());
+            assert_eq!(state.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(state.shutdown_polls.load(Ordering::SeqCst), 0);
+            assert_eq!(sibling_state.drops.load(Ordering::SeqCst), 0);
+            assert_eq!(router.expiry_queue.len(), 1);
+            let SessionLookup::ByDestination(lookup) = &router.session_lookup else {
+                panic!()
+            };
+            assert!(!lookup.contains_key(&destination));
+            assert_eq!(router.startup_slots.snapshot().active, 0);
+            assert_eq!(router.startup_bytes.snapshot().active, 0);
+            assert_eq!(router.server_write_queue.len(), 1);
+            assert_eq!(&router.server_write_queue[0].buf[..5], b"reply");
+            assert_eq!(router.server_write_queue[0].id, 0);
+            assert_eq!(tokio::time::Instant::now(), started);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pending_shutdowns_are_bounded_and_expire() {
         let (stream, _peer) = tokio::io::duplex(1024);
         let mut server =
@@ -2048,6 +2176,7 @@ mod tests {
     struct PacketSource {
         packets: PacketQueue,
         closed: Arc<Mutex<VecDeque<MessageSessionId>>>,
+        block_writes: Arc<AtomicBool>,
     }
 
     impl AsyncReadTargetedMessage for PacketSource {
@@ -2088,6 +2217,9 @@ mod tests {
             _: &[u8],
             _: &NetLocation,
         ) -> Poll<io::Result<()>> {
+            if self.block_writes.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
             Poll::Ready(Ok(()))
         }
     }
