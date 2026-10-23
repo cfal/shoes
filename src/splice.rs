@@ -654,9 +654,19 @@ mod tests {
             let (mut left, a) = pair(false).await;
             let (b, mut right) = pair(false).await;
             let data = payload(256_123, 81);
+            let source = crate::control::flows::test_guard();
+            let destination = crate::control::flows::test_guard();
             timeout(Duration::from_secs(5), async {
                 let (result, (), received) = tokio::join!(
-                    copy_direction(&a, &b, &operations),
+                    copy_direction_tracked(
+                        &a,
+                        &b,
+                        &operations,
+                        Accounting {
+                            source: Some(&source.entry),
+                            destination: Some(&destination.entry),
+                        }
+                    ),
                     async {
                         left.write_all(&data).await.unwrap();
                         left.shutdown().await.unwrap();
@@ -669,6 +679,8 @@ mod tests {
                 );
                 result.unwrap();
                 assert_eq!(received, data, "fault {error} at {at}");
+                assert_eq!(source.entry.counters.totals(), (0, data.len() as u64));
+                assert_eq!(destination.entry.counters.totals(), (data.len() as u64, 0));
             })
             .await
             .unwrap();
@@ -693,15 +705,33 @@ mod tests {
             let (mut left, a) = pair(false).await;
             let (b, _right) = pair(false).await;
             left.write_all(&vec![7; BUFFER_SIZE + 128]).await.unwrap();
-            let result = timeout(Duration::from_secs(2), copy_direction(&a, &b, &operations))
-                .await
-                .unwrap()
-                .unwrap_err();
+            let source = crate::control::flows::test_guard();
+            let destination = crate::control::flows::test_guard();
+            let result = timeout(
+                Duration::from_secs(2),
+                copy_direction_tracked(
+                    &a,
+                    &b,
+                    &operations,
+                    Accounting {
+                        source: Some(&source.entry),
+                        destination: Some(&destination.entry),
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
             if error == 0 {
                 assert_eq!(result.kind(), io::ErrorKind::WriteZero);
             } else {
                 assert_eq!(result.raw_os_error(), Some(error));
             }
+            assert_eq!(
+                source.entry.counters.totals(),
+                (0, (BUFFER_SIZE + 128) as u64)
+            );
+            assert_eq!(destination.entry.counters.totals(), (BUFFER_SIZE as u64, 0));
             assert_pipes_closed(&operations);
         }
         let operations = Faults::new(usize::MAX, 0);
@@ -711,16 +741,36 @@ mod tests {
             .set_send_buffer_size(4096)
             .unwrap();
         let sender = tokio::spawn(async move { left.write_all(&vec![7; 8 * 1024 * 1024]).await });
+        let source = crate::control::flows::test_guard();
+        let destination = crate::control::flows::test_guard();
         let (result, _) = tokio::join!(
             timeout(
                 Duration::from_millis(100),
-                copy_direction(&a, &b, &operations)
+                copy_direction_tracked(
+                    &a,
+                    &b,
+                    &operations,
+                    Accounting {
+                        source: Some(&source.entry),
+                        destination: Some(&destination.entry),
+                    }
+                )
             ),
             async { right.read_exact(&mut vec![0; BUFFER_SIZE]).await.unwrap() }
         );
         assert!(result.is_err());
         assert!(!operations.pipes.lock().unwrap().is_empty());
         assert!(operations.pending.load(Ordering::Relaxed) > 0);
+        shutdown_write(&b).unwrap();
+        let mut remaining = Vec::new();
+        timeout(Duration::from_secs(2), right.read_to_end(&mut remaining))
+            .await
+            .unwrap()
+            .unwrap();
+        let delivered = (BUFFER_SIZE + remaining.len()) as u64;
+        let pending = operations.pending.load(Ordering::Relaxed) as u64;
+        assert_eq!(source.entry.counters.totals(), (0, delivered + pending));
+        assert_eq!(destination.entry.counters.totals(), (delivered, 0));
         assert_pipes_closed(&operations);
         sender.abort();
         let _ = sender.await;
