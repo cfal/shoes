@@ -54,6 +54,9 @@ async fn clash_api_tun_counts_payload_and_cancels_destinations_independently() {
     let udp_peer = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"")
         .await
         .unwrap();
+    let sibling_peer = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"")
+        .await
+        .unwrap();
     let mut tcp = tun.connect_tcp(tcp_peer.local_addr().port()).await.unwrap();
     tcp.write_all(b"tcp-payload").await.unwrap();
     let mut received = [0; 11];
@@ -69,14 +72,26 @@ async fn clash_api_tun_counts_payload_and_cancels_destinations_independently() {
     udp_exchange(&udp, destination, b"udp-payload")
         .await
         .unwrap();
+    let sibling = SocketAddr::new(tun.target, sibling_peer.local_addr().port());
+    udp_exchange(&udp, sibling, b"udp-sibling").await.unwrap();
     let snapshot = request(controller, "GET", "/connections").await;
+    let sibling_id = snapshot["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|flow| {
+            flow["metadata"]["network"] == "udp"
+                && flow["metadata"]["destinationPort"].as_str() == Some(&sibling.port().to_string())
+        })
+        .unwrap()["id"]
+        .clone();
     assert_eq!(
         snapshot["uploadTotal"].as_u64().unwrap() - baseline["uploadTotal"].as_u64().unwrap(),
-        22
+        33
     );
     assert_eq!(
         snapshot["downloadTotal"].as_u64().unwrap() - baseline["downloadTotal"].as_u64().unwrap(),
-        22
+        33
     );
     for network in ["tcp", "udp"] {
         let port = if network == "tcp" {
@@ -118,8 +133,31 @@ async fn clash_api_tun_counts_payload_and_cancels_destinations_independently() {
         })
         .await
         .unwrap();
-        // The UDP source session survives cancellation of either destination.
+        udp_exchange(&udp, sibling, b"still alive").await.unwrap();
+        let current = request(controller, "GET", "/connections").await;
+        assert!(
+            current["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|flow| flow["id"] == sibling_id),
+            "sibling flow must retain its identity"
+        );
         udp_exchange(&udp, destination, b"again").await.unwrap();
+        if network == "udp" {
+            let current = request(controller, "GET", "/connections").await;
+            let reopened = current["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|flow| {
+                    flow["metadata"]["network"] == "udp"
+                        && flow["metadata"]["destinationPort"].as_str()
+                            == Some(&destination.port().to_string())
+                })
+                .unwrap();
+            assert_ne!(reopened["id"], flow["id"]);
+        }
     }
     assert!(matches!(
         timeout(Duration::from_secs(3), tcp.read_u8()).await,
