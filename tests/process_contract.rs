@@ -1224,7 +1224,7 @@ async fn sighup_completes_pending_file_reload_without_waiting_for_debounce() {
         .await
         .unwrap();
     assert!(
-        timeout(Duration::from_millis(3500), async {
+        timeout(Duration::from_millis(5500), async {
             while let Some(line) = child.lines.recv().await {
                 assert!(!line.contains("Servers ready"), "duplicate reload");
             }

@@ -13,7 +13,7 @@ use crate::file_watcher::watch;
 use crate::option_util::OneOrSome;
 use crate::resources;
 
-const RELOAD_DEBOUNCE: Duration = Duration::from_secs(3);
+const RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
 async fn load_validated(
     paths: &[String],

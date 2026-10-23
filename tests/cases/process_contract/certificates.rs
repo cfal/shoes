@@ -93,7 +93,7 @@ async fn rotation_roundtrip(named: bool, no_reload: bool) {
         recv.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"after!");
         if !no_reload {
-            assert_no_reload(&mut child, Duration::from_millis(3500), "live rotation").await;
+            assert_no_reload(&mut child, Duration::from_millis(5500), "live rotation").await;
         }
         while let Ok(line) = child.lines.try_recv() { assert!(!line.contains("Servers ready"), "certificate rotation must not reload listeners"); }
         config[usize::from(named)]["protocol"]["tls_targets"]["proxy.test"]["certificate_source"] = json!("missing");
@@ -135,7 +135,7 @@ async fn assert_no_reload(child: &mut Process, duration: Duration, phase: &str) 
 
 #[tokio::test]
 async fn reload_only_pems_debounce_recover_and_stop_watching_removed_dependencies() {
-    timeout(Duration::from_secs(75), async {
+    timeout(Duration::from_secs(90), async {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.yaml");
         let cert_path = directory.path().join("client.crt");
@@ -169,9 +169,9 @@ async fn reload_only_pems_debounce_recover_and_stop_watching_removed_dependencie
         child.wait_for("Servers ready").await;
 
         std::fs::write(&cert_path, second.cert.pem()).unwrap();
-        assert_no_reload(&mut child, Duration::from_millis(1500), "first write debounce").await;
+        assert_no_reload(&mut child, Duration::from_millis(3500), "first write debounce").await;
         std::fs::write(&key_path, second.signing_key.serialize_pem()).unwrap();
-        assert_no_reload(&mut child, Duration::from_secs(2), "second write debounce").await;
+        assert_no_reload(&mut child, Duration::from_secs(4), "second write debounce").await;
         child.wait_for("Servers ready").await;
 
         std::fs::write(&key_path, first.signing_key.serialize_pem()).unwrap();
@@ -209,14 +209,14 @@ async fn reload_only_pems_debounce_recover_and_stop_watching_removed_dependencie
         child.wait_for("Servers ready").await;
         std::fs::write(&cert_path, "removed dependency").unwrap();
         std::fs::write(&missing, "removed dependency").unwrap();
-        assert_no_reload(&mut child, Duration::from_millis(3500), "removed dependencies").await;
+        assert_no_reload(&mut child, Duration::from_millis(5500), "removed dependencies").await;
         child.signal(libc::SIGTERM);
         assert!(child.exit().await.success());
 
         let mut child = Process::start(&path, &["--no-reload"]);
         child.wait_for("Servers ready").await;
         std::fs::write(&ca_path, "incomplete").unwrap();
-        assert_no_reload(&mut child, Duration::from_millis(3500), "disabled reload").await;
+        assert_no_reload(&mut child, Duration::from_millis(5500), "disabled reload").await;
         child.signal(libc::SIGHUP);
         child.wait_for("Reload rejected").await;
         std::fs::write(&ca_path, second.cert.pem()).unwrap();

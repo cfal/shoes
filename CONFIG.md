@@ -1793,7 +1793,7 @@ ShadowTLS certificates/keys, and ACME custom `ca_cert` files. Changing ACME trus
 roots replaces the affected renewal worker after successful preparation, while
 retaining its account and issued certificate.
 
-Automatic full reloads wait for **3 seconds of quiet after the last relevant
+Automatic full reloads wait for **5 seconds of quiet after the last relevant
 filesystem event**. Writes to config, rule, or reload-only PEM dependencies share
 that debounce window. Separate certificate/key writes are coalesced; an invalid
 or incomplete candidate is rejected without retiring the running listeners.
