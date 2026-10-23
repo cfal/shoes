@@ -431,7 +431,7 @@ async fn auth_errors_rules_providers_and_outbound_probes() {
         );
         assert_eq!(body["message"], "Unauthorized");
     }
-    let (status, _, _) = request_io(
+    let (status, headers, _) = request_io(
         TcpStream::connect(fixture.api).await.unwrap(),
         "GET",
         "/version",
@@ -443,6 +443,8 @@ async fn auth_errors_rules_providers_and_outbound_probes() {
     )
     .await;
     assert_eq!(status, 403);
+    assert_eq!(headers["connection"], "close");
+    assert!(headers.get("access-control-allow-origin").is_none());
     assert_eq!(
         api(fixture.api, "POST", "/restart", Value::Null).await.0,
         501

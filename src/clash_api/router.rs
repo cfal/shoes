@@ -19,14 +19,16 @@ pub async fn serve(
     connection: CancellationToken,
     connection_permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Response<Body>, Infallible> {
-    let origin = match auth::origin(&request, &config) {
-        Ok(origin) => origin,
-        Err(status) => return Ok(error(status, "Origin is not allowed")),
-    };
-    let mut response = if request.method() == Method::OPTIONS {
-        preflight(&request, &config)
-    } else {
-        dispatch(&mut request, &config, &state, connection, connection_permit).await
+    let (mut response, origin) = match auth::origin(&request, &config) {
+        Err(status) => (error(status, "Origin is not allowed"), None),
+        Ok(origin) => {
+            let response = if request.method() == Method::OPTIONS {
+                preflight(&request, &config)
+            } else {
+                dispatch(&mut request, &config, &state, connection, connection_permit).await
+            };
+            (response, origin)
+        }
     };
     auth::cors(response.headers_mut(), origin.as_deref());
     if response.status().is_client_error()
@@ -281,21 +283,13 @@ async fn route(
             } else {
                 match probes::probe(&state.runtime, &generation, name, &query).await {
                     Ok(delay) => super::json(StatusCode::OK, &json!({"delay":delay})),
-                    Err(error_value) => {
-                        let status = if error_value.kind() == std::io::ErrorKind::TimedOut {
-                            StatusCode::GATEWAY_TIMEOUT
-                        } else {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        };
-                        error(
-                            status,
-                            if status == StatusCode::GATEWAY_TIMEOUT {
-                                "Timeout"
-                            } else {
-                                "delay test failed or unavailable"
-                            },
-                        )
+                    Err(error_value) if error_value.kind() == std::io::ErrorKind::TimedOut => {
+                        error(StatusCode::GATEWAY_TIMEOUT, "Timeout")
                     }
+                    Err(_) => error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "delay test failed or unavailable",
+                    ),
                 }
             }
         }

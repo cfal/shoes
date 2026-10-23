@@ -309,6 +309,7 @@ async fn serve_websocket<S>(
     let (mut sink, mut incoming) = websocket.split();
     let mut source = Source::new(&state, subscription);
     'stream: loop {
+        // Ping/Pong handling must not cancel a pending initial snapshot or interval tick.
         let next = source.next();
         tokio::pin!(next);
         loop {

@@ -119,21 +119,7 @@ fn json(status: hyper::StatusCode, value: &impl serde::Serialize) -> hyper::Resp
 }
 
 fn error(status: hyper::StatusCode, message: &str) -> hyper::Response<Body> {
-    let mut response = json(status, &serde_json::json!({"message":message}));
-    if [
-        hyper::StatusCode::UNAUTHORIZED,
-        hyper::StatusCode::FORBIDDEN,
-        hyper::StatusCode::REQUEST_TIMEOUT,
-        hyper::StatusCode::PAYLOAD_TOO_LARGE,
-    ]
-    .contains(&status)
-    {
-        response.headers_mut().insert(
-            "connection",
-            hyper::header::HeaderValue::from_static("close"),
-        );
-    }
-    response
+    json(status, &serde_json::json!({"message":message}))
 }
 
 fn no_content() -> hyper::Response<Body> {

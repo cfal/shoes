@@ -38,13 +38,7 @@ impl crate::logging::LogWriter for Writer {
         }
         let mut message = record.args().to_string();
         // JSON escaping can expand each input byte sixfold; keep either DTO below 16 KiB.
-        if message.len() > 2600 {
-            let mut end = 2600;
-            while !message.is_char_boundary(end) {
-                end -= 1;
-            }
-            message.truncate(end);
-        }
+        message.truncate(message.floor_char_boundary(2600));
         let _ = hub.sender.send(LogEvent {
             level: record.level(),
             time: chrono::Utc::now().to_rfc3339(),

@@ -271,11 +271,12 @@ pub async fn probe_group(
     let mut started = false;
     let mut successes = serde_json::Map::new();
     while let Some((name, result)) = results.next().await {
-        if let Some(result) = result {
-            started = true;
-            if let Ok(delay) = result {
-                successes.insert(name.clone(), json!(delay));
-            }
+        let Some(result) = result else {
+            continue;
+        };
+        started = true;
+        if let Ok(delay) = result {
+            successes.insert(name, json!(delay));
         }
     }
     if !successes.is_empty() {
@@ -298,8 +299,12 @@ async fn probe_until(
     deadline: tokio::time::Instant,
 ) -> io::Result<u16> {
     let result = tokio::select! {
-        result = tokio::time::timeout_at(deadline, request(generation, name, query)) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout")).and_then(|result| result),
-        _ = runtime.shutdown.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "controller stopped")),
+        result = tokio::time::timeout_at(deadline, request(generation, name, query)) => {
+            result.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")))
+        }
+        _ = runtime.shutdown.cancelled() => {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "controller stopped"));
+        }
     };
     let (delay, satisfied) = result.as_ref().copied().unwrap_or((0, false));
     generation
@@ -321,17 +326,7 @@ async fn request(
         .trim_start_matches('[')
         .trim_end_matches(']');
     let port = query.url.port_or_known_default().unwrap();
-    let target = NetLocation::from_str(
-        &format!(
-            "{}:{port}",
-            if host.contains(':') {
-                format!("[{host}]")
-            } else {
-                host.into()
-            }
-        ),
-        None,
-    )?;
+    let target = NetLocation::new(crate::address::Address::from(host)?, port);
     let resolver = ProbeResolver {
         inner: generation.probes.resolver.clone(),
         target: target.clone(),
@@ -409,7 +404,7 @@ async fn request(
 trait ProbeIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ProbeIo for T {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProbeResolver {
     inner: Arc<dyn Resolver>,
     target: NetLocation,
@@ -443,12 +438,7 @@ impl Resolver for ProbeResolver {
         if location != &self.target {
             return resolve;
         }
-        let policy = Self {
-            inner: self.inner.clone(),
-            target: self.target.clone(),
-            forbidden_ranges: self.forbidden_ranges.clone(),
-            denied: self.denied,
-        };
+        let policy = self.clone();
         Box::pin(async move {
             let addresses = resolve.await?;
             policy.check(&addresses)?;
@@ -458,24 +448,21 @@ impl Resolver for ProbeResolver {
 }
 
 fn forbidden(ip: IpAddr) -> bool {
-    match ip {
+    match ip.to_canonical() {
         IpAddr::V4(ip) => {
             ip.is_loopback()
                 || ip.is_link_local()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || ip.is_broadcast()
-                || (ip.octets()[0] == 198 && ip.octets()[1] & 254 == 18)
+                || matches!(ip.octets(), [198, 18 | 19, _, _])
         }
-        IpAddr::V6(ip) => ip
-            .to_ipv4_mapped()
-            .map(|ip| forbidden(IpAddr::V4(ip)))
-            .unwrap_or_else(|| {
-                ip.is_loopback()
-                    || ip.is_unspecified()
-                    || ip.is_multicast()
-                    || ip.is_unicast_link_local()
-            }),
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unicast_link_local()
+        }
     }
 }
 
@@ -484,6 +471,35 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn destination_policy_preserves_ipv4_and_ipv6_boundaries() {
+        for (address, denied) in [
+            ("127.0.0.1", true),
+            ("0.0.0.0", true),
+            ("169.254.1.1", true),
+            ("224.0.0.1", true),
+            ("255.255.255.255", true),
+            ("198.17.255.255", false),
+            ("198.18.0.0", true),
+            ("198.19.255.255", true),
+            ("198.20.0.0", false),
+            ("192.0.2.1", false),
+            ("10.0.0.1", false),
+            ("::", true),
+            ("::1", true),
+            ("fe80::1", true),
+            ("ff02::1", true),
+            ("2001:db8::1", false),
+            ("fc00::1", false),
+            ("::127.0.0.1", false),
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:198.18.0.1", true),
+            ("::ffff:192.0.2.1", false),
+        ] {
+            assert_eq!(forbidden(address.parse().unwrap()), denied, "{address}");
+        }
+    }
 
     #[derive(Debug)]
     struct Answers(Vec<SocketAddr>);
@@ -507,10 +523,7 @@ mod tests {
     fn catalog() -> Catalog {
         Catalog {
             nodes: IndexMap::from([("DIRECT".into(), CatalogNode::Leaf(Box::default()))]),
-            selection: crate::control::selection::SelectionOwner::new(None)
-                .unwrap()
-                .prepare(Default::default())
-                .unwrap(),
+            selection: Default::default(),
         }
     }
 

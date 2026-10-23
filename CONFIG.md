@@ -359,19 +359,19 @@ Supported endpoints: `/version`, read-only `/configs`, `/proxies`, `/group`,
 selector PUTs, node/group `/delay`, read-only `/rules`, `/connections` snapshots
 and DELETE cancellation, plus WebSocket/NDJSON `/traffic`, `/memory`, and `/logs`.
 Provider collections return `{"providers":{}}`. Traffic counters measure outbound
-application payload, not headers, padding, or retransmissions. Probes and internal
-DNS/carrier traffic and unauthenticated camouflage/fallback forwarding are excluded;
-synthetic fake-DNS answers and ICMP are not
-represented as connections. Connection speeds are derived by the dashboard from
-successive byte counters. Process/GeoIP data is not fabricated.
+application payload, not headers, padding, or retransmissions. Probes, internal
+DNS/carrier traffic, and unauthenticated camouflage/fallback forwarding are excluded;
+synthetic fake-DNS answers and ICMP are not represented as connections.
+Connection speeds are derived by the dashboard from successive byte counters.
+Process/GeoIP data is not fabricated.
 
 Delay tests send HTTP HEAD through actual outbounds, verify HTTPS certificates,
 and never follow redirects. A leaf test is standalone, not a test of every chain
 containing that leaf. Unused WireGuard nodes remain inactive and cannot be probed
-until referenced by a forwarding or DNS rule. Direct probe destinations cannot be loopback, link-local,
-unspecified, multicast, or synthetic fake-IP addresses. Remote proxies may resolve
-names differently: this is authenticated administrative network access, not an
-API for untrusted users.
+until referenced by a forwarding or DNS rule. Direct probe destinations cannot be
+loopback, link-local, unspecified, multicast, or synthetic fake-IP addresses.
+Remote proxies may resolve names differently: this is authenticated administrative
+network access, not an API for untrusted users.
 
 The compatibility target is zashboard revision
 `6225aac84439425ae4f4493437b110a314753436`, not full Mihomo parity. Only rule mode
