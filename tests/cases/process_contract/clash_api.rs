@@ -248,6 +248,24 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn outbound_mut(&mut self) -> &mut Value {
+        self.config
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["client_group"] == "outbound")
+            .unwrap()
+    }
+
+    fn tcp_controller_mut(&mut self) -> &mut Value {
+        self.config
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry.get("clash_api_address").is_some())
+            .unwrap()
+    }
+
     async fn new() -> Self {
         let (east, east_task) = egress(b'E').await;
         let (west, west_task) = egress(b'W').await;
@@ -364,7 +382,7 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
     check_flow(&mut new, b'W').await;
     let mut ws = websocket(fixture.api).await;
     frame(&mut ws).await;
-    fixture.config[3]["default"] = json!("west");
+    fixture.outbound_mut()["default"] = json!("west");
     fixture.write();
     process.signal(libc::SIGHUP);
     process.wait_for("Servers ready").await;
@@ -384,7 +402,7 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
     );
     fixture.stop(&mut process).await;
     assert!(!fixture.directory.path().join("api.sock").exists());
-    fixture.config[3]["default"] = json!("east");
+    fixture.outbound_mut()["default"] = json!("east");
     let mut process = fixture.start().await;
     assert_eq!(fixture.selected().await, "west");
     flow(fixture.entry, b'W').await;
@@ -630,7 +648,7 @@ async fn defaults_follow_config_without_cache_writes_and_controller_changes_reje
     let mut process = fixture.start().await;
     assert_eq!(fixture.selected().await, "east");
     flow(fixture.entry, b'E').await;
-    fixture.config[3]["default"] = json!("west");
+    fixture.outbound_mut()["default"] = json!("west");
     fixture.write();
     process.signal(libc::SIGHUP);
     process.wait_for("Servers ready").await;
@@ -638,11 +656,11 @@ async fn defaults_follow_config_without_cache_writes_and_controller_changes_reje
     flow(fixture.entry, b'W').await;
     assert!(!fixture.directory.path().join("cache.db").exists());
     fixture.stop(&mut process).await;
-    fixture.config[3]["default"] = json!("east");
+    fixture.outbound_mut()["default"] = json!("east");
     let mut process = fixture.start().await;
     assert_eq!(fixture.selected().await, "east");
     flow(fixture.entry, b'E').await;
-    fixture.config[0]["secret"] = json!("changed-secret");
+    fixture.tcp_controller_mut()["secret"] = json!("changed-secret");
     fixture.write();
     process.signal(libc::SIGHUP);
     process.wait_for("require a restart").await;
@@ -657,7 +675,7 @@ async fn udp_payload_totals_and_destination_cancellation_are_isolated() {
         socks5::Socks5UdpAssociation, test_servers::start_udp_echo_server_with_suffix,
     };
     let mut fixture = Fixture::new().await;
-    fixture.config[3]["client_proxies"] = json!([
+    fixture.outbound_mut()["client_proxies"] = json!([
         {"name":"east", "protocol":{"type":"direct"}},
         {"name":"west", "protocol":{"type":"direct"}}
     ]);
@@ -910,51 +928,106 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
     let vless = json!({"type":"vless", "user_id":shoes_test_support::test_fixture::TEST_UUID});
     let mut mux = vless.clone();
     mux["h2mux"] = json!({});
+    struct ProtocolCase {
+        name: &'static str,
+        server: Value,
+        client: Value,
+        tls_alpn: Option<&'static str>,
+        quic: bool,
+        exercise_udp: bool,
+    }
     let mut protocols = vec![
-        (
-            "socks",
-            json!({"type":"socks"}),
-            json!({"type":"socks"}),
-            false,
-        ),
-        (
-            "http",
-            json!({"type":"http"}),
-            json!({"type":"http"}),
-            false,
-        ),
-        ("vless", vless.clone(), vless.clone(), false),
-        ("h2mux", vless.clone(), mux, false),
-        (
-            "http2",
-            json!({"type":"http"}),
-            json!({"type":"http", "http_version":"h2"}),
-            true,
-        ),
-        (
-            "anytls",
-            json!({"type":"anytls", "users":[{"name":"test", "password":"test-secret"}]}),
-            json!({"type":"anytls", "password":"test-secret"}),
-            true,
-        ),
+        ProtocolCase {
+            name: "socks",
+            server: json!({"type":"socks"}),
+            client: json!({"type":"socks"}),
+            tls_alpn: None,
+            quic: false,
+            exercise_udp: false,
+        },
+        ProtocolCase {
+            name: "http",
+            server: json!({"type":"http"}),
+            client: json!({"type":"http"}),
+            tls_alpn: None,
+            quic: false,
+            exercise_udp: false,
+        },
+        ProtocolCase {
+            name: "vless",
+            server: vless.clone(),
+            client: vless.clone(),
+            tls_alpn: None,
+            quic: false,
+            exercise_udp: true,
+        },
+        ProtocolCase {
+            name: "h2mux",
+            server: vless.clone(),
+            client: mux,
+            tls_alpn: None,
+            quic: false,
+            exercise_udp: true,
+        },
+        ProtocolCase {
+            name: "http2",
+            server: json!({"type":"http"}),
+            client: json!({"type":"http", "http_version":"h2"}),
+            tls_alpn: Some("h2"),
+            quic: false,
+            exercise_udp: false,
+        },
+        ProtocolCase {
+            name: "anytls",
+            server: json!({"type":"anytls", "users":[{"name":"test", "password":"test-secret"}]}),
+            client: json!({"type":"anytls", "password":"test-secret"}),
+            tls_alpn: Some("h2"),
+            quic: false,
+            exercise_udp: true,
+        },
     ];
-    for name in ["shadowsocks", "snell", "trojan"] {
+    for (name, exercise_udp) in [("shadowsocks", true), ("snell", true), ("trojan", false)] {
         let mut protocol = json!({"type":name, "password":"test-secret"});
         if name != "trojan" {
             protocol["cipher"] = json!("chacha20-ietf-poly1305");
         }
-        protocols.push((name, protocol.clone(), protocol, false));
+        protocols.push(ProtocolCase {
+            name,
+            server: protocol.clone(),
+            client: protocol,
+            tls_alpn: None,
+            quic: false,
+            exercise_udp,
+        });
     }
-    for version in ["h1", "h2", "h3"] {
+    for (version, tls_alpn, quic) in [
+        ("h1", Some("http/1.1"), false),
+        ("h2", Some("h2"), false),
+        ("h3", None, true),
+    ] {
         let server =
             json!({"type":"xhttp", "path":"/tunnel", "http_version":version, "protocol":vless});
         let mut client = server.clone();
         client["mode"] = json!("stream-one");
-        protocols.push((version, server, client, version != "h3"));
+        protocols.push(ProtocolCase {
+            name: version,
+            server,
+            client,
+            tls_alpn,
+            quic,
+            exercise_udp: false,
+        });
     }
-    for (name, mut server, mut client, tls) in protocols {
-        if tls {
-            let alpn = if name == "h1" { "http/1.1" } else { "h2" };
+    for ProtocolCase {
+        name,
+        mut server,
+        mut client,
+        tls_alpn,
+        quic,
+        exercise_udp,
+    } in protocols
+    {
+        if let Some(alpn) = tls_alpn {
             server = json!({"type":"tls", "default_tls_target":{"cert":certificate.cert.pem(), "key":certificate.signing_key.serialize_pem(), "alpn_protocols":[alpn], "protocol":server}});
             client = json!({"type":"tls", "sni_hostname":"localhost", "verify":false, "alpn_protocols":[alpn], "protocol":client});
         }
@@ -971,7 +1044,7 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
         let mut client_config = json!([
             {"address":format!("0.0.0.0:{}", entry.port()), "protocol":{"type":"socks"}, "rules":[{"mask":"0.0.0.0/0", "action":"allow", "client_chain":[{"address":remote.to_string(), "protocol":client}]}]}
         ]);
-        if name == "h3" {
+        if quic {
             server_config[1]["transport"] = json!("quic");
             server_config[1]["quic_settings"] = json!({"cert":certificate.cert.pem(), "key":certificate.signing_key.serialize_pem(), "alpn_protocols":["h3"], "num_endpoints":1});
             let outbound = &mut client_config[0]["rules"][0]["client_chain"][0];
@@ -1046,7 +1119,7 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
                 .0,
             204
         );
-        if matches!(name, "vless" | "h2mux" | "anytls" | "shadowsocks" | "snell") {
+        if exercise_udp {
             timeout(Duration::from_secs(3), async {
                 while !api(controller, "GET", "/connections", Value::Null).await.1["connections"]
                     .as_array()
