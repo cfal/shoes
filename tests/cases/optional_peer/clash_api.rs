@@ -166,7 +166,7 @@ async fn forwarding_ready(socks: SocketAddr, target: SocketAddr, process: &mut P
 #[tokio::test]
 async fn clash_api_pinned_mihomo_contract() {
     let binary = std::env::var_os("SHOES_TEST_MIHOMO_BIN").expect(
-        "set SHOES_TEST_MIHOMO_BIN to Mihomo built at 94b13aed49b8dc41973e4bb3f721c5fa2c5c1f",
+        "set SHOES_TEST_MIHOMO_BIN to Mihomo built at 94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f",
     );
     let directory = tempfile::tempdir().unwrap();
     let shoes = address();
