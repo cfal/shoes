@@ -223,10 +223,12 @@ impl SocketOwner {
 #[cfg(unix)]
 impl Drop for SocketOwner {
     fn drop(&mut self) {
-        use std::os::unix::fs::MetadataExt;
-        if std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
-        {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            metadata.file_type().is_socket()
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode
+        }) {
             let _ = std::fs::remove_file(&self.path);
         }
         let _ = self.lock.unlock();
@@ -236,7 +238,7 @@ impl Drop for SocketOwner {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
     #[tokio::test]
     async fn bind_enforces_socket_limit_for_unix_after_tcp() {
@@ -275,7 +277,7 @@ mod tests {
         let active = tokio::net::UnixListener::bind(&path).unwrap();
         assert!(SocketOwner::bind(&path).await.is_err());
         drop(active);
-        let (listener, owner) = SocketOwner::bind(&path).await.unwrap();
+        let (listener, mut owner) = SocketOwner::bind(&path).await.unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
@@ -283,7 +285,29 @@ mod tests {
         drop(listener);
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"replacement").unwrap();
+        // Models inode reuse without depending on the filesystem's allocation order.
+        owner.inode = std::fs::symlink_metadata(&path).unwrap().ino();
         drop(owner);
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    }
+
+    #[tokio::test]
+    async fn unix_socket_cleanup_preserves_replacement_sockets() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("api.sock");
+        let (listener, owner) = SocketOwner::bind(&path).await.unwrap();
+        // Keeps the original inode allocated while replacing its path.
+        std::fs::rename(&path, directory.path().join("retired.sock")).unwrap();
+        let replacement = tokio::net::UnixListener::bind(&path).unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(metadata.dev(), owner.device);
+        assert_ne!(metadata.ino(), owner.inode);
+        drop(owner);
+        let retained = std::fs::symlink_metadata(&path).unwrap();
+        assert!(retained.file_type().is_socket());
+        assert_eq!(retained.ino(), metadata.ino());
+        drop(replacement);
+        drop(listener);
     }
 }
