@@ -349,8 +349,16 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     #[cfg(unix)]
     super::wireguard_devices::collect_devices(&mut validated, &mut client_groups)?;
     super::fake_dns::validate(&mut validated)?;
+    refresh_catalog_clients(&mut validated, &client_groups)?;
+    Ok(validated)
+}
+
+pub(super) fn refresh_catalog_clients(
+    validated: &mut ValidatedConfigs,
+    groups: &HashMap<String, Vec<ClientConfig>>,
+) -> std::io::Result<()> {
     if let Some(mut catalog) = validated.catalog.take() {
-        for clients in client_groups.values() {
+        for clients in groups.values() {
             for client in clients {
                 catalog.update_client(client);
             }
@@ -361,7 +369,7 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
         })?;
         validated.catalog = Some(catalog);
     }
-    Ok(validated)
+    Ok(())
 }
 
 fn validate_wireguard_dns(validated: &ValidatedConfigs) -> std::io::Result<()> {

@@ -20,7 +20,15 @@ async fn load_validated(
     let mut configs = config::load_configs(&paths.to_vec()).await?;
     discovered(&crate::rule_set::dependencies(&mut configs)?);
     let (configs, _) = config::convert_cert_paths(configs).await?;
-    config::compile_configs(configs).await
+    let validated = config::compile_configs(configs).await?;
+    tokio::task::spawn_blocking(move || {
+        if validated.catalog.is_some() {
+            crate::control::validation::validate_resources(&validated)?;
+        }
+        Ok(validated)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 struct PreparedServers {
@@ -42,15 +50,7 @@ async fn prepare_tracking(
     discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
     control: &mut Option<crate::control::runtime::ControlService>,
 ) -> io::Result<PreparedServers> {
-    let validated = load_validated(paths, discovered).await?;
-    let mut validated = tokio::task::spawn_blocking(move || {
-        if validated.catalog.is_some() {
-            crate::control::validation::validate_resources(&validated)?;
-        }
-        Ok::<_, io::Error>(validated)
-    })
-    .await
-    .map_err(io::Error::other)??;
+    let mut validated = load_validated(paths, discovered).await?;
     if control.is_none() && validated.catalog.is_some() {
         if previous.is_some()
             && (!validated.control.listeners.is_empty()
@@ -573,15 +573,7 @@ async fn run_inner(
     api: &mut Option<crate::clash_api::ApiService>,
 ) -> io::Result<()> {
     if dry_run {
-        let validated = load_validated(&paths, &mut |_| {}).await?;
-        tokio::task::spawn_blocking(move || {
-            if validated.catalog.is_some() {
-                crate::control::validation::validate_resources(&validated)?;
-            }
-            Ok::<_, io::Error>(())
-        })
-        .await
-        .map_err(io::Error::other)??;
+        load_validated(&paths, &mut |_| {}).await?;
         println!("Configuration valid");
         return Ok(());
     }

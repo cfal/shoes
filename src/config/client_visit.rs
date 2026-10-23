@@ -1,12 +1,28 @@
+use std::collections::HashMap;
 use std::io;
 
 use super::{
-    ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection, RuleActionConfig,
-    RuleConfig, ServerProxyConfig, ShadowTlsServerHandshakeConfig, ValidatedConfigs,
+    ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
+    RuleActionConfig, RuleConfig, ServerProxyConfig, ShadowTlsServerHandshakeConfig,
+    ValidatedConfigs,
 };
 use crate::option_util::NoneOrSome;
 
 type Visitor<'a> = dyn FnMut(&mut ClientConfig) -> io::Result<()> + 'a;
+
+// Generated client identities and projected rule order depend on lexical target order.
+pub(crate) fn sorted_targets<T>(targets: &mut HashMap<String, T>) -> Vec<(&String, &mut T)> {
+    let mut targets: Vec<_> = targets.iter_mut().collect();
+    targets.sort_unstable_by_key(|(key, _)| *key);
+    targets
+}
+
+fn visit_chain(chain: &mut ClientChain, visitor: &mut Visitor<'_>) -> io::Result<()> {
+    for hop in chain.hops.iter_mut() {
+        visit_hop(hop, visitor)?;
+    }
+    Ok(())
+}
 
 pub(crate) fn visit_hop(hop: &mut ClientChainHop, visitor: &mut Visitor<'_>) -> io::Result<()> {
     match hop {
@@ -34,11 +50,18 @@ pub(crate) fn visit_client(client: &mut ClientConfig, visitor: &mut Visitor<'_>)
     if let ClientProxyConfig::Wireguard(config) = &mut client.protocol
         && let Some(chain) = &mut config.peer_client_chain
     {
-        for hop in chain.hops.iter_mut() {
-            visit_hop(hop, visitor)?;
-        }
+        visit_chain(chain, visitor)?;
     }
     visitor(client)
+}
+
+fn visit_action(action: &mut RuleActionConfig, visitor: &mut Visitor<'_>) -> io::Result<()> {
+    if let RuleActionConfig::Allow { client_chains, .. } = action {
+        for chain in client_chains.iter_mut() {
+            visit_chain(chain, visitor)?;
+        }
+    }
+    Ok(())
 }
 
 fn visit_rules(
@@ -46,16 +69,8 @@ fn visit_rules(
     visitor: &mut Visitor<'_>,
 ) -> io::Result<()> {
     for rule in rules.iter_mut() {
-        if let ConfigSelection::Config(RuleConfig {
-            action: RuleActionConfig::Allow { client_chains, .. },
-            ..
-        }) = rule
-        {
-            for chain in client_chains.iter_mut() {
-                for hop in chain.hops.iter_mut() {
-                    visit_hop(hop, visitor)?;
-                }
-            }
+        if let ConfigSelection::Config(rule) = rule {
+            visit_action(&mut rule.action, visitor)?;
         }
     }
     Ok(())
@@ -69,9 +84,7 @@ fn visit_dns(
         if let super::DnsServerSpec::WithOptions { client_chain, .. } = spec {
             for chain in client_chain.iter_mut() {
                 if let ConfigSelection::Config(chain) = chain {
-                    for hop in chain.hops.iter_mut() {
-                        visit_hop(hop, visitor)?;
-                    }
+                    visit_chain(chain, visitor)?;
                 }
             }
         }
@@ -90,13 +103,7 @@ pub(crate) fn visit_configs(configs: &mut [Config], visitor: &mut Visitor<'_>) -
             Config::RuleConfigGroup(group) => {
                 if let super::RuleGroupRules::Policies(rules) = &mut group.rules {
                     for rule in rules.iter_mut() {
-                        if let RuleActionConfig::Allow { client_chains, .. } = &mut rule.action {
-                            for chain in client_chains.iter_mut() {
-                                for hop in chain.hops.iter_mut() {
-                                    visit_hop(hop, visitor)?;
-                                }
-                            }
-                        }
+                        visit_action(&mut rule.action, visitor)?;
                     }
                 }
             }
@@ -124,9 +131,7 @@ fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -
     match protocol {
         ServerProxyConfig::Wireguard(config) => {
             if let Some(chain) = &mut config.peer_client_chain {
-                for hop in chain.hops.iter_mut() {
-                    visit_hop(hop, visitor)?;
-                }
+                visit_chain(chain, visitor)?;
             }
         }
         ServerProxyConfig::Tls {
@@ -136,10 +141,7 @@ fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -
             reality_targets,
             ..
         } => {
-            let mut keys: Vec<_> = tls_targets.keys().cloned().collect();
-            keys.sort();
-            for key in keys {
-                let target = tls_targets.get_mut(&key).unwrap();
+            for (_, target) in sorted_targets(tls_targets) {
                 visit_rules(&mut target.override_rules, visitor)?;
                 visit_protocol(&mut target.protocol, visitor)?;
             }
@@ -147,10 +149,7 @@ fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -
                 visit_rules(&mut target.override_rules, visitor)?;
                 visit_protocol(&mut target.protocol, visitor)?;
             }
-            let mut keys: Vec<_> = shadowtls_targets.keys().cloned().collect();
-            keys.sort();
-            for key in keys {
-                let target = shadowtls_targets.get_mut(&key).unwrap();
+            for (_, target) in sorted_targets(shadowtls_targets) {
                 visit_rules(&mut target.override_rules, visitor)?;
                 visit_protocol(&mut target.protocol, visitor)?;
                 if let ShadowTlsServerHandshakeConfig::Remote(remote) = &mut target.handshake {
@@ -159,10 +158,7 @@ fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -
                     }
                 }
             }
-            let mut keys: Vec<_> = reality_targets.keys().cloned().collect();
-            keys.sort();
-            for key in keys {
-                let target = reality_targets.get_mut(&key).unwrap();
+            for (_, target) in sorted_targets(reality_targets) {
                 visit_rules(&mut target.override_rules, visitor)?;
                 visit_protocol(&mut target.protocol, visitor)?;
                 for hop in target.dest_client_chain.iter_mut() {
@@ -196,9 +192,7 @@ impl ValidatedConfigs {
         }
         for endpoint in &mut self.wireguard_endpoints {
             if let Some(chain) = &mut endpoint.peer_client_chain {
-                for hop in chain.hops.iter_mut() {
-                    visit_hop(hop, visitor)?;
-                }
+                visit_chain(chain, visitor)?;
             }
             if let Some(inbound) = &mut endpoint.inbound {
                 visit_rules(&mut inbound.rules, visitor)?;
@@ -207,9 +201,7 @@ impl ValidatedConfigs {
         for group in &mut self.dns_groups {
             for spec in &mut group.specs {
                 for chain in &mut spec.client_chains {
-                    for hop in chain.hops.iter_mut() {
-                        visit_hop(hop, visitor)?;
-                    }
+                    visit_chain(chain, visitor)?;
                 }
             }
         }

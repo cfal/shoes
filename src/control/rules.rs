@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use super::catalog::RuleDescription;
 use super::flows::{FlowContext, FlowRegistry};
+use crate::config::client_visit::sorted_targets;
 use crate::config::{Config, ConfigSelection, RuleConfig, ServerProxyConfig, ValidatedConfigs};
 use crate::option_util::NoneOrSome;
 
@@ -99,10 +100,7 @@ impl Builder {
                 reality_targets,
                 ..
             } => {
-                let mut keys: Vec<_> = tls_targets.keys().cloned().collect();
-                keys.sort();
-                for key in keys {
-                    let target = tls_targets.get_mut(&key).unwrap();
+                for (key, target) in sorted_targets(tls_targets) {
                     let scope = format!("{scope}/tls/{key}");
                     self.target(
                         &mut target.override_rules,
@@ -122,10 +120,7 @@ impl Builder {
                         &scope,
                     );
                 }
-                let mut keys: Vec<_> = shadowtls_targets.keys().cloned().collect();
-                keys.sort();
-                for key in keys {
-                    let target = shadowtls_targets.get_mut(&key).unwrap();
+                for (key, target) in sorted_targets(shadowtls_targets) {
                     let scope = format!("{scope}/shadowtls/{key}");
                     self.target(
                         &mut target.override_rules,
@@ -135,10 +130,7 @@ impl Builder {
                         &scope,
                     );
                 }
-                let mut keys: Vec<_> = reality_targets.keys().cloned().collect();
-                keys.sort();
-                for key in keys {
-                    let target = reality_targets.get_mut(&key).unwrap();
+                for (key, target) in sorted_targets(reality_targets) {
                     let scope = format!("{scope}/reality/{key}");
                     self.target(
                         &mut target.override_rules,

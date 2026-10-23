@@ -213,19 +213,8 @@ pub(super) fn collect_devices(
         }
     }
     validated.visit_clients(&mut |client| clients.register(client))?;
-    if !validated.control.listeners.is_empty()
-        && let Some(mut catalog) = validated.catalog.take()
-    {
-        for group in groups.values() {
-            for client in group {
-                catalog.update_client(client);
-            }
-        }
-        validated.visit_clients(&mut |client| {
-            catalog.update_client(client);
-            Ok(())
-        })?;
-        validated.catalog = Some(catalog);
+    if !validated.control.listeners.is_empty() {
+        super::validate::refresh_catalog_clients(validated, groups)?;
     }
     let referenced_dns: HashSet<_> = validated
         .configs
