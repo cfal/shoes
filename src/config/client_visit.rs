@@ -179,6 +179,17 @@ fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -
 }
 
 impl ValidatedConfigs {
+    pub(crate) fn refresh_catalog(&mut self) -> io::Result<()> {
+        if let Some(mut catalog) = self.catalog.take() {
+            self.visit_clients(&mut |client| {
+                catalog.update_client(client);
+                Ok(())
+            })?;
+            self.catalog = Some(catalog);
+        }
+        Ok(())
+    }
+
     pub(crate) fn visit_clients(&mut self, visitor: &mut Visitor<'_>) -> io::Result<()> {
         for config in &mut self.configs {
             match config {

@@ -251,7 +251,7 @@ impl Prepared {
             connectors.insert(config.id.clone(), connector.clone());
             pending.push((peers, connector));
         }
-        let mut attach = |client: &mut crate::config::ClientConfig| {
+        validated.visit_clients(&mut |client| {
             if let ClientProxyConfig::Wireguard(reference) = &mut client.protocol {
                 reference.connector = Some(
                     connectors
@@ -261,8 +261,7 @@ impl Prepared {
                 );
             }
             Ok(())
-        };
-        validated.visit_clients(&mut attach)?;
+        })?;
         if !validated.control.listeners.is_empty()
             && let Some(catalog) = &mut validated.catalog
         {

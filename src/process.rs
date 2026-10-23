@@ -124,13 +124,7 @@ async fn prepare_tracking(
         server.bind_location = BindLocation::Address(OneOrSome::Some(resolved));
     }
     let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated.configs).collect();
-    if let Some(mut catalog) = validated.catalog.take() {
-        validated.visit_clients(&mut |client| {
-            catalog.update_client(client);
-            Ok(())
-        })?;
-        validated.catalog = Some(catalog);
-    }
+    validated.refresh_catalog()?;
     let mut dns = dns::build_dns_registry_for_runtime(
         std::mem::take(&mut validated.dns_groups),
         validated.global_limits,

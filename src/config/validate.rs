@@ -366,19 +366,12 @@ pub(super) fn refresh_catalog_clients(
     validated: &mut ValidatedConfigs,
     groups: &HashMap<String, Vec<ClientConfig>>,
 ) -> std::io::Result<()> {
-    if let Some(mut catalog) = validated.catalog.take() {
-        for clients in groups.values() {
-            for client in clients {
-                catalog.update_client(client);
-            }
-        }
-        validated.visit_clients(&mut |client| {
+    if let Some(catalog) = &mut validated.catalog {
+        for client in groups.values().flatten() {
             catalog.update_client(client);
-            Ok(())
-        })?;
-        validated.catalog = Some(catalog);
+        }
     }
-    Ok(())
+    validated.refresh_catalog()
 }
 
 fn validate_wireguard_dns(validated: &ValidatedConfigs) -> std::io::Result<()> {
