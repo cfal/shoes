@@ -19,6 +19,13 @@ const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
 const PRIVILEGED_START_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// When set, guards stop children with SIGTERM before SIGKILL on Linux, so instrumented
+/// binaries can write coverage profiles on exit.
+const GRACEFUL_STOP_ENV: &str = "SHOES_TEST_GRACEFUL_STOP";
+
+#[cfg(target_os = "linux")]
 const PRIVILEGED_SESSION_SCRIPT: &str = r#"
 set -eu
 pid_file=$1
@@ -148,13 +155,11 @@ impl Drop for ProcessGuard {
 
         match process.try_wait() {
             Ok(Some(_)) => {}
-            Ok(None) => {
-                if let Err(error) = process.kill()
-                    && error.kind() != io::ErrorKind::InvalidInput
-                {
-                    eprintln!("[GUARD] Could not kill {}: {}", self.name, error);
-                }
-            }
+            Ok(None) => stop_child(
+                &mut process,
+                std::env::var_os(GRACEFUL_STOP_ENV).is_some(),
+                &self.name,
+            ),
             Err(error) => eprintln!("[GUARD] Could not inspect {}: {}", self.name, error),
         }
         if let Err(error) = process.wait() {
@@ -163,6 +168,38 @@ impl Drop for ProcessGuard {
         #[cfg(target_os = "linux")]
         if let Some((id, use_sudo)) = process_group {
             report_lingering_process_group(id, use_sudo, &self.name);
+        }
+    }
+}
+
+fn stop_child(process: &mut Child, graceful: bool, name: &str) {
+    #[cfg(target_os = "linux")]
+    if graceful && terminate_child(process, GRACEFUL_STOP_TIMEOUT) {
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = graceful;
+    if let Err(error) = process.kill()
+        && error.kind() != io::ErrorKind::InvalidInput
+    {
+        eprintln!("[GUARD] Could not kill {name}: {error}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_child(process: &mut Child, timeout: Duration) -> bool {
+    let Ok(process_id) = libc::pid_t::try_from(process.id()) else {
+        return false;
+    };
+    if unsafe { libc::kill(process_id, libc::SIGTERM) } != 0 {
+        return false;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        match process.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_GROUP_POLL_INTERVAL),
+            _ => return false,
         }
     }
 }
@@ -786,7 +823,55 @@ async fn wait_for_mihomo_startup(
 mod tests {
     use super::*;
     use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
     use std::sync::mpsc;
+
+    /// Runs a shell in `directory` that installs `trap` and then idles for about 20 seconds,
+    /// so a failed stop cannot leak it.
+    fn spawn_shell_with_trap(directory: &Path, trap: &str) -> io::Result<Child> {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "{trap}; : > ready; i=0; while [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done"
+            ))
+            .current_dir(directory)
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !directory.join("ready").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the child never installed its trap"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(child)
+    }
+
+    #[test]
+    fn graceful_stop_lets_the_child_handle_sigterm() -> io::Result<()> {
+        for graceful in [true, false] {
+            let directory = tempfile::tempdir()?;
+            let mut child =
+                spawn_shell_with_trap(directory.path(), "trap ': > stopped; exit 0' TERM")?;
+            stop_child(&mut child, graceful, "graceful-stop-test");
+            child.wait()?;
+            assert_eq!(
+                directory.path().join("stopped").exists(),
+                graceful,
+                "graceful={graceful}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn graceful_stop_falls_back_when_sigterm_is_ignored() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut child = spawn_shell_with_trap(directory.path(), "trap '' TERM")?;
+        stop_child(&mut child, true, "ignored-sigterm-test");
+        assert_eq!(child.wait()?.signal(), Some(libc::SIGKILL));
+        Ok(())
+    }
 
     fn blocked_startup_process() -> io::Result<ProcessGuard> {
         let child = Command::new("sh")

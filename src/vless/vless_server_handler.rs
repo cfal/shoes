@@ -531,3 +531,103 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::Address;
+    use crate::resolver::NativeResolver;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const USER_ID: &str = "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4";
+
+    fn handler(fallback: Option<NetLocation>) -> VlessTcpServerHandler {
+        VlessTcpServerHandler::new(
+            USER_ID,
+            false,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            fallback,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn probes() -> [(&'static str, Vec<u8>); 2] {
+        let mut wrong_user = vec![0];
+        wrong_user.extend_from_slice(&[0x42; 16]);
+        wrong_user.extend_from_slice(&[0, 1, 0, 80, 1, 127, 0, 0, 1]);
+        wrong_user.extend_from_slice(b"payload after the header");
+        [
+            ("wrong user id", wrong_user),
+            (
+                "non-VLESS version",
+                b"GET / HTTP/1.1\r\nHost: front.example\r\n\r\n".to_vec(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn failed_authentication_relays_every_byte_to_the_fallback() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (name, probe) in probes() {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let fallback = NetLocation::new(
+                    Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                    listener.local_addr().unwrap().port(),
+                );
+                let (server_io, mut client) = tokio::io::duplex(4096);
+                client.write_all(&probe).await.unwrap();
+                let setup = handler(Some(fallback))
+                    .setup_server_stream(Box::new(server_io))
+                    .await
+                    .unwrap();
+                let TcpServerSetupResult::Session(session) = setup else {
+                    panic!("{name}: expected a fallback session");
+                };
+                let session = tokio::spawn(session);
+                let (mut origin, _) = listener.accept().await.unwrap();
+
+                let mut forwarded = vec![0; probe.len()];
+                origin.read_exact(&mut forwarded).await.unwrap();
+                assert_eq!(forwarded, probe, "{name}");
+                client.write_all(b" and later bytes").await.unwrap();
+                let mut later = [0; 16];
+                origin.read_exact(&mut later).await.unwrap();
+                assert_eq!(&later, b" and later bytes", "{name}");
+
+                origin.write_all(b"camouflage reply").await.unwrap();
+                origin.shutdown().await.unwrap();
+                let mut reply = [0; 16];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"camouflage reply", "{name}");
+                client.shutdown().await.unwrap();
+                assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0, "{name}");
+                session.await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_authentication_without_a_fallback_is_an_error() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (name, probe) in probes() {
+                let (server_io, mut client) = tokio::io::duplex(4096);
+                client.write_all(&probe).await.unwrap();
+                assert!(
+                    handler(None)
+                        .setup_server_stream(Box::new(server_io))
+                        .await
+                        .is_err(),
+                    "{name}"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+}

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use tokio::time::Instant;
 
 use crate::async_stream::AsyncMessageStream;
 use crate::util::allocate_vec;
@@ -135,7 +135,7 @@ impl CopyBuffer {
 
 enum TransferState {
     Running,
-    ShuttingDown,
+    ShuttingDown(Pin<Box<tokio::time::Sleep>>),
     Done,
 }
 
@@ -168,12 +168,23 @@ where
         match state {
             TransferState::Running => {
                 ready!(buf.poll_copy(cx, r.as_mut(), w.as_mut()))?;
-                *state = TransferState::ShuttingDown;
+                *state = TransferState::ShuttingDown(Box::pin(tokio::time::sleep(
+                    crate::util::SHUTDOWN_TIMEOUT,
+                )));
             }
-            TransferState::ShuttingDown => {
-                ready!(w.as_mut().poll_shutdown_message(cx))?;
-                *state = TransferState::Done;
-            }
+            TransferState::ShuttingDown(deadline) => match w.as_mut().poll_shutdown_message(cx) {
+                Poll::Ready(result) => {
+                    result?;
+                    *state = TransferState::Done;
+                }
+                Poll::Pending => {
+                    ready!(deadline.as_mut().poll(cx));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "message stream shutdown timed out",
+                    )));
+                }
+            },
             TransferState::Done => return Poll::Ready(Ok(())),
         }
     }
@@ -253,7 +264,8 @@ where
 ///
 /// The future will immediately return an error if any IO operation on `a`
 /// or `b` returns an error. Some data read from either stream may be lost (not
-/// written to the other stream) in this case.
+/// written to the other stream) in this case. A shutdown that is still pending
+/// after `SHUTDOWN_TIMEOUT` fails with `TimedOut`, as in the stream copy.
 ///
 /// # Return value
 ///
@@ -302,6 +314,7 @@ mod tests {
         outgoing: Vec<Vec<u8>>,
         eof_on_empty: bool,
         write_ready: bool,
+        shutdown_pending: bool,
     }
 
     impl AsyncReadMessage for Messages {
@@ -347,6 +360,9 @@ mod tests {
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
         ) -> Poll<io::Result<()>> {
+            if self.shutdown_pending {
+                return Poll::Pending;
+            }
             Poll::Ready(Ok(()))
         }
     }
@@ -417,5 +433,43 @@ mod tests {
         assert!(writer.outgoing.is_empty());
         assert_eq!(reader.incoming.len(), 1);
         assert_eq!(buffer.read_count, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_after_eof_is_bounded() {
+        let mut reader = Messages {
+            incoming: [vec![]].into(),
+            eof_on_empty: true,
+            ..Messages::default()
+        };
+        let mut writer = Messages {
+            shutdown_pending: true,
+            ..Messages::default()
+        };
+        let start = Instant::now();
+        let error = copy_bidirectional_message(&mut reader, &mut writer, false, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), crate::util::SHUTDOWN_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_associations_expire_within_one_ping_interval_of_the_timeout() {
+        let (mut a, mut b) = (Messages::default(), Messages::default());
+        let start = Instant::now();
+        let timeout = std::time::Duration::from_secs(DEFAULT_ASSOCIATION_TIMEOUT_SECS.into());
+        tokio::time::timeout(
+            timeout * 2,
+            copy_bidirectional_message(&mut a, &mut b, false, false),
+        )
+        .await
+        .expect("idle associations must expire")
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= timeout && elapsed < timeout + std::time::Duration::from_secs(60),
+            "{elapsed:?}"
+        );
     }
 }

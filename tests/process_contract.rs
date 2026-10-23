@@ -1104,6 +1104,77 @@ async fn rejected_reload_preserves_traffic_and_valid_reload_drains_tcp() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn connection_budget_changes_only_with_accepted_reloads_and_counts_draining_flows() {
+    async fn assert_rejected(address: SocketAddr) {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let _ = stream.write_all(b"over budget").await;
+        let result = timeout(Duration::from_secs(5), stream.read_u8())
+            .await
+            .unwrap();
+        assert!(result.is_err(), "an over-budget connection was served");
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    let config = |max_connections: usize| {
+        format!(
+            "- global_limits: {{max_connections: {max_connections}, reload_grace_secs: 60}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{}'\n",
+            echo.local_addr()
+        )
+    };
+    std::fs::write(&path, config(1)).unwrap();
+    let mut child = Process::start(&path, &["--no-reload"]);
+    child.wait_for("Servers ready").await;
+    let mut draining = TcpStream::connect(address).await.unwrap();
+    roundtrip(&mut draining).await;
+    assert_rejected(address).await;
+
+    // A rejected candidate's larger budget is never applied.
+    std::fs::write(&path, config(2).replace("type: forward", "type: unknown")).unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("Reload rejected").await;
+    assert_rejected(address).await;
+    roundtrip(&mut draining).await;
+
+    // The accepted generation's budget still counts the previous generation's flow.
+    std::fs::write(&path, config(2)).unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    let mut current = TcpStream::connect(address).await.unwrap();
+    roundtrip(&mut current).await;
+    assert_rejected(address).await;
+    roundtrip(&mut draining).await;
+
+    // Closing the draining flow returns its permit.
+    drop(draining);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(b"still serving").await.unwrap();
+        let mut response = [0; 13];
+        if timeout(Duration::from_secs(1), stream.read_exact(&mut response))
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
+            assert_eq!(&response, b"still serving");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the drained flow's permit was not released"
+        );
+    }
+    roundtrip(&mut current).await;
+    child.signal(libc::SIGTERM);
+    assert_eq!(child.exit().await.code(), Some(0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn shutdown_interrupts_watcher_debounce() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");

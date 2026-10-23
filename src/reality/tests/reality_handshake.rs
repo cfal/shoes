@@ -83,6 +83,64 @@ fn real_target_certificate_never_authenticates_reality() {
     assert!(client.is_handshaking() && !client.wants_write());
 }
 
+#[test]
+fn authenticated_hellos_longer_than_one_record_reach_rustls() {
+    use crate::reality::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
+    let (cc, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+    let mut client = cc.create_connection().unwrap();
+    let mut records = Vec::new();
+    client.write_tls(&mut records).unwrap();
+    // Pad the hello past 16 KiB, as a client could after reassembly, and authenticate it again.
+    let mut padding = vec![0xff, 0xa5, 0x45, 0x00];
+    padding.resize(4 + 0x4500, 0);
+    let records = crate::sniff::tests::extend_hello(records, &padding);
+    // Rejoin the records into the single record that reassembly produces.
+    let mut hello = crate::sniff::tests::records(&records, u16::MAX.into());
+    let message_len = usize::from(u16::from_be_bytes([hello[3], hello[4]]));
+    assert_eq!(hello.len(), 5 + message_len);
+    assert!(message_len > 16384);
+    let shares = extract_client_key_shares(&hello).unwrap();
+    let shared =
+        perform_ecdh(&sc.private_key, shares.authentication_public_key().unwrap()).unwrap();
+    let auth = derive_auth_key(&shared, &hello[11..31], b"REALITY").unwrap();
+    let mut aad = hello[5..].to_vec();
+    aad[39..71].fill(0);
+    let mut payload = [0; 16];
+    payload[..3].copy_from_slice(&[1, 8, 0]);
+    payload[8..].fill(1);
+    let session = encrypt_session_id(&payload, &auth, &hello[31..43], &aad).unwrap();
+    hello[44..76].copy_from_slice(&session);
+
+    let mut server = sc
+        .authenticate_client_hello(&hello)
+        .unwrap()
+        .into_connection(&target_records(
+            RealityGroup::X25519MlKem768,
+            CipherSuite::AES_128_GCM_SHA256,
+            &hello[44..76],
+        ))
+        .unwrap();
+    let mut flight = Vec::new();
+    server.write_tls(&mut flight).unwrap();
+    assert!(!flight.is_empty());
+}
+
+#[test]
+fn ordinary_tls_client_hello_is_denied() {
+    let (_, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let mut client =
+        rustls::ClientConnection::new(Arc::new(config), "cover.test".try_into().unwrap()).unwrap();
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello).unwrap();
+    assert_eq!(
+        sc.authenticate_client_hello(&hello).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+}
+
 impl rustls::KeyLog for Secrets {
     fn log(&self, label: &str, _: &[u8], secret: &[u8]) {
         self.0.lock().insert(label.into(), secret.to_vec());

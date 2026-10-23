@@ -225,3 +225,83 @@ impl TcpServerHandler for TlsServerHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::port_forward_handler::PortForwardServerHandler;
+
+    fn server_config(cert: &rcgen::CertifiedKey<rcgen::KeyPair>) -> rustls::ServerConfig {
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn large_client_hellos_split_into_tiny_records_reach_rustls() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut padding = vec![0xff, 0xa5, 0x10, 0x00];
+        padding.resize(4 + 0x1000, 0);
+        let hello = crate::sniff::tests::extend_hello(
+            crate::sniff::tests::hello(&rustls::version::TLS13, true),
+            &padding,
+        );
+        let records = crate::sniff::tests::records(&hello, 1);
+        let mut connection = rustls::ServerConnection::new(Arc::new(server_config(&cert))).unwrap();
+        feed_rustls_server_connection(&mut connection, &records).unwrap();
+        connection.process_new_packets().unwrap();
+        assert!(
+            connection.wants_write(),
+            "rustls must answer the reassembled ClientHello"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_hellos_split_across_records_complete_the_handshake() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server_config = server_config(&cert);
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        let target = TlsServerTarget::Tls {
+            server_config: Arc::new(server_config),
+            effective_selector: selector.clone(),
+            inner_protocol: InnerProtocol::Normal(Box::new(PortForwardServerHandler::new(
+                vec![NetLocation::new(
+                    crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                    9,
+                )],
+                selector,
+            ))),
+        };
+        let handler = TlsServerHandler::new(
+            FxHashMap::default(),
+            Some(target),
+            None,
+            Arc::new(crate::resolver::NativeResolver::new()),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // The smallest fragment rustls allows splits the ClientHello across many records.
+        client_config.max_fragment_size = Some(32);
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let client = async {
+            tokio_rustls::TlsConnector::from(Arc::new(client_config))
+                .connect("localhost".try_into().unwrap(), client_io)
+                .await
+        };
+        let (setup, client) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(handler.setup_server_stream(Box::new(server_io)), client)
+        })
+        .await
+        .unwrap();
+        setup.unwrap();
+        client.unwrap();
+    }
+}

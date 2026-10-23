@@ -706,10 +706,8 @@ mod tests {
     #[tokio::test]
     async fn separately_configured_tcp_remains_a_primary_when_udp_is_silent() {
         for system_pair in [true, false] {
-            let tcp = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-            let mut address = tcp.local_addr().unwrap();
-            address.set_ip("127.0.0.1".parse().unwrap());
-            let _udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+            let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+            let address = udp.local_addr().unwrap();
             let mut udp_config = ConnectionConfig::udp();
             udp_config.port = address.port();
             let mut tcp_config = ConnectionConfig::tcp();
@@ -1037,9 +1035,8 @@ mod tests {
         for silent in [false, true] {
             for caller_deadline in [false, true] {
                 for synthetic in [false, true] {
-                    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let addr = tcp.local_addr().unwrap();
-                    let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
+                    let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+                    let addr = udp.local_addr().unwrap();
                     let tcp = if silent {
                         Some(tcp)
                     } else {
@@ -1132,9 +1129,8 @@ mod tests {
 
     #[tokio::test]
     async fn udp_truncation_retries_the_same_configured_server_over_tcp() {
-        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = tcp.local_addr().unwrap();
-        let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
+        let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+        let addr = udp.local_addr().unwrap();
         let mut raw = exchange(addr, false);
         let mut config = ConnectionConfig::tcp();
         config.port = addr.port();

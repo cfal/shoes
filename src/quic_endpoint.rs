@@ -285,6 +285,9 @@ impl UdpPoller for MemoryPoller {
 }
 
 #[cfg(test)]
+pub(crate) use tests::test_endpoints;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -445,6 +448,17 @@ mod tests {
         .unwrap();
         let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
         (client_config, server_config)
+    }
+
+    /// Plain quinn endpoints on loopback whose client trusts the server's self-signed
+    /// `localhost` certificate.
+    pub(crate) fn test_endpoints() -> (quinn::Endpoint, quinn::Endpoint) {
+        let (client_config, server_config) = configs();
+        let server =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config);
+        (server, client)
     }
 
     fn endpoints() -> (QuicEndpoint, QuicEndpoint) {

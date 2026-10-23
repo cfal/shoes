@@ -98,6 +98,7 @@ const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 
+const TLS_EXT_SERVER_NAME: u16 = 0x0000;
 const TLS_EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 
 // retry request random value, see https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
@@ -129,7 +130,7 @@ fn validate_shadowtls_client_hello(
         None => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "client did not send a 32-byte session id",
+                "client did not send a single-record ClientHello with a 32-byte session id",
             ));
         }
     };
@@ -341,11 +342,16 @@ pub async fn setup_shadowtls_server_stream(
 }
 
 pub struct ParsedClientHello {
+    /// The ClientHello records exactly as received.
     pub client_hello_frame: Vec<u8>,
+    /// The ClientHello as one record. Equals `client_hello_frame` unless the client split
+    /// the message across records.
+    pub client_hello_record: Vec<u8>,
     pub client_hello_record_legacy_version_major: u8,
     pub client_hello_record_legacy_version_minor: u8,
     pub client_hello_content_version_major: u8,
     pub client_hello_content_version_minor: u8,
+    /// Only set for single-record ClientHellos, which ShadowTLS clients send.
     pub parsed_digest: Option<ParsedClientHelloDigest>,
     pub client_reader: StreamReader,
     pub requested_server_name: Option<String>,
@@ -358,88 +364,92 @@ pub struct ParsedClientHelloDigest {
     pub client_hello_digest_end_index: usize,
 }
 
+/// Bounds a ClientHello split across records to what one record can carry.
+const MAX_CLIENT_HELLO_LEN: usize = 65535;
+
+fn invalid_client_hello(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
 #[inline]
 pub async fn read_client_hello(
     server_stream: &mut Box<dyn AsyncStream>,
 ) -> std::io::Result<ParsedClientHello> {
     let mut client_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN);
+    let mut client_hello_frame = Vec::new();
+    let mut message = Vec::new();
+    let mut record_count = 0;
+    let mut client_legacy_version = [0; 2];
 
-    // Allocates to allow borrowing the payload below.
-    let client_tls_header_bytes = client_reader
-        .read_slice(server_stream, TLS_HEADER_LEN)
-        .await?
-        .to_vec();
+    // Clients may split the ClientHello across handshake records, e.g. to evade DPI.
+    loop {
+        let mut header = [0; TLS_HEADER_LEN];
+        client_reader
+            .read_slice_into(server_stream, &mut header)
+            .await?;
+        if header[0] != CONTENT_TYPE_HANDSHAKE {
+            return Err(invalid_client_hello("expected client handshake"));
+        }
+        let payload_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if payload_len == 0 {
+            return Err(invalid_client_hello("empty handshake record"));
+        }
+        let payload = client_reader.read_slice(server_stream, payload_len).await?;
+        if record_count == 0 {
+            client_legacy_version = [header[1], header[2]];
+        }
+        record_count += 1;
+        client_hello_frame.extend_from_slice(&header);
+        client_hello_frame.extend_from_slice(payload);
+        message.extend_from_slice(payload);
 
-    let client_content_type = client_tls_header_bytes[0];
-    if client_content_type != CONTENT_TYPE_HANDSHAKE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "expected client handshake",
-        ));
+        if message[0] != HANDSHAKE_TYPE_CLIENT_HELLO {
+            return Err(invalid_client_hello("expected ClientHello"));
+        }
+        if message.len() < 4 {
+            continue;
+        }
+        let message_len = 4 + u32::from_be_bytes([0, message[1], message[2], message[3]]) as usize;
+        if message_len > MAX_CLIENT_HELLO_LEN {
+            return Err(invalid_client_hello(format!(
+                "ClientHello too large ({message_len} bytes)"
+            )));
+        }
+        if message.len() > message_len {
+            return Err(invalid_client_hello("unexpected data after ClientHello"));
+        }
+        if message.len() == message_len {
+            break;
+        }
     }
 
-    let client_legacy_version_major = client_tls_header_bytes[1];
-    let client_legacy_version_minor = client_tls_header_bytes[2];
-
-    let client_payload_len =
-        u16::from_be_bytes([client_tls_header_bytes[3], client_tls_header_bytes[4]]) as usize;
-    let client_payload_bytes = client_reader
-        .read_slice(server_stream, client_payload_len)
-        .await?;
-
-    let mut client_hello = BufReader::new(client_payload_bytes);
-    if client_hello.read_u8()? != HANDSHAKE_TYPE_CLIENT_HELLO {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "expected ClientHello",
-        ));
-    }
-
-    let client_hello_message_len = client_hello.read_u24_be()? as usize;
-    // this should be 4 bytes less than the payload length (handshake type + 3 bytes length)
-    if client_hello_message_len + 4 != client_payload_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "client hello message length mismatch",
-        ));
-    }
+    let mut client_hello = BufReader::new(&message);
+    client_hello.skip(4)?; // handshake type and length
 
     let client_version_major = client_hello.read_u8()?;
     let client_version_minor = client_hello.read_u8()?;
     let record_protocol_version_ok = client_version_major == 0x03
         && (client_version_minor == 0x01 || client_version_minor == 0x03);
     if !record_protocol_version_ok {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "unexpected ClientHello TLS version {client_version_major}.{client_version_minor}"
-            ),
-        ));
+        return Err(invalid_client_hello(format!(
+            "unexpected ClientHello TLS version {client_version_major}.{client_version_minor}"
+        )));
     }
 
     client_hello.skip(32)?; // client random
 
-    let client_session_id_len = client_hello.read_u8()?;
+    let client_session_id_len = client_hello.read_u8()? as usize;
+    let client_session_id = client_hello.read_slice(client_session_id_len)?;
 
-    let parsed_digest = if client_session_id_len == 32 {
-        let client_session_id = client_hello.read_slice(32)?;
-
+    let parsed_digest = if client_session_id_len == 32 && record_count == 1 {
         // Saves HMAC digest and session ID position for later validation.
-        let client_hello_digest = client_session_id[28..].to_vec();
         let post_session_id_index = client_hello.position();
-
-        let client_hello_digest_start_index = TLS_HEADER_LEN + post_session_id_index - 4;
-        let client_hello_digest_end_index = TLS_HEADER_LEN + post_session_id_index;
-
         Some(ParsedClientHelloDigest {
-            client_hello_digest,
-            client_hello_digest_start_index,
-            client_hello_digest_end_index,
+            client_hello_digest: client_session_id[28..].to_vec(),
+            client_hello_digest_start_index: TLS_HEADER_LEN + post_session_id_index - 4,
+            client_hello_digest_end_index: TLS_HEADER_LEN + post_session_id_index,
         })
     } else {
-        if client_session_id_len > 0 {
-            client_hello.skip(client_session_id_len as usize)?;
-        }
         None
     };
 
@@ -460,59 +470,51 @@ pub async fn read_client_hello(
     while !client_extensions.is_consumed() {
         let extension_type = client_extensions.read_u16_be()?;
         let extension_len = client_extensions.read_u16_be()? as usize;
+        let mut extension = BufReader::new(client_extensions.read_slice(extension_len)?);
 
-        if extension_type == 0x0000 {
-            // server_name
-            if requested_server_name.is_some() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "multiple server names",
-                ));
+        if extension_type == TLS_EXT_SERVER_NAME {
+            let server_name_list_len = extension.read_u16_be()? as usize;
+            if server_name_list_len == 0 || server_name_list_len != extension.remaining() {
+                return Err(invalid_client_hello("invalid server name list length"));
             }
-            // TODO: assert lengths
-            let _server_name_list_len = client_extensions.read_u16_be()?;
-            let server_name_type = client_extensions.read_u8()?;
-            if server_name_type != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "expected server name type to be hostname (0)",
-                ));
+            while !extension.is_consumed() {
+                if extension.read_u8()? != 0 {
+                    return Err(invalid_client_hello(
+                        "expected server name type to be hostname (0)",
+                    ));
+                }
+                if requested_server_name.is_some() {
+                    return Err(invalid_client_hello("multiple server names"));
+                }
+                let server_name_len = extension.read_u16_be()? as usize;
+                requested_server_name = Some(extension.read_str(server_name_len)?.to_string());
             }
-            let server_name_len = client_extensions.read_u16_be()?;
-            let server_name_str = client_extensions.read_str(server_name_len as usize)?;
-            requested_server_name = Some(server_name_str.to_string());
-        } else if extension_type == 0x002b {
-            // supported_versions
-            let version_list_len = client_extensions.read_u8()?;
-            if version_list_len % 2 != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid odd version list length: 0x{version_list_len:02x}"),
-                ));
+        } else if extension_type == TLS_EXT_SUPPORTED_VERSIONS {
+            let version_list_len = extension.read_u8()? as usize;
+            if !version_list_len.is_multiple_of(2) || version_list_len != extension.remaining() {
+                return Err(invalid_client_hello(format!(
+                    "invalid version list length: 0x{version_list_len:02x}"
+                )));
             }
-            let version_list_bytes = client_extensions.read_slice(version_list_len as usize)?;
-            for i in (0..version_list_bytes.len()).step_by(2) {
-                let version_major = version_list_bytes[i];
-                let version_minor = version_list_bytes[i + 1];
-                if version_major == 3 && version_minor == 4 {
+            while !extension.is_consumed() {
+                if extension.read_u16_be()? == 0x0304 {
                     client_supports_tls13 = true;
-                    break;
                 }
             }
-        } else {
-            client_extensions.skip(extension_len)?;
         }
     }
 
-    let mut client_hello_frame =
-        Vec::with_capacity(client_tls_header_bytes.len() + client_payload_bytes.len());
-    client_hello_frame.extend_from_slice(&client_tls_header_bytes);
-    client_hello_frame.extend_from_slice(client_payload_bytes);
+    let mut client_hello_record = Vec::with_capacity(TLS_HEADER_LEN + message.len());
+    client_hello_record.push(CONTENT_TYPE_HANDSHAKE);
+    client_hello_record.extend_from_slice(&client_legacy_version);
+    client_hello_record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+    client_hello_record.extend_from_slice(&message);
 
     Ok(ParsedClientHello {
         client_hello_frame,
-        client_hello_record_legacy_version_major: client_legacy_version_major,
-        client_hello_record_legacy_version_minor: client_legacy_version_minor,
+        client_hello_record,
+        client_hello_record_legacy_version_major: client_legacy_version[0],
+        client_hello_record_legacy_version_minor: client_legacy_version[1],
         client_hello_content_version_major: client_version_major,
         client_hello_content_version_minor: client_version_minor,
         parsed_digest,
@@ -685,6 +687,10 @@ pub fn parse_validated_server_hello(
 
     Ok(parsed)
 }
+
+#[cfg(test)]
+#[path = "tests/client_hello.rs"]
+mod client_hello_tests;
 
 #[cfg(test)]
 #[path = "tests/server_hello.rs"]

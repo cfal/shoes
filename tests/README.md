@@ -66,6 +66,29 @@ fixtures additionally use `XRAY_BINARY` and `MIHOMO_BINARY`; their fixture guide
 and workflow specify the exact pins. Requested but unavailable peers should
 fail, not silently skip.
 
+## Measuring Coverage
+
+CI does not collect coverage. To measure it locally with
+[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov), collect the unit,
+integration, and process-contract suites into one profile set and report once:
+
+```sh
+export CARGO_BUILD_JOBS=1 SHOES_TEST_GRACEFUL_STOP=1
+export SHOES_TEST_SING_BOX_BIN=/absolute/path/to/sing-box
+cargo llvm-cov clean --workspace
+cargo llvm-cov --no-report --workspace --lib --bins --locked -- --test-threads=2
+cargo llvm-cov --no-report --locked --features integration-tests \
+  --test integration --test process_contract -- --test-threads=1
+cargo llvm-cov report --summary-only
+```
+
+On Linux, `SHOES_TEST_GRACEFUL_STOP` makes test guards send SIGTERM before
+SIGKILL, so instrumented Shoes subprocesses write their profiles. Without it,
+and on other platforms, which ignore it, code reached only through integration
+subprocesses is reported as uncovered. Totals include test modules and
+test-support code, so compare per-file figures rather than the headline
+percentage.
+
 ## CI And Remaining Gaps
 
 The workflows run Linux unit, process, FFI, local-protocol, external-network,
@@ -73,7 +96,8 @@ kernel TUN/WireGuard, and pinned-peer suites. macOS runs rootless TUN, WireGuard
 process-watcher unit tests, and selected FFI/process contracts. Android and iOS
 jobs cross-compile the native libraries but do not exercise device VPN lifecycles.
 Only selected bounded stress cases run in CI; long-duration and performance tests
-remain explicit opt-ins.
+remain explicit opt-ins. Filtered test steps run through
+`.github/require-tests.sh`, which fails a step whose filter selects no tests.
 
 Retain the existing suite boundaries. Prefer deterministic in-process tests for
 fragmentation, cancellation, credit accounting, and parser rejection; use
@@ -83,35 +107,23 @@ fixture-task failures rather than accepting a timeout as proof of rejection.
 
 Important remaining limitations:
 
-- No measured whole-project line or branch coverage is maintained by these
-  workflows; passing suites do not establish exhaustive coverage.
+- CI does not measure coverage; see [Measuring Coverage](#measuring-coverage).
+  Passing suites do not establish exhaustive coverage.
 - Android/iOS device execution and macOS Network Extension kernel-device behavior
   remain separate from host-side tests and cross-compilation.
 - Windows build entries are disabled; ARM and musl builds do not establish
   runtime coverage. macOS does not run the full Linux protocol and IP-stack suite.
-- Global resource-budget changes across rejected and accepted reload generations
-  need a combined process contract; separate budget and reload tests do not cover
-  their interaction.
-- Graceful message-stream EOF with a permanently pending shutdown needs an
-  explicit shutdown policy and regression. Error-path cleanup already has a
-  deadline; changing the graceful path is not merely a test improvement. The
-  association idle timer also lacks deterministic paused-clock coverage.
-- Pre-auth ClientHello negative cases, credential rejection for VLESS fallback,
-  Hysteria2 and TUIC, and broader WebSocket length/control-frame boundaries need
-  focused tests. Multi-record ClientHello support and extension-length handling
-  need separate protocol review.
 - The legacy `privileged` target's `tun::` cases are not selected by CI; the
   `tun_kernel::` cases are. Native Naive and most sustained multi-GiB stress tests
-  remain manual. Several local ShadowTLS handshake cases still live in the
-  Internet-dependent target.
-- Filtered CI invocations can still select zero tests after a rename. The
-  resource-limit and raw-descriptor subprocess tests explicitly require one
-  passed child test, but that guard is not applied to every workflow filter.
+  remain manual.
 - The historical Naive/sing-box idle timeout remains unattributed. Progress
   diagnostics and deterministic H2 credit tests do not prove its cause.
 - Mihomo and sing-box early-half-close limitations retain ignored strict tests.
   Their enabled reply-first cases still require exact payloads and clean TLS EOF.
   A passing non-injected run is not proof that the timing-sensitive Mihomo issue
   is fixed; see the fixture guide.
+- WebSocket Close frames are skipped rather than answered as RFC 6455 requires.
+  Xray, sing-box and mihomo close the TCP connection right after sending Close,
+  so reads still end at EOF.
 - Internet-dependent failures and manual native Naive prerequisites require
   separate investigation; they are not covered by a local-only test run.

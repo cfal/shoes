@@ -1,9 +1,3 @@
-// This library shares code with the shoes binary. Server-side code appears "unused"
-// in lib builds but is used by: (1) the binary for server mode, (2) FFI for mobile.
-// The client/server code is intermingled within modules - a proper fix would require
-// splitting into separate client/server modules or using feature flags.
-#![allow(dead_code)]
-
 //! shoes - A high-performance multi-protocol proxy server.
 //!
 //! This library provides the core functionality for shoes, enabling it to be
@@ -41,8 +35,8 @@
 //! - Android (arm64-v8a, armeabi-v7a, x86_64)
 //! - iOS (arm64)
 
-// Modules are declared here (mirroring main.rs) so the library crate can
-// expose them for FFI/mobile integration.
+// This module tree backs both the shoes binary, through `cli`, and FFI/mobile
+// integration.
 mod address;
 mod anytls;
 mod async_stream;
@@ -63,6 +57,7 @@ mod naiveproxy;
 mod option_util;
 mod port_forward_handler;
 mod prepend_stream;
+mod process;
 mod quic_endpoint;
 mod quic_server;
 mod quic_stream;
@@ -100,6 +95,9 @@ mod vless;
 mod vmess;
 mod websocket;
 mod xudp;
+
+/// Command-line entry point of the `shoes` binary.
+pub mod cli;
 
 /// Configuration types.
 pub mod config;

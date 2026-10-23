@@ -539,7 +539,8 @@ pub enum ProxyType {
     },
     ShoesShadowTlsRemoteServer {
         password: String,
-        handshake_server: String,
+        server_name: String,
+        handshake_address: String,
     },
     ShoesShadowTlsClient {
         upstream_ip: String,
@@ -550,12 +551,15 @@ pub enum ProxyType {
     SingboxShadowTlsServer {
         password: String,
         inner_port: u16, // sing-box needs separate port for inner protocol
+        handshake_server: String,
+        handshake_port: u16,
     },
     SingboxShadowTlsClient {
         upstream_ip: String,
         upstream_port: u16,
         password: String,
         server_name: String,
+        certificate_path: String,
     },
 
     // Shadowsocks
@@ -2306,9 +2310,24 @@ impl ProxyTestFixture {
 
     /// Add a shoes ShadowTLS server with remote TLS handshake
     pub fn with_shoes_shadowtls_remote_server(
-        mut self,
+        self,
         password: &str,
         handshake_server: &str,
+    ) -> Self {
+        self.with_shoes_shadowtls_remote_server_at(
+            password,
+            handshake_server,
+            &format!("{handshake_server}:443"),
+        )
+    }
+
+    /// Add a shoes ShadowTLS server for `server_name` that relays its handshake to
+    /// `handshake_address`
+    pub fn with_shoes_shadowtls_remote_server_at(
+        mut self,
+        password: &str,
+        server_name: &str,
+        handshake_address: &str,
     ) -> Self {
         let (ip, port) = self.ports.get_listener_port();
         let role = if self.proxies.is_empty() {
@@ -2320,7 +2339,8 @@ impl ProxyTestFixture {
             ip,
             proxy_type: ProxyType::ShoesShadowTlsRemoteServer {
                 password: password.to_string(),
-                handshake_server: handshake_server.to_string(),
+                server_name: server_name.to_string(),
+                handshake_address: handshake_address.to_string(),
             },
             port,
             role,
@@ -2350,8 +2370,14 @@ impl ProxyTestFixture {
         self
     }
 
-    /// Add a sing-box ShadowTLS server (with VLESS inner protocol)
-    pub fn with_singbox_shadowtls_server(mut self, password: &str) -> Self {
+    /// Add a sing-box ShadowTLS server (with VLESS inner protocol) that relays its handshake
+    /// to `handshake_server:handshake_port`
+    pub fn with_singbox_shadowtls_server(
+        mut self,
+        password: &str,
+        handshake_server: &str,
+        handshake_port: u16,
+    ) -> Self {
         let (ip, port) = self.ports.get_listener_port();
         // Use get_port() for inner port since it's sing-box internal (listens on 127.0.0.1)
         // and we don't need to wait for it - sing-box handles the internal routing
@@ -2366,6 +2392,8 @@ impl ProxyTestFixture {
             proxy_type: ProxyType::SingboxShadowTlsServer {
                 password: password.to_string(),
                 inner_port,
+                handshake_server: handshake_server.to_string(),
+                handshake_port,
             },
             port,
             role,
@@ -2373,8 +2401,14 @@ impl ProxyTestFixture {
         self
     }
 
-    /// Add a sing-box ShadowTLS client
-    pub fn with_singbox_shadowtls_client(mut self, password: &str, server_name: &str) -> Self {
+    /// Add a sing-box ShadowTLS client that verifies the handshake against
+    /// `certificate_path`
+    pub fn with_singbox_shadowtls_client(
+        mut self,
+        password: &str,
+        server_name: &str,
+        certificate_path: &Path,
+    ) -> Self {
         let (ip, port) = self.ports.get_listener_port();
         let role = if self.proxies.is_empty() {
             ProxyRole::Entry
@@ -2388,6 +2422,7 @@ impl ProxyTestFixture {
                 upstream_port: 0,
                 password: password.to_string(),
                 server_name: server_name.to_string(),
+                certificate_path: certificate_path.display().to_string(),
             },
             port,
             role,
@@ -3689,7 +3724,8 @@ impl ProxyTestFixture {
                 }
                 ProxyType::ShoesShadowTlsRemoteServer {
                     password,
-                    handshake_server,
+                    server_name,
+                    handshake_address,
                 } => Some(format!(
                     r#"- address: "{}:{}"
   protocol:
@@ -3698,12 +3734,12 @@ impl ProxyTestFixture {
       "{}":
         password: "{}"
         handshake:
-          address: "{}:443"
+          address: "{}"
         protocol:
           type: vless
           user_id: "{}"
           udp_enabled: false"#,
-                    proxy.ip, proxy.port, handshake_server, password, handshake_server, TEST_UUID
+                    proxy.ip, proxy.port, server_name, password, handshake_address, TEST_UUID
                 )),
                 ProxyType::ShoesShadowTlsClient {
                     upstream_ip,
@@ -4846,6 +4882,8 @@ impl ProxyTestFixture {
             ProxyType::SingboxShadowTlsServer {
                 password,
                 inner_port,
+                handshake_server,
+                handshake_port,
             } => Some(format!(
                 r#"{{
   "log": {{
@@ -4864,8 +4902,8 @@ impl ProxyTestFixture {
         }}
       ],
       "handshake": {{
-        "server": "www.cloudflare.com",
-        "server_port": 443
+        "server": "{}",
+        "server_port": {}
       }},
       "detour": "vless-in"
     }},
@@ -4891,13 +4929,20 @@ impl ProxyTestFixture {
     "final": "direct"
   }}
 }}"#,
-                proxy.ip, proxy.port, password, inner_port, TEST_UUID
+                proxy.ip,
+                proxy.port,
+                password,
+                handshake_server,
+                handshake_port,
+                inner_port,
+                TEST_UUID
             )),
             ProxyType::SingboxShadowTlsClient {
                 upstream_ip,
                 upstream_port,
                 password,
                 server_name,
+                certificate_path,
             } => Some(format!(
                 r#"{{
   "log": {{
@@ -4932,7 +4977,8 @@ impl ProxyTestFixture {
       "password": "{}",
       "tls": {{
         "enabled": true,
-        "server_name": "{}"
+        "server_name": "{}",
+        "certificate_path": {}
       }}
     }}
   ],
@@ -4940,7 +4986,14 @@ impl ProxyTestFixture {
     "final": "vless-out"
   }}
 }}"#,
-                proxy.ip, proxy.port, TEST_UUID, upstream_ip, upstream_port, password, server_name
+                proxy.ip,
+                proxy.port,
+                TEST_UUID,
+                upstream_ip,
+                upstream_port,
+                password,
+                server_name,
+                serde_json::to_string(certificate_path).unwrap()
             )),
             ProxyType::SingboxShadowsocksServer { cipher, password } => Some(format!(
                 r#"{{

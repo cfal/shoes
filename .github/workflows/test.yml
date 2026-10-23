@@ -99,7 +99,7 @@ jobs:
       env:
         RUST_LOG: warn
       run: >-
-        cargo test -p shoes --locked --features optional-peer-tests
+        .github/require-tests.sh cargo test -p shoes --locked --features optional-peer-tests
         --test optional_peer wireguard -- --ignored --test-threads=1
 
   unit-tests:
@@ -180,23 +180,23 @@ jobs:
 
     - name: Run raw-FD and packet tests without a TUN device
       run: >-
-        cargo test -p shoes --locked --lib --features ffi tun:: -- --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi tun:: -- --test-threads=1
 
     - name: Run rootless WireGuard, FFI, and process lifecycle tests
       run: >-
-        cargo test -p shoes --locked --lib --test process_contract --features ffi wireguard -- --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --lib --test process_contract --features ffi wireguard -- --test-threads=1
 
     - name: Run FFI rule-source startup and packet tests
       run: >-
-        cargo test -p shoes --locked --lib --features ffi ffi::common::rule_source_tests -- --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi ffi::common::rule_source_tests -- --test-threads=1
 
     - name: Run rule-source routing and filesystem reload tests
       run: >-
-        cargo test -p shoes --locked --test process_contract --features ffi rule_sets:: -- --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --test process_contract --features ffi rule_sets:: -- --test-threads=1
 
     - name: Run process filesystem watcher unit tests
       run: >-
-        cargo test -p shoes --locked --bin shoes process:: -- --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --lib process:: -- --test-threads=1
 
   integration-tests:
     name: Integration (${{ matrix.name }})
@@ -330,7 +330,7 @@ jobs:
     - name: Run sing-box mux lifecycle tests
       if: matrix.name == 'local protocols'
       run: >-
-        cargo test -p shoes --locked --lib --features integration-tests
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features integration-tests
         h2mux::h2mux_server_session::singbox_interop_tests:: -- --test-threads=1
 
     - name: Restore pinned XHTTP peers
@@ -401,7 +401,7 @@ jobs:
             --verbose -- --test-threads=1
         else
           for filter in $TEST_FILTERS; do
-            cargo test -p shoes --locked \
+            .github/require-tests.sh cargo test -p shoes --locked \
               --features "${{ matrix.features }}" \
               --test "${{ matrix.target }}" \
               --verbose "$filter::" -- --test-threads=1

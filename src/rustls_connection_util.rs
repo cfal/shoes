@@ -25,6 +25,14 @@ pub fn feed_rustls_server_connection(
             ));
         }
         i += n;
+        // rustls buffers little unprocessed input, which a ClientHello split into many
+        // small records can exceed.
+        connection.process_new_packets().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to process fed TLS records: {e}"),
+            )
+        })?;
     }
     Ok(())
 }
