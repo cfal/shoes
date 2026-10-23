@@ -20,6 +20,12 @@ pub struct MemberOrigin {
 }
 
 impl MemberOrigin {
+    pub fn has_selector(&self) -> bool {
+        self.path
+            .iter()
+            .any(|(group, _)| self.selection.definitions().contains_key(group))
+    }
+
     pub fn selector_path(&self) -> Vec<(String, String)> {
         self.path
             .iter()
@@ -104,11 +110,7 @@ fn member_name(member: &ConfigSelection<ClientConfig>) -> String {
 
 pub fn bounded(mut value: String) -> String {
     if value.len() > 4096 {
-        let mut end = 4093;
-        while !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        value.truncate(end);
+        value.truncate(value.floor_char_boundary(4093));
         value.push_str("...");
     }
     value
@@ -171,7 +173,7 @@ impl Catalog {
         if !enabled {
             return Ok(None);
         }
-        let empty = SelectionOwner::new(None)?.prepare(SelectorDefinitions::new())?;
+        let empty = Arc::<SelectionView>::default();
         let mut nodes = IndexMap::new();
         nodes.insert("DIRECT".into(), CatalogNode::Leaf(Box::default()));
         nodes.insert("REJECT".into(), CatalogNode::Reject);
@@ -192,6 +194,7 @@ impl Catalog {
             match config {
                 Config::ClientConfigGroup(group) => {
                     claim(&group.client_group)?;
+                    // Reserve source order before populating members in the second pass.
                     nodes.insert(
                         group.client_group.clone(),
                         CatalogNode::Group {

@@ -16,7 +16,7 @@ pub struct SelectorDefinition {
 pub type SelectorDefinitions = BTreeMap<String, SelectorDefinition>;
 pub type Choices = BTreeMap<String, String>;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SelectionView {
     definitions: Arc<SelectorDefinitions>,
     choices: RwLock<Arc<Choices>>,
@@ -50,10 +50,7 @@ impl SelectionOwner {
         Ok(Self {
             explicit,
             store,
-            active: Arc::new(SelectionView {
-                definitions: Arc::new(SelectorDefinitions::new()),
-                choices: RwLock::new(Arc::new(Choices::new())),
-            }),
+            active: Arc::default(),
         })
     }
 
