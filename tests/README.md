@@ -122,5 +122,8 @@ Important remaining limitations:
   Their enabled reply-first cases still require exact payloads and clean TLS EOF.
   A passing non-injected run is not proof that the timing-sensitive Mihomo issue
   is fixed; see the fixture guide.
+- WebSocket Close frames are skipped rather than answered as RFC 6455 requires.
+  Xray, sing-box and mihomo close the TCP connection right after sending Close,
+  so reads still end at EOF.
 - Internet-dependent failures and manual native Naive prerequisites require
   separate investigation; they are not covered by a local-only test run.

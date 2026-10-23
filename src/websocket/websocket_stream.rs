@@ -313,7 +313,11 @@ impl WebsocketStream {
                     self.step_skip_content(cx, buf)
                 }
             }
-            // TODO: handle close frames
+            // Close frames are skipped like unknown frames, without the reply RFC 6455
+            // requires. Xray, sing-box and mihomo close TCP right after sending Close, so
+            // reads end at EOF anyway. Replying from this read path would need a deadline
+            // for peers that stop reading and wakeups shared by split read and write halves,
+            // which is more complexity than the reply is worth.
             _ => {
                 warn!("Ignoring unknown frame type: {:?}", self.read_frame_opcode);
                 if self.read_frame_length == 0 {
