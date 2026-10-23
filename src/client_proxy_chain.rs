@@ -558,54 +558,17 @@ impl ClientProxyChain {
                 target.location()
             );
 
-            // Build the chain: initial -> intermediates -> final (UDP)
-            match entry {
+            let first_target: ResolvedLocation = if let Some(first) = intermediate_proxies.first() {
+                first.proxy_location().into()
+            } else {
+                final_proxy.proxy_location().into()
+            };
+            let mut stream = match entry {
                 InitialHopEntry::Direct(socket) | InitialHopEntry::Wireguard(socket) => {
-                    // Determine first target after initial hop
-                    let first_target: ResolvedLocation =
-                        if let Some(first) = intermediate_proxies.first() {
-                            first.proxy_location().into()
-                        } else {
-                            final_proxy.proxy_location().into()
-                        };
-
                     debug!("Chain UDP: Direct -> {} (TCP)", first_target.location());
-                    let mut stream = socket.connect(resolver, &first_target).await?;
-
-                    // Process intermediate hops (all TCP)
-                    for (i, proxy) in intermediate_proxies.iter().enumerate() {
-                        let next_target: ResolvedLocation = intermediate_proxies
-                            .get(i + 1)
-                            .map(|p| p.proxy_location().into())
-                            .unwrap_or_else(|| final_proxy.proxy_location().into());
-                        let next_target = proxy.prepare_target(next_target, resolver).await?;
-                        debug!(
-                            "Chain UDP intermediate hop {}/{}: {} -> {} (TCP)",
-                            i + 1,
-                            intermediate_proxies.len(),
-                            proxy.proxy_location(),
-                            next_target.location()
-                        );
-                        let result = proxy.setup_tcp_stream(stream, &next_target).await?;
-                        stream = result.client_stream;
-                    }
-
-                    // Final hop: UDP stream
-                    debug!(
-                        "Chain UDP final hop: {} (UDP)",
-                        final_proxy.proxy_location()
-                    );
-                    final_proxy.setup_udp_bidirectional(stream, target).await
+                    socket.connect(resolver, &first_target).await?
                 }
                 InitialHopEntry::Proxy { socket, proxy } => {
-                    // Determine first target after initial hop
-                    let first_target: ResolvedLocation =
-                        if let Some(first) = intermediate_proxies.first() {
-                            first.proxy_location().into()
-                        } else {
-                            final_proxy.proxy_location().into()
-                        };
-
                     debug!(
                         "Chain UDP: Proxy {} -> {} (TCP)",
                         proxy.proxy_location(),
@@ -615,34 +578,32 @@ impl ClientProxyChain {
                     let first_target = proxy.prepare_target(first_target, resolver).await?;
                     let stream = socket.connect(resolver, &proxy_loc).await?;
                     let result = proxy.setup_tcp_stream(stream, &first_target).await?;
-                    let mut stream = result.client_stream;
-
-                    // Process intermediate hops (all TCP)
-                    for (i, proxy) in intermediate_proxies.iter().enumerate() {
-                        let next_target: ResolvedLocation = intermediate_proxies
-                            .get(i + 1)
-                            .map(|p| p.proxy_location().into())
-                            .unwrap_or_else(|| final_proxy.proxy_location().into());
-                        let next_target = proxy.prepare_target(next_target, resolver).await?;
-                        debug!(
-                            "Chain UDP intermediate hop {}/{}: {} -> {} (TCP)",
-                            i + 1,
-                            intermediate_proxies.len(),
-                            proxy.proxy_location(),
-                            next_target.location()
-                        );
-                        let result = proxy.setup_tcp_stream(stream, &next_target).await?;
-                        stream = result.client_stream;
-                    }
-
-                    // Final hop: UDP stream
-                    debug!(
-                        "Chain UDP final hop: {} (UDP)",
-                        final_proxy.proxy_location()
-                    );
-                    final_proxy.setup_udp_bidirectional(stream, target).await
+                    result.client_stream
                 }
+            };
+
+            for (i, proxy) in intermediate_proxies.iter().enumerate() {
+                let next_target: ResolvedLocation = intermediate_proxies
+                    .get(i + 1)
+                    .map(|p| p.proxy_location().into())
+                    .unwrap_or_else(|| final_proxy.proxy_location().into());
+                let next_target = proxy.prepare_target(next_target, resolver).await?;
+                debug!(
+                    "Chain UDP intermediate hop {}/{}: {} -> {} (TCP)",
+                    i + 1,
+                    intermediate_proxies.len(),
+                    proxy.proxy_location(),
+                    next_target.location()
+                );
+                let result = proxy.setup_tcp_stream(stream, &next_target).await?;
+                stream = result.client_stream;
             }
+
+            debug!(
+                "Chain UDP final hop: {} (UDP)",
+                final_proxy.proxy_location()
+            );
+            final_proxy.setup_udp_bidirectional(stream, target).await
         }
     }
 }
@@ -728,6 +689,9 @@ mod carrier_tests {
     use crate::address::NetLocation;
     use crate::async_stream::AsyncStream;
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TRANSPORT_DATA: &[u8] = b"transport";
 
     #[test]
     fn unselected_large_pools_keep_constant_time_round_robin() {
@@ -849,7 +813,9 @@ mod carrier_tests {
                 .lock()
                 .unwrap()
                 .push(format!("socket {} -> {}", self.0, target));
-            Ok(Box::new(tokio::io::duplex(64).0))
+            let (stream, mut peer) = tokio::io::duplex(64);
+            peer.write_all(TRANSPORT_DATA).await?;
+            Ok(Box::new(stream))
         }
         async fn connect_udp_bidirectional(
             &self,
@@ -867,6 +833,7 @@ mod carrier_tests {
     struct Proxy {
         location: NetLocation,
         lazy: bool,
+        early_data: Option<Vec<u8>>,
         calls: Arc<Mutex<Vec<String>>>,
     }
     #[async_trait::async_trait]
@@ -880,6 +847,17 @@ mod carrier_tests {
         fn needs_carrier_dialer(&self) -> bool {
             self.lazy
         }
+        async fn prepare_target(
+            &self,
+            target: ResolvedLocation,
+            _: &Arc<dyn Resolver>,
+        ) -> std::io::Result<ResolvedLocation> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("prepare {} -> {}", self.location, target));
+            Ok(target)
+        }
         async fn setup_tcp_stream(
             &self,
             stream: Box<dyn AsyncStream>,
@@ -891,7 +869,7 @@ mod carrier_tests {
                 .push(format!("{} -> {}", self.location, target));
             Ok(TcpClientSetupResult {
                 client_stream: stream,
-                early_data: None,
+                early_data: self.early_data.clone(),
             })
         }
         async fn connect_tcp_with_dialer(
@@ -907,10 +885,22 @@ mod carrier_tests {
         }
         async fn setup_udp_bidirectional(
             &self,
-            _: Box<dyn AsyncStream>,
-            _: ResolvedLocation,
+            mut stream: Box<dyn AsyncStream>,
+            target: ResolvedLocation,
         ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-            unreachable!()
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("udp {} -> {}", self.location, target));
+            let mut bytes = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                stream.read_to_end(&mut bytes),
+            )
+            .await
+            .expect("UDP chain transport did not reach EOF")?;
+            assert_eq!(bytes, TRANSPORT_DATA, "intermediate early data leaked");
+            Ok(Box::new(crate::vless::VlessMessageStream::new(stream)))
         }
     }
 
@@ -922,6 +912,7 @@ mod carrier_tests {
             Box::new(Proxy {
                 location: location(address),
                 lazy,
+                early_data: None,
                 calls: calls.clone(),
             }) as Box<dyn ProxyConnector>
         };
@@ -943,14 +934,90 @@ mod carrier_tests {
             assert_eq!(
                 *calls.lock().unwrap(),
                 vec![
+                    "prepare xhttp.test:443 -> target.test:80".into(),
+                    "prepare first.test:80 -> xhttp.test:443".into(),
                     format!("socket {index} -> first.test:80"),
                     "first.test:80 -> xhttp.test:443".into(),
+                    "prepare first.test:80 -> xhttp.test:443".into(),
                     format!("socket {index} -> first.test:80"),
                     "first.test:80 -> xhttp.test:443".into(),
                     "xhttp.test:443 -> target.test:80".into(),
                 ]
             );
             calls.lock().unwrap().clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_chain_preserves_preparation_order_and_ignores_intermediate_early_data() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        for initial in ["direct", "wireguard", "proxy"] {
+            for intermediates in [0, 2] {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let proxy = |address| {
+                    Box::new(Proxy {
+                        location: NetLocation::from_str(address, None).unwrap(),
+                        lazy: false,
+                        early_data: Some(vec![1, 2, 3]),
+                        calls: calls.clone(),
+                    }) as Box<dyn ProxyConnector>
+                };
+                let socket = Arc::new(Socket(0, calls.clone()));
+                let entry = match initial {
+                    "direct" => InitialHopEntry::Direct(socket),
+                    "wireguard" => InitialHopEntry::Wireguard(socket),
+                    "proxy" => InitialHopEntry::Proxy {
+                        socket,
+                        proxy: proxy("initial.test:80"),
+                    },
+                    _ => unreachable!(),
+                };
+                let mut hops = Vec::new();
+                if intermediates == 2 {
+                    hops.push(vec![proxy("middle1.test:80")]);
+                    hops.push(vec![proxy("middle2.test:80")]);
+                }
+                hops.push(vec![proxy("final.test:80")]);
+                let chain = ClientProxyChain::new(vec![entry], hops);
+                chain
+                    .connect_udp_bidirectional(
+                        &resolver,
+                        NetLocation::from_str("target.test:53", None)
+                            .unwrap()
+                            .into(),
+                    )
+                    .await
+                    .unwrap();
+
+                let first = if intermediates == 0 {
+                    "final.test:80"
+                } else {
+                    "middle1.test:80"
+                };
+                let mut expected = if initial == "proxy" {
+                    vec![
+                        format!("prepare initial.test:80 -> {first}"),
+                        "socket 0 -> initial.test:80".into(),
+                        format!("initial.test:80 -> {first}"),
+                    ]
+                } else {
+                    vec![format!("socket 0 -> {first}")]
+                };
+                if intermediates == 2 {
+                    expected.extend([
+                        "prepare middle1.test:80 -> middle2.test:80".into(),
+                        "middle1.test:80 -> middle2.test:80".into(),
+                        "prepare middle2.test:80 -> final.test:80".into(),
+                        "middle2.test:80 -> final.test:80".into(),
+                    ]);
+                }
+                expected.push("udp final.test:80 -> target.test:53".into());
+                assert_eq!(
+                    *calls.lock().unwrap(),
+                    expected,
+                    "{initial}/{intermediates}"
+                );
+            }
         }
     }
 
@@ -963,6 +1030,7 @@ mod carrier_tests {
                 proxy: Box::new(Proxy {
                     location: NetLocation::from_str("xhttp.test:443", None).unwrap(),
                     lazy: true,
+                    early_data: None,
                     calls,
                 }),
             }],
