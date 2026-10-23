@@ -48,10 +48,10 @@ use super::user_lookup::UserLookup;
 ///
 /// This is needed because `TokioIo<Upgraded>` doesn't implement `AsyncStream`
 /// (which requires `Sync`), but we need `AsyncStream` for UoT stream wrappers.
-struct HyperUpgradedStream(
-    Mutex<TokioIo<hyper::upgrade::Upgraded>>,
-    Option<std::net::SocketAddr>,
-);
+struct HyperUpgradedStream {
+    io: Mutex<TokioIo<hyper::upgrade::Upgraded>>,
+    peer: Option<std::net::SocketAddr>,
+}
 
 impl tokio::io::AsyncRead for HyperUpgradedStream {
     fn poll_read(
@@ -59,7 +59,7 @@ impl tokio::io::AsyncRead for HyperUpgradedStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(self.0.get_mut()).poll_read(cx, buf)
+        std::pin::Pin::new(self.io.get_mut()).poll_read(cx, buf)
     }
 }
 
@@ -136,21 +136,21 @@ impl tokio::io::AsyncWrite for HyperUpgradedStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        std::pin::Pin::new(self.0.get_mut()).poll_write(cx, buf)
+        std::pin::Pin::new(self.io.get_mut()).poll_write(cx, buf)
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(self.0.get_mut()).poll_flush(cx)
+        std::pin::Pin::new(self.io.get_mut()).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(self.0.get_mut()).poll_shutdown(cx)
+        std::pin::Pin::new(self.io.get_mut()).poll_shutdown(cx)
     }
 }
 
@@ -169,7 +169,7 @@ impl crate::async_stream::AsyncPing for HyperUpgradedStream {
 
 impl AsyncStream for HyperUpgradedStream {
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        self.1
+        self.peer
     }
 }
 
@@ -481,7 +481,10 @@ async fn naive_service(
         let _permits = permits;
         match on_upgrade.await {
             Ok(upgraded) => {
-                let io = HyperUpgradedStream(Mutex::new(TokioIo::new(upgraded)), peer);
+                let io = HyperUpgradedStream {
+                    io: Mutex::new(TokioIo::new(upgraded)),
+                    peer,
+                };
 
                 if padding_type != PaddingType::None {
                     let stream =
