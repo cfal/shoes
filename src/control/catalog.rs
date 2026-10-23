@@ -337,6 +337,70 @@ pub fn protocol_type(protocol: &ClientProxyConfig) -> &str {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn unused_catalog_leaves_are_normalized_without_activating_wireguard() {
+        use base64::Engine;
+        use serde_json::json;
+
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = certificate.cert.pem();
+        let key = certificate.signing_key.serialize_pem();
+        for nested in [false, true] {
+            for named_pems in [false, true] {
+                let mut client = json!({
+                    "name":"unused-tls", "address":"localhost:443",
+                    "protocol":{"type":"tls", "server_fingerprints":"any",
+                        "protocol":{"type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"}}
+                });
+                if named_pems {
+                    client["protocol"]["cert"] = json!("client-cert");
+                    client["protocol"]["key"] = json!("client-key");
+                }
+                let definition = if nested {
+                    json!({"client_group":"unused", "client_proxies":{
+                        "name":"unused-wireguard", "address":"192.0.2.1:51820",
+                        "protocol":{"type":"wireguard",
+                            "private_key":base64::engine::general_purpose::STANDARD.encode([42;32]),
+                            "public_key":base64::engine::general_purpose::STANDARD.encode([43;32]),
+                            "addresses":["10.77.0.2/32"], "peer_client_chain":[client]}
+                    }})
+                } else {
+                    json!({"rule_group":"unused", "rules":[{
+                        "mask":"0.0.0.0/0", "action":"allow", "client_chain":[client]
+                    }]})
+                };
+                let configs = serde_yaml::from_str(
+                    &json!([
+                        {"clash_api_address":"127.0.0.1:0", "secret":"test"},
+                        {"pem":"client-cert", "data":cert},
+                        {"pem":"client-key", "data":key},
+                        definition
+                    ])
+                    .to_string(),
+                )
+                .unwrap();
+                let validated = crate::config::create_server_configs(configs).unwrap();
+                assert!(validated.wireguard_endpoints.is_empty());
+                let catalog = validated.catalog.unwrap();
+                crate::clash_api::dto::leaf_udp_support(&catalog).unwrap_or_else(|error| {
+                    panic!("nested={nested}, named_pems={named_pems}: {error}")
+                });
+                let CatalogNode::Leaf(client) = &catalog.nodes["unused-tls"] else {
+                    panic!()
+                };
+                let ClientProxyConfig::Tls(tls) = &client.protocol else {
+                    panic!()
+                };
+                assert!(tls.server_fingerprints.is_unspecified());
+                if named_pems {
+                    assert_eq!(tls.cert.as_deref(), Some(cert.as_str()));
+                    assert_eq!(tls.key.as_deref(), Some(key.as_str()));
+                }
+            }
+        }
+    }
+
     const CONFIG: &str = "
 - client_group: child
   client_proxies:

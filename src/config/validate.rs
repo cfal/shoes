@@ -350,6 +350,15 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     super::wireguard_devices::collect_devices(&mut validated, &mut client_groups)?;
     super::fake_dns::validate(&mut validated)?;
     refresh_catalog_clients(&mut validated, &client_groups)?;
+    if let Some(catalog) = &mut validated.catalog {
+        // Unused definitions are still probeable, but must not activate WireGuard devices.
+        for node in catalog.nodes.values_mut() {
+            if let crate::control::catalog::CatalogNode::Leaf(client) = node {
+                expand_peer_chains(client, &client_groups)?;
+                validate_client_config(client, &named_pems, global_limits)?;
+            }
+        }
+    }
     Ok(validated)
 }
 
