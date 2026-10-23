@@ -387,14 +387,12 @@ where
 {
     let a_flow = a.flow().cloned();
     let b_flow = b.flow().cloned();
-    if a_flow.is_none() && b_flow.is_none() {
-        return copy_bidirectional_inner(a, b, a_need_initial_flush, b_need_initial_flush).await;
-    }
-    tokio::select! {
-        result = copy_bidirectional_inner(a, b, a_need_initial_flush, b_need_initial_flush) => result,
-        _ = crate::control::tracked_stream::wait_cancel(a_flow.as_deref()) => Err(crate::control::tracked_stream::cancelled()),
-        _ = crate::control::tracked_stream::wait_cancel(b_flow.as_deref()) => Err(crate::control::tracked_stream::cancelled()),
-    }
+    crate::control::tracked_stream::during_flows(
+        a_flow.as_deref(),
+        b_flow.as_deref(),
+        copy_bidirectional_inner(a, b, a_need_initial_flush, b_need_initial_flush),
+    )
+    .await
 }
 
 async fn copy_bidirectional_inner<A: AsyncStream + ?Sized, B: AsyncStream + ?Sized>(
@@ -472,14 +470,9 @@ where
         a_to_b_buf_size,
         b_to_a_buf_size,
     );
-    if a_flow.is_none() && b_flow.is_none() {
-        return copy.await.map(|_| ());
-    }
-    tokio::select! {
-        result = copy => result.map(|_| ()),
-        _ = crate::control::tracked_stream::wait_cancel(a_flow.as_deref()) => Err(crate::control::tracked_stream::cancelled()),
-        _ = crate::control::tracked_stream::wait_cancel(b_flow.as_deref()) => Err(crate::control::tracked_stream::cancelled()),
-    }
+    crate::control::tracked_stream::during_flows(a_flow.as_deref(), b_flow.as_deref(), copy)
+        .await
+        .map(|_| ())
 }
 
 fn copy_buffer_size(requested: usize, writer: &(impl AsyncStream + ?Sized)) -> usize {

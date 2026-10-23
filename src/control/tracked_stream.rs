@@ -78,6 +78,22 @@ pub async fn finish_shutdown(
     }
 }
 
+pub async fn during_flows<T>(
+    a: Option<&FlowEntry>,
+    b: Option<&FlowEntry>,
+    future: impl Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    if a.is_none() && b.is_none() {
+        return future.await;
+    }
+    // Unlike setup writes, relay completion and cancellation retain unbiased tie-breaking.
+    tokio::select! {
+        result = future => result,
+        _ = wait_cancel(a) => Err(cancelled()),
+        _ = wait_cancel(b) => Err(cancelled()),
+    }
+}
+
 impl AsyncRead for TrackedStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -113,6 +129,7 @@ impl AsyncWrite for TrackedStream {
         Pin::new(&mut *self.inner).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // The forwarding owner still allows a bounded FIN after cancellation.
         Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
 }

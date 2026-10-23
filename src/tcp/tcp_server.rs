@@ -370,16 +370,17 @@ pub async fn run_udp_copy(
 ) -> std::io::Result<()> {
     let server_flow = server_stream.flow().cloned();
     let client_flow = client_stream.flow().cloned();
-    let copy_result = tokio::select! {
-        result = copy_bidirectional_message(
-        &mut server_stream,
-        &mut client_stream,
-        server_need_initial_flush,
-        client_need_initial_flush,
-        ) => result,
-        _ = crate::control::tracked_stream::wait_cancel(server_flow.as_deref()) => Err(crate::control::tracked_stream::cancelled()),
-        _ = crate::control::tracked_stream::wait_cancel(client_flow.as_deref()) => Err(crate::control::tracked_stream::cancelled()),
-    };
+    let copy_result = crate::control::tracked_stream::during_flows(
+        server_flow.as_deref(),
+        client_flow.as_deref(),
+        copy_bidirectional_message(
+            &mut server_stream,
+            &mut client_stream,
+            server_need_initial_flush,
+            client_need_initial_flush,
+        ),
+    )
+    .await;
 
     crate::control::tracked_stream::finish_shutdown(
         server_flow.as_deref(),
