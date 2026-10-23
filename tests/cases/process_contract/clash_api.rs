@@ -1100,6 +1100,14 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
             quic: false,
             exercise_udp: true,
         },
+        ProtocolCase {
+            name: "naive",
+            server: json!({"type":"naiveproxy", "users":[{"name":"test", "username":"test", "password":"test-secret"}]}),
+            client: json!({"type":"naiveproxy", "username":"test", "password":"test-secret"}),
+            tls_alpn: Some("h2"),
+            quic: false,
+            exercise_udp: false,
+        },
     ];
     for (name, exercise_udp) in [("shadowsocks", true), ("snell", true), ("trojan", false)] {
         let mut protocol = json!({"type":name, "password":"test-secret"});

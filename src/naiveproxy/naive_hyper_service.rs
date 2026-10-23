@@ -194,6 +194,7 @@ where
 
 /// Service configuration for hyper NaiveProxy handler
 struct NaiveServiceConfig {
+    peer: Option<std::net::SocketAddr>,
     users: Arc<UserLookup>,
     fallback_path: Option<PathBuf>,
     resolver: Arc<dyn Resolver>,
@@ -262,6 +263,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
     let executor = ConnectionExecutor(Arc::downgrade(&tasks));
 
     let service_config = Arc::new(NaiveServiceConfig {
+        peer,
         users: naive_cfg.users.clone(),
         fallback_path: naive_cfg.fallback_path.clone(),
         resolver,
@@ -278,13 +280,8 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         // HTTP/2 for NaiveProxy clients
         Ok(TcpServerSetupResult::Session(Box::pin(async move {
             let _tasks = tasks;
-            let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
-                if let Some(peer) = peer {
-                    req.extensions_mut().insert(peer);
-                }
-                let config = service_config.clone();
-                async move { naive_service(req, config).await }
-            });
+            let service =
+                hyper::service::service_fn(move |req| naive_service(req, service_config.clone()));
 
             // H2 settings tuned for reasonable throughput without excessive memory
             // Reference naiveproxy uses ~64KB default, we use 256 KB for better throughput
@@ -458,9 +455,7 @@ async fn naive_service(
             destination.clone(),
             Vec::new(),
         ) {
-            Ok(prepared) => {
-                Some(prepared.with_source(req.extensions().get::<std::net::SocketAddr>().copied()))
-            }
+            Ok(prepared) => Some(prepared.with_source(config.peer)),
             Err(_) => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
@@ -472,7 +467,7 @@ async fn naive_service(
 
     // Get upgrade future before moving the request
     let on_upgrade = hyper::upgrade::on(&mut req);
-    let peer = req.extensions().get::<std::net::SocketAddr>().copied();
+    let peer = config.peer;
     let resolver = config.resolver.clone();
     let proxy_selector = config.proxy_selector.clone();
     let udp_enabled = config.udp_enabled;
@@ -664,6 +659,7 @@ mod sniff_tests {
                     };
                     let streams = Arc::new(Mutex::new(JoinSet::new()));
                     let config = Arc::new(NaiveServiceConfig {
+                        peer: None,
                         users: Arc::new(UserLookup::new(vec![("test".into(), "user".into(), "pass".into())])),
                         fallback_path: None, resolver: fixture.resolver.clone(), proxy_selector: fixture.selector.clone(),
                         udp_enabled: true, padding_enabled: true,
@@ -704,6 +700,7 @@ mod sniff_tests {
                     let (selector, resolver, target, payload) = case.fixture(&mut upstreams).await;
                     let tasks = Arc::new(Mutex::new(JoinSet::new()));
                     let config = Arc::new(NaiveServiceConfig {
+                        peer: None,
                         users: Arc::new(UserLookup::new(vec![("test".into(), "user".into(), "pass".into())])),
                         fallback_path: None, resolver, proxy_selector: selector,
                         udp_enabled: true, padding_enabled: padded,
@@ -755,6 +752,7 @@ mod sniff_tests {
             ] {
                 let tasks = Arc::new(Mutex::new(JoinSet::new()));
                 let config = Arc::new(NaiveServiceConfig {
+                    peer: None,
                     users: Arc::new(UserLookup::new(vec![(
                         "test".into(), "user".into(), "pass".into(),
                     )])),
