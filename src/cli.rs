@@ -103,6 +103,7 @@ pub fn main() {
 
     let directives = logging::resolve_directives();
     let mut writers: Vec<Box<dyn logging::LogWriter>> = Vec::new();
+    writers.push(Box::new(crate::control::logs::Writer));
 
     if log_files.is_empty() || log_files.iter().any(|p| p == "-") {
         writers.push(Box::new(logging::StderrWriter));

@@ -113,6 +113,7 @@ impl WriteChannel {
 /// Uses bounded channels with backpressure to prevent OOM during
 /// speed-mismatched transfers.
 pub struct AnyTlsStream {
+    pub(super) peer: Option<std::net::SocketAddr>,
     /// Stream ID (unique within session)
     id: u32,
 
@@ -176,6 +177,7 @@ impl AnyTlsStream {
             fin_sent: false,
             eof: false,
             _session_keepalive: None,
+            peer: None,
         }
     }
 
@@ -205,12 +207,17 @@ impl AnyTlsStream {
             fin_sent: false,
             eof: false,
             _session_keepalive: Some(session),
+            peer: None,
         }
     }
 
     /// Get the stream ID
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    pub(super) fn close_read(&mut self) {
+        self.data_rx.close();
     }
 
     /// Best-effort FIN send for Drop (cannot block in Drop)
@@ -407,7 +414,11 @@ impl AsyncPing for AnyTlsStream {
     }
 }
 
-impl AsyncStream for AnyTlsStream {}
+impl AsyncStream for AnyTlsStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer
+    }
+}
 
 #[cfg(test)]
 mod tests {

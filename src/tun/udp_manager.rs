@@ -366,7 +366,9 @@ async fn session_task(
                     };
                     let setup = tokio::time::timeout(
                         WRITE_TIMEOUT,
-                        create_connection(&dest, &proxy_selector, &resolver),
+                        crate::routing::ingress::connect_udp(
+                            &proxy_selector, dest.clone(), &resolver, Some(peer_addr),
+                        ),
                     )
                     .await
                     .unwrap_or_else(|_| {
@@ -567,15 +569,6 @@ async fn destination_task(
             }
         }
     }
-}
-
-/// Create a connection to a destination through the proxy chain.
-async fn create_connection(
-    dest: &NetLocation,
-    proxy_selector: &Arc<ClientProxySelector>,
-    resolver: &Arc<dyn Resolver>,
-) -> io::Result<Box<dyn AsyncMessageStream>> {
-    crate::routing::ingress::connect_udp(proxy_selector, dest.clone(), resolver).await
 }
 
 #[cfg(test)]

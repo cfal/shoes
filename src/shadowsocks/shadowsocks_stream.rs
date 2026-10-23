@@ -949,6 +949,9 @@ impl AsyncShutdownMessage for ShadowsocksStream {
 }
 
 impl AsyncStream for ShadowsocksStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
     fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
         match self.stream_type {
             ShadowsocksStreamType::Aead => {

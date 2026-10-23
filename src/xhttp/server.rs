@@ -3445,6 +3445,7 @@ impl XhttpServer {
     }
 
     pub async fn serve_h3(&self, connection: quinn::Connection) -> io::Result<()> {
+        let peer = connection.remote_address();
         let mut driver = h3::server::builder()
             .max_field_section_size(self.state.config.header_limit() as u64)
             .build(super::h3::Connection::new(connection))
@@ -3472,7 +3473,7 @@ impl XhttpServer {
             let state = self.state.clone();
             requests.spawn(async move {
                 let _request_permit = request_permit;
-                let Ok(Ok((request, stream))) = tokio::time::timeout(
+                let Ok(Ok((mut request, stream))) = tokio::time::timeout(
                     Duration::from_secs(state.config.limits.setup_timeout_secs),
                     resolver.resolve_request(),
                 )
@@ -3480,6 +3481,7 @@ impl XhttpServer {
                 else {
                     return;
                 };
+                request.extensions_mut().insert(peer);
                 let (mut send, mut receive) = stream.split();
                 let workers = Tasks::new();
                 let memory = state.new_memory();
@@ -3798,14 +3800,22 @@ impl State {
         }
         match wire::classify(&self.config, &self.path, request)? {
             Kind::Options => Ok((Body::Empty, false)),
-            Kind::One => self.stream_one(body).map_err(Into::into),
-            Kind::Download(id) => self.download(id).map_err(Into::into),
+            Kind::One => self
+                .stream_one(body, request.extensions().get().copied())
+                .map_err(Into::into),
+            Kind::Download(id) => self
+                .download(id, request.extensions().get().copied())
+                .map_err(Into::into),
             Kind::Upload(id) => self.stream_upload(request, body, id).map_err(Into::into),
             Kind::Packet(id, sequence) => self.packet(request, body, id, sequence).await,
         }
     }
 
-    fn stream_one(self: &Arc<Self>, body: Reader) -> Result<(Body, bool), StatusCode> {
+    fn stream_one(
+        self: &Arc<Self>,
+        body: Reader,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Result<(Body, bool), StatusCode> {
         let admission = self
             .admission
             .acquire(1)
@@ -3818,6 +3828,7 @@ impl State {
             read: body,
             write: writer,
             _tasks: tasks.clone(),
+            peer,
         };
         self.spawn_inner_session(stream, permit, tasks.cancel.clone(), move || {
             drop(admission);
@@ -3832,7 +3843,11 @@ impl State {
         Ok((Body::stream(reader).with_guard(guard), true))
     }
 
-    fn download(self: &Arc<Self>, id: String) -> Result<(Body, bool), StatusCode> {
+    fn download(
+        self: &Arc<Self>,
+        id: String,
+        peer: Option<std::net::SocketAddr>,
+    ) -> Result<(Body, bool), StatusCode> {
         let session = self.session(&id)?;
         let (reader, permit) = session.claim_download()?;
         session.progress.notify_waiters();
@@ -3842,6 +3857,7 @@ impl State {
             read: reader,
             write: writer,
             _tasks: tasks,
+            peer,
         };
         let state = Arc::downgrade(self);
         let session_id = id.clone();
@@ -4272,6 +4288,7 @@ impl State {
         stream: Box<dyn AsyncStream>,
         deadline: tokio::time::Instant,
     ) -> io::Result<()> {
+        let peer = stream.peer_addr();
         let header_limit = self.config.header_limit();
         let first_header = Arc::new(Notify::new());
         let received_header = first_header.clone();
@@ -4289,7 +4306,10 @@ impl State {
                     );
                 };
                 let (parts, body) = request.into_parts();
-                let request = Request::from_parts(parts, ());
+                let mut request = Request::from_parts(parts, ());
+                if let Some(peer) = peer {
+                    request.extensions_mut().insert(peer);
+                }
                 let streaming_upload = matches!(
                     wire::classify(&state.config, &state.path, &request),
                     Ok(Kind::One | Kind::Upload(_))
@@ -4342,6 +4362,7 @@ impl State {
         stream: Box<dyn AsyncStream>,
         deadline: tokio::time::Instant,
     ) -> io::Result<()> {
+        let peer = stream.peer_addr();
         let (stream_window, connection_window) = self.config.limits.h2_windows();
         let mut connection = tokio::time::timeout_at(
             deadline,
@@ -4379,6 +4400,9 @@ impl State {
                 let _request_permit = request_permit;
                 let (parts, body) = request.into_parts();
                 let mut request = Request::from_parts(parts, ());
+                if let Some(peer) = peer {
+                    request.extensions_mut().insert(peer);
+                }
                 let reset = CancellationToken::new();
                 request.extensions_mut().insert(RequestReset(reset.clone()));
                 let streaming_upload = matches!(

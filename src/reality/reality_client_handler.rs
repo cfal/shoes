@@ -110,6 +110,19 @@ impl RealityClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for RealityClientHandler {
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        resolver: &std::sync::Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        match &self.handler {
+            RealityInnerClientHandler::Default(handler) => {
+                handler.prepare_target(target, resolver).await
+            }
+            RealityInnerClientHandler::VisionVless { .. } => Ok(target),
+        }
+    }
+
     async fn try_reuse_tcp_stream(
         &self,
         target: &ResolvedLocation,

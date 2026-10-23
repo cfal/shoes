@@ -262,6 +262,33 @@ impl Prepared {
             }
             Ok(())
         })?;
+        if !validated.control.listeners.is_empty()
+            && let Some(catalog) = &mut validated.catalog
+        {
+            for node in catalog.nodes.values_mut() {
+                if let crate::control::catalog::CatalogNode::Leaf(client) = node {
+                    crate::config::client_visit::visit_client(client, &mut |client| {
+                        if let ClientProxyConfig::Wireguard(reference) = &mut client.protocol {
+                            // Probe pools include unselected leaves; fail at dial, not construction.
+                            reference.connector = Some(
+                                connectors
+                                    .get(&reference.endpoint_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        Arc::new(Connector {
+                                            name: reference.endpoint_id.clone(),
+                                            active: Mutex::new(None),
+                                            addresses: Vec::new(),
+                                            routes: Vec::new(),
+                                        })
+                                    }),
+                            );
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+        }
         // Endpoint chains share the prepared handles used by ordinary listeners and DNS.
         let mut endpoints = Vec::with_capacity(pending.len());
         for ((peers, connector), config) in pending.into_iter().zip(&validated.wireguard_endpoints)
@@ -541,6 +568,7 @@ fn spawn_inbound(
                     target,
                     selector,
                     resolver,
+                    Some(connection.source),
                 )
                 .await;
             });

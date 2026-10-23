@@ -909,7 +909,11 @@ async fn build_entry_and_plan(
             parsed_url: parsed_url.clone(),
             chain_group: chain_group.clone(),
             bootstrap_resolver: bootstrap_resolver.clone(),
-            chain_key: serde_yaml::to_string(&spec.client_chains).map_err(|e| {
+            chain_key: serde_yaml::to_string(&(
+                &spec.client_chains,
+                crate::control::catalog::chain_selection_key(&spec.client_chains)?,
+            ))
+            .map_err(|e| {
                 std::io::Error::other(format!("failed to serialize client_chains: {e}"))
             })?,
             bootstrap_key: spec.bootstrap_url.clone(),
@@ -1889,6 +1893,81 @@ mod tests {
             !debug.contains("CompositeResolver"),
             "equivalent specs should not de-pool into CompositeResolver, got: {}",
             debug
+        );
+    }
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[tokio::test]
+    async fn selector_identity_prevents_dns_pooling_of_identical_members() {
+        let configs = serde_yaml::from_str(
+            r#"
+- client_group: east
+  client_proxies: [{name: east-direct, protocol: {type: direct}, bind_interface: east}]
+- client_group: west
+  client_proxies: [{name: west-direct, protocol: {type: direct}, bind_interface: west}]
+- client_group: first
+  strategy: selector
+  default: east
+  client_proxies: [east, west]
+- client_group: second
+  strategy: selector
+  default: west
+  client_proxies: [east, west]
+- dns_group: selected
+  dns_servers:
+    - {url: 'udp://192.0.2.1', client_chain: first}
+    - {url: 'udp://192.0.2.2', client_chain: second}
+"#,
+        )
+        .unwrap();
+        let validated = crate::config::create_server_configs(configs).unwrap();
+        let specs = &validated.dns_groups[0].specs;
+        assert_eq!(
+            serde_yaml::to_string(&specs[0].client_chains).unwrap(),
+            serde_yaml::to_string(&specs[1].client_chains).unwrap()
+        );
+        let registry = DnsRegistry::new();
+        let (_, first) = build_entry_and_plan(&specs[0], &registry).await.unwrap();
+        let (_, second) = build_entry_and_plan(&specs[1], &registry).await.unwrap();
+        let plans = [first.unwrap(), second.unwrap()];
+        assert!(!plans[0].is_pool_compatible_with(&plans[1]));
+        assert!(
+            try_build_hickory_pool_from_plans(&plans)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let resolver = build_hickory_resolver_group(&plans).await.unwrap();
+        assert!(format!("{resolver:?}").contains("CompositeResolver"));
+        assert_eq!(
+            plans[0].chain_group.select_bind_interface().unwrap(),
+            Some("east")
+        );
+        assert_eq!(
+            plans[1].chain_group.select_bind_interface().unwrap(),
+            Some("west")
+        );
+        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+        owner
+            .activate(validated.catalog.unwrap().selection)
+            .unwrap();
+        owner.select("first", "west").unwrap();
+        assert_eq!(
+            plans[0].chain_group.select_bind_interface().unwrap(),
+            Some("west")
+        );
+        assert_eq!(
+            plans[1].chain_group.select_bind_interface().unwrap(),
+            Some("west")
+        );
+        owner.select("second", "east").unwrap();
+        assert_eq!(
+            plans[0].chain_group.select_bind_interface().unwrap(),
+            Some("west")
+        );
+        assert_eq!(
+            plans[1].chain_group.select_bind_interface().unwrap(),
+            Some("east")
         );
     }
 

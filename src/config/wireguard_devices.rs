@@ -36,7 +36,17 @@ impl ClientRegistry {
         }
         // Compares effective carrier socket defaults without rewriting ordinary clients.
         let mut settings = client.clone();
+        // The leaf's placement chooses this device; only its carriers affect device identity.
+        settings.control = None;
+        let mut selection_paths = Vec::new();
         visit_client(&mut settings, &mut |carrier| {
+            selection_paths.push(
+                carrier
+                    .control
+                    .as_ref()
+                    .map(crate::control::catalog::MemberOrigin::selector_path)
+                    .unwrap_or_default(),
+            );
             if carrier.bind_interface.is_unspecified() {
                 carrier.bind_interface = NoneOrOne::None;
             }
@@ -50,7 +60,7 @@ impl ClientRegistry {
             Ok(())
         })?;
         // Serialization excludes generation-local IDs and prepared connectors.
-        let settings = serde_yaml::to_value(settings)
+        let settings = serde_yaml::to_value((settings, selection_paths))
             .map_err(|_| invalid("cannot compare WireGuard client settings"))?;
         let ClientProxyConfig::Wireguard(config) = &mut client.protocol else {
             unreachable!("checked WireGuard protocol")
@@ -203,6 +213,9 @@ pub(super) fn collect_devices(
         }
     }
     validated.visit_clients(&mut |client| clients.register(client))?;
+    if !validated.control.listeners.is_empty() {
+        super::validate::refresh_catalog_clients(validated, groups)?;
+    }
     let referenced_dns: HashSet<_> = validated
         .configs
         .iter()
@@ -950,6 +963,27 @@ mod tests {
         let mut invalid = configs;
         invalid[0]["client_proxies"][0]["protocol"]["mtu"] = json!(9000);
         assert!(validate(invalid).is_err());
+    }
+
+    #[test]
+    fn selectors_share_wireguard_devices_without_activating_unused_nodes() {
+        let mut configs = json!([
+            {"clash_api_address":"127.0.0.1:9090","secret":"test"},
+            {"client_group":"vpn","client_proxies":[client()]},
+            {"client_group":"outbound","strategy":"selector","client_proxies":["vpn","direct"]},
+            {"client_group":"another","strategy":"selector","client_proxies":["outbound","vpn"]}
+        ]);
+        assert!(
+            validate(configs.clone())
+                .unwrap()
+                .wireguard_endpoints
+                .is_empty()
+        );
+        configs.as_array_mut().unwrap().push(json!({
+            "address":"127.0.0.1:1080","protocol":{"type":"socks"},
+            "rules":[{"mask":"0.0.0.0/0","action":"allow","client_chain":"another"}]
+        }));
+        assert_eq!(validate(configs).unwrap().wireguard_endpoints.len(), 1);
     }
 
     #[test]

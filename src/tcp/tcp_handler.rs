@@ -96,6 +96,15 @@ pub struct TcpClientSetupResult {
     reason = "async-trait adds must_use to boxed futures"
 )]
 pub trait TcpClientHandler: Send + Sync + Debug {
+    /// Resolve protocol-local targets with the current dial's resolver, including on reuse.
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        _resolver: &Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        Ok(target)
+    }
+
     /// Validates the immediately enclosing TLS layer before any protocol bytes are sent.
     fn validate_alpn(&self, _alpn: Option<&[u8]>) -> std::io::Result<()> {
         Ok(())

@@ -96,6 +96,32 @@ fn adversarial_inputs_stay_within_their_compilation_reserves() {
     assert!(used < json.len() * 4 + 4096, "JSON peak: {used}");
     println!("JSON bytes={}, peak={used}", json.len());
 
+    let available = 16 * 1024 * 1024;
+    for json in [
+        format!("[{}]", vec!["[]"; 200_000].join(",")),
+        format!("[{}]", vec![r#"{"a":0}"#; 200_000].join(",")),
+        format!(
+            r#"{{"version":3,"rules":[{{"domain":[{}]}}]}}"#,
+            vec![r#""a.example""#; 200_000].join(",")
+        ),
+    ] {
+        let (result, used) = load_peak(
+            json.as_bytes(),
+            Format::SingboxJson,
+            512 * 1024 * 1024 - available,
+        );
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("budget"), "{error}");
+        assert!(
+            used < available,
+            "JSON peak: {used}, available: {available}"
+        );
+        println!(
+            "JSON tree bytes={}, peak={used}, available={available}",
+            json.len()
+        );
+    }
+
     let count = 100_000;
     let mut domain = message(2, b"example.com");
     domain.extend_from_slice(&[0x1a, 0].repeat(count));

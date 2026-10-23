@@ -303,6 +303,10 @@ where
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientConfig {
+    #[serde(skip)]
+    pub name: Option<String>,
+    #[serde(skip)]
+    pub control: Option<crate::control::catalog::MemberOrigin>,
     #[serde(default, skip_serializing_if = "NoneOrOne::is_unspecified")]
     pub bind_interface: NoneOrOne<String>,
     #[serde(
@@ -330,6 +334,8 @@ impl<'de> Deserialize<'de> for ClientConfig {
         #[serde(deny_unknown_fields)]
         struct Fields {
             #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
             bind_interface: NoneOrOne<String>,
             #[serde(default = "unspecified_address")]
             address: NetLocation,
@@ -348,6 +354,8 @@ impl<'de> Deserialize<'de> for ClientConfig {
             }
         });
         Ok(Self {
+            name: fields.name,
+            control: None,
             bind_interface: fields.bind_interface,
             address: fields.address,
             protocol: fields.protocol,
@@ -361,6 +369,8 @@ impl<'de> Deserialize<'de> for ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
+            name: None,
+            control: None,
             bind_interface: NoneOrOne::None,
             address: unspecified_address(),
             protocol: ClientProxyConfig::Direct,
@@ -642,6 +652,8 @@ mod tests {
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig {
+            name: None,
+            control: None,
             bind_interface: NoneOrOne::One("eth0".to_string()),
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
             protocol: ClientProxyConfig::Socks {

@@ -35,10 +35,17 @@ pub(crate) enum UdpRoute<'a> {
         chain: &'a ClientChainGroup,
         target: ResolvedLocation,
         reply_identity: NetLocation,
+        info: crate::control::flows::FlowInfo,
     },
 }
 
 impl UdpRoute<'_> {
+    pub(crate) fn with_source(mut self, source: Option<std::net::SocketAddr>) -> Self {
+        if let Self::Forward { info, .. } = &mut self {
+            info.source = source;
+        }
+        self
+    }
     pub(crate) async fn connect(self, resolver: &Arc<dyn Resolver>) -> io::Result<UdpSetup> {
         match self {
             Self::Local(setup) => Ok(setup),
@@ -46,8 +53,9 @@ impl UdpRoute<'_> {
                 chain,
                 target,
                 reply_identity,
+                info,
             } => Ok(UdpSetup {
-                stream: chain.connect_udp_bidirectional(resolver, target).await?,
+                stream: chain.connect_udp_with_info(resolver, target, info).await?,
                 reply_identity,
             }),
         }
@@ -72,11 +80,14 @@ pub(crate) async fn connect_udp(
     selector: &ClientProxySelector,
     destination: NetLocation,
     resolver: &Arc<dyn Resolver>,
+    source: Option<std::net::SocketAddr>,
 ) -> io::Result<Box<dyn AsyncMessageStream>> {
     let target = selector.prepare(destination.into())?;
-    Ok(connect_prepared_udp(selector, target, resolver, false)
-        .await?
-        .stream)
+    Ok(
+        connect_prepared_udp(selector, target, resolver, false, source)
+            .await?
+            .stream,
+    )
 }
 
 pub(crate) async fn connect_prepared_udp(
@@ -84,9 +95,11 @@ pub(crate) async fn connect_prepared_udp(
     target: IngressTarget,
     resolver: &Arc<dyn Resolver>,
     require_ip_reply: bool,
+    source: Option<std::net::SocketAddr>,
 ) -> io::Result<UdpSetup> {
     route_prepared_udp(selector, target, resolver, require_ip_reply)
         .await?
+        .with_source(source)
         .connect(resolver)
         .await
 }
@@ -117,6 +130,11 @@ async fn route_prepared_udp<'a>(
         }
         IngressTarget::Forward(target) => target,
     };
+    let info = if selector.tracks_flows() {
+        target.flow_info()
+    } else {
+        Default::default()
+    };
     let routed = selector.judge_prepared(target, None, resolver).await?;
     match routed.decision {
         ConnectDecision::Allow {
@@ -135,6 +153,7 @@ async fn route_prepared_udp<'a>(
                 chain: chain_group,
                 target: remote_location,
                 reply_identity,
+                info,
             })
         }
         ConnectDecision::Block => Err(io::Error::new(io::ErrorKind::PermissionDenied, PolicyBlock)),
@@ -413,6 +432,7 @@ pub(crate) mod tests {
                 selector.prepare(wire.clone().into()).unwrap(),
                 &real,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -435,7 +455,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(
-            connect_prepared_udp(&selector, target, &real, true)
+            connect_prepared_udp(&selector, target, &real, true, None)
                 .await
                 .is_err(),
             "IP-only reply protocols must resolve a hostname or fail explicitly"

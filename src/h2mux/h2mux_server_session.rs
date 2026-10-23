@@ -389,8 +389,9 @@ pub async fn handle_h2mux_session<S>(
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: crate::async_stream::AsyncStream + 'static,
 {
+    let peer = stream.peer_addr();
     info!("H2MUX: Starting server session");
 
     // Wrap with PrependStream if there's initial data from protocol parsing
@@ -409,7 +410,8 @@ where
             inbound = session.accept() => inbound,
             _ = tasks.join_next(), if !tasks.is_empty() => continue,
         };
-        let Some(inbound) = inbound else { break };
+        let Some(mut inbound) = inbound else { break };
+        inbound.stream.peer = peer;
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
 
@@ -483,7 +485,8 @@ async fn handle_h2mux_tcp(
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
     let prepared =
-        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, destination.clone(), Vec::new())?;
+        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, destination.clone(), Vec::new())?
+            .with_source(stream.peer);
     let route =
         timeout_stream_setup(prepared.route(&mut stream, &proxy_selector, &resolver)).await?;
     let routed = timeout_stream_setup(route.connect(&resolver)).await?;
@@ -494,12 +497,16 @@ async fn handle_h2mux_tcp(
                 routed.wire_destination
             );
             let mut client_stream = client_result.client_stream;
+            let flow = client_stream.flow().cloned();
 
             if let Some(data) = client_result.early_data {
-                timeout_stream_setup(async {
-                    stream.write_all(&data).await?;
-                    stream.flush().await
-                })
+                crate::control::tracked_stream::during_flow(
+                    flow.as_deref(),
+                    timeout_stream_setup(async {
+                        stream.write_all(&data).await?;
+                        stream.flush().await
+                    }),
+                )
                 .await?;
             }
             if !routed.prefix.is_empty() {
@@ -513,10 +520,7 @@ async fn handle_h2mux_tcp(
             drop(routed.prefix);
             let result = copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
-            futures::join!(
-                shutdown_stream(&mut stream),
-                shutdown_stream(&mut client_stream),
-            );
+            crate::util::shutdown_stream_pair(&mut stream, &mut client_stream).await;
 
             result
         }
@@ -547,7 +551,7 @@ async fn handle_h2mux_udp(
     ))
     .await
     {
-        Ok(route) => route,
+        Ok(route) => route.with_source(stream.peer),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             reject_h2mux_stream(&mut stream, "Connection blocked by rules").await;
             return Err(io::Error::new(

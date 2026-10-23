@@ -35,7 +35,7 @@ impl<'de> DeserializeSeed<'de> for Seed<'_> {
         }
         // Covers Value/vector capacity and the later typed expression while the
         // original tree is consumed. Object members are charged separately.
-        self.charge(128, 0)?;
+        self.charge(4 * std::mem::size_of::<Value>(), 0)?;
         decoder.deserialize_any(self)
     }
 }
@@ -74,14 +74,14 @@ impl<'de> Visitor<'de> for Seed<'_> {
             budget: self.budget,
             depth: self.depth + 1,
         })? {
-            self.charge(32, 0)?;
+            self.charge(std::mem::size_of::<Value>(), 0)?;
             values.push(value);
         }
         Ok(Value::Array(values))
     }
     fn visit_map<A: MapAccess<'de>>(mut self, mut map: A) -> Result<Value, A::Error> {
         let mut values = Map::new();
-        // A BTreeMap node may be allocated for a single tiny object. Charge per
+        // A map may allocate capacity for a single tiny object. Charge per
         // member before allocating it, not as a multiple of serialized bytes.
         while let Some(key) = map.next_key::<String>()? {
             if key.len() > 128 {
@@ -104,6 +104,21 @@ impl<'de> Visitor<'de> for Seed<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_budget_covers_value_layout_and_temporary_vectors() {
+        let count = 2000;
+        let bytes = format!("[{}]", vec!["{}"; count].join(","));
+        let mut budget = Compiler::default();
+        let minimum_peak = count * 4 * std::mem::size_of::<Value>();
+        budget.charge(512 * 1024 * 1024 - minimum_peak, 0).unwrap();
+        assert!(
+            decode(bytes.as_bytes(), &mut budget)
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+    }
 
     #[test]
     fn many_small_objects_are_charged_before_materialization() {

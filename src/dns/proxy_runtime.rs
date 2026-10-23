@@ -26,9 +26,7 @@ pub struct ProxyRuntimeProvider {
     /// Resolver for proxy server hostnames (not the DNS queries themselves).
     /// Uses NativeResolver since we can't use the DNS server we're trying to reach.
     bootstrap_resolver: Arc<dyn Resolver>,
-    /// Bind interface for UDP/QUIC (from direct-only chain).
-    bind_interface: Option<String>,
-    /// QUIC socket binder that uses the bind_interface.
+    /// QUIC socket binder that selects from the same direct-only chain.
     quic_binder: ProxyQuicBinder,
     /// Timeout for establishing connections to DNS upstreams.
     connect_timeout: Duration,
@@ -41,15 +39,13 @@ impl ProxyRuntimeProvider {
         bootstrap_resolver: Arc<dyn Resolver>,
         connect_timeout: Duration,
     ) -> Self {
-        let bind_interface = chain_group.get_bind_interface().map(ToString::to_string);
         let quic_binder = ProxyQuicBinder {
-            bind_interface: bind_interface.clone(),
+            chain_group: chain_group.clone(),
             memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
         };
         Self {
             chain_group,
             bootstrap_resolver,
-            bind_interface,
             quic_binder,
             connect_timeout,
         }
@@ -150,16 +146,10 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         local_addr: SocketAddr,
         _server_addr: SocketAddr,
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
-        let bind_interface = self.bind_interface.clone();
-        let direct = self.chain_group.is_direct_only();
+        let chain_group = self.chain_group.clone();
 
         Box::pin(async move {
-            if !direct {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "UDP DNS requires a direct chain",
-                ));
-            }
+            let bind_interface = chain_group.select_bind_interface()?.map(str::to_owned);
             let socket = crate::socket_util::new_outbound_socket2_udp_socket(
                 local_addr.is_ipv6(),
                 bind_interface,
@@ -179,7 +169,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
 /// QUIC socket binder that supports bind_interface.
 #[derive(Clone)]
 struct ProxyQuicBinder {
-    bind_interface: Option<String>,
+    chain_group: Arc<ClientChainGroup>,
     memory_bytes: usize,
 }
 
@@ -193,7 +183,7 @@ impl QuicSocketBinder for ProxyQuicBinder {
             .ok_or_else(|| crate::resources::quic_memory_exhausted(self.memory_bytes))?;
         let socket = crate::socket_util::new_outbound_socket2_udp_socket(
             local_addr.is_ipv6(),
-            self.bind_interface.clone(),
+            self.chain_group.select_bind_interface()?.map(str::to_owned),
             Some(local_addr),
         )?;
         crate::quic_endpoint::socket_with_memory(socket.into(), memory)
@@ -275,6 +265,70 @@ mod tests {
             result.is_ok(),
             "bind_udp should succeed: {:?}",
             result.err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn new_dns_sockets_follow_direct_selector_changes() {
+        let config = r#"
+- client_group: dns-route
+  strategy: selector
+  default: usable
+  client_proxies:
+    - name: unavailable
+      bind_interface: shoes-missing
+      protocol: {type: direct}
+    - name: usable
+      protocol: {type: direct}
+- dns_group: upstream
+  dns_servers:
+    - url: udp://192.0.2.1
+      client_chain: dns-route
+"#;
+        let mut validated =
+            crate::config::create_server_configs(serde_yaml::from_str(config).unwrap()).unwrap();
+        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+        owner
+            .activate(validated.catalog.take().unwrap().selection)
+            .unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let chains = validated.dns_groups.remove(0).specs.remove(0).client_chains;
+        let group = crate::tcp::chain_builder::try_build_client_chain_group(
+            crate::option_util::NoneOrSome::Some(chains),
+            resolver.clone(),
+        )
+        .unwrap();
+        let provider =
+            ProxyRuntimeProvider::with_bootstrap(Arc::new(group), resolver, TEST_CONNECT_TIMEOUT)
+                .with_quic_memory(0);
+        let local = "0.0.0.0:0".parse().unwrap();
+        let server = "192.0.2.1:53".parse().unwrap();
+        let udp = provider.bind_udp(local, server).await.unwrap();
+        let quic = provider
+            .quic_binder()
+            .unwrap()
+            .bind_quic(local, server)
+            .unwrap();
+        owner.select("dns-route", "unavailable").unwrap();
+        assert!(provider.bind_udp(local, server).await.is_err());
+        assert!(
+            provider
+                .quic_binder()
+                .unwrap()
+                .bind_quic(local, server)
+                .is_err()
+        );
+        assert!(udp.local_addr().is_ok());
+        assert!(quic.local_addr().is_ok());
+        owner.select("dns-route", "usable").unwrap();
+        assert!(provider.bind_udp(local, server).await.is_ok());
+        assert!(
+            provider
+                .quic_binder()
+                .unwrap()
+                .bind_quic(local, server)
+                .is_ok()
         );
     }
 
@@ -404,7 +458,7 @@ mod tests {
             return;
         }
         let binder = ProxyQuicBinder {
-            bind_interface: None,
+            chain_group: Arc::new(build_direct_chain_group(Arc::new(NativeResolver::new()))),
             memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
         };
         let local_addr = "0.0.0.0:0".parse().unwrap();

@@ -34,11 +34,16 @@ impl UdpRelay {
     pub fn new(
         selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
+        peer: Option<std::net::SocketAddr>,
     ) -> io::Result<Self> {
         let permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
         let (tx, input) = mpsc::channel(QUEUE_SIZE);
         let (output, rx) = mpsc::channel(QUEUE_SIZE);
-        let stream = ChannelStream { input, output };
+        let stream = ChannelStream {
+            input,
+            output,
+            peer,
+        };
         let task = tokio::spawn(async move {
             let _ = run_udp_routing(
                 ServerStream::Targeted(Box::new(stream)),
@@ -99,6 +104,7 @@ impl Drop for UdpRelay {
 }
 
 struct ChannelStream {
+    peer: Option<std::net::SocketAddr>,
     input: mpsc::Receiver<(Bytes, NetLocation)>,
     output: mpsc::Sender<Reply>,
 }
@@ -169,7 +175,11 @@ impl AsyncPing for ChannelStream {
         Poll::Ready(Ok(false))
     }
 }
-impl AsyncTargetedMessageStream for ChannelStream {}
+impl AsyncTargetedMessageStream for ChannelStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -228,7 +238,11 @@ mod tests {
     fn replies_keep_full_queue_drops_and_closed_queue_errors() {
         let (_tx, input) = mpsc::channel(QUEUE_SIZE);
         let (output, mut rx) = mpsc::channel(QUEUE_SIZE);
-        let mut stream = ChannelStream { input, output };
+        let mut stream = ChannelStream {
+            input,
+            output,
+            peer: None,
+        };
         let source = NetLocation::from_str("[::1]:53", None).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for i in 0..=QUEUE_SIZE {
@@ -264,7 +278,7 @@ mod tests {
                 crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
             ),
         )]));
-        let relay = UdpRelay::new(selector, resolver).unwrap();
+        let relay = UdpRelay::new(selector, resolver, None).unwrap();
         let original = NetLocation::from_str("192.0.2.1:53", None).unwrap();
         for payload in [b"".as_slice(), b"query".as_slice()] {
             relay
@@ -308,7 +322,7 @@ mod tests {
                     crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
                 ),
             )]));
-            let relay = UdpRelay::new(selector, resolver.clone()).unwrap();
+            let relay = UdpRelay::new(selector, resolver.clone(), None).unwrap();
             relay
                 .send_to(
                     Bytes::from_static(b"query"),

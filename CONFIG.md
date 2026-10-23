@@ -286,6 +286,116 @@ A configuration file is a YAML array containing one or more configuration entrie
   path: /path/to/cert.pem
 ```
 
+## Clash Controller
+
+The CLI can expose a documented subset of the Clash API. The controller is
+disabled unless a listener is configured. It does not change existing groups'
+round-robin behavior.
+
+```yaml
+- clash_api_address: "0.0.0.0:9090"
+  secret: "replace-with-a-strong-secret"
+  cors_origins: ["https://dashboard.example.com"]
+
+- clash_api_path: "/run/shoes/clash.sock"
+  secret: "replace-with-a-local-secret"
+
+- cache_file_path: "./cache.db"
+```
+
+`clash_api_address` accepts one address or a list, using the ordinary server
+address syntax. Use either `clash_api_address` or `clash_api_path` per entry.
+Multiple entries share selectors, connections, counters, and resource budgets;
+they are not separate tenants. Each has its own secret and browser origins.
+Listener definitions and `cache_file_path` require a restart to change.
+
+Every listener requires a nonempty secret. HTTP uses `Authorization: Bearer
+<secret>`; supported WebSocket upgrades also accept `?token=`. Browser origins
+must exactly match `cors_origins`; the default empty list permits authenticated
+non-browser clients without an Origin header. Wildcards and `null` origins are
+not accepted. Optional `allow_private_network: true` enables private-network
+preflight responses for allowed origins, not mixed-content bypass. Protect TCP
+with a firewall and external TLS termination. Unix sockets require an absolute
+path in an existing owner-only directory and are created with mode `0600`.
+Browsers need an HTTP reverse proxy to use a Unix socket.
+
+Opt into manual selection explicitly:
+
+```yaml
+- client_group: outbound
+  strategy: selector
+  default: east
+  client_proxies:
+    - name: east
+      address: "east.example.com:1080"
+      protocol: {type: socks}
+    - name: west
+      address: "west.example.com:1080"
+      protocol: {type: socks}
+```
+
+Rules continue to use `client_chain: outbound`. A selector chooses an immediate
+named member or referenced group; inline selector members require `name`.
+Other groups default to `strategy: round-robin`. Nested round-robin weights,
+duplicate membership, and existing UDP filtering are preserved. A selected
+branch without UDP support fails new UDP flows instead of silently falling back.
+Selection changes affect new flows only; existing streams, UDP destinations,
+DNS connections, and WireGuard associations remain pinned until reopened.
+Optional client and server/TUN `name` fields provide stable dashboard identities.
+Generated anonymous names are stable only for unchanged definition sites.
+
+Only one `cache_file_path` is allowed across all input files. Its absence disables
+persistence; relative paths resolve against the process working directory.
+The file is Shoes-specific versioned JSON, not a sing-box/Mihomo database. Parent
+directories must exist, and Unix cache/lock files must be private. Explicit API
+choices take precedence over `default`, then the first member. Startup/reload
+never save defaults or rewrite YAML. Every accepted selection PUT saves before
+publishing the new choice. Failed saves leave routing unchanged. An error after
+atomic replacement can leave an unacknowledged choice on disk; logs report this
+durability uncertainty. Saved entries for removed groups are retained. Both reads
+and writes are limited to 1 MiB; remove obsolete entries only while Shoes is stopped.
+
+Supported endpoints: `/version`, read-only `/configs`, `/proxies`, `/group`,
+selector PUTs, node/group `/delay`, read-only `/rules`, `/connections` snapshots
+and DELETE cancellation, plus WebSocket/NDJSON `/traffic`, `/memory`, and `/logs`.
+Provider collections return `{"providers":{}}`. Traffic counters measure outbound
+application payload, not headers, padding, or retransmissions. Probes, internal
+DNS/carrier traffic, and unauthenticated camouflage/fallback forwarding are excluded;
+synthetic fake-DNS answers and ICMP are not represented as connections.
+Connection speeds are derived by the dashboard from successive byte counters.
+Process/GeoIP data is not fabricated.
+
+Delay tests send HTTP HEAD through actual outbounds, verify HTTPS certificates,
+and never follow redirects. A leaf test is standalone, not a test of every chain
+containing that leaf. Unused WireGuard nodes remain inactive and cannot be probed
+until referenced by a forwarding or DNS rule. Direct probe destinations cannot be
+loopback, link-local, unspecified, multicast, or synthetic fake-IP addresses.
+Remote proxies may resolve names differently: this is authenticated administrative
+network access, not an API for untrusted users.
+
+The compatibility target is zashboard revision
+`6225aac84439425ae4f4493437b110a314753436`, not full Mihomo parity. Only rule mode
+is offered, with no synthetic `GLOBAL`. Use `disableUpgradeCore=1` in the dashboard
+backend settings. Unsupported controls can still be visible: config editing,
+API reload/restart, upgrades, provider updates, rule disabling, DNS/cache
+maintenance, and dashboard storage sync return explicit errors, never fake success.
+No UI download/hosting is included. Controller/cache entries are rejected by FFI.
+
+See [the complete example](examples/clash_api.yaml). Controller connections share
+a limit of 64, subscriptions 16, probes 16, and bound sockets 16. Request heads
+must finish within 15 seconds of accept or the preceding response; ordinary
+request bodies have a 10-second deadline and 64 KiB limit. Established subscriptions
+are exempt from header idle expiry and have bounded queues/write deadlines.
+Responses are limited to 32 MiB. An oversized connection snapshot closes its
+WebSocket with code 1009 and reason `response exceeds 32 MiB`; tracking continues
+without truncating the connection list.
+Configuring a controller, `cache_file_path`, or any selector group enables the
+catalog and its 16,384-node limit. Names must be nonempty, unique, at most 256
+bytes, and contain no control characters. `DIRECT`, `REJECT`, and
+`GLOBAL` are reserved. Configuration preparation rejects `/rules` or base
+`/proxies` responses larger than 32 MiB. Group delay requests support at most
+1,024 immediate members.
+
 ## Server Config
 
 WireGuard servers require one literal UDP address with a nonzero port, or omit

@@ -48,7 +48,10 @@ use super::user_lookup::UserLookup;
 ///
 /// This is needed because `TokioIo<Upgraded>` doesn't implement `AsyncStream`
 /// (which requires `Sync`), but we need `AsyncStream` for UoT stream wrappers.
-struct HyperUpgradedStream(Mutex<TokioIo<hyper::upgrade::Upgraded>>);
+struct HyperUpgradedStream {
+    io: Mutex<TokioIo<hyper::upgrade::Upgraded>>,
+    peer: Option<std::net::SocketAddr>,
+}
 
 impl tokio::io::AsyncRead for HyperUpgradedStream {
     fn poll_read(
@@ -56,7 +59,7 @@ impl tokio::io::AsyncRead for HyperUpgradedStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(self.0.get_mut()).poll_read(cx, buf)
+        std::pin::Pin::new(self.io.get_mut()).poll_read(cx, buf)
     }
 }
 
@@ -133,21 +136,21 @@ impl tokio::io::AsyncWrite for HyperUpgradedStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        std::pin::Pin::new(self.0.get_mut()).poll_write(cx, buf)
+        std::pin::Pin::new(self.io.get_mut()).poll_write(cx, buf)
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(self.0.get_mut()).poll_flush(cx)
+        std::pin::Pin::new(self.io.get_mut()).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(self.0.get_mut()).poll_shutdown(cx)
+        std::pin::Pin::new(self.io.get_mut()).poll_shutdown(cx)
     }
 }
 
@@ -164,7 +167,11 @@ impl crate::async_stream::AsyncPing for HyperUpgradedStream {
     }
 }
 
-impl AsyncStream for HyperUpgradedStream {}
+impl AsyncStream for HyperUpgradedStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer
+    }
+}
 
 #[derive(Clone)]
 struct ConnectionExecutor(Weak<Mutex<JoinSet<()>>>);
@@ -187,6 +194,7 @@ where
 
 /// Service configuration for hyper NaiveProxy handler
 struct NaiveServiceConfig {
+    peer: Option<std::net::SocketAddr>,
     users: Arc<UserLookup>,
     fallback_path: Option<PathBuf>,
     resolver: Arc<dyn Resolver>,
@@ -249,11 +257,13 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
     resolver: Arc<dyn Resolver>,
     use_h2: bool,
 ) -> io::Result<TcpServerSetupResult> {
+    let peer = tls_stream.peer_addr();
     let io = TokioIo::new(tls_stream);
     let tasks = Arc::new(Mutex::new(JoinSet::new()));
     let executor = ConnectionExecutor(Arc::downgrade(&tasks));
 
     let service_config = Arc::new(NaiveServiceConfig {
+        peer,
         users: naive_cfg.users.clone(),
         fallback_path: naive_cfg.fallback_path.clone(),
         resolver,
@@ -270,10 +280,8 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         // HTTP/2 for NaiveProxy clients
         Ok(TcpServerSetupResult::Session(Box::pin(async move {
             let _tasks = tasks;
-            let service = hyper::service::service_fn(move |req| {
-                let config = service_config.clone();
-                async move { naive_service(req, config).await }
-            });
+            let service =
+                hyper::service::service_fn(move |req| naive_service(req, service_config.clone()));
 
             // H2 settings tuned for reasonable throughput without excessive memory
             // Reference naiveproxy uses ~64KB default, we use 256 KB for better throughput
@@ -447,7 +455,7 @@ async fn naive_service(
             destination.clone(),
             Vec::new(),
         ) {
-            Ok(prepared) => Some(prepared),
+            Ok(prepared) => Some(prepared.with_source(config.peer)),
             Err(_) => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
@@ -459,6 +467,7 @@ async fn naive_service(
 
     // Get upgrade future before moving the request
     let on_upgrade = hyper::upgrade::on(&mut req);
+    let peer = config.peer;
     let resolver = config.resolver.clone();
     let proxy_selector = config.proxy_selector.clone();
     let udp_enabled = config.udp_enabled;
@@ -467,7 +476,10 @@ async fn naive_service(
         let _permits = permits;
         match on_upgrade.await {
             Ok(upgraded) => {
-                let io = HyperUpgradedStream(Mutex::new(TokioIo::new(upgraded)));
+                let io = HyperUpgradedStream {
+                    io: Mutex::new(TokioIo::new(upgraded)),
+                    peer,
+                };
 
                 if padding_type != PaddingType::None {
                     let stream =
@@ -647,6 +659,7 @@ mod sniff_tests {
                     };
                     let streams = Arc::new(Mutex::new(JoinSet::new()));
                     let config = Arc::new(NaiveServiceConfig {
+                        peer: None,
                         users: Arc::new(UserLookup::new(vec![("test".into(), "user".into(), "pass".into())])),
                         fallback_path: None, resolver: fixture.resolver.clone(), proxy_selector: fixture.selector.clone(),
                         udp_enabled: true, padding_enabled: true,
@@ -687,6 +700,7 @@ mod sniff_tests {
                     let (selector, resolver, target, payload) = case.fixture(&mut upstreams).await;
                     let tasks = Arc::new(Mutex::new(JoinSet::new()));
                     let config = Arc::new(NaiveServiceConfig {
+                        peer: None,
                         users: Arc::new(UserLookup::new(vec![("test".into(), "user".into(), "pass".into())])),
                         fallback_path: None, resolver, proxy_selector: selector,
                         udp_enabled: true, padding_enabled: padded,
@@ -738,6 +752,7 @@ mod sniff_tests {
             ] {
                 let tasks = Arc::new(Mutex::new(JoinSet::new()));
                 let config = Arc::new(NaiveServiceConfig {
+                    peer: None,
                     users: Arc::new(UserLookup::new(vec![(
                         "test".into(), "user".into(), "pass".into(),
                     )])),
@@ -872,6 +887,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             );
 
             if is_connect == 1 {
+                let peer = stream.peer_addr();
                 let uot_v2_stream = UotV2Stream::new(stream);
 
                 let route = crate::util::timeout_stream_setup(crate::routing::ingress::route_udp(
@@ -887,7 +903,9 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                         error
                     }
                 })?;
-                let setup = crate::util::timeout_stream_setup(route.connect(&resolver)).await?;
+                let setup =
+                    crate::util::timeout_stream_setup(route.with_source(peer).connect(&resolver))
+                        .await?;
                 return run_udp_copy(Box::new(uot_v2_stream), setup.stream, false, false).await;
             } else {
                 // V2 non-connect mode (same as V1)
@@ -916,11 +934,15 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     let routed = crate::util::timeout_stream_setup(route.connect(&resolver)).await?;
     let mut client_stream: Box<dyn AsyncStream> = match routed.setup {
         Some(result) => {
+            let flow = result.client_stream.flow().cloned();
             if let Some(data) = result.early_data {
-                crate::util::timeout_stream_setup(async {
-                    tokio::io::AsyncWriteExt::write_all(&mut stream, &data).await?;
-                    tokio::io::AsyncWriteExt::flush(&mut stream).await
-                })
+                crate::control::tracked_stream::during_flow(
+                    flow.as_deref(),
+                    crate::util::timeout_stream_setup(async {
+                        tokio::io::AsyncWriteExt::write_all(&mut stream, &data).await?;
+                        tokio::io::AsyncWriteExt::flush(&mut stream).await
+                    }),
+                )
                 .await?;
             }
             result.client_stream
@@ -951,10 +973,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     )
     .await;
 
-    futures::join!(
-        crate::util::shutdown_stream(&mut stream),
-        crate::util::shutdown_stream(&mut client_stream),
-    );
+    crate::util::shutdown_stream_pair(&mut stream, &mut client_stream).await;
 
     match result {
         Ok(()) => {

@@ -228,6 +228,7 @@ pub struct ClientProxySelector {
     has_ip_rules: bool,
     has_hostname_rules: bool,
     sniff_enabled: bool,
+    tracks_flows: bool,
     fake_dns: Option<Arc<FakeDnsContext>>,
 }
 
@@ -255,6 +256,18 @@ pub(crate) struct PreparedDestination {
 }
 
 impl PreparedDestination {
+    pub(crate) fn flow_info(&self) -> crate::control::flows::FlowInfo {
+        crate::control::flows::FlowInfo {
+            original: Some(self.wire_destination.clone()),
+            restored_host: self
+                .connection_target
+                .address()
+                .hostname()
+                .map(str::to_owned),
+            fake_dns: self.is_fake_dns(),
+            ..Default::default()
+        }
+    }
     pub(crate) fn is_fake_dns(&self) -> bool {
         self.source == DestinationSource::FakeDns
     }
@@ -302,6 +315,10 @@ impl ClientProxySelector {
         };
 
         let has_ip_rules = rules.iter().any(|rule| rule.predicate.dependencies.ip);
+        let tracks_flows = rules.iter().any(|rule| match &rule.action {
+            ConnectAction::Allow { chain_group, .. } => chain_group.tracks_flows(),
+            ConnectAction::Block => false,
+        });
         let has_hostname_rules = rules
             .iter()
             .any(|rule| rule.predicate.dependencies.hostname);
@@ -311,6 +328,7 @@ impl ClientProxySelector {
             has_ip_rules,
             has_hostname_rules,
             sniff_enabled: false,
+            tracks_flows,
             fake_dns: None,
         }
     }
@@ -318,6 +336,10 @@ impl ClientProxySelector {
     pub(crate) fn with_sniff(mut self, enabled: bool) -> Self {
         self.sniff_enabled = enabled;
         self
+    }
+
+    pub(crate) fn tracks_flows(&self) -> bool {
+        self.tracks_flows
     }
 
     pub(crate) fn inherit_inbound_policy(mut self, parent: &Self) -> std::io::Result<Self> {

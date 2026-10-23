@@ -55,6 +55,19 @@ impl TlsClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for TlsClientHandler {
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        resolver: &std::sync::Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        match &self.handler {
+            TlsInnerClientHandler::Default(handler) => {
+                handler.prepare_target(target, resolver).await
+            }
+            TlsInnerClientHandler::VisionVless { .. } => Ok(target),
+        }
+    }
+
     async fn try_reuse_tcp_stream(
         &self,
         target: &ResolvedLocation,
@@ -164,6 +177,17 @@ mod tests {
 
     #[async_trait]
     impl TcpClientHandler for RejectReuse {
+        async fn prepare_target(
+            &self,
+            _: ResolvedLocation,
+            _: &Arc<dyn crate::resolver::Resolver>,
+        ) -> std::io::Result<ResolvedLocation> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "target rejected",
+            ))
+        }
+
         async fn try_reuse_tcp_stream(
             &self,
             _: &ResolvedLocation,
@@ -205,7 +229,9 @@ mod tests {
                 Box::new(RejectReuse),
             )),
         ];
-        for handler in defaults {
+        let resolver: Arc<dyn crate::resolver::Resolver> =
+            Arc::new(crate::resolver::NativeResolver::new());
+        for handler in &defaults {
             assert_eq!(
                 handler
                     .try_reuse_tcp_stream(&target)
@@ -214,6 +240,30 @@ mod tests {
                     .unwrap()
                     .to_string(),
                 "CONNECT rejected"
+            );
+        }
+        let wrappers: Vec<Box<dyn TcpClientHandler>> = vec![
+            Box::new(crate::websocket::WebsocketTcpClientHandler::new(
+                None,
+                None,
+                Default::default(),
+                Box::new(RejectReuse),
+            )),
+            Box::new(crate::shadow_tls::ShadowTlsClientHandler::new(
+                "password".into(),
+                config.clone(),
+                "localhost".try_into().unwrap(),
+                Box::new(RejectReuse),
+            )),
+        ];
+        for handler in defaults.into_iter().chain(wrappers) {
+            assert_eq!(
+                handler
+                    .prepare_target(target.clone(), &resolver)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
             );
         }
         let vision: Vec<Box<dyn TcpClientHandler>> = vec![
@@ -234,6 +284,14 @@ mod tests {
             )),
         ];
         for handler in vision {
+            assert_eq!(
+                handler
+                    .prepare_target(target.clone(), &resolver)
+                    .await
+                    .unwrap()
+                    .location(),
+                target.location()
+            );
             assert!(
                 handler
                     .try_reuse_tcp_stream(&target)

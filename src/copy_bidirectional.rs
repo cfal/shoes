@@ -385,10 +385,32 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
+    let a_flow = a.flow().cloned();
+    let b_flow = b.flow().cloned();
+    crate::control::tracked_stream::during_flows(
+        a_flow.as_deref(),
+        b_flow.as_deref(),
+        copy_bidirectional_inner(a, b, a_need_initial_flush, b_need_initial_flush),
+    )
+    .await
+}
+
+async fn copy_bidirectional_inner<A: AsyncStream + ?Sized, B: AsyncStream + ?Sized>(
+    a: &mut A,
+    b: &mut B,
+    a_need_initial_flush: bool,
+    b_need_initial_flush: bool,
+) -> io::Result<()> {
     #[cfg(target_os = "linux")]
-    if let (Some(a), Some(b)) = (a.plain_tcp(), b.plain_tcp()) {
+    if let (Some(a_tcp), Some(b_tcp)) = (a.plain_tcp(), b.plain_tcp()) {
         // Raw Tokio sockets have no userspace output to flush.
-        return crate::splice::copy_bidirectional(a, b).await;
+        return crate::splice::copy_bidirectional_tracked(
+            a_tcp,
+            b_tcp,
+            a.flow().map(AsRef::as_ref),
+            b.flow().map(AsRef::as_ref),
+        )
+        .await;
     }
 
     let copy = CopyBidirectional::new(
@@ -410,9 +432,11 @@ where
         CopyOutcome::Splice => {
             // The buffered stage may have exhausted its byte quota in this poll.
             tokio::task::yield_now().await;
-            crate::splice::copy_bidirectional(
+            crate::splice::copy_bidirectional_tracked(
                 a.plain_tcp().expect("raw stream after handoff"),
                 b.plain_tcp().expect("raw stream after handoff"),
+                a.flow().map(AsRef::as_ref),
+                b.flow().map(AsRef::as_ref),
             )
             .await
         }
@@ -436,16 +460,19 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
-    CopyBidirectional::new(
+    let a_flow = a.flow().cloned();
+    let b_flow = b.flow().cloned();
+    let copy = CopyBidirectional::new(
         a,
         b,
         a_need_initial_flush,
         b_need_initial_flush,
         a_to_b_buf_size,
         b_to_a_buf_size,
-    )
-    .await
-    .map(|_| ())
+    );
+    crate::control::tracked_stream::during_flows(a_flow.as_deref(), b_flow.as_deref(), copy)
+        .await
+        .map(|_| ())
 }
 
 fn copy_buffer_size(requested: usize, writer: &(impl AsyncStream + ?Sized)) -> usize {

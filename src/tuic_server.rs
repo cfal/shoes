@@ -289,8 +289,14 @@ async fn run_bidirectional_loop(
         let resolver = resolver.clone();
         tasks.spawn(async move {
             let _permit = permit;
-            match process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream)
-                .await
+            match process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                send_stream,
+                recv_stream,
+                conn.remote_address(),
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -392,6 +398,7 @@ async fn process_tcp_stream(
     resolver: Arc<dyn Resolver>,
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
     let mut stream_reader = StreamReader::new_with_buffer_size(1024);
     let tuic_version = stream_reader.read_u8(&mut recv).await?;
@@ -414,7 +421,7 @@ async fn process_tcp_stream(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
     relay_tcp_stream(
-        Box::new(QuicStream::from(send, recv)),
+        Box::new(QuicStream::from(send, recv).with_peer(peer)),
         remote_location,
         stream_reader.into_unparsed_data(),
         client_proxy_selector,
@@ -436,7 +443,8 @@ async fn relay_tcp_stream(
                 &client_proxy_selector,
                 remote_location.clone(),
                 initial_data,
-            )?;
+            )?
+            .with_source(server_stream.peer_addr());
             prepared
                 .route(&mut server_stream, &client_proxy_selector, &resolver)
                 .await
@@ -474,17 +482,21 @@ async fn relay_tcp_stream(
         return Ok(());
     };
 
-    crate::util::timeout_stream_setup(async {
-        if let Some(data) = early_data {
-            write_all(&mut server_stream, &data).await?;
-            server_stream.flush().await?;
-        }
-        if !routed.prefix.is_empty() {
-            write_all(&mut client_stream, &routed.prefix).await?;
-            client_stream.flush().await?;
-        }
-        Ok(())
-    })
+    let flow = client_stream.flow().cloned();
+    crate::control::tracked_stream::during_flow(
+        flow.as_deref(),
+        crate::util::timeout_stream_setup(async {
+            if let Some(data) = early_data {
+                write_all(&mut server_stream, &data).await?;
+                server_stream.flush().await?;
+            }
+            if !routed.prefix.is_empty() {
+                write_all(&mut client_stream, &routed.prefix).await?;
+                client_stream.flush().await?;
+            }
+            Ok(())
+        }),
+    )
     .await?;
     drop(routed.prefix);
 
@@ -499,10 +511,7 @@ async fn relay_tcp_stream(
     )
     .await;
 
-    futures::join!(
-        crate::util::shutdown_stream(&mut server_stream),
-        crate::util::shutdown_stream(&mut client_stream),
-    );
+    crate::util::shutdown_stream_pair(&mut server_stream, &mut client_stream).await;
 
     copy_result?;
     Ok(())
@@ -1024,7 +1033,11 @@ async fn process_udp_packet(
                         None
                     }
                 };
-                let client_socket = UdpRelay::new(client_proxy_selector.clone(), resolver.clone())?;
+                let client_socket = UdpRelay::new(
+                    client_proxy_selector.clone(),
+                    resolver.clone(),
+                    Some(connection.remote_address()),
+                )?;
 
                 let session = if is_uni_stream {
                     UdpSession::start_with_send_stream(
@@ -1419,6 +1432,7 @@ mod lifecycle_tests {
             UdpRelay::new(
                 Arc::new(ClientProxySelector::new(Vec::new())),
                 Arc::new(crate::resolver::NativeResolver::new()),
+                None,
             )
             .unwrap(),
         );

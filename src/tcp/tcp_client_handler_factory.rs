@@ -424,7 +424,8 @@ pub fn create_tcp_client_proxy_selector(
                     client_chains,
                 } => {
                     let chain_group =
-                        try_build_client_chain_group(client_chains, resolver.clone())?;
+                        try_build_client_chain_group(client_chains, resolver.clone())?
+                            .with_description(criteria.description.clone());
                     ConnectAction::new_allow(override_address, chain_group)
                 }
                 RuleActionConfig::Block => ConnectAction::new_block(),

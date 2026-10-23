@@ -13,6 +13,7 @@
 //! - [`groups`]: Top-level configuration groups and the Config enum
 //! - [`dns`]: DNS server configuration
 
+pub mod clash_api;
 pub mod client;
 pub mod common;
 pub mod dns;
@@ -30,6 +31,7 @@ pub mod wireguard;
 pub mod xhttp;
 
 // Re-export all public types for convenience
+pub use clash_api::{CacheFileConfig, ClashApiConfig, ControlConfig};
 #[allow(unused_imports)]
 pub use client::{
     ClientConfig, ClientProxyConfig, H2MuxConfig, HttpVersion, TlsClientConfig,
@@ -38,7 +40,7 @@ pub use client::{
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
 pub use global::GlobalLimits;
-pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource, RuleGroupRules};
+pub use groups::{ClientConfigGroup, Config, GroupStrategy, NamedPem, PemSource, RuleGroupRules};
 pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;
 pub use server::{

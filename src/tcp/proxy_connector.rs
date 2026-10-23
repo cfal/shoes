@@ -39,6 +39,14 @@ use crate::tcp::tcp_handler::TcpClientSetupResult;
     reason = "async-trait adds must_use to boxed futures"
 )]
 pub trait ProxyConnector: Send + Sync + Debug {
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        _resolver: &Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        Ok(target)
+    }
+
     fn needs_carrier_dialer(&self) -> bool {
         false
     }

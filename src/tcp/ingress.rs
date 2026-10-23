@@ -14,6 +14,7 @@ pub(crate) struct PreparedTcp {
     target: IngressTarget,
     prefix: Vec<u8>,
     probe: Option<StreamProbe>,
+    source: Option<std::net::SocketAddr>,
 }
 
 pub(crate) struct RoutedTcp {
@@ -27,6 +28,7 @@ pub(crate) struct TcpRoute<'a> {
     wire_destination: NetLocation,
     prefix: Vec<u8>,
     target: TcpRouteTarget<'a>,
+    info: crate::control::flows::FlowInfo,
 }
 
 enum TcpRouteTarget<'a> {
@@ -45,7 +47,11 @@ impl TcpRoute<'_> {
             TcpRouteTarget::Forward(ConnectDecision::Allow {
                 chain_group,
                 remote_location,
-            }) => Some(chain_group.connect_tcp(remote_location, resolver).await?),
+            }) => Some(
+                chain_group
+                    .connect_tcp_with_info(remote_location, resolver, self.info)
+                    .await?,
+            ),
             TcpRouteTarget::Forward(ConnectDecision::Block) => None,
         };
         Ok(RoutedTcp {
@@ -74,7 +80,13 @@ impl PreparedTcp {
             target,
             prefix,
             probe,
+            source: None,
         })
+    }
+
+    pub(crate) fn with_source(mut self, source: Option<std::net::SocketAddr>) -> Self {
+        self.source = source;
+        self
     }
 
     pub(crate) fn needs_sniff_read(&self) -> bool {
@@ -107,6 +119,14 @@ impl PreparedTcp {
         } else {
             (None, self.prefix)
         };
+        let mut info = crate::control::flows::FlowInfo::default();
+        if selector.tracks_flows()
+            && let IngressTarget::Forward(target) = &self.target
+        {
+            info = target.flow_info();
+            info.source = self.source;
+            info.sniff_host = hostname.clone();
+        }
         let (wire_destination, target) = match self.target {
             IngressTarget::LocalDns {
                 wire_destination,
@@ -126,6 +146,7 @@ impl PreparedTcp {
             wire_destination,
             target,
             prefix,
+            info,
         })
     }
 }

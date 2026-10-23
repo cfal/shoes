@@ -10,10 +10,10 @@ use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec,
 use crate::async_stream::AsyncTargetedMessageStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
-use crate::tcp::tcp_server::run_udp_copy;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
 use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -32,6 +32,10 @@ use tokio_util::sync::CancellationToken;
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn cancelled_fin(stream: &mut AnyTlsStream) {
+    let _ = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+}
 
 async fn setup_timeout<T>(
     future: impl std::future::Future<Output = io::Result<T>>,
@@ -104,6 +108,7 @@ pub struct AnyTlsSession {
 
     /// Authenticated user name for logging
     user_name: String,
+    peer: Option<std::net::SocketAddr>,
 
     /// Initial data buffered during auth (to be prepended to first read)
     /// Uses std::sync::Mutex since it's only accessed once with no await points
@@ -124,14 +129,16 @@ impl AnyTlsSession {
         initial_data: Option<Box<[u8]>>,
     ) -> Arc<Self>
     where
-        IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        IO: crate::async_stream::AsyncStream + 'static,
     {
+        let peer = conn.peer_addr();
         let (reader, writer) = tokio::io::split(conn);
         // Use bounded channel for outgoing data to provide backpressure
         // Buffer size is per-session, shared across all streams
         let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER * 4);
 
         Arc::new(Self {
+            peer,
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
@@ -166,7 +173,7 @@ impl AnyTlsSession {
     #[cfg(test)]
     pub fn new_server_test<IO>(conn: IO, padding: Arc<PaddingFactory>) -> Arc<Self>
     where
-        IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        IO: crate::async_stream::AsyncStream + 'static,
     {
         use crate::client_proxy_selector::ConnectRule;
         use crate::resolver::NativeResolver;
@@ -204,6 +211,7 @@ impl AnyTlsSession {
             proxy_provider,
             udp_enabled: false,
             user_name: String::new(),
+            peer: None,
             initial_data: std::sync::Mutex::new(None),
         })
     }
@@ -416,12 +424,13 @@ impl AnyTlsSession {
                         Entry::Vacant(entry) => {
                             // Create new stream with bounded channel for backpressure
                             let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-                            let stream = AnyTlsStream::new(
+                            let mut stream = AnyTlsStream::new(
                                 stream_id,
                                 data_rx,
                                 self.outgoing_tx.clone(),
                                 Arc::clone(&self.is_closed),
                             );
+                            stream.peer = self.peer;
                             entry.insert(data_tx);
                             Some(stream)
                         }
@@ -771,7 +780,7 @@ impl AnyTlsSession {
             destination.clone(),
             Vec::new(),
         ) {
-            Ok(prepared) => prepared,
+            Ok(prepared) => prepared.with_source(self.peer),
             Err(error) => {
                 let message = format!("connect failed: {error}");
                 let _ = self.send_synack(stream_id, Some(&message)).await;
@@ -804,23 +813,56 @@ impl AnyTlsSession {
         match routed.setup {
             Some(client_result) => {
                 let mut client_stream = client_result.client_stream;
+                let flow = client_stream.flow().cloned();
 
                 if !optimistic {
-                    self.send_synack(stream_id, None).await?;
+                    let synack = self.send_synack(stream_id, None);
+                    tokio::pin!(synack);
+                    tokio::select! {
+                        result = &mut synack => result?,
+                        _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => {
+                            drop(client_stream);
+                            stream.close_read();
+                            // Finish the bounded control write; truncating a shared frame corrupts siblings.
+                            let _ = synack.await;
+                            cancelled_fin(&mut stream).await;
+                            return Err(crate::control::tracked_stream::cancelled());
+                        }
+                    }
                 }
-                if let Some(data) = client_result.early_data {
-                    setup_timeout(async {
-                        stream.write_all(&data).await?;
-                        stream.flush().await
-                    })
-                    .await?;
+                if let Some(data) = client_result.early_data
+                    && let Err(error) = crate::control::tracked_stream::during_flow(
+                        flow.as_deref(),
+                        setup_timeout(async {
+                            stream.write_all(&data).await?;
+                            stream.flush().await
+                        }),
+                    )
+                    .await
+                {
+                    drop(client_stream);
+                    stream.close_read();
+                    if flow.as_ref().is_some_and(|flow| flow.cancel.is_cancelled()) {
+                        cancelled_fin(&mut stream).await;
+                    }
+                    return Err(error);
                 }
-                if !routed.prefix.is_empty() {
-                    setup_timeout(async {
-                        client_stream.write_all(&routed.prefix).await?;
-                        client_stream.flush().await
-                    })
-                    .await?;
+                if !routed.prefix.is_empty()
+                    && let Err(error) = crate::control::tracked_stream::during_flow(
+                        flow.as_deref(),
+                        setup_timeout(async {
+                            client_stream.write_all(&routed.prefix).await?;
+                            client_stream.flush().await
+                        }),
+                    )
+                    .await
+                {
+                    drop(client_stream);
+                    stream.close_read();
+                    if flow.as_ref().is_some_and(|flow| flow.cancel.is_cancelled()) {
+                        cancelled_fin(&mut stream).await;
+                    }
+                    return Err(error);
                 }
 
                 drop(routed.prefix);
@@ -830,11 +872,19 @@ impl AnyTlsSession {
                 let result =
                     copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
-                let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, async {
-                    let _ = stream.shutdown().await;
-                    let _ = client_stream.shutdown().await;
-                })
-                .await;
+                let cancelled = tokio::select! {
+                    biased;
+                    _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => true,
+                    _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, async {
+                        let _ = stream.shutdown().await;
+                        let _ = client_stream.shutdown().await;
+                    }) => false,
+                };
+                if cancelled {
+                    drop(client_stream);
+                    stream.close_read();
+                    cancelled_fin(&mut stream).await;
+                }
 
                 if let Err(e) = &result {
                     log::debug!("AnyTLS stream {} ended: {}", stream_id, e);
@@ -928,7 +978,7 @@ impl AnyTlsSession {
     /// Uses connect_udp for proper proxy chaining support.
     async fn handle_uot_v2_connect(
         &self,
-        stream: AnyTlsStream,
+        mut stream: AnyTlsStream,
         destination: NetLocation,
     ) -> io::Result<()> {
         let stream_id = stream.id();
@@ -940,7 +990,7 @@ impl AnyTlsSession {
         ))
         .await
         {
-            Ok(route) => route,
+            Ok(route) => route.with_source(self.peer),
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 let _ = self
                     .send_synack(stream_id, Some("UDP blocked by rules"))
@@ -966,14 +1016,46 @@ impl AnyTlsSession {
                 return Err(error);
             }
         };
-        self.send_synack(stream_id, None).await?;
-        run_udp_copy(
-            Box::new(VlessMessageStream::new(stream)),
-            setup.stream,
-            false,
-            false,
-        )
-        .await
+        let flow = setup.stream.flow().cloned();
+        let synack = self.send_synack(stream_id, None);
+        tokio::pin!(synack);
+        tokio::select! {
+            result = &mut synack => result?,
+            _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => {
+                drop(setup.stream);
+                stream.close_read();
+                // A partially written shared control frame must finish before FIN.
+                let _ = synack.await;
+                cancelled_fin(&mut stream).await;
+                return Err(crate::control::tracked_stream::cancelled());
+            }
+        }
+        let mut client_stream = setup.stream;
+        let (result, cancelled) = {
+            let mut server_stream = VlessMessageStream::new(&mut stream);
+            let result = crate::control::tracked_stream::during_flow(
+                flow.as_deref(),
+                copy_bidirectional_message(&mut server_stream, &mut client_stream, false, false),
+            )
+            .await;
+            let cancelled = tokio::select! {
+                biased;
+                _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => true,
+                _ = async {
+                    futures::join!(
+                        crate::util::shutdown_message_stream(&mut server_stream),
+                        crate::util::shutdown_message_stream(&mut client_stream),
+                    );
+                } => false,
+            };
+            (result, cancelled)
+        };
+        if cancelled {
+            drop(client_stream);
+            stream.close_read();
+            cancelled_fin(&mut stream).await;
+        }
+        result
     }
 
     /// Handle UoT multi-destination mode (V1 and V2 non-connect)
@@ -1424,6 +1506,349 @@ mod tests {
             })
             .await
             .unwrap();
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestConnector {
+        address: std::net::SocketAddr,
+        blocked_write: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[derive(Debug)]
+    struct BlockedWriter {
+        stream: tokio::net::TcpStream,
+        writing: Arc<tokio::sync::Notify>,
+    }
+
+    impl AsyncRead for BlockedWriter {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for BlockedWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.writing.notify_one();
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for BlockedWriter {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<bool>> {
+            std::task::Poll::Ready(Ok(false))
+        }
+    }
+    impl crate::async_stream::AsyncStream for BlockedWriter {}
+
+    #[async_trait::async_trait]
+    impl crate::tcp::socket_connector::SocketConnector for TestConnector {
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: &crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
+            Ok(Box::new(BlockedWriter {
+                stream: tokio::net::TcpStream::connect(self.address).await?,
+                writing: self.blocked_write.as_ref().unwrap().clone(),
+            }))
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
+            let stream = tokio::net::TcpStream::connect(self.address).await?;
+            Ok(Box::new(VlessMessageStream::new(stream)))
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_flows_release_reads_and_egress_before_bounded_fin() {
+        #[derive(Clone, Copy, Debug)]
+        enum Phase {
+            Synack,
+            EarlyData,
+            Prefix,
+            Copy,
+            UdpSynack,
+            UdpCopy,
+            UdpShutdown,
+        }
+        use Phase::*;
+        for (phase, drain) in [
+            Synack,
+            EarlyData,
+            Prefix,
+            Copy,
+            UdpSynack,
+            UdpCopy,
+            UdpShutdown,
+        ]
+        .into_iter()
+        .flat_map(|phase| [true, false].map(|drain| (phase, drain)))
+        {
+            let early_data = matches!(phase, EarlyData);
+            let prefix = matches!(phase, Prefix);
+            let established = matches!(phase, Copy | UdpCopy | UdpShutdown);
+            let udp = matches!(phase, UdpSynack | UdpCopy | UdpShutdown);
+            let during_shutdown = matches!(phase, UdpShutdown);
+            timeout(Duration::from_secs(3), async {
+                use crate::client_proxy_chain::ClientChainGroup;
+                use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+                use crate::control::catalog::RuleDescription;
+                use crate::control::flows::{FlowContext, FlowRegistry};
+                let registry = Arc::new(FlowRegistry::default());
+                let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver);
+                let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+                let target = NetLocation::from_str(
+                    &format!("127.0.0.1:{}", listener.local_addr().unwrap().port()),
+                    None,
+                )
+                .unwrap();
+                let client = if early_data {
+                    serde_json::from_value(serde_json::json!({
+                        "address": target.to_string(), "protocol": {"type":"http"},
+                    }))
+                    .unwrap()
+                } else {
+                    crate::config::ClientConfig::default()
+                };
+                let writing = Arc::new(tokio::sync::Notify::new());
+                let chain = if udp || prefix {
+                    crate::client_proxy_chain::ClientProxyChain::new(
+                        vec![crate::client_proxy_chain::InitialHopEntry::Direct(
+                            Arc::new(TestConnector {
+                                address: std::net::SocketAddr::from((
+                                    [127, 0, 0, 1],
+                                    listener.local_addr().unwrap().port(),
+                                )),
+                                blocked_write: prefix.then(|| writing.clone()),
+                            }),
+                        )],
+                        Vec::new(),
+                    )
+                } else {
+                    crate::tcp::chain_builder::try_build_client_proxy_chain(
+                        crate::option_util::OneOrSome::One(crate::config::ClientChainHop::Single(
+                            crate::config::ConfigSelection::Config(client),
+                        )),
+                        resolver.clone(),
+                    )
+                    .unwrap()
+                };
+                let group = ClientChainGroup::new(vec![chain]).with_description(Some(Arc::new(
+                    RuleDescription {
+                        payload: "all".into(),
+                        proxy: "DIRECT".into(),
+                        context: Some(Arc::new(FlowContext {
+                            registry: registry.clone(),
+                            generation: 1,
+                            inbound: "test".into(),
+                            scope: "root".into(),
+                            protocol: "AnyTLS".into(),
+                        })),
+                    },
+                )));
+                let selector = Arc::new(
+                    ClientProxySelector::new(vec![ConnectRule::new(
+                        if prefix {
+                            vec![crate::address::NetLocationMask::from("sniff.example").unwrap()]
+                        } else {
+                            vec![crate::address::NetLocationMask::ANY]
+                        },
+                        ConnectAction::new_allow(None, group),
+                    )])
+                    .with_sniff(prefix),
+                );
+                let (transport, mut peer) = duplex(if early_data || prefix || established {
+                    8192
+                } else {
+                    1
+                });
+                let session = AnyTlsSession::new_server_with_initial_data(
+                    transport,
+                    PaddingFactory::default_factory(),
+                    resolver,
+                    selector,
+                    false,
+                    "test".into(),
+                    None,
+                );
+                session.peer_version.store(2, Ordering::Relaxed);
+                while session.outgoing_tx.capacity() > 0 {
+                    session
+                        .outgoing_tx
+                        .try_send((2, Bytes::from_static(b"queued")))
+                        .unwrap();
+                }
+                let (sender, receiver) = mpsc::channel(1);
+                if prefix {
+                    sender
+                        .try_send(Bytes::from(crate::sniff::tests::hello(
+                            &rustls::version::TLS13,
+                            true,
+                        )))
+                        .unwrap();
+                } else if !established {
+                    sender
+                        .try_send(Bytes::from_static(b"queued upload"))
+                        .unwrap();
+                }
+                let stream = AnyTlsStream::new(
+                    1,
+                    receiver,
+                    session.outgoing_tx.clone(),
+                    session.is_closed.clone(),
+                );
+                let handler = session.clone();
+                let forwarding = tokio::spawn(async move {
+                    if udp {
+                        handler.handle_uot_v2_connect(stream, target).await
+                    } else {
+                        handler.handle_tcp_forward(stream, target).await
+                    }
+                });
+                let (mut egress, _) = listener.accept().await.unwrap();
+                if early_data {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(egress.read_u8().await.unwrap());
+                    }
+                    assert!(request.starts_with(b"CONNECT "));
+                    egress
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\ngreeting")
+                        .await
+                        .unwrap();
+                }
+                let mut header = [0; 7];
+                let initial = if early_data || prefix || established {
+                    7
+                } else {
+                    1
+                };
+                peer.read_exact(&mut header[..initial]).await.unwrap();
+                if prefix {
+                    writing.notified().await;
+                    assert_eq!(
+                        registry.snapshot(0).connections[0].metadata.sniff_host,
+                        "sniff.example"
+                    );
+                }
+                if early_data {
+                    assert_eq!(
+                        registry.snapshot(0).connections[0].download,
+                        8,
+                        "fixture must return early data before copying starts"
+                    );
+                }
+                if established {
+                    if udp {
+                        egress.write_all(&8u16.to_be_bytes()).await.unwrap();
+                    }
+                    egress.write_all(b"download").await.unwrap();
+                    while registry.snapshot(0).connections[0].download == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                tokio::task::yield_now().await;
+                if during_shutdown {
+                    sender.try_send(Bytes::new()).unwrap();
+                    assert_eq!(egress.read(&mut [0; 1]).await.unwrap(), 0);
+                }
+                registry.cancel_all();
+                if established || prefix {
+                    sender
+                        .try_send(Bytes::from_static(b"queued upload"))
+                        .unwrap();
+                }
+                timeout(Duration::from_millis(100), async {
+                    while !registry.snapshot(0).connections.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(egress.read(&mut [0; 1]).await.unwrap(), 0);
+                timeout(Duration::from_millis(100), sender.closed())
+                    .await
+                    .unwrap();
+                assert!(!forwarding.is_finished(), "{phase:?}, drain={drain}");
+                peer.read_exact(&mut header[initial..]).await.unwrap();
+                assert_eq!(
+                    header.as_slice(),
+                    Frame::control(Command::SynAck, 1).encode().as_ref()
+                );
+                if drain {
+                    let mut outgoing = session.outgoing_rx.lock().await;
+                    loop {
+                        let (id, data) = outgoing.recv().await.unwrap();
+                        if id == 1 {
+                            assert!(
+                                data.is_empty(),
+                                "cancelled stream must queue FIN after SYNACK"
+                            );
+                            break;
+                        }
+                        assert_eq!((id, data), (2, Bytes::from_static(b"queued")));
+                    }
+                    drop(outgoing);
+                }
+                let result = timeout(Duration::from_secs(1), forwarding)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if during_shutdown {
+                    result.unwrap();
+                } else {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+                }
+                let (result, read) =
+                    tokio::join!(session.send_synack(2, None), peer.read_exact(&mut header));
+                result.unwrap();
+                read.unwrap();
+                assert_eq!(
+                    header.as_slice(),
+                    Frame::control(Command::SynAck, 2).encode().as_ref()
+                );
+                assert!(!session.is_closed());
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{phase:?}, drain={drain}: {error}"));
         }
     }
 

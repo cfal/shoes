@@ -239,10 +239,12 @@ impl TcpServerHandler for SnellServerHandler {
         } else {
             write_all(&mut server_stream, UDP_READY_RESPONSE).await?;
 
+            let peer = server_stream.peer_addr();
             let udp_stream = SnellUdpStream::new(
                 Box::new(server_stream),
                 ShadowsocksStreamType::Aead.max_payload_len(),
-            );
+            )
+            .with_peer(peer);
 
             Ok(TcpServerSetupResult::MultiDirectionalUdp {
                 stream: Box::new(udp_stream),

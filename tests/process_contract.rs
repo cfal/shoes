@@ -30,6 +30,10 @@ mod fake_dns;
 mod rule_sets;
 
 #[cfg(unix)]
+#[path = "cases/process_contract/clash_api.rs"]
+mod clash_api;
+
+#[cfg(unix)]
 #[tokio::test]
 async fn wireguard_reload_retains_invalid_candidates_rebinds_and_releases_on_exit() {
     wireguard_reload(false).await;

@@ -151,6 +151,7 @@ enum SessionLookup {
 
 /// A routing session (one per unique flow)
 struct RoutingSession {
+    cancelled: Option<Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>>,
     permit: Option<crate::resources::BudgetPermit>,
     /// The destination this session routes to
     destination: NetLocation,
@@ -200,7 +201,11 @@ impl RoutingSession {
         lookup_key: LookupKey,
         remote: Box<dyn AsyncMessageStream>,
     ) -> Self {
+        let cancelled = remote
+            .flow()
+            .map(|flow| Box::pin(flow.cancel.clone().cancelled_owned()));
         Self {
+            cancelled,
             permit: None,
             destination,
             session_id,
@@ -296,6 +301,12 @@ pub enum ServerStream {
 }
 
 impl ServerStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::Targeted(stream) => stream.peer_addr(),
+            Self::Session(stream) => stream.peer_addr(),
+        }
+    }
     fn supports_hostname_source(&self) -> bool {
         match self {
             Self::Targeted(stream) => stream.supports_hostname_source(),
@@ -419,6 +430,7 @@ struct PendingSessionCreate {
 }
 
 struct PendingShutdown {
+    cancelled: Option<Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>>,
     _permit: Option<crate::resources::BudgetPermit>,
     stream: Box<dyn AsyncMessageStream>,
     deadline: Pin<Box<tokio::time::Sleep>>,
@@ -556,6 +568,13 @@ impl<'a> UdpRouter<'a> {
         let count = self.pending_shutdowns.len();
         for _ in 0..count {
             let mut pending = self.pending_shutdowns.pop_front().unwrap();
+            if pending
+                .cancelled
+                .as_mut()
+                .is_some_and(|cancelled| cancelled.as_mut().poll(cx).is_ready())
+            {
+                continue;
+            }
             if pending.deadline.as_mut().poll(cx).is_pending()
                 && Pin::new(&mut pending.stream)
                     .poll_shutdown_message(cx)
@@ -1116,7 +1135,15 @@ impl<'a> UdpRouter<'a> {
                         buf: PendingWriteBuffer::Startup(packet),
                     });
                 }
+                // Creation can finish after this poll's cancellation sweep.
+                let cancelled = session
+                    .cancelled
+                    .as_mut()
+                    .is_some_and(|cancelled| cancelled.as_mut().poll(cx).is_ready());
                 self.sessions.insert(id, session);
+                if cancelled {
+                    self.cancel_session(id);
+                }
                 true
             }
             Err(e) => {
@@ -1192,9 +1219,11 @@ impl<'a> UdpRouter<'a> {
         let require_ip_reply =
             !selector.fake_dns_enabled() || !self.server.supports_hostname_source();
 
+        let source = self.server.peer_addr();
         let future: SessionCreateFuture = Box::pin(async move {
             let setup =
-                connect_prepared_udp(&selector, prepared, &resolver, require_ip_reply).await?;
+                connect_prepared_udp(&selector, prepared, &resolver, require_ip_reply, source)
+                    .await?;
             Ok(SessionCreateResult {
                 permit,
                 remote: setup.stream,
@@ -1251,6 +1280,9 @@ impl<'a> UdpRouter<'a> {
             self.pending_shutdowns.pop_front();
         }
         self.pending_shutdowns.push_back(PendingShutdown {
+            cancelled: stream
+                .flow()
+                .map(|flow| Box::pin(flow.cancel.clone().cancelled_owned())),
             _permit: permit,
             stream,
             deadline: Box::pin(tokio::time::sleep(SHUTDOWN_TIMEOUT)),
@@ -1399,6 +1431,20 @@ impl<'a> Future for UdpRouter<'a> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+
+        let cancelled: Vec<_> = this
+            .sessions
+            .iter_mut()
+            .filter_map(|(id, session)| {
+                session
+                    .cancelled
+                    .as_mut()
+                    .and_then(|cancelled| cancelled.as_mut().poll(cx).is_ready().then_some(*id))
+            })
+            .collect();
+        for id in cancelled {
+            this.cancel_session(id);
+        }
 
         this.expiry_iteration = this.expiry_iteration.wrapping_add(1);
 
@@ -1759,6 +1805,189 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cancelled_expired_session_drops_blocked_shutdown() {
+        use crate::control::flows::{FlowContext, FlowRegistry};
+        use crate::control::tracked_stream::TrackedMessageStream;
+        let registry = Arc::new(FlowRegistry::default());
+        let destination = NetLocation::from_str("192.0.2.1:53", None).unwrap();
+        let guard = FlowContext {
+            registry: registry.clone(),
+            generation: 1,
+            inbound: "test".into(),
+            scope: "root".into(),
+            protocol: "Socks5".into(),
+        }
+        .register(
+            "udp",
+            &destination.clone().into(),
+            vec!["DIRECT".into()],
+            "all",
+            Default::default(),
+        );
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let mut server =
+            ServerStream::Targeted(Box::new(crate::uot::UotV1ServerStream::new_uot(stream)));
+        let mut router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            false,
+        );
+        let state = Arc::new(RemoteState::default());
+        let mut session = RoutingSession::new(
+            destination.clone(),
+            0,
+            destination.clone(),
+            LookupKey::Destination(destination.clone()),
+            Box::new(TrackedMessageStream::new(
+                Box::new(RecordingRemote {
+                    state: state.clone(),
+                }),
+                guard,
+            )),
+        );
+        session.expiry_key = Some(router.expiry_queue.insert(0, Duration::from_secs(1)));
+        router.sessions.insert(0, session);
+        let SessionLookup::ByDestination(lookup) = &mut router.session_lookup else {
+            unreachable!()
+        };
+        lookup.insert(destination, KeyState::Active(0));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        router.process_expired(&mut cx);
+        router.drain_remote_shutdowns(&mut cx);
+        assert_eq!(router.pending_shutdowns.len(), 1);
+        assert_eq!(registry.snapshot(0).connections.len(), 1);
+        assert!(state.shutdown_polls.load(Ordering::SeqCst) > 0);
+        registry.cancel_all();
+        router.drain_remote_shutdowns(&mut cx);
+        assert!(router.pending_shutdowns.is_empty());
+        assert!(registry.snapshot(0).connections.is_empty());
+        assert_eq!(state.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_session_cancellation_wakes_behind_a_blocked_sibling_response() {
+        use crate::control::flows::{FlowContext, FlowRegistry};
+        use crate::control::tracked_stream::TrackedMessageStream;
+
+        #[derive(Default)]
+        struct WakeFlag(AtomicBool);
+        impl futures::task::ArcWake for WakeFlag {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for cancel_before_ready in [true, false] {
+            let started = tokio::time::Instant::now();
+            let source = PacketSource::default();
+            source.block_writes.store(true, Ordering::SeqCst);
+            let mut server = ServerStream::Targeted(Box::new(source));
+            let mut router = test_router(&mut server);
+            let sibling = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+            let sibling_state = Arc::new(RemoteState::default());
+            seed_pending(
+                &mut router,
+                LookupKey::Destination(sibling.clone()),
+                b"sibling",
+            );
+            finish_setup(&mut router, sibling_state.clone());
+            router.sessions.get_mut(&0).unwrap().in_server_write_queue = 1;
+            let mut response = router.server_write_pool.acquire().unwrap();
+            response[..5].copy_from_slice(b"reply");
+            router.server_write_queue.push_back(PendingResponse {
+                id: 0,
+                buf: response,
+                len: 5,
+                source: sibling,
+                session_id: 0,
+            });
+
+            let destination = NetLocation::from_str("192.0.2.1:53", None).unwrap();
+            let registry = Arc::new(FlowRegistry::default());
+            let guard = FlowContext {
+                registry: registry.clone(),
+                generation: 1,
+                inbound: "test".into(),
+                scope: "root".into(),
+                protocol: "Socks5".into(),
+            }
+            .register(
+                "udp",
+                &destination.clone().into(),
+                vec!["DIRECT".into()],
+                "all",
+                Default::default(),
+            );
+            let state = Arc::new(RemoteState::default());
+            let remote = TrackedMessageStream::new(
+                Box::new(RecordingRemote {
+                    state: state.clone(),
+                }),
+                guard,
+            );
+            seed_pending(
+                &mut router,
+                LookupKey::Destination(destination.clone()),
+                b"new",
+            );
+            let (ready, pending) = tokio::sync::oneshot::channel();
+            router.pending_creates[0].future = Box::pin(async move { pending.await.unwrap() });
+            let wake = Arc::new(WakeFlag::default());
+            let waker = futures::task::waker(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+            wake.0.store(false, Ordering::SeqCst);
+            if cancel_before_ready {
+                registry.cancel_all();
+            }
+            assert!(
+                ready
+                    .send(Ok(SessionCreateResult {
+                        permit: crate::resources::try_stream().unwrap(),
+                        remote: Box::new(remote),
+                        reply_identity: destination.clone(),
+                    }))
+                    .is_ok()
+            );
+            assert!(wake.0.swap(false, Ordering::SeqCst));
+            assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+            if !cancel_before_ready {
+                assert_eq!(router.sessions.len(), 2);
+                registry.cancel_all();
+            }
+            for _ in 0..8 {
+                if !wake.0.swap(false, Ordering::SeqCst) {
+                    break;
+                }
+                assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+            }
+            assert_eq!(
+                router.sessions.len(),
+                1,
+                "cancel_before_ready={cancel_before_ready}"
+            );
+            assert!(registry.snapshot(0).connections.is_empty());
+            assert_eq!(state.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(state.shutdown_polls.load(Ordering::SeqCst), 0);
+            assert_eq!(sibling_state.drops.load(Ordering::SeqCst), 0);
+            assert_eq!(router.expiry_queue.len(), 1);
+            let SessionLookup::ByDestination(lookup) = &router.session_lookup else {
+                panic!()
+            };
+            assert!(!lookup.contains_key(&destination));
+            assert_eq!(router.startup_slots.snapshot().active, 0);
+            assert_eq!(router.startup_bytes.snapshot().active, 0);
+            assert_eq!(router.server_write_queue.len(), 1);
+            assert_eq!(&router.server_write_queue[0].buf[..5], b"reply");
+            assert_eq!(router.server_write_queue[0].id, 0);
+            assert_eq!(tokio::time::Instant::now(), started);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pending_shutdowns_are_bounded_and_expire() {
         let (stream, _peer) = tokio::io::duplex(1024);
         let mut server =
@@ -1947,6 +2176,7 @@ mod tests {
     struct PacketSource {
         packets: PacketQueue,
         closed: Arc<Mutex<VecDeque<MessageSessionId>>>,
+        block_writes: Arc<AtomicBool>,
     }
 
     impl AsyncReadTargetedMessage for PacketSource {
@@ -1987,6 +2217,9 @@ mod tests {
             _: &[u8],
             _: &NetLocation,
         ) -> Poll<io::Result<()>> {
+            if self.block_writes.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
             Poll::Ready(Ok(()))
         }
     }

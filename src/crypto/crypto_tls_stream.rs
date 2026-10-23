@@ -522,6 +522,9 @@ impl<IO: AsyncStream> AsyncPing for CryptoTlsStream<IO> {
 }
 
 impl<IO: AsyncStream> AsyncStream for CryptoTlsStream<IO> {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.io.peer_addr()
+    }
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&tokio::net::TcpStream> {
         if self.state != TlsState::Stream

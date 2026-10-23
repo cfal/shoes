@@ -151,6 +151,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
     _permit: crate::resources::BudgetPermit,
     setup_timeout: Duration,
 ) -> std::io::Result<()> {
+    let source = stream.peer_addr();
     let setup_server_stream_future =
         timeout(setup_timeout, setup_server_stream(stream, server_handler));
 
@@ -185,7 +186,8 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                         &proxy_selector,
                         remote_location.clone(),
                         initial_remote_data.map_or_else(Vec::new, |data| data.into_vec()),
-                    )?;
+                    )?
+                    .with_source(source);
                     if prepared.needs_sniff_read() {
                         crate::util::timeout_stream_setup(async {
                             let response = connection_success_response.take();
@@ -238,23 +240,27 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             };
             log::debug!("TCP setup completed for {}", routed.wire_destination);
 
-            crate::util::timeout_stream_setup(async {
-                let flush_server = server_need_initial_flush || early_data.is_some();
-                if let Some(data) = connection_success_response {
-                    write_all(&mut server_stream, &data).await?;
-                }
-                if let Some(data) = early_data {
-                    write_all(&mut server_stream, &data).await?;
-                }
-                if flush_server {
-                    server_stream.flush().await?;
-                }
-                if !routed.is_local_dns && !routed.prefix.is_empty() {
-                    write_all(&mut client_stream, &routed.prefix).await?;
-                    client_stream.flush().await?;
-                }
-                Ok(())
-            })
+            let flow = client_stream.flow().cloned();
+            crate::control::tracked_stream::during_flow(
+                flow.as_deref(),
+                crate::util::timeout_stream_setup(async {
+                    let flush_server = server_need_initial_flush || early_data.is_some();
+                    if let Some(data) = connection_success_response {
+                        write_all(&mut server_stream, &data).await?;
+                    }
+                    if let Some(data) = early_data {
+                        write_all(&mut server_stream, &data).await?;
+                    }
+                    if flush_server {
+                        server_stream.flush().await?;
+                    }
+                    if !routed.is_local_dns && !routed.prefix.is_empty() {
+                        write_all(&mut client_stream, &routed.prefix).await?;
+                        client_stream.flush().await?;
+                    }
+                    Ok(())
+                }),
+            )
             .await?;
             // Local DNS can produce replies before it consumes a pipelined prefix.
             if routed.is_local_dns {
@@ -269,10 +275,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             let copy_result =
                 copy_bidirectional(&mut server_stream, &mut client_stream, false, false).await;
 
-            futures::join!(
-                crate::util::shutdown_stream(&mut server_stream),
-                crate::util::shutdown_stream(&mut client_stream),
-            );
+            crate::util::shutdown_stream_pair(&mut server_stream, &mut client_stream).await;
 
             copy_result?;
             Ok(())
@@ -284,18 +287,23 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             proxy_selector,
         } => {
             let setup = crate::util::timeout_stream_setup(async {
-                crate::routing::ingress::connect_udp(&proxy_selector, remote_location, &resolver)
-                    .await
-                    .map_err(|error| {
-                        if crate::routing::ingress::is_policy_block(&error) {
-                            std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                "Blocked bidirectional udp forward",
-                            )
-                        } else {
-                            error
-                        }
-                    })
+                crate::routing::ingress::connect_udp(
+                    &proxy_selector,
+                    remote_location,
+                    &resolver,
+                    source,
+                )
+                .await
+                .map_err(|error| {
+                    if crate::routing::ingress::is_policy_block(&error) {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "Blocked bidirectional udp forward",
+                        )
+                    } else {
+                        error
+                    }
+                })
             })
             .await;
             let client_stream = match setup {
@@ -360,18 +368,31 @@ pub async fn run_udp_copy(
     server_need_initial_flush: bool,
     client_need_initial_flush: bool,
 ) -> std::io::Result<()> {
-    let copy_result = copy_bidirectional_message(
-        &mut server_stream,
-        &mut client_stream,
-        server_need_initial_flush,
-        client_need_initial_flush,
+    let server_flow = server_stream.flow().cloned();
+    let client_flow = client_stream.flow().cloned();
+    let copy_result = crate::control::tracked_stream::during_flows(
+        server_flow.as_deref(),
+        client_flow.as_deref(),
+        copy_bidirectional_message(
+            &mut server_stream,
+            &mut client_stream,
+            server_need_initial_flush,
+            client_need_initial_flush,
+        ),
     )
     .await;
 
-    futures::join!(
-        crate::util::shutdown_message_stream(&mut server_stream),
-        crate::util::shutdown_message_stream(&mut client_stream),
-    );
+    crate::control::tracked_stream::finish_shutdown(
+        server_flow.as_deref(),
+        client_flow.as_deref(),
+        async {
+            futures::join!(
+                crate::util::shutdown_message_stream(&mut server_stream),
+                crate::util::shutdown_message_stream(&mut client_stream),
+            );
+        },
+    )
+    .await;
 
     copy_result
 }
@@ -753,6 +774,61 @@ mod lifetime_tests {
         fn bind_interface(&self) -> Option<&str> {
             None
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_flow_drops_a_blocked_initial_response() {
+        use crate::control::catalog::RuleDescription;
+        use crate::control::flows::{FlowContext, FlowRegistry};
+        let registry = Arc::new(FlowRegistry::default());
+        let (inbound, _peer) = tokio::io::duplex(1);
+        let (outbound, _target) = tokio::io::duplex(64);
+        let chain = ClientProxyChain::new(
+            vec![InitialHopEntry::Direct(Arc::new(ReadyConnector(
+                std::sync::Mutex::new(Some(FlushStream {
+                    inner: outbound,
+                    stalled: false,
+                    flushes: Arc::new(AtomicUsize::new(0)),
+                })),
+            )))],
+            vec![],
+        );
+        let group =
+            ClientChainGroup::new(vec![chain]).with_description(Some(Arc::new(RuleDescription {
+                payload: "all".into(),
+                proxy: "DIRECT".into(),
+                context: Some(Arc::new(FlowContext {
+                    registry: registry.clone(),
+                    generation: 1,
+                    inbound: "test".into(),
+                    scope: "root".into(),
+                    protocol: "Socks5".into(),
+                })),
+            })));
+        let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![crate::address::NetLocationMask::ANY],
+            ConnectAction::new_allow(None, group),
+        )]));
+        let relay = tokio::spawn(process_stream(
+            inbound,
+            Arc::new(Handler(selector)),
+            Arc::new(PendingResolver),
+        ));
+        timeout(Duration::from_secs(1), async {
+            while registry.snapshot(0).connections.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        registry.cancel_all();
+        let error = timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(registry.snapshot(0).connections.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

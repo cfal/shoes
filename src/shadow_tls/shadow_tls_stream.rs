@@ -399,7 +399,11 @@ impl AsyncPing for ShadowTlsStream {
     }
 }
 
-impl AsyncStream for ShadowTlsStream {}
+impl AsyncStream for ShadowTlsStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
+}
 
 #[cfg(test)]
 mod tests {

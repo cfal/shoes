@@ -24,6 +24,7 @@ pub(crate) async fn serve(
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
+    let peer = stream.peer_addr();
     let limit = resources::limits().max_streams_per_connection;
     let budget = Arc::new(Budget::new(limit));
     let mut connection = crate::util::timeout_stream_setup(async {
@@ -54,7 +55,8 @@ pub(crate) async fn serve(
             }
             accepted = connection.accept() => {
                 let Some(accepted) = accepted else { break };
-                let (request, mut respond) = accepted.map_err(io::Error::other)?;
+                let (mut request, mut respond) = accepted.map_err(io::Error::other)?;
+                if let Some(peer) = peer { request.extensions_mut().insert(peer); }
                 if auth_failed {
                     let _ = reject(&mut respond, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
                     continue;
@@ -167,7 +169,9 @@ async fn tunnel(
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
     let prepared = match PreparedTcp::new(&selector, target, Vec::new()) {
-        Ok(prepared) => prepared,
+        Ok(prepared) => {
+            prepared.with_source(request.extensions().get::<std::net::SocketAddr>().copied())
+        }
         Err(_) => return reject(&mut respond, StatusCode::BAD_GATEWAY),
     };
     if prepared.needs_sniff_read() {
@@ -229,11 +233,12 @@ async fn relay(
     prefix: Vec<u8>,
 ) -> io::Result<()> {
     let reset = stream.reset();
+    let flow = upstream.client_stream.flow().cloned();
     tokio::select! {
         biased;
         _ = reset => Ok(()),
         result = async {
-            crate::util::timeout_stream_setup(async {
+            crate::control::tracked_stream::during_flow(flow.as_deref(), crate::util::timeout_stream_setup(async {
                 if let Some(data) = upstream.early_data.take() {
                     stream.write_all(&data).await?;
                     stream.flush().await?;
@@ -243,7 +248,7 @@ async fn relay(
                     upstream.client_stream.flush().await?;
                 }
                 Ok(())
-            }).await?;
+            })).await?;
             drop(prefix);
             let result = crate::copy_bidirectional::copy_bidirectional(
                 &mut stream,
@@ -252,10 +257,7 @@ async fn relay(
                 false,
             ).await;
             if result.is_ok() {
-                tokio::join!(
-                    crate::util::shutdown_stream(&mut stream),
-                    crate::util::shutdown_stream(&mut upstream.client_stream),
-                );
+                crate::util::shutdown_stream_pair(&mut stream, &mut upstream.client_stream).await;
             }
             result.map(|_| ())
         } => result,

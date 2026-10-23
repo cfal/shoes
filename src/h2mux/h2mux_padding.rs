@@ -416,7 +416,11 @@ impl<S: AsyncStream> AsyncPing for H2MuxPaddingStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncStream for H2MuxPaddingStream<S> {}
+impl<S: AsyncStream> AsyncStream for H2MuxPaddingStream<S> {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.peer_addr()
+    }
+}
 
 #[cfg(test)]
 mod tests {

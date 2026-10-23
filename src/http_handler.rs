@@ -675,6 +675,20 @@ impl HttpTcpClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for HttpTcpClientHandler {
+    async fn prepare_target(
+        &self,
+        mut target: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        if self.resolver.is_some()
+            && target.resolved_addr().is_none()
+            && target.address().hostname().is_some()
+        {
+            target.set_resolved(resolve_single_address(resolver, target.location()).await?);
+        }
+        Ok(target)
+    }
+
     fn validate_alpn(&self, alpn: Option<&[u8]>) -> std::io::Result<()> {
         let valid = match self.version {
             HttpVersion::H1 => true,

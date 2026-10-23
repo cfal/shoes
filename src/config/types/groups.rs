@@ -20,8 +20,20 @@ use super::tun::TunConfig;
 #[serde(deny_unknown_fields)]
 pub struct ClientConfigGroup {
     pub client_group: String,
+    #[serde(default)]
+    pub strategy: GroupStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
     #[serde(alias = "client_proxy")]
     pub client_proxies: OneOrSome<ConfigSelection<ClientConfig>>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GroupStrategy {
+    #[default]
+    RoundRobin,
+    Selector,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -205,6 +217,8 @@ impl Serialize for NamedPem {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Config {
+    ClashApi(super::ClashApiConfig),
+    CacheFile(super::CacheFileConfig),
     GlobalLimits(GlobalLimits),
     Server(ServerConfig),
     /// TUN device server - accepts IP packets from a TUN device.
@@ -231,6 +245,17 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let map = value.as_mapping().ok_or_else(|| {
             Error::custom("Expected a YAML mapping for Config, but found a different type")
         })?;
+
+        if map.contains_key("clash_api_address") || map.contains_key("clash_api_path") {
+            return serde_yaml::from_value(value)
+                .map(Config::ClashApi)
+                .map_err(Error::custom);
+        }
+        if map.contains_key("cache_file_path") {
+            return serde_yaml::from_value(value)
+                .map(Config::CacheFile)
+                .map_err(Error::custom);
+        }
 
         // Look for discriminating fields
         let has_client_group = map.contains_key(Value::String("client_group".to_string()));
@@ -317,6 +342,8 @@ impl serde::ser::Serialize for Config {
         S: serde::ser::Serializer,
     {
         match self {
+            Config::ClashApi(config) => config.serialize(serializer),
+            Config::CacheFile(config) => config.serialize(serializer),
             Config::GlobalLimits(limits) => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(1))?;
@@ -346,6 +373,8 @@ mod tests {
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig {
+            name: None,
+            control: None,
             bind_interface: crate::option_util::NoneOrOne::One("eth0".to_string()),
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
             protocol: ClientProxyConfig::Socks {
@@ -361,6 +390,7 @@ mod tests {
     fn create_test_rule_config() -> RuleConfig {
         RuleConfig {
             criteria: super::super::rules::RuleCriteria {
+                description: None,
                 expression: crate::rules::Expression::Legacy(OneOrSome::Some(vec![
                     NetLocationMask::from("192.168.0.0/16:80").unwrap(),
                     NetLocationMask::from("10.0.0.0/8:443").unwrap(),
@@ -384,10 +414,14 @@ mod tests {
     #[test]
     fn test_client_config_group() {
         let original = vec![Config::ClientConfigGroup(ClientConfigGroup {
+            strategy: Default::default(),
+            default: None,
             client_group: "test-client-group".to_string(),
             client_proxies: OneOrSome::Some(vec![
                 ConfigSelection::Config(create_test_client_config()),
                 ConfigSelection::Config(ClientConfig {
+                    name: None,
+                    control: None,
                     bind_interface: crate::option_util::NoneOrOne::None,
                     address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
                     protocol: ClientProxyConfig::Http {

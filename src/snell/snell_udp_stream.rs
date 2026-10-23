@@ -15,6 +15,7 @@ use crate::util::allocate_vec;
 
 pub struct SnellUdpStream {
     stream: Box<dyn AsyncMessageStream>,
+    peer: Option<SocketAddr>,
     max_payload_size: usize,
 
     read_buf: Box<[u8]>,
@@ -29,6 +30,7 @@ impl SnellUdpStream {
     pub fn new(stream: Box<dyn AsyncMessageStream>, max_payload_size: usize) -> Self {
         Self {
             stream,
+            peer: None,
             max_payload_size,
 
             read_buf: allocate_vec(65535).into_boxed_slice(),
@@ -38,6 +40,11 @@ impl SnellUdpStream {
 
             is_eof: false,
         }
+    }
+
+    pub fn with_peer(mut self, peer: Option<SocketAddr>) -> Self {
+        self.peer = peer;
+        self
     }
 }
 
@@ -222,7 +229,11 @@ impl AsyncPing for SnellUdpStream {
     }
 }
 
-impl AsyncTargetedMessageStream for SnellUdpStream {}
+impl AsyncTargetedMessageStream for SnellUdpStream {
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+}
 
 /// Client-side Snell UDP stream.
 /// Writes requests with target (cmd + address format) and reads responses with source (ip_version format).

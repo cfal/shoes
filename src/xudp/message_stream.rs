@@ -565,7 +565,11 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
     }
 }
 
-impl AsyncSessionMessageStream for XudpMessageStream {}
+impl AsyncSessionMessageStream for XudpMessageStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner_stream.peer_addr()
+    }
+}
 
 #[cfg(test)]
 mod tests {

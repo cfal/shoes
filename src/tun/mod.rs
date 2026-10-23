@@ -189,9 +189,14 @@ async fn run_tun_server_inner(
 
                     debug!("Handling TCP connection to {:?}", target);
 
-                    if let Err(e) =
-                        handle_tcp_connection(new_conn.connection, target, proxy_selector, resolver)
-                            .await
+                    if let Err(e) = handle_tcp_connection(
+                        new_conn.connection,
+                        target,
+                        proxy_selector,
+                        resolver,
+                        Some(new_conn.source_addr),
+                    )
+                    .await
                     {
                         debug!("TCP connection to {} failed: {}", remote_addr, e);
                     }
@@ -260,10 +265,12 @@ pub(crate) async fn handle_tcp_connection(
     target: NetLocation,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    source: Option<std::net::SocketAddr>,
 ) -> std::io::Result<()> {
     let _permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
     let prepared =
-        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, target.clone(), Vec::new())?;
+        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, target.clone(), Vec::new())?
+            .with_source(source);
     let route = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         prepared.route(&mut connection, &proxy_selector, &resolver),
@@ -276,14 +283,19 @@ pub(crate) async fn handle_tcp_connection(
         let Some(mut setup) = routed.setup else {
             return Ok(None);
         };
-        if let Some(data) = setup.early_data.take() {
-            connection.write_all(&data).await?;
-            connection.flush().await?;
-        }
-        if !routed.prefix.is_empty() {
-            setup.client_stream.write_all(&routed.prefix).await?;
-            setup.client_stream.flush().await?;
-        }
+        let flow = setup.client_stream.flow().cloned();
+        crate::control::tracked_stream::during_flow(flow.as_deref(), async {
+            if let Some(data) = setup.early_data.take() {
+                connection.write_all(&data).await?;
+                connection.flush().await?;
+            }
+            if !routed.prefix.is_empty() {
+                setup.client_stream.write_all(&routed.prefix).await?;
+                setup.client_stream.flush().await?;
+            }
+            Ok(())
+        })
+        .await?;
         drop(routed.prefix);
         Ok::<_, std::io::Error>(Some((setup.client_stream, routed.wire_destination)))
     })
@@ -296,7 +308,11 @@ pub(crate) async fn handle_tcp_connection(
         debug!("TCP connection blocked by rules");
         return Ok(());
     };
-    let result = tokio::io::copy_bidirectional(&mut connection, &mut remote).await;
+    let flow = remote.flow().cloned();
+    let result = tokio::select! {
+        result = tokio::io::copy_bidirectional(&mut connection, &mut remote) => result,
+        _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => Err(crate::control::tracked_stream::cancelled()),
+    };
     match result {
         Ok((sent, received)) => debug!(
             "TCP connection to {} completed: {} bytes sent, {} bytes received",
@@ -588,6 +604,7 @@ mod tests {
                 NetLocation::from_str("127.0.0.1:80", None).unwrap(),
                 selector,
                 resolver,
+                None,
             )
             .await
             .unwrap();
@@ -613,7 +630,7 @@ mod tests {
             assert_eq!(control.enqueue_recv_data(&hello), hello.len());
             control.set_recv_state(tcp_conn::TcpSocketState::Closed);
             tasks.spawn(async move {
-                handle_tcp_connection(connection, target, selector, resolver)
+                handle_tcp_connection(connection, target, selector, resolver, None)
                     .await
                     .unwrap();
             });
@@ -648,7 +665,7 @@ mod tests {
                 assert_eq!(control.enqueue_recv_data(&payload), payload.len());
                 control.set_recv_state(tcp_conn::TcpSocketState::Closed);
                 let mut task = tokio::spawn(handle_tcp_connection(
-                    connection, target, selector, resolver,
+                    connection, target, selector, resolver, None,
                 ));
                 let mut received = Vec::new();
                 loop {

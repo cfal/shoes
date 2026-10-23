@@ -4,6 +4,9 @@
 #[path = "tun_kernel/offload_failure.rs"]
 mod offload_failure;
 
+#[path = "tun_kernel/clash_api.rs"]
+mod clash_api;
+
 use shoes_test_support::test_fixture::{
     ProcessGuard, RouteGuard, add_route_via_device, start_shoes_server_with_sudo,
 };
