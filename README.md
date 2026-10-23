@@ -56,6 +56,7 @@ same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
 - **Upstream proxy chaining**: Multi-hop chains with load balancing
 - **Rule-based routing**: Route by IP/CIDR or hostname masks
 - **Named PEM certificates**: Define once, reference everywhere
+- **Live certificate sources**: Shared TLS/QUIC file rotation and built-in ACME HTTP-01/TLS-ALPN-01 ([configuration](CONFIG.md#certificate-sources))
 - **TLS fingerprint authentication**: Certificate pinning for TLS/QUIC
 - **Hot reloading**: Apply config changes without restart
 - **Unix socket support**: Bind to Unix domain sockets

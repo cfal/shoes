@@ -14,6 +14,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [Rules System](#rules-system)
 - [Named Groups](#named-groups)
 - [Named PEMs](#named-pems)
+- [Certificate Sources](#certificate-sources)
 - [Advanced Features](#advanced-features)
 - [Command Line](#command-line)
 
@@ -1543,6 +1544,169 @@ Define certificates once and reference throughout configuration.
           type: http
 ```
 
+## Certificate Sources
+
+Ordinary TLS targets and QUIC listeners can share a named certificate source.
+Use `certificate_source` instead of `cert` and `key`; combining them is an error.
+Existing inline certificates, file paths, and named PEMs remain supported.
+
+```yaml
+- certificate_source: public
+  type: files
+  cert: /etc/shoes/certs/fullchain.pem
+  key: /etc/shoes/certs/privkey.pem
+  poll_interval_secs: 5
+
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    tls_targets:
+      proxy.example.com:
+        certificate_source: public
+        protocol: {type: trojan, password: change-me}
+
+- address: "0.0.0.0:443"
+  transport: quic
+  quic_settings:
+    certificate_source: public
+  protocol: {type: hysteria2, password: change-me}
+```
+
+There is one runtime worker per source, not per listener. File sources poll the
+contents of both files (default 5 seconds, configurable from 1 to 3600 seconds).
+They support atomic rename and symlink replacement. Both the full certificate
+chain and its matching private key must validate before publication. Separate
+file writes, missing files, malformed data, key mismatches, and invalid validity
+periods leave the last good pair in place; the next poll retries. Errors are
+rate-limited and never include private material. An expired source fails new
+handshakes rather than serving a substitute certificate. Existing connections
+continue uninterrupted.
+
+Legacy `cert`/`key` paths, including paths referenced through named PEMs, also
+rotate live at a 5-second interval. Inline-only pairs stay static. This applies
+to ordinary inbound TLS and QUIC, including Hysteria2, TUIC and XHTTP. Outbound
+client certificates, trust roots, and local ShadowTLS handshake certificates
+retain their existing configuration-reload behavior. REALITY is unchanged.
+
+New handshakes use the current certificate without replacing TCP listeners or
+QUIC endpoints. TLS session state is scoped to the certificate generation and
+the listener's security policy: sessions resume within a generation, but not
+across rotation or expiration. Existing TCP and QUIC sessions are not retired.
+
+### Built-in ACME
+
+ACME uses `instant-acme` and explicitly configured domains. Start with your CA's
+staging directory. No certificate is issued during `--dry-run`.
+
+```yaml
+- certificate_source: public
+  type: acme
+  domains: [proxy.example.com]
+  directory_url: https://acme-staging-v02.api.letsencrypt.org/directory
+  state_dir: /var/lib/shoes/acme/public
+  contacts: [mailto:operator@example.com]
+  # Read the CA's terms, then set this to its exact meta.termsOfService URL.
+  terms_of_service: https://example.invalid/replace-with-accepted-ca-terms-url
+  challenge:
+    type: http01
+    listen: ["0.0.0.0:8080"]
+```
+
+Reference `public` from TLS or QUIC as in the file-source example. Domains must
+be unique lowercase ASCII DNS names (use punycode for internationalized names).
+Every named TLS target using an ACME source must be covered by its domains.
+There is no issuance based on incoming SNI.
+
+`terms_of_service` is explicit acceptance of that exact URL, not blanket
+acceptance of future terms. Shoes checks the directory's `meta.termsOfService`
+before account operations and refuses a changed URL. Review new terms and
+update the configuration to accept them. If a private CA publishes no terms,
+omit this field; a subsequently advertised terms URL still requires explicit
+acceptance. Accounts requiring external account
+binding are not supported in this version.
+
+HTTP-01 requirements:
+
+- The CA must reach public TCP port 80 for every domain, forwarded to one of the
+  explicit `listen` addresses. Shoes never implicitly binds port 80.
+- The challenge listener is independent of proxy listeners, so UDP-only QUIC
+  deployments can use HTTP-01. A reverse proxy/CDN must forward the exact
+  `/.well-known/acme-challenge/` path and original Host header.
+- Listen addresses must not overlap another HTTP-01 source or a TCP proxy
+  listener. Use a single multi-domain source when sharing the challenge address.
+  Dry-run checks literal addresses and port ranges; a hostname-bound TCP
+  listener on the same port is conservatively treated as a conflict.
+- Only exact, pending, unexpired GET challenges are answered. Unknown tokens
+  return 404. Headers are limited to 8 KiB / 32 fields, with at most 64 concurrent
+  connections per address and a 10-second request lifetime.
+
+For TLS-ALPN-01, replace the `challenge` mapping with:
+
+```yaml
+  challenge: {type: tls_alpn01}
+```
+
+The CA must reach public TCP port 443, forwarded to an existing outermost Shoes
+TLS listener covering every configured domain. This is not QUIC, ShadowTLS or
+REALITY validation. An intermediate TLS terminator must pass the handshake
+through, including SNI and ALPN. Shoes only answers the sole offered protocol
+`acme-tls/1` for a pending configured SNI. The short-lived challenge response
+uses the RFC 8737 critical `acmeIdentifier` extension and never enters the proxy
+handler or replaces the ordinary certificate. Normal ALPN, client authentication,
+fallback routing and QUIC policy are unchanged.
+
+At first start, proxy and challenge listeners bind before issuance begins.
+Normal handshakes for a source without a certificate fail until issuance
+succeeds; `Servers ready` means listeners are bound, not that ACME has finished.
+A valid cached certificate allows immediate startup during a CA outage.
+
+Shoes persists the account key before registration, account credentials,
+in-progress orders and CSR keys, and the certificate/key pair in one atomically
+replaced, synced state file. Do not edit it or share it between sources. On Unix,
+the state directory must be owned by the running user with mode 0700, and files
+use 0600. Other platforms use their inherited filesystem access controls; place
+the directory in private application storage. An exclusive OS file lock prevents
+multiple processes or embedded lifecycles from owning the same directory.
+Back up the whole directory securely. Changing the CA or domain list requires a
+distinct state directory; staging and production must never share one.
+
+Renewal normally begins with one third of the certificate's lifetime remaining.
+ARI can request earlier renewal when the CA and certificate support it; its
+Retry-After is honored, and ordinary renewal does not depend on ARI. Transient
+failures preserve valid material and use jittered exponential backoff from 60
+seconds to 6 hours, honoring longer CA Retry-After values. An attempt is bounded
+to 10 minutes. A completed pair is persisted before it becomes live. Storage
+errors do not publish an unpersisted replacement.
+
+CA traffic goes directly through the OS resolver and Shoes' protected TCP socket
+helper, not through proxy rules or the certificate being issued. HTTPS verifies
+the CA hostname and public roots. Optional `ca_cert: /path/to/test-ca.crt`
+replaces those roots for a private CA. Requests have a 30-second total timeout,
+32 KiB response header limit and 1 MiB response body limit; redirects are not
+followed. Plain HTTP directories/endpoints are accepted only on numeric loopback
+addresses for local testing. Never disable verification for a public CA.
+
+Configuration reload reuses unchanged sources and their workers, accounts and
+pending challenges. Changed sources hand off storage and challenge listeners
+only after successful listener activation; failed preparation does not mutate
+live sources. Removed sources are canceled. CLI and mobile/FFI use the same
+manager, with no process-global certificate registry. Mobile deployments still
+need externally reachable challenge ports and persistent application storage.
+
+`--dry-run` validates configuration, references, domain coverage, challenge
+compatibility, certificate material and declared address conflicts without
+contacting a CA, binding ports, or creating ACME state. An unissued ACME source
+is a valid configuration, not a self-signed placeholder. Actual OS port conflicts,
+storage ownership and permissions are checked during runtime preparation.
+
+There is no built-in DNS-01, wildcard ACME issuance, DNS vendor API, shell hook,
+Tailscale provider, or Cloudflare Origin CA provider. For wildcard certificates
+or DNS-01, run an external client such as acme.sh, lego or Certbot and use a file
+source. Manually supplied wildcard certificates remain supported.
+
+Examples: [file rotation and reuse](examples/certificates_files.yaml) and
+[ACME with shared TCP/QUIC consumers](examples/certificates_acme.yaml).
+
 ## Advanced Features
 
 ### Vision (XTLS-Vision)
@@ -1623,6 +1787,10 @@ Configuration changes are automatically detected. `--no-reload` disables file wa
 On Linux, if directory permissions prevent watching a readable configuration's parent, startup falls back to direct file watches and logs a warning. In-place edits remain detectable, but atomic replacements may be missed; use SIGHUP or grant directory read permission when replacing files.
 
 Replacement configurations, certificates, and DNS resolvers are prepared while the current listeners continue serving. A preparation failure leaves the current configuration running. Once preparation succeeds, listeners are replaced. A failure to activate replacements exits with status 1; there is no rollback after listeners are retired. Existing TCP connections may drain for `global_limits.reload_grace_secs` during successful reloads; QUIC connections are closed.
+
+Certificate-source file changes and ACME renewal do not trigger this full reload.
+They rotate live without replacing listeners or closing QUIC connections; see
+[Certificate Sources](#certificate-sources).
 
 QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. A five-second socket-release guard remains; exceeding it indicates a local cleanup failure and exits with an error rather than announcing a partially ready generation.
 

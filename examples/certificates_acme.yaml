@@ -1,0 +1,33 @@
+# Configure a domain you control and forward public TCP :80 to :8080.
+# Read the staging CA's terms and replace terms_of_service with its exact URL.
+# After staging succeeds, use the production directory and a NEW state_dir.
+- certificate_source: public
+  type: acme
+  domains: [proxy.example.com]
+  directory_url: https://acme-staging-v02.api.letsencrypt.org/directory
+  state_dir: /var/lib/shoes/acme/staging-public
+  contacts: [mailto:operator@example.com]
+  terms_of_service: https://example.invalid/replace-with-accepted-ca-terms-url
+  challenge:
+    type: http01
+    listen: ["0.0.0.0:8080"]
+  # Alternatively, forward public TCP :443 to :8443 and use:
+  # challenge: {type: tls_alpn01}
+
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    tls_targets:
+      proxy.example.com:
+        certificate_source: public
+        protocol:
+          type: trojan
+          password: replace-with-a-strong-password
+
+- address: "0.0.0.0:8443"
+  transport: quic
+  quic_settings:
+    certificate_source: public
+  protocol:
+    type: hysteria2
+    password: replace-with-a-strong-password
