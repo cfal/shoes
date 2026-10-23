@@ -315,7 +315,10 @@ impl ClientProxySelector {
         };
 
         let has_ip_rules = rules.iter().any(|rule| rule.predicate.dependencies.ip);
-        let tracks_flows = rules.iter().any(|rule| matches!(&rule.action, ConnectAction::Allow { chain_group, .. } if chain_group.tracks_flows()));
+        let tracks_flows = rules.iter().any(|rule| match &rule.action {
+            ConnectAction::Allow { chain_group, .. } => chain_group.tracks_flows(),
+            ConnectAction::Block => false,
+        });
         let has_hostname_rules = rules
             .iter()
             .any(|rule| rule.predicate.dependencies.hostname);

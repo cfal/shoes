@@ -169,9 +169,8 @@ impl ControlRuntime {
         let id = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let rules = super::rules::attach(
             validated,
-            self.flows.clone(),
             id,
-            !self.config.listeners.is_empty(),
+            (!self.config.listeners.is_empty()).then(|| self.flows.clone()),
         )?;
         Ok((id, rules))
     }

@@ -8,14 +8,13 @@ use crate::config::{Config, ConfigSelection, RuleConfig, ServerProxyConfig, Vali
 use crate::option_util::NoneOrSome;
 
 struct Builder {
-    registry: Arc<FlowRegistry>,
+    registry: Option<Arc<FlowRegistry>>,
     generation: u64,
-    enabled: bool,
     rules: Vec<serde_json::Value>,
 }
 
 impl Builder {
-    fn rules(
+    fn project_rules(
         &mut self,
         rules: &mut NoneOrSome<ConfigSelection<RuleConfig>>,
         inbound: &str,
@@ -41,9 +40,9 @@ impl Builder {
                     .into(),
                     context: None,
                 });
-            if self.enabled {
+            if let Some(registry) = &self.registry {
                 description.context = Some(Arc::new(FlowContext {
-                    registry: self.registry.clone(),
+                    registry: registry.clone(),
                     generation: self.generation,
                     inbound: inbound.into(),
                     scope: scope.into(),
@@ -62,7 +61,7 @@ impl Builder {
         }
     }
 
-    fn target(
+    fn project_target(
         &mut self,
         rules: &mut NoneOrSome<ConfigSelection<RuleConfig>>,
         protocol: &mut ServerProxyConfig,
@@ -74,18 +73,18 @@ impl Builder {
             // Project inherited contexts without rebuilding shared routing pools or counters.
             let mut effective = inherited.clone();
             let first = self.rules.len();
-            self.rules(&mut effective, inbound, scope, inbound_type(protocol));
+            self.project_rules(&mut effective, inbound, scope, inbound_type(protocol));
             for rule in &mut self.rules[first..] {
                 rule["shoes"]["inherited"] = serde_json::json!(true);
             }
-            self.protocol(protocol, inbound, scope, &effective);
+            self.project_protocol(protocol, inbound, scope, &effective);
         } else {
-            self.rules(rules, inbound, scope, inbound_type(protocol));
-            self.protocol(protocol, inbound, scope, rules);
+            self.project_rules(rules, inbound, scope, inbound_type(protocol));
+            self.project_protocol(protocol, inbound, scope, rules);
         }
     }
 
-    fn protocol(
+    fn project_protocol(
         &mut self,
         protocol: &mut ServerProxyConfig,
         inbound: &str,
@@ -102,7 +101,7 @@ impl Builder {
             } => {
                 for (key, target) in sorted_targets(tls_targets) {
                     let scope = format!("{scope}/tls/{key}");
-                    self.target(
+                    self.project_target(
                         &mut target.override_rules,
                         &mut target.protocol,
                         inherited,
@@ -112,7 +111,7 @@ impl Builder {
                 }
                 if let Some(target) = default_tls_target {
                     let scope = format!("{scope}/tls/default");
-                    self.target(
+                    self.project_target(
                         &mut target.override_rules,
                         &mut target.protocol,
                         inherited,
@@ -122,7 +121,7 @@ impl Builder {
                 }
                 for (key, target) in sorted_targets(shadowtls_targets) {
                     let scope = format!("{scope}/shadowtls/{key}");
-                    self.target(
+                    self.project_target(
                         &mut target.override_rules,
                         &mut target.protocol,
                         inherited,
@@ -132,7 +131,7 @@ impl Builder {
                 }
                 for (key, target) in sorted_targets(reality_targets) {
                     let scope = format!("{scope}/reality/{key}");
-                    self.target(
+                    self.project_target(
                         &mut target.override_rules,
                         &mut target.protocol,
                         inherited,
@@ -144,7 +143,7 @@ impl Builder {
             ServerProxyConfig::Websocket { targets } => {
                 for (index, target) in targets.iter_mut().enumerate() {
                     let scope = format!("{scope}/websocket/{index}");
-                    self.target(
+                    self.project_target(
                         &mut target.override_rules,
                         &mut target.protocol,
                         inherited,
@@ -153,7 +152,7 @@ impl Builder {
                     );
                 }
             }
-            ServerProxyConfig::Xhttp(config) => self.target(
+            ServerProxyConfig::Xhttp(config) => self.project_target(
                 &mut NoneOrSome::None,
                 &mut config.protocol,
                 inherited,
@@ -185,14 +184,12 @@ pub fn inbound_type(protocol: &ServerProxyConfig) -> &'static str {
 
 pub fn attach(
     validated: &mut ValidatedConfigs,
-    registry: Arc<FlowRegistry>,
     generation: u64,
-    enabled: bool,
+    registry: Option<Arc<FlowRegistry>>,
 ) -> io::Result<Vec<serde_json::Value>> {
     let mut builder = Builder {
         registry,
         generation,
-        enabled,
         rules: Vec::new(),
     };
     for (index, config) in validated.configs.iter_mut().enumerate() {
@@ -202,24 +199,24 @@ pub fn attach(
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("inbound-{index}"));
-                builder.rules(
+                builder.project_rules(
                     &mut server.rules,
                     &inbound,
                     "root",
                     inbound_type(&server.protocol),
                 );
-                builder.protocol(&mut server.protocol, &inbound, "root", &server.rules);
+                builder.project_protocol(&mut server.protocol, &inbound, "root", &server.rules);
             }
             Config::TunServer(tun) => {
                 let inbound = tun.name.clone().unwrap_or_else(|| format!("tun-{index}"));
-                builder.rules(&mut tun.rules, &inbound, "root", "Tun");
+                builder.project_rules(&mut tun.rules, &inbound, "root", "Tun");
             }
             _ => {}
         }
     }
     for endpoint in &mut validated.wireguard_endpoints {
         if let Some(inbound) = &mut endpoint.inbound {
-            builder.rules(
+            builder.project_rules(
                 &mut inbound.rules,
                 inbound.name.as_deref().unwrap_or(&endpoint.id),
                 "wireguard",
@@ -245,6 +242,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rule_projection_without_tracking_leaves_flow_context_absent() {
+        let configs = serde_yaml::from_str(
+            "- address: '127.0.0.1:1080'\n  protocol: {type: socks}\n  rules: allow-all-direct",
+        )
+        .unwrap();
+        let mut validated = crate::config::create_server_configs(configs).unwrap();
+        let rules = attach(&mut validated, 1, None).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["proxy"], "DIRECT");
+        let Config::Server(server) = &validated.configs[0] else {
+            panic!()
+        };
+        let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
+            panic!()
+        };
+        assert!(
+            rule.criteria
+                .description
+                .as_ref()
+                .unwrap()
+                .context
+                .is_none()
+        );
+    }
+
+    #[test]
     fn inherited_protocol_rules_are_projected_without_materializing_overrides() {
         let configs = serde_yaml::from_str(
             &serde_json::json!([
@@ -259,7 +282,7 @@ mod tests {
         )
         .unwrap();
         let mut validated = crate::config::create_server_configs(configs).unwrap();
-        let rules = attach(&mut validated, Arc::new(FlowRegistry::default()), 1, true).unwrap();
+        let rules = attach(&mut validated, 1, Some(Arc::new(FlowRegistry::default()))).unwrap();
         assert_eq!(rules.len(), 3);
         assert_eq!(rules[1]["shoes"]["scope"], "root/websocket/0");
         assert_eq!(rules[1]["shoes"]["inherited"], true);
