@@ -1250,7 +1250,7 @@ async fn run_datagram_loop(
 #[allow(clippy::too_many_arguments)]
 pub async fn start_tuic_server(
     bind_address: SocketAddr,
-    quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
+    quic_server_config: Arc<dyn quinn::crypto::ServerConfig>,
     uuid: Arc<[u8]>,
     password: Arc<str>,
     client_proxy_selector: Arc<ClientProxySelector>,

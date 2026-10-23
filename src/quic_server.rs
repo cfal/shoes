@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
-use crate::rustls_config_util::try_create_server_config;
+use crate::rustls_config_util::try_create_server_config_with_source;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tcp::tcp_server_handler_factory::{HandlerServices, create_tcp_server_handler_shared};
@@ -18,7 +18,7 @@ use crate::uuid_util::parse_uuid;
 
 async fn start_quic_server(
     bind_address: SocketAddr,
-    quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
+    quic_server_config: Arc<dyn quinn::crypto::ServerConfig>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
@@ -167,6 +167,8 @@ pub async fn start_quic_servers(
     };
 
     let ServerQuicConfig {
+        certificate_source: _,
+        certificate_binding,
         key_exchange_groups,
         cert,
         key,
@@ -197,13 +199,14 @@ pub async fn start_quic_servers(
         } else {
             alpn_protocols.into_vec()
         };
-    let mut server_config = try_create_server_config(
+    let mut server_config = try_create_server_config_with_source(
         &cert_bytes,
         &key_bytes,
         processed_ca_certs,
         &alpn_protocols,
         &client_fingerprints.into_vec(),
         &key_exchange_groups,
+        certificate_binding.as_ref(),
     )?;
     // QUIC manages early data separately; its TLS limit must be zero or u32::MAX.
     if !key_exchange_groups.requires_hybrid() {
@@ -211,11 +214,7 @@ pub async fn start_quic_servers(
     }
     let server_config = Arc::new(server_config);
 
-    let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
-        .try_into()
-        .map_err(|e| std::io::Error::other(format!("invalid QUIC server config: {e}")))?;
-
-    let quic_server_config = Arc::new(quic_server_config);
+    let quic_server_config = crate::certificates::quic_config(server_config, certificate_binding)?;
 
     let client_proxy_selector = Arc::new(
         create_tcp_client_proxy_selector(rules.clone(), resolver.clone())?.with_sniff(sniff),
@@ -433,6 +432,8 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                certificate_source: None,
+                certificate_binding: None,
                 key_exchange_groups: Default::default(),
                 cert: cert.cert.pem(),
                 key: cert.signing_key.serialize_pem(),

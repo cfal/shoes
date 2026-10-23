@@ -402,12 +402,18 @@ pub struct RealityServerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsServerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_source: Option<String>,
+    #[serde(skip)]
+    pub certificate_binding: Option<std::sync::Arc<crate::certificates::Source>>,
     #[serde(
         default,
         skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
     )]
     pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
+    #[serde(default)]
     pub cert: String,
+    #[serde(default)]
     pub key: String,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
@@ -1040,6 +1046,8 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                certificate_source: None,
+                certificate_binding: None,
                 key_exchange_groups: Default::default(),
                 cert: "server.crt".to_string(),
                 key: "server.key".to_string(),
@@ -1082,6 +1090,8 @@ mod tests {
         tls_targets.insert(
             "example.com".to_string(),
             TlsServerConfig {
+                certificate_source: None,
+                certificate_binding: None,
                 key_exchange_groups: Default::default(),
                 cert: "example.crt".to_string(),
                 key: "example.key".to_string(),
@@ -1105,6 +1115,8 @@ mod tests {
             protocol: ServerProxyConfig::Tls {
                 tls_targets,
                 default_tls_target: Some(Box::new(TlsServerConfig {
+                    certificate_source: None,
+                    certificate_binding: None,
                     key_exchange_groups: Default::default(),
                     cert: "default.crt".to_string(),
                     key: "default.key".to_string(),
@@ -1211,6 +1223,8 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                certificate_source: None,
+                certificate_binding: None,
                 key_exchange_groups: Default::default(),
                 cert: "hysteria.crt".to_string(),
                 key: "hysteria.key".to_string(),
@@ -1238,6 +1252,8 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                certificate_source: None,
+                certificate_binding: None,
                 key_exchange_groups: Default::default(),
                 cert: "tuic.crt".to_string(),
                 key: "tuic.key".to_string(),

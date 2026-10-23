@@ -217,6 +217,7 @@ pub async fn start_from_config(
 
     let mut validated = crate::config::compile_configs(configs).await?;
     validated.control.reject_ffi()?;
+    let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
     let crate::config::ValidatedConfigs {
@@ -308,6 +309,7 @@ pub async fn start_from_config(
         }
     }
 
+    certificates.start().await;
     // Run TUN server (blocks until shutdown). close_fd_on_drop = false because mobile owns the FD
     #[cfg(unix)]
     let result = {
@@ -322,6 +324,7 @@ pub async fn start_from_config(
 
     // Cleanup any servers when TUN stops
     join_handles.stop().await;
+    certificates.shutdown().await;
     #[cfg(unix)]
     wireguard_running.stop().await;
 
@@ -330,6 +333,10 @@ pub async fn start_from_config(
 
     result
 }
+
+#[cfg(all(test, unix))]
+#[path = "certificate_tests.rs"]
+mod certificate_tests;
 
 #[cfg(all(test, unix))]
 #[path = "wireguard_tests.rs"]

@@ -219,6 +219,7 @@ impl Serialize for NamedPem {
 pub enum Config {
     ClashApi(super::ClashApiConfig),
     CacheFile(super::CacheFileConfig),
+    CertificateSource(crate::certificates::NamedSource),
     GlobalLimits(GlobalLimits),
     Server(ServerConfig),
     /// TUN device server - accepts IP packets from a TUN device.
@@ -287,6 +288,10 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             serde_yaml::from_value::<GlobalLimitsEntry>(value)
                 .map(|entry| Config::GlobalLimits(entry.global_limits.unwrap_or_default()))
                 .map_err(|e| Error::custom(format!("invalid global limits: {e}")))
+        } else if map.contains_key("certificate_source") {
+            serde_yaml::from_value(value)
+                .map(Config::CertificateSource)
+                .map_err(|_| Error::custom("invalid certificate source configuration"))
         } else if has_pem {
             // NamedPem (pem field is unique to NamedPem)
             serde_yaml::from_value(value)
@@ -344,6 +349,7 @@ impl serde::ser::Serialize for Config {
         match self {
             Config::ClashApi(config) => config.serialize(serializer),
             Config::CacheFile(config) => config.serialize(serializer),
+            Config::CertificateSource(source) => source.serialize(serializer),
             Config::GlobalLimits(limits) => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(1))?;

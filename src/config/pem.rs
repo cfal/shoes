@@ -17,7 +17,10 @@ use crate::config::ConfigSelection;
 /// - Converts inline file paths in cert/key fields to new named PEM items
 ///
 /// Returns the converted configs and the count of PEM files loaded.
-pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Vec<Config>, usize)> {
+pub async fn convert_cert_paths(
+    mut all_configs: Vec<Config>,
+) -> std::io::Result<(Vec<Config>, usize)> {
+    crate::certificates::configure(&mut all_configs)?;
     let mut path_pem_configs: HashMap<String, NamedPem> = HashMap::new();
     let mut data_configs = vec![];
     let mut load_count = 0usize;
@@ -45,6 +48,7 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
                 };
 
                 load_count += 1;
+                data_configs.push(Config::NamedPem(loaded_config.clone()));
                 path_pem_configs.insert(path, loaded_config);
             }
             Config::Server(server_config) => {
@@ -128,11 +132,6 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
     let mut updated_configs = vec![];
 
     updated_configs.append(&mut data_configs);
-
-    // Insert the loaded path configs
-    for (_, named_pem) in path_pem_configs.into_iter() {
-        updated_configs.push(Config::NamedPem(named_pem));
-    }
 
     // Generate new named configs from inlined paths
     load_count += unknown_pem_paths.len();

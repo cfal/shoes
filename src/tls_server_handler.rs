@@ -56,6 +56,7 @@ pub enum InnerProtocol {
 #[allow(clippy::large_enum_variant)]
 pub enum TlsServerTarget {
     Tls {
+        certificate_source: Option<Arc<crate::certificates::Source>>,
         server_config: Arc<rustls::ServerConfig>,
         /// The effective proxy selector for this TLS target.
         /// This selector is passed to inner handlers at construction and should be used
@@ -101,7 +102,18 @@ impl TcpServerHandler for TlsServerHandler {
     ) -> std::io::Result<TcpServerSetupResult> {
         let parsed_client_hello = read_client_hello(&mut server_stream).await?;
 
-        let target = match parsed_client_hello.requested_server_name.as_ref() {
+        let acme_name = if parsed_client_hello.acme_alpn {
+            parsed_client_hello
+                .requested_server_name
+                .as_ref()
+                .map(|name| name.to_ascii_lowercase())
+        } else {
+            None
+        };
+        let target = match acme_name
+            .as_ref()
+            .or(parsed_client_hello.requested_server_name.as_ref())
+        {
             None => match self.default_target {
                 Some(ref t) => t,
                 None => {
@@ -125,23 +137,64 @@ impl TcpServerHandler for TlsServerHandler {
 
         match target {
             TlsServerTarget::Tls {
+                certificate_source,
                 server_config,
                 effective_selector,
                 inner_protocol,
             } => {
+                if parsed_client_hello.acme_alpn {
+                    let config = certificate_source
+                        .as_ref()
+                        .and_then(|source| {
+                            source.challenge_config(
+                                parsed_client_hello.requested_server_name.as_deref(),
+                            )
+                        })
+                        .ok_or_else(|| {
+                            std::io::Error::other("no pending TLS-ALPN-01 challenge for this SNI")
+                        })?;
+                    let mut connection =
+                        rustls::ServerConnection::new(config).map_err(std::io::Error::other)?;
+                    feed_rustls_server_connection(
+                        &mut connection,
+                        &parsed_client_hello.client_hello_frame,
+                    )?;
+                    connection
+                        .process_new_packets()
+                        .map_err(std::io::Error::other)?;
+                    let mut stream = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        CryptoTlsStream::handshake(
+                            server_stream,
+                            TlsConnection::new(connection),
+                            TlsReadMode::Stream,
+                            parsed_client_hello.client_reader.unparsed_data(),
+                        ),
+                    )
+                    .await??;
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::io::AsyncWriteExt::shutdown(&mut stream),
+                    )
+                    .await??;
+                    return Ok(TcpServerSetupResult::Session(Box::pin(async {})));
+                }
                 let ParsedClientHello {
                     client_hello_frame,
                     client_reader,
                     ..
                 } = parsed_client_hello;
 
-                let mut server_conn = rustls::ServerConnection::new(server_config.clone())
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("Failed to create server connection: {e}"),
-                        )
-                    })?;
+                let config = match certificate_source {
+                    Some(source) => source.snapshot(server_config),
+                    None => server_config.clone(),
+                };
+                let mut server_conn = rustls::ServerConnection::new(config).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Failed to create server connection: {e}"),
+                    )
+                })?;
 
                 if let Some(size) = self.tls_buffer_size {
                     server_conn.set_buffer_limit(Some(size));
@@ -267,6 +320,7 @@ mod tests {
         let server_config = server_config(&cert);
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));
         let target = TlsServerTarget::Tls {
+            certificate_source: None,
             server_config: Arc::new(server_config),
             effective_selector: selector.clone(),
             inner_protocol: InnerProtocol::Normal(Box::new(PortForwardServerHandler::new(

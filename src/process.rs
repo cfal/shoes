@@ -33,6 +33,7 @@ async fn load_validated(
 
 struct PreparedServers {
     generation: Option<std::sync::Arc<crate::control::runtime::Generation>>,
+    certificates: crate::certificates::Registry,
     validated: ValidatedConfigs,
     dns: DnsRegistry,
     #[cfg(unix)]
@@ -41,12 +42,13 @@ struct PreparedServers {
 
 #[cfg(test)]
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
-    prepare_tracking(paths, previous, &mut |_| {}, &mut None).await
+    prepare_tracking(paths, previous, None, &mut |_| {}, &mut None).await
 }
 
 async fn prepare_tracking(
     paths: &[String],
     previous: Option<&DnsRegistry>,
+    previous_certificates: Option<&crate::certificates::Registry>,
     discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
     control: &mut Option<crate::control::runtime::ControlService>,
 ) -> io::Result<PreparedServers> {
@@ -143,6 +145,8 @@ async fn prepare_tracking(
             ))
         }
     })?;
+    let certificates =
+        crate::certificates::Registry::prepare(&mut validated, previous_certificates).await?;
     let generation = if let (Some((id, rules)), Some(catalog)) =
         (control_generation, validated.catalog.take())
     {
@@ -164,6 +168,7 @@ async fn prepare_tracking(
     };
     Ok(PreparedServers {
         generation,
+        certificates,
         validated,
         dns,
         #[cfg(unix)]
@@ -198,11 +203,12 @@ impl RunningServers {
         std::future::pending().await
     }
 
-    async fn shutdown(&mut self, registries: &[&DnsRegistry]) -> io::Result<()> {
+    async fn shutdown(&mut self, registries: &[&PreparedServers]) -> io::Result<()> {
         self.stop().await;
         let mut result = Ok(());
         for registry in registries {
-            if let Err(error) = registry.shutdown_checkpoint().await {
+            registry.certificates.stop().await;
+            if let Err(error) = registry.dns.shutdown_checkpoint().await {
                 log::warn!("Final Fake DNS checkpoint failed: {error}");
                 if result.is_ok() {
                     result = Err(error);
@@ -274,6 +280,7 @@ impl RunningServers {
                 }
             }
         }
+        prepared.certificates.start().await;
         println!("Servers ready");
         Ok(())
     }
@@ -579,7 +586,7 @@ async fn run_inner(
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = prepare_tracking(&paths, None, &mut discovered, control) => result?,
+        result = prepare_tracking(&paths, None, None, &mut discovered, control) => result?,
     };
     watches.activated(&prepared.validated.rule_files);
     let mut running = RunningServers::default();
@@ -592,9 +599,9 @@ async fn run_inner(
     }
     tokio::select! {
         biased;
-        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+        _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
         result = running.start(&mut prepared) => if let Err(error) = result {
-            let _ = running.shutdown(&[&prepared.dns]).await;
+            let _ = running.shutdown(&[&prepared]).await;
             return Err(error);
         },
     }
@@ -604,9 +611,9 @@ async fn run_inner(
     loop {
         let debounce = tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+            _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
             error = running.tun_failure() => {
-                let _ = running.shutdown(&[&prepared.dns]).await;
+                let _ = running.shutdown(&[&prepared]).await;
                 return Err(error);
             },
             _ = reload.recv() => false,
@@ -615,9 +622,9 @@ async fn run_inner(
         if debounce {
             tokio::select! {
                 biased;
-                _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+                _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
                 error = running.tun_failure() => {
-                    let _ = running.shutdown(&[&prepared.dns]).await;
+                    let _ = running.shutdown(&[&prepared]).await;
                     return Err(error);
                 },
                 _ = reload.recv() => {}
@@ -632,12 +639,12 @@ async fn run_inner(
         let mut discovered = |paths: &[PathBuf]| watches.discovered(paths);
         let candidate = tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+            _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
             error = running.tun_failure() => {
-                let _ = running.shutdown(&[&prepared.dns]).await;
+                let _ = running.shutdown(&[&prepared]).await;
                 return Err(error);
             },
-            result = prepare_tracking(&paths, Some(&prepared.dns), &mut discovered, control) => result,
+            result = prepare_tracking(&paths, Some(&prepared.dns), Some(&prepared.certificates), &mut discovered, control) => result,
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
@@ -658,9 +665,9 @@ async fn run_inner(
         }
         tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+            _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
             result = running.quic_retirements.wait() => if let Err(error) = result {
-                let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                let _ = running.shutdown(&[&prepared, &candidate]).await;
                 return Err(error);
             },
         }
@@ -672,7 +679,7 @@ async fn run_inner(
         loop {
             let result = tokio::select! {
                 biased;
-                _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+                _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
                 result = running.start(&mut candidate) => result,
             };
             match result {
@@ -683,20 +690,20 @@ async fn run_inner(
                 {
                     tokio::select! {
                         biased;
-                        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+                        _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
                         result = running.quic_retirements.wait() => if let Err(error) = result {
-                            let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                            let _ = running.shutdown(&[&prepared, &candidate]).await;
                             return Err(error);
                         },
                     }
                     tokio::select! {
                         biased;
-                        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+                        _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
                         _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                     }
                 }
                 Err(error) => {
-                    let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                    let _ = running.shutdown(&[&prepared, &candidate]).await;
                     return Err(error);
                 }
             }
@@ -705,7 +712,8 @@ async fn run_inner(
         if let Some(control) = control.as_ref() {
             control.runtime.resume().await?;
         }
-        drop(std::mem::replace(&mut prepared, candidate));
+        let mut retired = std::mem::replace(&mut prepared, candidate);
+        retired.certificates.shutdown().await;
     }
 }
 
@@ -891,7 +899,7 @@ mod tests {
         }));
         assert!(
             running
-                .shutdown(&[&registries[0].dns, &registries[1].dns])
+                .shutdown(&[&registries[0], &registries[1]])
                 .await
                 .is_err()
         );

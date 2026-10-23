@@ -445,6 +445,8 @@ fn create_tls_server_target(
     scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<TlsServerTarget> {
     let TlsServerConfig {
+        certificate_source: _,
+        certificate_binding,
         key_exchange_groups,
         cert,
         key,
@@ -491,14 +493,17 @@ fn create_tls_server_target(
         alpn_protocols.into_vec()
     };
 
-    let server_config = Arc::new(try_create_server_config(
-        &cert_bytes,
-        &key_bytes,
-        client_ca_certs,
-        &effective_alpn,
-        &client_fingerprints.into_vec(),
-        &key_exchange_groups,
-    )?);
+    let server_config = Arc::new(
+        crate::rustls_config_util::try_create_server_config_with_source(
+            &cert_bytes,
+            &key_bytes,
+            client_ca_certs,
+            &effective_alpn,
+            &client_fingerprints.into_vec(),
+            &key_exchange_groups,
+            certificate_binding.as_ref(),
+        )?,
+    );
 
     let effective_selector = if !override_rules.is_empty() {
         create_override_selector(override_rules, client_proxy_selector, resolver)?
@@ -535,6 +540,7 @@ fn create_tls_server_target(
     };
 
     Ok(TlsServerTarget::Tls {
+        certificate_source: certificate_binding,
         server_config,
         effective_selector,
         inner_protocol,
