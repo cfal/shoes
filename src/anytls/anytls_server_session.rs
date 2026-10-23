@@ -10,10 +10,10 @@ use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec,
 use crate::async_stream::AsyncTargetedMessageStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
-use crate::tcp::tcp_server::run_udp_copy;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
 use crate::vless::VlessMessageStream;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -1018,13 +1018,32 @@ impl AnyTlsSession {
                 return Err(crate::control::tracked_stream::cancelled());
             }
         }
-        run_udp_copy(
-            Box::new(VlessMessageStream::new(stream)),
-            setup.stream,
-            false,
-            false,
-        )
-        .await
+        let mut client_stream = setup.stream;
+        let (result, cancelled) = {
+            let mut server_stream = VlessMessageStream::new(&mut stream);
+            let result = crate::control::tracked_stream::during_flow(
+                flow.as_deref(),
+                copy_bidirectional_message(&mut server_stream, &mut client_stream, false, false),
+            )
+            .await;
+            let cancelled = tokio::select! {
+                biased;
+                _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => true,
+                _ = async {
+                    futures::join!(
+                        crate::util::shutdown_message_stream(&mut server_stream),
+                        crate::util::shutdown_message_stream(&mut client_stream),
+                    );
+                } => false,
+            };
+            (result, cancelled)
+        };
+        if cancelled {
+            drop(client_stream);
+            stream.close_read();
+            let _ = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+        }
+        result
     }
 
     /// Handle UoT multi-destination mode (V1 and V2 non-connect)
@@ -1507,13 +1526,13 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_flows_release_reads_and_egress_before_bounded_fin() {
-        for (phase, drain) in ["synack", "early-data", "copy", "udp-synack"]
+        for (phase, drain) in ["synack", "early-data", "copy", "udp-synack", "udp-copy"]
             .into_iter()
             .flat_map(|phase| [true, false].map(|drain| (phase, drain)))
         {
             let early_data = phase == "early-data";
-            let established = phase == "copy";
-            let udp = phase == "udp-synack";
+            let established = matches!(phase, "copy" | "udp-copy");
+            let udp = matches!(phase, "udp-synack" | "udp-copy");
             timeout(Duration::from_secs(3), async {
                 use crate::client_proxy_chain::ClientChainGroup;
                 use crate::client_proxy_selector::{ConnectAction, ConnectRule};
@@ -1632,6 +1651,9 @@ mod tests {
                     );
                 }
                 if established {
+                    if udp {
+                        egress.write_all(&8u16.to_be_bytes()).await.unwrap();
+                    }
                     egress.write_all(b"download").await.unwrap();
                     while registry.snapshot(0).connections[0].download == 0 {
                         tokio::task::yield_now().await;
