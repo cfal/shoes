@@ -125,19 +125,51 @@ impl WebsocketStream {
         }
     }
 
+    fn unprocessed_len(&self) -> usize {
+        self.unprocessed_end_offset - self.unprocessed_start_offset
+    }
+
+    fn consume_unprocessed(&mut self, len: usize) {
+        self.unprocessed_start_offset += len;
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+        }
+    }
+
+    /// How much of the current frame's remaining payload is buffered.
+    fn buffered_payload_len(&self) -> usize {
+        std::cmp::min(self.unprocessed_len() as u64, self.read_frame_length) as usize
+    }
+
+    fn consume_payload(&mut self, len: usize) {
+        self.consume_unprocessed(len);
+        self.read_frame_length -= len as u64;
+    }
+
+    /// Unmasks the next `len` buffered payload bytes in place and returns their range in
+    /// `unprocessed_buf`.
+    fn unmask_payload(&mut self, len: usize) -> std::ops::Range<usize> {
+        let payload = self.unprocessed_start_offset..self.unprocessed_start_offset + len;
+        if self.read_frame_masked {
+            apply_mask(
+                &mut self.unprocessed_buf[payload.clone()],
+                &self.read_frame_mask,
+                self.read_frame_mask_offset,
+            );
+            self.read_frame_mask_offset = (self.read_frame_mask_offset + len) % 4;
+        }
+        payload
+    }
+
     fn step_init(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> std::io::Result<()> {
-        let unprocessed_len = self.unprocessed_end_offset - self.unprocessed_start_offset;
-        if unprocessed_len < 2 {
+        if self.unprocessed_len() < 2 {
             return Ok(());
         }
 
         let first = self.unprocessed_buf[self.unprocessed_start_offset];
         let second = self.unprocessed_buf[self.unprocessed_start_offset + 1];
-        self.unprocessed_start_offset += 2;
-        if self.unprocessed_start_offset == self.unprocessed_end_offset {
-            self.unprocessed_start_offset = 0;
-            self.unprocessed_end_offset = 0;
-        }
+        self.consume_unprocessed(2);
 
         let read_frame_final = first & 0x80 != 0;
 
@@ -196,24 +228,18 @@ impl WebsocketStream {
         buf: &mut ReadBuf<'_>,
         length_bytes_len: usize,
     ) -> std::io::Result<()> {
-        let unprocessed_len = self.unprocessed_end_offset - self.unprocessed_start_offset;
-        if unprocessed_len < length_bytes_len {
+        if self.unprocessed_len() < length_bytes_len {
             return Ok(());
         }
 
         let length_bytes = &self.unprocessed_buf
             [self.unprocessed_start_offset..self.unprocessed_start_offset + length_bytes_len];
-        self.unprocessed_start_offset += length_bytes_len;
-        if self.unprocessed_start_offset == self.unprocessed_end_offset {
-            self.unprocessed_start_offset = 0;
-            self.unprocessed_end_offset = 0;
-        }
-
         let mut length = 0u64;
         for b in length_bytes {
             length = (length << 8) | (*b as u64);
         }
         self.read_frame_length = length;
+        self.consume_unprocessed(length_bytes_len);
 
         if self.read_frame_length > 0x7fffffffffffffffu64 {
             return Err(std::io::Error::other(format!(
@@ -235,20 +261,15 @@ impl WebsocketStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::io::Result<()> {
-        let unprocessed_len = self.unprocessed_end_offset - self.unprocessed_start_offset;
-        if unprocessed_len < 4 {
+        if self.unprocessed_len() < 4 {
             return Ok(());
         }
 
         let mask_bytes =
             &self.unprocessed_buf[self.unprocessed_start_offset..self.unprocessed_start_offset + 4];
         self.read_frame_mask.copy_from_slice(mask_bytes);
-
-        self.unprocessed_start_offset += 4;
-        if self.unprocessed_start_offset == self.unprocessed_end_offset {
-            self.unprocessed_start_offset = 0;
-            self.unprocessed_end_offset = 0;
-        }
+        self.read_frame_mask_offset = 0;
+        self.consume_unprocessed(4);
 
         self.step_check_content(cx, buf)
     }
@@ -336,18 +357,10 @@ impl WebsocketStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::io::Result<()> {
+        let skip_amount = self.buffered_payload_len();
+        self.consume_payload(skip_amount);
         if self.read_frame_length > 0 {
-            let unprocessed_len = self.unprocessed_end_offset - self.unprocessed_start_offset;
-            let skip_amount = std::cmp::min(unprocessed_len as u64, self.read_frame_length);
-            self.unprocessed_start_offset += skip_amount as usize;
-            if self.unprocessed_start_offset == self.unprocessed_end_offset {
-                self.unprocessed_start_offset = 0;
-                self.unprocessed_end_offset = 0;
-            }
-            self.read_frame_length -= skip_amount;
-            if self.read_frame_length > 0 {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         self.read_state = ReadState::Init;
@@ -359,39 +372,18 @@ impl WebsocketStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::io::Result<()> {
-        let unprocessed_len = self.unprocessed_end_offset - self.unprocessed_start_offset;
-        let read_amount = std::cmp::min(unprocessed_len, self.read_frame_length as usize);
+        let read_amount = self.buffered_payload_len();
         if read_amount == 0 {
             return Ok(());
         }
 
-        let content_bytes = &mut self.unprocessed_buf
-            [self.unprocessed_start_offset..self.unprocessed_start_offset + read_amount];
-        if self.read_frame_masked {
-            let iter = content_bytes.iter_mut().zip(
-                self.read_frame_mask
-                    .iter()
-                    .cycle()
-                    .skip(self.read_frame_mask_offset),
-            );
-            for (byte, &key) in iter {
-                *byte ^= key
-            }
-            self.read_frame_mask_offset = (self.read_frame_mask_offset + read_amount) % 4;
-        }
-
+        let payload = self.unmask_payload(read_amount);
         self.ping_data[self.ping_data_size..self.ping_data_size + read_amount]
-            .copy_from_slice(content_bytes);
+            .copy_from_slice(&self.unprocessed_buf[payload]);
         self.ping_data_size += read_amount;
-        self.unprocessed_start_offset += read_amount;
-        if self.unprocessed_start_offset == self.unprocessed_end_offset {
-            self.unprocessed_start_offset = 0;
-            self.unprocessed_end_offset = 0;
-        }
-        self.read_frame_length -= read_amount as u64;
+        self.consume_payload(read_amount);
 
         if self.read_frame_length == 0 {
-            self.read_frame_mask_offset = 0;
             self.read_state = ReadState::Init;
             // this previously tried to pack_write_pong_frame right away - but there's no
             // point in doing it, because copy_bidirectional wouldn't know there's anything
@@ -408,8 +400,6 @@ impl WebsocketStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::io::Result<()> {
-        let unprocessed_len = self.unprocessed_end_offset - self.unprocessed_start_offset;
-
         let available_space = buf.remaining();
         if available_space == 0 {
             // it's possible that we looped through all the steps and ended up in read content
@@ -417,41 +407,16 @@ impl WebsocketStream {
             return Ok(());
         }
 
-        let read_amount = std::cmp::min(
-            std::cmp::min(unprocessed_len, self.read_frame_length as usize),
-            available_space,
-        );
-
+        let read_amount = std::cmp::min(self.buffered_payload_len(), available_space);
         if read_amount == 0 {
             return Ok(());
         }
 
-        let content_bytes = &mut self.unprocessed_buf
-            [self.unprocessed_start_offset..self.unprocessed_start_offset + read_amount];
-        if self.read_frame_masked {
-            let iter = content_bytes.iter_mut().zip(
-                self.read_frame_mask
-                    .iter()
-                    .cycle()
-                    .skip(self.read_frame_mask_offset),
-            );
-            for (byte, &key) in iter {
-                *byte ^= key
-            }
-            self.read_frame_mask_offset = (self.read_frame_mask_offset + read_amount) % 4;
-        }
+        let payload = self.unmask_payload(read_amount);
+        buf.put_slice(&self.unprocessed_buf[payload]);
+        self.consume_payload(read_amount);
 
-        buf.put_slice(content_bytes);
-
-        self.unprocessed_start_offset += read_amount;
-        if self.unprocessed_start_offset == self.unprocessed_end_offset {
-            self.unprocessed_start_offset = 0;
-            self.unprocessed_end_offset = 0;
-        }
-
-        self.read_frame_length -= read_amount as u64;
         if self.read_frame_length == 0 {
-            self.read_frame_mask_offset = 0;
             self.read_state = ReadState::Init;
             return self.step_init(cx, buf);
         }
@@ -828,16 +793,18 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
     if input_len > 0 {
         output[offset..offset + input_len].copy_from_slice(input);
         if let Some(mask_bytes) = mask {
-            let iter = output[offset..offset + input_len]
-                .iter_mut()
-                .zip(mask_bytes.iter().cycle());
-            for (byte, &key) in iter {
-                *byte ^= key
-            }
+            apply_mask(&mut output[offset..offset + input_len], &mask_bytes, 0);
         }
     }
 
     offset + input_len
+}
+
+/// XORs `bytes` with `mask`, starting `offset` bytes into the mask.
+fn apply_mask(bytes: &mut [u8], mask: &[u8; 4], offset: usize) {
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte ^= mask[(offset + i) % 4];
+    }
 }
 
 #[cfg(test)]
