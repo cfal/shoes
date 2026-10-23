@@ -1033,7 +1033,7 @@ async fn process_udp_packet(
                         None
                     }
                 };
-                let client_socket = UdpRelay::new_from(
+                let client_socket = UdpRelay::new(
                     client_proxy_selector.clone(),
                     resolver.clone(),
                     Some(connection.remote_address()),
@@ -1432,6 +1432,7 @@ mod lifecycle_tests {
             UdpRelay::new(
                 Arc::new(ClientProxySelector::new(Vec::new())),
                 Arc::new(crate::resolver::NativeResolver::new()),
+                None,
             )
             .unwrap(),
         );

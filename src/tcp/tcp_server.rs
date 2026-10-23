@@ -287,7 +287,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             proxy_selector,
         } => {
             let setup = crate::util::timeout_stream_setup(async {
-                crate::routing::ingress::connect_udp_from(
+                crate::routing::ingress::connect_udp(
                     &proxy_selector,
                     remote_location,
                     &resolver,

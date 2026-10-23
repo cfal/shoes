@@ -564,7 +564,7 @@ fn spawn_inbound(
                 );
                 let target =
                     NetLocation::from_ip_addr(connection.target.ip(), connection.target.port());
-                let _ = crate::tun::handle_tcp_connection_from(
+                let _ = crate::tun::handle_tcp_connection(
                     connection.connection,
                     target,
                     selector,

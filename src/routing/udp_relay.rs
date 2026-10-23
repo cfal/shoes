@@ -31,15 +31,7 @@ pub struct UdpRelay {
 }
 
 impl UdpRelay {
-    #[cfg(test)]
     pub fn new(
-        selector: Arc<ClientProxySelector>,
-        resolver: Arc<dyn Resolver>,
-    ) -> io::Result<Self> {
-        Self::new_from(selector, resolver, None)
-    }
-
-    pub fn new_from(
         selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
         peer: Option<std::net::SocketAddr>,
@@ -286,7 +278,7 @@ mod tests {
                 crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
             ),
         )]));
-        let relay = UdpRelay::new(selector, resolver).unwrap();
+        let relay = UdpRelay::new(selector, resolver, None).unwrap();
         let original = NetLocation::from_str("192.0.2.1:53", None).unwrap();
         for payload in [b"".as_slice(), b"query".as_slice()] {
             relay
@@ -330,7 +322,7 @@ mod tests {
                     crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
                 ),
             )]));
-            let relay = UdpRelay::new(selector, resolver.clone()).unwrap();
+            let relay = UdpRelay::new(selector, resolver.clone(), None).unwrap();
             relay
                 .send_to(
                     Bytes::from_static(b"query"),

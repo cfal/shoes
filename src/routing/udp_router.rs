@@ -24,7 +24,7 @@ use tokio::io::ReadBuf;
 use tokio::time::Instant;
 use tokio_util::time::{DelayQueue, delay_queue};
 
-use super::ingress::connect_prepared_udp_from;
+use super::ingress::connect_prepared_udp;
 use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncReadSessionMessage,
@@ -1214,7 +1214,7 @@ impl<'a> UdpRouter<'a> {
         let source = self.server.peer_addr();
         let future: SessionCreateFuture = Box::pin(async move {
             let setup =
-                connect_prepared_udp_from(&selector, prepared, &resolver, require_ip_reply, source)
+                connect_prepared_udp(&selector, prepared, &resolver, require_ip_reply, source)
                     .await?;
             Ok(SessionCreateResult {
                 permit,

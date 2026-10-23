@@ -528,7 +528,7 @@ async fn run_udp_local_to_remote_loop(
                         None
                     }
                 };
-                let Ok(client_socket) = UdpRelay::new_from(
+                let Ok(client_socket) = UdpRelay::new(
                     client_proxy_selector.clone(),
                     resolver.clone(),
                     Some(connection.remote_address()),

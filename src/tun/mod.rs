@@ -189,7 +189,7 @@ async fn run_tun_server_inner(
 
                     debug!("Handling TCP connection to {:?}", target);
 
-                    if let Err(e) = handle_tcp_connection_from(
+                    if let Err(e) = handle_tcp_connection(
                         new_conn.connection,
                         target,
                         proxy_selector,
@@ -260,17 +260,7 @@ fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
 }
 
 /// Handle a TCP connection by forwarding it through the proxy chain.
-#[cfg(test)]
 pub(crate) async fn handle_tcp_connection(
-    connection: tcp_conn::TcpConnection,
-    target: NetLocation,
-    proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-) -> std::io::Result<()> {
-    handle_tcp_connection_from(connection, target, proxy_selector, resolver, None).await
-}
-
-pub(crate) async fn handle_tcp_connection_from(
     mut connection: tcp_conn::TcpConnection,
     target: NetLocation,
     proxy_selector: Arc<ClientProxySelector>,
@@ -614,6 +604,7 @@ mod tests {
                 NetLocation::from_str("127.0.0.1:80", None).unwrap(),
                 selector,
                 resolver,
+                None,
             )
             .await
             .unwrap();
@@ -639,7 +630,7 @@ mod tests {
             assert_eq!(control.enqueue_recv_data(&hello), hello.len());
             control.set_recv_state(tcp_conn::TcpSocketState::Closed);
             tasks.spawn(async move {
-                handle_tcp_connection(connection, target, selector, resolver)
+                handle_tcp_connection(connection, target, selector, resolver, None)
                     .await
                     .unwrap();
             });
@@ -674,7 +665,7 @@ mod tests {
                 assert_eq!(control.enqueue_recv_data(&payload), payload.len());
                 control.set_recv_state(tcp_conn::TcpSocketState::Closed);
                 let mut task = tokio::spawn(handle_tcp_connection(
-                    connection, target, selector, resolver,
+                    connection, target, selector, resolver, None,
                 ));
                 let mut received = Vec::new();
                 loop {

@@ -76,7 +76,7 @@ pub(crate) async fn route_udp<'a>(
     .await
 }
 
-pub(crate) async fn connect_udp_from(
+pub(crate) async fn connect_udp(
     selector: &ClientProxySelector,
     destination: NetLocation,
     resolver: &Arc<dyn Resolver>,
@@ -84,23 +84,13 @@ pub(crate) async fn connect_udp_from(
 ) -> io::Result<Box<dyn AsyncMessageStream>> {
     let target = selector.prepare(destination.into())?;
     Ok(
-        connect_prepared_udp_from(selector, target, resolver, false, source)
+        connect_prepared_udp(selector, target, resolver, false, source)
             .await?
             .stream,
     )
 }
 
-#[cfg(test)]
 pub(crate) async fn connect_prepared_udp(
-    selector: &ClientProxySelector,
-    target: IngressTarget,
-    resolver: &Arc<dyn Resolver>,
-    require_ip_reply: bool,
-) -> io::Result<UdpSetup> {
-    connect_prepared_udp_from(selector, target, resolver, require_ip_reply, None).await
-}
-
-pub(crate) async fn connect_prepared_udp_from(
     selector: &ClientProxySelector,
     target: IngressTarget,
     resolver: &Arc<dyn Resolver>,
@@ -442,6 +432,7 @@ pub(crate) mod tests {
                 selector.prepare(wire.clone().into()).unwrap(),
                 &real,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -464,7 +455,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(
-            connect_prepared_udp(&selector, target, &real, true)
+            connect_prepared_udp(&selector, target, &real, true, None)
                 .await
                 .is_err(),
             "IP-only reply protocols must resolve a hostname or fail explicitly"
