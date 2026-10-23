@@ -74,39 +74,36 @@ pub(super) async fn serve(bound: Bound, state: Arc<ApiState>) {
     match bound {
         Bound::Tcp(listener, config) => loop {
             let accepted = tokio::select! { _ = state.cancel.cancelled() => break, result = listener.accept() => result };
-            let (stream, _) = match accepted {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    log::warn!("Clash API TCP accept failed: {error}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-            let Ok(permit) = state.runtime.connections.clone().try_acquire_owned() else {
-                continue;
-            };
-            state
-                .tasks
-                .spawn(connection(stream, config.clone(), state.clone(), permit));
+            admit(accepted.map(|(stream, _)| stream), "TCP", &config, &state).await;
         },
         #[cfg(unix)]
         Bound::Unix(listener, config, _owner) => loop {
             let accepted = tokio::select! { _ = state.cancel.cancelled() => break, result = listener.accept() => result };
-            let (stream, _) = match accepted {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    log::warn!("Clash API Unix accept failed: {error}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-            let Ok(permit) = state.runtime.connections.clone().try_acquire_owned() else {
-                continue;
-            };
-            state
-                .tasks
-                .spawn(connection(stream, config.clone(), state.clone(), permit));
+            admit(accepted.map(|(stream, _)| stream), "Unix", &config, &state).await;
         },
+    }
+}
+
+async fn admit<T>(
+    accepted: io::Result<T>,
+    transport: &str,
+    config: &Arc<ClashApiConfig>,
+    state: &Arc<ApiState>,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let stream = match accepted {
+        Ok(stream) => stream,
+        Err(error) => {
+            log::warn!("Clash API {transport} accept failed: {error}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return;
+        }
+    };
+    if let Ok(permit) = state.runtime.connections.clone().try_acquire_owned() {
+        state
+            .tasks
+            .spawn(connection(stream, config.clone(), state.clone(), permit));
     }
 }
 
