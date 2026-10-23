@@ -33,6 +33,10 @@ const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+async fn cancelled_fin(stream: &mut AnyTlsStream) {
+    let _ = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+}
+
 async fn setup_timeout<T>(
     future: impl std::future::Future<Output = io::Result<T>>,
 ) -> io::Result<T> {
@@ -821,7 +825,7 @@ impl AnyTlsSession {
                             stream.close_read();
                             // Finish the bounded control write; truncating a shared frame corrupts siblings.
                             let _ = synack.await;
-                            let _ = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+                            cancelled_fin(&mut stream).await;
                             return Err(crate::control::tracked_stream::cancelled());
                         }
                     }
@@ -839,17 +843,26 @@ impl AnyTlsSession {
                     drop(client_stream);
                     stream.close_read();
                     if flow.as_ref().is_some_and(|flow| flow.cancel.is_cancelled()) {
-                        let _ = tokio::time::timeout(Duration::from_millis(250), stream.shutdown())
-                            .await;
+                        cancelled_fin(&mut stream).await;
                     }
                     return Err(error);
                 }
-                if !routed.prefix.is_empty() {
-                    setup_timeout(async {
-                        client_stream.write_all(&routed.prefix).await?;
-                        client_stream.flush().await
-                    })
-                    .await?;
+                if !routed.prefix.is_empty()
+                    && let Err(error) = crate::control::tracked_stream::during_flow(
+                        flow.as_deref(),
+                        setup_timeout(async {
+                            client_stream.write_all(&routed.prefix).await?;
+                            client_stream.flush().await
+                        }),
+                    )
+                    .await
+                {
+                    drop(client_stream);
+                    stream.close_read();
+                    if flow.as_ref().is_some_and(|flow| flow.cancel.is_cancelled()) {
+                        cancelled_fin(&mut stream).await;
+                    }
+                    return Err(error);
                 }
 
                 drop(routed.prefix);
@@ -870,8 +883,7 @@ impl AnyTlsSession {
                 if cancelled {
                     drop(client_stream);
                     stream.close_read();
-                    let _ =
-                        tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+                    cancelled_fin(&mut stream).await;
                 }
 
                 if let Err(e) = &result {
@@ -1014,7 +1026,7 @@ impl AnyTlsSession {
                 stream.close_read();
                 // A partially written shared control frame must finish before FIN.
                 let _ = synack.await;
-                let _ = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+                cancelled_fin(&mut stream).await;
                 return Err(crate::control::tracked_stream::cancelled());
             }
         }
@@ -1041,7 +1053,7 @@ impl AnyTlsSession {
         if cancelled {
             drop(client_stream);
             stream.close_read();
-            let _ = tokio::time::timeout(Duration::from_millis(250), stream.shutdown()).await;
+            cancelled_fin(&mut stream).await;
         }
         result
     }
@@ -1498,16 +1510,77 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct TcpDatagramConnector(std::net::SocketAddr);
+    struct TestConnector {
+        address: std::net::SocketAddr,
+        blocked_write: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[derive(Debug)]
+    struct BlockedWriter {
+        stream: tokio::net::TcpStream,
+        writing: Arc<tokio::sync::Notify>,
+    }
+
+    impl AsyncRead for BlockedWriter {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for BlockedWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.writing.notify_one();
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for BlockedWriter {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<bool>> {
+            std::task::Poll::Ready(Ok(false))
+        }
+    }
+    impl crate::async_stream::AsyncStream for BlockedWriter {}
 
     #[async_trait::async_trait]
-    impl crate::tcp::socket_connector::SocketConnector for TcpDatagramConnector {
+    impl crate::tcp::socket_connector::SocketConnector for TestConnector {
         async fn connect(
             &self,
             _: &Arc<dyn Resolver>,
             _: &crate::address::ResolvedLocation,
         ) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
-            unreachable!("datagram fixture")
+            Ok(Box::new(BlockedWriter {
+                stream: tokio::net::TcpStream::connect(self.address).await?,
+                writing: self.blocked_write.as_ref().unwrap().clone(),
+            }))
         }
 
         async fn connect_udp_bidirectional(
@@ -1515,7 +1588,7 @@ mod tests {
             _: &Arc<dyn Resolver>,
             _: crate::address::ResolvedLocation,
         ) -> io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
-            let stream = tokio::net::TcpStream::connect(self.0).await?;
+            let stream = tokio::net::TcpStream::connect(self.address).await?;
             Ok(Box::new(VlessMessageStream::new(stream)))
         }
 
@@ -1526,21 +1599,34 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_flows_release_reads_and_egress_before_bounded_fin() {
+        #[derive(Clone, Copy, Debug)]
+        enum Phase {
+            Synack,
+            EarlyData,
+            Prefix,
+            Copy,
+            UdpSynack,
+            UdpCopy,
+            UdpShutdown,
+        }
+        use Phase::*;
         for (phase, drain) in [
-            "synack",
-            "early-data",
-            "copy",
-            "udp-synack",
-            "udp-copy",
-            "udp-shutdown",
+            Synack,
+            EarlyData,
+            Prefix,
+            Copy,
+            UdpSynack,
+            UdpCopy,
+            UdpShutdown,
         ]
         .into_iter()
         .flat_map(|phase| [true, false].map(|drain| (phase, drain)))
         {
-            let early_data = phase == "early-data";
-            let established = matches!(phase, "copy" | "udp-copy" | "udp-shutdown");
-            let udp = matches!(phase, "udp-synack" | "udp-copy" | "udp-shutdown");
-            let during_shutdown = phase == "udp-shutdown";
+            let early_data = matches!(phase, EarlyData);
+            let prefix = matches!(phase, Prefix);
+            let established = matches!(phase, Copy | UdpCopy | UdpShutdown);
+            let udp = matches!(phase, UdpSynack | UdpCopy | UdpShutdown);
+            let during_shutdown = matches!(phase, UdpShutdown);
             timeout(Duration::from_secs(3), async {
                 use crate::client_proxy_chain::ClientChainGroup;
                 use crate::client_proxy_selector::{ConnectAction, ConnectRule};
@@ -1562,13 +1648,17 @@ mod tests {
                 } else {
                     crate::config::ClientConfig::default()
                 };
-                let chain = if udp {
+                let writing = Arc::new(tokio::sync::Notify::new());
+                let chain = if udp || prefix {
                     crate::client_proxy_chain::ClientProxyChain::new(
                         vec![crate::client_proxy_chain::InitialHopEntry::Direct(
-                            Arc::new(TcpDatagramConnector(std::net::SocketAddr::from((
-                                [127, 0, 0, 1],
-                                listener.local_addr().unwrap().port(),
-                            )))),
+                            Arc::new(TestConnector {
+                                address: std::net::SocketAddr::from((
+                                    [127, 0, 0, 1],
+                                    listener.local_addr().unwrap().port(),
+                                )),
+                                blocked_write: prefix.then(|| writing.clone()),
+                            }),
                         )],
                         Vec::new(),
                     )
@@ -1594,12 +1684,22 @@ mod tests {
                         })),
                     },
                 )));
-                let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
-                    vec![crate::address::NetLocationMask::ANY],
-                    ConnectAction::new_allow(None, group),
-                )]));
-                let (transport, mut peer) =
-                    duplex(if early_data || established { 8192 } else { 1 });
+                let selector = Arc::new(
+                    ClientProxySelector::new(vec![ConnectRule::new(
+                        if prefix {
+                            vec![crate::address::NetLocationMask::from("sniff.example").unwrap()]
+                        } else {
+                            vec![crate::address::NetLocationMask::ANY]
+                        },
+                        ConnectAction::new_allow(None, group),
+                    )])
+                    .with_sniff(prefix),
+                );
+                let (transport, mut peer) = duplex(if early_data || prefix || established {
+                    8192
+                } else {
+                    1
+                });
                 let session = AnyTlsSession::new_server_with_initial_data(
                     transport,
                     PaddingFactory::default_factory(),
@@ -1617,7 +1717,14 @@ mod tests {
                         .unwrap();
                 }
                 let (sender, receiver) = mpsc::channel(1);
-                if !established {
+                if prefix {
+                    sender
+                        .try_send(Bytes::from(crate::sniff::tests::hello(
+                            &rustls::version::TLS13,
+                            true,
+                        )))
+                        .unwrap();
+                } else if !established {
                     sender
                         .try_send(Bytes::from_static(b"queued upload"))
                         .unwrap();
@@ -1649,8 +1756,19 @@ mod tests {
                         .unwrap();
                 }
                 let mut header = [0; 7];
-                let initial = if early_data || established { 7 } else { 1 };
+                let initial = if early_data || prefix || established {
+                    7
+                } else {
+                    1
+                };
                 peer.read_exact(&mut header[..initial]).await.unwrap();
+                if prefix {
+                    writing.notified().await;
+                    assert_eq!(
+                        registry.snapshot(0).connections[0].metadata.sniff_host,
+                        "sniff.example"
+                    );
+                }
                 if early_data {
                     assert_eq!(
                         registry.snapshot(0).connections[0].download,
@@ -1673,7 +1791,7 @@ mod tests {
                     assert_eq!(egress.read(&mut [0; 1]).await.unwrap(), 0);
                 }
                 registry.cancel_all();
-                if established {
+                if established || prefix {
                     sender
                         .try_send(Bytes::from_static(b"queued upload"))
                         .unwrap();
@@ -1689,7 +1807,7 @@ mod tests {
                 timeout(Duration::from_millis(100), sender.closed())
                     .await
                     .unwrap();
-                assert!(!forwarding.is_finished());
+                assert!(!forwarding.is_finished(), "{phase:?}, drain={drain}");
                 peer.read_exact(&mut header[initial..]).await.unwrap();
                 assert_eq!(
                     header.as_slice(),
@@ -1730,7 +1848,7 @@ mod tests {
                 assert!(!session.is_closed());
             })
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{phase:?}, drain={drain}: {error}"));
         }
     }
 
