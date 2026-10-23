@@ -3,7 +3,6 @@
   type: files
   cert: /etc/shoes/certs/fullchain.pem
   key: /etc/shoes/certs/privkey.pem
-  poll_interval_secs: 5
 
 - address: "0.0.0.0:8443"
   protocol:

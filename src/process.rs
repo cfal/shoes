@@ -1,26 +1,31 @@
-use std::collections::HashSet;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::RecommendedWatcher;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::address::NetLocation;
 use crate::config::{self, BindLocation, Config, ValidatedConfigs};
 use crate::dns::{self, DnsRegistry};
+use crate::file_watcher::watch;
 use crate::option_util::OneOrSome;
 use crate::resources;
+
+const RELOAD_DEBOUNCE: Duration = Duration::from_secs(3);
 
 async fn load_validated(
     paths: &[String],
     discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
 ) -> io::Result<ValidatedConfigs> {
     let mut configs = config::load_configs(&paths.to_vec()).await?;
-    discovered(&crate::rule_set::dependencies(&mut configs)?);
+    let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
+    dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
+    discovered(&dependencies);
     let (configs, _) = config::convert_cert_paths(configs).await?;
-    let validated = config::compile_configs(configs).await?;
+    let mut validated = config::compile_configs(configs).await?;
+    validated.reload_files = dependencies;
     tokio::task::spawn_blocking(move || {
         if validated.catalog.is_some() {
             crate::control::validation::validate_resources(&validated)?;
@@ -281,7 +286,6 @@ impl RunningServers {
             }
         }
         prepared.certificates.start().await;
-        println!("Servers ready");
         Ok(())
     }
 }
@@ -296,91 +300,6 @@ impl Drop for RunningServers {
             task.abort();
         }
     }
-}
-
-fn watch<P: AsRef<Path>>(paths: &[P], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatcher> {
-    let mut files = HashSet::new();
-    let mut required_directories = HashSet::new();
-    for path in paths {
-        let path = std::path::absolute(path)?;
-        if let Some(parent) = path.parent() {
-            required_directories.insert(parent.to_path_buf());
-        }
-        if let Ok(canonical) = std::fs::canonicalize(&path) {
-            if let Some(parent) = canonical.parent() {
-                required_directories.insert(parent.to_path_buf());
-            }
-            files.insert(canonical);
-        }
-        files.insert(path.clone());
-        if let Err(error) = resolve_watch_path(&path, &mut files, &mut 0) {
-            log::warn!(
-                "Could not resolve watch path {}: {error}; retaining lexical and discovered paths for recovery",
-                path.display()
-            );
-        }
-    }
-    let required_directories: HashSet<_> = required_directories
-        .iter()
-        .map(|path| watch_directory(path))
-        .collect();
-    let directories: HashSet<_> = files
-        .iter()
-        .filter_map(|path| path.parent()?.ancestors().find(|parent| parent.is_dir()))
-        .map(watch_directory)
-        .collect();
-    let direct_files: HashSet<_> = files
-        .iter()
-        .filter_map(|path| std::fs::canonicalize(path).ok())
-        .filter(|path| path.is_file())
-        .collect();
-    files.extend(direct_files.iter().cloned());
-    let mut watcher =
-        notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
-            Ok(event)
-                if matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) && event.paths.iter().any(|path| files.contains(path)) =>
-            {
-                let _ = tx.try_send(());
-            }
-            Err(error) => log::warn!("Config watcher failed: {error}"),
-            _ => {}
-        })
-        .map_err(io::Error::other)?;
-    for directory in directories {
-        if let Err(error) = watcher.watch(&directory, RecursiveMode::NonRecursive) {
-            if required_directories.contains(&directory) {
-                if !matches!(&error.kind, notify::ErrorKind::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
-                {
-                    return Err(io::Error::other(error));
-                }
-                log::warn!(
-                    "Could not watch config directory {}: {error}; using file watches, atomic replacements may be missed",
-                    directory.display()
-                );
-            } else {
-                log::warn!(
-                    "Could not watch intermediate config directory {}: {error}",
-                    directory.display()
-                );
-            }
-        }
-    }
-    for file in direct_files {
-        if let Err(error) = watcher.watch(&file, RecursiveMode::NonRecursive) {
-            let missing = match &error.kind {
-                notify::ErrorKind::PathNotFound => true,
-                notify::ErrorKind::Io(error) => error.kind() == io::ErrorKind::NotFound,
-                _ => false,
-            };
-            if !missing {
-                log::warn!("Could not watch config file {}: {error}", file.display());
-            }
-        }
-    }
-    Ok(watcher)
 }
 
 struct ConfigWatches {
@@ -423,7 +342,7 @@ impl ConfigWatches {
     fn discovered(&mut self, paths: &[PathBuf]) {
         self.candidate = paths.to_vec();
         if let Err(error) = self.refresh() {
-            log::warn!("Could not refresh rule/config watches: {error}");
+            log::warn!("Could not refresh config dependency watches: {error}");
         }
     }
 
@@ -431,64 +350,9 @@ impl ConfigWatches {
         self.active = paths.to_vec();
         self.candidate.clear();
         if let Err(error) = self.refresh() {
-            log::warn!("Could not refresh rule/config watches: {error}");
+            log::warn!("Could not refresh config dependency watches: {error}");
         }
     }
-}
-
-fn watch_directory(path: &Path) -> PathBuf {
-    // inotify keeps one event path per inode; register directory aliases only once.
-    #[cfg(unix)]
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
-    }
-    path.to_path_buf()
-}
-
-fn resolve_watch_path(
-    path: &Path,
-    files: &mut HashSet<PathBuf>,
-    symlinks: &mut usize,
-) -> io::Result<PathBuf> {
-    let mut resolved = PathBuf::new();
-    for component in path.components() {
-        if component == Component::ParentDir {
-            resolved.pop();
-            continue;
-        }
-        resolved.push(component);
-        match std::fs::symlink_metadata(&resolved) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                *symlinks += 1;
-                if *symlinks > 40 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "too many config symlinks",
-                    ));
-                }
-                let target = resolved
-                    .parent()
-                    .unwrap()
-                    .join(std::fs::read_link(&resolved)?);
-                if cfg!(target_os = "macos") && resolved.parent() == Some(Path::new("/")) {
-                    // System-volume links cannot be retargeted; tracking them subscribes
-                    // FSEvents to the entire filesystem even with NonRecursive watches.
-                    resolved = resolve_watch_path(&target, &mut HashSet::new(), symlinks)?;
-                } else {
-                    files.insert(resolved.clone());
-                    resolved = resolve_watch_path(&target, files, symlinks)?;
-                }
-            }
-            // Retain missing components so creating a target or its parent triggers another reload.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                files.insert(resolved.clone());
-            }
-            Err(error) => return Err(error),
-            Ok(_) => {}
-        }
-    }
-    files.insert(resolved.clone());
-    Ok(resolved)
 }
 
 #[cfg(unix)]
@@ -588,7 +452,7 @@ async fn run_inner(
         _ = shutdown.recv() => return Ok(()),
         result = prepare_tracking(&paths, None, None, &mut discovered, control) => result?,
     };
-    watches.activated(&prepared.validated.rule_files);
+    watches.activated(&prepared.validated.reload_files);
     let mut running = RunningServers::default();
     if let (Some(control), Some(generation)) = (control.as_ref(), prepared.generation.as_ref()) {
         control.runtime.begin_activation(generation).await?;
@@ -608,6 +472,7 @@ async fn run_inner(
     if let Some(control) = control.as_ref() {
         control.runtime.resume().await?;
     }
+    println!("Servers ready");
     loop {
         let debounce = tokio::select! {
             biased;
@@ -628,7 +493,7 @@ async fn run_inner(
                     return Err(error);
                 },
                 _ = reload.recv() => {}
-                _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                _ = crate::file_watcher::debounce(&mut changes, RELOAD_DEBOUNCE) => {}
             }
         }
         while changes.try_recv().is_ok() {}
@@ -708,12 +573,13 @@ async fn run_inner(
                 }
             }
         }
-        watches.activated(&candidate.validated.rule_files);
+        watches.activated(&candidate.validated.reload_files);
         if let Some(control) = control.as_ref() {
             control.runtime.resume().await?;
         }
         let mut retired = std::mem::replace(&mut prepared, candidate);
         retired.certificates.shutdown().await;
+        println!("Servers ready");
     }
 }
 
@@ -920,43 +786,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn directory_aliases_preserve_missing_target_notifications() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let target = root.join("target");
-        std::fs::create_dir(&target).unwrap();
-        std::os::unix::fs::symlink(&target, root.join("alias")).unwrap();
-        let existing = root.join("alias/existing.yaml");
-        std::fs::write(&existing, "existing").unwrap();
-        let missing = target.join("missing.yaml");
-        let (tx, mut events) = mpsc::channel(1);
-        let _watcher = watch(
-            &[
-                existing.to_str().unwrap().to_owned(),
-                missing.to_str().unwrap().to_owned(),
-            ],
-            tx,
-        )
-        .unwrap();
-        std::fs::write(&missing, "created").unwrap();
-        tokio::time::timeout(Duration::from_secs(3), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn system_symlinks_do_not_add_root_directory_watches() {
-        let mut files = HashSet::new();
-        resolve_watch_path(Path::new("/var/db/config.yaml"), &mut files, &mut 0).unwrap();
-        assert!(files.contains(Path::new("/private/var/db/config.yaml")));
-        assert!(!files.contains(Path::new("/var")));
-        assert!(!files.contains(Path::new("/private/var")));
-    }
-
     #[tokio::test]
     async fn preparation_preserves_ipv6_scope_ids_and_port_ranges() {
         let directory = tempfile::tempdir().unwrap();
@@ -985,40 +814,6 @@ mod tests {
                 "[fe80::1%2]:8080".parse().unwrap(),
                 "[fe80::1%2]:8081".parse().unwrap()
             ]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn watch_paths_include_missing_targets_and_symlinked_parents() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        std::fs::create_dir(root.join("targets")).unwrap();
-        std::os::unix::fs::symlink("targets", root.join("alias")).unwrap();
-        std::os::unix::fs::symlink("alias/missing/config.yaml", root.join("config.yaml")).unwrap();
-        let mut files = HashSet::new();
-        resolve_watch_path(&root.join("config.yaml"), &mut files, &mut 0).unwrap();
-        for path in [
-            "config.yaml",
-            "alias",
-            "targets/missing",
-            "targets/missing/config.yaml",
-        ] {
-            assert!(files.contains(&root.join(path)), "missing {path}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn watch_paths_reject_symlink_cycles() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.yaml");
-        std::os::unix::fs::symlink("config.yaml", &path).unwrap();
-        assert_eq!(
-            resolve_watch_path(&path, &mut HashSet::new(), &mut 0)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
         );
     }
 }

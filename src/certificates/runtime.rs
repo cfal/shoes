@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use super::{ChallengeConfig, Source, Spec, acme, challenge, visit};
+use super::{ChallengeConfig, Input, Source, Spec, acme, challenge, visit};
 use crate::config::ValidatedConfigs;
 
 #[derive(Default)]
@@ -27,6 +27,7 @@ impl Worker {
     fn matches_source(&self, source: &Source) -> bool {
         // Implicit file-source names depend on discovery order, not identity.
         self.source.spec == source.spec
+            && self.source.trust_digest == source.trust_digest
             && (self.source.name == source.name
                 || (self.source.name.starts_with('@') && source.name.starts_with('@')))
     }
@@ -177,29 +178,7 @@ impl Registry {
             *task = Some(tokio::spawn(async move {
                 let _lock = lock;
                 match &source.spec {
-                    Spec::Files { interval, .. } => {
-                        let mut failures = 0u32;
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(*interval)).await;
-                            match source.refresh_files() {
-                                Ok(changed) => {
-                                    if changed {
-                                        log::info!("Certificate source {} rotated", source.name);
-                                    }
-                                    failures = 0;
-                                }
-                                Err(_) => {
-                                    if failures == 0 || failures.is_multiple_of(60) {
-                                        log::warn!(
-                                            "Certificate source {} update rejected; retaining last good pair (expired certificates are not served)",
-                                            source.name
-                                        );
-                                    }
-                                    failures = failures.saturating_add(1);
-                                }
-                            }
-                        }
-                    }
+                    Spec::Files { .. } => watch_files(&source).await,
                     Spec::Acme(config) => {
                         let _cleanup = challenge::Cleanup(source.clone());
                         tokio::select! {
@@ -232,6 +211,59 @@ impl Registry {
     }
 }
 
+async fn watch_files(source: &Source) {
+    const DEBOUNCE: Duration = Duration::from_millis(250);
+    const RETRY: Duration = Duration::from_secs(1);
+    const RECONCILE: Duration = Duration::from_secs(60);
+    let Spec::Files { cert, key } = &source.spec else {
+        return;
+    };
+    let paths: Vec<_> = [cert, key]
+        .into_iter()
+        .filter_map(|input| match input {
+            Input::File(path) => Some(path),
+            Input::Inline(_) => None,
+        })
+        .collect();
+    let (tx, mut changes) = tokio::sync::mpsc::channel(1);
+    let mut _watcher = None;
+    let mut refresh_watch = true;
+    let mut watch_failed = false;
+    let mut next_warning = tokio::time::Instant::now();
+    loop {
+        // Build replacement watches before dropping the old ones, including symlink targets.
+        if refresh_watch {
+            watch_failed = match crate::file_watcher::watch(&paths, tx.clone()) {
+                Ok(next) => {
+                    _watcher = Some(next);
+                    false
+                }
+                Err(_) => true,
+            };
+        }
+        let result = source.refresh_files();
+        if matches!(result, Ok(true)) {
+            log::info!("Certificate source {} rotated", source.name);
+        }
+        if (watch_failed || result.is_err()) && tokio::time::Instant::now() >= next_warning {
+            log::warn!(
+                "Certificate source {} watch or update failed; retrying and retaining last good pair (expired certificates are not served)",
+                source.name
+            );
+            next_warning = tokio::time::Instant::now() + RECONCILE;
+        }
+        // Retry separate writes promptly; reconcile missed events and watch failures periodically.
+        let delay = if result.is_err() { RETRY } else { RECONCILE };
+        tokio::select! {
+            _ = changes.recv() => {
+                crate::file_watcher::debounce(&mut changes, DEBOUNCE).await;
+                refresh_watch = true;
+            }
+            _ = tokio::time::sleep(delay) => refresh_watch = delay == RECONCILE,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,7 +276,6 @@ mod tests {
   type: files
   cert: '{}'
   key: '{}'
-  poll_interval_secs: 1
 - address: 127.0.0.1:18443
   protocol:
     type: tls
@@ -266,7 +297,7 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn one_worker_is_reused_and_removal_cancels_it() {
         let dir = tempfile::tempdir().unwrap();
         let first = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
@@ -290,8 +321,7 @@ mod tests {
         assert!(Arc::ptr_eq(&old.workers[0], &next.workers[0]));
         let second = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
         std::fs::write(dir.path().join("cert.pem"), second.cert.pem()).unwrap();
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
             validated.certificates[0].current().unwrap().cert[0],
             *first.cert.der()
@@ -301,8 +331,13 @@ mod tests {
             second.signing_key.serialize_pem(),
         )
         .unwrap();
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while validated.certificates[0].current().unwrap().cert[0] != *second.cert.der() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(
             validated.certificates[0].current().unwrap().cert[0],
             *second.cert.der()
@@ -312,6 +347,112 @@ mod tests {
         let task = next.workers[0].task.lock().as_ref().unwrap().abort_handle();
         next.shutdown().await;
         assert!(task.is_finished());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn file_watches_follow_symlink_replacement_and_release_on_stop() {
+        use std::os::unix::fs::symlink;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a");
+            let b = dir.path().join("b");
+            std::fs::create_dir(&a).unwrap();
+            std::fs::create_dir(&b).unwrap();
+            let first = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+            let second = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+            for (directory, certificate) in [(&a, &first), (&b, &second)] {
+                std::fs::write(directory.join("cert.pem"), certificate.cert.pem()).unwrap();
+                std::fs::write(
+                    directory.join("key.pem"),
+                    certificate.signing_key.serialize_pem(),
+                )
+                .unwrap();
+            }
+            let current = dir.path().join("current");
+            symlink(&a, &current).unwrap();
+            let mut validated = config(&current);
+            let mut registry = Registry::prepare(&mut validated, None).await.unwrap();
+            registry.start().await;
+            tokio::task::yield_now().await;
+            symlink(&b, dir.path().join("next")).unwrap();
+            std::fs::rename(dir.path().join("next"), &current).unwrap();
+            let source = &validated.certificates[0];
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while source.current().unwrap().cert[0] != *second.cert.der() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let unchanged = source.current().unwrap();
+            std::fs::write(b.join("cert.pem"), second.cert.pem()).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(Arc::ptr_eq(&source.current().unwrap(), &unchanged));
+            std::fs::remove_file(b.join("key.pem")).unwrap();
+            std::fs::write(b.join("cert.pem"), first.cert.pem()).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(Arc::ptr_eq(&source.current().unwrap(), &unchanged));
+            std::fs::write(b.join("new.key"), first.signing_key.serialize_pem()).unwrap();
+            std::fs::rename(b.join("new.key"), b.join("key.pem")).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while source.current().unwrap().cert[0] != *first.cert.der() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            registry.shutdown().await;
+            std::fs::write(b.join("cert.pem"), second.cert.pem()).unwrap();
+            std::fs::write(b.join("key.pem"), second.signing_key.serialize_pem()).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(source.current().unwrap().cert[0], *first.cert.der());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_acme_trust_replaces_worker_only_after_successful_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca_path = directory.path().join("ca.crt");
+        let first = rcgen::generate_simple_self_signed(vec!["ca.test".into()]).unwrap();
+        std::fs::write(&ca_path, first.cert.pem()).unwrap();
+        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let make = || {
+            crate::config::create_server_configs(serde_yaml::from_value(serde_yaml::to_value(
+                serde_json::json!([{
+                    "certificate_source": "managed", "type": "acme", "domains": ["proxy.test"],
+                    "directory_url": "http://127.0.0.1:9/directory", "state_dir": directory.path().join("state"),
+                    "ca_cert": ca_path, "challenge": {"type": "http01", "listen": [address.to_string()]}
+                }])
+            ).unwrap()).unwrap())
+        };
+        let mut validated = make().unwrap();
+        let mut old = Registry::prepare(&mut validated, None).await.unwrap();
+        let mut unchanged = make().unwrap();
+        let reused = Registry::prepare(&mut unchanged, Some(&old)).await.unwrap();
+        assert!(Arc::ptr_eq(&old.workers[0], &reused.workers[0]));
+        drop(reused);
+        std::fs::write(&ca_path, "incomplete").unwrap();
+        assert!(make().is_err());
+        let digest = old.workers[0].source.trust_digest.clone();
+        let second = rcgen::generate_simple_self_signed(vec!["ca.test".into()]).unwrap();
+        std::fs::write(&ca_path, second.cert.pem()).unwrap();
+        let mut validated = make().unwrap();
+        let candidate = Registry::prepare(&mut validated, Some(&old)).await.unwrap();
+        assert!(!Arc::ptr_eq(&old.workers[0], &candidate.workers[0]));
+        assert!(Arc::ptr_eq(
+            old.workers[0].lock.as_ref().unwrap(),
+            candidate.workers[0].lock.as_ref().unwrap()
+        ));
+        assert_eq!(old.workers[0].source.trust_digest, digest);
+        assert_ne!(candidate.workers[0].source.trust_digest, digest);
+        drop(candidate);
+        old.shutdown().await;
+        assert!(TcpListener::bind(address).await.is_ok());
     }
 
     #[tokio::test]

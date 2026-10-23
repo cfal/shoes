@@ -33,17 +33,8 @@ pub struct NamedSource {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceConfig {
-    Files {
-        cert: PathBuf,
-        key: PathBuf,
-        #[serde(default = "default_poll")]
-        poll_interval_secs: u64,
-    },
+    Files { cert: PathBuf, key: PathBuf },
     Acme(AcmeConfig),
-}
-
-fn default_poll() -> u64 {
-    5
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -85,17 +76,14 @@ impl Input {
 
 #[derive(Clone, PartialEq, Eq)]
 enum Spec {
-    Files {
-        cert: Input,
-        key: Input,
-        interval: u64,
-    },
+    Files { cert: Input, key: Input },
     Acme(AcmeConfig),
 }
 
 pub struct Source {
     name: String,
     spec: Spec,
+    trust_digest: Option<Vec<u8>>,
     material: RwLock<Option<Material>>,
     challenges: RwLock<Vec<challenge::Pending>>,
 }
@@ -206,9 +194,24 @@ impl Material {
 
 impl Source {
     fn new(name: String, spec: Spec) -> io::Result<Arc<Self>> {
+        let trust_digest = match &spec {
+            Spec::Acme(config) => config
+                .ca_cert
+                .as_ref()
+                .map(|path| {
+                    read_text(path).map(|pem| {
+                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, pem.as_bytes())
+                            .as_ref()
+                            .to_vec()
+                    })
+                })
+                .transpose()?,
+            Spec::Files { .. } => None,
+        };
         let source = Arc::new(Self {
             name,
             spec,
+            trust_digest,
             material: RwLock::new(None),
             challenges: RwLock::new(Vec::new()),
         });
@@ -482,23 +485,13 @@ pub(crate) fn configure(configs: &mut [Config]) -> io::Result<Vec<Arc<Source>>> 
                     return Err(invalid("invalid or duplicate certificate_source name"));
                 }
                 let spec = match &named.source {
-                    SourceConfig::Files {
-                        cert,
-                        key,
-                        poll_interval_secs,
-                    } => {
-                        if !(1..=3600).contains(poll_interval_secs)
-                            || cert.as_os_str().is_empty()
-                            || key.as_os_str().is_empty()
-                        {
-                            return Err(invalid(
-                                "file source requires cert/key paths and poll_interval_secs in 1..=3600",
-                            ));
+                    SourceConfig::Files { cert, key } => {
+                        if cert.as_os_str().is_empty() || key.as_os_str().is_empty() {
+                            return Err(invalid("file source requires cert/key paths"));
                         }
                         Spec::Files {
                             cert: Input::File(cert.clone()),
                             key: Input::File(key.clone()),
-                            interval: *poll_interval_secs,
                         }
                     }
                     SourceConfig::Acme(acme) => {
@@ -577,11 +570,7 @@ pub(crate) fn configure(configs: &mut [Config]) -> io::Result<Vec<Arc<Source>>> 
             let cert = resolve(cert);
             let key = resolve(key);
             if matches!(cert, Input::File(_)) || matches!(key, Input::File(_)) {
-                let spec = Spec::Files {
-                    cert,
-                    key,
-                    interval: default_poll(),
-                };
+                let spec = Spec::Files { cert, key };
                 let source = sources.values().find(|source| source.spec == spec).cloned();
                 let source = match source {
                     Some(source) => source,

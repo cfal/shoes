@@ -63,70 +63,23 @@ pub async fn convert_cert_paths(
 
     let mut unknown_pem_paths = HashMap::new();
 
+    let mut collect = |pem: &mut String, _| {
+        process_pem_path(pem, &path_pem_configs, &mut unknown_pem_paths);
+    };
+
     // Gather all paths that are inlined but not named.
     // We do this as a separate step because we can't load the data in an async manner
     // right away due to recursion.
     for config in server_configs.iter_mut() {
-        gather_pem_file_paths_from_server_config(
-            config,
-            &path_pem_configs,
-            &mut unknown_pem_paths,
-        )?;
+        gather_pem_file_paths_from_server_config(config, &mut collect)?;
     }
 
     for config in client_group_configs.iter_mut() {
-        gather_pem_file_paths_from_client_config_group(
-            config,
-            &path_pem_configs,
-            &mut unknown_pem_paths,
-        );
+        gather_pem_file_paths_from_client_config_group(config, &mut collect);
     }
 
     for config in &mut other_configs {
-        match config {
-            Config::TunServer(tun) => {
-                for rule in tun.rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(
-                        rule,
-                        &path_pem_configs,
-                        &mut unknown_pem_paths,
-                    );
-                }
-                if let Some(dns) = &mut tun.dns {
-                    gather_dns_pem_paths(
-                        &mut dns.servers,
-                        &path_pem_configs,
-                        &mut unknown_pem_paths,
-                    );
-                }
-            }
-            Config::DnsConfigGroup(group) => {
-                gather_dns_pem_paths(
-                    &mut group.dns_servers,
-                    &path_pem_configs,
-                    &mut unknown_pem_paths,
-                );
-            }
-            Config::RuleConfigGroup(group) => {
-                let super::RuleGroupRules::Policies(rules) = &mut group.rules else {
-                    continue;
-                };
-                for rule in rules.iter_mut() {
-                    if let RuleActionConfig::Allow { client_chains, .. } = &mut rule.action {
-                        for chain in client_chains.iter_mut() {
-                            for hop in chain.hops.iter_mut() {
-                                gather_pem_file_paths_from_chain_hop(
-                                    hop,
-                                    &path_pem_configs,
-                                    &mut unknown_pem_paths,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        visit_config_pems(config, &mut collect)?;
     }
 
     let mut updated_configs = vec![];
@@ -158,52 +111,126 @@ pub async fn convert_cert_paths(
     Ok((updated_configs, load_count))
 }
 
+#[derive(Clone, Copy)]
+enum PemUsage {
+    ServerIdentity,
+    Reload,
+}
+
+type PemVisitor<'a> = dyn FnMut(&mut String, PemUsage) + 'a;
+
+/// Discover reload-only PEM dependencies before expansion erases file identity.
+pub(crate) fn pem_reload_dependencies(
+    configs: &mut [Config],
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let named: HashMap<_, _> = configs
+        .iter()
+        .filter_map(|config| {
+            let Config::NamedPem(pem) = config else {
+                return None;
+            };
+            Some((pem.pem.clone(), pem.source.clone()))
+        })
+        .collect();
+    let mut paths = std::collections::BTreeSet::new();
+    for config in configs {
+        if let Config::CertificateSource(source) = config
+            && let crate::certificates::SourceConfig::Acme(acme) = &source.source
+            && let Some(path) = &acme.ca_cert
+        {
+            paths.insert(path.clone());
+        }
+        visit_config_pems(config, &mut |pem, usage| {
+            if matches!(usage, PemUsage::ServerIdentity) {
+                return;
+            }
+            match named.get(pem) {
+                Some(PemSource::Path(path)) => {
+                    paths.insert(std::path::PathBuf::from(path));
+                }
+                Some(PemSource::Data(_)) => {}
+                None if is_pem_file_path(pem) => {
+                    paths.insert(std::path::PathBuf::from(pem.as_str()));
+                }
+                None => {}
+            }
+        })?;
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn visit_config_pems(config: &mut Config, visitor: &mut PemVisitor<'_>) -> std::io::Result<()> {
+    match config {
+        Config::Server(server) => gather_pem_file_paths_from_server_config(server, visitor)?,
+        Config::ClientConfigGroup(group) => {
+            gather_pem_file_paths_from_client_config_group(group, visitor)
+        }
+        Config::TunServer(tun) => {
+            for rule in tun.rules.iter_mut() {
+                gather_pem_file_paths_from_rule(rule, visitor);
+            }
+            if let Some(dns) = &mut tun.dns {
+                gather_dns_pem_paths(&mut dns.servers, visitor);
+            }
+        }
+        Config::DnsConfigGroup(group) => {
+            gather_dns_pem_paths(&mut group.dns_servers, visitor);
+        }
+        Config::RuleConfigGroup(group) => {
+            let super::RuleGroupRules::Policies(rules) = &mut group.rules else {
+                return Ok(());
+            };
+            for rule in rules.iter_mut() {
+                if let RuleActionConfig::Allow { client_chains, .. } = &mut rule.action {
+                    for chain in client_chains.iter_mut() {
+                        for hop in chain.hops.iter_mut() {
+                            gather_pem_file_paths_from_chain_hop(hop, visitor);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn gather_pem_file_paths_from_server_config(
     server_config: &mut ServerConfig,
-    known_pem_paths: &HashMap<String, NamedPem>,
-    unknown_pem_paths: &mut HashMap<String, String>,
+    visitor: &mut PemVisitor<'_>,
 ) -> std::io::Result<()> {
     // Check QUIC settings
     if let Some(ref mut quic_settings) = server_config.quic_settings {
-        process_pem_path(&mut quic_settings.cert, known_pem_paths, unknown_pem_paths);
-        process_pem_path(&mut quic_settings.key, known_pem_paths, unknown_pem_paths);
+        visitor(&mut quic_settings.cert, PemUsage::ServerIdentity);
+        visitor(&mut quic_settings.key, PemUsage::ServerIdentity);
         for cert in quic_settings.client_ca_certs.iter_mut() {
-            process_pem_path(cert, known_pem_paths, unknown_pem_paths);
+            visitor(cert, PemUsage::Reload);
         }
     }
 
     // Recursively check the protocol
-    gather_pem_file_paths_from_server_proxy(
-        &mut server_config.protocol,
-        known_pem_paths,
-        unknown_pem_paths,
-    )?;
+    gather_pem_file_paths_from_server_proxy(&mut server_config.protocol, visitor)?;
 
     // Check rules
     for rule in server_config.rules.iter_mut() {
-        gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+        gather_pem_file_paths_from_rule(rule, visitor);
     }
     if let Some(dns) = &mut server_config.dns {
-        gather_dns_pem_paths(&mut dns.servers, known_pem_paths, unknown_pem_paths);
+        gather_dns_pem_paths(&mut dns.servers, visitor);
     }
     Ok(())
 }
 
 fn gather_dns_pem_paths(
     specs: &mut crate::option_util::NoneOrSome<super::DnsServerSpec>,
-    known_pem_paths: &HashMap<String, NamedPem>,
-    unknown_pem_paths: &mut HashMap<String, String>,
+    visitor: &mut PemVisitor<'_>,
 ) {
     for spec in specs.iter_mut() {
         if let super::DnsServerSpec::WithOptions { client_chain, .. } = spec {
             for selection in client_chain.iter_mut() {
                 if let ConfigSelection::Config(chain) = selection {
                     for hop in chain.hops.iter_mut() {
-                        gather_pem_file_paths_from_chain_hop(
-                            hop,
-                            known_pem_paths,
-                            unknown_pem_paths,
-                        );
+                        gather_pem_file_paths_from_chain_hop(hop, visitor);
                     }
                 }
             }
@@ -213,16 +240,11 @@ fn gather_dns_pem_paths(
 
 fn gather_pem_file_paths_from_client_config_group(
     client_group_config: &mut ClientConfigGroup,
-    known_pem_paths: &HashMap<String, NamedPem>,
-    unknown_pem_paths: &mut HashMap<String, String>,
+    visitor: &mut PemVisitor<'_>,
 ) {
     for selection in client_group_config.client_proxies.iter_mut() {
         if let ConfigSelection::Config(client_config) = selection {
-            gather_pem_file_paths_from_client_config(
-                client_config,
-                known_pem_paths,
-                unknown_pem_paths,
-            );
+            gather_pem_file_paths_from_client_config(client_config, visitor);
         }
         // GroupName selections are resolved later, skip here
     }
@@ -257,14 +279,13 @@ fn validate_vision_protocol(
 
 fn gather_pem_file_paths_from_server_proxy(
     server_proxy: &mut ServerProxyConfig,
-    known_pem_paths: &HashMap<String, NamedPem>,
-    unknown_pem_paths: &mut HashMap<String, String>,
+    visitor: &mut PemVisitor<'_>,
 ) -> std::io::Result<()> {
     match server_proxy {
         ServerProxyConfig::Wireguard(config) => {
             if let Some(chain) = &mut config.peer_client_chain {
                 for hop in chain.hops.iter_mut() {
-                    gather_pem_file_paths_from_chain_hop(hop, known_pem_paths, unknown_pem_paths);
+                    gather_pem_file_paths_from_chain_hop(hop, visitor);
                 }
             }
         }
@@ -277,10 +298,10 @@ fn gather_pem_file_paths_from_server_proxy(
         } => {
             // Process TLS targets
             for (sni, tls_config) in tls_targets.iter_mut() {
-                process_pem_path(&mut tls_config.cert, known_pem_paths, unknown_pem_paths);
-                process_pem_path(&mut tls_config.key, known_pem_paths, unknown_pem_paths);
+                visitor(&mut tls_config.cert, PemUsage::ServerIdentity);
+                visitor(&mut tls_config.key, PemUsage::ServerIdentity);
                 for cert in tls_config.client_ca_certs.iter_mut() {
-                    process_pem_path(cert, known_pem_paths, unknown_pem_paths);
+                    visitor(cert, PemUsage::Reload);
                 }
 
                 // Validate Vision configuration
@@ -291,23 +312,19 @@ fn gather_pem_file_paths_from_server_proxy(
                 )?;
 
                 // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut tls_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
+                gather_pem_file_paths_from_server_proxy(&mut tls_config.protocol, visitor)?;
                 // Check override rules
                 for rule in tls_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+                    gather_pem_file_paths_from_rule(rule, visitor);
                 }
             }
 
             // Process default TLS target
             if let Some(tls_config) = default_tls_target {
-                process_pem_path(&mut tls_config.cert, known_pem_paths, unknown_pem_paths);
-                process_pem_path(&mut tls_config.key, known_pem_paths, unknown_pem_paths);
+                visitor(&mut tls_config.cert, PemUsage::ServerIdentity);
+                visitor(&mut tls_config.key, PemUsage::ServerIdentity);
                 for cert in tls_config.client_ca_certs.iter_mut() {
-                    process_pem_path(cert, known_pem_paths, unknown_pem_paths);
+                    visitor(cert, PemUsage::Reload);
                 }
 
                 // Validate Vision configuration
@@ -318,14 +335,10 @@ fn gather_pem_file_paths_from_server_proxy(
                 )?;
 
                 // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut tls_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
+                gather_pem_file_paths_from_server_proxy(&mut tls_config.protocol, visitor)?;
                 // Check override rules
                 for rule in tls_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+                    gather_pem_file_paths_from_rule(rule, visitor);
                 }
             }
 
@@ -334,35 +347,30 @@ fn gather_pem_file_paths_from_server_proxy(
                 if let ShadowTlsServerHandshakeConfig::Local(ref mut handshake) =
                     shadowtls_config.handshake
                 {
-                    process_pem_path(&mut handshake.cert, known_pem_paths, unknown_pem_paths);
-                    process_pem_path(&mut handshake.key, known_pem_paths, unknown_pem_paths);
+                    visitor(&mut handshake.cert, PemUsage::Reload);
+                    visitor(&mut handshake.key, PemUsage::Reload);
+                    for cert in handshake.client_ca_certs.iter_mut() {
+                        visitor(cert, PemUsage::Reload);
+                    }
                 } else if let ShadowTlsServerHandshakeConfig::Remote(handshake) =
                     &mut shadowtls_config.handshake
                 {
                     for hop in handshake.client_chain.iter_mut() {
-                        gather_pem_file_paths_from_chain_hop(
-                            hop,
-                            known_pem_paths,
-                            unknown_pem_paths,
-                        );
+                        gather_pem_file_paths_from_chain_hop(hop, visitor);
                     }
                 }
                 // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut shadowtls_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
+                gather_pem_file_paths_from_server_proxy(&mut shadowtls_config.protocol, visitor)?;
                 // Check override rules
                 for rule in shadowtls_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+                    gather_pem_file_paths_from_rule(rule, visitor);
                 }
             }
 
             // Process Reality targets
             for (sni, reality_config) in reality_targets.iter_mut() {
                 for hop in reality_config.dest_client_chain.iter_mut() {
-                    gather_pem_file_paths_from_chain_hop(hop, known_pem_paths, unknown_pem_paths);
+                    gather_pem_file_paths_from_chain_hop(hop, visitor);
                 }
                 // Validate Vision configuration
                 validate_vision_protocol(
@@ -372,37 +380,25 @@ fn gather_pem_file_paths_from_server_proxy(
                 )?;
 
                 // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut reality_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
+                gather_pem_file_paths_from_server_proxy(&mut reality_config.protocol, visitor)?;
                 // Check override rules
                 for rule in reality_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+                    gather_pem_file_paths_from_rule(rule, visitor);
                 }
             }
         }
         ServerProxyConfig::Websocket { targets } => {
             for websocket_config in targets.iter_mut() {
                 // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut websocket_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
+                gather_pem_file_paths_from_server_proxy(&mut websocket_config.protocol, visitor)?;
                 // Check override rules
                 for rule in websocket_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+                    gather_pem_file_paths_from_rule(rule, visitor);
                 }
             }
         }
         ServerProxyConfig::Xhttp(config) => {
-            gather_pem_file_paths_from_server_proxy(
-                &mut config.protocol,
-                known_pem_paths,
-                unknown_pem_paths,
-            )?;
+            gather_pem_file_paths_from_server_proxy(&mut config.protocol, visitor)?;
         }
         _ => {}
     }
@@ -411,8 +407,7 @@ fn gather_pem_file_paths_from_server_proxy(
 
 fn gather_pem_file_paths_from_rule(
     rule_selection: &mut ConfigSelection<super::types::RuleConfig>,
-    known_pem_paths: &HashMap<String, NamedPem>,
-    unknown_pem_paths: &mut HashMap<String, String>,
+    visitor: &mut PemVisitor<'_>,
 ) {
     if let ConfigSelection::Config(rule) = rule_selection
         && let RuleActionConfig::Allow {
@@ -422,36 +417,24 @@ fn gather_pem_file_paths_from_rule(
     {
         for chain in client_chains.iter_mut() {
             for hop in chain.hops.iter_mut() {
-                gather_pem_file_paths_from_chain_hop(hop, known_pem_paths, unknown_pem_paths);
+                gather_pem_file_paths_from_chain_hop(hop, visitor);
             }
         }
     }
 }
 
-fn gather_pem_file_paths_from_chain_hop(
-    hop: &mut ClientChainHop,
-    known_pem_paths: &HashMap<String, NamedPem>,
-    unknown_pem_paths: &mut HashMap<String, String>,
-) {
+fn gather_pem_file_paths_from_chain_hop(hop: &mut ClientChainHop, visitor: &mut PemVisitor<'_>) {
     match hop {
         ClientChainHop::Single(selection) => {
             if let ConfigSelection::Config(client_config) = selection {
-                gather_pem_file_paths_from_client_config(
-                    client_config,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                );
+                gather_pem_file_paths_from_client_config(client_config, visitor);
             }
             // GroupName selections are resolved later, skip here
         }
         ClientChainHop::Pool(selections) => {
             for selection in selections.iter_mut() {
                 if let ConfigSelection::Config(client_config) = selection {
-                    gather_pem_file_paths_from_client_config(
-                        client_config,
-                        known_pem_paths,
-                        unknown_pem_paths,
-                    );
+                    gather_pem_file_paths_from_client_config(client_config, visitor);
                 }
                 // GroupName selections are resolved later, skip here
             }
@@ -461,66 +444,48 @@ fn gather_pem_file_paths_from_chain_hop(
 
 fn gather_pem_file_paths_from_client_config(
     client_config: &mut ClientConfig,
-    known_pem_paths: &HashMap<String, NamedPem>,
-    unknown_pem_paths: &mut HashMap<String, String>,
+    visitor: &mut PemVisitor<'_>,
 ) {
     // Check QUIC settings
     if let Some(ref mut quic_config) = client_config.quic_settings {
-        process_optional_pem_path(&mut quic_config.cert, known_pem_paths, unknown_pem_paths);
-        process_optional_pem_path(&mut quic_config.key, known_pem_paths, unknown_pem_paths);
+        visit_optional_pem(&mut quic_config.cert, visitor);
+        visit_optional_pem(&mut quic_config.key, visitor);
     }
 
     // Recurse into client proxy config
-    gather_pem_file_paths_from_client_proxy(
-        &mut client_config.protocol,
-        known_pem_paths,
-        unknown_pem_paths,
-    );
+    gather_pem_file_paths_from_client_proxy(&mut client_config.protocol, visitor);
 }
 
 fn gather_pem_file_paths_from_client_proxy(
     client_proxy: &mut ClientProxyConfig,
-    known_pem_paths: &HashMap<String, NamedPem>,
-    unknown_pem_paths: &mut HashMap<String, String>,
+    visitor: &mut PemVisitor<'_>,
 ) {
     match client_proxy {
         ClientProxyConfig::Wireguard(config) => {
             if let Some(chain) = &mut config.peer_client_chain {
                 for hop in chain.hops.iter_mut() {
-                    gather_pem_file_paths_from_chain_hop(hop, known_pem_paths, unknown_pem_paths);
+                    gather_pem_file_paths_from_chain_hop(hop, visitor);
                 }
             }
         }
         ClientProxyConfig::Tls(tls_config) => {
-            process_optional_pem_path(&mut tls_config.cert, known_pem_paths, unknown_pem_paths);
-            process_optional_pem_path(&mut tls_config.key, known_pem_paths, unknown_pem_paths);
+            visit_optional_pem(&mut tls_config.cert, visitor);
+            visit_optional_pem(&mut tls_config.key, visitor);
             // Recurse into inner protocol
-            gather_pem_file_paths_from_client_proxy(
-                &mut tls_config.protocol,
-                known_pem_paths,
-                unknown_pem_paths,
-            );
+            gather_pem_file_paths_from_client_proxy(&mut tls_config.protocol, visitor);
         }
         ClientProxyConfig::Reality { protocol, .. } => {
             // Reality doesn't have cert/key PEM files, but recurse into inner protocol
-            gather_pem_file_paths_from_client_proxy(protocol, known_pem_paths, unknown_pem_paths);
+            gather_pem_file_paths_from_client_proxy(protocol, visitor);
         }
         ClientProxyConfig::ShadowTls { protocol, .. } => {
-            gather_pem_file_paths_from_client_proxy(protocol, known_pem_paths, unknown_pem_paths);
+            gather_pem_file_paths_from_client_proxy(protocol, visitor);
         }
         ClientProxyConfig::Websocket(ws_config) => {
-            gather_pem_file_paths_from_client_proxy(
-                &mut ws_config.protocol,
-                known_pem_paths,
-                unknown_pem_paths,
-            );
+            gather_pem_file_paths_from_client_proxy(&mut ws_config.protocol, visitor);
         }
         ClientProxyConfig::Xhttp(config) => {
-            gather_pem_file_paths_from_client_proxy(
-                &mut config.protocol,
-                known_pem_paths,
-                unknown_pem_paths,
-            );
+            gather_pem_file_paths_from_client_proxy(&mut config.protocol, visitor);
         }
         _ => {}
     }
@@ -561,13 +526,9 @@ fn process_pem_path(
     }
 }
 
-fn process_optional_pem_path(
-    pem: &mut Option<String>,
-    known_pem_paths: &HashMap<String, NamedPem>,
-    unknown_pem_paths: &mut HashMap<String, String>,
-) {
-    if let Some(pem_str) = pem {
-        process_pem_path(pem_str, known_pem_paths, unknown_pem_paths);
+fn visit_optional_pem(pem: &mut Option<String>, visitor: &mut PemVisitor<'_>) {
+    if let Some(pem) = pem {
+        visitor(pem, PemUsage::Reload);
     }
 }
 
@@ -585,5 +546,100 @@ pub(super) fn embed_optional_pem_from_map(
 ) {
     if let Some(pem_str) = pem {
         embed_pem_from_map(pem_str, named_pems);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn reload_dependencies_cover_pem_roles_without_live_server_identities() {
+        let client = |name: &str| {
+            json!({
+                "address": "127.0.0.1:443",
+                "protocol": {"type": "tls", "cert": format!("{name}.crt"),
+                    "key": format!("{name}.key"), "protocol": {"type": "socks"}}
+            })
+        };
+        let value = json!([
+            {"pem": "named-ca", "path": "ca.crt"},
+            {"pem": "inline.pem", "data": "-----BEGIN CERTIFICATE-----\ninline"},
+            {"address": "127.0.0.1:8443", "transport": "quic",
+                "quic_settings": {"cert": "live.crt", "key": "live.key", "client_ca_certs": "quic-ca.crt"},
+                "protocol": {"type": "tls", "default_tls_target": {
+                    "cert": "live.crt", "key": "live.key", "client_ca_certs": ["named-ca", "inline.pem"],
+                    "protocol": {"type": "socks"}
+                }, "shadowtls_targets": {"proxy.test": {
+                    "password": "test", "handshake": {"cert": "shadow.crt", "key": "shadow.key", "client_ca_certs": "shadow-ca.crt"},
+                    "protocol": {"type": "socks"},
+                    "override_rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": [client("override")]}]
+                }}},
+                "rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": [client("rule")]}]},
+            {"client_group": "outbound", "client_proxy": {
+                "address": "127.0.0.1:443", "transport": "quic",
+                "quic_settings": {"cert": "client-quic.crt", "key": "client-quic.key"},
+                "protocol": {"type": "tls", "cert": "live.crt", "key": "outbound.key", "protocol": {"type": "socks"}}
+            }},
+            {"dns_group": "dns", "dns_servers": [{"url": "udp://127.0.0.1:53", "client_chain": [client("dns")]}]},
+            {"device_fd": 42, "rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": [client("tun")]}]},
+            {"rule_group": "rules", "rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": [client("group")]}]},
+            {"certificate_source": "acme", "type": "acme", "domains": ["proxy.test"],
+                "directory_url": "http://127.0.0.1:9/directory", "state_dir": "unused", "ca_cert": "acme-ca.crt",
+                "challenge": {"type": "http01", "listen": ["127.0.0.1:18080"]}}
+        ]);
+        let mut configs: Vec<Config> =
+            serde_yaml::from_value(serde_yaml::to_value(value).unwrap()).unwrap();
+        let before = serde_yaml::to_string(&configs).unwrap();
+        let paths = pem_reload_dependencies(&mut configs).unwrap();
+        let mut expected: Vec<_> = [
+            "ca.crt",
+            "quic-ca.crt",
+            "shadow.crt",
+            "shadow.key",
+            "shadow-ca.crt",
+            "override.crt",
+            "override.key",
+            "rule.crt",
+            "rule.key",
+            "client-quic.crt",
+            "client-quic.key",
+            "live.crt",
+            "outbound.key",
+            "dns.crt",
+            "dns.key",
+            "tun.crt",
+            "tun.key",
+            "group.crt",
+            "group.key",
+            "acme-ca.crt",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        expected.sort();
+        assert_eq!(paths, expected);
+        assert_eq!(serde_yaml::to_string(&configs).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn local_shadowtls_ca_paths_are_loaded_before_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+        let ca = dir.path().join("ca.crt");
+        std::fs::write(&ca, cert.cert.pem()).unwrap();
+        let value = json!([{"address": "127.0.0.1:8443", "protocol": {
+            "type": "tls", "shadowtls_targets": {"proxy.test": {
+                "password": "test", "handshake": {"cert": cert.cert.pem(),
+                    "key": cert.signing_key.serialize_pem(), "client_ca_certs": ca},
+                "protocol": {"type": "socks"}
+            }}
+        }}]);
+        let configs = serde_yaml::from_value(serde_yaml::to_value(value).unwrap()).unwrap();
+        let (configs, loaded) = convert_cert_paths(configs).await.unwrap();
+        assert_eq!(loaded, 1);
+        super::super::create_server_configs(configs).unwrap();
     }
 }

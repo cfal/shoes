@@ -7,6 +7,15 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn file_rotation_keeps_tcp_and_quic_tunnels_and_rejects_bad_reload() {
+    rotation_roundtrip(true, true).await;
+}
+
+#[tokio::test]
+async fn legacy_file_references_rotate_without_triggering_config_reload() {
+    rotation_roundtrip(false, false).await;
+}
+
+async fn rotation_roundtrip(named: bool, no_reload: bool) {
     timeout(Duration::from_secs(20), async {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.yaml");
@@ -19,16 +28,27 @@ async fn file_rotation_keeps_tcp_and_quic_tunnels_and_rejects_bad_reload() {
         let tcp = available_address();
         let quic = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0).await.unwrap();
-        let config = json!([
-            {"certificate_source":"shared", "type":"files", "cert":cert_path, "key":key_path, "poll_interval_secs":1},
+        let mut config = json!([
+            {"certificate_source":"shared", "type":"files", "cert":cert_path, "key":key_path},
             {"address":tcp.to_string(), "protocol":{"type":"tls", "tls_targets":{"proxy.test":{
                 "certificate_source":"shared", "protocol":{"type":"forward", "target":echo.local_addr().to_string()}
             }}}},
             {"address":quic.to_string(), "transport":"quic", "quic_settings":{"certificate_source":"shared", "num_endpoints":1},
                 "protocol":{"type":"forward", "target":echo.local_addr().to_string()}}
         ]);
+        if !named {
+            let target = config[1]["protocol"]["tls_targets"]["proxy.test"].as_object_mut().unwrap();
+            target.remove("certificate_source");
+            target.insert("cert".into(), json!(cert_path));
+            target.insert("key".into(), json!(key_path));
+            let quic = config[2]["quic_settings"].as_object_mut().unwrap();
+            quic.remove("certificate_source");
+            quic.insert("cert".into(), json!(cert_path));
+            quic.insert("key".into(), json!(key_path));
+            config.as_array_mut().unwrap().remove(0);
+        }
         std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
-        let mut child = Process::start(&path, &["--no-reload"]);
+        let mut child = Process::start(&path, if no_reload { &["--no-reload"] } else { &[] });
         child.wait_for("Servers ready").await;
         let mut roots = rustls::RootCertStore::empty();
         roots.add(first.cert.der().clone()).unwrap();
@@ -72,11 +92,12 @@ async fn file_rotation_keeps_tcp_and_quic_tunnels_and_rejects_bad_reload() {
         send.write_all(b"after!").await.unwrap();
         recv.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"after!");
+        if !no_reload {
+            assert_no_reload(&mut child, Duration::from_millis(3500), "live rotation").await;
+        }
         while let Ok(line) = child.lines.try_recv() { assert!(!line.contains("Servers ready"), "certificate rotation must not reload listeners"); }
-        let invalid = serde_yaml::to_string(&config).unwrap().replace("certificate_source: shared", "certificate_source: missing");
-        // Keep the definition's name, but break both consumers.
-        let invalid = invalid.replacen("certificate_source: missing", "certificate_source: shared", 1);
-        std::fs::write(&path, invalid).unwrap();
+        config[usize::from(named)]["protocol"]["tls_targets"]["proxy.test"]["certificate_source"] = json!("missing");
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
         child.signal(libc::SIGHUP);
         child.wait_for("Reload rejected").await;
         old_tls.write_all(b"still!").await.unwrap();
@@ -89,6 +110,120 @@ async fn file_rotation_keeps_tcp_and_quic_tunnels_and_rejects_bad_reload() {
         endpoint.wait_idle().await;
         assert!(std::net::TcpListener::bind(tcp).is_ok());
         assert!(std::net::UdpSocket::bind(quic).is_ok());
+    }).await.unwrap();
+}
+
+async fn assert_no_reload(child: &mut Process, duration: Duration, phase: &str) {
+    assert!(
+        timeout(duration, async {
+            loop {
+                let line = child
+                    .lines
+                    .recv()
+                    .await
+                    .expect("process exited unexpectedly");
+                assert!(
+                    !line.contains("Servers ready") && !line.contains("Reload rejected"),
+                    "unexpected reload during {phase}: {line}"
+                );
+            }
+        })
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn reload_only_pems_debounce_recover_and_stop_watching_removed_dependencies() {
+    timeout(Duration::from_secs(75), async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let cert_path = directory.path().join("client.crt");
+        let key_path = directory.path().join("client.key");
+        let ca_path = directory.path().join("ca.crt");
+        let shadow_cert = directory.path().join("shadow.crt");
+        let shadow_key = directory.path().join("shadow.key");
+        let first = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+        let second = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+        for cert in [&cert_path, &ca_path, &shadow_cert] {
+            std::fs::write(cert, first.cert.pem()).unwrap();
+        }
+        for key in [&key_path, &shadow_key] {
+            std::fs::write(key, first.signing_key.serialize_pem()).unwrap();
+        }
+        let mut config = json!([
+            {"pem": "outbound-cert", "path": cert_path},
+            {"pem": "roots", "path": ca_path},
+            {"address": available_address().to_string(), "protocol": {"type": "tls",
+                "default_tls_target": {"cert": first.cert.pem(), "key": first.signing_key.serialize_pem(),
+                    "client_ca_certs": "roots", "protocol": {"type": "socks"}},
+                "shadowtls_targets": {"shadow.test": {"password": "test",
+                    "handshake": {"cert": shadow_cert, "key": shadow_key}, "protocol": {"type": "socks"}}}},
+                "rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": [{
+                    "address": "127.0.0.1:9", "protocol": {"type": "tls", "cert": "outbound-cert", "key": key_path,
+                        "protocol": {"type": "socks"}}
+                }]}]}
+        ]);
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let mut child = Process::start(&path, &[]);
+        child.wait_for("Servers ready").await;
+
+        std::fs::write(&cert_path, second.cert.pem()).unwrap();
+        assert_no_reload(&mut child, Duration::from_millis(1500), "first write debounce").await;
+        std::fs::write(&key_path, second.signing_key.serialize_pem()).unwrap();
+        assert_no_reload(&mut child, Duration::from_secs(2), "second write debounce").await;
+        child.wait_for("Servers ready").await;
+
+        std::fs::write(&key_path, first.signing_key.serialize_pem()).unwrap();
+        child.wait_for("Reload rejected").await;
+        std::fs::write(&key_path, second.signing_key.serialize_pem()).unwrap();
+        child.wait_for("Servers ready").await;
+
+        std::fs::write(&ca_path, "incomplete").unwrap();
+        child.wait_for("Reload rejected").await;
+        let replacement = directory.path().join("next.crt");
+        std::fs::write(&replacement, second.cert.pem()).unwrap();
+        std::fs::rename(&replacement, &ca_path).unwrap();
+        child.wait_for("Servers ready").await;
+
+        std::fs::write(&shadow_cert, second.cert.pem()).unwrap();
+        std::fs::write(&shadow_key, second.signing_key.serialize_pem()).unwrap();
+        child.wait_for("Servers ready").await;
+
+        std::fs::remove_file(&key_path).unwrap();
+        child.wait_for("Reload rejected").await;
+        std::fs::write(&key_path, second.signing_key.serialize_pem()).unwrap();
+        child.wait_for("Servers ready").await;
+
+        let missing = directory.path().join("new/client.key");
+        config[2]["rules"][0]["client_chain"][0]["protocol"]["key"] = json!(missing);
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        child.wait_for("Reload rejected").await;
+        std::fs::create_dir(missing.parent().unwrap()).unwrap();
+        std::fs::write(&missing, second.signing_key.serialize_pem()).unwrap();
+        child.wait_for("Servers ready").await;
+
+        config[2]["rules"] = json!(["allow-all-direct"]);
+        config.as_array_mut().unwrap().remove(0);
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        child.wait_for("Servers ready").await;
+        std::fs::write(&cert_path, "removed dependency").unwrap();
+        std::fs::write(&missing, "removed dependency").unwrap();
+        assert_no_reload(&mut child, Duration::from_millis(3500), "removed dependencies").await;
+        child.signal(libc::SIGTERM);
+        assert!(child.exit().await.success());
+
+        let mut child = Process::start(&path, &["--no-reload"]);
+        child.wait_for("Servers ready").await;
+        std::fs::write(&ca_path, "incomplete").unwrap();
+        assert_no_reload(&mut child, Duration::from_millis(3500), "disabled reload").await;
+        child.signal(libc::SIGHUP);
+        child.wait_for("Reload rejected").await;
+        std::fs::write(&ca_path, second.cert.pem()).unwrap();
+        child.signal(libc::SIGHUP);
+        child.wait_for("Servers ready").await;
+        child.signal(libc::SIGTERM);
+        assert!(child.exit().await.success());
     }).await.unwrap();
 }
 

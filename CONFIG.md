@@ -1321,7 +1321,8 @@ before a reload stops existing listeners. Invalid sources reject the candidate.
 Automatic reload watches imported files as well as configs. A parseable rejected
 candidate keeps its source paths watched, so creating or repairing a missing file
 can recover without another config edit. Active sources remain watched until a
-replacement activates. `--no-reload` disables file watches; SIGHUP still reloads.
+replacement activates. `--no-reload` disables automatic full reloads; SIGHUP
+still reloads, and live server-certificate rotation remains enabled.
 Established connections retain their original rules until they drain. New routing
 caches belong to the new configuration; Fake DNS pools are preserved separately.
 
@@ -1555,7 +1556,6 @@ Existing inline certificates, file paths, and named PEMs remain supported.
   type: files
   cert: /etc/shoes/certs/fullchain.pem
   key: /etc/shoes/certs/privkey.pem
-  poll_interval_secs: 5
 
 - address: "0.0.0.0:443"
   protocol:
@@ -1572,21 +1572,26 @@ Existing inline certificates, file paths, and named PEMs remain supported.
   protocol: {type: hysteria2, password: change-me}
 ```
 
-There is one runtime worker per source, not per listener. File sources poll the
-contents of both files (default 5 seconds, configurable from 1 to 3600 seconds).
-They support atomic rename and symlink replacement. Both the full certificate
-chain and its matching private key must validate before publication. Separate
-file writes, missing files, malformed data, key mismatches, and invalid validity
-periods leave the last good pair in place; the next poll retries. Errors are
-rate-limited and never include private material. An expired source fails new
-handshakes rather than serving a substitute certificate. Existing connections
-continue uninterrupted.
+There is one runtime worker per source, not per listener. File sources use the
+same filesystem watcher machinery as configuration files, with a 250 ms quiet
+period after the last relevant event. They support atomic rename and symlink
+replacement. Both the full certificate chain and its matching private key must
+validate before publication. Separate file writes, missing files, malformed
+data, key mismatches, and invalid validity
+periods leave the last good pair in place. Failed updates retry every second;
+a 60-second internal reconciliation also recovers missed events or unavailable
+watches. Neither interval is a configuration setting. Errors are rate-limited
+and never include private material. An expired source fails new handshakes
+rather than serving a substitute certificate. Existing connections continue
+uninterrupted.
 
 Legacy `cert`/`key` paths, including paths referenced through named PEMs, also
-rotate live at a 5-second interval. Inline-only pairs stay static. This applies
+rotate live through these watches. Inline-only pairs stay static. This applies
 to ordinary inbound TLS and QUIC, including Hysteria2, TUIC and XHTTP. Outbound
 client certificates, trust roots, and local ShadowTLS handshake certificates
-retain their existing configuration-reload behavior. REALITY is unchanged.
+instead trigger a full CLI configuration reload when their referenced files
+change, including named PEM references. If a file serves both roles, a full
+reload is still necessary. REALITY's handshake behavior is unchanged.
 
 New handshakes use the current certificate without replacing TCP listeners or
 QUIC endpoints. TLS session state is scoped to the certificate generation and
@@ -1782,7 +1787,24 @@ client_chain:
 
 ### Hot Reloading
 
-Configuration changes are automatically detected. `--no-reload` disables file watching; on Unix, SIGHUP still requests a reload.
+Configuration changes are automatically detected. The CLI also watches referenced
+outbound TLS/QUIC client certificates and keys, client-auth CA bundles, local
+ShadowTLS certificates/keys, and ACME custom `ca_cert` files. Changing ACME trust
+roots replaces the affected renewal worker after successful preparation, while
+retaining its account and issued certificate.
+
+Automatic full reloads wait for **3 seconds of quiet after the last relevant
+filesystem event**. Writes to config, rule, or reload-only PEM dependencies share
+that debounce window. Separate certificate/key writes are coalesced; an invalid
+or incomplete candidate is rejected without retiring the running listeners.
+Active and parseable candidate dependencies remain watched, so repairing or
+creating a missing PEM file retries the reload without another config edit.
+Unix SIGHUP bypasses debounce; shutdown also interrupts it immediately.
+
+`--no-reload` disables automatic full-reload watches, not live server-certificate
+rotation or ACME renewal. On Unix, SIGHUP still requests a reload. Embedded/FFI
+instances use the same live server-certificate watcher, but have no full config
+reload loop: reload-only PEM changes require restarting the embedded instance.
 
 On Linux, if directory permissions prevent watching a readable configuration's parent, startup falls back to direct file watches and logs a warning. In-place edits remain detectable, but atomic replacements may be missed; use SIGHUP or grant directory read permission when replacing files.
 

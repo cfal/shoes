@@ -29,7 +29,7 @@ pub struct ValidatedConfigs {
     pub catalog: Option<crate::control::catalog::Catalog>,
     pub control: super::ControlConfig,
     pub certificates: Vec<std::sync::Arc<crate::certificates::Source>>,
-    pub rule_files: Vec<std::path::PathBuf>,
+    pub reload_files: Vec<std::path::PathBuf>,
     pub global_limits: GlobalLimits,
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
@@ -51,7 +51,8 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     let catalog = crate::control::catalog::Catalog::capture(&mut all_configs)?;
     let mut control = super::ControlConfig::default();
     let mut compiler = crate::rules::Compiler::default();
-    let rule_files = crate::rule_set::dependencies(&mut all_configs)?;
+    let mut reload_files = crate::rule_set::dependencies(&mut all_configs)?;
+    reload_files.extend(super::pem_reload_dependencies(&mut all_configs)?);
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
@@ -343,7 +344,7 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
         catalog,
         control,
         certificates,
-        rule_files,
+        reload_files,
         global_limits,
         configs: result,
         dns_groups: final_dns_groups,

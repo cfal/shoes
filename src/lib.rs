@@ -50,6 +50,7 @@ mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
 pub mod dns;
+mod file_watcher;
 mod h2mux;
 mod http2;
 mod http_handler;

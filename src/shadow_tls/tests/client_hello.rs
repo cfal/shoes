@@ -284,7 +284,10 @@ async fn alpn_selection_survives_fragmented_client_hellos() {
             let split = crate::sniff::tests::records(&hello, chunk);
             let parsed = parse(&split).await.unwrap();
             assert_eq!(parsed.acme_alpn, acme);
-            assert_eq!(parsed.requested_server_name.as_deref(), Some("proxy.example"));
+            assert_eq!(
+                parsed.requested_server_name.as_deref(),
+                Some("proxy.example")
+            );
             assert!(parsed.supports_tls13);
             assert_eq!(parsed.client_hello_frame, split);
             assert_eq!(parsed.client_hello_record, hello);

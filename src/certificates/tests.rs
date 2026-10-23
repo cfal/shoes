@@ -17,7 +17,6 @@ fn file_source(dir: &Path) -> Arc<Source> {
         Spec::Files {
             cert: Input::File(dir.join("cert.pem")),
             key: Input::File(dir.join("key.pem")),
-            interval: 1,
         },
     )
     .unwrap()

@@ -24,6 +24,7 @@ mod wireguard_devices;
 
 pub(crate) use fake_dns::{tun_endpoint_ips, validate_tun_endpoints};
 pub use pem::convert_cert_paths;
+pub(crate) use pem::pem_reload_dependencies;
 pub use types::*;
 pub use validate::{ValidatedConfigs, create_server_configs};
 pub(crate) use validate::{validate_client_vision_protocol, validate_server_vision};
