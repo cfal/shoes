@@ -18,7 +18,7 @@ pub type Choices = BTreeMap<String, String>;
 
 #[derive(Debug, Default)]
 pub struct SelectionView {
-    definitions: Arc<SelectorDefinitions>,
+    definitions: SelectorDefinitions,
     choices: RwLock<Arc<Choices>>,
 }
 
@@ -59,7 +59,7 @@ impl SelectionOwner {
         self.check_capacity(&definitions)?;
         Ok(Arc::new(SelectionView {
             choices: RwLock::new(Arc::new(effective(&definitions, &self.explicit))),
-            definitions: Arc::new(definitions),
+            definitions,
         }))
     }
 

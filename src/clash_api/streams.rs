@@ -77,7 +77,7 @@ pub(super) async fn connections(state: &ApiState) -> io::Result<Bytes> {
         .map_err(|error| io::Error::new(error.kind(), error))
 }
 
-pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Arc<Sample>>) {
+pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Sample>) {
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(1),
         Duration::from_secs(1),
@@ -128,13 +128,13 @@ pub async fn sample(state: Arc<ApiState>, sender: watch::Sender<Arc<Sample>>) {
             );
         }
         oversized = connections.is_err();
-        sender.send_replace(Arc::new(Sample {
+        sender.send_replace(Sample {
             sequence,
             connections,
             traffic,
             memory: json_bytes(&json!({"inuse":rss,"oslimit":0})).unwrap(),
             rss,
-        }));
+        });
     }
 }
 
@@ -198,7 +198,7 @@ struct Source {
     first: bool,
     last_sequence: u64,
     subscription: Subscription,
-    samples: watch::Receiver<Arc<Sample>>,
+    samples: watch::Receiver<Sample>,
     logs: Option<tokio::sync::broadcast::Receiver<crate::control::logs::LogEvent>>,
     interval: tokio::time::Interval,
     snapshots: Arc<tokio::sync::Semaphore>,
@@ -391,7 +391,7 @@ mod tests {
             let error = json_bytes(&"x".repeat(32 * 1024 * 1024)).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
             let service = ControlService::new(Default::default()).unwrap();
-            let (sender, samples) = watch::channel(Arc::new(Sample::initial()));
+            let (sender, samples) = watch::channel(Sample::initial());
             let state = Arc::new(ApiState {
                 runtime: service.runtime.clone(),
                 samples,
@@ -418,11 +418,11 @@ mod tests {
                 Subscription::parse("connections", &HashMap::new()).unwrap(),
             )));
             assert!(client.next().await.unwrap().unwrap().is_text());
-            sender.send_replace(Arc::new(Sample {
+            sender.send_replace(Sample {
                 sequence: u64::MAX,
                 connections: Err(Arc::new(error)),
                 ..Sample::initial()
-            }));
+            });
             let Message::Close(Some(frame)) = client.next().await.unwrap().unwrap() else {
                 panic!("expected a close frame")
             };
@@ -437,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_first_snapshot_stays_immediate() {
         let service = ControlService::new(Default::default()).unwrap();
-        let (_sender, samples) = watch::channel(Arc::new(Sample::initial()));
+        let (_sender, samples) = watch::channel(Sample::initial());
         let state = ApiState {
             runtime: service.runtime.clone(),
             samples,
@@ -463,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn initial_snapshot_fences_an_older_shared_snapshot_published_later() {
         let service = ControlService::new(Default::default()).unwrap();
-        let (sender, samples) = watch::channel(Arc::new(Sample::initial()));
+        let (sender, samples) = watch::channel(Sample::initial());
         let state = ApiState {
             runtime: service.runtime.clone(),
             samples,
@@ -504,21 +504,21 @@ mod tests {
 
         // Hold serialization/publication of the shared sample until after the first frame.
         let older = SerializedConnections::new(older);
-        sender.send_replace(Arc::new(Sample {
+        sender.send_replace(Sample {
             sequence: older.sequence,
             connections: older.bytes,
             ..Sample::initial()
-        }));
+        });
         let next = source.next();
         tokio::pin!(next);
         assert!(next.as_mut().now_or_never().is_none());
 
         let newer = SerializedConnections::new(state.runtime.flows.snapshot(0));
-        sender.send_replace(Arc::new(Sample {
+        sender.send_replace(Sample {
             sequence: newer.sequence,
             connections: newer.bytes,
             ..Sample::initial()
-        }));
+        });
         let second: serde_json::Value = serde_json::from_slice(&next.await.unwrap()).unwrap();
         assert_eq!(first, second);
     }

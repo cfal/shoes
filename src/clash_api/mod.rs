@@ -19,7 +19,7 @@ pub type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, io::Error>;
 
 struct ApiState {
     runtime: Arc<ControlRuntime>,
-    samples: watch::Receiver<Arc<streams::Sample>>,
+    samples: watch::Receiver<streams::Sample>,
     tasks: TaskTracker,
     cancel: CancellationToken,
     snapshots: Arc<tokio::sync::Semaphore>,
@@ -33,7 +33,7 @@ pub struct ApiService {
 impl ApiService {
     pub async fn start(runtime: Arc<ControlRuntime>) -> io::Result<Self> {
         let binds = listener::bind(&runtime.config.listeners).await?;
-        let (sender, samples) = watch::channel(Arc::new(streams::Sample::initial()));
+        let (sender, samples) = watch::channel(streams::Sample::initial());
         let state = Arc::new(ApiState {
             cancel: runtime.shutdown.child_token(),
             runtime,
