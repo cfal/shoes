@@ -1526,13 +1526,21 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_flows_release_reads_and_egress_before_bounded_fin() {
-        for (phase, drain) in ["synack", "early-data", "copy", "udp-synack", "udp-copy"]
-            .into_iter()
-            .flat_map(|phase| [true, false].map(|drain| (phase, drain)))
+        for (phase, drain) in [
+            "synack",
+            "early-data",
+            "copy",
+            "udp-synack",
+            "udp-copy",
+            "udp-shutdown",
+        ]
+        .into_iter()
+        .flat_map(|phase| [true, false].map(|drain| (phase, drain)))
         {
             let early_data = phase == "early-data";
-            let established = matches!(phase, "copy" | "udp-copy");
-            let udp = matches!(phase, "udp-synack" | "udp-copy");
+            let established = matches!(phase, "copy" | "udp-copy" | "udp-shutdown");
+            let udp = matches!(phase, "udp-synack" | "udp-copy" | "udp-shutdown");
+            let during_shutdown = phase == "udp-shutdown";
             timeout(Duration::from_secs(3), async {
                 use crate::client_proxy_chain::ClientChainGroup;
                 use crate::client_proxy_selector::{ConnectAction, ConnectRule};
@@ -1660,6 +1668,10 @@ mod tests {
                     }
                 }
                 tokio::task::yield_now().await;
+                if during_shutdown {
+                    sender.try_send(Bytes::new()).unwrap();
+                    assert_eq!(egress.read(&mut [0; 1]).await.unwrap(), 0);
+                }
                 registry.cancel_all();
                 if established {
                     sender
@@ -1698,15 +1710,15 @@ mod tests {
                     }
                     drop(outgoing);
                 }
-                assert_eq!(
-                    timeout(Duration::from_secs(1), forwarding)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .unwrap_err()
-                        .kind(),
-                    io::ErrorKind::ConnectionAborted
-                );
+                let result = timeout(Duration::from_secs(1), forwarding)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if during_shutdown {
+                    result.unwrap();
+                } else {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+                }
                 let (result, read) =
                     tokio::join!(session.send_synack(2, None), peer.read_exact(&mut header));
                 result.unwrap();
