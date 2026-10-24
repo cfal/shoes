@@ -11131,7 +11131,7 @@ SOFTWARE.
 License: MIT License (MIT)
 Package: tokio-util 0.7.20
 Repository: https://github.com/tokio-rs/tokio
-Package: tokio 1.54.0
+Package: tokio 1.54.1
 Repository: https://github.com/tokio-rs/tokio
 
 MIT License
