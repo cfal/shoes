@@ -30,6 +30,39 @@ class Origin(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def check_notices(container):
+    notice_paths = [
+        ROOT / "LICENSE",
+        ROOT / "THIRD_PARTY_NOTICES.md",
+        *sorted((ROOT / "licenses").glob("*")),
+    ]
+    for path in notice_paths:
+        relative = path.relative_to(ROOT)
+        assert docker(
+            "exec", container, "cat", f"/usr/share/doc/shoes/{relative}"
+        ) == path.read_bytes(), f"Incorrect notice: {relative}"
+
+
+def check_proxy(container, origin_port):
+    address = docker("port", container, "1080/tcp").decode().strip()
+    host, port = address.rsplit(":", 1)
+    deadline = time.monotonic() + 30
+    while True:
+        connection = http.client.HTTPConnection(host, int(port), timeout=2)
+        try:
+            connection.request("GET", f"http://host.docker.internal:{origin_port}/")
+            response = connection.getresponse()
+            assert response.status == 200, f"Proxy returned {response.status}"
+            assert response.read() == PAYLOAD
+            return
+        except (OSError, http.client.HTTPException):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+        finally:
+            connection.close()
+
+
 def smoke(image):
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
     assert docker("run", "--rm", image, "--version").strip() == f"shoes {version}".encode()
@@ -45,8 +78,8 @@ def smoke(image):
         docker("run", "--rm", "--volume", mount, image, "check", "/etc/shoes/config.yaml")
 
         with http.server.ThreadingHTTPServer(("0.0.0.0", 0), Origin) as origin:
-            thread = threading.Thread(target=origin.serve_forever, daemon=True)
-            thread.start()
+            origin_thread = threading.Thread(target=origin.serve_forever, daemon=True)
+            origin_thread.start()
             container = None
             try:
                 container = docker(
@@ -59,29 +92,8 @@ def smoke(image):
                 assert b"BEGIN CERTIFICATE" in docker(
                     "exec", container, "cat", "/etc/ssl/certs/ca-certificates.crt"
                 )
-                for path in [ROOT / "LICENSE", ROOT / "THIRD_PARTY_NOTICES.md", *sorted((ROOT / "licenses").glob("*"))]:
-                    relative = path.relative_to(ROOT)
-                    assert docker(
-                        "exec", container, "cat", f"/usr/share/doc/shoes/{relative}"
-                    ) == path.read_bytes(), f"Incorrect notice: {relative}"
-
-                address = docker("port", container, "1080/tcp").decode().strip()
-                host, port = address.rsplit(":", 1)
-                deadline = time.monotonic() + 30
-                while True:
-                    connection = http.client.HTTPConnection(host, int(port), timeout=2)
-                    try:
-                        connection.request("GET", f"http://host.docker.internal:{origin.server_port}/")
-                        response = connection.getresponse()
-                        assert response.status == 200, f"Proxy returned {response.status}"
-                        assert response.read() == PAYLOAD
-                        break
-                    except (OSError, http.client.HTTPException):
-                        if time.monotonic() >= deadline:
-                            raise
-                        time.sleep(0.1)
-                    finally:
-                        connection.close()
+                check_notices(container)
+                check_proxy(container, origin.server_port)
 
                 docker("stop", "--time", "10", container)
                 assert docker("inspect", "--format", "{{.State.ExitCode}}", container).strip() == b"0"
@@ -93,7 +105,7 @@ def smoke(image):
                 if container:
                     docker("rm", "--force", container)
                 origin.shutdown()
-                thread.join(timeout=5)
+                origin_thread.join(timeout=5)
     print(f"Docker smoke passed: {image}")
 
 
