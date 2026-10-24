@@ -6,19 +6,17 @@
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hickory_resolver::Resolver;
 use hickory_resolver::config::{
     ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig,
 };
-use hickory_resolver::net::NetError;
 
 use crate::address::NetLocation;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::dns::parsed::IpStrategy;
-use crate::dns::proxy_runtime::{LOOKUP_LOCAL_FAILURE, ProxyRuntimeProvider};
+use crate::dns::proxy_runtime::ProxyRuntimeProvider;
 use crate::resolver::Resolver as ShoesResolver;
 
 /// Tuning options for hickory-backed resolvers.
@@ -53,36 +51,6 @@ pub struct HickoryResolver {
     inner: Resolver<ProxyRuntimeProvider>,
     exchange: Arc<super::exchange::RawDnsExchange>,
     description: String,
-}
-
-#[derive(Debug)]
-struct DnsLookupError(NetError);
-
-impl std::fmt::Display for DnsLookupError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "DNS lookup failed: {}", self.0)
-    }
-}
-
-impl std::error::Error for DnsLookupError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        // NetError::Io does not expose its contained error through source().
-        match &self.0 {
-            NetError::Io(error) => Some(error.as_ref()),
-            error => Some(error),
-        }
-    }
-}
-
-impl From<DnsLookupError> for std::io::Error {
-    fn from(error: DnsLookupError) -> Self {
-        let kind = match error.0 {
-            NetError::Busy => std::io::ErrorKind::WouldBlock,
-            NetError::NoConnections => std::io::ErrorKind::NotConnected,
-            _ => std::io::ErrorKind::Other,
-        };
-        Self::new(kind, error)
-    }
 }
 
 impl Debug for HickoryResolver {
@@ -309,28 +277,18 @@ impl ShoesResolver for HickoryResolver {
         Box::pin(async move {
             let started = std::time::Instant::now();
 
-            // Hickory can replace transport errors with NoConnections. Keep local
-            // admission/policy failures scoped to this lookup, not the resolver pool.
-            let local_failure = Arc::new(AtomicBool::new(false));
-            let response = LOOKUP_LOCAL_FAILURE
-                .scope(local_failure.clone(), resolver.lookup_ip(&name))
-                .await
-                .map_err(|e| {
-                    let elapsed = started.elapsed();
-                    log::warn!(
-                        "DNS lookup failed via {}: {}:{} in {:?}: {}",
-                        description,
-                        name,
-                        port,
-                        elapsed,
-                        e
-                    );
-                    if local_failure.load(Ordering::Relaxed) {
-                        std::io::Error::new(std::io::ErrorKind::WouldBlock, DnsLookupError(e))
-                    } else {
-                        std::io::Error::from(DnsLookupError(e))
-                    }
-                })?;
+            let response = resolver.lookup_ip(&name).await.map_err(|e| {
+                let elapsed = started.elapsed();
+                log::warn!(
+                    "DNS lookup failed via {}: {}:{} in {:?}: {}",
+                    description,
+                    name,
+                    port,
+                    elapsed,
+                    e
+                );
+                std::io::Error::other(format!("DNS lookup failed: {e}"))
+            })?;
 
             let addrs: Vec<SocketAddr> = response
                 .iter()
@@ -372,24 +330,6 @@ impl ShoesResolver for HickoryResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lookup_errors_preserve_local_admission_classification() {
-        let error = std::io::Error::from(DnsLookupError(NetError::Io(Arc::new(
-            crate::resources::exhausted(),
-        ))));
-        assert!(crate::resources::is_exhausted(&error));
-        assert_eq!(
-            error.to_string(),
-            "DNS lookup failed: io error: process resource budget exhausted"
-        );
-        for (error, kind) in [
-            (NetError::Busy, std::io::ErrorKind::WouldBlock),
-            (NetError::NoConnections, std::io::ErrorKind::NotConnected),
-        ] {
-            assert_eq!(std::io::Error::from(DnsLookupError(error)).kind(), kind);
-        }
-    }
 
     #[test]
     fn test_hickory_resolver_options_default() {

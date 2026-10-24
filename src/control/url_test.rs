@@ -8,11 +8,11 @@ use tokio::time::Instant;
 use crate::config::UrlTestConfig;
 
 tokio::task_local! {
-    pub static PROBING: ();
+    pub static BACKGROUND: ();
 }
 
-pub fn is_probe() -> bool {
-    PROBING.try_with(|_| ()).is_ok()
+pub fn is_background() -> bool {
+    BACKGROUND.try_with(|_| ()).is_ok()
 }
 
 // Only unambiguous transport failures request a recheck. A user destination's
@@ -148,7 +148,7 @@ impl AutomaticGroups {
     }
 
     pub fn touch(&self, name: &str, failed: bool) {
-        if !is_probe()
+        if !is_background()
             && let Some(group) = self.0.get(name)
         {
             let mut state = group.state.lock();
@@ -236,16 +236,9 @@ impl AutomaticGroup {
         }
         state.last_check = Some(now);
         state.recheck = false;
-        let mut members: Vec<_> = (state.cursor..self.members.len())
+        let members = (state.cursor..self.members.len())
             .chain(0..state.cursor)
             .collect();
-        // Inconclusive queued attempts retain their sample age and lead the next round.
-        members.sort_by_key(|index| {
-            state
-                .samples
-                .get(&self.members[*index])
-                .map(|sample| sample.at)
-        });
         Some(members)
     }
 
@@ -336,7 +329,7 @@ mod tests {
         let group = &groups.0["one"];
         assert!(group.due_members(Instant::now()).is_some());
         tokio::time::advance(Duration::from_secs(10)).await;
-        PROBING
+        BACKGROUND
             .scope((), async {
                 groups.touch("one", true);
             })
