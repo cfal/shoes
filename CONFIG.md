@@ -388,7 +388,10 @@ Changing selection affects new connections, not established streams or associati
 
 There is one initial check after activation, including for lazy groups. Thereafter
 `lazy: true` checks only groups used by new forwarding connections during the last
-interval. Probes and dashboard reads never count as use. `lazy: false` checks idle
+interval. Probes, dashboard reads, and WireGuard carrier maintenance never count as use.
+New outbound connections through a WireGuard endpoint wake its carrier groups,
+including nested carriers, without changing their existing associations. Inbound-only
+endpoints and long-lived flows need `lazy: false` for continuous checks. `lazy: false` checks idle
 groups too. Samples older than `2 * interval + timeout` are stale and cannot win
 on delay. Without fresh healthy results (startup, all dead, stale, or locally
 unavailable probes), retain the eligible incumbent, or choose the first eligible
@@ -399,6 +402,7 @@ per second); they do not mark the configured URL dead based on a different user
 destination. Local overload and unsupported operations do not penalize health.
 User payloads are never retried across candidates. Probes use HTTP HEAD and accept
 any HTTP response status, without redirects; HTTPS certificates are verified.
+Local probe lookups use guarded system DNS, not a server's configured DNS group.
 API probes with the same normalized URL and wildcard/default expected status also
 update selection. Other URLs and explicit status expectations cannot overwrite it.
 
@@ -406,8 +410,9 @@ Periodic and API probes share a 16-probe limit. Each periodic round's timeout
 includes admission/queue time; members not admitted before the deadline retain
 their previous health. A deadline expiry after queueing is inconclusive and also
 preserves prior health; successful probes and explicit remote errors still update it.
-Unprobed members and the oldest samples lead each round, so inconclusive attempts
-can receive a full budget on a later round. Tied members rotate on admission.
+Members with no full-budget attempt, then the oldest full-budget attempts, lead each
+round, independently of health. Local failures cannot monopolize these slots, and
+queued attempts can receive a full budget on a later round. Tied members rotate on admission.
 Due groups with the oldest unqueued admission get priority, with stable catalog order
 breaking ties.
 Under sustained saturation, reduce group size, increase
