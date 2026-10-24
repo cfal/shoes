@@ -172,8 +172,8 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
         format!("- global_limits: {{reload_grace_secs: 6}}\n{replacement_config}"),
     )?;
     round_trip(&mut existing, b"during reload").await?;
-    // A distinct listener identifies the new generation without requiring an outage.
-    let mut replacement = timeout(Duration::from_secs(5), async {
+    // Allow the five-second debounce before identifying the new generation by its listener.
+    let mut replacement = timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(stream) = TcpStream::connect(("127.0.0.1", replacement_port)).await {
                 break stream;
