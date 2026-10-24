@@ -296,7 +296,7 @@ async fn alpn_selection_survives_fragmented_client_hellos() {
 }
 
 #[tokio::test]
-async fn malformed_or_mixed_acme_alpn_is_rejected() {
+async fn malformed_or_mixed_acme_alpn_retains_normal_dispatch() {
     let alpn = extension(TLS_EXT_ALPN, b"\x00\x0b\x0aacme-tls/1");
     let mut duplicate = alpn.clone();
     duplicate.extend(alpn);
@@ -307,7 +307,12 @@ async fn malformed_or_mixed_acme_alpn_is_rejected() {
         extension(TLS_EXT_ALPN, b"\x00\x02\x02h"),
         extension(TLS_EXT_ALPN, b"\x00\x01\x00"),
     ] {
-        assert!(parse(&client_hello(&[], &extensions)).await.is_err());
+        assert!(
+            !parse(&client_hello(&[], &extensions))
+                .await
+                .unwrap()
+                .acme_alpn
+        );
     }
 }
 

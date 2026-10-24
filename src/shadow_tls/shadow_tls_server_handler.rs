@@ -494,27 +494,11 @@ pub async fn read_client_hello(
                 requested_server_name = Some(extension.read_str(server_name_len)?.to_string());
             }
         } else if extension_type == TLS_EXT_ALPN {
-            if seen_alpn {
-                return Err(std::io::Error::other("duplicate ALPN extension"));
-            }
+            // Recognize only the RFC 8737 offer. Other ALPNs, including malformed
+            // offers, must retain the normal TLS/REALITY/ShadowTLS dispatch path.
+            acme_alpn = !seen_alpn
+                && extension.read_slice(extension.remaining())? == b"\x00\x0b\x0aacme-tls/1";
             seen_alpn = true;
-            let len = extension.read_u16_be()? as usize;
-            if len != extension.remaining() {
-                return Err(std::io::Error::other("invalid ALPN extension length"));
-            }
-            let mut count = 0;
-            while !extension.is_consumed() {
-                let len = extension.read_u8()? as usize;
-                if len == 0 {
-                    return Err(std::io::Error::other("empty ALPN protocol"));
-                }
-                acme_alpn |= extension.read_slice(len)? == b"acme-tls/1";
-                count += 1;
-            }
-            // RFC 8737 requires this to be the sole offered protocol.
-            if acme_alpn && count != 1 {
-                return Err(std::io::Error::other("acme-tls/1 must be the sole ALPN"));
-            }
         } else if extension_type == TLS_EXT_SUPPORTED_VERSIONS {
             let version_list_len = extension.read_u8()? as usize;
             if !version_list_len.is_multiple_of(2) || version_list_len != extension.remaining() {
