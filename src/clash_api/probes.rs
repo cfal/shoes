@@ -34,14 +34,14 @@ struct UrlHistory {
 
 #[derive(Default)]
 struct FullBudgetAttempts {
-    unfiltered: Option<tokio::time::Instant>,
-    filtered: Option<tokio::time::Instant>,
+    unfiltered: IndexMap<String, tokio::time::Instant>,
+    filtered: IndexMap<String, tokio::time::Instant>,
 }
 
 pub struct ProbeState {
     connectors: Mutex<HashMap<String, Arc<ClientChainGroup>>>,
     history: Mutex<HashMap<String, History>>,
-    full_budget_attempts: Mutex<HashMap<String, IndexMap<String, FullBudgetAttempts>>>,
+    full_budget_attempts: Mutex<HashMap<String, FullBudgetAttempts>>,
     resolver: Arc<dyn Resolver>,
     forbidden: Vec<ipnetwork::IpNetwork>,
 }
@@ -122,33 +122,31 @@ impl ProbeState {
     fn order_members(&self, indices: &mut [usize], members: &[String], query: &ProbeQuery) {
         let attempts = self.full_budget_attempts.lock();
         indices.sort_by_key(|&index| {
-            attempts
-                .get(&members[index])
-                .and_then(|urls| urls.get(query.url.as_str()))
-                .and_then(|attempts| {
-                    if query.expected.is_empty() {
-                        attempts.unfiltered
-                    } else {
-                        attempts.filtered
-                    }
-                })
+            attempts.get(&members[index]).and_then(|attempts| {
+                let urls = if query.expected.is_empty() {
+                    &attempts.unfiltered
+                } else {
+                    &attempts.filtered
+                };
+                urls.get(query.url.as_str()).copied()
+            })
         });
     }
 
     fn record_full_budget_attempt(&self, name: &str, query: &ProbeQuery) {
         let mut attempts = self.full_budget_attempts.lock();
-        let urls = attempts.entry(name.into()).or_default();
-        let mut attempt = urls.shift_remove(query.url.as_str()).unwrap_or_default();
-        // Filtered API probes cannot refresh automatic health or defer its checks.
-        if query.expected.is_empty() {
-            attempt.unfiltered = Some(tokio::time::Instant::now());
+        let attempts = attempts.entry(name.into()).or_default();
+        // Filtered probes must not update or evict automatic scheduling metadata.
+        let urls = if query.expected.is_empty() {
+            &mut attempts.unfiltered
         } else {
-            attempt.filtered = Some(tokio::time::Instant::now());
-        }
+            &mut attempts.filtered
+        };
+        urls.shift_remove(query.url.as_str());
         if urls.len() >= 8 {
             urls.shift_remove_index(0);
         }
-        urls.insert(query.url.to_string(), attempt);
+        urls.insert(query.url.to_string(), tokio::time::Instant::now());
     }
 
     fn connector(&self, catalog: &Catalog, name: &str) -> io::Result<Arc<ClientChainGroup>> {
@@ -982,6 +980,34 @@ mod tests {
             generation.catalog.selection.automatic.0["auto"].health("auto-0"),
             "dead"
         );
+        service.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_filtered_url_eviction_does_not_change_admission() {
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        let occupied = service.runtime.probes.acquire_many(15).await.unwrap();
+        let resolver = Arc::new(ScheduledAnswers::default());
+        let generation = scheduled_generation(&[("auto", 2, 10, 1000)], resolver.clone());
+        generation
+            .probes
+            .record_full_budget_attempt("auto-0", &query());
+        let mut filtered = query();
+        filtered.expected = vec![(204, 204)];
+        for index in 0..8 {
+            filtered.url = url::Url::parse(&format!("http://other.invalid/{index}")).unwrap();
+            generation
+                .probes
+                .record_full_budget_attempt("auto-0", &filtered);
+        }
+        service.runtime.publish(generation.clone()).await.unwrap();
+        service.runtime.resume().await.unwrap();
+        advance_rounds(2).await;
+        assert_eq!(*resolver.calls.lock(), ["auto-1.invalid"]);
+        let automatic = &generation.catalog.selection.automatic.0["auto"];
+        assert_eq!(automatic.health("auto-0"), "unprobed");
+        assert_eq!(automatic.health("auto-1"), "dead");
+        drop(occupied);
         service.shutdown().await;
     }
 
@@ -1979,7 +2005,16 @@ mod tests {
         indices = vec![1, 0];
         state.order_members(&mut indices, &members, &probe);
         assert_eq!(indices, [0, 1]);
+        for index in 1..=8 {
+            probe.url = url::Url::parse(&format!("https://filtered.invalid/{index}")).unwrap();
+            state.record_full_budget_attempt("a", &probe);
+        }
         probe.expected.clear();
+        probe.url = url::Url::parse("https://probe.invalid/0").unwrap();
+        indices = vec![0, 1];
+        state.order_members(&mut indices, &members, &probe);
+        assert_eq!(indices, [1, 0]);
+        indices = vec![0, 1];
         probe.url = url::Url::parse("https://probe.invalid/1").unwrap();
         state.order_members(&mut indices, &members, &probe);
         assert_eq!(indices, [0, 1]);
@@ -1988,8 +2023,13 @@ mod tests {
             state.record_full_budget_attempt("a", &probe);
         }
         let attempts = state.full_budget_attempts.lock();
-        assert_eq!(attempts["a"].len(), 8);
-        assert!(!attempts["a"].contains_key("https://probe.invalid/0"));
+        assert_eq!(attempts["a"].unfiltered.len(), 8);
+        assert_eq!(attempts["a"].filtered.len(), 8);
+        assert!(
+            !attempts["a"]
+                .unfiltered
+                .contains_key("https://probe.invalid/0")
+        );
         assert!(state.history.lock().is_empty());
     }
 
