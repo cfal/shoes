@@ -383,6 +383,7 @@ fn validate_acme(config: &AcmeConfig) -> io::Result<()> {
     if let Some(path) = &config.ca_cert {
         acme::client_tls(Some(path))?;
     }
+    acme::validate_state(config)?;
     Ok(())
 }
 

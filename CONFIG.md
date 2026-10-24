@@ -1676,12 +1676,29 @@ Back up the whole directory securely. Changing the CA or domain list requires a
 distinct state directory; staging and production must never share one.
 
 Renewal normally begins with one third of the certificate's lifetime remaining.
-ARI can request earlier renewal when the CA and certificate support it; its
-Retry-After is honored, and ordinary renewal does not depend on ARI. Transient
+ARI is checked while idle and can request earlier renewal when the CA and
+certificate support it. Its Retry-After applies only to ARI; optional checks,
+including account setup, cannot delay due renewal. The source worker alone
+schedules requests and durable deadlines. Pending orders use a five-second
+polling interval unless the CA requests a longer wait. Transient
 failures preserve valid material and use jittered exponential backoff from 60
-seconds to 6 hours, honoring longer CA Retry-After values. An attempt is bounded
-to 10 minutes. A completed pair is persisted before it becomes live. Storage
-errors do not publish an unpersisted replacement.
+seconds to 6 hours, honoring longer CA Retry-After values. Retry-After waits over
+100 years or outside the platform clock range are rejected. Each worker step is
+bounded to 10 minutes. Pending and processing orders are polled until the CA
+completes, invalidates, or removes them. A completed pair is persisted before
+it becomes live. Storage errors do not publish an unpersisted replacement.
+Order retry deadlines, including successful finalization and resumed orders,
+survive restart; startup logs an inherited delay rather than bypassing it.
+The failure backoff resets after installation or healthy idle, not after a
+deferred wake or a successful intermediate order step. Its exponent is kept
+in memory; the selected deadline survives restart.
+ARI retry deadlines also survive restart, including failed ARI responses.
+Missing or invalid orders are discarded so a later attempt can create a new one.
+Certificate failures and inherited retry delays are visible with the default
+error-only logging; successful issuance and rotation use the info level.
+During deferred polling, pending challenge responses remain
+available until their 10-minute lease expires, the order leaves the pending
+state, or the source is stopped.
 
 CA traffic goes directly through the OS resolver and Shoes' protected TCP socket
 helper, not through proxy rules or the certificate being issued. HTTPS verifies
@@ -1701,7 +1718,10 @@ need externally reachable challenge ports and persistent application storage.
 `--dry-run` validates configuration, references, domain coverage, challenge
 compatibility, certificate material and declared address conflicts without
 contacting a CA, binding ports, or creating ACME state. An unissued ACME source
-is a valid configuration, not a self-signed placeholder. Actual OS port conflicts,
+is a valid configuration, not a self-signed placeholder. Existing readable state
+is checked for CA/domain identity mismatches without locking or modifying it;
+the check need not run as the service user.
+Actual OS port conflicts,
 storage ownership and permissions are checked during runtime preparation.
 
 There is no built-in DNS-01, wildcard ACME issuance, DNS vendor API, shell hook,

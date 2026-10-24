@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use instant_acme::{
-    Account, AuthorizationStatus, ChallengeType, Identifier, NewOrder, OrderStatus, RetryPolicy,
+    Account, AuthorizationStatus, ChallengeStatus, ChallengeType, Identifier, NewOrder, OrderStatus,
 };
 use parking_lot::Mutex;
 use rustls::pki_types::pem::PemObject;
@@ -17,7 +17,11 @@ use super::{AcmeConfig, ChallengeConfig, Material, Source, challenge, invalid, n
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ORDER_TIMEOUT: Duration = Duration::from_secs(600);
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const MAX_RESPONSE: usize = 1024 * 1024;
+// Keep instant-acme's unchecked deadline arithmetic far from clock limits.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 
 #[cfg(test)]
 #[path = "acme_tests.rs"]
@@ -46,16 +50,25 @@ pub(super) fn validate_url(value: &str) -> io::Result<url::Url> {
 pub(super) fn client_tls(ca: Option<&Path>) -> io::Result<Arc<rustls::ClientConfig>> {
     let mut config = crate::rustls_config_util::create_dns_client_config();
     if let Some(path) = ca {
-        let pem = read_text(path)?;
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
-            roots
-                .add(cert.map_err(|_| invalid("invalid ACME CA certificate"))?)
-                .map_err(|_| invalid("invalid ACME CA certificate"))?;
-        }
-        if roots.is_empty() {
-            return Err(invalid("empty ACME CA certificate file"));
-        }
+        let roots = (|| {
+            let pem = read_text(path)?;
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
+                roots
+                    .add(cert.map_err(|_| invalid("invalid ACME CA certificate"))?)
+                    .map_err(|_| invalid("invalid ACME CA certificate"))?;
+            }
+            if roots.is_empty() {
+                return Err(invalid("empty ACME CA certificate file"));
+            }
+            Ok(roots)
+        })()
+        .map_err(|error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                format!("ACME ca_cert '{}': {error}", path.display()),
+            )
+        })?;
         config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))
@@ -72,7 +85,68 @@ struct HttpClient {
     tls: Arc<rustls::ClientConfig>,
     directory: String,
     terms: Option<String>,
-    retry_after: Arc<Mutex<Instant>>,
+    last: Arc<Mutex<Option<ResponseMetadata>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ResponseMetadata {
+    url: String,
+    status: http::StatusCode,
+    retry_after: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct Failure {
+    error: Box<instant_acme::Error>,
+    response: Option<ResponseMetadata>,
+}
+
+impl From<instant_acme::Error> for Failure {
+    fn from(error: instant_acme::Error) -> Self {
+        Self {
+            error: Box::new(error),
+            response: None,
+        }
+    }
+}
+
+impl From<io::Error> for Failure {
+    fn from(error: io::Error) -> Self {
+        instant_acme::Error::Other(Box::new(error)).into()
+    }
+}
+
+impl HttpClient {
+    fn new(tls: Arc<rustls::ClientConfig>, config: &AcmeConfig) -> Self {
+        Self {
+            tls,
+            directory: config.directory_url.clone(),
+            terms: config.terms_of_service.clone(),
+            last: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn perform<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        operation: impl std::future::Future<Output = Result<T, instant_acme::Error>>,
+    ) -> Result<(T, Option<ResponseMetadata>), Failure> {
+        self.last.lock().take();
+        if deadline <= tokio::time::Instant::now() {
+            return Err(instant_acme::Error::Timeout(None).into());
+        }
+        let result = tokio::time::timeout_at(deadline, operation)
+            .await
+            .unwrap_or(Err(instant_acme::Error::Timeout(None)));
+        let response = self.last.lock().take();
+        match result {
+            Ok(value) => Ok((value, response)),
+            Err(error) => Err(Failure {
+                error: Box::new(error),
+                response,
+            }),
+        }
+    }
 }
 
 impl instant_acme::HttpClient for HttpClient {
@@ -88,7 +162,9 @@ impl instant_acme::HttpClient for HttpClient {
     > {
         let client = self.clone();
         Box::pin(async move {
+            client.last.lock().take();
             let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+                let request_url = request.uri().to_string();
                 let url = validate_url(&request.uri().to_string())?;
                 if url.scheme() == "http" && !client.directory.starts_with("http://") {
                     return Err(invalid(
@@ -176,11 +252,12 @@ impl instant_acme::HttpClient for HttpClient {
                     {
                         return Err(io::Error::other("ACME response headers exceed 32 KiB"));
                     }
-                    if !parts.status.is_success()
-                        && let Some(value) = parts
-                            .headers
-                            .get(http::header::RETRY_AFTER)
-                            .and_then(|value| value.to_str().ok())
+                    let mut retry_after = None;
+                    if let Some(value) = parts
+                        .headers
+                        .get(http::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
                     {
                         let delay =
                             value
@@ -192,19 +269,35 @@ impl instant_acme::HttpClient for HttpClient {
                                         date.duration_since(SystemTime::now()).ok()
                                     })
                                 });
-                        if let Some(delay) = delay
-                            && let Some(deadline) = Instant::now().checked_add(delay)
-                        {
-                            let mut current = client.retry_after.lock();
-                            *current = (*current).max(deadline);
+                        if let Some(delay) = delay {
+                            if delay > MAX_RETRY_AFTER
+                                || SystemTime::now().checked_add(delay).is_none()
+                            {
+                                return Err(invalid("ACME Retry-After exceeds supported range"));
+                            }
+                            let deadline = Instant::now().checked_add(delay).ok_or_else(|| {
+                                invalid("ACME Retry-After exceeds supported range")
+                            })?;
+                            retry_after = Some(deadline);
                         }
                     }
+                    *client.last.lock() = Some(ResponseMetadata {
+                        url: request_url,
+                        status: parts.status,
+                        retry_after,
+                    });
                     let bytes = Limited::new(body, MAX_RESPONSE)
                         .collect()
                         .await
                         .map_err(|_| io::Error::other("ACME response failed or exceeded 1 MiB"))?
                         .to_bytes();
                     if is_directory {
+                        if !parts.status.is_success() {
+                            return Err(io::Error::other(format!(
+                                "ACME directory returned HTTP {}",
+                                parts.status.as_u16()
+                            )));
+                        }
                         let directory: serde_json::Value = serde_json::from_slice(&bytes)
                             .map_err(|_| invalid("invalid ACME directory"))?;
                         let terms = match directory.pointer("/meta/termsOfService") {
@@ -314,6 +407,11 @@ pub(super) fn lock_state(config: &AcmeConfig) -> io::Result<File> {
 }
 
 fn load(config: &AcmeConfig) -> io::Result<Option<State>> {
+    load_state(config, true)
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn load_state(config: &AcmeConfig, check_owner: bool) -> io::Result<Option<State>> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -330,7 +428,7 @@ fn load(config: &AcmeConfig) -> io::Result<Option<State>> {
     {
         use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
-        if meta.mode() & 0o077 != 0 || meta.uid() != unsafe { libc::geteuid() } {
+        if meta.mode() & 0o077 != 0 || (check_owner && meta.uid() != unsafe { libc::geteuid() }) {
             return Err(invalid(
                 "ACME state must be owner-only and owned by the current user",
             ));
@@ -357,6 +455,22 @@ fn load(config: &AcmeConfig) -> io::Result<Option<State>> {
     Ok(Some(state))
 }
 
+pub(super) fn validate_state(config: &AcmeConfig) -> io::Result<()> {
+    match load_state(config, false) {
+        Ok(_) => Ok(()),
+        // A nonprivileged config check may not have the runtime user's state access.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        Err(error) => Err(state_error(config, error)),
+    }
+}
+
+pub(super) fn state_error(config: &AcmeConfig, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("ACME state_dir '{}': {error}", config.state_dir.display()),
+    )
+}
+
 fn persist(config: &AcmeConfig, state: &State) -> io::Result<()> {
     let bytes =
         serde_json::to_vec(state).map_err(|_| io::Error::other("cannot encode ACME state"))?;
@@ -371,6 +485,10 @@ fn persist(config: &AcmeConfig, state: &State) -> io::Result<()> {
         file.write_all(&bytes)?;
         file.sync_all()?;
         std::fs::rename(&temporary, config.state_dir.join("state.json"))?;
+        #[cfg(test)]
+        if tests::FAIL_STATE_SYNC.replace(false) {
+            return Err(io::Error::other("fixture state sync failure"));
+        }
         #[cfg(unix)]
         File::open(&config.state_dir)?.sync_all()?;
         Ok(())
@@ -390,7 +508,7 @@ pub(super) fn load_cached(source: &Source, config: &AcmeConfig) -> io::Result<()
                 source.publish(material);
             }
             Err(_) => {
-                log::warn!(
+                log::error!(
                     "Certificate source {} has no usable cached certificate; normal handshakes will fail until issuance succeeds",
                     source.name
                 );
@@ -466,248 +584,607 @@ fn renewal_time(source: &Source) -> i64 {
     })
 }
 
-async fn cycle(
-    source: &Arc<Source>,
+fn retry_time(delay: Duration) -> i64 {
+    // Both timestamps truncate fractional seconds; round up to avoid early polling.
+    now()
+        .saturating_add(delay.as_secs().min(i64::MAX as u64) as i64)
+        .saturating_add(2)
+}
+
+fn clear_order(
+    source: &Source,
     config: &AcmeConfig,
-    client: HttpClient,
-) -> Result<Duration, instant_acme::Error> {
-    let mut state = load(config)
-        .and_then(|state| state.map_or_else(|| initial_state(config), Ok))
-        .map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
-    // A rename may have succeeded before the directory sync failed. Retry durability
-    // and publication of that pair, rather than creating another ACME order.
-    if let (Some(cert), Some(key)) = (&state.certificate, &state.private_key)
-        && let Ok(material) = Material::parse(cert, key, &config.domains)
-    {
-        let changed = source
-            .material
-            .read()
+    state: &mut State,
+) -> Result<(), instant_acme::Error> {
+    source.challenges.write().clear();
+    state.order_url = None;
+    state.order_key = None;
+    persist(config, state).map_err(|error| instant_acme::Error::Other(Box::new(error)))
+}
+
+async fn invalid_order(
+    source: &Source,
+    config: &AcmeConfig,
+    state: &mut State,
+    order: &mut instant_acme::Order,
+) -> instant_acme::Error {
+    // Forget the terminal order before fetching diagnostics, even if those requests fail.
+    if let Err(error) = clear_order(source, config, state) {
+        return error;
+    }
+    if let Some(problem) = &order.state().error {
+        return instant_acme::Error::Api(problem.clone());
+    }
+    let mut authorizations = order.authorizations();
+    while let Some(Ok(authorization)) = authorizations.next().await {
+        if authorization.status == AuthorizationStatus::Valid {
+            continue;
+        }
+        if let Some(problem) = authorization
+            .challenges
+            .iter()
+            .find_map(|challenge| challenge.error.clone())
+        {
+            return instant_acme::Error::Api(problem);
+        }
+    }
+    instant_acme::Error::Str("order invalid")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Progress {
+    Deferred,
+    Idle,
+    Pending,
+    Installed,
+}
+
+#[derive(Debug)]
+struct Turn {
+    wake_at: i64,
+    outcome: Result<Progress, instant_acme::Error>,
+}
+
+struct Scheduler {
+    client: Option<HttpClient>,
+    account: Option<(Account, Instant)>,
+    backoff: u64,
+}
+
+fn defer(config: &AcmeConfig, state: &mut State, at: i64) -> io::Result<()> {
+    state.retry_at = at;
+    persist(config, state)
+}
+
+fn response_deadline(response: &Option<ResponseMetadata>) -> i64 {
+    response
+        .as_ref()
+        .and_then(|response| response.retry_after)
+        .map_or(0, |deadline| {
+            retry_time(deadline.saturating_duration_since(Instant::now()))
+        })
+}
+
+impl Scheduler {
+    fn new() -> Self {
+        Self {
+            client: None,
+            account: None,
+            backoff: 60,
+        }
+    }
+
+    fn failure(
+        &mut self,
+        source: &Source,
+        config: &AcmeConfig,
+        state: Option<&mut State>,
+        failure: Failure,
+    ) -> Turn {
+        self.account = None;
+        let jitter = rand::random::<u64>() % (self.backoff / 4 + 1);
+        let delay = Duration::from_secs((self.backoff + jitter).min(6 * 3600));
+        self.backoff = (self.backoff * 2).min(6 * 3600);
+        let wake_at = retry_time(delay)
+            .max(response_deadline(&failure.response))
+            .max(state.as_ref().map_or(0, |state| state.retry_at));
+        let reason = failure_message(&failure.error);
+        log::error!(
+            "Certificate source {} ACME attempt failed (state_dir '{}'): {reason}; retry in {} seconds; retaining last good certificate",
+            source.name,
+            config.state_dir.display(),
+            wake_at.saturating_sub(now())
+        );
+        if let Some(state) = state
+            && let Err(error) = defer(config, state, wake_at)
+        {
+            log::error!(
+                "Certificate source {} could not persist retry state: {}",
+                source.name,
+                state_error(config, error)
+            );
+        }
+        Turn {
+            wake_at,
+            outcome: Err(*failure.error),
+        }
+    }
+
+    async fn ensure_account(
+        &mut self,
+        config: &AcmeConfig,
+        state: &mut State,
+        client: &HttpClient,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Failure> {
+        if self
+            .account
             .as_ref()
-            .is_none_or(|current| current.digest != material.digest);
-        if changed {
-            persist(config, &state).map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
+            .is_some_and(|(_, created)| created.elapsed() < ORDER_TIMEOUT)
+        {
+            return Ok(());
+        }
+        self.account = None;
+        let (account, _) = client
+            .perform(deadline, account(config, state, client.clone()))
+            .await?;
+        self.account = Some((account, Instant::now()));
+        Ok(())
+    }
+
+    async fn turn(&mut self, source: &Arc<Source>, config: &AcmeConfig) -> Turn {
+        source
+            .challenges
+            .write()
+            .retain(|pending| pending.expires > Instant::now());
+        let mut state =
+            match load(config).and_then(|state| state.map_or_else(|| initial_state(config), Ok)) {
+                Ok(state) => state,
+                Err(error) => return self.failure(source, config, None, error.into()),
+            };
+        // Recover a rename that succeeded before its directory sync or publication failed.
+        if let (Some(cert), Some(key)) = (&state.certificate, &state.private_key)
+            && let Ok(material) = Material::parse(cert, key, &config.domains)
+            && source
+                .material
+                .read()
+                .as_ref()
+                .is_none_or(|current| current.digest != material.digest)
+        {
+            if let Err(error) = persist(config, &state) {
+                return self.failure(source, config, Some(&mut state), error.into());
+            }
             source.publish(material);
         }
-    }
-    if state.retry_at > now() {
-        return Ok(Duration::from_secs((state.retry_at - now()) as u64));
-    }
-    let account = account(config, &mut state, client).await?;
-    let mut renewal = renewal_time(source);
-    let current = source.current();
-    if let Some(current) = current
-        && now() >= state.ari_retry_at
-        && let Ok(id) = instant_acme::CertificateIdentifier::try_from(&current.cert[0])
-    {
-        state.ari_retry_at = now().saturating_add(6 * 3600);
-        if let Ok((info, delay)) = account.renewal_info(&id).await {
-            state.ari_retry_at =
-                now().saturating_add(delay.as_secs().clamp(60, i64::MAX as u64) as i64);
-            let start = info.suggested_window.start.unix_timestamp();
-            let end = info.suggested_window.end.unix_timestamp();
-            if end > start {
-                // A stable choice inside ARI's window avoids rescheduling on every poll.
-                let offset = u64::from_be_bytes(
-                    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, current.cert[0].as_ref())
-                        .as_ref()[..8]
-                        .try_into()
-                        .unwrap(),
-                );
-                state.ari_renew_at = start.saturating_add((offset % (end - start) as u64) as i64);
-            }
+        if state.retry_at > now() {
+            return Turn {
+                wake_at: state.retry_at,
+                outcome: Ok(Progress::Deferred),
+            };
         }
-        persist(config, &state).map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
-    }
-    if state.ari_renew_at != 0 {
-        renewal = renewal.min(state.ari_renew_at);
-    }
-    if now() < renewal && state.order_url.is_none() {
-        return Ok(Duration::from_secs((renewal - now()).min(6 * 3600) as u64));
-    }
-    let identifiers: Vec<_> = config
-        .domains
-        .iter()
-        .cloned()
-        .map(Identifier::Dns)
-        .collect();
-    let mut order = if let Some(url) = &state.order_url {
-        match account.order(url.clone()).await {
-            Ok(order) => order,
-            Err(error) => {
-                if matches!(&error, instant_acme::Error::Api(problem) if matches!(problem.status, Some(404 | 410)))
-                {
-                    state.order_url = None;
-                    state.order_key = None;
-                    persist(config, &state)
-                        .map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
+        let renewal = if state.ari_renew_at == 0 {
+            renewal_time(source)
+        } else {
+            renewal_time(source).min(state.ari_renew_at)
+        };
+        let mandatory = state.order_url.is_some() || source.current().is_none() || now() >= renewal;
+        if !mandatory && now() < state.ari_retry_at && config.contacts == state.contacts {
+            self.account = None;
+            self.backoff = 60;
+            return Turn {
+                wake_at: renewal.min(state.ari_retry_at),
+                outcome: Ok(Progress::Idle),
+            };
+        }
+        if !mandatory {
+            return self.ari(source, config, &mut state, renewal).await;
+        }
+        let result = self.mandatory(source, config, &mut state).await;
+        match result {
+            Ok(Progress::Installed) => {
+                self.account = None;
+                self.backoff = 60;
+                Turn {
+                    wake_at: now() + 60,
+                    outcome: Ok(Progress::Installed),
                 }
-                return Err(error);
+            }
+            Ok(Progress::Pending) => {
+                let wake_at = state.retry_at.max(retry_time(POLL_INTERVAL));
+                if let Err(error) = defer(config, &mut state, wake_at) {
+                    return self.failure(source, config, Some(&mut state), error.into());
+                }
+                Turn {
+                    wake_at,
+                    outcome: Ok(Progress::Pending),
+                }
+            }
+            Ok(_) => unreachable!("mandatory work installs a certificate or awaits an order"),
+            Err(failure) => self.failure(source, config, Some(&mut state), failure),
+        }
+    }
+
+    fn client(&mut self, config: &AcmeConfig) -> io::Result<HttpClient> {
+        if self.client.is_none() {
+            self.client = Some(HttpClient::new(
+                client_tls(config.ca_cert.as_deref())?,
+                config,
+            ));
+        }
+        Ok(self.client.as_ref().unwrap().clone())
+    }
+
+    async fn ari(
+        &mut self,
+        source: &Source,
+        config: &AcmeConfig,
+        state: &mut State,
+        renewal: i64,
+    ) -> Turn {
+        let probe_due = now() >= state.ari_retry_at;
+        if probe_due {
+            state.ari_retry_at = now().saturating_add(MAINTENANCE_INTERVAL.as_secs() as i64);
+        }
+        let current = source.current();
+        let result = async {
+            persist(config, state)?;
+            let current = current
+                .as_ref()
+                .ok_or(instant_acme::Error::Str("no current certificate"))?;
+            let client = self.client(config)?;
+            // Optional setup and ARI cannot run past the next mandatory renewal.
+            let budget =
+                Duration::from_secs(renewal.saturating_sub(now()).max(0) as u64).min(ORDER_TIMEOUT);
+            let deadline = tokio::time::Instant::now() + budget;
+            self.ensure_account(config, state, &client, deadline)
+                .await?;
+            if !probe_due {
+                return Ok(None);
+            }
+            let id = instant_acme::CertificateIdentifier::try_from(&current.cert[0])
+                .map_err(|_| instant_acme::Error::Unsupported("certificate renewal identifier"))?;
+            let account = &self.account.as_ref().unwrap().0;
+            client
+                .perform(deadline, account.renewal_info(&id))
+                .await
+                .map(Some)
+        }
+        .await;
+        self.account = None;
+        match result {
+            Ok(Some(((info, delay), response))) => {
+                state.ari_retry_at = retry_time(delay.max(Duration::from_secs(60)))
+                    .max(response_deadline(&response));
+                let start = info.suggested_window.start.unix_timestamp();
+                let end = info.suggested_window.end.unix_timestamp();
+                if end > start
+                    && let Some(current) = &current
+                {
+                    let offset = u64::from_be_bytes(
+                        aws_lc_rs::digest::digest(
+                            &aws_lc_rs::digest::SHA256,
+                            current.cert[0].as_ref(),
+                        )
+                        .as_ref()[..8]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    state.ari_renew_at =
+                        start.saturating_add((offset % (end - start) as u64) as i64);
+                }
+            }
+            Ok(None) => {}
+            Err(failure) => {
+                state.ari_retry_at = state.ari_retry_at.max(response_deadline(&failure.response));
+                if !matches!(*failure.error, instant_acme::Error::Unsupported(_)) {
+                    log::error!(
+                        "Certificate source {} ARI check failed: {}; ordinary renewal remains scheduled",
+                        source.name,
+                        failure_message(&failure.error)
+                    );
+                }
             }
         }
-    } else {
-        let order = account.new_order(&NewOrder::new(&identifiers)).await?;
-        state.order_url = Some(order.url().to_owned());
-        state.order_key = Some(
-            rcgen::KeyPair::generate()
-                .map_err(|_| instant_acme::Error::Crypto)?
-                .serialize_pem(),
-        );
-        persist(config, &state).map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
-        order
-    };
-    if order.state().status == OrderStatus::Invalid {
-        state.order_url = None;
-        state.order_key = None;
-        persist(config, &state).map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
-        return Err(instant_acme::Error::Str("order invalid"));
+        if let Err(error) = persist(config, state) {
+            log::error!(
+                "Certificate source {} could not persist ARI state: {}",
+                source.name,
+                state_error(config, error)
+            );
+        }
+        let renewal = if state.ari_renew_at == 0 {
+            renewal
+        } else {
+            renewal.min(state.ari_renew_at)
+        };
+        Turn {
+            wake_at: renewal.min(state.ari_retry_at),
+            outcome: Ok(Progress::Idle),
+        }
     }
-    let _cleanup = challenge::Cleanup(source.clone());
-    if order.state().status == OrderStatus::Pending {
-        let mut authorizations = order.authorizations();
-        while let Some(result) = authorizations.next().await {
-            let mut authorization = result?;
-            if authorization.status == AuthorizationStatus::Valid {
-                continue;
+
+    async fn mandatory(
+        &mut self,
+        source: &Source,
+        config: &AcmeConfig,
+        state: &mut State,
+    ) -> Result<Progress, Failure> {
+        let client = self.client(config)?;
+        let deadline = tokio::time::Instant::now() + ORDER_TIMEOUT;
+        self.ensure_account(config, state, &client, deadline)
+            .await?;
+        let account = &self.account.as_ref().unwrap().0;
+        let (mut order, mut response) = if let Some(url) = state.order_url.clone() {
+            match client.perform(deadline, account.order(url.clone())).await {
+                Ok(value) => value,
+                Err(failure) => {
+                    if failure.response.as_ref().is_some_and(|response| {
+                        response.url == url && matches!(response.status.as_u16(), 404 | 410)
+                    }) {
+                        clear_order(source, config, state).map_err(|error| Failure {
+                            response: failure.response.clone(),
+                            ..Failure::from(error)
+                        })?;
+                    }
+                    return Err(failure);
+                }
             }
-            if authorization.status != AuthorizationStatus::Pending {
-                return Err("authorization not pending".into());
+        } else {
+            source.challenges.write().clear();
+            let identifiers: Vec<_> = config
+                .domains
+                .iter()
+                .cloned()
+                .map(Identifier::Dns)
+                .collect();
+            let key = rcgen::KeyPair::generate()
+                .map_err(|_| instant_acme::Error::Crypto)?
+                .serialize_pem();
+            let result = client
+                .perform(deadline, account.new_order(&NewOrder::new(&identifiers)))
+                .await?;
+            state.order_url = Some(result.0.url().to_owned());
+            state.order_key = Some(key);
+            persist(config, state).map_err(|error| Failure {
+                response: result.1.clone(),
+                ..Failure::from(error)
+            })?;
+            result
+        };
+        if order.state().status != OrderStatus::Pending {
+            source.challenges.write().clear();
+        }
+        if order.state().status == OrderStatus::Pending {
+            let hint = response_deadline(&response);
+            if hint > now() {
+                // Commit this hint before challenge preparation can fail or be cancelled.
+                defer(config, state, hint)?;
             }
-            let kind = match config.challenge {
-                ChallengeConfig::Http01 { .. } => ChallengeType::Http01,
-                ChallengeConfig::TlsAlpn01 => ChallengeType::TlsAlpn01,
-            };
-            let mut challenge = authorization
-                .challenge(kind.clone())
-                .ok_or("CA did not offer configured challenge")?;
-            let domain = challenge.identifier().to_string();
-            if !config.domains.contains(&domain) {
-                return Err("CA returned an unconfigured identifier".into());
-            }
-            let token = challenge.token.clone();
-            if token.len() < 22
-                || token.len() > 256
-                || !token
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-            {
-                return Err("CA returned invalid challenge token".into());
-            }
-            let authorization = challenge.key_authorization();
-            let tls = if kind == ChallengeType::TlsAlpn01 {
-                Some(
-                    challenge::tls_config(&domain, authorization.digest().as_ref())
-                        .map_err(|error| instant_acme::Error::Other(Box::new(error)))?,
+            client
+                .perform(
+                    deadline,
+                    prepare_challenges(source, config, state, &mut order),
                 )
-            } else {
-                None
-            };
-            source.challenges.write().push(challenge::Pending {
+                .await?;
+            return Ok(Progress::Pending);
+        }
+        if order.state().status == OrderStatus::Ready {
+            let key = rcgen::KeyPair::from_pem(
+                state
+                    .order_key
+                    .as_ref()
+                    .ok_or(instant_acme::Error::Str("missing order key"))?,
+            )
+            .map_err(|_| instant_acme::Error::Crypto)?;
+            let mut params = rcgen::CertificateParams::new(config.domains.clone())
+                .map_err(|_| instant_acme::Error::Crypto)?;
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            let csr = params
+                .serialize_request(&key)
+                .map_err(|_| instant_acme::Error::Crypto)?;
+            (_, response) = client
+                .perform(deadline, order.finalize_csr(csr.der()))
+                .await?;
+        }
+        match order.state().status {
+            OrderStatus::Processing => {
+                let hint = response_deadline(&response);
+                if hint > now() {
+                    defer(config, state, hint)?;
+                }
+                Ok(Progress::Pending)
+            }
+            OrderStatus::Invalid => {
+                // Preserve the primary response before best-effort diagnostic requests.
+                let (error, _) = client
+                    .perform(deadline, async {
+                        Ok(invalid_order(source, config, state, &mut order).await)
+                    })
+                    .await
+                    .unwrap_or_else(|failure| (*failure.error, None));
+                Err(Failure {
+                    error: Box::new(error),
+                    response,
+                })
+            }
+            OrderStatus::Valid => {
+                let (cert, _) = client.perform(deadline, order.certificate()).await?;
+                let cert = cert.ok_or(instant_acme::Error::Str("no certificate received"))?;
+                let key = state
+                    .order_key
+                    .as_ref()
+                    .ok_or(instant_acme::Error::Str("missing order key"))?;
+                let material = Material::parse(&cert, key, &config.domains)?;
+                state.certificate = Some(cert);
+                state.private_key = state.order_key.take();
+                state.order_url = None;
+                state.ari_retry_at = 0;
+                state.ari_renew_at = 0;
+                defer(config, state, 0)?;
+                source.publish(material);
+                log::info!("Certificate source {} issued and persisted", source.name);
+                Ok(Progress::Installed)
+            }
+            _ => Err(instant_acme::Error::Str("unexpected order state").into()),
+        }
+    }
+}
+
+async fn prepare_challenges(
+    source: &Source,
+    config: &AcmeConfig,
+    state: &mut State,
+    order: &mut instant_acme::Order,
+) -> Result<(), instant_acme::Error> {
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authorization = result?;
+        if authorization.status == AuthorizationStatus::Valid {
+            continue;
+        }
+        if authorization.status != AuthorizationStatus::Pending {
+            clear_order(source, config, state)?;
+            return Err(authorization
+                .challenges
+                .iter()
+                .find_map(|challenge| challenge.error.clone())
+                .map_or(
+                    instant_acme::Error::Str("authorization not pending"),
+                    instant_acme::Error::Api,
+                ));
+        }
+        let kind = match config.challenge {
+            ChallengeConfig::Http01 { .. } => ChallengeType::Http01,
+            ChallengeConfig::TlsAlpn01 => ChallengeType::TlsAlpn01,
+        };
+        let mut challenge = authorization
+            .challenge(kind.clone())
+            .ok_or("CA did not offer configured challenge")?;
+        if challenge.status == ChallengeStatus::Invalid {
+            clear_order(source, config, state)?;
+            return Err(challenge.error.clone().map_or(
+                instant_acme::Error::Str("challenge invalid"),
+                instant_acme::Error::Api,
+            ));
+        }
+        if challenge.status == ChallengeStatus::Valid {
+            continue;
+        }
+        let domain = challenge.identifier().to_string();
+        if !config.domains.contains(&domain) {
+            return Err("CA returned an unconfigured identifier".into());
+        }
+        let token = challenge.token.clone();
+        if token.len() < 22
+            || token.len() > 256
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        {
+            return Err("CA returned invalid challenge token".into());
+        }
+        let authorization = challenge.key_authorization();
+        let tls = if kind == ChallengeType::TlsAlpn01 {
+            Some(
+                challenge::tls_config(&domain, authorization.digest().as_ref())
+                    .map_err(|error| instant_acme::Error::Other(Box::new(error)))?,
+            )
+        } else {
+            None
+        };
+        {
+            let mut pending = source.challenges.write();
+            pending.retain(|existing| existing.domain != domain);
+            pending.push(challenge::Pending {
                 domain,
                 token,
                 authorization: authorization.as_str().to_owned(),
                 expires: Instant::now() + ORDER_TIMEOUT,
                 tls,
             });
+        }
+        if challenge.status == ChallengeStatus::Pending {
             challenge.set_ready().await?;
         }
     }
-    let policy = RetryPolicy::new()
-        .initial_delay(Duration::from_secs(1))
-        .timeout(Duration::from_secs(240));
-    if order.state().status == OrderStatus::Pending {
-        order.poll_ready(&policy).await?;
-    }
-    if order.state().status == OrderStatus::Ready {
-        let key = rcgen::KeyPair::from_pem(state.order_key.as_ref().ok_or("missing order key")?)
-            .map_err(|_| instant_acme::Error::Crypto)?;
-        let mut params = rcgen::CertificateParams::new(config.domains.clone())
-            .map_err(|_| instant_acme::Error::Crypto)?;
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        let csr = params
-            .serialize_request(&key)
-            .map_err(|_| instant_acme::Error::Crypto)?;
-        order.finalize_csr(csr.der()).await?;
-    }
-    let cert = order.poll_certificate(&policy).await?;
-    let key = state.order_key.take().ok_or("missing order key")?;
-    let material = Material::parse(&cert, &key, &config.domains)
-        .map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
-    state.certificate = Some(cert);
-    state.private_key = Some(key);
-    state.order_url = None;
-    state.retry_at = 0;
-    state.ari_retry_at = 0;
-    state.ari_renew_at = 0;
-    persist(config, &state).map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
-    source.publish(material);
-    log::info!("Certificate source {} issued and persisted", source.name);
-    Ok(Duration::from_secs(60))
+    Ok(())
 }
 
 pub(super) async fn run(source: Arc<Source>, config: &AcmeConfig) {
-    let tls = loop {
-        match client_tls(config.ca_cert.as_deref()) {
-            Ok(tls) => break tls,
-            Err(_) => {
-                log::error!(
-                    "Certificate source {} cannot load ACME trust roots; retry in 60 seconds",
-                    source.name
-                );
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        }
-    };
-    let client = HttpClient {
-        tls,
-        directory: config.directory_url.clone(),
-        terms: config.terms_of_service.clone(),
-        retry_after: Arc::new(Mutex::new(Instant::now())),
-    };
-    let mut backoff = 60u64;
+    let _cleanup = challenge::Cleanup(source.clone());
+    let mut scheduler = Scheduler::new();
+    let mut first_turn = true;
     loop {
-        let retry_delay = client
-            .retry_after
-            .lock()
-            .saturating_duration_since(Instant::now());
-        if !retry_delay.is_zero() {
-            tokio::time::sleep(retry_delay.min(Duration::from_secs(6 * 3600))).await;
-            continue;
+        let turn = scheduler.turn(&source, config).await;
+        if first_turn && matches!(turn.outcome, Ok(Progress::Deferred)) {
+            log::error!(
+                "Certificate source {} ACME retry deferred until Unix time {} (state_dir '{}'); waiting {} seconds",
+                source.name,
+                turn.wake_at,
+                config.state_dir.display(),
+                turn.wake_at.saturating_sub(now())
+            );
         }
-        let outcome =
-            tokio::time::timeout(ORDER_TIMEOUT, cycle(&source, config, client.clone())).await;
-        let delay = match outcome {
-            Ok(Ok(delay)) => {
-                backoff = 60;
-                delay
-            }
-            _ => {
-                source.challenges.write().clear();
-                let jitter = rand::random::<u64>() % (backoff / 4 + 1);
-                let backoff_delay = Duration::from_secs((backoff + jitter).min(6 * 3600));
-                let retry_after = client
-                    .retry_after
-                    .lock()
-                    .saturating_duration_since(Instant::now());
-                let delay = backoff_delay.max(retry_after);
-                log::warn!(
-                    "Certificate source {} ACME attempt failed; retry in {} seconds; retaining last good certificate",
-                    source.name,
-                    delay.as_secs()
-                );
-                if let Ok(Some(mut state)) = load(config) {
-                    state.retry_at =
-                        now().saturating_add(delay.as_secs().min(i64::MAX as u64) as i64);
-                    if persist(config, &state).is_err() {
-                        log::error!(
-                            "Certificate source {} could not persist retry state",
-                            source.name
-                        );
-                    }
-                }
-                backoff = (backoff * 2).min(6 * 3600);
-                delay
-            }
-        };
-        tokio::time::sleep(delay.min(Duration::from_secs(6 * 3600))).await;
+        first_turn = false;
+        let delay = Duration::from_secs(turn.wake_at.saturating_sub(now()).max(0) as u64);
+        tokio::time::sleep(delay.min(MAINTENANCE_INTERVAL)).await;
+    }
+}
+
+fn failure_message(error: &instant_acme::Error) -> String {
+    use instant_acme::Error;
+    match error {
+        Error::Api(problem) => {
+            // CA detail/subproblems and JSON errors can echo submitted data. Log only
+            // recognized problem codes and numeric status, never remote free text.
+            let code = problem
+                .r#type
+                .as_deref()
+                .and_then(|kind| kind.strip_prefix("urn:ietf:params:acme:error:"))
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        "accountDoesNotExist"
+                            | "alreadyRevoked"
+                            | "badCSR"
+                            | "badNonce"
+                            | "badPublicKey"
+                            | "badRevocationReason"
+                            | "badSignatureAlgorithm"
+                            | "caa"
+                            | "compound"
+                            | "connection"
+                            | "dns"
+                            | "externalAccountRequired"
+                            | "incorrectResponse"
+                            | "invalidContact"
+                            | "malformed"
+                            | "orderNotReady"
+                            | "rateLimited"
+                            | "rejectedIdentifier"
+                            | "serverInternal"
+                            | "tls"
+                            | "unauthorized"
+                            | "unsupportedContact"
+                            | "unsupportedIdentifier"
+                            | "userActionRequired"
+                    )
+                })
+                .unwrap_or("unrecognized problem");
+            format!("CA rejected request: {code} (status {:?})", problem.status)
+        }
+        Error::Other(error) => match error.downcast_ref::<io::Error>() {
+            Some(error) => error.to_string(),
+            None => "ACME protocol operation failed".to_owned(),
+        },
+        Error::Json(_) => "invalid ACME JSON or account credentials".to_owned(),
+        Error::Str(_)
+        | Error::Unsupported(_)
+        | Error::Timeout(_)
+        | Error::Crypto
+        | Error::KeyRejected
+        | Error::Http(_)
+        | Error::InvalidUri(_) => error.to_string(),
+        _ => "ACME request failed".to_owned(),
     }
 }

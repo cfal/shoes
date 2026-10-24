@@ -86,9 +86,27 @@ impl Registry {
                         *source.material.write() = worker.source.material.read().clone();
                         worker.lock.as_ref().expect("ACME storage lease").clone()
                     } else {
-                        Arc::new(acme::lock_state(config)?)
+                        Arc::new(acme::lock_state(config).map_err(|error| {
+                            io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "certificate source {}: {}",
+                                    source.name,
+                                    acme::state_error(config, error)
+                                ),
+                            )
+                        })?)
                     };
-                    acme::load_cached(source, config)?;
+                    acme::load_cached(source, config).map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "certificate source {}: {}",
+                                source.name,
+                                acme::state_error(config, error)
+                            ),
+                        )
+                    })?;
                     if let ChallengeConfig::Http01 { listen } = &config.challenge {
                         for address in listen {
                             let existing = previous.and_then(|previous| {
@@ -166,11 +184,12 @@ impl Registry {
             let source = worker.source.clone();
             let listeners = worker.listeners.lock().clone();
             if let Spec::Acme(config) = &source.spec
-                && acme::load_cached(&source, config).is_err()
+                && let Err(error) = acme::load_cached(&source, config)
             {
-                log::warn!(
-                    "Certificate source {} could not refresh durable state during activation; retaining prepared certificate",
-                    source.name
+                log::error!(
+                    "Certificate source {} could not refresh durable state during activation: {}; retaining prepared certificate",
+                    source.name,
+                    acme::state_error(config, error)
                 );
             }
             // Keep the storage lease until the aborted task has actually finished.
@@ -180,7 +199,6 @@ impl Registry {
                 match &source.spec {
                     Spec::Files { .. } => watch_files(&source).await,
                     Spec::Acme(config) => {
-                        let _cleanup = challenge::Cleanup(source.clone());
                         tokio::select! {
                             _ = acme::run(source.clone(), config) => {}
                             result = challenge::serve(listeners, source.clone()) => {

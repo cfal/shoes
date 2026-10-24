@@ -6,6 +6,50 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 #[tokio::test]
+async fn persisted_acme_retry_is_reported_once_without_contacting_the_ca() {
+    use std::os::unix::fs::PermissionsExt;
+    timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ca = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/directory", ca.local_addr().unwrap());
+        let retry_at = chrono::Utc::now().timestamp() + 3600;
+        let state_file = state.join("state.json");
+        std::fs::write(&state_file, serde_json::to_vec(&json!({
+            "directory_url": url, "domains": ["proxy.test"], "account_key": "not used until retry",
+            "credentials": null, "certificate": null, "private_key": null, "order_url": null, "order_key": null, "retry_at": retry_at
+        })).unwrap()).unwrap();
+        std::fs::set_permissions(&state_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = directory.path().join("config.yaml");
+        std::fs::write(&path, serde_yaml::to_string(&json!([
+            {"certificate_source": "managed", "type": "acme", "domains": ["proxy.test"], "directory_url": url,
+             "state_dir": state, "challenge": {"type": "http01", "listen": [available_address().to_string()]}},
+            {"address": available_address().to_string(), "protocol": {"type": "socks"}}
+        ])).unwrap()).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .args(["-t", "1"]).arg(&path).env_remove("RUST_LOG")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let mut child = Process::from_child(child);
+        let marker = "ACME retry deferred until Unix time";
+        loop {
+            let line = child.lines.recv().await.unwrap();
+            if line.contains(marker) {
+                assert!(line.contains("managed") && line.contains(state.to_str().unwrap()) && line.contains(&retry_at.to_string()), "{line}");
+                break;
+            }
+        }
+        assert!(timeout(Duration::from_millis(200), ca.accept()).await.is_err());
+        child.signal(libc::SIGTERM);
+        assert!(child.exit().await.success());
+        while let Some(line) = child.lines.recv().await {
+            assert!(!line.contains(marker), "duplicate retry message: {line}");
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn file_rotation_keeps_tcp_and_quic_tunnels_and_rejects_bad_reload() {
     rotation_roundtrip(true, true).await;
 }
