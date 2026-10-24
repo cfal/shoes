@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use crate::tun::start_tun_server;
 use crate::util::write_all;
 
 async fn run_tcp_server(
-    listener: tokio::net::TcpListener,
+    listener: Arc<tokio::net::TcpListener>,
     tcp_config: TcpConfig,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
@@ -400,9 +400,113 @@ pub async fn run_udp_copy(
     copy_result
 }
 
+#[cfg(any(test, target_os = "android", target_os = "ios", feature = "ffi"))]
 pub async fn start_servers(
     config: Config,
     resolver: Arc<dyn Resolver>,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
+    start_servers_with_listeners(config, resolver, &mut TcpListeners::default()).await
+}
+
+/// Socket ownership is independent of handlers and routing generations.
+#[derive(Default)]
+pub(crate) struct TcpListeners {
+    sockets: HashMap<SocketAddr, Arc<tokio::net::TcpListener>>,
+    admission: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl TcpListeners {
+    pub(crate) fn prepare(
+        configs: &[Config],
+        previous: &Self,
+        retiring_http: &[SocketAddr],
+    ) -> std::io::Result<Self> {
+        let mut next = Self::default();
+        next.defer_admission();
+        let mut seen = std::collections::HashSet::new();
+        for config in configs {
+            let Config::Server(server) = config else {
+                continue;
+            };
+            if server.transport != Transport::Tcp {
+                continue;
+            }
+            let BindLocation::Address(addresses) = &server.bind_location else {
+                continue;
+            };
+            for address in addresses.iter() {
+                for address in address.to_socket_addrs()? {
+                    if address.port() == 0 {
+                        continue;
+                    }
+                    if !seen.insert(address) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            format!("duplicate TCP listener at {address}"),
+                        ));
+                    }
+                    if let Some(listener) = previous.sockets.get(&address) {
+                        next.sockets.insert(address, listener.clone());
+                        continue;
+                    }
+                    match next.bind(address) {
+                        Ok(_) => {}
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::AddrInUse
+                                && previous
+                                    .sockets
+                                    .values()
+                                    .filter_map(|listener| listener.local_addr().ok())
+                                    .chain(retiring_http.iter().copied())
+                                    .any(|bound| {
+                                        bound.port() == address.port()
+                                            && (bound.ip() == address.ip()
+                                                || bound.ip().is_unspecified()
+                                                || address.ip().is_unspecified())
+                                    }) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        Ok(next)
+    }
+
+    pub(crate) fn retain_shared(&mut self, next: &Self) {
+        self.sockets.retain(|address, listener| {
+            next.sockets
+                .get(address)
+                .is_some_and(|next| Arc::ptr_eq(listener, next))
+        });
+    }
+
+    /// Gates subsequently started listeners without affecting already draining flows.
+    pub(crate) fn defer_admission(&mut self) {
+        self.admission = Some(tokio_util::sync::CancellationToken::new());
+    }
+
+    pub(crate) fn activate(&self) {
+        if let Some(admission) = &self.admission {
+            admission.cancel();
+        }
+    }
+
+    fn bind(&mut self, address: SocketAddr) -> std::io::Result<Arc<tokio::net::TcpListener>> {
+        if let Some(listener) = self.sockets.get(&address) {
+            return Ok(listener.clone());
+        }
+        let listener = Arc::new(new_tcp_listener(address, 4096, None)?);
+        if address.port() != 0 {
+            self.sockets.insert(address, listener.clone());
+        }
+        Ok(listener)
+    }
+}
+
+pub(crate) async fn start_servers_with_listeners(
+    config: Config,
+    resolver: Arc<dyn Resolver>,
+    listeners: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
         #[cfg(unix)]
@@ -424,7 +528,9 @@ pub async fn start_servers(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
         )),
-        Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
+        Config::Server(server_config) => {
+            start_tcp_or_quic_servers(server_config, resolver, listeners).await
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Expected a server configuration",
@@ -435,10 +541,11 @@ pub async fn start_servers(
 async fn start_tcp_or_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    listeners: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let bind_location = config.bind_location.to_string();
     let join_handles = match config.transport {
-        Transport::Tcp => start_tcp_servers(config, resolver).await?,
+        Transport::Tcp => start_tcp_servers(config, resolver, listeners).await?,
         Transport::Quic => start_quic_servers(config, resolver).await?,
         Transport::Udp => {
             return Err(std::io::Error::new(
@@ -461,6 +568,7 @@ async fn start_tcp_or_quic_servers(
 async fn start_tcp_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    sockets: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
@@ -496,7 +604,7 @@ async fn start_tcp_servers(
             let mut listeners = Vec::new();
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
-                    let listener = new_tcp_listener(socket_addr, 4096, None)?;
+                    let listener = sockets.bind(socket_addr)?;
                     let tcp_handler = match handlers.entry(socket_addr.ip()) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
@@ -517,7 +625,12 @@ async fn start_tcp_servers(
             for (listener, tcp_handler) in listeners {
                 let tcp_config = tcp_config.clone();
                 let resolver = resolver.clone();
+                let admission = sockets.admission.clone();
                 handles.push(tokio::spawn(async move {
+                    // Uncommitted flows must not outlive rollback through graceful draining.
+                    if let Some(admission) = admission {
+                        admission.cancelled().await;
+                    }
                     if let Err(error) =
                         run_tcp_server(listener, tcp_config, resolver, tcp_handler).await
                     {
@@ -540,7 +653,11 @@ async fn start_tcp_servers(
                 let tcp_handler: Arc<dyn TcpServerHandler> =
                     create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)?
                         .into();
+                let admission = sockets.admission.clone();
                 let handle = tokio::spawn(async move {
+                    if let Some(admission) = admission {
+                        admission.cancelled().await;
+                    }
                     if let Err(error) = run_unix_server(listener, resolver, tcp_handler).await {
                         error!("Unix listener stopped: {error}");
                     }
@@ -578,6 +695,15 @@ mod lifetime_tests {
     use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
     use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
     use crate::tcp::socket_connector::SocketConnector;
+
+    #[tokio::test]
+    async fn ephemeral_tcp_activation_does_not_cache_automatic_ports() {
+        let mut sockets = TcpListeners::default();
+        let first = sockets.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let second = sockets.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_ne!(first.local_addr().unwrap(), second.local_addr().unwrap());
+        assert!(sockets.sockets.is_empty());
+    }
 
     #[tokio::test]
     async fn fake_dns_udp_modes() {

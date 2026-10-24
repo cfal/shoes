@@ -384,6 +384,51 @@ async fn url_test_routes_without_controller_and_can_be_removed_on_reload() {
 }
 
 #[tokio::test]
+async fn failed_activation_restores_control_generation_and_selection() {
+    let mut fixture = Fixture::new().await;
+    let mut process = fixture.start().await;
+    let mut old = flow(fixture.entry, b'E').await;
+    let generation = api(fixture.api, "GET", "/connections", Value::Null).await.1["connections"][0]
+        ["shoesGeneration"]
+        .clone();
+    let live = fixture.config.clone();
+    fixture.config[3]["default"] = json!("west");
+    let partial = available_address();
+    fixture.config.as_array_mut().unwrap().extend([
+        json!({"address":partial.to_string(), "protocol":{"type":"socks"}}),
+        json!({"path":fixture.directory.path().join("missing/listener.sock"), "protocol":{"type":"socks"}}),
+    ]);
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process
+        .wait_for("Reload rejected; previous servers restored")
+        .await;
+    assert_eq!(fixture.selected().await, "east");
+    check_flow(&mut old, b'E').await;
+    let mut restored = flow(fixture.entry, b'E').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    assert!(
+        snapshot["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|flow| flow["shoesGeneration"] == generation)
+    );
+    drop(std::net::TcpListener::bind(partial).unwrap());
+    fixture.select("west").await;
+    check_flow(&mut restored, b'E').await;
+    flow(fixture.entry, b'W').await;
+
+    fixture.config = live;
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process.wait_for("Servers ready").await;
+    assert_eq!(fixture.selected().await, "west");
+    flow(fixture.entry, b'W').await;
+    fixture.stop(&mut process).await;
+}
+
+#[tokio::test]
 async fn selectors_change_real_traffic_and_restore_after_restart() {
     let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;

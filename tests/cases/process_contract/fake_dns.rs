@@ -35,7 +35,7 @@ async fn fake_dns_reload_shutdown_and_crash_preserve_safe_mapping_state() {
         let port = available_address().port();
         let mut config = json!([
             {"dns_group":"shared", "dns_servers":"udp://127.0.0.1:9",
-             "fake_ip":{"state_file":state,"max_entries":16}},
+             "fake_ip":{"state_file":state,"max_entries":16,"ipv4_range":"198.18.0.0/24"}},
             {"address":format!("0.0.0.0:{port}"),"protocol":{"type":"socks","udp_enabled":true},
              "dns":{"servers":"shared"}}
         ]);
@@ -51,6 +51,21 @@ async fn fake_dns_reload_shutdown_and_crash_preserve_safe_mapping_state() {
         let mut process = Process::start(&path, &["--no-reload"]);
         process.wait_for("Servers ready").await;
         let stable = query(port, "stable.example.").await;
+        let mut failed = config.clone();
+        failed.as_array_mut().unwrap().extend([
+            json!({"dns_group":"candidate", "dns_servers":"system", "fake_ip":{
+                "state_file":directory.path().join("candidate.json"),
+                "ipv4_range":"198.19.0.0/24", "ipv6_range":"2001:2:1::/64", "max_entries":16
+            }}),
+            json!({"path":directory.path().join("missing/listener.sock"), "protocol":{"type":"socks"}}),
+        ]);
+        std::fs::write(&path, failed.to_string()).unwrap();
+        process.signal(libc::SIGHUP);
+        process.wait_for("Reload rejected; previous servers restored").await;
+        assert_eq!(query(port, "stable.example.").await, stable);
+        query(port, "after-rejection.example.").await;
+        failed.as_array_mut().unwrap().pop();
+        config = failed;
         config[0]["fake_ip"]["https_records"] = "suppress".into();
         std::fs::write(&path, config.to_string()).unwrap();
         process.signal(libc::SIGHUP);

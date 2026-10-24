@@ -213,6 +213,20 @@ impl Registry {
         Ok(())
     }
 
+    pub(crate) fn listener_addresses(&self) -> Vec<std::net::SocketAddr> {
+        self.workers
+            .iter()
+            .flat_map(|worker| {
+                worker
+                    .listeners
+                    .lock()
+                    .iter()
+                    .filter_map(|listener| listener.local_addr().ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub(crate) async fn start(&self) {
         let replacements = std::mem::take(&mut *self.replacements.lock());
         for worker in replacements {

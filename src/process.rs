@@ -12,6 +12,7 @@ use crate::dns::{self, DnsRegistry};
 use crate::file_watcher::watch;
 use crate::option_util::OneOrSome;
 use crate::resources;
+use crate::tcp::tcp_server::TcpListeners;
 
 const RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
@@ -43,8 +44,11 @@ struct PreparedServers {
     certificates: crate::certificates::Registry,
     validated: ValidatedConfigs,
     dns: DnsRegistry,
+    tcp: TcpListeners,
     #[cfg(unix)]
     wireguard: crate::wireguard::Prepared,
+    #[cfg(unix)]
+    tun_fds: std::collections::HashMap<std::os::fd::RawFd, std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
 #[cfg(test)]
@@ -182,13 +186,28 @@ async fn prepare_tracking(
     } else {
         None
     };
+    #[cfg(unix)]
+    let tun_fds = validated
+        .configs
+        .iter()
+        .filter_map(|config| {
+            let Config::TunServer(tun) = config else {
+                return None;
+            };
+            let fd = tun.device_fd?;
+            Some((fd, previous_servers?.tun_fds.get(&fd)?.clone()))
+        })
+        .collect();
     Ok(PreparedServers {
         generation,
         certificates,
         validated,
         dns,
+        tcp: TcpListeners::default(),
         #[cfg(unix)]
         wireguard,
+        #[cfg(unix)]
+        tun_fds,
     })
 }
 
@@ -279,7 +298,27 @@ impl RunningServers {
             let resolver = prepared.dns.get_for_server(dns_ref);
             #[cfg(unix)]
             if let Config::TunServer(config) = config {
-                match crate::tun::start_tun_server(config.clone(), resolver).await {
+                if let Some(fd) = config.device_fd {
+                    use std::os::fd::FromRawFd;
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        prepared.tun_fds.entry(fd)
+                    {
+                        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        entry.insert(std::sync::Arc::new(unsafe {
+                            std::os::fd::OwnedFd::from_raw_fd(fd)
+                        }));
+                    }
+                }
+                // The registry retains the descriptor through rollback; each stack borrows a duplicate.
+                match crate::tun::start_tun_server_with_fd_ownership(
+                    config.clone(),
+                    resolver,
+                    false,
+                )
+                .await
+                {
                     Ok(task) => self.tun.push(task),
                     Err(error) => {
                         self.stop().await;
@@ -288,7 +327,11 @@ impl RunningServers {
                 }
                 continue;
             }
-            let startup = crate::tcp::tcp_server::start_servers(config.clone(), resolver);
+            let startup = crate::tcp::tcp_server::start_servers_with_listeners(
+                config.clone(),
+                resolver,
+                &mut prepared.tcp,
+            );
             match self.quic_retirements.track(startup).await {
                 Ok(tasks) => self.listeners.extend(tasks),
                 Err(error) => {
@@ -297,7 +340,56 @@ impl RunningServers {
                 }
             }
         }
-        prepared.certificates.start().await;
+        Ok(())
+    }
+
+    async fn start_retry(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match self.start(prepared).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    self.stop().await;
+                    if error.kind() != io::ErrorKind::AddrInUse
+                        || tokio::time::Instant::now() >= deadline
+                    {
+                        return Err(error);
+                    }
+                    self.quic_retirements.wait().await?;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    async fn rollback(
+        &mut self,
+        previous: &mut PreparedServers,
+        candidate: &mut PreparedServers,
+        control: Option<&crate::control::runtime::ControlService>,
+    ) -> io::Result<()> {
+        self.stop().await;
+        candidate
+            .certificates
+            .retire_unused(&previous.certificates)
+            .await;
+        candidate.certificates.shutdown().await;
+        candidate.tcp = TcpListeners::default();
+        self.quic_retirements.wait().await?;
+        // Pools may be shared with the live registry: rejection is not terminal shutdown.
+        if let Err(error) = candidate.dns.checkpoint().await {
+            log::warn!("Rejected candidate Fake DNS checkpoint failed: {error}");
+        }
+        previous.tcp.defer_admission();
+        self.start_retry(previous).await?;
+        if let Some(control) = control {
+            if let Some(generation) = &previous.generation {
+                control.runtime.publish(generation.clone()).await?;
+            }
+            control.runtime.resume().await?;
+        }
+        previous.certificates.start().await;
+        previous.tcp.activate();
         Ok(())
     }
 }
@@ -502,6 +594,8 @@ async fn run_inner(
         _ = shutdown.recv() => return Ok(()),
         result = prepare_tracking(&paths, None, None, &mut discovered, control) => result?,
     };
+    prepared.tcp =
+        TcpListeners::prepare(&prepared.validated.configs, &TcpListeners::default(), &[])?;
     watches.activated(&prepared.validated.reload_files);
     let mut running = RunningServers::default();
     if let (Some(control), Some(generation)) = (control.as_ref(), prepared.generation.as_ref()) {
@@ -522,6 +616,8 @@ async fn run_inner(
     if let Some(control) = control.as_ref() {
         control.runtime.resume().await?;
     }
+    prepared.certificates.start().await;
+    prepared.tcp.activate();
     println!("Servers ready");
     loop {
         let debounce = tokio::select! {
@@ -570,69 +666,77 @@ async fn run_inner(
                 continue;
             }
         };
+        candidate.tcp = match TcpListeners::prepare(
+            &candidate.validated.configs,
+            &prepared.tcp,
+            &prepared.certificates.listener_addresses(),
+        ) {
+            Ok(listeners) => listeners,
+            Err(error) => {
+                eprintln!("Reload rejected; current servers retained: {error}");
+                continue;
+            }
+        };
         if let (Some(control), Some(generation)) = (control.as_ref(), candidate.generation.as_ref())
             && let Err(error) = control.runtime.begin_activation(generation).await
         {
             eprintln!("Reload rejected; current servers retained: {error}");
             continue;
         }
-        running.stop().await;
-        prepared
-            .certificates
-            .retire_unused(&candidate.certificates)
-            .await;
-        if let Err(error) = prepared.dns.checkpoint().await {
-            log::warn!("Reload Fake DNS checkpoint failed; continuing reload: {error}");
-        }
+        let retirement = async {
+            running.stop().await;
+            prepared.tcp.retain_shared(&candidate.tcp);
+            prepared
+                .certificates
+                .retire_unused(&candidate.certificates)
+                .await;
+            if let Err(error) = prepared.dns.checkpoint().await {
+                log::warn!("Reload Fake DNS checkpoint failed; continuing reload: {error}");
+            }
+            running.quic_retirements.wait().await
+        };
         tokio::select! {
             biased;
             _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
-            result = running.quic_retirements.wait() => if let Err(error) = result {
+            result = retirement => if let Err(error) = result {
                 let _ = running.shutdown(&[&prepared, &candidate]).await;
                 return Err(error);
             },
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        if let (Some(control), Some(generation)) = (control.as_ref(), candidate.generation.as_ref())
-        {
-            control.runtime.publish(generation.clone()).await?;
-        }
-        loop {
-            let result = tokio::select! {
+        let activation = async {
+            running.start_retry(&mut candidate).await?;
+            if let Some(control) = control.as_ref() {
+                if let Some(generation) = &candidate.generation {
+                    control.runtime.publish(generation.clone()).await?;
+                }
+                control.runtime.resume().await?;
+            }
+            // Workers can update durable ACME state, so activation starts them last.
+            candidate.certificates.start().await;
+            candidate.tcp.activate();
+            Ok::<_, io::Error>(())
+        };
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
+            result = activation => result,
+        };
+        if let Err(error) = result {
+            let rollback = tokio::select! {
                 biased;
                 _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
-                result = running.start(&mut candidate) => result,
+                result = running.rollback(&mut prepared, &mut candidate, control.as_ref()) => result,
             };
-            match result {
-                Ok(()) => break,
-                Err(error)
-                    if error.kind() == io::ErrorKind::AddrInUse
-                        && tokio::time::Instant::now() < deadline =>
-                {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
-                        result = running.quic_retirements.wait() => if let Err(error) = result {
-                            let _ = running.shutdown(&[&prepared, &candidate]).await;
-                            return Err(error);
-                        },
-                    }
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
-                        _ = tokio::time::sleep(Duration::from_millis(50)) => {},
-                    }
-                }
-                Err(error) => {
-                    let _ = running.shutdown(&[&prepared, &candidate]).await;
-                    return Err(error);
-                }
+            if let Err(rollback) = rollback {
+                let cleanup = running.shutdown(&[&prepared, &candidate]).await;
+                return Err(io::Error::other(format!(
+                    "Reload activation failed: {error}; rollback failed: {rollback}; shutdown: {cleanup:?}"
+                )));
             }
+            eprintln!("Reload rejected; previous servers restored: {error}");
+            continue;
         }
         watches.activated(&candidate.validated.reload_files);
-        if let Some(control) = control.as_ref() {
-            control.runtime.resume().await?;
-        }
         let mut retired = std::mem::replace(&mut prepared, candidate);
         retired.certificates.shutdown().await;
         println!("Servers ready");
@@ -646,6 +750,146 @@ mod retention_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unchanged_tcp_socket_queues_connections_between_generations() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.yaml");
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = reservation.local_addr().unwrap();
+            drop(reservation);
+            std::fs::write(
+                &path,
+                format!("- address: '{address}'\n  protocol: {{type: socks}}\n"),
+            )
+            .unwrap();
+            let paths = [path.to_str().unwrap().to_owned()];
+            let mut previous = prepare(&paths, None).await.unwrap();
+            let mut running = RunningServers::default();
+            running.start(&mut previous).await.unwrap();
+            let mut next = prepare(&paths, Some(&previous.dns)).await.unwrap();
+            next.tcp = TcpListeners::prepare(&next.validated.configs, &previous.tcp, &[]).unwrap();
+            running.stop().await;
+            previous.tcp.retain_shared(&next.tcp);
+            let mut queued = tokio::net::TcpStream::connect(address).await.unwrap();
+            queued.write_all(&[5, 1, 0]).await.unwrap();
+            drop(previous);
+            assert!(std::net::TcpListener::bind(address).is_err());
+            running.start(&mut next).await.unwrap();
+            let mut response = [0; 2];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), queued.read_exact(&mut response))
+                    .await
+                    .is_err()
+            );
+            next.tcp.activate();
+            queued.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [5, 0]);
+            drop(queued);
+            running.shutdown(&[&next]).await.unwrap();
+            drop(next);
+            crate::socket_util::new_tcp_listener(address, 128, None).unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_or_cancelled_activation_does_not_admit_candidate_dns_flows() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for shutdown in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("config.yaml");
+                let paths = [path.to_str().unwrap().to_owned()];
+                std::fs::write(
+                    &path,
+                    "- address: '127.0.0.1:0'\n  protocol: {type: socks}\n",
+                )
+                .unwrap();
+                let mut previous = prepare(&paths, None).await.unwrap();
+                let mut running = RunningServers::default();
+                running.start(&mut previous).await.unwrap();
+
+                let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = reservation.local_addr().unwrap();
+                drop(reservation);
+                let unix_path = directory.path().join("listener.sock");
+                std::fs::write(
+                    &path,
+                    serde_json::json!([
+                        {"dns_group":"candidate", "dns_servers":"udp://127.0.0.1:9", "fake_ip":{
+                            "state_file":directory.path().join("state.json"), "max_entries":16
+                        }},
+                        {"address":address.to_string(), "protocol":{"type":"socks"},
+                         "dns":{"servers":"candidate"}},
+                        {"path":unix_path, "protocol":{"type":"socks"},
+                         "dns":{"servers":"candidate"}}
+                    ])
+                    .to_string(),
+                )
+                .unwrap();
+                let mut candidate = prepare(&paths, Some(&previous.dns)).await.unwrap();
+                let resolver =
+                    std::sync::Arc::downgrade(&candidate.dns.get_by_name("candidate").unwrap());
+                candidate.tcp =
+                    TcpListeners::prepare(&candidate.validated.configs, &previous.tcp, &[])
+                        .unwrap();
+                running.stop().await;
+                previous.tcp.retain_shared(&candidate.tcp);
+                running.start(&mut candidate).await.unwrap();
+                let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+                let mut unix = tokio::net::UnixStream::connect(&unix_path).await.unwrap();
+                // Pipelined negotiation would open a lease-owning DNS stream without the gate.
+                let request = [5, 1, 0, 5, 1, 0, 1, 198, 18, 0, 1, 0, 53];
+                tcp.write_all(&request).await.unwrap();
+                unix.write_all(&request).await.unwrap();
+                for stream in [
+                    &mut tcp as &mut dyn crate::async_stream::AsyncStream,
+                    &mut unix,
+                ] {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), stream.read_u8())
+                            .await
+                            .is_err(),
+                        "uncommitted listener admitted a flow"
+                    );
+                }
+                if shutdown {
+                    running.shutdown(&[&previous, &candidate]).await.unwrap();
+                } else {
+                    // Covers failure after listener startup but before activation commits.
+                    running
+                        .rollback(&mut previous, &mut candidate, None)
+                        .await
+                        .unwrap();
+                }
+                drop(candidate);
+                assert!(resolver.upgrade().is_none());
+
+                // Queued clients stay open while the same persistent pool is acquired again.
+                let mut next = prepare(&paths, Some(&previous.dns)).await.unwrap();
+                running.stop().await;
+                next.tcp =
+                    TcpListeners::prepare(&next.validated.configs, &previous.tcp, &[]).unwrap();
+                running.start(&mut next).await.unwrap();
+                let mut queued = tokio::net::UnixStream::connect(&unix_path).await.unwrap();
+                queued.write_all(&[5, 1, 0]).await.unwrap();
+                next.tcp.activate();
+                let mut response = [0; 2];
+                queued.read_exact(&mut response).await.unwrap();
+                assert_eq!(response, [5, 0]);
+                drop((tcp, unix, queued));
+                running.shutdown(&[&previous, &next]).await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn activation_discards_candidate_identity_events_but_preserves_reload_events() {
