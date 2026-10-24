@@ -1,0 +1,347 @@
+name: Publish Docker Image
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - tests/support/**
+      - LICENSE
+      - THIRD_PARTY_NOTICES.md
+      - licenses/**
+      - scripts/smoke-docker.py
+      - .github/workflows/docker-publish.yml
+  push:
+    branches: [master]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  verify_pr:
+    name: Docker Smoke
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: docker-verify-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - name: Set image name
+        run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Build candidate image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: shoes-pr:smoke
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-amd64
+
+      - name: Verify packaged proxy
+        run: python3 scripts/smoke-docker.py shoes-pr:smoke
+
+  build:
+    name: Build Image (${{ matrix.arch }})
+    if: github.event_name == 'push' || github.event_name == 'release'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set image name
+        run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: type=sha,format=long,prefix=sha-
+
+      - name: Build and push platform image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},ignore-error=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Docker build did not produce a valid digest." >&2
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: docker-digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish_sha:
+    name: Publish Commit Image
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: docker-publish-sha-${{ github.sha }}
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      digest: ${{ steps.published.outputs.digest }}
+    steps:
+      - name: Set image name
+        id: image
+        run: |
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=${image}" >> "$GITHUB_ENV"
+          echo "name=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find existing commit image
+        id: existing
+        run: |
+          set -euo pipefail
+          commit_image="${IMAGE}:sha-${GITHUB_SHA}"
+          manifest_path="${RUNNER_TEMP}/existing-manifest.json"
+          error_path="${RUNNER_TEMP}/existing-manifest-error.log"
+          if ! docker buildx imagetools inspect --raw "$commit_image" > "$manifest_path" 2> "$error_path"; then
+            if grep -Eiq 'manifest unknown|not found' "$error_path"; then
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat "$error_path" >&2
+            exit 1
+          fi
+          jq -e '
+            [.manifests[]?.platform | select(.os == "linux") | .architecture] as $architectures
+            | ($architectures | index("amd64")) != null
+              and ($architectures | index("arm64")) != null
+          ' "$manifest_path" > /dev/null
+          digest="sha256:$(sha256sum "$manifest_path" | cut -d ' ' -f 1)"
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Reusing ${commit_image} at ${digest}." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download platform digests
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: docker-digests-*
+          merge-multiple: true
+
+      - name: Assemble commit image
+        id: build
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          paths=("${RUNNER_TEMP}/digests/"*)
+          if [ "${#paths[@]}" -ne 2 ]; then
+            echo "Expected exactly two platform digests." >&2
+            exit 1
+          fi
+          sources=()
+          for path in "${paths[@]}"; do
+            digest="${path##*/}"
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Invalid platform digest: ${digest}" >&2
+              exit 1
+            fi
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+          commit_image="${IMAGE}:sha-${GITHUB_SHA}"
+          docker buildx imagetools create --tag "$commit_image" "${sources[@]}"
+          manifest_path="${RUNNER_TEMP}/published-manifest.json"
+          docker buildx imagetools inspect --raw "$commit_image" > "$manifest_path"
+          jq -e '
+            [.manifests[]?.platform | select(.os == "linux") | .architecture] as $architectures
+            | ($architectures | index("amd64")) != null
+              and ($architectures | index("arm64")) != null
+          ' "$manifest_path" > /dev/null
+          digest="sha256:$(sha256sum "$manifest_path" | cut -d ' ' -f 1)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve published digest
+        id: published
+        env:
+          EXISTING_DIGEST: ${{ steps.existing.outputs.digest }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest="${EXISTING_DIGEST:-$BUILT_DIGEST}"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Docker publication did not produce a valid digest." >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    name: Verify Published Image (${{ matrix.arch }})
+    needs: publish_sha
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and verify published image
+        env:
+          IMAGE: ${{ needs.publish_sha.outputs.image }}
+          DIGEST: ${{ needs.publish_sha.outputs.digest }}
+        run: |
+          docker pull "${IMAGE}@${DIGEST}"
+          python3 scripts/smoke-docker.py "${IMAGE}@${DIGEST}"
+
+  promote:
+    name: Advance Branch Or Release Tags
+    needs: [publish_sha, smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: docker-promote-${{ github.event_name }}
+      cancel-in-progress: false
+      queue: max
+    env:
+      IMAGE: ${{ needs.publish_sha.outputs.image }}
+      DIGEST: ${{ needs.publish_sha.outputs.digest }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Advance master tag
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/branches/master" --jq .commit.sha)"
+          if [ "$head_sha" != "$GITHUB_SHA" ]; then
+            echo "Master is now ${head_sha}; leaving :master unchanged." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          docker buildx imagetools create --tag "${IMAGE}:master" "${IMAGE}@${DIGEST}"
+          echo "Published ${IMAGE}:master at ${DIGEST}." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release tags
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] ||
+             [[ "$RELEASE_TAG" == master || "$RELEASE_TAG" == latest ||
+                "$RELEASE_TAG" == buildcache* || "$RELEASE_TAG" == sha-* ]]; then
+            echo "Release tag is invalid or reserved for container publishing: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          docker buildx imagetools create --tag "${IMAGE}:${RELEASE_TAG}" "${IMAGE}@${DIGEST}"
+          echo "Published ${IMAGE}:${RELEASE_TAG} at ${DIGEST}." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$PRERELEASE" = true ]; then
+            exit 0
+          fi
+          latest_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .id)"
+          if [ "$latest_id" != "$RELEASE_ID" ]; then
+            echo "Release is not GitHub's latest stable release; leaving :latest unchanged." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}@${DIGEST}"
+          echo "Published ${IMAGE}:latest at ${DIGEST}." >> "$GITHUB_STEP_SUMMARY"

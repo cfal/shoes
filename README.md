@@ -161,6 +161,106 @@ Distribute [the dependency notices and source information](THIRD_PARTY_NOTICES.m
 with the app. CI cross-compiles the native libraries without packaging or
 publishing a mobile SDK.
 
+### Docker
+
+GHCR images are published at `ghcr.io/cfal/shoes` for `linux/amd64` and
+`linux/arm64`:
+
+- `master` follows the current branch head after both architectures pass the
+  container smoke test.
+- `sha-<full commit SHA>` is published before smoke verification and pins a
+  commit image; retries and releases reuse it.
+- A published GitHub release adds its exact tag, such as `v0.3.4`.
+- `latest` is set only by a `published` release event when that stable release
+  is GitHub's latest at promotion time.
+
+Only `master`, release tags, and `latest` wait for successful smoke tests.
+Converting a prerelease to stable or changing GitHub's latest release later
+does not update the image tags.
+
+Draft releases and tag pushes alone do not publish release image tags. Release
+tag names must be valid Docker tags; `master`, `latest`, `buildcache*`, and `sha-*`
+are reserved. Publishing uses the repository's `GITHUB_TOKEN` with package
+write permission. After the first publication, make the GHCR package public
+in its package settings to allow anonymous pulls. Forks publish under their
+own repository name.
+
+```sh
+docker pull ghcr.io/cfal/shoes:master
+```
+
+Build the release binary and its runtime image from the checkout:
+
+```sh
+docker build -t shoes:local .
+```
+
+Verify the image on Linux with Python 3.11 or newer:
+
+```sh
+python3 scripts/smoke-docker.py shoes:local
+```
+
+The image runs as UID/GID `65532:65532` and reads `/etc/shoes/config.yaml` by
+default. Create a `config` directory containing `config.yaml`, for example:
+
+```yaml
+- address: "0.0.0.0:1080"
+  protocol:
+    type: socks
+```
+
+Mount the whole directory so configuration reloads also see files replaced by
+an editor. Configuration, certificates, and keys must be readable by the
+container user; relative paths resolve from `/etc/shoes`.
+
+```sh
+docker run --rm --name shoes \
+  --publish 127.0.0.1:1080:1080 \
+  --mount type=bind,src="$(pwd)/config",dst=/etc/shoes,readonly \
+  ghcr.io/cfal/shoes:master
+```
+
+Use `shoes:local` instead to run the checkout build.
+
+Files Shoes writes cannot live in the read-only `/etc/shoes` mount. Give
+`cache_file_path`, fake DNS `state_file`, Unix socket listeners, and `--log-file`
+targets absolute paths on a separate writable mount owned by the container
+user. For example, create a private state directory:
+
+```sh
+mkdir -p state
+sudo chown 65532:65532 state
+sudo chmod 700 state
+```
+
+Set `cache_file_path: /var/lib/shoes/cache.db` in the configuration and add this
+option to `docker run`:
+
+```sh
+--mount type=bind,src="$(pwd)/state",dst=/var/lib/shoes
+```
+
+Publish UDP ports separately for UDP listeners. Bind listeners to `0.0.0.0`
+inside the container; host port bindings control which clients can reach them.
+Configure authentication before exposing a proxy beyond the host.
+
+Arguments after the image name replace the default configuration argument:
+
+```sh
+docker run --rm shoes:local --version
+docker run --rm \
+  --mount type=bind,src="$(pwd)/config",dst=/etc/shoes,readonly \
+  shoes:local check /etc/shoes/config.yaml
+```
+
+The runtime includes CA certificates and the license/source notices under
+`/usr/share/doc/shoes`. No configuration or credentials are baked into it.
+Ordinary proxy and userspace WireGuard listeners need no extra capabilities.
+Linux TUN configurations require `--user 0:0`, `--cap-add NET_ADMIN`, and
+`--device /dev/net/tun`; their network changes remain in the container's network
+namespace unless host networking is explicitly selected.
+
 ### WireGuard Kernel Interoperability
 
 Linux kernel peer tests require kernel WireGuard support, network/PID namespaces,
