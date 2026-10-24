@@ -3,7 +3,8 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -60,29 +61,54 @@ test('echo rejects incorrect and excess bytes', async t => {
   }
 });
 
-function runHarness(t, source, { success = false } = {}) {
+function createScratchDirectory() {
   const scratch = process.env.TMPDIR || path.join(os.homedir(), 'tmp');
   fs.mkdirSync(scratch, { recursive: true });
-  const directory = fs.mkdtempSync(path.join(scratch, 'reload-harness-test-'));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return fs.mkdtempSync(path.join(scratch, 'reload-harness-test-'));
+}
+
+function runHarness(t, source, {
+  success = false,
+  rustcSource,
+  cwd = fileURLToPath(new URL('..', import.meta.url)),
+  env = {},
+} = {}) {
+  const directory = createScratchDirectory();
+  t.after(() => {
+    if (rustcSource) {
+      for (const name of ['rustc.pid', 'reload.json.pid']) {
+        const pidFile = path.join(directory, name);
+        if (!fs.existsSync(pidFile)) continue;
+        try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 'SIGKILL'); }
+        catch (error) { if (error.code !== 'ESRCH') throw error; }
+      }
+    }
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
   const binary = path.join(directory, 'server.mjs');
   fs.writeFileSync(binary, `#!/usr/bin/env node\n${source}`, { mode: 0o755 });
+  if (rustcSource) {
+    fs.writeFileSync(path.join(directory, 'rustc'), `#!/usr/bin/env node\n${rustcSource}`, { mode: 0o755 });
+  }
   const inputs = ['domains.yaml', 'cn.srs', 'us.srs'].map(name => path.join(directory, name));
   for (const input of inputs) fs.writeFileSync(input, 'fixture');
   const script = fileURLToPath(new URL('./reload_memory.mjs', import.meta.url));
   const result = spawnSync(process.execPath, [script, binary,
     directory, ...inputs], {
-    cwd: fileURLToPath(new URL('..', import.meta.url)),
+    cwd,
     encoding: 'utf8', timeout: 10000,
-    env: { ...process.env, BENCH_BUILD_COMMAND: 'test fixture', BENCH_GENERATIONS: '3' },
+    env: {
+      ...process.env, ...env, BENCH_BUILD_COMMAND: 'test fixture', BENCH_GENERATIONS: '3',
+      PATH: rustcSource ? `${directory}${path.delimiter}${process.env.PATH}` : process.env.PATH,
+    },
   });
   assert.ifError(result.error);
   if (success) assert.equal(result.status, 0, result.stderr);
   else assert.notEqual(result.status, 0);
-  return { result, log: fs.readFileSync(path.join(directory, 'server.log'), 'utf8') };
+  return { result, directory, log: fs.readFileSync(path.join(directory, 'server.log'), 'utf8') };
 }
 
-test('reload harness fails and retains logs when a pinned stream closes', { skip: process.platform !== 'linux' }, t => {
+test('reload harness fails and retains logs when a warmup stream closes', { skip: process.platform !== 'linux' }, t => {
   const { result, log } = runHarness(t, `
 import fs from 'node:fs';
 import net from 'node:net';
@@ -122,22 +148,28 @@ test('FD cleanup does not accept a stable retained descriptor count', { skip: pr
   await assert.rejects(waitForFds(process.pid, 0, { timeout: 20 }), /FD cleanup deadline/);
 });
 
-function forwardingFixture(reload) {
+function forwardingFixture(reload, { closeOnReload = false } = {}) {
   return `
 import fs from 'node:fs';
 import net from 'node:net';
 const load = () => JSON.parse(fs.readFileSync(process.argv.at(-1), 'utf8')).at(-1);
 let config = load();
 const port = Number(config.address.split(':').at(-1));
+const sockets = new Set();
 net.createServer(socket => {
+  sockets.add(socket);
   const target = Number(config.protocol.target.split(':').at(-1));
   const upstream = net.createConnection({ host: '127.0.0.1', port: target });
   socket.on('error', () => upstream.destroy());
   upstream.on('error', () => socket.destroy());
-  socket.on('close', () => upstream.destroy());
+  socket.on('close', () => { sockets.delete(socket); upstream.destroy(); });
   socket.pipe(upstream).pipe(socket);
 }).listen(port, '0.0.0.0', () => console.log('Servers ready'));
-process.on('SIGHUP', () => { ${reload ? 'config = load();' : ''} console.log('Servers ready'); });
+process.on('SIGHUP', () => {
+  ${reload ? 'config = load();' : ''}
+  ${closeOnReload ? 'for (const socket of sockets) socket.destroy();' : ''}
+  console.log('Servers ready');
+});
 `;
 }
 
@@ -148,12 +180,78 @@ test('reload harness verifies target changes, exact payloads and drained FDs', {
   assert.deepEqual(report.samples.filter(s => s.phase === 'pinned').map(s => s.target), [0, 1, 0]);
   assert.ok(report.samples.at(-1).fds <= report.samples[0].fds);
   for (const sample of report.samples) assert.ok(sample.rss_kib > 0 && sample.fds > 0);
+  for (const sample of [report.initial_load, ...report.samples]) {
+    assert.ok(report.sampled_peak_rss_kib >= sample.rss_kib);
+  }
   assert.match(report.harness_sha256, /^[0-9a-f]{64}$/);
   assert.match(report.server_log_sha256, /^[0-9a-f]{64}$/);
+});
+
+test('reload provenance preserves dirty patch bytes independently of Git settings', { skip: process.platform !== 'linux' }, t => {
+  const cwd = createScratchDirectory();
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  const git = (...args) => execFileSync('git', args, {
+    cwd, env: { ...process.env, GIT_DIFF_OPTS: undefined },
+  });
+  git('init', '--quiet');
+  fs.writeFileSync(path.join(cwd, 'Cargo.lock'), 'fixture\n');
+  fs.writeFileSync(path.join(cwd, '.gitattributes'), 'fixture.txt diff=fixture\n');
+  fs.writeFileSync(path.join(cwd, 'fixture.txt'), 'first\nbefore\nlast\n');
+  fs.writeFileSync(path.join(cwd, 'fixture.bin'), Buffer.from([0, 1, 2]));
+  git('add', 'Cargo.lock', '.gitattributes', 'fixture.txt', 'fixture.bin');
+  git('-c', 'user.name=Harness Test', '-c', 'user.email=harness@example.invalid',
+    '-c', 'commit.gpgSign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', 'fixture');
+  fs.writeFileSync(path.join(cwd, 'fixture.txt'), Buffer.from('first\n\xff\nlast\n', 'latin1'));
+  fs.writeFileSync(path.join(cwd, 'fixture.bin'), Buffer.from([0, 3, 4]));
+  git('config', 'diff.noprefix', 'true');
+  git('config', 'diff.mnemonicPrefix', 'true');
+  git('config', 'color.ui', 'always');
+  git('config', 'diff.external', 'false');
+  git('config', 'diff.fixture.textconv', 'false');
+  git('config', 'diff.context', '0');
+
+  const { result } = runHarness(t, forwardingFixture(true), {
+    success: true, cwd, env: { GIT_DIFF_OPTS: '-u0' },
+  });
+  const report = JSON.parse(result.stdout);
+  const patch = git('diff', '--no-color', '--no-ext-diff', '--no-textconv', '--unified=3',
+    '--src-prefix=a/', '--dst-prefix=b/', '--binary', 'HEAD');
+  assert.ok(patch.length > 0);
+  assert.ok(patch.includes(Buffer.from([0xff])));
+  assert.ok(patch.includes(Buffer.from('GIT binary patch')));
+  const recorded = Buffer.from(report.source.patch_base64, 'base64');
+  assert.deepEqual(recorded, patch);
+  assert.equal(report.source.patch_sha256, crypto.createHash('sha256').update(patch).digest('hex'));
+  execFileSync('git', ['apply', '--reverse', '--check'], { cwd, input: recorded });
 });
 
 test('readiness alone cannot pass a reload with an unchanged datapath', { skip: process.platform !== 'linux' }, t => {
   const { result, log } = runHarness(t, forwardingFixture(false));
   assert.match(result.stderr, /committed target not observed/);
   assert.equal(log.match(/Servers ready/g).length, 2);
+});
+
+test('reload harness rejects loss of a pinned connection after reload', { skip: process.platform !== 'linux' }, t => {
+  const { result, log } = runHarness(t, forwardingFixture(true, { closeOnReload: true }));
+  assert.match(result.stderr, /premature echo close/);
+  assert.equal(log.match(/Servers ready/g).length, 2);
+});
+
+test('a stalled toolchain probe is killed and the server is cleaned up', { skip: process.platform !== 'linux' }, t => {
+  const source = forwardingFixture(true) + `
+fs.writeFileSync(process.argv.at(-1) + '.pid', String(process.pid));
+`;
+  const rustcSource = `
+import fs from 'node:fs';
+fs.writeFileSync(process.argv[1] + '.pid', String(process.pid));
+process.on('SIGTERM', () => {});
+setTimeout(() => {}, 65000);
+`;
+  const { result, directory, log } = runHarness(t, source, { rustcSource });
+  assert.match(result.stderr, /SIGKILL/);
+  assert.equal(log.match(/Servers ready/g).length, 3);
+  for (const name of ['rustc.pid', 'reload.json.pid']) {
+    const pid = Number(fs.readFileSync(path.join(directory, name), 'utf8'));
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+  }
 });

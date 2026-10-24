@@ -130,13 +130,18 @@ connections must keep echoing exact bytes. FDs must return to the pre-connection
 idle ceiling within five seconds after warmup and final drain.
 A fresh post-drain connection must still reach the final committed upstream and
 echo exact bytes before the final idle sample is taken.
+The asynchronous toolchain probe has a five-second deadline and also observes
+whole-run cancellation. The reported RSS peak includes every recorded sample.
 
 The measurement requires Linux `/proc`; missing metrics are errors, never zero.
 RSS/HWM and reload time are informational, without slope or nanosecond gates.
 RSS includes allocator retention and cannot establish that live allocations
 leak. The report records source revision/tree, tracked patch, untracked Rust
 source hashes, lockfile, binary, harness, inputs, server log, toolchain, supplied
-build command, and command arguments. `BENCH_CONTENTION` records observed outside
+build command, and command arguments. `source.patch_base64` preserves raw patch
+bytes, with color, external diffs and text conversions disabled, fixed path
+prefixes and three context lines; `source.patch_sha256` hashes the decoded bytes.
+`BENCH_CONTENTION` records observed outside
 load; its default is explicitly `not recorded`. Use a fresh output directory:
 the harness refuses to overwrite `server.log`.
 
