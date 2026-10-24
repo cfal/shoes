@@ -8,7 +8,7 @@ fn next_port(state: &mut u64) -> u16 {
 
 #[test]
 fn port_range_union_matches_linear_oracle_and_boolean_composition() {
-    let mut seed = 0x51_10_e5_2026_u64;
+    let mut seed = 0x0051_10e5_2026_u64;
     for case in 0..128 {
         let mut ranges = Vec::new();
         for _ in 0..32 {
