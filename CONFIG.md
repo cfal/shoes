@@ -370,6 +370,9 @@ Automatic selection does not require a controller listener or a cache file:
 ```
 
 Only `url` is required for `url-test`; the values above are the other defaults.
+Literal URL addresses denied by probe policy (including loopback, link-local,
+multicast, unspecified, and synthetic benchmark addresses) are configuration errors.
+Locally resolved hostnames are subject to the same destination policy at probe time.
 `default` is selector-only. `url`, `interval`, `timeout`, `tolerance`, and `lazy`
 are url-test-only. Members must be nonempty and distinct; references to nested
 groups are supported. Explicit names are recommended for automatic inline members.
@@ -400,11 +403,18 @@ update selection. Other URLs and explicit status expectations cannot overwrite i
 
 Periodic and API probes share a 16-probe limit. Each periodic round's timeout
 includes admission/queue time; members not admitted before the deadline retain
-their previous health. Admission order rotates to avoid permanently starving a
-large group's tail. Under sustained saturation, reduce group size, increase
+their previous health. A deadline expiry after queueing is inconclusive and also
+preserves prior health; successful probes and explicit remote errors still update it.
+Unprobed members and the oldest samples lead each round, so inconclusive attempts
+can receive a full budget on a later round. Tied members rotate on admission.
+Due groups with the oldest admission get priority, with stable catalog order
+breaking ties.
+Under sustained saturation, reduce group size, increase
 timeout/interval, or expect unprobed/stale members. Scheduling has one-second
-granularity and does not overlap rounds. Activation/reload cancels old work and
-rejects obsolete results; new committed generations start with unprobed health.
+granularity and does not overlap rounds within a group; other groups can run while
+a slow round is in flight. Activation/reload cancels old work and rejects obsolete
+results; an interrupted round is immediately eligible when its generation resumes.
+New committed generations start with unprobed health.
 
 The controller reports `type: URLTest`, effective TCP `now`, optional `udpNow`,
 `testUrl`, and selected-member `health` (`unprobed`, `healthy`, `dead`, or `stale`).

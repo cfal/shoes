@@ -365,6 +365,20 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    #[tokio::test]
+    async fn url_test_configuration_is_rejected_without_a_process_supervisor() {
+        let config = r#"
+- client_group: automatic
+  type: url-test
+  url: http://probe.invalid/
+  client_proxies: [direct]
+"#;
+        let (_shutdown, shutdown) = oneshot::channel();
+        let error = start_from_config(config, shutdown).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("url-test groups"));
+    }
+
     #[test]
     fn lifecycle_requires_a_non_runtime_thread() {
         assert!(is_lifecycle_thread());

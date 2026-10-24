@@ -10,6 +10,7 @@ use http_body_util::Empty;
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::address::NetLocation;
 use crate::client_proxy_chain::ClientChainGroup;
@@ -23,7 +24,13 @@ use crate::resolver::Resolver;
 struct History {
     history: Vec<Value>,
     alive: bool,
-    urls: IndexMap<String, (bool, Vec<Value>)>,
+    urls: IndexMap<String, UrlHistory>,
+}
+
+struct UrlHistory {
+    alive: bool,
+    samples: Vec<Value>,
+    at: tokio::time::Instant,
 }
 
 pub struct ProbeState {
@@ -39,7 +46,7 @@ impl ProbeState {
             .lock()
             .get(name)
             .and_then(|history| history.urls.get(url))
-            .map(|(_, samples)| json!(samples))
+            .map(|history| json!(history.samples))
             .unwrap_or_else(|| json!([]))
     }
 
@@ -62,8 +69,11 @@ impl ProbeState {
         object["alive"] = json!(history.alive);
         object["history"] = json!(history.history);
         let mut extra = serde_json::Map::new();
-        for (url, (alive, samples)) in &history.urls {
-            extra.insert(url.clone(), json!({"alive":alive,"history":samples}));
+        for (url, history) in &history.urls {
+            extra.insert(
+                url.clone(),
+                json!({"alive":history.alive,"history":history.samples}),
+            );
         }
         object["extra"] = Value::Object(extra);
     }
@@ -80,7 +90,7 @@ impl ProbeState {
         let mut samples = history
             .urls
             .shift_remove(url)
-            .map(|(_, samples)| samples)
+            .map(|history| history.samples)
             .unwrap_or_default();
         if history.urls.len() >= 8 {
             history.urls.shift_remove_index(0);
@@ -93,7 +103,26 @@ impl ProbeState {
         if samples.len() > 10 {
             samples.remove(0);
         }
-        history.urls.insert(url.into(), (satisfied, samples));
+        history.urls.insert(
+            url.into(),
+            UrlHistory {
+                alive: satisfied,
+                samples,
+                at: tokio::time::Instant::now(),
+            },
+        );
+    }
+
+    fn ordered_members(&self, members: &[String], url: &str) -> Vec<String> {
+        let histories = self.history.lock();
+        let mut members = members.to_vec();
+        members.sort_by_key(|name| {
+            histories
+                .get(name)
+                .and_then(|history| history.urls.get(url))
+                .map(|history| history.at)
+        });
+        members
     }
 
     fn connector(&self, catalog: &Catalog, name: &str) -> io::Result<Arc<ClientChainGroup>> {
@@ -170,6 +199,21 @@ pub struct ProbeQuery {
 }
 
 impl ProbeQuery {
+    pub(crate) fn validate_automatic_target(&self) -> io::Result<()> {
+        let denied = match self.url.host() {
+            Some(url::Host::Ipv4(ip)) => forbidden(ip.into()),
+            Some(url::Host::Ipv6(ip)) => forbidden(ip.into()),
+            _ => false,
+        };
+        if denied {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "url-test URL is denied by probe destination policy",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn parse(query: &HashMap<String, String>, group: bool) -> io::Result<Self> {
         let bad = || io::Error::new(io::ErrorKind::InvalidInput, "invalid delay test query");
         let raw = query.get("url").ok_or_else(bad)?;
@@ -231,7 +275,7 @@ pub async fn probe(
             "generation is activating",
         ));
     }
-    runtime.with_probe_generation(generation.id, || ())?;
+    let epoch = runtime.with_probe_generation(generation.id, || runtime.probe_epoch())?;
     let _permit = runtime
         .probes
         .try_acquire()
@@ -242,6 +286,8 @@ pub async fn probe(
         name,
         query,
         tokio::time::Instant::now() + query.timeout,
+        false,
+        &epoch,
     )
     .await
 }
@@ -252,35 +298,51 @@ pub async fn probe_group(
     members: &[String],
     query: &ProbeQuery,
 ) -> io::Result<serde_json::Map<String, Value>> {
-    let epoch = runtime.probe_epoch();
+    let epoch = runtime
+        .with_probe_generation(generation.id, || runtime.probe_epoch())
+        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "group probes unavailable"))?;
     let deadline = tokio::time::Instant::now() + query.timeout;
-    let mut results = futures::stream::iter(members.iter().cloned().map(|name: String| {
-        let epoch = &epoch;
-        async move {
-            let activating = || {
-                runtime
-                    .activating
-                    .load(std::sync::atomic::Ordering::Acquire)
-            };
-            if activating() || tokio::time::Instant::now() >= deadline {
-                return (name, None);
+    let members = generation
+        .probes
+        .ordered_members(members, query.url.as_str());
+    let mut results =
+        futures::stream::iter(members.iter().cloned().enumerate().map(|(index, name)| {
+            let epoch = &epoch;
+            async move {
+                let activating = || {
+                    runtime
+                        .activating
+                        .load(std::sync::atomic::Ordering::Acquire)
+                };
+                if activating() || tokio::time::Instant::now() >= deadline {
+                    return (name, None);
+                }
+                let permit = tokio::select! {
+                    biased;
+                    _ = epoch.cancelled() => return (name, None),
+                    _ = runtime.shutdown.cancelled() => return (name, None),
+                    permit = acquire_probe(runtime, deadline) => permit,
+                };
+                let Ok((_permit, waited)) = permit else {
+                    return (name, None);
+                };
+                if activating() || tokio::time::Instant::now() >= deadline {
+                    return (name, None);
+                }
+                let result = probe_until(
+                    runtime,
+                    generation,
+                    &name,
+                    query,
+                    deadline,
+                    waited || index >= 16,
+                    epoch,
+                )
+                .await;
+                (name, Some(result))
             }
-            let permit = tokio::select! {
-                _ = epoch.cancelled() => return (name, None),
-                _ = runtime.shutdown.cancelled() => return (name, None),
-                permit = tokio::time::timeout_at(deadline, runtime.probes.acquire()) => permit,
-            };
-            let Ok(Ok(_permit)) = permit else {
-                return (name, None);
-            };
-            if activating() || tokio::time::Instant::now() >= deadline {
-                return (name, None);
-            }
-            let result = probe_until(runtime, generation, &name, query, deadline).await;
-            (name, Some(result))
-        }
-    }))
-    .buffer_unordered(16);
+        }))
+        .buffer_unordered(16);
     let mut started = false;
     let mut successes = serde_json::Map::new();
     while let Some((name, result)) = results.next().await {
@@ -304,14 +366,30 @@ pub async fn probe_group(
     }
 }
 
+async fn acquire_probe(
+    runtime: &ControlRuntime,
+    deadline: tokio::time::Instant,
+) -> io::Result<(tokio::sync::SemaphorePermit<'_>, bool)> {
+    if let Ok(permit) = runtime.probes.try_acquire() {
+        return Ok((permit, false));
+    }
+    let permit = tokio::time::timeout_at(deadline, runtime.probes.acquire())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "probes stopped"))?;
+    Ok((permit, true))
+}
+
 async fn probe_until(
     runtime: &ControlRuntime,
     generation: &Generation,
     name: &str,
     query: &ProbeQuery,
     deadline: tokio::time::Instant,
+    queued: bool,
+    epoch: &CancellationToken,
 ) -> io::Result<u16> {
-    let epoch = runtime.with_probe_generation(generation.id, || runtime.probe_epoch())?;
+    runtime.with_probe_generation(generation.id, || ())?;
     let probe_request =
         crate::control::url_test::PROBING.scope((), request(generation, name, query));
     let result = tokio::select! {
@@ -323,7 +401,12 @@ async fn probe_until(
             return Err(io::Error::new(io::ErrorKind::Interrupted, "probe generation changed"));
         }
         result = tokio::time::timeout_at(deadline, probe_request) => {
-            result.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")))
+            match result {
+                Ok(result) => result,
+                // Queue time shortened this attempt's budget; expiry is not evidence of remote failure.
+                Err(_) if queued => return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")),
+                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")),
+            }
         }
     };
     let (delay, satisfied) = result.as_ref().copied().unwrap_or((0, false));
@@ -355,6 +438,16 @@ async fn probe_until(
 }
 
 fn local_failure(error: &io::Error) -> bool {
+    if crate::resources::is_exhausted(error) {
+        return true;
+    }
+    if let Some(inner) = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<io::Error>())
+        && local_failure(inner)
+    {
+        return true;
+    }
     #[cfg(unix)]
     if error.raw_os_error().is_some_and(|code| {
         matches!(
@@ -405,69 +498,129 @@ impl std::error::Error for ProbePolicyDenied {}
 pub(crate) async fn run_automatic(
     runtime: std::sync::Weak<ControlRuntime>,
     generation: Arc<Generation>,
-    epoch: tokio_util::sync::CancellationToken,
+    epoch: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut cursor = 0;
+    let groups: Vec<_> = generation
+        .catalog
+        .nodes
+        .keys()
+        .filter_map(|name| generation.catalog.selection.automatic.0.get(name))
+        .collect();
+    let mut rounds = futures::stream::FuturesUnordered::new();
+    let mut checking = vec![false; groups.len()];
     loop {
         let Some(runtime) = runtime.upgrade() else {
             return;
         };
         tokio::select! {
+            biased;
             _ = runtime.shutdown.cancelled() => return,
             _ = epoch.cancelled() => return,
+            Some(index) = rounds.next(), if !rounds.is_empty() => {
+                checking[index] = false;
+                continue;
+            }
             _ = ticker.tick() => {}
         }
         if runtime.with_probe_generation(generation.id, || ()).is_err() {
             return;
         }
         let now = tokio::time::Instant::now();
-        let mut due: Vec<_> = generation
-            .catalog
-            .selection
-            .automatic
-            .0
-            .values()
-            .filter_map(|group| group.due_members(now).map(|members| (group, members)))
+        let mut due: Vec<_> = groups
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !checking[*index])
+            .filter_map(|(index, group)| group.due_members(now).map(|members| (index, members)))
             .collect();
-        if due.is_empty() {
-            continue;
-        }
-        let length = due.len();
-        due.rotate_left(cursor % length);
-        cursor = cursor.wrapping_add(1);
-        let mut jobs = Vec::new();
-        for (group, members) in due {
-            let query = Arc::new(ProbeQuery {
-                url: url::Url::parse(&group.config.url).expect("validated url-test URL"),
-                timeout: Duration::from_millis(group.config.timeout),
-                expected: Vec::new(),
+        // A busy, short-interval group must not reset a waiting group's priority.
+        due.sort_by_key(|(index, _)| groups[*index].last_admission());
+        for (index, members) in due {
+            let group = groups[index];
+            checking[index] = true;
+            let round = AutomaticRound {
+                group,
+                completed: false,
+            };
+            let runtime = runtime.clone();
+            let generation = &generation;
+            let epoch = &epoch;
+            rounds.push(async move {
+                run_automatic_round(round, &runtime, generation, members, now, epoch).await;
+                index
             });
-            for name in members {
-                jobs.push((name, query.clone(), now + query.timeout));
-            }
-        }
-        let mut results = futures::stream::iter(jobs)
-            .map(|(name, query, deadline)| {
-                let runtime = &runtime;
-                let generation = &generation;
-                async move {
-                    let permit = tokio::time::timeout_at(deadline, runtime.probes.acquire()).await;
-                    let Ok(Ok(_permit)) = permit else { return };
-                    if tokio::time::Instant::now() >= deadline {
-                        return;
-                    }
-                    let _ = probe_until(runtime, generation, &name, &query, deadline).await;
-                }
-            })
-            .buffer_unordered(16);
-        tokio::select! {
-            _ = runtime.shutdown.cancelled() => return,
-            _ = epoch.cancelled() => return,
-            _ = async { while results.next().await.is_some() {} } => {}
         }
     }
+}
+
+struct AutomaticRound<'a> {
+    group: &'a crate::control::url_test::AutomaticGroup,
+    completed: bool,
+}
+
+impl Drop for AutomaticRound<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.group.cancel_check();
+        }
+    }
+}
+
+async fn run_automatic_round(
+    mut round: AutomaticRound<'_>,
+    runtime: &ControlRuntime,
+    generation: &Generation,
+    members: Vec<usize>,
+    started: tokio::time::Instant,
+    epoch: &CancellationToken,
+) {
+    let group = round.group;
+    let query = ProbeQuery {
+        url: url::Url::parse(&group.config.url).expect("validated url-test URL"),
+        timeout: Duration::from_millis(group.config.timeout),
+        expected: Vec::new(),
+    };
+    let deadline = started + query.timeout;
+    let mut probes = futures::stream::iter(members.into_iter().enumerate())
+        .map(|(ordinal, index)| {
+            let query = &query;
+            async move {
+                let Ok((_permit, waited)) = acquire_probe(runtime, deadline).await else {
+                    return;
+                };
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                let admitted = runtime
+                    .with_probe_generation(generation.id, || {
+                        if epoch.is_cancelled() {
+                            return false;
+                        }
+                        group.admitted(index);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !admitted {
+                    return;
+                }
+                let _ = probe_until(
+                    runtime,
+                    generation,
+                    &group.members[index],
+                    query,
+                    deadline,
+                    waited || ordinal >= 16,
+                    epoch,
+                )
+                .await;
+            }
+        })
+        .buffer_unordered(16);
+    while probes.next().await.is_some() {}
+    round.completed = runtime
+        .with_probe_generation(generation.id, || !epoch.is_cancelled())
+        .unwrap_or(false);
 }
 
 async fn request(
@@ -682,6 +835,519 @@ mod tests {
         let mut generation = generation(validated.catalog.unwrap(), resolver);
         generation.id = id;
         Arc::new(generation)
+    }
+
+    #[derive(Debug, Default)]
+    struct ScheduledAnswers {
+        calls: Mutex<Vec<String>>,
+        delays: HashMap<String, Duration>,
+    }
+
+    impl Resolver for ScheduledAnswers {
+        fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
+            let host = location.address().hostname().unwrap().to_owned();
+            self.calls.lock().push(host.clone());
+            let delay = self.delays.get(&host).copied();
+            Box::pin(async move {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                    Err(io::ErrorKind::ConnectionRefused.into())
+                } else {
+                    std::future::pending().await
+                }
+            })
+        }
+    }
+
+    fn scheduled_generation(
+        groups: &[(&str, usize, u64, u64)],
+        resolver: Arc<ScheduledAnswers>,
+    ) -> Arc<Generation> {
+        let configs: Vec<_> = groups
+            .iter()
+            .map(|&(name, count, interval, timeout)| {
+                let members: Vec<_> = (0..count)
+                    .map(|index| {
+                        json!({
+                            "name": format!("{name}-{index}"),
+                            "address": format!("{name}-{index}.invalid:80"),
+                            "protocol": {"type": "http"}
+                        })
+                    })
+                    .collect();
+                json!({
+                    "client_group": name, "type": "url-test", "url": "http://probe.invalid/",
+                    "interval": interval, "timeout": timeout, "lazy": false,
+                    "client_proxies": members
+                })
+            })
+            .collect();
+        let catalog =
+            crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
+                .unwrap()
+                .catalog
+                .unwrap();
+        Arc::new(generation(catalog, resolver))
+    }
+
+    async fn advance_rounds(seconds: u64) {
+        for _ in 0..seconds * 10 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_partial_capacity_eventually_admits_every_member() {
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        let _occupied = service.runtime.probes.acquire_many(15).await.unwrap();
+        let resolver = Arc::new(ScheduledAnswers::default());
+        let generation = scheduled_generation(&[("auto", 32, 1, 1000)], resolver.clone());
+        service.runtime.publish(generation.clone()).await.unwrap();
+        service.runtime.resume().await.unwrap();
+        advance_rounds(1).await;
+        assert_eq!(generation.probes.history.lock().len(), 1);
+        assert_eq!(
+            generation.catalog.selection.automatic.0["auto"].health("auto-31"),
+            "unprobed"
+        );
+        advance_rounds(35).await;
+        let seen: std::collections::HashSet<_> = resolver.calls.lock().iter().cloned().collect();
+        assert_eq!(seen.len(), 32, "admitted: {seen:?}");
+        drop(_occupied);
+        service.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_different_intervals_do_not_starve_a_due_group() {
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        let resolver = Arc::new(ScheduledAnswers::default());
+        let generation = scheduled_generation(
+            &[("a", 16, 1, 1000), ("b", 16, 2, 1000), ("c", 16, 2, 1000)],
+            resolver.clone(),
+        );
+        service.runtime.publish(generation).await.unwrap();
+        service.runtime.resume().await.unwrap();
+        advance_rounds(8).await;
+        let seen: std::collections::HashSet<_> = resolver.calls.lock().iter().cloned().collect();
+        assert_eq!(seen.len(), 48, "admitted: {seen:?}");
+        service.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_unadmitted_round_does_not_skip_members_on_the_next_round() {
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        let resolver = Arc::new(ScheduledAnswers::default());
+        let generation =
+            scheduled_generation(&[("a", 32, 1, 1000), ("b", 16, 1, 1000)], resolver.clone());
+        service.runtime.publish(generation).await.unwrap();
+        service.runtime.resume().await.unwrap();
+        advance_rounds(6).await;
+        let seen: std::collections::HashSet<_> = resolver.calls.lock().iter().cloned().collect();
+        assert_eq!(seen.len(), 48, "admitted: {seen:?}");
+        service.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_slow_group_does_not_block_short_intervals() {
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        let resolver = Arc::new(ScheduledAnswers {
+            delays: HashMap::from([("b-0.invalid".into(), Duration::ZERO)]),
+            ..Default::default()
+        });
+        let generation =
+            scheduled_generation(&[("a", 1, 60, 60000), ("b", 1, 1, 500)], resolver.clone());
+        service.runtime.publish(generation).await.unwrap();
+        service.runtime.resume().await.unwrap();
+        advance_rounds(5).await;
+        let checks = resolver
+            .calls
+            .lock()
+            .iter()
+            .filter(|host| *host == "b-0.invalid")
+            .count();
+        assert!(checks >= 4, "short-interval checks: {checks}");
+        service.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_unchecked_groups_use_catalog_order_for_admission_ties() {
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        let resolver = Arc::new(ScheduledAnswers::default());
+        let generation = scheduled_generation(
+            &[("z-first", 16, 10, 1000), ("a-second", 16, 10, 1000)],
+            resolver.clone(),
+        );
+        service.runtime.publish(generation).await.unwrap();
+        service.runtime.resume().await.unwrap();
+        advance_rounds(1).await;
+        assert!(
+            resolver
+                .calls
+                .lock()
+                .iter()
+                .all(|host| host.starts_with("z-first-"))
+        );
+        assert_eq!(resolver.calls.lock().len(), 16);
+        service.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_buffered_timeouts_get_a_full_budget_on_a_later_round() {
+        for automatic in [false, true] {
+            let mut service =
+                crate::control::runtime::ControlService::new(Default::default()).unwrap();
+            let resolver = Arc::new(ScheduledAnswers {
+                delays: (0..16)
+                    .map(|index| (format!("auto-{index}.invalid"), Duration::ZERO))
+                    .collect(),
+                ..Default::default()
+            });
+            let generation = scheduled_generation(&[("auto", 17, 10, 1000)], resolver);
+            let automatic_groups = &generation.catalog.selection.automatic;
+            automatic_groups.record("auto-16", "http://probe.invalid/", Some(5));
+            generation
+                .probes
+                .record("auto-16", "http://probe.invalid/", 5, true);
+            tokio::time::advance(Duration::from_millis(1)).await;
+            service.runtime.publish(generation.clone()).await.unwrap();
+            if automatic {
+                service.runtime.resume().await.unwrap();
+                advance_rounds(12).await;
+            } else {
+                service
+                    .runtime
+                    .activating
+                    .store(false, std::sync::atomic::Ordering::Release);
+                for _ in 0..2 {
+                    assert!(
+                        probe_group(
+                            &service.runtime,
+                            &generation,
+                            &automatic_groups.0["auto"].members,
+                            &query()
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            }
+            assert_eq!(automatic_groups.0["auto"].health("auto-16"), "dead");
+            assert_eq!(
+                generation
+                    .probes
+                    .url_history("auto-16", "http://probe.invalid/")
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()["delay"],
+                0
+            );
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_canceled_api_group_cannot_adopt_a_resumed_epoch() {
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        let resolver = Arc::new(PendingAnswers::default());
+        let generation = Arc::new(generation(catalog(), resolver.clone()));
+        service.runtime.publish(generation.clone()).await.unwrap();
+        service.runtime.resume().await.unwrap();
+        let members = vec!["DIRECT".into()];
+        let query = query();
+        for _ in 0..32 {
+            let occupied = service.runtime.probes.acquire_many(16).await.unwrap();
+            let mut probes = Box::pin(probe_group(&service.runtime, &generation, &members, &query));
+            assert!(futures::poll!(&mut probes).is_pending());
+            service.runtime.begin_activation(&generation).await.unwrap();
+            service.runtime.resume().await.unwrap();
+            drop(occupied);
+            let _ = futures::poll!(&mut probes);
+            assert_eq!(resolver.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(generation.probes.history.lock().is_empty());
+        }
+        service.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_canceled_round_cannot_finish_or_advance_admission() {
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        let generation = automatic_generation(1, 16, Arc::new(PendingAnswers::default()));
+        service.runtime.publish(generation.clone()).await.unwrap();
+        service
+            .runtime
+            .activating
+            .store(false, std::sync::atomic::Ordering::Release);
+        let group = &generation.catalog.selection.automatic.0["auto"];
+        let now = tokio::time::Instant::now();
+        let members = group.due_members(now).unwrap();
+        let occupied = service.runtime.probes.acquire_many(16).await.unwrap();
+        let epoch = service.runtime.probe_epoch();
+        let mut round = Box::pin(run_automatic_round(
+            AutomaticRound {
+                group,
+                completed: false,
+            },
+            &service.runtime,
+            &generation,
+            members,
+            now,
+            &epoch,
+        ));
+        assert!(futures::poll!(&mut round).is_pending());
+        service.runtime.begin_activation(&generation).await.unwrap();
+        drop(occupied);
+        round.await;
+        assert!(group.last_admission().is_none());
+        assert!(group.due_members(tokio::time::Instant::now()).is_some());
+        service.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_late_admission_timeout_does_not_overwrite_health() {
+        for automatic in [false, true] {
+            let mut service =
+                crate::control::runtime::ControlService::new(Default::default()).unwrap();
+            let resolver = Arc::new(ScheduledAnswers {
+                delays: (0..16)
+                    .map(|index| (format!("auto-{index}.invalid"), Duration::from_millis(900)))
+                    .collect(),
+                ..Default::default()
+            });
+            let generation = scheduled_generation(&[("auto", 17, 10, 1000)], resolver.clone());
+            generation.catalog.selection.automatic.record(
+                "auto-16",
+                "http://probe.invalid/",
+                Some(5),
+            );
+            service.runtime.publish(generation.clone()).await.unwrap();
+            if automatic {
+                service.runtime.resume().await.unwrap();
+                advance_rounds(2).await;
+            } else {
+                service
+                    .runtime
+                    .activating
+                    .store(false, std::sync::atomic::Ordering::Release);
+                let query = ProbeQuery::parse(
+                    &HashMap::from([
+                        ("url".into(), "http://probe.invalid/".into()),
+                        ("timeout".into(), "1000".into()),
+                    ]),
+                    true,
+                )
+                .unwrap();
+                let members = &generation.catalog.selection.automatic.0["auto"].members;
+                assert!(
+                    probe_group(&service.runtime, &generation, members, &query)
+                        .await
+                        .is_err()
+                );
+            }
+            assert!(
+                resolver
+                    .calls
+                    .lock()
+                    .iter()
+                    .any(|host| host == "auto-16.invalid")
+            );
+            assert_eq!(
+                generation.catalog.selection.automatic.0["auto"].health("auto-16"),
+                "healthy"
+            );
+            assert!(!generation.probes.history.lock().contains_key("auto-16"));
+            service.shutdown().await;
+        }
+    }
+
+    #[test]
+    fn url_test_quic_budget_rejection_preserves_health_in_a_fresh_process() {
+        const CHILD: &str = "SHOES_URL_TEST_QUIC_BUDGET_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "clash_api::probes::tests::url_test_quic_budget_rejection_preserves_health_in_a_fresh_process", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            crate::resources::configure(crate::config::GlobalLimits {
+                quic_memory_bytes: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let configs = serde_json::from_value(json!([
+                {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":[
+                    {"name":"quic", "address":"127.0.0.1:443", "transport":"quic", "quic_settings":{"verify":false}, "protocol":{"type":"socks"}}
+                ]}
+            ])).unwrap();
+            let catalog = crate::config::create_server_configs(configs)
+                .unwrap()
+                .catalog
+                .unwrap();
+            let generation = Arc::new(generation(catalog, Arc::new(Answers(Vec::new()))));
+            let mut service =
+                crate::control::runtime::ControlService::new(Default::default()).unwrap();
+            generation.catalog.selection.automatic.record(
+                "quic", "http://probe.invalid/", Some(5),
+            );
+            service.runtime.publish(generation.clone()).await.unwrap();
+            service.runtime.activating.store(false, std::sync::atomic::Ordering::Release);
+            let error = probe(&service.runtime, &generation, "quic", &query())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("QUIC memory budget exhausted"), "{error}");
+            assert_eq!(
+                generation.catalog.selection.automatic.0["auto"].health("quic"), "healthy"
+            );
+            assert!(generation.probes.history.lock().is_empty());
+            assert!(!crate::control::url_test::remote_failure(&crate::resources::exhausted()));
+            service.shutdown().await;
+        });
+    }
+
+    #[tokio::test]
+    async fn url_test_xhttp_session_budget_rejection_preserves_health() {
+        let configs = serde_json::from_value(json!([
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":[
+                {"name":"xhttp", "address":"proxy.invalid:80", "protocol":{
+                    "type":"xhttp", "limits":{"max_sessions":1}, "protocol":{"type":"socks"}
+                }}
+            ]}
+        ])).unwrap();
+        let catalog = crate::config::create_server_configs(configs)
+            .unwrap()
+            .catalog
+            .unwrap();
+        let generation = Arc::new(generation(catalog, Arc::new(ScheduledAnswers::default())));
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        service.runtime.publish(generation.clone()).await.unwrap();
+        service
+            .runtime
+            .activating
+            .store(false, std::sync::atomic::Ordering::Release);
+        let query = query();
+        let mut occupied = Box::pin(request(&generation, "xhttp", &query));
+        assert!(futures::poll!(&mut occupied).is_pending());
+        generation
+            .catalog
+            .selection
+            .automatic
+            .record("xhttp", "http://probe.invalid/", Some(5));
+        let error = probe(&service.runtime, &generation, "xhttp", &query)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "process resource budget exhausted");
+        assert!(crate::resources::is_exhausted(&error));
+        assert!(!crate::control::url_test::remote_failure(&error));
+        assert_eq!(
+            generation.catalog.selection.automatic.0["auto"].health("xhttp"),
+            "healthy"
+        );
+        assert!(generation.probes.history.lock().is_empty());
+        drop(occupied);
+        service.shutdown().await;
+    }
+
+    #[test]
+    fn url_test_dns_quic_budget_rejection_preserves_health_in_a_fresh_process() {
+        const CHILD: &str = "SHOES_URL_TEST_DNS_BUDGET_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "clash_api::probes::tests::url_test_dns_quic_budget_rejection_preserves_health_in_a_fresh_process",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            crate::resources::configure(crate::config::GlobalLimits {
+                quic_memory_bytes: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            for (strategy, attempts) in [("ipv4_only", 0), ("ipv4_then_ipv6", 1)] {
+                let configs = serde_yaml::from_str(&format!(
+                    r#"
+- dns_group: test
+  dns_servers:
+    - url: h3://127.0.0.1:443/dns-query
+      timeout_secs: 1
+      ip_strategy: {strategy}
+      attempts: {attempts}
+- client_group: auto
+  type: url-test
+  url: http://probe.example.net/
+  client_proxies:
+    - name: member-0
+      protocol: {{type: direct}}
+"#,
+                ))
+                .unwrap();
+                let validated = crate::config::create_server_configs(configs).unwrap();
+                let registry = crate::dns::build_dns_registry(validated.dns_groups)
+                    .await
+                    .unwrap();
+                let generation = Arc::new(generation(
+                    validated.catalog.unwrap(),
+                    registry.get_by_name("test").unwrap(),
+                ));
+                let mut service =
+                    crate::control::runtime::ControlService::new(Default::default()).unwrap();
+                generation.catalog.selection.automatic.record(
+                    "member-0",
+                    "http://probe.example.net/",
+                    Some(5),
+                );
+                service.runtime.publish(generation.clone()).await.unwrap();
+                service
+                    .runtime
+                    .activating
+                    .store(false, std::sync::atomic::Ordering::Release);
+                let mut query = query();
+                query.url = url::Url::parse("http://probe.example.net/").unwrap();
+                query.timeout = Duration::from_secs(10);
+                let error = probe(&service.runtime, &generation, "member-0", &query)
+                    .await
+                    .unwrap_err();
+                assert!(crate::resources::snapshot().quic_buffer_bytes.rejected > 0);
+                assert!(local_failure(&error), "{error}");
+                assert!(!crate::control::url_test::remote_failure(&error));
+                assert!(local_failure(&io::Error::other(error)));
+                assert_eq!(
+                    generation.catalog.selection.automatic.0["auto"].health("member-0"),
+                    "healthy"
+                );
+                assert!(generation.probes.history.lock().is_empty());
+                service.shutdown().await;
+            }
+        });
     }
 
     #[derive(Debug, Default)]
@@ -900,7 +1566,6 @@ mod tests {
         service.runtime.begin_activation(&candidate).await.unwrap();
         resolver.wait(16, 0).await;
         service.runtime.resume().await.unwrap();
-        tokio::time::advance(Duration::from_secs(10)).await;
         resolver.wait(32, 16).await;
         assert_eq!(service.runtime.generation().unwrap().id, 1);
         assert!(candidate.probes.history.lock().is_empty());

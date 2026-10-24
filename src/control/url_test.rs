@@ -18,6 +18,9 @@ pub fn is_probe() -> bool {
 // Only unambiguous transport failures request a recheck. A user destination's
 // failure is not evidence that the configured probe URL is unreachable.
 pub fn remote_failure(error: &io::Error) -> bool {
+    if crate::resources::is_exhausted(error) {
+        return false;
+    }
     matches!(
         error.kind(),
         io::ErrorKind::ConnectionRefused
@@ -44,6 +47,7 @@ struct State {
     incumbent: [Option<String>; 2],
     last_touch: Option<Instant>,
     last_check: Option<Instant>,
+    last_admission: Option<Instant>,
     recheck: bool,
     cursor: usize,
 }
@@ -212,7 +216,7 @@ impl AutomaticGroup {
         }
     }
 
-    pub fn due_members(&self, now: Instant) -> Option<Vec<String>> {
+    pub fn due_members(&self, now: Instant) -> Option<Vec<usize>> {
         let mut state = self.state.lock();
         let interval = Duration::from_secs(self.config.interval);
         if let Some(last_check) = state.last_check {
@@ -232,12 +236,31 @@ impl AutomaticGroup {
         }
         state.last_check = Some(now);
         state.recheck = false;
-        let mut members = self.members.clone();
-        members.rotate_left(state.cursor);
-        // Rotate admission order so a group larger than one deadline's capacity
-        // does not permanently starve its tail.
-        state.cursor = (state.cursor + 16) % members.len();
+        let mut members: Vec<_> = (state.cursor..self.members.len())
+            .chain(0..state.cursor)
+            .collect();
+        // Inconclusive queued attempts retain their sample age and lead the next round.
+        members.sort_by_key(|index| {
+            state
+                .samples
+                .get(&self.members[*index])
+                .map(|sample| sample.at)
+        });
         Some(members)
+    }
+
+    pub fn admitted(&self, index: usize) {
+        let mut state = self.state.lock();
+        state.cursor = (index + 1) % self.members.len();
+        state.last_admission = Some(Instant::now());
+    }
+
+    pub fn last_admission(&self) -> Option<Instant> {
+        self.state.lock().last_admission
+    }
+
+    pub fn cancel_check(&self) {
+        self.state.lock().last_check = None;
     }
 }
 

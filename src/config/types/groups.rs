@@ -125,8 +125,8 @@ impl UrlTestConfig {
                 ("timeout".into(), self.timeout.to_string()),
             ]),
             true,
-        )
-        .map(|_| ())
+        )?
+        .validate_automatic_target()
     }
 }
 
@@ -175,6 +175,12 @@ mod group_type_tests {
             ("default", json!("DIRECT")),
             ("url", json!("ftp://probe.invalid/")),
             ("url", json!("http://u:p@probe.invalid/")),
+            ("url", json!("http://127.0.0.1/")),
+            ("url", json!("http://[::ffff:127.0.0.1]/")),
+            ("url", json!("http://169.254.1.1/")),
+            ("url", json!("http://198.18.0.1/")),
+            ("url", json!("http://[::]/")),
+            ("url", json!("http://224.0.0.1/")),
             ("interval", json!(0)),
             ("interval", json!(86401)),
             ("interval", json!(1)),
