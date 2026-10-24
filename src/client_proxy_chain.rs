@@ -67,6 +67,12 @@ impl std::fmt::Debug for InitialHopEntry {
 }
 
 impl InitialHopEntry {
+    fn socket(&self) -> &Arc<dyn SocketConnector> {
+        match self {
+            Self::Direct(socket) | Self::Wireguard(socket) | Self::Proxy { socket, .. } => socket,
+        }
+    }
+
     /// Returns true if this entry supports UDP.
     pub fn supports_udp(&self) -> bool {
         match self {
@@ -142,11 +148,7 @@ impl ClientProxyChain {
             .map(|(i, hop)| hop[indices[i + 1]].clone())
             .collect();
         SelectedRoute {
-            socket: match self.initial_hop[initial_index].as_ref() {
-                InitialHopEntry::Direct(socket)
-                | InitialHopEntry::Wireguard(socket)
-                | InitialHopEntry::Proxy { socket, .. } => socket.clone(),
-            },
+            socket: self.initial_hop[initial_index].socket().clone(),
             initial: Some(self.initial_hop[initial_index].clone()),
             subsequent,
             resolver: resolver.clone(),
@@ -412,6 +414,7 @@ impl ClientProxyChain {
             *path = self.route_names(&indices);
         }
         self.touch_automatic(&indices, false);
+        self.initial_hop[indices[0]].socket().record_demand();
         let result = self
             .connect_tcp_selected(remote_location, resolver, &indices)
             .await;
@@ -563,6 +566,7 @@ impl ClientProxyChain {
             *path = self.route_names(&indices);
         }
         self.touch_automatic(&indices, false);
+        self.initial_hop[indices[0]].socket().record_demand();
         let result = self.connect_udp_selected(resolver, target, &indices).await;
         if let Err(error) = &result
             && crate::control::url_test::remote_failure(error)

@@ -1593,6 +1593,140 @@ async fn h1_waiting_packet_ack_does_not_consume_another_sessions_connections() {
 }
 
 #[tokio::test]
+async fn url_test_pooled_h2_sessions_record_carrier_demand() {
+    use crate::{
+        address::ResolvedLocation,
+        async_stream::AsyncMessageStream,
+        client_proxy_chain::{ClientProxyChain, InitialHopEntry},
+        control::url_test::{AutomaticGroups, BACKGROUND},
+        resolver::{NativeResolver, Resolver},
+        tcp::{proxy_connector_impl::ProxyConnectorImpl, socket_connector::SocketConnector},
+    };
+
+    #[derive(Debug)]
+    struct ActivitySocket {
+        address: SocketAddr,
+        opens: AtomicUsize,
+        groups: AutomaticGroups,
+    }
+
+    #[async_trait]
+    impl SocketConnector for ActivitySocket {
+        fn record_demand(&self) {
+            self.groups.touch("carrier", false);
+        }
+
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: &ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncStream>> {
+            self.record_demand();
+            self.opens.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(
+                tokio::net::TcpStream::connect(self.address).await?,
+            ))
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!("XHTTP uses the TCP carrier")
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    for udp in [false, true] {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let (address, _server) = echo_peer(XhttpVersion::H2, false).await;
+            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+            let config = serde_json::from_value(serde_json::json!({
+                "address": address.to_string(),
+                "protocol": {
+                    "type": "xhttp", "http_version": "h2", "mode": "stream-one",
+                    "pool": {"idle_timeout_secs": 600},
+                    "protocol": {"type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000"}
+                }
+            }))
+            .unwrap();
+            let proxy = ProxyConnectorImpl::from_config(config, resolver.clone())
+                .unwrap()
+                .unwrap();
+            let mut groups = AutomaticGroups::default();
+            groups
+                .insert(
+                    "carrier".into(),
+                    crate::config::UrlTestConfig {
+                        url: "http://probe.invalid/".into(),
+                        interval: 10,
+                        timeout: 1000,
+                        tolerance: 50,
+                        lazy: true,
+                    },
+                    vec!["peer".into()],
+                )
+                .unwrap();
+            let socket = Arc::new(ActivitySocket {
+                address,
+                opens: AtomicUsize::new(0),
+                groups,
+            });
+            let chain = ClientProxyChain::new(
+                vec![InitialHopEntry::Wireguard(socket.clone())],
+                vec![vec![Box::new(proxy)]],
+            );
+            let target: ResolvedLocation =
+                NetLocation::from_str("192.0.2.1:443", None).unwrap().into();
+            let first = chain.connect_tcp(target.clone(), &resolver).await.unwrap();
+            let group = &socket.groups.0["carrier"];
+            assert_eq!(socket.opens.load(Ordering::Relaxed), 1);
+            assert!(group.due_members(tokio::time::Instant::now()).is_some());
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(11)).await;
+            assert!(group.due_members(tokio::time::Instant::now()).is_none());
+            for background in [true, false] {
+                let session = async {
+                    if udp {
+                        drop(
+                            chain
+                                .connect_udp_bidirectional(&resolver, target.clone())
+                                .await
+                                .unwrap(),
+                        );
+                    } else {
+                        drop(chain.connect_tcp(target.clone(), &resolver).await.unwrap());
+                    }
+                };
+                if background {
+                    BACKGROUND.scope((), session).await;
+                } else {
+                    session.await;
+                }
+                assert_eq!(
+                    socket.opens.load(Ordering::Relaxed),
+                    1,
+                    "carrier was redialed"
+                );
+                assert_eq!(
+                    group.due_members(tokio::time::Instant::now()).is_some(),
+                    !background,
+                    "udp={udp}, background={background}",
+                );
+            }
+            tokio::time::resume();
+            drop(first);
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn url_test_h1_packet_redials_preserve_activity_context_without_replay() {
     #[derive(Debug)]
     struct ActivityDialer {
