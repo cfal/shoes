@@ -53,6 +53,18 @@ async fn controller_accept_recovers_after_descriptor_exhaustion() {
         });
     }
     let mut process = Process::from_child(command.spawn().unwrap());
+    process
+        .wait_for(&format!(
+            "Starting Clash API controller at 0.0.0.0:{}",
+            address.port()
+        ))
+        .await;
+    process
+        .wait_for(&format!(
+            "Starting Clash API controller at {}",
+            socket.display()
+        ))
+        .await;
     process.wait_for("Servers ready").await;
     let mut tcp = Vec::new();
     for _ in 0..64 {

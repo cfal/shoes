@@ -17,6 +17,7 @@ pub(super) enum Bound {
 pub(super) async fn bind(configs: &[ClashApiConfig]) -> io::Result<Vec<Bound>> {
     let mut bound = Vec::new();
     for config in configs {
+        println!("Starting Clash API controller at {}", config.bind);
         let config = Arc::new(config.clone());
         match &config.bind {
             BindLocation::Address(addresses) => {
