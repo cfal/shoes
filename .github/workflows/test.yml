@@ -143,6 +143,9 @@ jobs:
     - name: Run rule compilation allocation regression
       run: cargo test -p shoes --locked --test rule_allocation --verbose
 
+    - name: Run retention allocation and matcher invariants
+      run: cargo test -p shoes --locked --test retention_allocation --test matcher_invariants -- --nocapture
+
     - name: Run host FFI tests
       run: cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
 
