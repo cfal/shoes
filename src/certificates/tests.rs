@@ -121,6 +121,35 @@ fn managed_validation_has_no_state_or_network_side_effects() {
 }
 
 #[test]
+fn managed_directory_urls_reject_http_uri_normalization() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("not-created");
+    let yaml = managed_yaml(&state, "type: tls_alpn01", "certificate_source: public");
+    for directory in [
+        "https://ca.test/dir ectory",
+        " https://ca.test/directory",
+        "https://ca.test/directory ",
+        "https://ca.test/dir\tectory",
+    ] {
+        assert!(url::Url::parse(directory).is_ok());
+        assert!(http::Request::builder().uri(directory).body(()).is_err());
+        let invalid = yaml.replace(
+            "http://127.0.0.1:9/directory",
+            &serde_json::to_string(directory).unwrap(),
+        );
+        assert!(compile(&invalid).is_err(), "accepted {directory:?}");
+    }
+    for directory in [
+        "https://ca.test/dir%20ectory",
+        "http://[::1]:9000/directory",
+    ] {
+        let valid = yaml.replace("http://127.0.0.1:9/directory", directory);
+        compile(&valid).unwrap();
+    }
+    assert!(!state.exists());
+}
+
+#[test]
 fn managed_schema_references_and_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let good = managed_yaml(dir.path(), "type: tls_alpn01", "certificate_source: public");
@@ -291,24 +320,36 @@ async fn state_preparation_errors_identify_source_and_storage_path() {
 }
 
 #[test]
-fn file_source_paths_reject_pasted_secrets_before_dependency_discovery() {
+fn source_paths_reject_pasted_secrets_before_dependency_discovery() {
     let secret = "PRIVATE KEY CONTENT MUST NOT APPEAR";
-    for field in ["cert", "key"] {
+    for field in ["cert", "key", "ca_cert"] {
         for value in [
             format!("  -----BEGIN PRIVATE KEY----- {secret}"),
             format!("not-a-path\n{secret}"),
         ] {
-            let mut entry = serde_json::json!({"certificate_source":"files", "type":"files", "cert":"/missing/cert.pem", "key":"/missing/key.pem"});
+            let mut entry = if field == "ca_cert" {
+                serde_json::json!({
+                    "certificate_source": "managed", "type": "acme",
+                    "domains": ["proxy.test"], "directory_url": "https://ca.test/directory",
+                    "state_dir": "/missing/state",
+                    "challenge": {"type": "http01", "listen": ["127.0.0.1:18080"]}
+                })
+            } else {
+                serde_json::json!({"certificate_source":"managed", "type":"files", "cert":"/missing/cert.pem", "key":"/missing/key.pem"})
+            };
             entry[field] = value.into();
             let mut configs: Vec<Config> =
                 serde_yaml::from_value(serde_yaml::to_value(vec![entry]).unwrap()).unwrap();
             for error in [
                 crate::config::pem_candidate_dependencies(&mut configs).unwrap_err(),
+                crate::config::pem_reload_dependencies(&mut configs).unwrap_err(),
                 configure(&mut configs).unwrap_err(),
             ] {
                 let error = error.to_string();
                 assert!(
-                    error.contains("files") && error.contains(field) && error.contains("file path"),
+                    error.contains("managed")
+                        && error.contains(field)
+                        && error.contains("file path"),
                     "{error}"
                 );
                 assert!(!error.contains(secret), "{error}");
@@ -465,6 +506,46 @@ async fn p521_signed_chains_validate_and_rotate() {
             assert_eq!(client.unwrap().get_ref().1.peer_certificates().unwrap()[0], *cert.der());
         }
     }).await.unwrap();
+}
+
+#[test]
+fn rsa_signed_chain_validation_checks_order_and_acme_domains() {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let issuer = rcgen::CertifiedIssuer::self_signed(
+        params,
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap(),
+    )
+    .unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["proxy.test".into()])
+        .unwrap()
+        .signed_by(&key, &issuer)
+        .unwrap();
+    let chain = format!("{}{}", leaf.pem(), issuer.pem());
+    Material::parse(&chain, &key.serialize_pem(), &["proxy.test".into()]).unwrap();
+
+    let reversed = format!("{}{}", issuer.pem(), leaf.pem());
+    let error = Material::parse(&reversed, &key.serialize_pem(), &[])
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "invalid certificate chain signature or order"
+    );
+
+    let error = Material::parse(
+        &chain,
+        &key.serialize_pem(),
+        &["proxy.test".into(), "missing.test".into()],
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "certificate does not cover every configured ACME domain"
+    );
 }
 
 fn tls_client(

@@ -28,6 +28,11 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 mod tests;
 
 pub(super) fn validate_url(value: &str) -> io::Result<url::Url> {
+    // instant-acme builds requests from the original string, not Url's normalized form.
+    let uri: http::Uri = value.parse().map_err(|_| invalid("invalid ACME URL"))?;
+    if uri.scheme().is_none() || uri.authority().is_none() {
+        return Err(invalid("invalid ACME URL"));
+    }
     let url = url::Url::parse(value).map_err(|_| invalid("invalid ACME URL"))?;
     let loopback = url.host_str().is_some_and(|host| {
         host.trim_matches(['[', ']'])
@@ -147,6 +152,12 @@ fn validate_directory(
             "ACME terms URL differs from explicitly accepted terms_of_service",
         ));
     }
+    // instant-acme's nonce request builder can panic before it reaches our HTTP adapter.
+    let nonce_url = directory
+        .get("newNonce")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid("invalid ACME directory"))?;
+    validate_url(nonce_url).map_err(|_| invalid("invalid ACME directory"))?;
     Ok(())
 }
 

@@ -58,6 +58,33 @@ fn retry_after_parsing_preserves_supported_and_ignored_headers() {
     }
 }
 
+#[test]
+fn directory_nonce_metadata_requires_an_absolute_request_url() {
+    for directory in [
+        json!({}),
+        json!({"newNonce": null}),
+        json!({"newNonce": 123}),
+        json!({"newNonce": ""}),
+        json!({"newNonce": "/nonce"}),
+        json!({"newNonce": "https://ca.test/non ce"}),
+        json!({"newNonce": format!("https://ca.test/{}", "n".repeat(65536))}),
+    ] {
+        let error = validate_directory(
+            http::StatusCode::OK,
+            &serde_json::to_vec(&directory).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "invalid ACME directory");
+    }
+    validate_directory(
+        http::StatusCode::OK,
+        br#"{"newNonce":"https://ca.test/nonce"}"#,
+        None,
+    )
+    .unwrap();
+}
+
 // Protocol/persistence tests skip short poll waits, but still enter the worker's
 // due-selection path. Scheduling tests use turn() or run() without this shortcut.
 async fn drive(
@@ -96,6 +123,7 @@ struct Order {
 
 struct CaState {
     base: String,
+    nonce_url: Option<String>,
     kind: &'static str,
     challenge_address: SocketAddr,
     issuer: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
@@ -162,6 +190,7 @@ impl Fixture {
                 .unwrap();
         let state = Arc::new(Mutex::new(CaState {
             base,
+            nonce_url: None,
             kind: if tls_alpn { "tls-alpn-01" } else { "http-01" },
             challenge_address,
             issuer,
@@ -310,7 +339,11 @@ async fn handle(
     }
     if path == "/directory" {
         let mut state = state.lock();
-        let value = json!({"newNonce":format!("{}/nonce", state.base), "newAccount":format!("{}/account", state.base),
+        let nonce_url = state
+            .nonce_url
+            .clone()
+            .unwrap_or_else(|| format!("{}/nonce", state.base));
+        let value = json!({"newNonce":nonce_url, "newAccount":format!("{}/account", state.base),
             "renewalInfo": state.ari_window.map(|_| format!("{}/renewal", state.base)),
             "newOrder":format!("{}/new-order", state.base), "meta":{"termsOfService":"https://ca.test/terms"}});
         return Ok(response(&mut state, 200, value.to_string(), None));
@@ -943,6 +976,55 @@ async fn ari_window_and_retry_after_survive_restart() {
         drive(&source, &config, client).await.unwrap();
         assert_eq!(fixture.state.lock().ari_requests, 3);
         assert_eq!(fixture.state.lock().orders.len(), 2);
+        serving.shutdown().await;
+        fixture.tasks.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn malformed_directory_nonce_url_backs_off_and_recovers() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut fixture = Fixture::new(listener.local_addr().unwrap(), false).await;
+        fixture.state.lock().nonce_url = Some("https://ca.test/non ce-PRIVATE-DATA".into());
+        let config = fixture.config(directory.path(), false);
+        let _lock = lock_state(&config).unwrap();
+        let source =
+            Source::new("fixture".into(), super::super::Spec::Acme(config.clone())).unwrap();
+        let mut serving = serve_challenges(
+            listener,
+            source.clone(),
+            false,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut scheduler = Scheduler::new();
+        let failed = scheduler.turn(&source, &config).await;
+        assert_eq!(
+            failure_message(&failed.outcome.unwrap_err()),
+            "invalid ACME directory"
+        );
+        assert!(failed.wake_at >= now() + 60);
+        assert_eq!(load(&config).unwrap().unwrap().retry_at, failed.wake_at);
+        assert_eq!(scheduler.backoff, 120);
+        assert_eq!(fixture.state.lock().accounts, 0);
+        assert!(fixture.state.lock().orders.is_empty());
+
+        fixture.state.lock().nonce_url = None;
+        let requests = fixture.requests.load(Ordering::SeqCst);
+        let deferred = scheduler.turn(&source, &config).await;
+        assert_eq!(deferred.outcome.unwrap(), Progress::Deferred);
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), requests);
+        for expected in [Progress::Pending, Progress::Installed] {
+            expire_retry(&config);
+            let turn = scheduler.turn(&source, &config).await;
+            assert_eq!(turn.outcome.unwrap(), expected);
+        }
+        assert!(source.current().is_some());
+        assert_eq!(fixture.state.lock().accounts, 1);
+        assert_eq!(fixture.state.lock().orders.len(), 1);
         serving.shutdown().await;
         fixture.tasks.shutdown().await;
     })

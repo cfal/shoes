@@ -39,14 +39,24 @@ pub enum SourceConfig {
 
 impl NamedSource {
     pub(crate) fn validate_file_paths(&self) -> io::Result<()> {
-        if let SourceConfig::Files { cert, key } = &self.source {
-            for (field, path) in [("cert", cert), ("key", key)] {
-                let value = path.to_string_lossy();
-                if value.trim_start().starts_with("-----BEGIN") || value.contains(['\r', '\n']) {
-                    return Err(invalid(&format!(
-                        "certificate source {}: {field} requires a file path, not inline material",
-                        self.certificate_source
-                    )));
+        let validate = |field: &str, path: &Path| {
+            let value = path.to_string_lossy();
+            if value.trim_start().starts_with("-----BEGIN") || value.contains(['\r', '\n']) {
+                return Err(invalid(&format!(
+                    "certificate source {}: {field} requires a file path, not inline material",
+                    self.certificate_source
+                )));
+            }
+            Ok(())
+        };
+        match &self.source {
+            SourceConfig::Files { cert, key } => {
+                validate("cert", cert)?;
+                validate("key", key)?;
+            }
+            SourceConfig::Acme(config) => {
+                if let Some(path) = &config.ca_cert {
+                    validate("ca_cert", path)?;
                 }
             }
         }

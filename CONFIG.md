@@ -1591,6 +1591,17 @@ configuration reload leaves the current listeners running and watches the candid
 file paths so repairing the pair retries the reload. After activation, identity-only
 changes use live rotation, not a full reload.
 
+**Upgrade warning:** These checks also apply to existing `cert`/`key` file paths
+and file-backed named PEMs, even without a configuration change. Previously accepted
+expired or not-yet-valid certificates and misordered bundles now reject at startup;
+running file sources stop serving at expiry, including when clients disable
+verification or pin a fingerprint. Renew expired certificates, put bundles in
+leaf-to-issuer order, remove expired cross-signs and certificates outside that chain,
+and synchronize the system clock before starting Shoes. Child-to-issuer signatures
+must use algorithms supported by the TLS provider: no SHA-1, and RSA issuer keys
+must be at least 2048 bits. Reissue certificates with unsupported signatures.
+Inline-only pairs retain their previous static behavior.
+
 Legacy `cert`/`key` paths, including paths referenced through named PEMs, also
 rotate live through these watches. Inline-only pairs stay static. This applies
 to ordinary inbound TLS and QUIC, including Hysteria2, TUIC and XHTTP. Outbound
