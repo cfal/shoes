@@ -12,6 +12,7 @@ use hickory_resolver::Resolver;
 use hickory_resolver::config::{
     ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig,
 };
+use hickory_resolver::net::NetError;
 
 use crate::address::NetLocation;
 use crate::client_proxy_chain::ClientChainGroup;
@@ -51,6 +52,36 @@ pub struct HickoryResolver {
     inner: Resolver<ProxyRuntimeProvider>,
     exchange: Arc<super::exchange::RawDnsExchange>,
     description: String,
+}
+
+#[derive(Debug)]
+struct DnsLookupError(NetError);
+
+impl std::fmt::Display for DnsLookupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "DNS lookup failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for DnsLookupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // NetError::Io does not expose its contained error through source().
+        match &self.0 {
+            NetError::Io(error) => Some(error.as_ref()),
+            error => Some(error),
+        }
+    }
+}
+
+impl From<DnsLookupError> for std::io::Error {
+    fn from(error: DnsLookupError) -> Self {
+        let kind = match error.0 {
+            // A retry after local admission failure may find no usable DNS connection.
+            NetError::Busy | NetError::NoConnections => std::io::ErrorKind::WouldBlock,
+            _ => std::io::ErrorKind::Other,
+        };
+        Self::new(kind, error)
+    }
 }
 
 impl Debug for HickoryResolver {
@@ -287,7 +318,7 @@ impl ShoesResolver for HickoryResolver {
                     elapsed,
                     e
                 );
-                std::io::Error::other(format!("DNS lookup failed: {e}"))
+                std::io::Error::from(DnsLookupError(e))
             })?;
 
             let addrs: Vec<SocketAddr> = response
@@ -330,6 +361,24 @@ impl ShoesResolver for HickoryResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lookup_errors_preserve_local_admission_classification() {
+        let error = std::io::Error::from(DnsLookupError(NetError::Io(Arc::new(
+            crate::resources::exhausted(),
+        ))));
+        assert!(crate::resources::is_exhausted(&error));
+        assert_eq!(
+            error.to_string(),
+            "DNS lookup failed: io error: process resource budget exhausted"
+        );
+        for error in [NetError::Busy, NetError::NoConnections] {
+            assert_eq!(
+                std::io::Error::from(DnsLookupError(error)).kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
 
     #[test]
     fn test_hickory_resolver_options_default() {
