@@ -373,6 +373,7 @@ Only `url` is required for `url-test`; the values above are the other defaults.
 Literal URL addresses denied by probe policy (including loopback, link-local,
 multicast, unspecified, and synthetic benchmark addresses) are configuration errors.
 Locally resolved hostnames are subject to the same destination policy at probe time.
+Literal URLs overlapping configured or retained fake-IP ranges are also rejected.
 `default` is selector-only. `url`, `interval`, `timeout`, `tolerance`, and `lazy`
 are url-test-only. Members must be nonempty and distinct; references to nested
 groups are supported. Explicit names are recommended for automatic inline members.
@@ -407,7 +408,7 @@ their previous health. A deadline expiry after queueing is inconclusive and also
 preserves prior health; successful probes and explicit remote errors still update it.
 Unprobed members and the oldest samples lead each round, so inconclusive attempts
 can receive a full budget on a later round. Tied members rotate on admission.
-Due groups with the oldest admission get priority, with stable catalog order
+Due groups with the oldest unqueued admission get priority, with stable catalog order
 breaking ties.
 Under sustained saturation, reduce group size, increase
 timeout/interval, or expect unprobed/stale members. Scheduling has one-second
