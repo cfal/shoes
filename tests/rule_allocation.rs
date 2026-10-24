@@ -1,52 +1,20 @@
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use shoes::rule_set::{Behavior, Format, RuleSource, YAML_PARSER_SCRATCH_BYTES};
 use shoes::rules::{Compiler, Expression};
-
-struct CountingAllocator;
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-fn allocated(size: usize) {
-    let live = LIVE.fetch_add(size, Relaxed) + size;
-    PEAK.fetch_max(live, Relaxed);
-}
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            allocated(layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Relaxed);
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        let result = unsafe { System.realloc(ptr, layout, size) };
-        if !result.is_null() {
-            // Conservatively count both buffers even when realloc is in place.
-            allocated(size);
-            LIVE.fetch_sub(layout.size(), Relaxed);
-        }
-        result
-    }
-}
+use shoes_test_support::measure::CountingAllocator;
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: CountingAllocator = CountingAllocator::new();
 
 fn peak<T>(run: impl FnOnce() -> T) -> (T, usize) {
-    let baseline = LIVE.load(Relaxed);
-    PEAK.store(baseline, Relaxed);
+    let baseline = ALLOCATOR.snapshot().live_bytes;
+    ALLOCATOR.reset_peak();
     let result = run();
-    (result, PEAK.load(Relaxed).saturating_sub(baseline))
+    (
+        result,
+        ALLOCATOR.snapshot().peak_bytes.saturating_sub(baseline),
+    )
 }
 
 fn load_peak(bytes: &[u8], format: Format, precharged: usize) -> (std::io::Result<()>, usize) {

@@ -2,6 +2,7 @@
 
 pub mod certs;
 pub mod curl;
+pub mod measure;
 pub mod port_helper;
 pub mod process;
 pub mod socks5;
