@@ -111,7 +111,7 @@ pub(super) fn start(
             incoming: incoming.clone(),
             drops: drops.clone(),
         };
-        workers.spawn(worker.run());
+        workers.spawn(crate::control::url_test::BACKGROUND.scope((), worker.run()));
     }
     drop(incoming);
     let shutdown = cancel.clone();
@@ -347,6 +347,135 @@ mod tests {
         poll_fn(|cx| Pin::new(&mut *stream).poll_flush_message(cx))
             .await
             .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn url_test_idle_reconnects_do_not_activate_lazy_groups() {
+        #[derive(Debug)]
+        struct FailingSocket(Arc<AtomicU64>);
+
+        #[async_trait::async_trait]
+        impl SocketConnector for FailingSocket {
+            async fn connect(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: &ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncStream>> {
+                unreachable!()
+            }
+
+            async fn connect_udp_bidirectional(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncMessageStream>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(io::ErrorKind::ConnectionRefused.into())
+            }
+
+            fn bind_interface(&self) -> Option<&str> {
+                None
+            }
+        }
+
+        let mut selection = crate::control::selection::SelectionView::default();
+        selection
+            .automatic
+            .insert(
+                "carrier".into(),
+                crate::config::UrlTestConfig {
+                    url: "http://probe.invalid/".into(),
+                    interval: 10,
+                    timeout: 1000,
+                    tolerance: 50,
+                    lazy: true,
+                },
+                vec!["peer".into()],
+            )
+            .unwrap();
+        let selection = Arc::new(selection);
+        let attempts = Arc::new(AtomicU64::new(0));
+        let chain = Arc::new(
+            ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Arc::new(FailingSocket(
+                    attempts.clone(),
+                )))],
+                vec![],
+            )
+            .with_origins(vec![vec![Some(crate::control::catalog::MemberOrigin {
+                name: Arc::from("peer"),
+                path: vec![("carrier".into(), "peer".into())],
+                selection: selection.clone(),
+            })]]),
+        );
+        let group = &selection.automatic.0["carrier"];
+        assert!(group.due_members(Instant::now()).is_some());
+        let (_sender, receiver, released) = start(
+            "idle".into(),
+            chain.clone(),
+            Arc::new(NativeResolver::new()),
+            ["127.0.0.1:51820".parse().unwrap()].into_iter(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(attempts.load(Ordering::Relaxed) > 1);
+        assert!(group.due_members(Instant::now()).is_none());
+        drop(receiver);
+        released.await.unwrap();
+
+        let stack = crate::ip_stack::driver::PacketStack::new(
+            vec!["10.0.0.2".parse().unwrap()],
+            1420,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        let connector = |carrier| {
+            Arc::new(crate::wireguard::Connector {
+                name: "demand".into(),
+                active: Mutex::new(Some(crate::wireguard::ActiveEndpoint {
+                    handle: stack.handle.clone(),
+                    carrier: Some(carrier),
+                })),
+                addresses: vec!["10.0.0.2".parse().unwrap()],
+                routes: vec!["0.0.0.0/0".parse().unwrap()],
+            })
+        };
+        let outer = connector(chain);
+        let nested = connector(Arc::new(ClientProxyChain::new(
+            vec![InitialHopEntry::Wireguard(outer)],
+            vec![],
+        )));
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let target: ResolvedLocation =
+            NetLocation::from_ip_addr("10.0.0.1".parse().unwrap(), 80).into();
+        for udp in [false, true] {
+            for background in [true, false] {
+                let connect = async {
+                    if udp {
+                        let attempt = nested.connect_udp_bidirectional(&resolver, target.clone());
+                        tokio::pin!(attempt);
+                        let _ = futures::poll!(&mut attempt);
+                    } else {
+                        let attempt = nested.connect(&resolver, &target);
+                        tokio::pin!(attempt);
+                        let _ = futures::poll!(&mut attempt);
+                    }
+                };
+                if background {
+                    crate::control::url_test::BACKGROUND
+                        .scope((), connect)
+                        .await;
+                } else {
+                    connect.await;
+                }
+                assert_eq!(group.due_members(Instant::now()).is_some(), !background);
+                tokio::time::advance(Duration::from_secs(11)).await;
+            }
+        }
     }
 
     async fn read(stream: &mut dyn AsyncMessageStream) -> Vec<u8> {

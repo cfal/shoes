@@ -34,6 +34,9 @@ use crate::resolver::Resolver;
     reason = "async-trait adds must_use to boxed futures"
 )]
 pub trait SocketConnector: Send + Sync + Debug {
+    /// Propagate new forwarding demand into a shared carrier without redialing it.
+    fn record_demand(&self) {}
+
     async fn connect_quic(
         &self,
         _resolver: &Arc<dyn Resolver>,

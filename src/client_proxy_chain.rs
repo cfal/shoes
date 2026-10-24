@@ -269,6 +269,24 @@ impl ClientProxyChain {
         }
     }
 
+    pub(crate) fn record_carrier_demand(&self) {
+        if crate::control::url_test::is_background() {
+            return;
+        }
+        // Shared carriers can have several pinned associations. Wake their groups
+        // without selecting a new route or attributing a destination failure to them.
+        for origin in self.origins.iter().flatten().flatten() {
+            for (group, _) in &origin.path {
+                origin.selection.automatic.touch(group, false);
+            }
+        }
+        for entry in &self.initial_hop {
+            if let InitialHopEntry::Wireguard(socket) = entry.as_ref() {
+                socket.record_demand();
+            }
+        }
+    }
+
     fn route_names(&self, indices: &[usize]) -> Vec<String> {
         indices
             .iter()
