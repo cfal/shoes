@@ -6,4 +6,5 @@ pub mod runtime;
 pub mod selection;
 pub mod store;
 pub mod tracked_stream;
+pub mod url_test;
 pub mod validation;

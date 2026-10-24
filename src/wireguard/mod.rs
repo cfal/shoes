@@ -262,9 +262,7 @@ impl Prepared {
             }
             Ok(())
         })?;
-        if !validated.control.listeners.is_empty()
-            && let Some(catalog) = &mut validated.catalog
-        {
+        if let Some(catalog) = &mut validated.catalog {
             for node in catalog.nodes.values_mut() {
                 if let crate::control::catalog::CatalogNode::Leaf(client) = node {
                     crate::config::client_visit::visit_client(client, &mut |client| {

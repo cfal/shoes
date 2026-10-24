@@ -9,7 +9,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::{ApiState, Body, auth, dto, error, full, no_content, probes, streams};
-use crate::config::{ClashApiConfig, GroupStrategy};
+use crate::config::{ClashApiConfig, GroupType};
 use crate::control::catalog::CatalogNode;
 
 pub async fn serve(
@@ -228,7 +228,7 @@ async fn route(
             match generation.catalog.nodes.get(*name) {
                 None => return error(StatusCode::NOT_FOUND, "Not found"),
                 Some(CatalogNode::Group {
-                    strategy: GroupStrategy::Selector,
+                    group_type: GroupType::Selector,
                     ..
                 }) => {}
                 _ => return error(StatusCode::BAD_REQUEST, "Must be a Selector"),

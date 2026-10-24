@@ -63,7 +63,11 @@ pub struct TokioSpawnHandle;
 
 impl Spawn for TokioSpawnHandle {
     fn spawn_bg(&mut self, future: impl Future<Output = ()> + Send + 'static) {
-        tokio::spawn(future);
+        if crate::control::url_test::is_probe() {
+            tokio::spawn(crate::control::url_test::PROBING.scope((), future));
+        } else {
+            tokio::spawn(future);
+        }
     }
 }
 
@@ -200,6 +204,24 @@ mod tests {
     use crate::tcp::socket_connector::SocketConnector;
     use async_trait::async_trait;
 
+    #[tokio::test]
+    async fn url_test_dns_background_dials_preserve_probe_context() {
+        for probing in [false, true] {
+            let (sent, received) = tokio::sync::oneshot::channel();
+            let spawn = async {
+                TokioSpawnHandle.spawn_bg(async move {
+                    sent.send(crate::control::url_test::is_probe()).unwrap();
+                });
+            };
+            if probing {
+                crate::control::url_test::PROBING.scope((), spawn).await;
+            } else {
+                spawn.await;
+            }
+            assert_eq!(received.await.unwrap(), probing);
+        }
+    }
+
     #[derive(Debug)]
     struct PendingSocketConnector;
 
@@ -273,7 +295,7 @@ mod tests {
     async fn new_dns_sockets_follow_direct_selector_changes() {
         let config = r#"
 - client_group: dns-route
-  strategy: selector
+  type: selector
   default: usable
   client_proxies:
     - name: unavailable

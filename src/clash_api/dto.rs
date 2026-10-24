@@ -2,10 +2,11 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io;
 
-use crate::config::{ClientChain, ClientChainHop, ConfigSelection, GroupStrategy};
+use crate::config::{ClientChain, ClientChainHop, ConfigSelection, GroupType};
 use crate::control::catalog::{Catalog, CatalogNode, protocol_type};
 use crate::control::runtime::Generation;
 use crate::control::selection::Choices;
+use crate::control::url_test::AutomaticGroup;
 use crate::option_util::OneOrSome;
 
 pub fn leaf_udp_support(catalog: &Catalog) -> io::Result<HashMap<String, bool>> {
@@ -33,10 +34,14 @@ pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<V
             json!({"name":name,"type":protocol_type(&client.protocol),"udp":udp})
         }
         CatalogNode::Reject => json!({"name":name,"type":"Reject","udp":false}),
-        CatalogNode::Group { members, strategy } => {
-            let proxy_type = match strategy {
-                GroupStrategy::Selector => "Selector",
-                GroupStrategy::RoundRobin => "LoadBalance",
+        CatalogNode::Group {
+            members,
+            group_type,
+        } => {
+            let proxy_type = match group_type {
+                GroupType::Selector => "Selector",
+                GroupType::RoundRobin => "LoadBalance",
+                GroupType::UrlTest(_) => "URLTest",
             };
             let mut value = json!({
                 "name": name,
@@ -51,7 +56,32 @@ pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<V
         }
     };
     generation.probes.decorate(name, &mut value);
+    if let Some(group) = generation.catalog.selection.automatic.0.get(name) {
+        let selected = automatic_member(generation, choices, group, false)?;
+        let health = group.health(&selected);
+        value["now"] = json!(selected);
+        value["udpNow"] = json!(automatic_member(generation, choices, group, true));
+        value["testUrl"] = json!(group.config.url);
+        value["health"] = json!(health);
+        value["alive"] = json!(health == "healthy");
+        value["history"] = generation.probes.url_history(&selected, &group.config.url);
+    }
     Some(value)
+}
+
+fn automatic_member(
+    generation: &Generation,
+    choices: &Choices,
+    group: &AutomaticGroup,
+    udp: bool,
+) -> Option<String> {
+    let eligible = group
+        .members
+        .iter()
+        .filter(|name| !udp || supports_udp(generation, choices, name, 1))
+        .map(String::as_str)
+        .collect();
+    group.choose(&eligible, udp)
 }
 
 fn supports_udp(generation: &Generation, choices: &Choices, name: &str, depth: usize) -> bool {
@@ -59,8 +89,11 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str, depth: u
         return false;
     }
     match generation.catalog.nodes.get(name) {
-        Some(CatalogNode::Group { members, strategy }) => {
-            if *strategy == GroupStrategy::Selector {
+        Some(CatalogNode::Group {
+            members,
+            group_type,
+        }) => {
+            if *group_type == GroupType::Selector {
                 choices
                     .get(name)
                     .is_some_and(|name| supports_udp(generation, choices, name, depth + 1))
@@ -108,13 +141,59 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn url_test_dto_reports_transport_eligible_members_and_url_health() {
+        let configs = serde_json::from_value(json!([
+            {"client_group":"manual", "type":"selector", "default":"tcp", "client_proxies":[
+                "direct", {"name":"tcp", "address":"proxy.invalid:80", "protocol":{"type":"http"}}
+            ]},
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":[
+                "manual", {"name":"udp", "protocol":{"type":"direct"}}
+            ]}
+        ])).unwrap();
+        let catalog = crate::config::create_server_configs(configs)
+            .unwrap()
+            .catalog
+            .unwrap();
+        let generation = Generation {
+            id: 1,
+            leaf_udp_support: leaf_udp_support(&catalog).unwrap(),
+            catalog,
+            rules: Vec::new(),
+            probes: super::super::probes::ProbeState::new(
+                Arc::new(crate::resolver::NativeResolver::new()),
+                Vec::new(),
+            ),
+        };
+        let mut owner = SelectionOwner::new(None).unwrap();
+        owner
+            .activate(generation.catalog.selection.clone())
+            .unwrap();
+        let node = proxies(&generation)["proxies"]["auto"].clone();
+        assert_eq!(node["now"], "manual");
+        assert_eq!(node["udpNow"], "udp");
+        assert_eq!(node["health"], "unprobed");
+        assert_eq!(node["alive"], false);
+        let automatic = &generation.catalog.selection.automatic;
+        automatic.record("manual", "http://probe.invalid/", Some(5));
+        automatic.record("udp", "http://probe.invalid/", Some(100));
+        let node = proxies(&generation)["proxies"]["auto"].clone();
+        assert_eq!(node["type"], "URLTest");
+        assert_eq!(node["now"], "manual");
+        assert_eq!(node["udpNow"], "udp");
+        assert_eq!(node["udp"], true);
+        assert_eq!(node["health"], "healthy");
+        owner.select("manual", "DIRECT").unwrap();
+        assert_eq!(proxies(&generation)["proxies"]["auto"]["udpNow"], "manual");
+    }
+
+    #[test]
     fn catalog_dtos_preserve_group_types_members_and_selected_udp_support() {
         let configs = serde_json::from_value(json!([
             {"client_group":"child", "client_proxies":[
                 {"name":"east", "address":"east.invalid:1080", "protocol":{"type":"socks"}},
                 "direct"
             ]},
-            {"client_group":"outbound", "strategy":"selector", "default":"child", "client_proxies":[
+            {"client_group":"outbound", "type":"selector", "default":"child", "client_proxies":[
                 "child",
                 {"name":"west", "address":"west.invalid:1080", "protocol":{"type":"socks"}}
             ]}
