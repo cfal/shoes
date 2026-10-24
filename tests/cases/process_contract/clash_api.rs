@@ -746,6 +746,87 @@ async fn controller_dispatch_preserves_preflight_and_error_ordering() {
 }
 
 #[tokio::test]
+async fn wildcard_cors_preserves_authentication_and_preflight_restrictions() {
+    let mut fixture = Fixture::new().await;
+    fixture.tcp_controller_mut()["cors_origins"] = json!(["*"]);
+    let mut process = fixture.start().await;
+    let authorization = format!("Bearer {SECRET}");
+    for origin in ["https://other.example", "http://localhost:3000", "null"] {
+        for (credential, expected) in [
+            (None, 401),
+            (Some("Bearer wrong"), 401),
+            (Some(authorization.as_str()), 200),
+        ] {
+            let mut headers = vec![("Origin", origin)];
+            if let Some(credential) = credential {
+                headers.push(("Authorization", credential));
+            }
+            let (status, headers, _) = request_io(
+                TcpStream::connect(fixture.api).await.unwrap(),
+                "GET",
+                "/version",
+                Value::Null,
+                &headers,
+            )
+            .await;
+            assert_eq!(status, expected);
+            assert_eq!(headers["access-control-allow-origin"], origin);
+            assert_eq!(headers["vary"], "Origin");
+        }
+    }
+    let origin = "https://other.example";
+    for (method, requested_headers, private_network, expected) in [
+        ("PUT", "Authorization, Content-Type", false, 204),
+        ("TRACE", "Authorization", false, 403),
+        ("PUT", "X-Custom", false, 403),
+        ("PUT", "Authorization", true, 403),
+    ] {
+        let mut headers = vec![
+            ("Origin", origin),
+            ("Access-Control-Request-Method", method),
+            ("Access-Control-Request-Headers", requested_headers),
+        ];
+        if private_network {
+            headers.push(("Access-Control-Request-Private-Network", "true"));
+        }
+        let (status, headers, _) = request_io(
+            TcpStream::connect(fixture.api).await.unwrap(),
+            "OPTIONS",
+            "/proxies/outbound",
+            Value::Null,
+            &headers,
+        )
+        .await;
+        assert_eq!(status, expected);
+        assert_eq!(headers["access-control-allow-origin"], origin);
+        assert!(
+            headers
+                .get("access-control-allow-private-network")
+                .is_none()
+        );
+    }
+    for (token, expected) in [("", 401), ("wrong", 401), (SECRET, 101)] {
+        let (status, headers, _) = request_io(
+            TcpStream::connect(fixture.api).await.unwrap(),
+            "GET",
+            &format!("/connections?token={token}"),
+            Value::Null,
+            &[
+                ("Origin", origin),
+                ("Connection", "Upgrade"),
+                ("Upgrade", "websocket"),
+                ("Sec-WebSocket-Version", "13"),
+                ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ],
+        )
+        .await;
+        assert_eq!(status, expected);
+        assert_eq!(headers["access-control-allow-origin"], origin);
+    }
+    fixture.stop(&mut process).await;
+}
+
+#[tokio::test]
 async fn defaults_follow_config_without_cache_writes_and_controller_changes_reject_reload() {
     let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;

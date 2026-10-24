@@ -13,7 +13,11 @@ pub fn origin<B>(
         return Err(StatusCode::FORBIDDEN);
     }
     let origin = origin.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
-    if config.cors_origins.iter().any(|allowed| allowed == origin) {
+    if config
+        .cors_origins
+        .iter()
+        .any(|allowed| allowed == "*" || allowed == origin)
+    {
         Ok(Some(origin.to_owned()))
     } else {
         Err(StatusCode::FORBIDDEN)
@@ -118,6 +122,36 @@ mod tests {
             .headers_mut()
             .insert("origin", HeaderValue::from_bytes(b"\xff").unwrap());
         assert_eq!(origin(&request, &config), Err(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn wildcard_allows_any_origin_but_still_requires_one_valid_header() {
+        let mut config = config();
+        config.cors_origins = vec!["*".into()];
+        let mut request = Request::new(());
+        assert_eq!(origin(&request, &config), Ok(None));
+        for value in ["https://other.example", "http://localhost:3000", "null"] {
+            request
+                .headers_mut()
+                .insert("origin", value.parse().unwrap());
+            assert_eq!(origin(&request, &config), Ok(Some(value.into())));
+        }
+        request
+            .headers_mut()
+            .append("origin", "https://other.example".parse().unwrap());
+        assert_eq!(origin(&request, &config), Err(StatusCode::FORBIDDEN));
+        request
+            .headers_mut()
+            .insert("origin", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert_eq!(origin(&request, &config), Err(StatusCode::FORBIDDEN));
+
+        config.cors_origins.clear();
+        request
+            .headers_mut()
+            .insert("origin", "https://other.example".parse().unwrap());
+        assert_eq!(origin(&request, &config), Err(StatusCode::FORBIDDEN));
+        request.headers_mut().remove("origin");
+        assert_eq!(origin(&request, &config), Ok(None));
     }
 
     #[test]

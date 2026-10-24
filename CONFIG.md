@@ -311,13 +311,17 @@ Listener definitions and `cache_file_path` require a restart to change.
 
 Every listener requires a nonempty secret. HTTP uses `Authorization: Bearer
 <secret>`; supported WebSocket upgrades also accept `?token=`. Browser origins
-must exactly match `cors_origins`; the default empty list permits authenticated
-non-browser clients without an Origin header. Wildcards and `null` origins are
-not accepted. Optional `allow_private_network: true` enables private-network
-preflight responses for allowed origins, not mixed-content bypass. Protect TCP
-with a firewall and external TLS termination. Unix sockets require an absolute
-path in an existing owner-only directory and are created with mode `0600`.
-Browsers need an HTTP reverse proxy to use a Unix socket.
+must exactly match `cors_origins`, unless `cors_origins: ["*"]` explicitly allows
+any origin, including opaque (`null`) origins. This applies to HTTP and WebSocket
+requests and does not disable authentication. Prefer exact origins when possible.
+With `*`, any website can attempt authenticated requests; use a long random secret.
+The default empty list permits authenticated clients without an Origin header
+but rejects requests carrying one. Only a standalone `*` acts as a wildcard;
+literal `null` entries are not accepted. Optional `allow_private_network: true`
+enables private-network preflight responses for allowed origins, not mixed-content
+bypass. Protect TCP with a firewall and external TLS termination. Unix sockets
+require an absolute path in an existing owner-only directory and are created
+with mode `0600`. Browsers need an HTTP reverse proxy to use a Unix socket.
 
 Opt into manual selection explicitly:
 

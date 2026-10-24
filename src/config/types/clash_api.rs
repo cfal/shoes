@@ -61,6 +61,9 @@ impl<'de> Deserialize<'de> for ClashApiConfig {
             return Err(Error::custom("Clash API secret must be nonempty"));
         }
         for origin in &fields.cors_origins {
+            if origin == "*" {
+                continue;
+            }
             let parsed = url::Url::parse(origin)
                 .map_err(|_| Error::custom("invalid Clash API CORS origin"))?;
             if !matches!(parsed.scheme(), "http" | "https")
@@ -72,7 +75,7 @@ impl<'de> Deserialize<'de> for ClashApiConfig {
                 || parsed.origin().ascii_serialization() != *origin
             {
                 return Err(Error::custom(
-                    "Clash API CORS origins must be exact HTTP(S) origins without paths or credentials",
+                    "Clash API CORS origins must be '*' or exact HTTP(S) origins without paths or credentials",
                 ));
             }
         }
@@ -217,9 +220,8 @@ mod tests {
     }
 
     #[test]
-    fn clash_api_origins_are_exact_and_explicit() {
+    fn clash_api_origins_are_exact_or_explicitly_unrestricted() {
         for origin in [
-            "*",
             "null",
             "https://example.com/",
             "https://user@example.com",
@@ -234,6 +236,18 @@ mod tests {
             "clash_api_address: '127.0.0.1:9'\nsecret: hidden\ncors_origins: ['https://dashboard.example.com']",
         ).unwrap();
         assert_eq!(config.cors_origins, ["https://dashboard.example.com"]);
+        for origins in ["['*']", "['https://dashboard.example.com', '*']"] {
+            let input = format!(
+                "clash_api_address: '127.0.0.1:9'\nsecret: hidden\ncors_origins: {origins}"
+            );
+            let config: ClashApiConfig = serde_yaml::from_str(&input).unwrap();
+            assert!(config.cors_origins.iter().any(|origin| origin == "*"));
+            let yaml = serde_yaml::to_string(&config).unwrap();
+            assert_eq!(
+                serde_yaml::from_str::<ClashApiConfig>(&yaml).unwrap(),
+                config
+            );
+        }
     }
 
     #[test]
