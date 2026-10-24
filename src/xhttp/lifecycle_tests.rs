@@ -1593,78 +1593,138 @@ async fn h1_waiting_packet_ack_does_not_consume_another_sessions_connections() {
 }
 
 #[tokio::test]
-async fn h1_packet_connection_close_redials_without_replaying_packets() {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-        let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
-        let received = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let packets = received.clone();
-        let tasks = Tasks::new();
-        tasks.spawn(async move {
-            let mut connections = tokio::task::JoinSet::new();
-            loop {
-                let (socket, _) = tokio::select! {
-                    accepted = listener.accept() => accepted.unwrap(),
-                    _ = connections.join_next(), if !connections.is_empty() => continue,
-                };
-                let packets = packets.clone();
-                connections.spawn(async move {
-                    let service = hyper::service::service_fn(
-                        move |request: Request<hyper::body::Incoming>| {
-                            let packets = packets.clone();
-                            async move {
-                                if request.method() == http::Method::GET {
-                                    let memory =
-                                        Memory::new(Arc::new(Budget::new(Some(1024))), Some(1024));
-                                    let (writer, reader) = pipe(memory);
-                                    return Ok::<_, io::Error>(Response::new(
-                                        Body::stream(reader).with_guard(writer),
-                                    ));
+async fn url_test_h1_packet_redials_preserve_activity_context_without_replay() {
+    #[derive(Debug)]
+    struct ActivityDialer {
+        inner: Dialer,
+        groups: crate::control::url_test::AutomaticGroups,
+    }
+
+    #[async_trait]
+    impl CarrierDialer for ActivityDialer {
+        fn route_key(&self) -> &RouteKey {
+            self.inner.route_key()
+        }
+
+        async fn open_stream(&self) -> io::Result<Box<dyn AsyncStream>> {
+            self.groups.touch("carrier", false);
+            self.inner.open_stream().await
+        }
+    }
+
+    for background in [false, true] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+            let received = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let packets = received.clone();
+            let tasks = Tasks::new();
+            tasks.spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    let (socket, _) = tokio::select! {
+                        accepted = listener.accept() => accepted.unwrap(),
+                        _ = connections.join_next(), if !connections.is_empty() => continue,
+                    };
+                    let packets = packets.clone();
+                    connections.spawn(async move {
+                        let service = hyper::service::service_fn(
+                            move |request: Request<hyper::body::Incoming>| {
+                                let packets = packets.clone();
+                                async move {
+                                    if request.method() == http::Method::GET {
+                                        let memory = Memory::new(
+                                            Arc::new(Budget::new(Some(1024))),
+                                            Some(1024),
+                                        );
+                                        let (writer, reader) = pipe(memory);
+                                        return Ok::<_, io::Error>(Response::new(
+                                            Body::stream(reader).with_guard(writer),
+                                        ));
+                                    }
+                                    let path = request.uri().path().to_owned();
+                                    let data =
+                                        request.into_body().collect().await.unwrap().to_bytes();
+                                    packets.lock().push((path, data));
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    Ok(Response::builder()
+                                        .header("connection", "close")
+                                        .body(Body::Empty)
+                                        .unwrap())
                                 }
-                                let path = request.uri().path().to_owned();
-                                let data = request.into_body().collect().await.unwrap().to_bytes();
-                                packets.lock().push((path, data));
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                Ok(Response::builder()
-                                    .header("connection", "close")
-                                    .body(Body::Empty)
-                                    .unwrap())
-                            }
-                        },
-                    );
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
-                        .await;
-                });
+                            },
+                        );
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                            .await;
+                    });
+                }
+            });
+            let config =
+                serde_json::from_value(serde_json::json!({"protocol":{"type":"socks"}})).unwrap();
+            let client = configured_client(config, XhttpVersion::H1, XhttpMode::PacketUp);
+            let mut groups = crate::control::url_test::AutomaticGroups::default();
+            groups
+                .insert(
+                    "carrier".into(),
+                    crate::config::UrlTestConfig {
+                        url: "http://probe.invalid/".into(),
+                        interval: 10,
+                        timeout: 1000,
+                        tolerance: 50,
+                        lazy: true,
+                    },
+                    vec!["peer".into()],
+                )
+                .unwrap();
+            assert!(
+                groups.0["carrier"]
+                    .due_members(tokio::time::Instant::now() - Duration::from_secs(11))
+                    .is_some()
+            );
+            let dialer = Arc::new(ActivityDialer {
+                groups,
+                inner: Dialer {
+                    address,
+                    key: RouteKey(vec![1]),
+                    opens: AtomicUsize::new(0),
+                },
+            });
+            let session = async {
+                let mut stream = client.open(dialer.clone()).await.unwrap();
+                for byte in 0..3 {
+                    stream.write_all(&[byte]).await.unwrap();
+                    stream.flush().await.unwrap();
+                    while received.lock().len() <= byte as usize {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                stream.shutdown().await.unwrap();
+            };
+            if background {
+                crate::control::url_test::BACKGROUND
+                    .scope((), session)
+                    .await;
+            } else {
+                session.await;
             }
-        });
-        let config =
-            serde_json::from_value(serde_json::json!({"protocol":{"type":"socks"}})).unwrap();
-        let client = configured_client(config, XhttpVersion::H1, XhttpMode::PacketUp);
-        let dialer = Arc::new(Dialer {
-            address,
-            key: RouteKey(vec![1]),
-            opens: AtomicUsize::new(0),
-        });
-        let mut stream = client.open(dialer.clone()).await.unwrap();
-        for byte in 0..3 {
-            stream.write_all(&[byte]).await.unwrap();
-            stream.flush().await.unwrap();
-            while received.lock().len() <= byte as usize {
-                tokio::task::yield_now().await;
+            assert_eq!(dialer.inner.opens.load(Ordering::Relaxed), 4);
+            assert_eq!(
+                dialer.groups.0["carrier"]
+                    .due_members(tokio::time::Instant::now())
+                    .is_some(),
+                !background
+            );
+            let received = received.lock();
+            assert_eq!(received.len(), 3);
+            for (sequence, (path, bytes)) in received.iter().enumerate() {
+                assert!(path.ends_with(&format!("/{sequence}")));
+                assert_eq!(bytes.as_ref(), &[sequence as u8]);
             }
-        }
-        stream.shutdown().await.unwrap();
-        assert_eq!(dialer.opens.load(Ordering::Relaxed), 4);
-        let received = received.lock();
-        assert_eq!(received.len(), 3);
-        for (sequence, (path, bytes)) in received.iter().enumerate() {
-            assert!(path.ends_with(&format!("/{sequence}")));
-            assert_eq!(bytes.as_ref(), &[sequence as u8]);
-        }
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
+    }
 }
 
 #[tokio::test]
