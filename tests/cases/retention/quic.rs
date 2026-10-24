@@ -14,7 +14,7 @@ pub(super) async fn exercise(baseline: &Snapshot) {
     .unwrap();
     let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
     for cycle in 0..8 {
-        let (server, released) = QuicEndpoint::listen(
+        let (server, mut released) = QuicEndpoint::listen(
             server_config.clone(),
             std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
             1024,
@@ -70,12 +70,18 @@ pub(super) async fn exercise(baseline: &Snapshot) {
         timeout(CLEANUP, server_conn.closed()).await.unwrap();
         assert!(peer_send.write_all(b"closed").await.is_err());
         assert!(peer_recv.read(&mut [0]).await.is_err());
-        assert!(
-            sample().quic_bytes >= baseline.quic_bytes + 1024,
+        assert_eq!(
+            sample().quic_bytes,
+            baseline.quic_bytes + 2048,
             "application handles still own their reservation"
+        );
+        assert_eq!(
+            released.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         );
         drop((server_conn, peer_send, peer_recv));
         assert!(timeout(CLEANUP, released).await.unwrap().is_err());
+        assert_eq!(sample().quic_bytes, baseline.quic_bytes + 1024);
         drop(std::net::UdpSocket::bind(bound).unwrap());
         client.close(0u32.into(), b"done");
         drop((client_conn, send, recv, client));

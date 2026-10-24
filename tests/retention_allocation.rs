@@ -26,7 +26,7 @@ fn failed_compilation() {
     assert!(error.to_string().contains("ports must be"));
 }
 
-fn same_live(before: Allocations, after: Allocations) {
+fn assert_same_live_allocations(before: Allocations, after: Allocations) {
     assert_eq!(after.live_bytes, before.live_bytes, "requested live bytes");
     assert_eq!(
         after.live_allocations, before.live_allocations,
@@ -51,13 +51,17 @@ fn compiled_generations_and_rejected_partial_builds_release_their_allocations() 
     ALLOCATOR.reset_peak();
     for (index, sample) in samples.iter_mut().enumerate() {
         failed_compilation();
-        same_live(baseline, ALLOCATOR.snapshot());
+        assert_same_live_allocations(baseline, ALLOCATOR.snapshot());
 
-        let old = Arc::downgrade(&current);
-        let pins = std::array::from_fn::<_, 4, _>(|offset| generation(index * 4 + offset));
-        let weak = pins.each_ref().map(Arc::downgrade);
+        let previous_owner = Arc::downgrade(&current);
+        let pins: [Arc<Predicate>; 4] =
+            std::array::from_fn(|offset| generation(index * 4 + offset));
+        let weak_pins = pins.each_ref().map(Arc::downgrade);
         current = generation(index + 1);
-        assert!(old.upgrade().is_none(), "replaced owner retained");
+        assert!(
+            previous_owner.upgrade().is_none(),
+            "replaced owner retained"
+        );
         for (offset, predicate) in pins.iter().enumerate() {
             assert_eq!(
                 predicate.evaluate(
@@ -70,15 +74,15 @@ fn compiled_generations_and_rejected_partial_builds_release_their_allocations() 
         }
         assert!(ALLOCATOR.snapshot().live_bytes > baseline.live_bytes);
         drop(pins);
-        assert!(weak.iter().all(|pin| pin.upgrade().is_none()));
-        drop(weak);
-        drop(old);
+        assert!(weak_pins.iter().all(|pin| pin.upgrade().is_none()));
+        drop(weak_pins);
+        drop(previous_owner);
         *sample = ALLOCATOR.snapshot();
-        same_live(baseline, *sample);
+        assert_same_live_allocations(baseline, *sample);
     }
     drop(current);
     let destroyed = ALLOCATOR.snapshot();
-    same_live(empty, destroyed);
+    assert_same_live_allocations(empty, destroyed);
     for (cycle, sample) in samples.iter().enumerate() {
         println!(
             "cycle={cycle} state=one_owner live_bytes={} live_allocations={} allocations={} peak_bytes={}",

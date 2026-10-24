@@ -109,8 +109,9 @@ Bound network waits, assert exact payloads and EOF/error outcomes, and propagate
 fixture-task failures rather than accepting a timeout as proof of rejection.
 
 The `process::retention_tests::` library case launches an exact-filter child to
-isolate process-global budgets and descriptor counts from parallel tests. It
-repeats partial listener startup failures, malformed and cancelled SOCKS
+isolate process-global budgets and descriptor counts from parallel tests. The
+child must run exactly one passing test, so a stale filter cannot silently pass.
+The case repeats partial listener startup failures, malformed and cancelled SOCKS
 handshakes, TCP generation retirement with live and stalled sessions, owner
 destruction, and QUIC endpoint/stream ownership. Every cycle must restore its
 known baseline within five seconds, including Tokio live tasks and active

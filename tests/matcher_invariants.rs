@@ -1,7 +1,7 @@
 use shoes::rules::{Compiler, Expression, Outcome};
 
 // Fixed generator and seed make failures independent of rand crate versions.
-fn next(state: &mut u64) -> u16 {
+fn next_port(state: &mut u64) -> u16 {
     *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
     (*state >> 32) as u16
 }
@@ -12,9 +12,9 @@ fn port_range_union_matches_linear_oracle_and_boolean_composition() {
     for case in 0..128 {
         let mut ranges = Vec::new();
         for _ in 0..32 {
-            let a = next(&mut seed);
-            let b = a.saturating_add(next(&mut seed) % 256);
-            ranges.push((a, b));
+            let start = next_port(&mut seed);
+            let end = start.saturating_add(next_port(&mut seed) % 256);
+            ranges.push((start, end));
         }
         ranges.extend([(0, 0), (u16::MAX, u16::MAX), ranges[0]]);
         let expression = Expression::PortRanges(ranges.clone());
@@ -30,13 +30,16 @@ fn port_range_union_matches_linear_oracle_and_boolean_composition() {
             .unwrap();
         let queries = ranges
             .iter()
-            .flat_map(|&(a, b)| [a.saturating_sub(1), a, b, b.saturating_add(1)])
-            .chain((0..256).map(|_| next(&mut seed)));
+            .flat_map(|&(start, end)| [start.saturating_sub(1), start, end, end.saturating_add(1)])
+            .chain((0..256).map(|_| next_port(&mut seed)));
         for port in queries {
-            let expected = if ranges.iter().any(|&(a, b)| a <= port && port <= b) {
-                Outcome::Match
+            let matches = ranges
+                .iter()
+                .any(|&(start, end)| start <= port && port <= end);
+            let (expected, inverted_expected) = if matches {
+                (Outcome::Match, Outcome::Miss)
             } else {
-                Outcome::Miss
+                (Outcome::Miss, Outcome::Match)
             };
             assert_eq!(
                 predicate.evaluate(None, None, port),
@@ -50,7 +53,7 @@ fn port_range_union_matches_linear_oracle_and_boolean_composition() {
             );
             assert_eq!(
                 inverted.evaluate(None, None, port),
-                expected.negate(),
+                inverted_expected,
                 "case={case} port={port}"
             );
         }
