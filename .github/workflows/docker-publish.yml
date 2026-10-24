@@ -130,7 +130,7 @@ jobs:
           name: docker-digests-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
 
   publish_sha:
     name: Publish Commit Image
