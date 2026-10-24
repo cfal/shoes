@@ -158,9 +158,10 @@ impl Material {
         let certs = rustls::pki_types::CertificateDer::pem_slice_iter(cert.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| invalid("invalid certificate PEM"))?;
-        let leaf = certs
-            .first()
-            .ok_or_else(|| invalid("empty certificate chain"))?;
+        if certs.is_empty() {
+            return Err(invalid("empty certificate chain"));
+        }
+        let mut parsed_certs = Vec::with_capacity(certs.len());
         let mut not_before = i64::MIN;
         let mut not_after = i64::MAX;
         for cert in &certs {
@@ -171,12 +172,11 @@ impl Material {
             }
             not_before = not_before.max(parsed.validity().not_before.timestamp());
             not_after = not_after.min(parsed.validity().not_after.timestamp());
+            parsed_certs.push(parsed);
         }
-        for pair in certs.windows(2) {
-            let (_, child) = x509_parser::parse_x509_certificate(&pair[0])
-                .map_err(|_| invalid("invalid certificate chain"))?;
-            let (_, issuer) = x509_parser::parse_x509_certificate(&pair[1])
-                .map_err(|_| invalid("invalid certificate chain"))?;
+        for pair in parsed_certs.windows(2) {
+            let child = &pair[0];
+            let issuer = &pair[1];
             let key = issuer.public_key();
             let verified = rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms
@@ -200,10 +200,8 @@ impl Material {
                 return Err(invalid("invalid certificate chain signature or order"));
             }
         }
-        let (_, parsed) = x509_parser::parse_x509_certificate(leaf)
-            .map_err(|_| invalid("invalid leaf certificate"))?;
         if !domains.is_empty() {
-            let san = parsed
+            let san = parsed_certs[0]
                 .subject_alternative_name()
                 .map_err(|_| invalid("invalid certificate SAN"))?
                 .ok_or_else(|| invalid("certificate has no SAN"))?;
@@ -630,15 +628,7 @@ pub(crate) fn configure(configs: &mut [Config]) -> io::Result<Vec<Arc<Source>>> 
         match pems.get(value) {
             Some(PemSource::Path(path)) => Input::File(path.into()),
             Some(PemSource::Data(data)) => Input::Inline(data.clone()),
-            None if !value.trim_start().starts_with("-----BEGIN")
-                && (value.contains('/')
-                    || value.contains('\\')
-                    || [".pem", ".crt", ".key"]
-                        .iter()
-                        .any(|ext| value.ends_with(ext))) =>
-            {
-                Input::File(value.into())
-            }
+            None if crate::config::is_pem_file_path(value) => Input::File(value.into()),
             None => Input::Inline(value.into()),
         }
     };

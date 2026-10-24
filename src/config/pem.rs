@@ -7,6 +7,7 @@ use log::debug;
 use super::types::{
     ClientChainHop, ClientConfig, ClientConfigGroup, ClientProxyConfig, Config, NamedPem,
     PemSource, RuleActionConfig, ServerConfig, ServerProxyConfig, ShadowTlsServerHandshakeConfig,
+    TlsServerConfig,
 };
 use crate::config::ConfigSelection;
 
@@ -21,7 +22,7 @@ pub async fn convert_cert_paths(
     mut all_configs: Vec<Config>,
 ) -> std::io::Result<(Vec<Config>, usize)> {
     crate::certificates::configure(&mut all_configs)?;
-    let mut path_pem_configs: HashMap<String, NamedPem> = HashMap::new();
+    let mut path_pem_names: HashMap<String, String> = HashMap::new();
     let mut data_configs = vec![];
     let mut load_count = 0usize;
     let mut server_configs = vec![];
@@ -48,8 +49,8 @@ pub async fn convert_cert_paths(
                 };
 
                 load_count += 1;
-                data_configs.push(Config::NamedPem(loaded_config.clone()));
-                path_pem_configs.insert(path, loaded_config);
+                path_pem_names.insert(path, loaded_config.pem.clone());
+                data_configs.push(Config::NamedPem(loaded_config));
             }
             Config::Server(server_config) => {
                 server_configs.push(server_config);
@@ -64,7 +65,7 @@ pub async fn convert_cert_paths(
     let mut unknown_pem_paths = HashMap::new();
 
     let mut collect = |pem: &mut String, _| {
-        process_pem_path(pem, &path_pem_configs, &mut unknown_pem_paths);
+        process_pem_path(pem, &path_pem_names, &mut unknown_pem_paths);
     };
 
     // Gather all paths that are inlined but not named.
@@ -324,50 +325,15 @@ fn gather_pem_file_paths_from_server_proxy(
             reality_targets,
             ..
         } => {
-            // Process TLS targets
             for (sni, tls_config) in tls_targets.iter_mut() {
-                visitor(&mut tls_config.cert, PemUsage::ServerIdentity);
-                visitor(&mut tls_config.key, PemUsage::ServerIdentity);
-                for cert in tls_config.client_ca_certs.iter_mut() {
-                    visitor(cert, PemUsage::Reload);
-                }
-
-                // Validate Vision configuration
-                validate_vision_protocol(
-                    tls_config.vision,
-                    &tls_config.protocol,
+                gather_pem_file_paths_from_tls_target(
+                    tls_config,
                     &format!("TLS target '{}'", sni),
+                    visitor,
                 )?;
-
-                // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(&mut tls_config.protocol, visitor)?;
-                // Check override rules
-                for rule in tls_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, visitor);
-                }
             }
-
-            // Process default TLS target
             if let Some(tls_config) = default_tls_target {
-                visitor(&mut tls_config.cert, PemUsage::ServerIdentity);
-                visitor(&mut tls_config.key, PemUsage::ServerIdentity);
-                for cert in tls_config.client_ca_certs.iter_mut() {
-                    visitor(cert, PemUsage::Reload);
-                }
-
-                // Validate Vision configuration
-                validate_vision_protocol(
-                    tls_config.vision,
-                    &tls_config.protocol,
-                    "default TLS target",
-                )?;
-
-                // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(&mut tls_config.protocol, visitor)?;
-                // Check override rules
-                for rule in tls_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, visitor);
-                }
+                gather_pem_file_paths_from_tls_target(tls_config, "default TLS target", visitor)?;
             }
 
             // Process ShadowTLS targets
@@ -429,6 +395,24 @@ fn gather_pem_file_paths_from_server_proxy(
             gather_pem_file_paths_from_server_proxy(&mut config.protocol, visitor)?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn gather_pem_file_paths_from_tls_target(
+    target: &mut TlsServerConfig,
+    label: &str,
+    visitor: &mut PemVisitor<'_>,
+) -> std::io::Result<()> {
+    visitor(&mut target.cert, PemUsage::ServerIdentity);
+    visitor(&mut target.key, PemUsage::ServerIdentity);
+    for cert in target.client_ca_certs.iter_mut() {
+        visitor(cert, PemUsage::Reload);
+    }
+    validate_vision_protocol(target.vision, &target.protocol, label)?;
+    gather_pem_file_paths_from_server_proxy(&mut target.protocol, visitor)?;
+    for rule in target.override_rules.iter_mut() {
+        gather_pem_file_paths_from_rule(rule, visitor);
     }
     Ok(())
 }
@@ -519,7 +503,7 @@ fn gather_pem_file_paths_from_client_proxy(
     }
 }
 
-pub(super) fn is_pem_file_path(s: &str) -> bool {
+pub(crate) fn is_pem_file_path(s: &str) -> bool {
     !s.trim_start().starts_with("-----BEGIN")
         && (s.contains('/')
             || s.contains('\\')
@@ -537,13 +521,13 @@ async fn read_pem_to_string(path: &str) -> std::io::Result<String> {
 
 fn process_pem_path(
     pem: &mut String,
-    known_pem_paths: &HashMap<String, NamedPem>,
+    known_pem_paths: &HashMap<String, String>,
     unknown_pem_paths: &mut HashMap<String, String>,
 ) {
     if is_pem_file_path(pem) {
         match known_pem_paths.get(pem) {
-            Some(named_pem) => {
-                *pem = named_pem.pem.clone();
+            Some(name) => {
+                *pem = name.clone();
             }
             None => {
                 let new_name = format!("inlined-{pem}");
@@ -582,6 +566,131 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn pem_path_classification_preserves_legacy_rules() {
+        for (value, is_path) in [
+            ("chain", false),
+            ("", false),
+            ("server.pem", true),
+            ("server.crt", true),
+            ("server.key", true),
+            ("server.PEM", false),
+            ("certs/server", true),
+            (r"certs\server", true),
+            ("  -----BEGIN CERTIFICATE-----\nabc/def", false),
+        ] {
+            assert_eq!(is_pem_file_path(value), is_path, "{value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_path_aliases_preserve_declarations_and_last_name_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.pem");
+        std::fs::write(&path, "fixture PEM data").unwrap();
+        let configs = serde_yaml::from_value(
+            serde_yaml::to_value(json!([
+                {"pem": "first", "path": path},
+                {"pem": "second", "path": path},
+                {"client_group": "outbound", "client_proxy": {
+                    "address": "127.0.0.1:443", "protocol": {
+                        "type": "tls", "cert": path, "key": path, "protocol": {"type": "socks"}
+                    }
+                }}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let (configs, loaded) = convert_cert_paths(configs).await.unwrap();
+        assert_eq!(loaded, 2);
+        assert_eq!(configs.len(), 3);
+        for (config, name) in configs[..2].iter().zip(["first", "second"]) {
+            let Config::NamedPem(pem) = config else {
+                panic!()
+            };
+            assert_eq!(pem.pem, name);
+            assert!(matches!(&pem.source, PemSource::Data(data) if data == "fixture PEM data"));
+        }
+        let Config::ClientConfigGroup(group) = &configs[2] else {
+            panic!()
+        };
+        let ConfigSelection::Config(client) = group.client_proxies.iter().next().unwrap() else {
+            panic!()
+        };
+        let ClientProxyConfig::Tls(tls) = &client.protocol else {
+            panic!()
+        };
+        assert_eq!(tls.cert.as_deref(), Some("second"));
+        assert_eq!(tls.key.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn tls_pem_traversal_preserves_roles_order_and_vision_labels() {
+        let target = |prefix: &str| {
+            json!({
+                "cert": format!("{prefix}.crt"), "key": format!("{prefix}.key"),
+                "client_ca_certs": format!("{prefix}-ca.crt"), "vision": false,
+                "protocol": {"type": "socks"}
+            })
+        };
+        let expected = [
+            ("named.crt", true),
+            ("named.key", true),
+            ("named-ca.crt", false),
+            ("default.crt", true),
+            ("default.key", true),
+            ("default-ca.crt", false),
+        ];
+        for (vision_pointer, visit_count, error_label) in [
+            (None, 6, None),
+            (
+                Some("/protocol/tls_targets/proxy.test/vision"),
+                3,
+                Some("TLS target 'proxy.test'"),
+            ),
+            (
+                Some("/protocol/default_tls_target/vision"),
+                6,
+                Some("default TLS target"),
+            ),
+        ] {
+            let mut value = json!({"address": "127.0.0.1:8443", "protocol": {
+                "type": "tls", "tls_targets": {"proxy.test": target("named")},
+                "default_tls_target": target("default")
+            }});
+            if let Some(pointer) = vision_pointer {
+                *value.pointer_mut(pointer).unwrap() = true.into();
+            }
+            let mut config: Config =
+                serde_yaml::from_value(serde_yaml::to_value(value).unwrap()).unwrap();
+            let mut visited = Vec::new();
+            let result = visit_config_pems(&mut config, &mut |pem, usage| {
+                visited.push((pem.clone(), matches!(usage, PemUsage::ServerIdentity)));
+            });
+            assert_eq!(
+                visited,
+                expected[..visit_count]
+                    .iter()
+                    .copied()
+                    .map(|(pem, identity)| (pem.to_owned(), identity))
+                    .collect::<Vec<_>>()
+            );
+            match error_label {
+                None => result.unwrap(),
+                Some(label) => {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        format!(
+                            "{label} config has vision=true but inner protocol is SOCKS (not VLESS). \
+                             Vision (XTLS-RPRX-Vision) requires VLESS as the inner protocol. \
+                             Either set vision=false or change the inner protocol to VLESS."
+                        )
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn reload_dependencies_cover_pem_roles_without_live_server_identities() {

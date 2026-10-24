@@ -95,6 +95,61 @@ struct ResponseMetadata {
     retry_after: Option<Instant>,
 }
 
+fn parse_retry_after(headers: &http::HeaderMap) -> io::Result<Option<Instant>> {
+    let Some(value) = headers
+        .get(http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    else {
+        return Ok(None);
+    };
+    let delay = value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .and_then(|date| date.duration_since(SystemTime::now()).ok())
+        });
+    let Some(delay) = delay else {
+        return Ok(None);
+    };
+    if delay > MAX_RETRY_AFTER || SystemTime::now().checked_add(delay).is_none() {
+        return Err(invalid("ACME Retry-After exceeds supported range"));
+    }
+    let deadline = Instant::now()
+        .checked_add(delay)
+        .ok_or_else(|| invalid("ACME Retry-After exceeds supported range"))?;
+    Ok(Some(deadline))
+}
+
+fn validate_directory(
+    status: http::StatusCode,
+    body: &[u8],
+    accepted_terms: Option<&str>,
+) -> io::Result<()> {
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "ACME directory returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let directory: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| invalid("invalid ACME directory"))?;
+    let terms = match directory.pointer("/meta/termsOfService") {
+        Some(serde_json::Value::String(terms)) => Some(terms.as_str()),
+        None | Some(serde_json::Value::Null) => None,
+        _ => return Err(invalid("invalid ACME terms URL metadata")),
+    };
+    if terms != accepted_terms {
+        return Err(invalid(
+            "ACME terms URL differs from explicitly accepted terms_of_service",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Failure {
     error: Box<instant_acme::Error>,
@@ -165,7 +220,7 @@ impl instant_acme::HttpClient for HttpClient {
             client.last.lock().take();
             let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
                 let request_url = request.uri().to_string();
-                let url = validate_url(&request.uri().to_string())?;
+                let url = validate_url(&request_url)?;
                 if url.scheme() == "http" && !client.directory.starts_with("http://") {
                     return Err(invalid(
                         "ACME HTTPS directory cannot downgrade to HTTP endpoints",
@@ -252,35 +307,7 @@ impl instant_acme::HttpClient for HttpClient {
                     {
                         return Err(io::Error::other("ACME response headers exceed 32 KiB"));
                     }
-                    let mut retry_after = None;
-                    if let Some(value) = parts
-                        .headers
-                        .get(http::header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::trim)
-                    {
-                        let delay =
-                            value
-                                .parse::<u64>()
-                                .ok()
-                                .map(Duration::from_secs)
-                                .or_else(|| {
-                                    httpdate::parse_http_date(value).ok().and_then(|date| {
-                                        date.duration_since(SystemTime::now()).ok()
-                                    })
-                                });
-                        if let Some(delay) = delay {
-                            if delay > MAX_RETRY_AFTER
-                                || SystemTime::now().checked_add(delay).is_none()
-                            {
-                                return Err(invalid("ACME Retry-After exceeds supported range"));
-                            }
-                            let deadline = Instant::now().checked_add(delay).ok_or_else(|| {
-                                invalid("ACME Retry-After exceeds supported range")
-                            })?;
-                            retry_after = Some(deadline);
-                        }
-                    }
+                    let retry_after = parse_retry_after(&parts.headers)?;
                     *client.last.lock() = Some(ResponseMetadata {
                         url: request_url,
                         status: parts.status,
@@ -292,24 +319,7 @@ impl instant_acme::HttpClient for HttpClient {
                         .map_err(|_| io::Error::other("ACME response failed or exceeded 1 MiB"))?
                         .to_bytes();
                     if is_directory {
-                        if !parts.status.is_success() {
-                            return Err(io::Error::other(format!(
-                                "ACME directory returned HTTP {}",
-                                parts.status.as_u16()
-                            )));
-                        }
-                        let directory: serde_json::Value = serde_json::from_slice(&bytes)
-                            .map_err(|_| invalid("invalid ACME directory"))?;
-                        let terms = match directory.pointer("/meta/termsOfService") {
-                            Some(serde_json::Value::String(terms)) => Some(terms.as_str()),
-                            None | Some(serde_json::Value::Null) => None,
-                            _ => return Err(invalid("invalid ACME terms URL metadata")),
-                        };
-                        if terms != client.terms.as_deref() {
-                            return Err(invalid(
-                                "ACME terms URL differs from explicitly accepted terms_of_service",
-                            ));
-                        }
+                        validate_directory(parts.status, &bytes, client.terms.as_deref())?;
                     }
                     Ok::<_, io::Error>(instant_acme::BytesResponse::from(
                         http::Response::from_parts(parts, Full::new(bytes)),
@@ -940,20 +950,17 @@ impl Scheduler {
             let key = rcgen::KeyPair::generate()
                 .map_err(|_| instant_acme::Error::Crypto)?
                 .serialize_pem();
-            let result = client
+            let (order, response) = client
                 .perform(deadline, account.new_order(&NewOrder::new(&identifiers)))
                 .await?;
-            state.order_url = Some(result.0.url().to_owned());
+            state.order_url = Some(order.url().to_owned());
             state.order_key = Some(key);
             persist(config, state).map_err(|error| Failure {
-                response: result.1.clone(),
+                response: response.clone(),
                 ..Failure::from(error)
             })?;
-            result
+            (order, response)
         };
-        if order.state().status != OrderStatus::Pending {
-            source.challenges.write().clear();
-        }
         if order.state().status == OrderStatus::Pending {
             let hint = response_deadline(&response);
             if hint > now() {
@@ -968,6 +975,7 @@ impl Scheduler {
                 .await?;
             return Ok(Progress::Pending);
         }
+        source.challenges.write().clear();
         if order.state().status == OrderStatus::Ready {
             let key = rcgen::KeyPair::from_pem(
                 state

@@ -16,6 +16,48 @@ thread_local! {
     pub(super) static FAIL_STATE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[test]
+fn retry_after_parsing_preserves_supported_and_ignored_headers() {
+    let mut headers = http::HeaderMap::new();
+    assert!(parse_retry_after(&headers).unwrap().is_none());
+    for value in [
+        http::HeaderValue::from_static("invalid"),
+        http::HeaderValue::from_static("-1"),
+        http::HeaderValue::from_static("Sat, 01 Jan 2000 00:00:00 GMT"),
+        http::HeaderValue::from_bytes(b"\xff").unwrap(),
+    ] {
+        headers.insert(http::header::RETRY_AFTER, value);
+        assert!(parse_retry_after(&headers).unwrap().is_none());
+    }
+    for (value, seconds) in [("0", 0), (" 120\t", 120)] {
+        headers.insert(http::header::RETRY_AFTER, value.parse().unwrap());
+        let before = Instant::now();
+        let deadline = parse_retry_after(&headers).unwrap().unwrap();
+        let after = Instant::now();
+        let delay = Duration::from_secs(seconds);
+        assert!((before + delay..=after + delay).contains(&deadline));
+    }
+    let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(3600));
+    headers.insert(http::header::RETRY_AFTER, date.parse().unwrap());
+    let remaining = parse_retry_after(&headers)
+        .unwrap()
+        .unwrap()
+        .duration_since(Instant::now());
+    assert!((3598..=3600).contains(&remaining.as_secs()));
+    for seconds in [MAX_RETRY_AFTER.as_secs() + 1, u64::MAX] {
+        headers.insert(
+            http::header::RETRY_AFTER,
+            seconds.to_string().parse().unwrap(),
+        );
+        let error = parse_retry_after(&headers).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "ACME Retry-After exceeds supported range"
+        );
+    }
+}
+
 // Protocol/persistence tests skip short poll waits, but still enter the worker's
 // due-selection path. Scheduling tests use turn() or run() without this shortcut.
 async fn drive(
@@ -724,12 +766,7 @@ async fn issuance_roundtrip(tls_alpn: bool) {
     assert!(lock_state(&config).is_err(), "storage must have one owner");
     let count = Arc::new(AtomicUsize::new(0));
     let mut serving = serve_challenges(listener, source.clone(), tls_alpn, count.clone());
-    let client = HttpClient {
-        tls: client_tls(config.ca_cert.as_deref()).unwrap(),
-        directory: config.directory_url.clone(),
-        terms: config.terms_of_service.clone(),
-        last: Arc::new(Mutex::new(None)),
-    };
+    let client = HttpClient::new(client_tls(config.ca_cert.as_deref()).unwrap(), &config);
     drive(&source, &config, client.clone()).await.unwrap();
     let first = source.current().unwrap().cert[0].clone();
     assert!(source.challenges.read().is_empty());
@@ -861,12 +898,7 @@ async fn ari_window_and_retry_after_survive_restart() {
         let serving_source = source.clone();
         serving
             .spawn(async move { challenge::serve(vec![Arc::new(listener)], serving_source).await });
-        let client = HttpClient {
-            tls: client_tls(config.ca_cert.as_deref()).unwrap(),
-            directory: config.directory_url.clone(),
-            terms: config.terms_of_service.clone(),
-            last: Arc::new(Mutex::new(None)),
-        };
+        let client = HttpClient::new(client_tls(config.ca_cert.as_deref()).unwrap(), &config);
         drive(&source, &config, client.clone()).await.unwrap();
         let turn = drive(&source, &config, client.clone()).await.unwrap();
         assert!(matches!(turn.outcome, Ok(Progress::Idle)));
@@ -1236,12 +1268,7 @@ async fn retry_after_overflow_does_not_stop_issuance_or_ari() {
             false,
             Arc::new(AtomicUsize::new(0)),
         );
-        let client = HttpClient {
-            tls: client_tls(config.ca_cert.as_deref()).unwrap(),
-            directory: config.directory_url.clone(),
-            terms: config.terms_of_service.clone(),
-            last: Arc::new(Mutex::new(None)),
-        };
+        let client = HttpClient::new(client_tls(config.ca_cert.as_deref()).unwrap(), &config);
         let error = drive(&source, &config, client.clone()).await.err().unwrap();
         assert!(failure_message(&error).contains("Retry-After exceeds supported range"));
         assert_eq!(fixture.state.lock().order_requests, 1);
@@ -1318,12 +1345,7 @@ async fn successful_order_retry_after_is_persisted_and_respected_on_restart() {
         workers.shutdown().await;
         let resumed =
             Source::new("restarted".into(), super::super::Spec::Acme(config.clone())).unwrap();
-        let client = HttpClient {
-            tls: client_tls(config.ca_cert.as_deref()).unwrap(),
-            directory: config.directory_url.clone(),
-            terms: config.terms_of_service.clone(),
-            last: Arc::new(Mutex::new(None)),
-        };
+        let client = HttpClient::new(client_tls(config.ca_cert.as_deref()).unwrap(), &config);
         let turn = drive(&resumed, &config, client).await.unwrap();
         assert!(matches!(turn.outcome, Ok(Progress::Deferred)));
         assert!(turn.wake_at >= now() + 890);
@@ -1355,12 +1377,7 @@ async fn finalize_and_restored_order_retry_after_prevent_early_polls() {
             false,
             Arc::new(AtomicUsize::new(0)),
         );
-        let client = HttpClient {
-            tls: client_tls(config.ca_cert.as_deref()).unwrap(),
-            directory: config.directory_url.clone(),
-            terms: config.terms_of_service.clone(),
-            last: Arc::new(Mutex::new(None)),
-        };
+        let client = HttpClient::new(client_tls(config.ca_cert.as_deref()).unwrap(), &config);
         let outcome = drive(&source, &config, client.clone()).await.unwrap();
         assert!(matches!(outcome.outcome, Ok(Progress::Pending)));
         assert!(outcome.wake_at >= now() + 890);
@@ -1374,9 +1391,7 @@ async fn finalize_and_restored_order_retry_after_prevent_early_polls() {
 
         // Simulate the first deadline passing, then a resumed processing response
         // that requests a new delay. No subsequent status response has been read.
-        let mut state = load(&config).unwrap().unwrap();
-        state.retry_at = 0;
-        persist(&config, &state).unwrap();
+        expire_retry(&config);
         fixture.state.lock().finalize_retry_after = None;
         fixture.state.lock().order_retry_after = Some(900);
         let restarted =
@@ -1396,9 +1411,7 @@ async fn finalize_and_restored_order_retry_after_prevent_early_polls() {
         assert!(outcome.wake_at >= now() + 890);
         assert_eq!(fixture.requests.load(Ordering::SeqCst), requests);
 
-        state = load(&config).unwrap().unwrap();
-        state.retry_at = 0;
-        persist(&config, &state).unwrap();
+        expire_retry(&config);
         fixture.state.lock().orders[0].status = "valid";
         fixture.state.lock().order_retry_after = None;
         drive(&restarted, &config, client).await.unwrap();
@@ -1474,12 +1487,7 @@ async fn missing_orders_and_invalid_authorizations_recover_without_an_extra_fail
                 false,
                 Arc::new(AtomicUsize::new(0)),
             );
-            let client = HttpClient {
-                tls: client_tls(config.ca_cert.as_deref()).unwrap(),
-                directory: config.directory_url.clone(),
-                terms: config.terms_of_service.clone(),
-                last: Arc::new(Mutex::new(None)),
-            };
+            let client = HttpClient::new(client_tls(config.ca_cert.as_deref()).unwrap(), &config);
             if let Ok(status) = mode.parse::<u16>() {
                 fixture.state.lock().finalize_retry_after = Some(900);
                 assert!(matches!(
@@ -1489,9 +1497,7 @@ async fn missing_orders_and_invalid_authorizations_recover_without_an_extra_fail
                         .outcome,
                     Ok(Progress::Pending)
                 ));
-                let mut state = load(&config).unwrap().unwrap();
-                state.retry_at = 0;
-                persist(&config, &state).unwrap();
+                expire_retry(&config);
                 fixture.state.lock().finalize_retry_after = None;
                 fixture.state.lock().missing_order_status = Some(status);
             } else {
@@ -1562,12 +1568,7 @@ async fn resumed_processing_challenges_are_served_without_resubmission() {
             false,
             Arc::new(AtomicUsize::new(0)),
         );
-        let client = HttpClient {
-            tls: client_tls(config.ca_cert.as_deref()).unwrap(),
-            directory: config.directory_url.clone(),
-            terms: config.terms_of_service.clone(),
-            last: Arc::new(Mutex::new(None)),
-        };
+        let client = HttpClient::new(client_tls(config.ca_cert.as_deref()).unwrap(), &config);
         assert!(matches!(
             drive(&source, &config, client.clone())
                 .await
@@ -1576,9 +1577,7 @@ async fn resumed_processing_challenges_are_served_without_resubmission() {
             Ok(Progress::Pending)
         ));
         source.challenges.write().clear();
-        let mut state = load(&config).unwrap().unwrap();
-        state.retry_at = 0;
-        persist(&config, &state).unwrap();
+        expire_retry(&config);
         assert!(matches!(
             drive(&source, &config, client.clone())
                 .await
@@ -1588,9 +1587,7 @@ async fn resumed_processing_challenges_are_served_without_resubmission() {
         ));
         assert_eq!(fixture.state.lock().challenge_requests, 1);
         validate_challenge(&fixture.state, 0).await.unwrap();
-        let mut state = load(&config).unwrap().unwrap();
-        state.retry_at = 0;
-        persist(&config, &state).unwrap();
+        expire_retry(&config);
         fixture.state.lock().order_retry_after = None;
         drive(&source, &config, client).await.unwrap();
         assert!(source.current().is_some());
@@ -1694,51 +1691,73 @@ async fn deferred_retries_do_not_reset_failure_backoff() {
 
 #[tokio::test]
 async fn tls_challenge_selection_never_dispatches_or_changes_normal_certificate() {
-    use crate::tcp::tcp_handler::TcpServerHandler;
     tokio::time::timeout(Duration::from_secs(10), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let config = AcmeConfig {
-            domains: vec!["proxy.test".into()], directory_url: "http://127.0.0.1:9/directory".into(),
-            state_dir: "unused".into(), terms_of_service: None, contacts: vec![],
-            challenge: ChallengeConfig::TlsAlpn01, ca_cert: None,
+            domains: vec!["proxy.test".into()],
+            directory_url: "http://127.0.0.1:9/directory".into(),
+            state_dir: "unused".into(),
+            terms_of_service: None,
+            contacts: vec![],
+            challenge: ChallengeConfig::TlsAlpn01,
+            ca_cert: None,
         };
         let source = Source::new("selection".into(), super::super::Spec::Acme(config)).unwrap();
         let authorization = "configured-token.account-thumbprint";
-        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, authorization.as_bytes());
+        let digest =
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, authorization.as_bytes());
         source.challenges.write().push(challenge::Pending {
-            domain: "proxy.test".into(), token: "configured-token".into(), authorization: authorization.into(),
-            expires: Instant::now() + Duration::from_secs(60), tls: Some(challenge::tls_config("proxy.test", digest.as_ref()).unwrap()),
+            domain: "proxy.test".into(),
+            token: "configured-token".into(),
+            authorization: authorization.into(),
+            expires: Instant::now() + Duration::from_secs(60),
+            tls: Some(challenge::tls_config("proxy.test", digest.as_ref()).unwrap()),
         });
         let count = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(tls_handler(source.clone(), count.clone()));
-        let mut serving = JoinSet::new();
-        serving.spawn(async move {
-            let mut connections = JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (stream, _) = accepted.unwrap();
-                        let handler = handler.clone();
-                        connections.spawn(async move { handler.setup_server_stream(Box::new(stream)).await });
-                    }
-                    _ = connections.join_next(), if !connections.is_empty() => {}
-                }
-            }
-        });
+        let mut serving = serve_challenges(listener, source.clone(), true, count.clone());
         let normal = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(normal.cert.der().clone()).unwrap();
-        let mut normal_client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-            .with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+        let mut normal_client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         normal_client.alpn_protocols = vec![b"normal".to_vec()];
         let connector = tokio_rustls::TlsConnector::from(Arc::new(normal_client.clone()));
-        assert!(connector.connect("proxy.test".try_into().unwrap(), TcpStream::connect(address).await.unwrap()).await.is_err());
+        assert!(
+            connector
+                .connect(
+                    "proxy.test".try_into().unwrap(),
+                    TcpStream::connect(address).await.unwrap()
+                )
+                .await
+                .is_err()
+        );
         validate_tls_challenge(address, authorization).await;
         assert_eq!(count.load(Ordering::SeqCst), 0);
-        source.publish(Material::parse(&normal.cert.pem(), &normal.signing_key.serialize_pem(), &["proxy.test".into()]).unwrap());
-        let mut connection = connector.connect("proxy.test".try_into().unwrap(), TcpStream::connect(address).await.unwrap()).await.unwrap();
-        assert_eq!(connection.get_ref().1.peer_certificates().unwrap()[0], *normal.cert.der());
+        source.publish(
+            Material::parse(
+                &normal.cert.pem(),
+                &normal.signing_key.serialize_pem(),
+                &["proxy.test".into()],
+            )
+            .unwrap(),
+        );
+        let mut connection = connector
+            .connect(
+                "proxy.test".try_into().unwrap(),
+                TcpStream::connect(address).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            connection.get_ref().1.peer_certificates().unwrap()[0],
+            *normal.cert.der()
+        );
         let _ = connection.read(&mut [0]).await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         validate_tls_challenge(address, authorization).await;
@@ -1747,25 +1766,51 @@ async fn tls_challenge_selection_never_dispatches_or_changes_normal_certificate(
             ("other.test", true, vec![b"acme-tls/1".to_vec()]),
             ("proxy.test", false, vec![b"acme-tls/1".to_vec()]),
         ] {
-            let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-                .with_safe_default_protocol_versions().unwrap().dangerous()
-                .with_custom_certificate_verifier(Arc::new(ChallengeVerifier(digest.as_ref().to_vec()))).with_no_client_auth();
+            let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(ChallengeVerifier(digest.as_ref().to_vec())))
+            .with_no_client_auth();
             config.alpn_protocols = alpn;
             config.enable_sni = enable_sni;
-            assert!(tokio_rustls::TlsConnector::from(Arc::new(config)).connect(sni.to_owned().try_into().unwrap(), TcpStream::connect(address).await.unwrap()).await.is_err());
+            assert!(
+                tokio_rustls::TlsConnector::from(Arc::new(config))
+                    .connect(
+                        sni.to_owned().try_into().unwrap(),
+                        TcpStream::connect(address).await.unwrap()
+                    )
+                    .await
+                    .is_err()
+            );
         }
         normal_client.alpn_protocols = vec![b"acme-tls/1".to_vec(), b"normal".to_vec()];
         let mut mixed = tokio_rustls::TlsConnector::from(Arc::new(normal_client))
-            .connect("proxy.test".try_into().unwrap(), TcpStream::connect(address).await.unwrap()).await.unwrap();
-        assert_eq!(mixed.get_ref().1.peer_certificates().unwrap()[0], *normal.cert.der());
-        assert_eq!(mixed.get_ref().1.alpn_protocol(), Some(b"normal".as_slice()));
+            .connect(
+                "proxy.test".try_into().unwrap(),
+                TcpStream::connect(address).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            mixed.get_ref().1.peer_certificates().unwrap()[0],
+            *normal.cert.der()
+        );
+        assert_eq!(
+            mixed.get_ref().1.alpn_protocol(),
+            Some(b"normal".as_slice())
+        );
         let _ = mixed.read(&mut [0]).await;
         assert_eq!(count.load(Ordering::SeqCst), 2);
         source.challenges.write()[0].expires = Instant::now();
         assert!(source.challenge_config(Some("proxy.test")).is_none());
         assert_eq!(source.current().unwrap().cert[0], *normal.cert.der());
         serving.shutdown().await;
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

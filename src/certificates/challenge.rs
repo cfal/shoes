@@ -62,7 +62,7 @@ pub(super) fn tls_config(domain: &str, digest: &[u8]) -> io::Result<Arc<rustls::
 }
 
 pub(super) async fn serve(listeners: Vec<Arc<TcpListener>>, source: Arc<Source>) -> io::Result<()> {
-    let mut servers = JoinSet::new();
+    let mut servers = JoinSet::<()>::new();
     for listener in listeners {
         let source = source.clone();
         servers.spawn(async move {
@@ -89,12 +89,10 @@ pub(super) async fn serve(listeners: Vec<Arc<TcpListener>>, source: Arc<Source>)
                     _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
-            #[allow(unreachable_code)]
-            Ok::<(), io::Error>(())
         });
     }
     match servers.join_next().await {
-        Some(result) => result.map_err(io::Error::other)?,
+        Some(result) => result.map_err(io::Error::other),
         None => std::future::pending().await,
     }
 }
