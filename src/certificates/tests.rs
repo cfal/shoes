@@ -155,6 +155,141 @@ fn managed_schema_references_and_coverage() {
     assert!(compile(&duplicate).is_err());
 }
 
+#[test]
+fn source_errors_identify_schema_fields_names_and_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = managed_yaml(
+        &dir.path().join("state"),
+        "type: tls_alpn01",
+        "certificate_source: public",
+    );
+    for (yaml, expected) in [
+        (good.replace("type: tls_alpn01", "type: http-01"), "http-01"),
+        (good.replace("domains:", "domain:"), "domain"),
+        (good.replace("state_dir:", "storage:"), "storage"),
+        (
+            good.replace(
+                "certificate_source: public\n        protocol",
+                "certificate_source: missing\n        protocol",
+            ),
+            "missing",
+        ),
+        (format!("{good}\n{good}"), "public"),
+    ] {
+        let error = compile(&yaml).err().unwrap().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+    let ca = dir.path().join("missing-ca.pem");
+    let yaml = good.replace(
+        "type: acme",
+        &format!("type: acme\n  ca_cert: '{}'", ca.display()),
+    );
+    let error = compile(&yaml).err().unwrap().to_string();
+    assert!(
+        error.contains("public")
+            && error.contains("ca_cert")
+            && error.contains(ca.to_str().unwrap()),
+        "{error}"
+    );
+
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    let spec = Spec::Files {
+        cert: Input::File(cert_path.clone()),
+        key: Input::File(key_path.clone()),
+    };
+    let error = Source::new("@files-3".into(), spec.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("@files-3")
+            && error.contains("certificate file")
+            && error.contains(cert_path.to_str().unwrap()),
+        "{error}"
+    );
+    let cert = certificate();
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    let error = Source::new("@files-3".into(), spec.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("private key file") && error.contains(key_path.to_str().unwrap()),
+        "{error}"
+    );
+
+    let mut params = rcgen::CertificateParams::new(vec!["proxy.test".into()]).unwrap();
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+    let expired = params.self_signed(&cert.signing_key).unwrap();
+    std::fs::write(&cert_path, expired.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+    let error = Source::new("@files-3".into(), spec)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("not currently valid")
+            && error.contains(cert_path.to_str().unwrap())
+            && error.contains(key_path.to_str().unwrap()),
+        "{error}"
+    );
+    assert!(!error.contains("PRIVATE KEY"));
+}
+
+#[tokio::test]
+async fn state_preparation_errors_identify_source_and_storage_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("blocked");
+    let state = parent.join("state");
+    let yaml = managed_yaml(
+        &state,
+        "type: http01, listen: ['127.0.0.1:18080']",
+        "certificate_source: public",
+    );
+    let mut validated = compile(&yaml).unwrap();
+    std::fs::write(&parent, "not a directory").unwrap();
+    let error = Registry::prepare(&mut validated, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("public")
+            && error.contains("state_dir")
+            && error.contains(state.to_str().unwrap()),
+        "{error}"
+    );
+    std::fs::remove_file(&parent).unwrap();
+
+    let Spec::Acme(config) = &validated.certificates[0].spec else {
+        unreachable!()
+    };
+    let lock = acme::lock_state(config).unwrap();
+    std::fs::write(state.join("state.json"), "PRIVATE STATE MUST NOT APPEAR").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            state.join("state.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    drop(lock);
+    let error = Registry::prepare(&mut validated, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("public")
+            && error.contains("state_dir")
+            && error.contains(state.to_str().unwrap())
+            && error.contains("invalid ACME durable state"),
+        "{error}"
+    );
+    assert!(!error.contains("PRIVATE STATE"));
+}
+
 #[tokio::test]
 async fn legacy_paths_named_pems_and_inline_remain_supported() {
     let dir = tempfile::tempdir().unwrap();
@@ -227,6 +362,82 @@ fn tls_base(source: &Arc<Source>, alpn: &str) -> Arc<rustls::ServerConfig> {
         )
         .unwrap(),
     )
+}
+
+#[tokio::test]
+async fn p521_signed_chains_validate_and_rotate() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let issuer = rcgen::CertifiedIssuer::self_signed(
+            params,
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P521_SHA512).unwrap(),
+        ).unwrap();
+        let issue = || {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = rcgen::CertificateParams::new(vec!["proxy.test".into()]).unwrap()
+                .signed_by(&key, &issuer).unwrap();
+            (cert, key)
+        };
+        let (first, first_key) = issue();
+        let chain = format!("{}{}", first.pem(), issuer.pem());
+        // x509-parser's verifier does not cover this provider-supported algorithm.
+        let (_, parsed) = x509_parser::parse_x509_certificate(first.der()).unwrap();
+        let (_, root) = x509_parser::parse_x509_certificate(issuer.der()).unwrap();
+        assert!(parsed.verify_signature(Some(root.public_key())).is_err());
+        let cert_path = directory.path().join("cert.pem");
+        let key_path = directory.path().join("key.pem");
+        std::fs::write(&cert_path, &chain).unwrap();
+        std::fs::write(&key_path, first_key.serialize_pem()).unwrap();
+        for kind in ["inline", "legacy", "named-pem", "named-source"] {
+            let mut configs = vec![];
+            let mut target = serde_json::json!({"cert": cert_path, "key": key_path, "protocol": {"type": "socks"}});
+            match kind {
+                "inline" => {
+                    target["cert"] = serde_json::json!(chain);
+                    target["key"] = serde_json::json!(first_key.serialize_pem());
+                }
+                "named-pem" => {
+                    configs.push(serde_json::json!({"pem": "chain", "path": cert_path}));
+                    configs.push(serde_json::json!({"pem": "private", "path": key_path}));
+                    target["cert"] = serde_json::json!("chain");
+                    target["key"] = serde_json::json!("private");
+                }
+                "named-source" => {
+                    configs.push(serde_json::json!({"certificate_source": "shared", "type": "files", "cert": cert_path, "key": key_path}));
+                    target = serde_json::json!({"certificate_source": "shared", "protocol": {"type": "socks"}});
+                }
+                _ => {}
+            }
+            configs.push(serde_json::json!({"address": "127.0.0.1:18443", "protocol": {"type": "tls", "default_tls_target": target}}));
+            let configs = serde_yaml::from_value(serde_yaml::to_value(configs).unwrap()).unwrap();
+            let (configs, _) = crate::config::convert_cert_paths(configs).await.unwrap();
+            crate::config::create_server_configs(configs).unwrap();
+        }
+        let source = file_source(directory.path());
+        let base = tls_base(&source, "test");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(issuer.der().clone()).unwrap();
+        let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+        client.alpn_protocols = vec![b"test".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        for (cert, key) in [(first, first_key), issue()] {
+            std::fs::write(&cert_path, format!("{}{}", cert.pem(), issuer.pem())).unwrap();
+            std::fs::write(&key_path, key.serialize_pem()).unwrap();
+            source.refresh_files().unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(source.snapshot(&base));
+            let (client, server) = tokio::io::duplex(16 * 1024);
+            let (client, server) = tokio::join!(
+                connector.connect("proxy.test".try_into().unwrap(), client),
+                acceptor.accept(server),
+            );
+            server.unwrap();
+            assert_eq!(client.unwrap().get_ref().1.peer_certificates().unwrap()[0], *cert.der());
+        }
+    }).await.unwrap();
 }
 
 fn tls_client(

@@ -291,7 +291,9 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         } else if map.contains_key("certificate_source") {
             serde_yaml::from_value(value)
                 .map(Config::CertificateSource)
-                .map_err(|_| Error::custom("invalid certificate source configuration"))
+                .map_err(|e| {
+                    Error::custom(format!("invalid certificate source configuration: {e}"))
+                })
         } else if has_pem {
             // NamedPem (pem field is unique to NamedPem)
             serde_yaml::from_value(value)

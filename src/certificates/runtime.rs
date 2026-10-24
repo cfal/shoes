@@ -246,28 +246,37 @@ async fn watch_files(source: &Source) {
     let (tx, mut changes) = tokio::sync::mpsc::channel(1);
     let mut _watcher = None;
     let mut refresh_watch = true;
-    let mut watch_failed = false;
+    let mut watch_error = None;
     let mut next_warning = tokio::time::Instant::now();
     loop {
         // Build replacement watches before dropping the old ones, including symlink targets.
         if refresh_watch {
-            watch_failed = match crate::file_watcher::watch(&paths, tx.clone()) {
+            watch_error = match crate::file_watcher::watch(&paths, tx.clone()) {
                 Ok(next) => {
                     _watcher = Some(next);
-                    false
+                    None
                 }
-                Err(_) => true,
+                Err(error) => Some(error),
             };
         }
         let result = source.refresh_files();
         if matches!(result, Ok(true)) {
             log::info!("Certificate source {} rotated", source.name);
         }
-        if (watch_failed || result.is_err()) && tokio::time::Instant::now() >= next_warning {
-            log::warn!(
-                "Certificate source {} watch or update failed; retrying and retaining last good pair (expired certificates are not served)",
-                source.name
-            );
+        if (watch_error.is_some() || result.is_err()) && tokio::time::Instant::now() >= next_warning
+        {
+            if let Some(error) = &watch_error {
+                log::error!(
+                    "Certificate source {} watch failed: {error}; using reconciliation",
+                    source.name
+                );
+            }
+            if let Err(error) = &result {
+                log::error!(
+                    "Certificate source {} update failed: {error}; retrying and retaining last good pair (expired certificates are not served)",
+                    source.name
+                );
+            }
             next_warning = tokio::time::Instant::now() + RECONCILE;
         }
         // Retry separate writes promptly; reconcile missed events and watch failures periodically.
@@ -277,7 +286,9 @@ async fn watch_files(source: &Source) {
                 crate::file_watcher::debounce(&mut changes, DEBOUNCE).await;
                 refresh_watch = true;
             }
-            _ = tokio::time::sleep(delay) => refresh_watch = delay == RECONCILE,
+            _ = tokio::time::sleep(delay) => {
+                refresh_watch = watch_error.is_some() || matches!(result, Ok(true));
+            },
         }
     }
 }

@@ -50,6 +50,51 @@ async fn persisted_acme_retry_is_reported_once_without_contacting_the_ca() {
 }
 
 #[tokio::test]
+async fn certificate_failures_are_visible_with_default_logging() {
+    timeout(Duration::from_secs(12), async {
+        let directory = tempfile::tempdir().unwrap();
+        let pair = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+        let cert = directory.path().join("cert.pem");
+        let key = directory.path().join("key.pem");
+        std::fs::write(&cert, pair.cert.pem()).unwrap();
+        std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+        let ca = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/directory", ca.local_addr().unwrap());
+        let mut fixture = tokio::task::JoinSet::new();
+        fixture.spawn(async move {
+            let (mut stream, _) = ca.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let mut received = 0;
+            while !request[..received].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                assert!(received < request.len(), "request headers exceed fixture limit");
+                let count = stream.read(&mut request[received..]).await.unwrap();
+                assert_ne!(count, 0, "request ended before headers");
+                received += count;
+            }
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+        });
+        let path = directory.path().join("config.yaml");
+        std::fs::write(&path, serde_yaml::to_string(&json!([
+            {"certificate_source": "files", "type": "files", "cert": cert, "key": key},
+            {"certificate_source": "managed", "type": "acme", "domains": ["proxy.test"], "directory_url": url,
+                "state_dir": directory.path().join("state"), "challenge": {"type": "http01", "listen": [available_address().to_string()]}},
+            {"address": available_address().to_string(), "protocol": {"type": "tls", "default_tls_target": {
+                "certificate_source": "files", "protocol": {"type": "socks"}}}}
+        ])).unwrap()).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .args(["-t", "1"]).arg(&path).env_remove("RUST_LOG")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let mut child = Process::from_child(child);
+        child.wait_for("ACME directory returned HTTP 503").await;
+        std::fs::write(&key, "invalid replacement").unwrap();
+        child.wait_for("Certificate source files update failed").await;
+        child.signal(libc::SIGTERM);
+        assert!(child.exit().await.success());
+        fixture.join_next().await.unwrap().unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn file_rotation_keeps_tcp_and_quic_tunnels_and_rejects_bad_reload() {
     rotation_roundtrip(true, true).await;
 }

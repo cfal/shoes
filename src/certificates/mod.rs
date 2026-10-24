@@ -37,6 +37,23 @@ pub enum SourceConfig {
     Acme(AcmeConfig),
 }
 
+impl NamedSource {
+    pub(crate) fn validate_file_paths(&self) -> io::Result<()> {
+        if let SourceConfig::Files { cert, key } = &self.source {
+            for (field, path) in [("cert", cert), ("key", key)] {
+                let value = path.to_string_lossy();
+                if value.trim_start().starts_with("-----BEGIN") || value.contains(['\r', '\n']) {
+                    return Err(invalid(&format!(
+                        "certificate source {}: {field} requires a file path, not inline material",
+                        self.certificate_source
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
@@ -66,10 +83,22 @@ enum Input {
 }
 
 impl Input {
-    fn read(&self) -> io::Result<String> {
+    fn read(&self, role: &str) -> io::Result<String> {
         match self {
-            Self::File(path) => read_text(path),
+            Self::File(path) => read_text(path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("{role} file '{}': {error}", path.display()),
+                )
+            }),
             Self::Inline(data) => Ok(data.clone()),
+        }
+    }
+
+    fn location(&self) -> String {
+        match self {
+            Self::File(path) => format!("file '{}'", path.display()),
+            Self::Inline(_) => "inline data".into(),
         }
     }
 }
@@ -148,9 +177,26 @@ impl Material {
                 .map_err(|_| invalid("invalid certificate chain"))?;
             let (_, issuer) = x509_parser::parse_x509_certificate(&pair[1])
                 .map_err(|_| invalid("invalid certificate chain"))?;
-            if child.issuer() != issuer.subject()
-                || child.verify_signature(Some(issuer.public_key())).is_err()
-            {
+            let key = issuer.public_key();
+            let verified = rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .all
+                .iter()
+                .any(|algorithm| {
+                    algorithm_matches(algorithm.public_key_alg_id(), &key.algorithm)
+                        && algorithm_matches(
+                            algorithm.signature_alg_id(),
+                            &child.signature_algorithm,
+                        )
+                        && algorithm
+                            .verify_signature(
+                                &key.subject_public_key.data,
+                                child.tbs_certificate.as_ref(),
+                                &child.signature_value.data,
+                            )
+                            .is_ok()
+                });
+            if child.issuer() != issuer.subject() || !verified {
                 return Err(invalid("invalid certificate chain signature or order"));
             }
         }
@@ -192,6 +238,25 @@ impl Material {
     }
 }
 
+fn algorithm_matches(
+    supported: rustls::pki_types::AlgorithmIdentifier,
+    actual: &x509_parser::x509::AlgorithmIdentifier<'_>,
+) -> bool {
+    use x509_parser::asn1_rs::{Any, FromDer, Oid};
+    // rustls stores the AlgorithmIdentifier contents without the enclosing SEQUENCE.
+    let Ok((parameters, oid)) = Oid::from_der(supported.as_ref()) else {
+        return false;
+    };
+    if oid != actual.algorithm {
+        return false;
+    }
+    match &actual.parameters {
+        None => parameters.is_empty(),
+        Some(actual) => Any::from_der(parameters)
+            .is_ok_and(|(rest, expected)| rest.is_empty() && expected == *actual),
+    }
+}
+
 impl Source {
     fn new(name: String, spec: Spec) -> io::Result<Arc<Self>> {
         let trust_digest = match &spec {
@@ -199,11 +264,21 @@ impl Source {
                 .ca_cert
                 .as_ref()
                 .map(|path| {
-                    read_text(path).map(|pem| {
-                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, pem.as_bytes())
-                            .as_ref()
-                            .to_vec()
-                    })
+                    read_text(path)
+                        .map_err(|error| {
+                            io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "certificate source {name}, ACME ca_cert '{}': {error}",
+                                    path.display()
+                                ),
+                            )
+                        })
+                        .map(|pem| {
+                            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, pem.as_bytes())
+                                .as_ref()
+                                .to_vec()
+                        })
                 })
                 .transpose()?,
             Spec::Files { .. } => None,
@@ -230,7 +305,17 @@ impl Source {
         let Spec::Files { cert, key, .. } = &self.spec else {
             return Ok(false);
         };
-        let material = Material::parse(&cert.read()?, &key.read()?, &[])?;
+        let material = Material::parse(&cert.read("certificate")?, &key.read("private key")?, &[])
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "certificate {} and private key {}: {error}",
+                        cert.location(),
+                        key.location()
+                    ),
+                )
+            })?;
         Ok(self.publish(material))
     }
 
@@ -475,6 +560,7 @@ pub(crate) fn configure(configs: &mut [Config]) -> io::Result<Vec<Arc<Source>>> 
                 }
             }
             Config::CertificateSource(named) => {
+                named.validate_file_paths()?;
                 let name = &named.certificate_source;
                 if name.is_empty()
                     || name.len() > 128
@@ -483,7 +569,9 @@ pub(crate) fn configure(configs: &mut [Config]) -> io::Result<Vec<Arc<Source>>> 
                         .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
                     || !names.insert(name.clone())
                 {
-                    return Err(invalid("invalid or duplicate certificate_source name"));
+                    return Err(invalid(&format!(
+                        "invalid or duplicate certificate_source name: {name}"
+                    )));
                 }
                 let spec = match &named.source {
                     SourceConfig::Files { cert, key } => {
@@ -496,7 +584,12 @@ pub(crate) fn configure(configs: &mut [Config]) -> io::Result<Vec<Arc<Source>>> 
                         }
                     }
                     SourceConfig::Acme(acme) => {
-                        validate_acme(acme)?;
+                        validate_acme(acme).map_err(|error| {
+                            io::Error::new(
+                                error.kind(),
+                                format!("certificate source {name}: {error}"),
+                            )
+                        })?;
                         if !state_dirs.insert(acme.state_dir.clone()) {
                             return Err(invalid("ACME sources must have distinct state_dir paths"));
                         }
@@ -559,7 +652,9 @@ pub(crate) fn configure(configs: &mut [Config]) -> io::Result<Vec<Arc<Source>>> 
             *binding = Some(
                 sources
                     .get(name)
-                    .ok_or_else(|| invalid("unknown certificate_source reference"))?
+                    .ok_or_else(|| {
+                        invalid(&format!("unknown certificate_source reference: {name}"))
+                    })?
                     .clone(),
             );
         } else if binding.is_none() {
