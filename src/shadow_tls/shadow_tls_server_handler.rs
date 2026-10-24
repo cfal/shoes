@@ -99,6 +99,7 @@ const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 
 const TLS_EXT_SERVER_NAME: u16 = 0x0000;
+const TLS_EXT_ALPN: u16 = 0x0010;
 const TLS_EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 
 // retry request random value, see https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
@@ -342,6 +343,7 @@ pub async fn setup_shadowtls_server_stream(
 }
 
 pub struct ParsedClientHello {
+    pub acme_alpn: bool,
     /// The ClientHello records exactly as received.
     pub client_hello_frame: Vec<u8>,
     /// The ClientHello as one record. Equals `client_hello_frame` unless the client split
@@ -466,6 +468,8 @@ pub async fn read_client_hello(
 
     let mut requested_server_name: Option<String> = None;
     let mut client_supports_tls13 = false;
+    let mut acme_alpn = false;
+    let mut seen_alpn = false;
 
     while !client_extensions.is_consumed() {
         let extension_type = client_extensions.read_u16_be()?;
@@ -489,6 +493,12 @@ pub async fn read_client_hello(
                 let server_name_len = extension.read_u16_be()? as usize;
                 requested_server_name = Some(extension.read_str(server_name_len)?.to_string());
             }
+        } else if extension_type == TLS_EXT_ALPN {
+            // Recognize only the RFC 8737 offer. Other ALPNs, including malformed
+            // offers, must retain the normal TLS/REALITY/ShadowTLS dispatch path.
+            acme_alpn = !seen_alpn
+                && extension.read_slice(extension.remaining())? == b"\x00\x0b\x0aacme-tls/1";
+            seen_alpn = true;
         } else if extension_type == TLS_EXT_SUPPORTED_VERSIONS {
             let version_list_len = extension.read_u8()? as usize;
             if !version_list_len.is_multiple_of(2) || version_list_len != extension.remaining() {
@@ -511,6 +521,7 @@ pub async fn read_client_hello(
     client_hello_record.extend_from_slice(&message);
 
     Ok(ParsedClientHello {
+        acme_alpn,
         client_hello_frame,
         client_hello_record,
         client_hello_record_legacy_version_major: client_legacy_version[0],

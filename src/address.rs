@@ -341,6 +341,23 @@ impl From<NetLocation> for NetLocationPortRange {
 }
 
 impl NetLocationPortRange {
+    pub(crate) fn may_overlap_socket(&self, socket: SocketAddr) -> bool {
+        self.ports.contains(&socket.port())
+            && match &self.address {
+                Address::Ipv4(ip) => {
+                    ip.is_unspecified()
+                        || socket.ip().is_unspecified()
+                        || socket.ip() == IpAddr::V4(*ip)
+                }
+                Address::Ipv6(ip) => {
+                    ip.is_unspecified()
+                        || socket.ip().is_unspecified()
+                        || socket.ip() == IpAddr::V6(*ip)
+                }
+                Address::Hostname(_) => true,
+            }
+    }
+
     pub(crate) fn literal_socket_addr(&self) -> Option<SocketAddr> {
         let &[port] = self.ports.as_slice() else {
             return None;

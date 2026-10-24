@@ -1,26 +1,33 @@
-use std::collections::HashSet;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::RecommendedWatcher;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::address::NetLocation;
 use crate::config::{self, BindLocation, Config, ValidatedConfigs};
 use crate::dns::{self, DnsRegistry};
+use crate::file_watcher::watch;
 use crate::option_util::OneOrSome;
 use crate::resources;
 
+const RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
+
 async fn load_validated(
     paths: &[String],
-    discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
+    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
 ) -> io::Result<ValidatedConfigs> {
     let mut configs = config::load_configs(&paths.to_vec()).await?;
-    discovered(&crate::rule_set::dependencies(&mut configs)?);
+    let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
+    let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
+    dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
+    recovery_dependencies.retain(|path| !dependencies.contains(path));
+    discovered(&dependencies, &recovery_dependencies);
     let (configs, _) = config::convert_cert_paths(configs).await?;
-    let validated = config::compile_configs(configs).await?;
+    let mut validated = config::compile_configs(configs).await?;
+    validated.reload_files = dependencies;
     tokio::task::spawn_blocking(move || {
         if validated.catalog.is_some() {
             crate::control::validation::validate_resources(&validated)?;
@@ -33,6 +40,7 @@ async fn load_validated(
 
 struct PreparedServers {
     generation: Option<std::sync::Arc<crate::control::runtime::Generation>>,
+    certificates: crate::certificates::Registry,
     validated: ValidatedConfigs,
     dns: DnsRegistry,
     #[cfg(unix)]
@@ -41,13 +49,14 @@ struct PreparedServers {
 
 #[cfg(test)]
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
-    prepare_tracking(paths, previous, &mut |_| {}, &mut None).await
+    prepare_tracking(paths, previous, None, &mut |_, _| {}, &mut None).await
 }
 
 async fn prepare_tracking(
     paths: &[String],
     previous: Option<&DnsRegistry>,
-    discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
+    previous_servers: Option<&PreparedServers>,
+    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
     control: &mut Option<crate::control::runtime::ControlService>,
 ) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths, discovered).await?;
@@ -143,6 +152,17 @@ async fn prepare_tracking(
             ))
         }
     })?;
+    let certificates = match previous_servers {
+        Some(previous) => {
+            crate::certificates::Registry::prepare_with_retiring(
+                &mut validated,
+                Some(&previous.certificates),
+                &previous.validated.configs,
+            )
+            .await?
+        }
+        None => crate::certificates::Registry::prepare(&mut validated, None).await?,
+    };
     let generation = if let (Some((id, rules)), Some(catalog)) =
         (control_generation, validated.catalog.take())
     {
@@ -164,6 +184,7 @@ async fn prepare_tracking(
     };
     Ok(PreparedServers {
         generation,
+        certificates,
         validated,
         dns,
         #[cfg(unix)]
@@ -198,11 +219,12 @@ impl RunningServers {
         std::future::pending().await
     }
 
-    async fn shutdown(&mut self, registries: &[&DnsRegistry]) -> io::Result<()> {
+    async fn shutdown(&mut self, registries: &[&PreparedServers]) -> io::Result<()> {
         self.stop().await;
         let mut result = Ok(());
         for registry in registries {
-            if let Err(error) = registry.shutdown_checkpoint().await {
+            registry.certificates.stop().await;
+            if let Err(error) = registry.dns.shutdown_checkpoint().await {
                 log::warn!("Final Fake DNS checkpoint failed: {error}");
                 if result.is_ok() {
                     result = Err(error);
@@ -235,6 +257,7 @@ impl RunningServers {
     }
 
     async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
+        prepared.certificates.bind_pending().await?;
         resources::configure(prepared.validated.global_limits)?;
         self.reporter = Some(resources::ResourceReporter::start());
         self.dns_snapshots = Some(prepared.dns.snapshot_task());
@@ -274,7 +297,7 @@ impl RunningServers {
                 }
             }
         }
-        println!("Servers ready");
+        prepared.certificates.start().await;
         Ok(())
     }
 }
@@ -291,108 +314,32 @@ impl Drop for RunningServers {
     }
 }
 
-fn watch<P: AsRef<Path>>(paths: &[P], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatcher> {
-    let mut files = HashSet::new();
-    let mut required_directories = HashSet::new();
-    for path in paths {
-        let path = std::path::absolute(path)?;
-        if let Some(parent) = path.parent() {
-            required_directories.insert(parent.to_path_buf());
-        }
-        if let Ok(canonical) = std::fs::canonicalize(&path) {
-            if let Some(parent) = canonical.parent() {
-                required_directories.insert(parent.to_path_buf());
-            }
-            files.insert(canonical);
-        }
-        files.insert(path.clone());
-        if let Err(error) = resolve_watch_path(&path, &mut files, &mut 0) {
-            log::warn!(
-                "Could not resolve watch path {}: {error}; retaining lexical and discovered paths for recovery",
-                path.display()
-            );
-        }
-    }
-    let required_directories: HashSet<_> = required_directories
-        .iter()
-        .map(|path| watch_directory(path))
-        .collect();
-    let directories: HashSet<_> = files
-        .iter()
-        .filter_map(|path| path.parent()?.ancestors().find(|parent| parent.is_dir()))
-        .map(watch_directory)
-        .collect();
-    let direct_files: HashSet<_> = files
-        .iter()
-        .filter_map(|path| std::fs::canonicalize(path).ok())
-        .filter(|path| path.is_file())
-        .collect();
-    files.extend(direct_files.iter().cloned());
-    let mut watcher =
-        notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
-            Ok(event)
-                if matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) && event.paths.iter().any(|path| files.contains(path)) =>
-            {
-                let _ = tx.try_send(());
-            }
-            Err(error) => log::warn!("Config watcher failed: {error}"),
-            _ => {}
-        })
-        .map_err(io::Error::other)?;
-    for directory in directories {
-        if let Err(error) = watcher.watch(&directory, RecursiveMode::NonRecursive) {
-            if required_directories.contains(&directory) {
-                if !matches!(&error.kind, notify::ErrorKind::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
-                {
-                    return Err(io::Error::other(error));
-                }
-                log::warn!(
-                    "Could not watch config directory {}: {error}; using file watches, atomic replacements may be missed",
-                    directory.display()
-                );
-            } else {
-                log::warn!(
-                    "Could not watch intermediate config directory {}: {error}",
-                    directory.display()
-                );
-            }
-        }
-    }
-    for file in direct_files {
-        if let Err(error) = watcher.watch(&file, RecursiveMode::NonRecursive) {
-            let missing = match &error.kind {
-                notify::ErrorKind::PathNotFound => true,
-                notify::ErrorKind::Io(error) => error.kind() == io::ErrorKind::NotFound,
-                _ => false,
-            };
-            if !missing {
-                log::warn!("Could not watch config file {}: {error}", file.display());
-            }
-        }
-    }
-    Ok(watcher)
-}
-
 struct ConfigWatches {
     configs: Vec<PathBuf>,
     active: Vec<PathBuf>,
     candidate: Vec<PathBuf>,
+    recovery: Vec<PathBuf>,
     watcher: Option<RecommendedWatcher>,
+    recovery_watcher: Option<RecommendedWatcher>,
     tx: mpsc::Sender<()>,
+    recovery_tx: mpsc::Sender<()>,
+    recovery_changes: mpsc::Receiver<()>,
     disabled: bool,
 }
 
 impl ConfigWatches {
     fn new(paths: &[String], tx: mpsc::Sender<()>, disabled: bool) -> io::Result<Self> {
+        let (recovery_tx, recovery_changes) = mpsc::channel(1);
         let mut state = Self {
             configs: paths.iter().map(PathBuf::from).collect(),
             active: Vec::new(),
             candidate: Vec::new(),
+            recovery: Vec::new(),
             watcher: None,
+            recovery_watcher: None,
             tx,
+            recovery_tx,
+            recovery_changes,
             disabled,
         };
         state.refresh()?;
@@ -409,79 +356,52 @@ impl ConfigWatches {
                 .collect();
             // Construct the replacement before dropping the old watches.
             self.watcher = Some(watch(&paths, self.tx.clone())?);
+            self.recovery_watcher = if self.recovery.is_empty() {
+                None
+            } else {
+                Some(watch(&self.recovery, self.recovery_tx.clone())?)
+            };
         }
         Ok(())
     }
 
-    fn discovered(&mut self, paths: &[PathBuf]) {
+    fn discovered(&mut self, paths: &[PathBuf], recovery: &[PathBuf]) {
         self.candidate = paths.to_vec();
+        self.recovery = recovery.to_vec();
         if let Err(error) = self.refresh() {
-            log::warn!("Could not refresh rule/config watches: {error}");
+            log::warn!("Could not refresh config dependency watches: {error}");
         }
     }
 
     fn activated(&mut self, paths: &[PathBuf]) {
         self.active = paths.to_vec();
         self.candidate.clear();
+        self.recovery.clear();
+        self.recovery_watcher = None;
+        // Late callbacks and queued identity-only events belong to the candidate,
+        // not the active generation. Preserve the separate config/reload queue.
+        (self.recovery_tx, self.recovery_changes) = mpsc::channel(1);
         if let Err(error) = self.refresh() {
-            log::warn!("Could not refresh rule/config watches: {error}");
+            log::warn!("Could not refresh config dependency watches: {error}");
         }
     }
-}
 
-fn watch_directory(path: &Path) -> PathBuf {
-    // inotify keeps one event path per inode; register directory aliases only once.
-    #[cfg(unix)]
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
+    async fn changed(&mut self, changes: &mut mpsc::Receiver<()>) {
+        tokio::select! {
+            _ = changes.recv() => {},
+            _ = self.recovery_changes.recv() => {},
+        }
     }
-    path.to_path_buf()
-}
 
-fn resolve_watch_path(
-    path: &Path,
-    files: &mut HashSet<PathBuf>,
-    symlinks: &mut usize,
-) -> io::Result<PathBuf> {
-    let mut resolved = PathBuf::new();
-    for component in path.components() {
-        if component == Component::ParentDir {
-            resolved.pop();
-            continue;
-        }
-        resolved.push(component);
-        match std::fs::symlink_metadata(&resolved) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                *symlinks += 1;
-                if *symlinks > 40 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "too many config symlinks",
-                    ));
-                }
-                let target = resolved
-                    .parent()
-                    .unwrap()
-                    .join(std::fs::read_link(&resolved)?);
-                if cfg!(target_os = "macos") && resolved.parent() == Some(Path::new("/")) {
-                    // System-volume links cannot be retargeted; tracking them subscribes
-                    // FSEvents to the entire filesystem even with NonRecursive watches.
-                    resolved = resolve_watch_path(&target, &mut HashSet::new(), symlinks)?;
-                } else {
-                    files.insert(resolved.clone());
-                    resolved = resolve_watch_path(&target, files, symlinks)?;
-                }
+    async fn debounce(&mut self, changes: &mut mpsc::Receiver<()>) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.changed(changes) => {},
+                _ = tokio::time::sleep(RELOAD_DEBOUNCE) => return,
             }
-            // Retain missing components so creating a target or its parent triggers another reload.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                files.insert(resolved.clone());
-            }
-            Err(error) => return Err(error),
-            Ok(_) => {}
         }
     }
-    files.insert(resolved.clone());
-    Ok(resolved)
 }
 
 #[cfg(unix)]
@@ -567,7 +487,7 @@ async fn run_inner(
     api: &mut Option<crate::clash_api::ApiService>,
 ) -> io::Result<()> {
     if dry_run {
-        load_validated(&paths, &mut |_| {}).await?;
+        load_validated(&paths, &mut |_, _| {}).await?;
         println!("Configuration valid");
         return Ok(());
     }
@@ -575,13 +495,14 @@ async fn run_inner(
     let mut reload = ReloadSignal::new()?;
     let (change_tx, mut changes) = mpsc::channel(1);
     let mut watches = ConfigWatches::new(&paths, change_tx, no_reload)?;
-    let mut discovered = |paths: &[PathBuf]| watches.discovered(paths);
+    let mut discovered =
+        |paths: &[PathBuf], recovery: &[PathBuf]| watches.discovered(paths, recovery);
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = prepare_tracking(&paths, None, &mut discovered, control) => result?,
+        result = prepare_tracking(&paths, None, None, &mut discovered, control) => result?,
     };
-    watches.activated(&prepared.validated.rule_files);
+    watches.activated(&prepared.validated.reload_files);
     let mut running = RunningServers::default();
     if let (Some(control), Some(generation)) = (control.as_ref(), prepared.generation.as_ref()) {
         control.runtime.begin_activation(generation).await?;
@@ -592,52 +513,55 @@ async fn run_inner(
     }
     tokio::select! {
         biased;
-        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+        _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
         result = running.start(&mut prepared) => if let Err(error) = result {
-            let _ = running.shutdown(&[&prepared.dns]).await;
+            let _ = running.shutdown(&[&prepared]).await;
             return Err(error);
         },
     }
     if let Some(control) = control.as_ref() {
         control.runtime.resume().await?;
     }
+    println!("Servers ready");
     loop {
         let debounce = tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+            _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
             error = running.tun_failure() => {
-                let _ = running.shutdown(&[&prepared.dns]).await;
+                let _ = running.shutdown(&[&prepared]).await;
                 return Err(error);
             },
             _ = reload.recv() => false,
-            _ = changes.recv() => true,
+            _ = watches.changed(&mut changes) => true,
         };
         if debounce {
             tokio::select! {
                 biased;
-                _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+                _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
                 error = running.tun_failure() => {
-                    let _ = running.shutdown(&[&prepared.dns]).await;
+                    let _ = running.shutdown(&[&prepared]).await;
                     return Err(error);
                 },
                 _ = reload.recv() => {}
-                _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                _ = watches.debounce(&mut changes) => {}
             }
         }
         while changes.try_recv().is_ok() {}
+        while watches.recovery_changes.try_recv().is_ok() {}
         // Refresh symlink targets even when the candidate's YAML is invalid.
         if let Err(error) = watches.refresh() {
             log::warn!("Could not refresh config watches: {error}");
         }
-        let mut discovered = |paths: &[PathBuf]| watches.discovered(paths);
+        let mut discovered =
+            |paths: &[PathBuf], recovery: &[PathBuf]| watches.discovered(paths, recovery);
         let candidate = tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+            _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
             error = running.tun_failure() => {
-                let _ = running.shutdown(&[&prepared.dns]).await;
+                let _ = running.shutdown(&[&prepared]).await;
                 return Err(error);
             },
-            result = prepare_tracking(&paths, Some(&prepared.dns), &mut discovered, control) => result,
+            result = prepare_tracking(&paths, Some(&prepared.dns), Some(&prepared), &mut discovered, control) => result,
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
@@ -653,14 +577,18 @@ async fn run_inner(
             continue;
         }
         running.stop().await;
+        prepared
+            .certificates
+            .retire_unused(&candidate.certificates)
+            .await;
         if let Err(error) = prepared.dns.checkpoint().await {
             log::warn!("Reload Fake DNS checkpoint failed; continuing reload: {error}");
         }
         tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+            _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
             result = running.quic_retirements.wait() => if let Err(error) = result {
-                let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                let _ = running.shutdown(&[&prepared, &candidate]).await;
                 return Err(error);
             },
         }
@@ -672,7 +600,7 @@ async fn run_inner(
         loop {
             let result = tokio::select! {
                 biased;
-                _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+                _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
                 result = running.start(&mut candidate) => result,
             };
             match result {
@@ -683,35 +611,117 @@ async fn run_inner(
                 {
                     tokio::select! {
                         biased;
-                        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+                        _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
                         result = running.quic_retirements.wait() => if let Err(error) = result {
-                            let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                            let _ = running.shutdown(&[&prepared, &candidate]).await;
                             return Err(error);
                         },
                     }
                     tokio::select! {
                         biased;
-                        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+                        _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
                         _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                     }
                 }
                 Err(error) => {
-                    let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                    let _ = running.shutdown(&[&prepared, &candidate]).await;
                     return Err(error);
                 }
             }
         }
-        watches.activated(&candidate.validated.rule_files);
+        watches.activated(&candidate.validated.reload_files);
         if let Some(control) = control.as_ref() {
             control.runtime.resume().await?;
         }
-        drop(std::mem::replace(&mut prepared, candidate));
+        let mut retired = std::mem::replace(&mut prepared, candidate);
+        retired.certificates.shutdown().await;
+        println!("Servers ready");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn activation_discards_candidate_identity_events_but_preserves_reload_events() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let directory = tempfile::tempdir().unwrap();
+            let config = directory.path().join("config.yaml");
+            let cert = directory.path().join("cert.pem");
+            let key = directory.path().join("key.pem");
+            let trust = directory.path().join("ca.pem");
+            let pair = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+            std::fs::write(&cert, pair.cert.pem()).unwrap();
+            std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+            std::fs::write(&trust, pair.cert.pem()).unwrap();
+            std::fs::write(&config, serde_yaml::to_string(&serde_json::json!([
+                {"address": "127.0.0.1:18443", "protocol": {"type": "tls", "default_tls_target": {
+                    "cert": cert, "key": key, "protocol": {"type": "socks"}
+                }}}
+            ])).unwrap()).unwrap();
+            let paths = [config.to_str().unwrap().to_owned()];
+            let (tx, mut changes) = mpsc::channel(1);
+            let mut watches = ConfigWatches::new(&paths, tx, false).unwrap();
+            let validated = load_validated(&paths, &mut |reload, recovery| {
+                assert!(!reload.contains(&cert) && !reload.contains(&key));
+                assert!(recovery.contains(&cert) && recovery.contains(&key));
+                watches.discovered(reload, recovery);
+            })
+            .await
+            .unwrap();
+            // A renewal while preparation is still in progress must not leak into
+            // the active reload queue, even if a notifier callback arrives late.
+            let late_callback = watches.recovery_tx.clone();
+            std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+            while watches.recovery_changes.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(changes.is_empty());
+            watches.activated(&validated.reload_files);
+            assert!(late_callback.try_send(()).is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), watches.changed(&mut changes))
+                    .await
+                    .is_err()
+            );
+
+            for changed in [&config, &trust] {
+                watches.discovered(std::slice::from_ref(&trust), &[cert.clone(), key.clone()]);
+                let contents = std::fs::read(changed).unwrap();
+                std::fs::write(changed, contents).unwrap();
+                while changes.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                watches.activated(std::slice::from_ref(&trust));
+                assert!(
+                    changes.try_recv().is_ok(),
+                    "activation must retain YAML and reload-only dependency events"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_debounce_includes_candidate_recovery_events() {
+        let (tx, mut changes) = mpsc::channel(1);
+        let mut watches = ConfigWatches::new(&[], tx.clone(), true).unwrap();
+        let recovery = watches.recovery_tx.clone();
+        let task = tokio::spawn(async move { watches.debounce(&mut changes).await });
+        tokio::task::yield_now().await;
+        for sender in [tx, recovery] {
+            tokio::time::advance(Duration::from_secs(4)).await;
+            assert!(!task.is_finished());
+            sender.send(()).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        task.await.unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -737,7 +747,7 @@ mod tests {
             r#"[{"dns_group":"ordinary","dns_servers":"udp://198.18.0.5:53"}]"#,
         )
         .unwrap();
-        load_validated(&paths, &mut |_| {}).await.unwrap();
+        load_validated(&paths, &mut |_, _| {}).await.unwrap();
         let error = prepare(&paths, Some(&live.dns)).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
@@ -772,7 +782,7 @@ mod tests {
             }]}),
         ] {
             std::fs::write(&path, json!([server]).to_string()).unwrap();
-            load_validated(&paths, &mut |_| {}).await.unwrap();
+            load_validated(&paths, &mut |_, _| {}).await.unwrap();
             let error = prepare(&paths, Some(&removed.dns)).await.err().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert!(
@@ -828,7 +838,7 @@ mod tests {
                     let mut tun = json!({"device_name":"tun0", "device_fd":42});
                     tun[field] = endpoint.into();
                     std::fs::write(&path, json!([tun]).to_string()).unwrap();
-                    load_validated(&paths, &mut |_| {}).await.unwrap();
+                    load_validated(&paths, &mut |_, _| {}).await.unwrap();
                     let result = prepare(&paths, Some(&retained.dns)).await;
                     if allowed {
                         result.unwrap();
@@ -891,7 +901,7 @@ mod tests {
         }));
         assert!(
             running
-                .shutdown(&[&registries[0].dns, &registries[1].dns])
+                .shutdown(&[&registries[0], &registries[1]])
                 .await
                 .is_err()
         );
@@ -910,43 +920,6 @@ mod tests {
                 .iter()
                 .any(|entry| entry[0] == "before.example")
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn directory_aliases_preserve_missing_target_notifications() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let target = root.join("target");
-        std::fs::create_dir(&target).unwrap();
-        std::os::unix::fs::symlink(&target, root.join("alias")).unwrap();
-        let existing = root.join("alias/existing.yaml");
-        std::fs::write(&existing, "existing").unwrap();
-        let missing = target.join("missing.yaml");
-        let (tx, mut events) = mpsc::channel(1);
-        let _watcher = watch(
-            &[
-                existing.to_str().unwrap().to_owned(),
-                missing.to_str().unwrap().to_owned(),
-            ],
-            tx,
-        )
-        .unwrap();
-        std::fs::write(&missing, "created").unwrap();
-        tokio::time::timeout(Duration::from_secs(3), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn system_symlinks_do_not_add_root_directory_watches() {
-        let mut files = HashSet::new();
-        resolve_watch_path(Path::new("/var/db/config.yaml"), &mut files, &mut 0).unwrap();
-        assert!(files.contains(Path::new("/private/var/db/config.yaml")));
-        assert!(!files.contains(Path::new("/var")));
-        assert!(!files.contains(Path::new("/private/var")));
     }
 
     #[tokio::test]
@@ -977,40 +950,6 @@ mod tests {
                 "[fe80::1%2]:8080".parse().unwrap(),
                 "[fe80::1%2]:8081".parse().unwrap()
             ]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn watch_paths_include_missing_targets_and_symlinked_parents() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        std::fs::create_dir(root.join("targets")).unwrap();
-        std::os::unix::fs::symlink("targets", root.join("alias")).unwrap();
-        std::os::unix::fs::symlink("alias/missing/config.yaml", root.join("config.yaml")).unwrap();
-        let mut files = HashSet::new();
-        resolve_watch_path(&root.join("config.yaml"), &mut files, &mut 0).unwrap();
-        for path in [
-            "config.yaml",
-            "alias",
-            "targets/missing",
-            "targets/missing/config.yaml",
-        ] {
-            assert!(files.contains(&root.join(path)), "missing {path}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn watch_paths_reject_symlink_cycles() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.yaml");
-        std::os::unix::fs::symlink("config.yaml", &path).unwrap();
-        assert_eq!(
-            resolve_watch_path(&path, &mut HashSet::new(), &mut 0)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
         );
     }
 }

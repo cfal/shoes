@@ -259,19 +259,26 @@ pub fn try_create_server_config(
     client_fingerprints: &[String],
     key_exchange_groups: &TlsKeyExchangeGroups,
 ) -> std::io::Result<rustls::ServerConfig> {
-    // Parse all certificates from the PEM file (server cert + intermediates)
-    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_bytes)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(std::io::Error::other)?;
+    try_create_server_config_with_source(
+        cert_bytes,
+        key_bytes,
+        ca_cert_bytes,
+        alpn_protocols,
+        client_fingerprints,
+        key_exchange_groups,
+        None,
+    )
+}
 
-    log::debug!(
-        "TLS server config: loaded {} certificate(s) in chain",
-        certs.len()
-    );
-
-    let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes)
-        .map_err(std::io::Error::other)?;
-
+pub fn try_create_server_config_with_source(
+    cert_bytes: &[u8],
+    key_bytes: &[u8],
+    ca_cert_bytes: Vec<Vec<u8>>,
+    alpn_protocols: &[String],
+    client_fingerprints: &[String],
+    key_exchange_groups: &TlsKeyExchangeGroups,
+    source: Option<&Arc<crate::certificates::Source>>,
+) -> std::io::Result<rustls::ServerConfig> {
     let webpki_verifier = if ca_cert_bytes.is_empty() {
         None
     } else {
@@ -311,9 +318,18 @@ pub fn try_create_server_config(
             client_fingerprints: process_fingerprints(client_fingerprints)?,
         }))
     };
-    let mut config = builder
-        .with_single_cert(certs, privkey)
-        .map_err(std::io::Error::other)?;
+    let mut config = if let Some(source) = source {
+        builder.with_cert_resolver(source.clone())
+    } else {
+        let certs = rustls::pki_types::CertificateDer::pem_slice_iter(cert_bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(std::io::Error::other)?;
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes)
+            .map_err(std::io::Error::other)?;
+        builder
+            .with_single_cert(certs, key)
+            .map_err(std::io::Error::other)?
+    };
 
     config.alpn_protocols = alpn_protocols
         .iter()

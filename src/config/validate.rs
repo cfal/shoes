@@ -28,7 +28,8 @@ const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 pub struct ValidatedConfigs {
     pub catalog: Option<crate::control::catalog::Catalog>,
     pub control: super::ControlConfig,
-    pub rule_files: Vec<std::path::PathBuf>,
+    pub certificates: Vec<std::sync::Arc<crate::certificates::Source>>,
+    pub reload_files: Vec<std::path::PathBuf>,
     pub global_limits: GlobalLimits,
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
@@ -46,10 +47,12 @@ pub struct ValidatedConfigs {
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
 pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    let certificates = crate::certificates::configure(&mut all_configs)?;
     let catalog = crate::control::catalog::Catalog::capture(&mut all_configs)?;
     let mut control = super::ControlConfig::default();
     let mut compiler = crate::rules::Compiler::default();
-    let rule_files = crate::rule_set::dependencies(&mut all_configs)?;
+    let mut reload_files = crate::rule_set::dependencies(&mut all_configs)?;
+    reload_files.extend(super::pem_reload_dependencies(&mut all_configs)?);
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
@@ -108,6 +111,7 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
                     ));
                 }
             }
+            Config::CertificateSource(_) => {}
             Config::GlobalLimits(limits) => {
                 if global_limits.replace(limits).is_some() {
                     return Err(std::io::Error::new(
@@ -339,7 +343,8 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     let mut validated = ValidatedConfigs {
         catalog,
         control,
-        rule_files,
+        certificates,
+        reload_files,
         global_limits,
         configs: result,
         dns_groups: final_dns_groups,
@@ -1038,6 +1043,7 @@ fn validate_server_config(
             &quic_settings.cert,
             &quic_settings.key,
             &quic_settings.client_ca_certs,
+            quic_settings.certificate_binding.as_ref(),
         )?;
     }
     if server_config.transport != Transport::Tcp && server_config.tcp_settings.is_some() {
@@ -1560,14 +1566,16 @@ fn validate_server_certificates(
     cert: &str,
     key: &str,
     ca: &NoneOrSome<String>,
+    source: Option<&std::sync::Arc<crate::certificates::Source>>,
 ) -> std::io::Result<()> {
-    crate::rustls_config_util::try_create_server_config(
+    crate::rustls_config_util::try_create_server_config_with_source(
         cert.as_bytes(),
         key.as_bytes(),
         ca.iter().map(|pem| pem.as_bytes().to_vec()).collect(),
         &[],
         &[],
         &Default::default(),
+        source,
     )
     .map(|_| ())
 }
@@ -1804,6 +1812,7 @@ fn validate_server_proxy_config(
                     &tls_server_config.cert,
                     &tls_server_config.key,
                     &tls_server_config.client_ca_certs,
+                    tls_server_config.certificate_binding.as_ref(),
                 )?;
 
                 let TlsServerConfig {
@@ -1849,6 +1858,7 @@ fn validate_server_proxy_config(
                     &tls_server_config.cert,
                     &tls_server_config.key,
                     &tls_server_config.client_ca_certs,
+                    tls_server_config.certificate_binding.as_ref(),
                 )?;
                 validate_client_fingerprints(&mut tls_server_config.client_fingerprints)?;
 
@@ -1904,6 +1914,7 @@ fn validate_server_proxy_config(
                         &local_handshake.cert,
                         &local_handshake.key,
                         &local_handshake.client_ca_certs,
+                        None,
                     )?;
                     validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
                 } else if let ShadowTlsServerHandshakeConfig::Remote(remote_handshake) = handshake {

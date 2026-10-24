@@ -117,6 +117,7 @@ h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-int
 h3-quinn = "*"
 hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
 http = "*"
+httpdate = "1"
 http-body-util = "*"
 httparse = "*"
 hyper = { version = "*", features = ["client", "server", "http1", "http2"] }
@@ -124,6 +125,7 @@ hyper-util = { version = "*", features = ["tokio", "server"] }
 hyper-tungstenite = "0.30.0"
 memory-stats = "1.2.0"
 indexmap = "*"
+instant-acme = { version = "=0.8.5", default-features = false, features = ["aws-lc-rs", "rcgen", "time", "x509-parser"] }
 ipnetwork = "0.21"
 libc = "*"
 log = { version = "*", features = ["std", "release_max_level_info"] }
@@ -136,6 +138,7 @@ notify = "*"
 parking_lot = "*"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+quinn-proto = { version = "0.11", default-features = false }
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
@@ -170,7 +173,7 @@ zeroize = "*"
 
 [dev-dependencies]
 tokio = { version = "*", features = ["test-util"] }
-rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 shoes-test-support = { path = "tests/support" }
 tempfile = "*"
 tokio-rustls = "*"

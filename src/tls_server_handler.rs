@@ -56,6 +56,7 @@ pub enum InnerProtocol {
 #[allow(clippy::large_enum_variant)]
 pub enum TlsServerTarget {
     Tls {
+        certificate_source: Option<Arc<crate::certificates::Source>>,
         server_config: Arc<rustls::ServerConfig>,
         /// The effective proxy selector for this TLS target.
         /// This selector is passed to inner handlers at construction and should be used
@@ -101,47 +102,86 @@ impl TcpServerHandler for TlsServerHandler {
     ) -> std::io::Result<TcpServerSetupResult> {
         let parsed_client_hello = read_client_hello(&mut server_stream).await?;
 
-        let target = match parsed_client_hello.requested_server_name.as_ref() {
-            None => match self.default_target {
-                Some(ref t) => t,
-                None => {
-                    return Err(std::io::Error::other(
-                        "No default target for unspecified SNI",
-                    ));
-                }
-            },
-            Some(hostname) => match self.sni_targets.get(hostname) {
-                Some(t) => t,
-                None => match self.default_target {
-                    Some(ref t) => t,
-                    None => {
-                        return Err(std::io::Error::other(format!(
-                            "No default target for unknown SNI: {hostname}"
-                        )));
-                    }
-                },
-            },
-        };
+        let name = parsed_client_hello.requested_server_name.as_deref();
+        let mut target = name
+            .and_then(|name| self.sni_targets.get(name))
+            .or(self.default_target.as_ref());
+        // Case-insensitive ACME lookup must not change REALITY/ShadowTLS routing.
+        if parsed_client_hello.acme_alpn
+            && target.is_none_or(|target| matches!(target, TlsServerTarget::Tls { .. }))
+        {
+            target = name
+                .and_then(|name| self.sni_targets.get(&name.to_ascii_lowercase()))
+                .filter(|target| matches!(target, TlsServerTarget::Tls { .. }))
+                .or(target);
+        }
+        let target = target.ok_or_else(|| match name {
+            Some(name) => {
+                std::io::Error::other(format!("No default target for unknown SNI: {name}"))
+            }
+            None => std::io::Error::other("No default target for unspecified SNI"),
+        })?;
 
         match target {
             TlsServerTarget::Tls {
+                certificate_source,
                 server_config,
                 effective_selector,
                 inner_protocol,
             } => {
+                if parsed_client_hello.acme_alpn {
+                    let config = certificate_source
+                        .as_ref()
+                        .and_then(|source| {
+                            source.challenge_config(
+                                parsed_client_hello.requested_server_name.as_deref(),
+                            )
+                        })
+                        .ok_or_else(|| {
+                            std::io::Error::other("no pending TLS-ALPN-01 challenge for this SNI")
+                        })?;
+                    let mut connection =
+                        rustls::ServerConnection::new(config).map_err(std::io::Error::other)?;
+                    feed_rustls_server_connection(
+                        &mut connection,
+                        &parsed_client_hello.client_hello_frame,
+                    )?;
+                    connection
+                        .process_new_packets()
+                        .map_err(std::io::Error::other)?;
+                    let mut stream = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        CryptoTlsStream::handshake(
+                            server_stream,
+                            TlsConnection::new(connection),
+                            TlsReadMode::Stream,
+                            parsed_client_hello.client_reader.unparsed_data(),
+                        ),
+                    )
+                    .await??;
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::io::AsyncWriteExt::shutdown(&mut stream),
+                    )
+                    .await??;
+                    return Ok(TcpServerSetupResult::Session(Box::pin(async {})));
+                }
                 let ParsedClientHello {
                     client_hello_frame,
                     client_reader,
                     ..
                 } = parsed_client_hello;
 
-                let mut server_conn = rustls::ServerConnection::new(server_config.clone())
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("Failed to create server connection: {e}"),
-                        )
-                    })?;
+                let config = match certificate_source {
+                    Some(source) => source.snapshot(server_config),
+                    None => server_config.clone(),
+                };
+                let mut server_conn = rustls::ServerConnection::new(config).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Failed to create server connection: {e}"),
+                    )
+                })?;
 
                 if let Some(size) = self.tls_buffer_size {
                     server_conn.set_buffer_limit(Some(size));
@@ -262,11 +302,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acme_offers_preserve_reality_forwarding_and_case_sensitive_routing() {
+        use crate::client_proxy_chain::{ClientProxyChain, InitialHopEntry};
+        use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for uppercase in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let dest = NetLocation::from_ip_addr(
+                    listener.local_addr().unwrap().ip(),
+                    listener.local_addr().unwrap().port(),
+                );
+                let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+                let reality = TlsServerTarget::Reality(RealityServerTarget {
+                    mldsa65_key: None,
+                    private_key: [1; 32],
+                    short_ids: vec![[0; 8]],
+                    dest: dest.clone(),
+                    max_time_diff: None,
+                    min_client_version: None,
+                    max_client_version: None,
+                    cipher_suites: Vec::new(),
+                    effective_selector: selector.clone(),
+                    inner_protocol: InnerProtocol::Normal(Box::new(PortForwardServerHandler::new(
+                        vec![dest.clone()],
+                        selector.clone(),
+                    ))),
+                    dest_client_chain: ClientProxyChain::new(
+                        vec![InitialHopEntry::Direct(Arc::new(
+                            SocketConnectorImpl::from_config(
+                                &crate::config::ClientConfig::default(),
+                                None,
+                            )
+                            .unwrap(),
+                        ))],
+                        Vec::new(),
+                    ),
+                });
+                let mut targets = FxHashMap::default();
+                let default = if uppercase {
+                    let cert =
+                        rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+                    targets.insert(
+                        "proxy.test".into(),
+                        TlsServerTarget::Tls {
+                            certificate_source: None,
+                            server_config: Arc::new(server_config(&cert)),
+                            effective_selector: selector.clone(),
+                            inner_protocol: InnerProtocol::Normal(Box::new(
+                                PortForwardServerHandler::new(vec![dest], selector),
+                            )),
+                        },
+                    );
+                    Some(reality)
+                } else {
+                    targets.insert("proxy.test".into(), reality);
+                    None
+                };
+                let handler = TlsServerHandler::new(
+                    targets,
+                    default,
+                    None,
+                    Arc::new(crate::resolver::NativeResolver::new()),
+                );
+                let mut config = rustls::ClientConfig::builder_with_protocol_versions(&[
+                    &rustls::version::TLS12,
+                ])
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+                config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
+                if !uppercase {
+                    config.alpn_protocols.push(b"h2".to_vec());
+                }
+                let name = if uppercase {
+                    "PROXY.TEST"
+                } else {
+                    "proxy.test"
+                };
+                let mut client =
+                    rustls::ClientConnection::new(Arc::new(config), name.try_into().unwrap())
+                        .unwrap();
+                let mut hello = Vec::new();
+                client.write_tls(&mut hello).unwrap();
+                let (server, mut peer) = tokio::io::duplex(65536);
+                peer.write_all(&hello).await.unwrap();
+                let decoy = async {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut received = vec![0; hello.len()];
+                    socket.read_exact(&mut received).await.unwrap();
+                    assert_eq!(received, hello);
+                };
+                let (result, ()) =
+                    tokio::join!(handler.setup_server_stream(Box::new(server)), decoy);
+                assert!(matches!(result.unwrap(), TcpServerSetupResult::Session(_)));
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn client_hellos_split_across_records_complete_the_handshake() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let server_config = server_config(&cert);
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));
         let target = TlsServerTarget::Tls {
+            certificate_source: None,
             server_config: Arc::new(server_config),
             effective_selector: selector.clone(),
             inner_protocol: InnerProtocol::Normal(Box::new(PortForwardServerHandler::new(

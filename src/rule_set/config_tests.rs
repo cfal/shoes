@@ -41,7 +41,7 @@ fn source_unions_inline_references_and_policy_order() {
     )
     .unwrap();
     assert_eq!(
-        validated.rule_files,
+        validated.reload_files,
         [dir.path().join("a.json"), dir.path().join("b.json")]
     );
     let Config::Server(server) = &validated.configs[0] else {
@@ -287,7 +287,7 @@ async fn each_config_file_anchors_its_own_inline_and_group_sources() {
             Outcome::Match
         );
     }
-    assert_eq!(validated.rule_files.len(), 2);
+    assert_eq!(validated.reload_files.len(), 2);
 }
 
 #[test]

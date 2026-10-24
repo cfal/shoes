@@ -1,0 +1,23 @@
+# Renew these files with an external ACME client. No Shoes reload is required.
+- certificate_source: public
+  type: files
+  cert: /etc/shoes/certs/fullchain.pem
+  key: /etc/shoes/certs/privkey.pem
+
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    tls_targets:
+      proxy.example.com:
+        certificate_source: public
+        protocol:
+          type: trojan
+          password: replace-with-a-strong-password
+
+- address: "0.0.0.0:8443"
+  transport: quic
+  quic_settings:
+    certificate_source: public
+  protocol:
+    type: hysteria2
+    password: replace-with-a-strong-password

@@ -271,6 +271,52 @@ async fn hellos_split_across_records_are_reassembled() {
 }
 
 #[tokio::test]
+async fn alpn_selection_survives_fragmented_client_hellos() {
+    for (protocols, acme) in [
+        (b"\x00\x0b\x0aacme-tls/1".as_slice(), true),
+        (b"\x00\x03\x02h2".as_slice(), false),
+    ] {
+        let mut extensions = server_name(0, b"proxy.example");
+        extensions.extend(extension(TLS_EXT_ALPN, protocols));
+        extensions.extend(supported_versions(&[[3, 4]]));
+        let hello = client_hello(&[7; 32], &extensions);
+        for chunk in [1, 3, 137] {
+            let split = crate::sniff::tests::records(&hello, chunk);
+            let parsed = parse(&split).await.unwrap();
+            assert_eq!(parsed.acme_alpn, acme);
+            assert_eq!(
+                parsed.requested_server_name.as_deref(),
+                Some("proxy.example")
+            );
+            assert!(parsed.supports_tls13);
+            assert_eq!(parsed.client_hello_frame, split);
+            assert_eq!(parsed.client_hello_record, hello);
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_or_mixed_acme_alpn_retains_normal_dispatch() {
+    let alpn = extension(TLS_EXT_ALPN, b"\x00\x0b\x0aacme-tls/1");
+    let mut duplicate = alpn.clone();
+    duplicate.extend(alpn);
+    for extensions in [
+        duplicate,
+        extension(TLS_EXT_ALPN, b"\x00\x0e\x0aacme-tls/1\x02h2"),
+        extension(TLS_EXT_ALPN, b"\x00\x04\x02h2"),
+        extension(TLS_EXT_ALPN, b"\x00\x02\x02h"),
+        extension(TLS_EXT_ALPN, b"\x00\x01\x00"),
+    ] {
+        assert!(
+            !parse(&client_hello(&[], &extensions))
+                .await
+                .unwrap()
+                .acme_alpn
+        );
+    }
+}
+
+#[tokio::test]
 async fn invalid_record_framing_is_rejected() {
     let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
     let split = crate::sniff::tests::records(&hello, 100);

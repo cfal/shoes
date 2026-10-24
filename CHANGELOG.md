@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Breaking: file-backed inbound TLS/QUIC identities, including legacy `cert`/`key` paths and file-backed named PEMs, now rotate live and require currently valid, leaf-to-issuer certificate chains. Expired or misordered bundles can fail startup after upgrade, and expired sources stop serving new handshakes even to clients using fingerprint pinning or disabled verification. Renew certificates, remove expired cross-signs and certificates outside that chain, and synchronize the system clock before starting Shoes. Child-to-issuer signatures must use TLS-provider-supported algorithms (no SHA-1; RSA issuer keys of at least 2048 bits); reissue certificates with unsupported signatures. Inline-only pairs retain their previous behavior. See [certificate sources](CONFIG.md#certificate-sources).
+
 ## v0.3.4
 
 - Added an opt-in Clash API controller over authenticated TCP or Unix sockets, with manual proxy selectors, optional persistent choices, connection inspection/cancellation, traffic/log streams, and delay probes. Existing groups remain round-robin; selection changes affect new flows only. Every controller requires a nonempty secret. TCP listeners serve plain HTTP; bind to loopback or terminate TLS in front. Controller settings require a restart. Browser origins require an explicit allowlist; `cors_origins: ["*"]` permits any origin without disabling authentication. No dashboard hosting or full Mihomo API parity is included; controller/cache entries are not supported through FFI.
