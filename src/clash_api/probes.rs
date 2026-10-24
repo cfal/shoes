@@ -437,7 +437,7 @@ async fn probe_until(
     result.map(|(delay, _)| delay)
 }
 
-fn local_failure(error: &io::Error) -> bool {
+pub(crate) fn local_failure(error: &io::Error) -> bool {
     if crate::resources::is_exhausted(error) {
         return true;
     }
@@ -457,10 +457,9 @@ fn local_failure(error: &io::Error) -> bool {
     }) {
         return true;
     }
-    if error
-        .get_ref()
-        .is_some_and(|error| error.is::<ProbePolicyDenied>())
-    {
+    if error.get_ref().is_some_and(|error| {
+        error.is::<ProbePolicyDenied>() || error.is::<crate::dns::SyntheticDnsAnswer>()
+    }) {
         return true;
     }
     // Protocol handlers can use these same kinds for remote rejections.
@@ -535,7 +534,7 @@ pub(crate) async fn run_automatic(
             .filter_map(|(index, group)| group.due_members(now).map(|members| (index, members)))
             .collect();
         // A busy, short-interval group must not reset a waiting group's priority.
-        due.sort_by_key(|(index, _)| groups[*index].last_admission());
+        due.sort_by_key(|(index, _)| groups[*index].last_unqueued_admission());
         for (index, members) in due {
             let group = groups[index];
             checking[index] = true;
@@ -592,12 +591,13 @@ async fn run_automatic_round(
                 if tokio::time::Instant::now() >= deadline {
                     return;
                 }
+                let queued = waited || ordinal >= 16;
                 let admitted = runtime
                     .with_probe_generation(generation.id, || {
                         if epoch.is_cancelled() {
                             return false;
                         }
-                        group.admitted(index);
+                        group.admitted(index, queued);
                         true
                     })
                     .unwrap_or(false);
@@ -610,7 +610,7 @@ async fn run_automatic_round(
                     &group.members[index],
                     query,
                     deadline,
-                    waited || ordinal >= 16,
+                    queued,
                     epoch,
                 )
                 .await;
@@ -971,6 +971,140 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn url_test_queued_group_gets_a_full_budget_on_a_later_round() {
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        let resolver = Arc::new(ScheduledAnswers {
+            delays: (0..16)
+                .map(|index| (format!("a-{index}.invalid"), Duration::from_millis(10)))
+                .collect(),
+            ..Default::default()
+        });
+        let generation = scheduled_generation(&[("a", 16, 10, 1000), ("b", 2, 10, 1000)], resolver);
+        generation
+            .catalog
+            .selection
+            .automatic
+            .record("b-0", "http://probe.invalid/", Some(5));
+        service.runtime.publish(generation.clone()).await.unwrap();
+        service.runtime.resume().await.unwrap();
+        advance_rounds(2).await;
+        assert_eq!(
+            generation.catalog.selection.automatic.0["b"].health("b-0"),
+            "healthy"
+        );
+        advance_rounds(10).await;
+        assert_eq!(
+            generation.catalog.selection.automatic.0["b"].health("b-0"),
+            "dead"
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn url_test_real_dns_policy_denial_preserves_health_and_history() {
+        let resolver = crate::dns::real_only(
+            Arc::new(Answers(vec!["198.18.0.2:80".parse().unwrap()])),
+            vec!["198.18.0.0/15".parse().unwrap()].into(),
+        );
+        let generation = automatic_generation(1, 1, resolver);
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        generation
+            .catalog
+            .selection
+            .automatic
+            .record("member-0", "http://probe.invalid/", Some(5));
+        generation
+            .probes
+            .record("member-0", "http://probe.invalid/", 5, true);
+        let history = generation
+            .probes
+            .url_history("member-0", "http://probe.invalid/");
+        service.runtime.publish(generation.clone()).await.unwrap();
+        service
+            .runtime
+            .activating
+            .store(false, std::sync::atomic::Ordering::Release);
+        let error = probe(&service.runtime, &generation, "member-0", &query())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            generation.catalog.selection.automatic.0["auto"].health("member-0"),
+            "healthy"
+        );
+        assert_eq!(
+            generation
+                .probes
+                .url_history("member-0", "http://probe.invalid/"),
+            history
+        );
+        assert!(!local_failure(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid TLS record"
+        )));
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn url_test_remote_dns_connection_refusal_records_dead_health() {
+        let unavailable =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        unavailable
+            .bind(
+                &"127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        let address = unavailable.local_addr().unwrap().as_socket().unwrap();
+        let configs = serde_json::from_value(json!([
+            {"dns_group":"test", "dns_servers":[{"url":format!("tcp://{address}"), "timeout_secs":1, "attempts":1}]},
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.example.net/",
+             "client_proxies":[{"name":"member-0", "protocol":{"type":"direct"}}]}
+        ])).unwrap();
+        let validated = crate::config::create_server_configs(configs).unwrap();
+        let registry = crate::dns::build_dns_registry(validated.dns_groups)
+            .await
+            .unwrap();
+        let generation = Arc::new(generation(
+            validated.catalog.unwrap(),
+            registry.get_by_name("test").unwrap(),
+        ));
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        generation.catalog.selection.automatic.record(
+            "member-0",
+            "http://probe.example.net/",
+            Some(5),
+        );
+        generation
+            .probes
+            .record("member-0", "http://probe.example.net/", 5, true);
+        service.runtime.publish(generation.clone()).await.unwrap();
+        service
+            .runtime
+            .activating
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut query = query();
+        query.url = url::Url::parse("http://probe.example.net/").unwrap();
+        query.timeout = Duration::from_secs(5);
+        let error = probe(&service.runtime, &generation, "member-0", &query)
+            .await
+            .unwrap_err();
+        assert!(!local_failure(&error), "{error}");
+        assert_eq!(
+            generation.catalog.selection.automatic.0["auto"].health("member-0"),
+            "dead"
+        );
+        let history = generation
+            .probes
+            .url_history("member-0", "http://probe.example.net/");
+        assert_eq!(history.as_array().unwrap().len(), 2);
+        assert_eq!(history.as_array().unwrap().last().unwrap()["delay"], 0);
+        service.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn url_test_unchecked_groups_use_catalog_order_for_admission_ties() {
         let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
         let resolver = Arc::new(ScheduledAnswers::default());
@@ -1099,7 +1233,7 @@ mod tests {
         service.runtime.begin_activation(&generation).await.unwrap();
         drop(occupied);
         round.await;
-        assert!(group.last_admission().is_none());
+        assert!(group.last_unqueued_admission().is_none());
         assert!(group.due_members(tokio::time::Instant::now()).is_some());
         service.shutdown().await;
     }
@@ -1333,18 +1467,21 @@ mod tests {
                 let mut query = query();
                 query.url = url::Url::parse("http://probe.example.net/").unwrap();
                 query.timeout = Duration::from_secs(10);
-                let error = probe(&service.runtime, &generation, "member-0", &query)
-                    .await
-                    .unwrap_err();
-                assert!(crate::resources::snapshot().quic_buffer_bytes.rejected > 0);
-                assert!(local_failure(&error), "{error}");
-                assert!(!crate::control::url_test::remote_failure(&error));
-                assert!(local_failure(&io::Error::other(error)));
-                assert_eq!(
-                    generation.catalog.selection.automatic.0["auto"].health("member-0"),
-                    "healthy"
-                );
-                assert!(generation.probes.history.lock().is_empty());
+                for _ in 0..2 {
+                    let rejected = crate::resources::snapshot().quic_buffer_bytes.rejected;
+                    let error = probe(&service.runtime, &generation, "member-0", &query)
+                        .await
+                        .unwrap_err();
+                    assert!(crate::resources::snapshot().quic_buffer_bytes.rejected > rejected);
+                    assert!(local_failure(&error), "{error}");
+                    assert!(!crate::control::url_test::remote_failure(&error));
+                    assert!(local_failure(&io::Error::other(error)));
+                    assert_eq!(
+                        generation.catalog.selection.automatic.0["auto"].health("member-0"),
+                        "healthy"
+                    );
+                    assert!(generation.probes.history.lock().is_empty());
+                }
                 service.shutdown().await;
             }
         });

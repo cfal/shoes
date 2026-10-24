@@ -6,6 +6,7 @@
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hickory_resolver::Resolver;
@@ -17,7 +18,7 @@ use hickory_resolver::net::NetError;
 use crate::address::NetLocation;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::dns::parsed::IpStrategy;
-use crate::dns::proxy_runtime::ProxyRuntimeProvider;
+use crate::dns::proxy_runtime::{LOOKUP_LOCAL_FAILURE, ProxyRuntimeProvider};
 use crate::resolver::Resolver as ShoesResolver;
 
 /// Tuning options for hickory-backed resolvers.
@@ -76,8 +77,8 @@ impl std::error::Error for DnsLookupError {
 impl From<DnsLookupError> for std::io::Error {
     fn from(error: DnsLookupError) -> Self {
         let kind = match error.0 {
-            // A retry after local admission failure may find no usable DNS connection.
-            NetError::Busy | NetError::NoConnections => std::io::ErrorKind::WouldBlock,
+            NetError::Busy => std::io::ErrorKind::WouldBlock,
+            NetError::NoConnections => std::io::ErrorKind::NotConnected,
             _ => std::io::ErrorKind::Other,
         };
         Self::new(kind, error)
@@ -308,18 +309,28 @@ impl ShoesResolver for HickoryResolver {
         Box::pin(async move {
             let started = std::time::Instant::now();
 
-            let response = resolver.lookup_ip(&name).await.map_err(|e| {
-                let elapsed = started.elapsed();
-                log::warn!(
-                    "DNS lookup failed via {}: {}:{} in {:?}: {}",
-                    description,
-                    name,
-                    port,
-                    elapsed,
-                    e
-                );
-                std::io::Error::from(DnsLookupError(e))
-            })?;
+            // Hickory can replace transport errors with NoConnections. Keep local
+            // admission/policy failures scoped to this lookup, not the resolver pool.
+            let local_failure = Arc::new(AtomicBool::new(false));
+            let response = LOOKUP_LOCAL_FAILURE
+                .scope(local_failure.clone(), resolver.lookup_ip(&name))
+                .await
+                .map_err(|e| {
+                    let elapsed = started.elapsed();
+                    log::warn!(
+                        "DNS lookup failed via {}: {}:{} in {:?}: {}",
+                        description,
+                        name,
+                        port,
+                        elapsed,
+                        e
+                    );
+                    if local_failure.load(Ordering::Relaxed) {
+                        std::io::Error::new(std::io::ErrorKind::WouldBlock, DnsLookupError(e))
+                    } else {
+                        std::io::Error::from(DnsLookupError(e))
+                    }
+                })?;
 
             let addrs: Vec<SocketAddr> = response
                 .iter()
@@ -372,11 +383,11 @@ mod tests {
             error.to_string(),
             "DNS lookup failed: io error: process resource budget exhausted"
         );
-        for error in [NetError::Busy, NetError::NoConnections] {
-            assert_eq!(
-                std::io::Error::from(DnsLookupError(error)).kind(),
-                std::io::ErrorKind::WouldBlock
-            );
+        for (error, kind) in [
+            (NetError::Busy, std::io::ErrorKind::WouldBlock),
+            (NetError::NoConnections, std::io::ErrorKind::NotConnected),
+        ] {
+            assert_eq!(std::io::Error::from(DnsLookupError(error)).kind(), kind);
         }
     }
 

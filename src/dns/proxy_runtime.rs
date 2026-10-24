@@ -5,6 +5,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hickory_resolver::net::runtime::iocompat::AsyncIoTokioAsStd;
@@ -17,6 +18,17 @@ use crate::resolver::Resolver;
 
 #[cfg(test)]
 const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+
+tokio::task_local! {
+    pub(super) static LOOKUP_LOCAL_FAILURE: Arc<AtomicBool>;
+}
+
+fn record_local_failure(error: io::Error) -> io::Error {
+    if crate::clash_api::probes::local_failure(&error) {
+        let _ = LOOKUP_LOCAL_FAILURE.try_with(|failed| failed.store(true, Ordering::Relaxed));
+    }
+    error
+}
 
 /// RuntimeProvider that routes TCP connections through a proxy chain.
 /// For direct-only chains, UDP and QUIC use the configured bind_interface.
@@ -63,6 +75,14 @@ pub struct TokioSpawnHandle;
 
 impl Spawn for TokioSpawnHandle {
     fn spawn_bg(&mut self, future: impl Future<Output = ()> + Send + 'static) {
+        let local_failure = LOOKUP_LOCAL_FAILURE.try_with(Arc::clone).ok();
+        let future = async move {
+            if let Some(local_failure) = local_failure {
+                LOOKUP_LOCAL_FAILURE.scope(local_failure, future).await;
+            } else {
+                future.await;
+            }
+        };
         if crate::control::url_test::is_probe() {
             tokio::spawn(crate::control::url_test::PROBING.scope((), future));
         } else {
@@ -126,7 +146,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
                         started.elapsed(),
                         e
                     );
-                    Err(e)
+                    Err(record_local_failure(e))
                 }
                 Err(_) => {
                     log::warn!(
@@ -153,13 +173,17 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         let chain_group = self.chain_group.clone();
 
         Box::pin(async move {
-            let bind_interface = chain_group.select_bind_interface()?.map(str::to_owned);
+            let bind_interface = chain_group
+                .select_bind_interface()
+                .map_err(record_local_failure)?
+                .map(str::to_owned);
             let socket = crate::socket_util::new_outbound_socket2_udp_socket(
                 local_addr.is_ipv6(),
                 bind_interface,
                 Some(local_addr),
-            )?;
-            tokio::net::UdpSocket::from_std(socket.into())
+            )
+            .map_err(record_local_failure)?;
+            tokio::net::UdpSocket::from_std(socket.into()).map_err(record_local_failure)
         })
     }
 
@@ -183,14 +207,20 @@ impl QuicSocketBinder for ProxyQuicBinder {
         local_addr: SocketAddr,
         _server_addr: SocketAddr,
     ) -> Result<Arc<dyn quinn::AsyncUdpSocket>, io::Error> {
-        let memory = crate::resources::try_quic_memory(self.memory_bytes)
-            .ok_or_else(|| crate::resources::quic_memory_exhausted(self.memory_bytes))?;
+        let memory = crate::resources::try_quic_memory(self.memory_bytes).ok_or_else(|| {
+            record_local_failure(crate::resources::quic_memory_exhausted(self.memory_bytes))
+        })?;
         let socket = crate::socket_util::new_outbound_socket2_udp_socket(
             local_addr.is_ipv6(),
-            self.chain_group.select_bind_interface()?.map(str::to_owned),
+            self.chain_group
+                .select_bind_interface()
+                .map_err(record_local_failure)?
+                .map(str::to_owned),
             Some(local_addr),
-        )?;
+        )
+        .map_err(record_local_failure)?;
         crate::quic_endpoint::socket_with_memory(socket.into(), memory)
+            .map_err(record_local_failure)
     }
 }
 
@@ -203,6 +233,28 @@ mod tests {
     use crate::tcp::chain_builder::build_direct_chain_group;
     use crate::tcp::socket_connector::SocketConnector;
     use async_trait::async_trait;
+
+    #[tokio::test]
+    async fn url_test_dns_local_failure_context_is_lookup_scoped_and_inherited() {
+        let local = Arc::new(AtomicBool::new(false));
+        let remote = Arc::new(AtomicBool::new(false));
+        let local_lookup = LOOKUP_LOCAL_FAILURE.scope(local.clone(), async {
+            let (sent, received) = tokio::sync::oneshot::channel();
+            TokioSpawnHandle.spawn_bg(async move {
+                let _ = record_local_failure(crate::resources::exhausted());
+                sent.send(()).unwrap();
+            });
+            received.await.unwrap();
+        });
+        let remote_lookup = LOOKUP_LOCAL_FAILURE.scope(remote.clone(), async {
+            let _ = record_local_failure(io::ErrorKind::ConnectionRefused.into());
+            tokio::task::yield_now().await;
+        });
+        tokio::join!(local_lookup, remote_lookup);
+        assert!(local.load(Ordering::Relaxed));
+        assert!(!remote.load(Ordering::Relaxed));
+        assert!(LOOKUP_LOCAL_FAILURE.try_with(Arc::clone).is_err());
+    }
 
     #[tokio::test]
     async fn url_test_dns_background_dials_preserve_probe_context() {
