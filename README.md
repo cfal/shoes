@@ -60,7 +60,7 @@ same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
 - **TLS fingerprint authentication**: Certificate pinning for TLS/QUIC
 - **Hot reloading**: Apply config changes without restart
 - **Unix socket support**: Bind to Unix domain sockets
-- **Optional Clash controller**: Named selectors, connection monitoring/cancellation, outbound delay tests, and optional selector persistence ([configuration](CONFIG.md#clash-controller), [example](examples/clash_api.yaml))
+- **Upstream groups and optional Clash controller**: Round-robin, manual selectors, and automatic URL tests (without an API listener); connection monitoring/cancellation and optional selector persistence ([configuration](CONFIG.md#clash-controller), [example](examples/clash_api.yaml), [URL-test example](examples/url_test.yaml))
 
 For advanced access control (IP allowlist/blocklists), see [tobaru](https://github.com/cfal/tobaru).
 
