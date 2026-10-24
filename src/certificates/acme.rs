@@ -695,6 +695,22 @@ impl Scheduler {
         }
     }
 
+    fn defer_hint(
+        config: &AcmeConfig,
+        state: &mut State,
+        response: Option<ResponseMetadata>,
+    ) -> Result<(), Failure> {
+        let hint = response_deadline(&response);
+        if hint > now() && hint > state.retry_at {
+            // Preserve each workflow hint before a later operation can fail or be cancelled.
+            defer(config, state, hint).map_err(|error| Failure {
+                response,
+                ..Failure::from(error)
+            })?;
+        }
+        Ok(())
+    }
+
     fn failure(
         &mut self,
         source: &Source,
@@ -973,16 +989,8 @@ impl Scheduler {
             (order, response)
         };
         if order.state().status == OrderStatus::Pending {
-            let hint = response_deadline(&response);
-            if hint > now() {
-                // Commit this hint before challenge preparation can fail or be cancelled.
-                defer(config, state, hint)?;
-            }
-            client
-                .perform(
-                    deadline,
-                    prepare_challenges(source, config, state, &mut order),
-                )
+            Self::defer_hint(config, state, response)?;
+            self.prepare_challenges(source, config, state, &mut order, deadline)
                 .await?;
             return Ok(Progress::Pending);
         }
@@ -1007,10 +1015,7 @@ impl Scheduler {
         }
         match order.state().status {
             OrderStatus::Processing => {
-                let hint = response_deadline(&response);
-                if hint > now() {
-                    defer(config, state, hint)?;
-                }
+                Self::defer_hint(config, state, response)?;
                 Ok(Progress::Pending)
             }
             OrderStatus::Invalid => {
@@ -1047,86 +1052,110 @@ impl Scheduler {
             _ => Err(instant_acme::Error::Str("unexpected order state").into()),
         }
     }
-}
 
-async fn prepare_challenges(
-    source: &Source,
-    config: &AcmeConfig,
-    state: &mut State,
-    order: &mut instant_acme::Order,
-) -> Result<(), instant_acme::Error> {
-    let mut authorizations = order.authorizations();
-    while let Some(result) = authorizations.next().await {
-        let mut authorization = result?;
-        if authorization.status == AuthorizationStatus::Valid {
-            continue;
+    async fn prepare_challenges(
+        &mut self,
+        source: &Source,
+        config: &AcmeConfig,
+        state: &mut State,
+        order: &mut instant_acme::Order,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Failure> {
+        let client = self.client(config)?;
+        let mut authorizations = order.authorizations();
+        loop {
+            let (authorization, response) = client
+                .perform(deadline, async { authorizations.next().await.transpose() })
+                .await?;
+            let Some(mut authorization) = authorization else {
+                break;
+            };
+            if authorization.status == AuthorizationStatus::Valid {
+                continue;
+            }
+            if authorization.status != AuthorizationStatus::Pending {
+                let error = clear_order(source, config, state).err().unwrap_or_else(|| {
+                    authorization
+                        .challenges
+                        .iter()
+                        .find_map(|challenge| challenge.error.clone())
+                        .map_or(
+                            instant_acme::Error::Str("authorization not pending"),
+                            instant_acme::Error::Api,
+                        )
+                });
+                return Err(Failure {
+                    error: Box::new(error),
+                    response,
+                });
+            }
+            Self::defer_hint(config, state, response)?;
+            let kind = match config.challenge {
+                ChallengeConfig::Http01 { .. } => ChallengeType::Http01,
+                ChallengeConfig::TlsAlpn01 => ChallengeType::TlsAlpn01,
+            };
+            let mut challenge =
+                authorization
+                    .challenge(kind.clone())
+                    .ok_or(instant_acme::Error::Str(
+                        "CA did not offer configured challenge",
+                    ))?;
+            if challenge.status == ChallengeStatus::Invalid {
+                clear_order(source, config, state)?;
+                return Err(challenge
+                    .error
+                    .clone()
+                    .map_or(
+                        instant_acme::Error::Str("challenge invalid"),
+                        instant_acme::Error::Api,
+                    )
+                    .into());
+            }
+            if challenge.status == ChallengeStatus::Valid {
+                continue;
+            }
+            let domain = challenge.identifier().to_string();
+            if !config.domains.contains(&domain) {
+                return Err(
+                    instant_acme::Error::Str("CA returned an unconfigured identifier").into(),
+                );
+            }
+            let token = challenge.token.clone();
+            if token.len() < 22
+                || token.len() > 256
+                || !token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            {
+                return Err(instant_acme::Error::Str("CA returned invalid challenge token").into());
+            }
+            let authorization = challenge.key_authorization();
+            let tls = if kind == ChallengeType::TlsAlpn01 {
+                Some(
+                    challenge::tls_config(&domain, authorization.digest().as_ref())
+                        .map_err(|error| instant_acme::Error::Other(Box::new(error)))?,
+                )
+            } else {
+                None
+            };
+            {
+                let mut pending = source.challenges.write();
+                pending.retain(|existing| existing.domain != domain);
+                pending.push(challenge::Pending {
+                    domain,
+                    token,
+                    authorization: authorization.as_str().to_owned(),
+                    expires: Instant::now() + ORDER_TIMEOUT,
+                    tls,
+                });
+            }
+            if challenge.status == ChallengeStatus::Pending {
+                let ((), response) = client.perform(deadline, challenge.set_ready()).await?;
+                Self::defer_hint(config, state, response)?;
+            }
         }
-        if authorization.status != AuthorizationStatus::Pending {
-            clear_order(source, config, state)?;
-            return Err(authorization
-                .challenges
-                .iter()
-                .find_map(|challenge| challenge.error.clone())
-                .map_or(
-                    instant_acme::Error::Str("authorization not pending"),
-                    instant_acme::Error::Api,
-                ));
-        }
-        let kind = match config.challenge {
-            ChallengeConfig::Http01 { .. } => ChallengeType::Http01,
-            ChallengeConfig::TlsAlpn01 => ChallengeType::TlsAlpn01,
-        };
-        let mut challenge = authorization
-            .challenge(kind.clone())
-            .ok_or("CA did not offer configured challenge")?;
-        if challenge.status == ChallengeStatus::Invalid {
-            clear_order(source, config, state)?;
-            return Err(challenge.error.clone().map_or(
-                instant_acme::Error::Str("challenge invalid"),
-                instant_acme::Error::Api,
-            ));
-        }
-        if challenge.status == ChallengeStatus::Valid {
-            continue;
-        }
-        let domain = challenge.identifier().to_string();
-        if !config.domains.contains(&domain) {
-            return Err("CA returned an unconfigured identifier".into());
-        }
-        let token = challenge.token.clone();
-        if token.len() < 22
-            || token.len() > 256
-            || !token
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-        {
-            return Err("CA returned invalid challenge token".into());
-        }
-        let authorization = challenge.key_authorization();
-        let tls = if kind == ChallengeType::TlsAlpn01 {
-            Some(
-                challenge::tls_config(&domain, authorization.digest().as_ref())
-                    .map_err(|error| instant_acme::Error::Other(Box::new(error)))?,
-            )
-        } else {
-            None
-        };
-        {
-            let mut pending = source.challenges.write();
-            pending.retain(|existing| existing.domain != domain);
-            pending.push(challenge::Pending {
-                domain,
-                token,
-                authorization: authorization.as_str().to_owned(),
-                expires: Instant::now() + ORDER_TIMEOUT,
-                tls,
-            });
-        }
-        if challenge.status == ChallengeStatus::Pending {
-            challenge.set_ready().await?;
-        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(super) async fn run(source: Arc<Source>, config: &AcmeConfig) {

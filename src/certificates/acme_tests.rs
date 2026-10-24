@@ -141,6 +141,8 @@ struct CaState {
     new_order_retry_after: Option<u64>,
     finalize_retry_after: Option<u64>,
     authorization_retry_after: Option<u64>,
+    challenge_retry_after: Option<u64>,
+    challenge_stall: bool,
     order_requests: usize,
     defer_validation: bool,
     missing_order_status: Option<u16>,
@@ -208,6 +210,8 @@ impl Fixture {
             new_order_retry_after: None,
             finalize_retry_after: None,
             authorization_retry_after: None,
+            challenge_retry_after: None,
+            challenge_stall: false,
             order_requests: 0,
             defer_validation: false,
             missing_order_status: None,
@@ -488,7 +492,7 @@ async fn handle(
     let (operation, id) = path.trim_start_matches('/').split_once('/').unwrap();
     let id: usize = id.parse().unwrap();
     if operation == "challenge" {
-        let deferred = {
+        let (deferred, stalled) = {
             let mut state = state.lock();
             assert_eq!(
                 state.orders[id].challenge_status, "pending",
@@ -496,15 +500,24 @@ async fn handle(
             );
             state.orders[id].challenge_status = "processing";
             state.challenge_requests += 1;
-            state.defer_validation
+            (state.defer_validation, state.challenge_stall)
         };
+        if stalled {
+            std::future::pending::<()>().await;
+        }
         if !deferred {
             validate_challenge(&state, id).await?;
         }
         let mut state = state.lock();
         let value = json!({"type":state.kind, "url":format!("{}/challenge/{id}", state.base),
             "token":state.orders[id].token, "status":if deferred {"processing"} else {"valid"}});
-        return Ok(response(&mut state, 200, value.to_string(), None));
+        let mut response = response(&mut state, 200, value.to_string(), None);
+        if let Some(delay) = state.challenge_retry_after {
+            response
+                .headers_mut()
+                .insert("retry-after", delay.to_string().parse().unwrap());
+        }
+        return Ok(response);
     }
     let mut state = state.lock();
     let value = match operation {
@@ -1265,9 +1278,108 @@ async fn order_metadata_is_operation_local_and_nonce_404_does_not_delete_order()
 }
 
 #[tokio::test]
+async fn pending_authorization_and_challenge_hints_survive_restart() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for (processing, authorization_hint, challenge_hint) in [
+            (true, Some(900), None),
+            (false, Some(900), None),
+            (false, None, Some(900)),
+            (false, Some(900), Some(300)),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut fixture = Fixture::new(listener.local_addr().unwrap(), false).await;
+            fixture.state.lock().defer_validation = true;
+            let config = fixture.config(directory.path(), false);
+            let _lock = lock_state(&config).unwrap();
+            let source =
+                Source::new("fixture".into(), super::super::Spec::Acme(config.clone())).unwrap();
+            let mut scheduler = Scheduler::new();
+            if processing {
+                assert_eq!(
+                    scheduler.turn(&source, &config).await.outcome.unwrap(),
+                    Progress::Pending
+                );
+                expire_retry(&config);
+            }
+            {
+                let mut state = fixture.state.lock();
+                state.authorization_retry_after = authorization_hint;
+                state.challenge_retry_after = challenge_hint;
+            }
+            let turn = scheduler.turn(&source, &config).await;
+            assert_eq!(turn.outcome.unwrap(), Progress::Pending);
+            assert!(turn.wake_at >= now() + 890, "pending hint lost");
+            assert_eq!(load(&config).unwrap().unwrap().retry_at, turn.wake_at);
+            assert_eq!(scheduler.backoff, 60);
+            assert_eq!(fixture.state.lock().challenge_requests, 1);
+            assert_eq!(source.challenges.read().len(), 1);
+            let requests = fixture.requests.load(Ordering::SeqCst);
+            for scheduler in [&mut scheduler, &mut Scheduler::new()] {
+                let deferred = scheduler.turn(&source, &config).await;
+                assert_eq!(deferred.outcome.unwrap(), Progress::Deferred);
+                assert_eq!(deferred.wake_at, turn.wake_at);
+            }
+            assert_eq!(fixture.requests.load(Ordering::SeqCst), requests);
+            fixture.tasks.shutdown().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn authorization_hint_is_durable_before_challenge_submission_completes() {
+    let directory = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut fixture = Fixture::new(listener.local_addr().unwrap(), false).await;
+    {
+        let mut state = fixture.state.lock();
+        state.authorization_retry_after = Some(900);
+        state.challenge_stall = true;
+    }
+    let config = fixture.config(directory.path(), false);
+    let _lock = lock_state(&config).unwrap();
+    let source = Source::new("fixture".into(), super::super::Spec::Acme(config.clone())).unwrap();
+    let mut scheduler = Scheduler::new();
+    let mut turn = Box::pin(scheduler.turn(&source, &config));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut turn => panic!("stalled submission completed: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if fixture.state.lock().challenge_requests == 1 {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // Cancellation must not depend on the final Pending or failure save.
+    drop(turn);
+    let state = load(&config).unwrap().unwrap();
+    assert!(state.retry_at >= now() + 890);
+    let requests = fixture.requests.load(Ordering::SeqCst);
+    let deferred = Scheduler::new().turn(&source, &config).await;
+    assert_eq!(deferred.outcome.unwrap(), Progress::Deferred);
+    assert_eq!(deferred.wake_at, state.retry_at);
+    assert_eq!(fixture.requests.load(Ordering::SeqCst), requests);
+    fixture.tasks.shutdown().await;
+}
+
+#[tokio::test]
 async fn order_hints_survive_persistence_and_challenge_preparation_failures() {
     tokio::time::timeout(Duration::from_secs(15), async {
-        for mode in ["create", "missing", "challenge"] {
+        for mode in [
+            "create",
+            "missing",
+            "challenge",
+            "authorization",
+            "ready-response",
+            "invalid-authorization-hint",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut fixture = Fixture::new(listener.local_addr().unwrap(), false).await;
@@ -1295,24 +1407,42 @@ async fn order_hints_survive_persistence_and_challenge_preparation_failures() {
                 state.fail_state_sync_on = Some("/order/0");
             } else {
                 let mut state = fixture.state.lock();
-                state.new_order_retry_after = Some(900);
-                if mode == "create" {
-                    state.fail_state_sync_on = Some("/new-order");
-                } else {
-                    state.invalid_authorization = true;
+                match mode {
+                    "create" => {
+                        state.new_order_retry_after = Some(900);
+                        state.fail_state_sync_on = Some("/new-order");
+                    }
+                    "challenge" => {
+                        state.new_order_retry_after = Some(900);
+                        state.invalid_authorization = true;
+                    }
+                    "authorization" => {
+                        state.authorization_retry_after = Some(900);
+                        state.fail_state_sync_on = Some("/auth/0");
+                    }
+                    "ready-response" => {
+                        state.challenge_retry_after = Some(900);
+                        state.fail_state_sync_on = Some("/challenge/0");
+                    }
+                    "invalid-authorization-hint" => {
+                        state.invalid_authorization = true;
+                        state.authorization_retry_after = Some(900);
+                    }
+                    _ => unreachable!(),
                 }
             }
             let turn = scheduler.turn(&source, &config).await;
             let error = turn.outcome.unwrap_err();
             assert!(!FAIL_STATE_SYNC.get());
-            if mode != "challenge" {
+            if !matches!(mode, "challenge" | "invalid-authorization-hint") {
                 assert!(failure_message(&error).contains("fixture state sync failure"));
             }
             assert!(turn.wake_at >= now() + 890, "{mode}: response hint lost");
             let state = load(&config).unwrap().unwrap();
             assert_eq!(state.retry_at, turn.wake_at);
-            assert_eq!(state.order_url.is_some(), mode == "create");
-            assert_eq!(state.order_key.is_some(), mode == "create");
+            let order_retained = matches!(mode, "create" | "authorization" | "ready-response");
+            assert_eq!(state.order_url.is_some(), order_retained);
+            assert_eq!(state.order_key.is_some(), order_retained);
             let requests = fixture.requests.load(Ordering::SeqCst);
             assert!(matches!(
                 scheduler.turn(&source, &config).await.outcome,
@@ -1587,6 +1717,16 @@ async fn missing_orders_and_invalid_authorizations_recover_without_an_extra_fail
                 fixture.state.lock().invalidate_on_poll = mode == "invalid-order";
                 fixture.state.lock().invalid_authorization = mode == "invalid-authorization";
                 if mode == "invalid-order" {
+                    assert_eq!(
+                        Scheduler::new()
+                            .turn(&source, &config)
+                            .await
+                            .outcome
+                            .unwrap(),
+                        Progress::Pending
+                    );
+                    expire_retry(&config);
+                    // Only the terminal diagnostic fetch carries this hint.
                     fixture.state.lock().authorization_retry_after = Some(900);
                 }
             }
