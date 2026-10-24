@@ -62,38 +62,37 @@ pub(super) fn tls_config(domain: &str, digest: &[u8]) -> io::Result<Arc<rustls::
 }
 
 pub(super) async fn serve(listeners: Vec<Arc<TcpListener>>, source: Arc<Source>) -> io::Result<()> {
-    let mut servers = JoinSet::<()>::new();
-    for listener in listeners {
-        let source = source.clone();
-        servers.spawn(async move {
-            let mut connections = JoinSet::new();
-            loop {
-                tokio::select! {
-                    result = listener.accept() => {
-                        let (stream, _) = match result {
-                            Ok(accepted) => accepted,
-                            Err(_) => {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                continue;
-                            }
-                        };
-                        if connections.len() >= 64 {
-                            drop(stream);
-                            continue;
-                        }
-                        let source = source.clone();
-                        connections.spawn(async move {
-                            let _ = tokio::time::timeout(Duration::from_secs(10), respond(stream, &source)).await;
-                        });
+    // Own accept loops directly so cancellation releases listener sockets synchronously.
+    let servers = listeners
+        .into_iter()
+        .map(|listener| serve_listener(listener, source.clone()));
+    futures::future::join_all(servers).await;
+    std::future::pending().await
+}
+
+async fn serve_listener(listener: Arc<TcpListener>, source: Arc<Source>) {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _) = match result {
+                    Ok(accepted) => accepted,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
-                    _ = connections.join_next(), if !connections.is_empty() => {}
+                };
+                if connections.len() >= 64 {
+                    drop(stream);
+                    continue;
                 }
+                let source = source.clone();
+                connections.spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(10), respond(stream, &source)).await;
+                });
             }
-        });
-    }
-    match servers.join_next().await {
-        Some(result) => result.map_err(io::Error::other),
-        None => std::future::pending().await,
+            _ = connections.join_next(), if !connections.is_empty() => {}
+        }
     }
 }
 
@@ -172,6 +171,36 @@ async fn respond(mut stream: TcpStream, source: &Source) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_releases_listener_without_yielding() {
+        let source = Source::new(
+            "test".into(),
+            super::super::Spec::Acme(super::super::AcmeConfig {
+                domains: vec!["proxy.test".into()],
+                directory_url: "http://127.0.0.1:9/directory".into(),
+                state_dir: "unused".into(),
+                terms_of_service: None,
+                contacts: vec![],
+                challenge: super::super::ChallengeConfig::Http01 { listen: vec![] },
+                ca_cert: None,
+            }),
+        )
+        .unwrap();
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let address = listener.local_addr().unwrap();
+        let weak = Arc::downgrade(&listener);
+        let mut serving = Box::pin(serve(vec![listener], source.clone()));
+        assert!(futures::poll!(&mut serving).is_pending());
+        tokio::task::yield_now().await;
+        drop(serving);
+        assert!(weak.upgrade().is_none());
+        let rebound = std::net::TcpListener::bind(address).unwrap();
+        drop(rebound);
+
+        let mut empty = Box::pin(serve(vec![], source));
+        assert!(futures::poll!(&mut empty).is_pending());
+    }
 
     #[tokio::test]
     async fn exact_http_routing_expiry_and_bounded_headers() {

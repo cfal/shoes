@@ -473,6 +473,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_shutdown_allows_immediate_rebind_and_restart() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let directory = tempfile::tempdir().unwrap();
+            let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = reserved.local_addr().unwrap();
+            drop(reserved);
+            let configs = serde_json::json!([{
+                "certificate_source": "managed", "type": "acme", "domains": ["proxy.test"],
+                "directory_url": "http://127.0.0.1:9/directory", "state_dir": directory.path().join("state"),
+                "challenge": {"type": "http01", "listen": [address.to_string()]}
+            }]);
+            for _ in 0..2 {
+                let mut validated = crate::config::create_server_configs(
+                    serde_yaml::from_value(serde_yaml::to_value(&configs).unwrap()).unwrap(),
+                )
+                .unwrap();
+                let mut registry = Registry::prepare(&mut validated, None).await.unwrap();
+                registry.start().await;
+                let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+                stream.write_all(b"GET / HTTP/1.1\r\nHost: proxy.test\r\n\r\n").await.unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).await.unwrap();
+                assert!(response.starts_with("HTTP/1.1 404 "));
+                registry.shutdown().await;
+                let socket = tokio::net::TcpSocket::new_v4().unwrap();
+                socket.set_reuseaddr(true).unwrap();
+                socket.bind(address).unwrap();
+                let rebound = socket.listen(128).unwrap();
+                let Spec::Acme(config) = &validated.certificates[0].spec else {
+                    unreachable!()
+                };
+                let lock = acme::lock_state(config).unwrap();
+                drop((rebound, lock));
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn one_worker_is_reused_and_removal_cancels_it() {
         let dir = tempfile::tempdir().unwrap();
         let first = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
