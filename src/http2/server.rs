@@ -191,6 +191,8 @@ async fn tunnel(
         let Some(upstream) = routed.setup else {
             return Ok(());
         };
+        drop(selector);
+        drop(resolver);
         return relay(stream, upstream, routed.prefix).await;
     }
     let mut no_read = tokio::io::empty();
@@ -219,6 +221,8 @@ async fn tunnel(
     let send = respond
         .send_response(Response::new(()), false)
         .map_err(io::Error::other)?;
+    drop(selector);
+    drop(resolver);
     relay(
         H2MultiStream::new(send, request.into_body()),
         upstream,

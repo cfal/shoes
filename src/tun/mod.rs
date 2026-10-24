@@ -303,6 +303,8 @@ pub(crate) async fn handle_tcp_connection(
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN TCP setup timed out"))
     .and_then(|result| result)
     .inspect_err(|error| warn!("Failed to connect to {}: {}", target, error))?;
+    drop(proxy_selector);
+    drop(resolver);
 
     let Some((mut remote, wire_destination)) = connected else {
         debug!("TCP connection blocked by rules");

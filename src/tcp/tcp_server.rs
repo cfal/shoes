@@ -230,6 +230,8 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                     ));
                 }
             };
+            drop(proxy_selector);
+            drop(resolver);
             let Some(TcpClientSetupResult {
                 mut client_stream,
                 early_data,
@@ -350,6 +352,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             .await
         }
         TcpServerSetupResult::Session(session) => {
+            drop(resolver);
             session.await;
             Ok(())
         }
@@ -829,6 +832,60 @@ mod lifetime_tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert!(registry.snapshot(0).connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fixed_tcp_releases_setup_owners_before_relay_and_half_close() {
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(5), async {
+            let (inbound, mut peer) = tokio::io::duplex(64);
+            let (outbound, mut target) = tokio::io::duplex(64);
+            let chain = ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Arc::new(ReadyConnector(
+                    std::sync::Mutex::new(Some(FlushStream {
+                        inner: outbound,
+                        stalled: false,
+                        flushes: Arc::new(AtomicUsize::new(0)),
+                    })),
+                )))],
+                vec![],
+            );
+            let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+                vec![crate::address::NetLocationMask::ANY],
+                ConnectAction::new_allow(None, ClientChainGroup::new(vec![chain])),
+            )]));
+            let resolver: Arc<dyn Resolver> = Arc::new(PendingResolver);
+            let handler = Arc::new(Handler(selector.clone()));
+            let weak_selector = Arc::downgrade(&selector);
+            let weak_resolver = Arc::downgrade(&resolver);
+            let weak_handler = Arc::downgrade(&handler);
+            drop(selector);
+            let relay = tokio::spawn(process_stream(inbound, handler, resolver));
+            let mut response = [0; 8];
+            peer.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"response");
+            let mut request = [0; 7];
+            target.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"request");
+            assert!(weak_selector.upgrade().is_none());
+            assert!(weak_resolver.upgrade().is_none());
+            assert!(weak_handler.upgrade().is_none());
+            assert!(!relay.is_finished());
+
+            peer.write_all(b"live request").await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut bytes = Vec::new();
+            target.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"live request");
+            target.write_all(b"reply after FIN").await.unwrap();
+            target.shutdown().await.unwrap();
+            bytes.clear();
+            peer.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"reply after FIN");
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]

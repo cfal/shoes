@@ -473,6 +473,8 @@ async fn relay_tcp_stream(
             ));
         }
     };
+    drop(client_proxy_selector);
+    drop(resolver);
     let Some(crate::tcp::tcp_handler::TcpClientSetupResult {
         mut client_stream,
         early_data,

@@ -932,6 +932,8 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         crate::util::timeout_stream_setup(prepared.route(&mut stream, &proxy_selector, &resolver))
             .await?;
     let routed = crate::util::timeout_stream_setup(route.connect(&resolver)).await?;
+    drop(proxy_selector);
+    drop(resolver);
     let mut client_stream: Box<dyn AsyncStream> = match routed.setup {
         Some(result) => {
             let flow = result.client_stream.flow().cloned();

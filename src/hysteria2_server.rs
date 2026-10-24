@@ -788,6 +788,8 @@ async fn relay_tcp_stream(
         Ok(routed.setup)
     }
     .await;
+    drop(client_proxy_selector);
+    drop(resolver);
     let Some(mut client_stream) = finish_tcp_setup(&mut server_stream, setup, success_sent)
         .await
         .map_err(|error| {
