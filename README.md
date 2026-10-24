@@ -168,10 +168,15 @@ GHCR images are published at `ghcr.io/cfal/shoes` for `linux/amd64` and
 
 - `master` follows the current branch head after both architectures pass the
   container smoke test.
-- `sha-<full commit SHA>` pins a commit image; retries and releases reuse it.
+- `sha-<full commit SHA>` is published before smoke verification and pins a
+  commit image; retries and releases reuse it.
 - A published GitHub release adds its exact tag, such as `v0.3.4`.
-- `latest` is set when a published stable release is GitHub's latest release,
-  never by a prerelease or master push.
+- `latest` is set only by a `published` release event when that stable release
+  is GitHub's latest at promotion time.
+
+Only `master`, release tags, and `latest` wait for successful smoke tests.
+Converting a prerelease to stable or changing GitHub's latest release later
+does not update the image tags.
 
 Draft releases and tag pushes alone do not publish release image tags. Release
 tag names must be valid Docker tags; `master`, `latest`, `buildcache*`, and `sha-*`
@@ -217,6 +222,24 @@ docker run --rm --name shoes \
 ```
 
 Use `shoes:local` instead to run the checkout build.
+
+Files Shoes writes cannot live in the read-only `/etc/shoes` mount. Give
+`cache_file_path`, fake DNS `state_file`, Unix socket listeners, and `--log-file`
+targets absolute paths on a separate writable mount owned by the container
+user. For example, create a private state directory:
+
+```sh
+mkdir -p state
+sudo chown 65532:65532 state
+sudo chmod 700 state
+```
+
+Set `cache_file_path: /var/lib/shoes/cache.db` in the configuration and add this
+option to `docker run`:
+
+```sh
+--mount type=bind,src="$(pwd)/state",dst=/var/lib/shoes
+```
 
 Publish UDP ports separately for UDP listeners. Bind listeners to `0.0.0.0`
 inside the container; host port bindings control which clients can reach them.
