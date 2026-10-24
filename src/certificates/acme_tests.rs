@@ -1161,6 +1161,7 @@ async fn optional_ari_setup_timeout_and_unsupported_leave_mandatory_policy_untou
                 state.ari_renew_at = now() + 2;
                 persist(&config, &state).unwrap();
             }
+            let started_at = now();
             let started = Instant::now();
             let turn = scheduler.turn(&source, &config).await;
             assert!(
@@ -1174,7 +1175,7 @@ async fn optional_ari_setup_timeout_and_unsupported_leave_mandatory_policy_untou
             assert_eq!(scheduler.backoff, 240);
             let mut state = load(&config).unwrap().unwrap();
             assert_eq!(state.retry_at, 0, "{mode}");
-            assert!(state.ari_retry_at >= now() + 6 * 3600 - 2);
+            assert!(state.ari_retry_at >= started_at + 6 * 3600);
             if mode == "contacts" {
                 assert_eq!(state.contacts, config.contacts);
                 assert_eq!(
@@ -1184,7 +1185,7 @@ async fn optional_ari_setup_timeout_and_unsupported_leave_mandatory_policy_untou
                 );
             }
             if mode == "setup-failure" {
-                assert!(state.ari_retry_at >= now() + 24 * 3600);
+                assert!(state.ari_retry_at >= started_at + 24 * 3600);
             }
             if mode == "timeout" {
                 assert_eq!(fixture.state.lock().ari_requests, 1);
