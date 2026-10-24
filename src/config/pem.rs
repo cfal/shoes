@@ -123,6 +123,19 @@ type PemVisitor<'a> = dyn FnMut(&mut String, PemUsage) + 'a;
 pub(crate) fn pem_reload_dependencies(
     configs: &mut [Config],
 ) -> std::io::Result<Vec<std::path::PathBuf>> {
+    pem_dependencies(configs, false)
+}
+
+pub(crate) fn pem_candidate_dependencies(
+    configs: &mut [Config],
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    pem_dependencies(configs, true)
+}
+
+fn pem_dependencies(
+    configs: &mut [Config],
+    include_server_identities: bool,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
     let named: HashMap<_, _> = configs
         .iter()
         .filter_map(|config| {
@@ -133,15 +146,30 @@ pub(crate) fn pem_reload_dependencies(
         })
         .collect();
     let mut paths = std::collections::BTreeSet::new();
+    if include_server_identities {
+        for source in named.values() {
+            if let PemSource::Path(path) = source {
+                paths.insert(std::path::PathBuf::from(path));
+            }
+        }
+    }
     for config in configs {
-        if let Config::CertificateSource(source) = config
-            && let crate::certificates::SourceConfig::Acme(acme) = &source.source
-            && let Some(path) = &acme.ca_cert
-        {
-            paths.insert(path.clone());
+        if let Config::CertificateSource(source) = config {
+            source.validate_file_paths()?;
+            match &source.source {
+                crate::certificates::SourceConfig::Files { cert, key }
+                    if include_server_identities =>
+                {
+                    paths.extend([cert.clone(), key.clone()]);
+                }
+                crate::certificates::SourceConfig::Acme(acme) => {
+                    paths.extend(acme.ca_cert.iter().cloned());
+                }
+                _ => {}
+            }
         }
         visit_config_pems(config, &mut |pem, usage| {
-            if matches!(usage, PemUsage::ServerIdentity) {
+            if matches!(usage, PemUsage::ServerIdentity) && !include_server_identities {
                 return;
             }
             match named.get(pem) {

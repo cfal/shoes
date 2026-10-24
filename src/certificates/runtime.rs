@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use super::{ChallengeConfig, Input, Source, Spec, acme, challenge, visit};
-use crate::config::ValidatedConfigs;
+use crate::config::{BindLocation, Config, Transport, ValidatedConfigs};
 
 #[derive(Default)]
 pub(crate) struct Registry {
@@ -53,6 +53,14 @@ impl Registry {
     pub(crate) async fn prepare(
         validated: &mut ValidatedConfigs,
         previous: Option<&Self>,
+    ) -> io::Result<Self> {
+        Self::prepare_with_retiring(validated, previous, &[]).await
+    }
+
+    pub(crate) async fn prepare_with_retiring(
+        validated: &mut ValidatedConfigs,
+        previous: Option<&Self>,
+        retiring: &[Config],
     ) -> io::Result<Self> {
         let mut registry = Self::default();
         let mut claimed_storage = std::collections::HashSet::new();
@@ -122,17 +130,25 @@ impl Registry {
                                     Some((worker, listener))
                                 })
                             });
-                            listeners.push(match existing {
+                            match existing {
                                 Some((owner, listener)) => {
                                     let replacements = registry.replacements.get_mut();
                                     if !replacements.iter().any(|worker| Arc::ptr_eq(worker, owner))
                                     {
                                         replacements.push(owner.clone());
                                     }
-                                    listener
+                                    listeners.push(listener);
                                 }
-                                None => Arc::new(TcpListener::bind(address).await?),
-                            });
+                                None => match TcpListener::bind(address).await {
+                                    Ok(listener) => listeners.push(Arc::new(listener)),
+                                    Err(error)
+                                        if error.kind() == io::ErrorKind::AddrInUse
+                                            && retiring_proxy_covers(retiring, *address) => {}
+                                    Err(error) => {
+                                        return Err(http_bind_error(source, *address, error));
+                                    }
+                                },
+                            }
                         }
                     }
                     Some(lock)
@@ -169,6 +185,32 @@ impl Registry {
             Ok(())
         })?;
         Ok(registry)
+    }
+
+    /// Finish binds deferred for ports still owned by the retiring proxy generation.
+    pub(crate) async fn bind_pending(&self) -> io::Result<()> {
+        for worker in &self.workers {
+            let Spec::Acme(config) = &worker.source.spec else {
+                continue;
+            };
+            let ChallengeConfig::Http01 { listen } = &config.challenge else {
+                continue;
+            };
+            for address in listen {
+                let bound = worker
+                    .listeners
+                    .lock()
+                    .iter()
+                    .any(|listener| listener.local_addr().ok().as_ref() == Some(address));
+                if !bound {
+                    let listener = TcpListener::bind(address)
+                        .await
+                        .map_err(|error| http_bind_error(&worker.source, *address, error))?;
+                    worker.listeners.lock().push(Arc::new(listener));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn start(&self) {
@@ -221,12 +263,59 @@ impl Registry {
         }
     }
 
+    pub(crate) async fn retire_unused(&self, next: &Self) {
+        for worker in &self.workers {
+            if !next
+                .workers
+                .iter()
+                .any(|retained| Arc::ptr_eq(worker, retained))
+            {
+                worker.stop_task().await;
+                worker.listeners.lock().clear();
+            }
+        }
+    }
+
     pub(crate) async fn stop(&self) {
         for worker in &self.workers {
             worker.stop_task().await;
             worker.listeners.lock().clear();
         }
     }
+}
+
+fn http_bind_error(source: &Source, address: std::net::SocketAddr, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "certificate source {} HTTP-01 bind at {address}: {error}",
+            source.name
+        ),
+    )
+}
+
+fn retiring_proxy_covers(configs: &[Config], address: std::net::SocketAddr) -> bool {
+    configs.iter().any(|config| {
+        let Config::Server(server) = config else {
+            return false;
+        };
+        if server.transport != Transport::Tcp {
+            return false;
+        }
+        let BindLocation::Address(addresses) = &server.bind_location else {
+            return false;
+        };
+        addresses
+            .iter()
+            .filter_map(|bound| bound.literal_socket_addr())
+            .any(|bound| {
+                // Do not infer ownership across address families or by widening a binding.
+                bound == address
+                    || (bound.port() == address.port()
+                        && bound.is_ipv4() == address.is_ipv4()
+                        && bound.ip().is_unspecified())
+            })
+    })
 }
 
 async fn watch_files(source: &Source) {
@@ -296,6 +385,63 @@ async fn watch_files(source: &Source) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_binds_require_a_known_covering_proxy_binding() {
+        for (bound, requested, covered) in [
+            ("127.0.0.1:18443", "127.0.0.1:18443", true),
+            ("0.0.0.0:18443", "127.0.0.1:18443", true),
+            ("127.0.0.1:18443", "0.0.0.0:18443", false),
+            ("0.0.0.0:18443", "[::1]:18443", false),
+            ("[::]:18443", "127.0.0.1:18443", false),
+            ("[::]:18443", "[::1]:18443", true),
+            ("127.0.0.1:18443", "127.0.0.1:18444", false),
+        ] {
+            let configs: Vec<Config> = serde_yaml::from_str(&format!(
+                "- address: '{bound}'\n  protocol: {{type: socks}}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                retiring_proxy_covers(&configs, requested.parse().unwrap()),
+                covered
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_bind_errors_identify_source_and_address_and_preserve_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reserved.local_addr().unwrap();
+        let mut validated = crate::config::create_server_configs(serde_yaml::from_str(&format!(
+            "- certificate_source: managed\n  type: acme\n  domains: [proxy.test]\n  directory_url: http://127.0.0.1:9/directory\n  state_dir: '{}'\n  challenge: {{type: http01, listen: ['{address}']}}\n", directory.path().join("state").display()
+        )).unwrap()).unwrap();
+        let error = Registry::prepare(&mut validated, None).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("managed HTTP-01 bind at {address}"))
+        );
+
+        let retiring: Vec<Config> = serde_yaml::from_str(&format!(
+            "- address: '{address}'\n  protocol: {{type: socks}}\n"
+        ))
+        .unwrap();
+        let mut registry = Registry::prepare_with_retiring(&mut validated, None, &retiring)
+            .await
+            .unwrap();
+        let error = registry.bind_pending().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("managed HTTP-01 bind at {address}"))
+        );
+        drop(reserved);
+        registry.bind_pending().await.unwrap();
+        registry.shutdown().await;
+    }
 
     fn config(dir: &std::path::Path) -> ValidatedConfigs {
         crate::config::create_server_configs(

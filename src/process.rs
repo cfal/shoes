@@ -17,12 +17,14 @@ const RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
 async fn load_validated(
     paths: &[String],
-    discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
+    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
 ) -> io::Result<ValidatedConfigs> {
     let mut configs = config::load_configs(&paths.to_vec()).await?;
     let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
+    let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
     dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
-    discovered(&dependencies);
+    recovery_dependencies.retain(|path| !dependencies.contains(path));
+    discovered(&dependencies, &recovery_dependencies);
     let (configs, _) = config::convert_cert_paths(configs).await?;
     let mut validated = config::compile_configs(configs).await?;
     validated.reload_files = dependencies;
@@ -47,14 +49,14 @@ struct PreparedServers {
 
 #[cfg(test)]
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
-    prepare_tracking(paths, previous, None, &mut |_| {}, &mut None).await
+    prepare_tracking(paths, previous, None, &mut |_, _| {}, &mut None).await
 }
 
 async fn prepare_tracking(
     paths: &[String],
     previous: Option<&DnsRegistry>,
-    previous_certificates: Option<&crate::certificates::Registry>,
-    discovered: &mut (dyn FnMut(&[PathBuf]) + Send),
+    previous_servers: Option<&PreparedServers>,
+    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
     control: &mut Option<crate::control::runtime::ControlService>,
 ) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths, discovered).await?;
@@ -150,8 +152,17 @@ async fn prepare_tracking(
             ))
         }
     })?;
-    let certificates =
-        crate::certificates::Registry::prepare(&mut validated, previous_certificates).await?;
+    let certificates = match previous_servers {
+        Some(previous) => {
+            crate::certificates::Registry::prepare_with_retiring(
+                &mut validated,
+                Some(&previous.certificates),
+                &previous.validated.configs,
+            )
+            .await?
+        }
+        None => crate::certificates::Registry::prepare(&mut validated, None).await?,
+    };
     let generation = if let (Some((id, rules)), Some(catalog)) =
         (control_generation, validated.catalog.take())
     {
@@ -246,6 +257,7 @@ impl RunningServers {
     }
 
     async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
+        prepared.certificates.bind_pending().await?;
         resources::configure(prepared.validated.global_limits)?;
         self.reporter = Some(resources::ResourceReporter::start());
         self.dns_snapshots = Some(prepared.dns.snapshot_task());
@@ -306,19 +318,28 @@ struct ConfigWatches {
     configs: Vec<PathBuf>,
     active: Vec<PathBuf>,
     candidate: Vec<PathBuf>,
+    recovery: Vec<PathBuf>,
     watcher: Option<RecommendedWatcher>,
+    recovery_watcher: Option<RecommendedWatcher>,
     tx: mpsc::Sender<()>,
+    recovery_tx: mpsc::Sender<()>,
+    recovery_changes: mpsc::Receiver<()>,
     disabled: bool,
 }
 
 impl ConfigWatches {
     fn new(paths: &[String], tx: mpsc::Sender<()>, disabled: bool) -> io::Result<Self> {
+        let (recovery_tx, recovery_changes) = mpsc::channel(1);
         let mut state = Self {
             configs: paths.iter().map(PathBuf::from).collect(),
             active: Vec::new(),
             candidate: Vec::new(),
+            recovery: Vec::new(),
             watcher: None,
+            recovery_watcher: None,
             tx,
+            recovery_tx,
+            recovery_changes,
             disabled,
         };
         state.refresh()?;
@@ -335,12 +356,18 @@ impl ConfigWatches {
                 .collect();
             // Construct the replacement before dropping the old watches.
             self.watcher = Some(watch(&paths, self.tx.clone())?);
+            self.recovery_watcher = if self.recovery.is_empty() {
+                None
+            } else {
+                Some(watch(&self.recovery, self.recovery_tx.clone())?)
+            };
         }
         Ok(())
     }
 
-    fn discovered(&mut self, paths: &[PathBuf]) {
+    fn discovered(&mut self, paths: &[PathBuf], recovery: &[PathBuf]) {
         self.candidate = paths.to_vec();
+        self.recovery = recovery.to_vec();
         if let Err(error) = self.refresh() {
             log::warn!("Could not refresh config dependency watches: {error}");
         }
@@ -349,8 +376,30 @@ impl ConfigWatches {
     fn activated(&mut self, paths: &[PathBuf]) {
         self.active = paths.to_vec();
         self.candidate.clear();
+        self.recovery.clear();
+        self.recovery_watcher = None;
+        // Late callbacks and queued identity-only events belong to the candidate,
+        // not the active generation. Preserve the separate config/reload queue.
+        (self.recovery_tx, self.recovery_changes) = mpsc::channel(1);
         if let Err(error) = self.refresh() {
             log::warn!("Could not refresh config dependency watches: {error}");
+        }
+    }
+
+    async fn changed(&mut self, changes: &mut mpsc::Receiver<()>) {
+        tokio::select! {
+            _ = changes.recv() => {},
+            _ = self.recovery_changes.recv() => {},
+        }
+    }
+
+    async fn debounce(&mut self, changes: &mut mpsc::Receiver<()>) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.changed(changes) => {},
+                _ = tokio::time::sleep(RELOAD_DEBOUNCE) => return,
+            }
         }
     }
 }
@@ -438,7 +487,7 @@ async fn run_inner(
     api: &mut Option<crate::clash_api::ApiService>,
 ) -> io::Result<()> {
     if dry_run {
-        load_validated(&paths, &mut |_| {}).await?;
+        load_validated(&paths, &mut |_, _| {}).await?;
         println!("Configuration valid");
         return Ok(());
     }
@@ -446,7 +495,8 @@ async fn run_inner(
     let mut reload = ReloadSignal::new()?;
     let (change_tx, mut changes) = mpsc::channel(1);
     let mut watches = ConfigWatches::new(&paths, change_tx, no_reload)?;
-    let mut discovered = |paths: &[PathBuf]| watches.discovered(paths);
+    let mut discovered =
+        |paths: &[PathBuf], recovery: &[PathBuf]| watches.discovered(paths, recovery);
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
@@ -482,7 +532,7 @@ async fn run_inner(
                 return Err(error);
             },
             _ = reload.recv() => false,
-            _ = changes.recv() => true,
+            _ = watches.changed(&mut changes) => true,
         };
         if debounce {
             tokio::select! {
@@ -493,15 +543,17 @@ async fn run_inner(
                     return Err(error);
                 },
                 _ = reload.recv() => {}
-                _ = crate::file_watcher::debounce(&mut changes, RELOAD_DEBOUNCE) => {}
+                _ = watches.debounce(&mut changes) => {}
             }
         }
         while changes.try_recv().is_ok() {}
+        while watches.recovery_changes.try_recv().is_ok() {}
         // Refresh symlink targets even when the candidate's YAML is invalid.
         if let Err(error) = watches.refresh() {
             log::warn!("Could not refresh config watches: {error}");
         }
-        let mut discovered = |paths: &[PathBuf]| watches.discovered(paths);
+        let mut discovered =
+            |paths: &[PathBuf], recovery: &[PathBuf]| watches.discovered(paths, recovery);
         let candidate = tokio::select! {
             biased;
             _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
@@ -509,7 +561,7 @@ async fn run_inner(
                 let _ = running.shutdown(&[&prepared]).await;
                 return Err(error);
             },
-            result = prepare_tracking(&paths, Some(&prepared.dns), Some(&prepared.certificates), &mut discovered, control) => result,
+            result = prepare_tracking(&paths, Some(&prepared.dns), Some(&prepared), &mut discovered, control) => result,
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
@@ -525,6 +577,10 @@ async fn run_inner(
             continue;
         }
         running.stop().await;
+        prepared
+            .certificates
+            .retire_unused(&candidate.certificates)
+            .await;
         if let Err(error) = prepared.dns.checkpoint().await {
             log::warn!("Reload Fake DNS checkpoint failed; continuing reload: {error}");
         }
@@ -587,6 +643,86 @@ async fn run_inner(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn activation_discards_candidate_identity_events_but_preserves_reload_events() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let directory = tempfile::tempdir().unwrap();
+            let config = directory.path().join("config.yaml");
+            let cert = directory.path().join("cert.pem");
+            let key = directory.path().join("key.pem");
+            let trust = directory.path().join("ca.pem");
+            let pair = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+            std::fs::write(&cert, pair.cert.pem()).unwrap();
+            std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+            std::fs::write(&trust, pair.cert.pem()).unwrap();
+            std::fs::write(&config, serde_yaml::to_string(&serde_json::json!([
+                {"address": "127.0.0.1:18443", "protocol": {"type": "tls", "default_tls_target": {
+                    "cert": cert, "key": key, "protocol": {"type": "socks"}
+                }}}
+            ])).unwrap()).unwrap();
+            let paths = [config.to_str().unwrap().to_owned()];
+            let (tx, mut changes) = mpsc::channel(1);
+            let mut watches = ConfigWatches::new(&paths, tx, false).unwrap();
+            let validated = load_validated(&paths, &mut |reload, recovery| {
+                assert!(!reload.contains(&cert) && !reload.contains(&key));
+                assert!(recovery.contains(&cert) && recovery.contains(&key));
+                watches.discovered(reload, recovery);
+            })
+            .await
+            .unwrap();
+            // A renewal while preparation is still in progress must not leak into
+            // the active reload queue, even if a notifier callback arrives late.
+            let late_callback = watches.recovery_tx.clone();
+            std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
+            while watches.recovery_changes.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(changes.is_empty());
+            watches.activated(&validated.reload_files);
+            assert!(late_callback.try_send(()).is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), watches.changed(&mut changes))
+                    .await
+                    .is_err()
+            );
+
+            for changed in [&config, &trust] {
+                watches.discovered(std::slice::from_ref(&trust), &[cert.clone(), key.clone()]);
+                let contents = std::fs::read(changed).unwrap();
+                std::fs::write(changed, contents).unwrap();
+                while changes.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                watches.activated(std::slice::from_ref(&trust));
+                assert!(
+                    changes.try_recv().is_ok(),
+                    "activation must retain YAML and reload-only dependency events"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_debounce_includes_candidate_recovery_events() {
+        let (tx, mut changes) = mpsc::channel(1);
+        let mut watches = ConfigWatches::new(&[], tx.clone(), true).unwrap();
+        let recovery = watches.recovery_tx.clone();
+        let task = tokio::spawn(async move { watches.debounce(&mut changes).await });
+        tokio::task::yield_now().await;
+        for sender in [tx, recovery] {
+            tokio::time::advance(Duration::from_secs(4)).await;
+            assert!(!task.is_finished());
+            sender.send(()).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        task.await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_dns_rejected_reload_keeps_inherited_guards_without_freezing_live_pool() {
@@ -611,7 +747,7 @@ mod tests {
             r#"[{"dns_group":"ordinary","dns_servers":"udp://198.18.0.5:53"}]"#,
         )
         .unwrap();
-        load_validated(&paths, &mut |_| {}).await.unwrap();
+        load_validated(&paths, &mut |_, _| {}).await.unwrap();
         let error = prepare(&paths, Some(&live.dns)).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
@@ -646,7 +782,7 @@ mod tests {
             }]}),
         ] {
             std::fs::write(&path, json!([server]).to_string()).unwrap();
-            load_validated(&paths, &mut |_| {}).await.unwrap();
+            load_validated(&paths, &mut |_, _| {}).await.unwrap();
             let error = prepare(&paths, Some(&removed.dns)).await.err().unwrap();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert!(
@@ -702,7 +838,7 @@ mod tests {
                     let mut tun = json!({"device_name":"tun0", "device_fd":42});
                     tun[field] = endpoint.into();
                     std::fs::write(&path, json!([tun]).to_string()).unwrap();
-                    load_validated(&paths, &mut |_| {}).await.unwrap();
+                    load_validated(&paths, &mut |_, _| {}).await.unwrap();
                     let result = prepare(&paths, Some(&retained.dns)).await;
                     if allowed {
                         result.unwrap();

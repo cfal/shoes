@@ -290,6 +290,33 @@ async fn state_preparation_errors_identify_source_and_storage_path() {
     assert!(!error.contains("PRIVATE STATE"));
 }
 
+#[test]
+fn file_source_paths_reject_pasted_secrets_before_dependency_discovery() {
+    let secret = "PRIVATE KEY CONTENT MUST NOT APPEAR";
+    for field in ["cert", "key"] {
+        for value in [
+            format!("  -----BEGIN PRIVATE KEY----- {secret}"),
+            format!("not-a-path\n{secret}"),
+        ] {
+            let mut entry = serde_json::json!({"certificate_source":"files", "type":"files", "cert":"/missing/cert.pem", "key":"/missing/key.pem"});
+            entry[field] = value.into();
+            let mut configs: Vec<Config> =
+                serde_yaml::from_value(serde_yaml::to_value(vec![entry]).unwrap()).unwrap();
+            for error in [
+                crate::config::pem_candidate_dependencies(&mut configs).unwrap_err(),
+                configure(&mut configs).unwrap_err(),
+            ] {
+                let error = error.to_string();
+                assert!(
+                    error.contains("files") && error.contains(field) && error.contains("file path"),
+                    "{error}"
+                );
+                assert!(!error.contains(secret), "{error}");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn legacy_paths_named_pems_and_inline_remain_supported() {
     let dir = tempfile::tempdir().unwrap();

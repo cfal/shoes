@@ -1585,6 +1585,12 @@ and never include private material. An expired source fails new handshakes
 rather than serving a substitute certificate. Existing connections continue
 uninterrupted.
 
+Initial file-source loading (including legacy paths) rejects expired or not-yet-valid
+chains, malformed or misordered chains, and PEM files larger than 1 MiB. A rejected
+configuration reload leaves the current listeners running and watches the candidate's
+file paths so repairing the pair retries the reload. After activation, identity-only
+changes use live rotation, not a full reload.
+
 Legacy `cert`/`key` paths, including paths referenced through named PEMs, also
 rotate live through these watches. Inline-only pairs stay static. This applies
 to ordinary inbound TLS and QUIC, including Hysteria2, TUIC and XHTTP. Outbound
@@ -1710,8 +1716,14 @@ addresses for local testing. Never disable verification for a public CA.
 
 Configuration reload reuses unchanged sources and their workers, accounts and
 pending challenges. Changed sources hand off storage and challenge listeners
-only after successful listener activation; failed preparation does not mutate
-live sources. Removed sources are canceled. CLI and mobile/FFI use the same
+when a validated reload commits. Retired challenge ports are released before
+new proxy listeners bind; failed preparation does not mutate live sources.
+When an existing proxy address moves to HTTP-01, its challenge bind is deferred
+until the old proxy has stopped. Narrowing a proxy wildcard within the same IP
+family is also supported. Other challenge addresses are still bound during
+preparation: widening bindings, changing IP families, or replacing a challenge
+wildcard binding may require a restart or two separate reloads to avoid conflicts.
+Removed sources are canceled. CLI and mobile/FFI use the same
 manager, with no process-global certificate registry. Mobile deployments still
 need externally reachable challenge ports and persistent application storage.
 

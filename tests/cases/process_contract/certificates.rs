@@ -223,6 +223,162 @@ async fn assert_no_reload(child: &mut Process, duration: Duration, phase: &str) 
 }
 
 #[tokio::test]
+async fn rejected_inbound_identities_recover_without_yaml_edits() {
+    timeout(Duration::from_secs(60), async {
+        for kind in ["legacy", "named-pem", "named-source"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.yaml");
+            let address = available_address();
+            let cert_path = directory.path().join("new/cert.pem");
+            let key_path = directory.path().join("new/key.pem");
+            let first = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+            let second = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+            std::fs::write(&path, serde_yaml::to_string(&json!([
+                {"address": address.to_string(), "protocol": {"type": "socks"}}
+            ])).unwrap()).unwrap();
+            let mut child = Process::start(&path, &[]);
+            child.wait_for("Servers ready").await;
+            let mut target = json!({"cert": cert_path, "key": key_path, "protocol": {"type": "socks"}});
+            let mut config = vec![];
+            match kind {
+                "named-source" => {
+                    config.push(json!({"certificate_source": "shared", "type": "files", "cert": cert_path, "key": key_path}));
+                    target = json!({"certificate_source": "shared", "protocol": {"type": "socks"}});
+                }
+                "named-pem" => {
+                    config.push(json!({"pem": "chain", "path": cert_path}));
+                    config.push(json!({"pem": "private", "path": key_path}));
+                    target["cert"] = json!("chain");
+                    target["key"] = json!("private");
+                }
+                _ => {}
+            }
+            config.push(json!({"address": address.to_string(), "protocol": {"type": "tls", "default_tls_target": target}}));
+            std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+            child.signal(libc::SIGHUP);
+            child.wait_for("Reload rejected").await;
+            let mut old = TcpStream::connect(address).await.unwrap();
+            old.write_all(&[5, 1, 0]).await.unwrap();
+            let mut reply = [0; 2];
+            old.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, 0]);
+            std::fs::create_dir(cert_path.parent().unwrap()).unwrap();
+            std::fs::write(&cert_path, first.cert.pem()).unwrap();
+            std::fs::write(&key_path, first.signing_key.serialize_pem()).unwrap();
+            child.wait_for("Servers ready").await;
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(first.cert.der().clone()).unwrap();
+            roots.add(second.cert.der().clone()).unwrap();
+            let client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+                .with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+            std::fs::write(&cert_path, second.cert.pem()).unwrap();
+            std::fs::write(&key_path, second.signing_key.serialize_pem()).unwrap();
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let stream = connector.connect("proxy.test".try_into().unwrap(), TcpStream::connect(address).await.unwrap()).await.unwrap();
+                    if stream.get_ref().1.peer_certificates().unwrap()[0] == *second.cert.der() { break; }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }).await.unwrap();
+            assert_no_reload(&mut child, Duration::from_millis(5500), kind).await;
+            child.signal(libc::SIGTERM);
+            assert!(child.exit().await.success());
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn reload_releases_retired_http01_ports_before_starting_proxy_listeners() {
+    timeout(Duration::from_secs(20), async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let challenge = available_address();
+        let proxy = available_address();
+        let mut config = json!([
+            {"certificate_source": "managed", "type": "acme", "domains": ["proxy.test"],
+                "directory_url": "http://127.0.0.1:9/directory", "state_dir": directory.path().join("state"),
+                "challenge": {"type": "http01", "listen": [challenge.to_string()]}},
+            {"address": proxy.to_string(), "protocol": {"type": "tls", "default_tls_target": {
+                "certificate_source": "managed", "protocol": {"type": "socks"}}}}
+        ]);
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let mut child = Process::start(&path, &[]);
+        child.wait_for("Servers ready").await;
+        config[0]["challenge"] = json!({"type": "tls_alpn01"});
+        config.as_array_mut().unwrap().push(json!({"address": challenge.to_string(), "protocol": {"type": "socks"}}));
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        child.signal(libc::SIGHUP);
+        child.wait_for("Servers ready").await;
+        let mut stream = TcpStream::connect(challenge).await.unwrap();
+        stream.write_all(&[5, 1, 0]).await.unwrap();
+        let mut reply = [0; 2];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [5, 0]);
+        drop(stream);
+
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config[0]["challenge"] = json!({"type": "http01", "listen": [challenge.to_string(), occupied.local_addr().unwrap().to_string()]});
+        config.as_array_mut().unwrap().pop();
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        child.signal(libc::SIGHUP);
+        child.wait_for("Reload rejected").await;
+        let mut stream = TcpStream::connect(challenge).await.unwrap();
+        stream.write_all(&[5, 1, 0]).await.unwrap();
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [5, 0], "failed deferred preparation must retain the proxy");
+        drop(stream);
+
+        config[0]["challenge"]["listen"] = json!([challenge.to_string()]);
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        child.signal(libc::SIGHUP);
+        child.wait_for("Servers ready").await;
+        let mut stream = TcpStream::connect(challenge).await.unwrap();
+        stream.write_all(b"GET /.well-known/acme-challenge/unknown HTTP/1.1\r\nHost: proxy.test\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+        child.signal(libc::SIGTERM);
+        assert!(child.exit().await.success());
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn unused_named_pem_rejection_recovers_from_file_creation() {
+    timeout(Duration::from_secs(20), async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let pem = directory.path().join("new/unused.pem");
+        let address = available_address();
+        let mut config = json!([{"address": address.to_string(), "protocol": {"type": "socks"}}]);
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let mut child = Process::start(&path, &[]);
+        child.wait_for("Servers ready").await;
+        config
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"pem": "unused", "path": pem}));
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        child.signal(libc::SIGHUP);
+        child.wait_for("Reload rejected").await;
+        std::fs::create_dir(pem.parent().unwrap()).unwrap();
+        std::fs::write(&pem, "unused material").unwrap();
+        child.wait_for("Servers ready").await;
+        std::fs::write(&pem, "still unused").unwrap();
+        assert_no_reload(
+            &mut child,
+            Duration::from_millis(5500),
+            "unused declaration after activation",
+        )
+        .await;
+        child.signal(libc::SIGTERM);
+        assert!(child.exit().await.success());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn reload_only_pems_debounce_recover_and_stop_watching_removed_dependencies() {
     timeout(Duration::from_secs(90), async {
         let directory = tempfile::tempdir().unwrap();
