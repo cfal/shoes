@@ -421,6 +421,9 @@ pub fn load(configs: &mut [Config], compiler: &mut Compiler) -> io::Result<()> {
                 &group.rule_group
             }
             Config::RuleSourceGroup(group) => {
+                if group.rules.is_empty() {
+                    return Err(invalid("rule source group cannot be empty"));
+                }
                 compiler.source_groups.insert(
                     group.rule_source_group.clone(),
                     crate::rules::Expression::or(group.rules.clone()),
@@ -643,6 +646,18 @@ fn read_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn programmatic_source_groups_must_be_nonempty() {
+        let config = Config::RuleSourceGroup(crate::config::RuleSourceGroup {
+            rule_source_group: "empty".into(),
+            rules: Vec::new(),
+        });
+        let error = crate::config::create_server_configs(vec![config])
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "rule source group cannot be empty");
+    }
 
     #[test]
     fn format_detection_prefers_overrides_then_signatures_then_suffixes() {
