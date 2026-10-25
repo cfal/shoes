@@ -248,11 +248,12 @@ throughput, and available memory rather than increasing buffers unconditionally.
 Periodic logs report endpoint flow/drop counts and each peer's public key,
 handshake age, and byte counters. Private keys and PSKs are redacted.
 
-Preparation failures retain the old configuration. Successful reloads
-disconnect existing tunnel flows and rebuild endpoints; sessions are not
-migrated. Bind failures during activation can still terminate the process
-after the old generation has stopped. Shutdown waits for buffered UDP tasks
-to release their sockets before rebind. No host route cleanup is necessary.
+Preparation failures retain the old configuration. Reload activation stops
+existing tunnel flows and rebuilds endpoints; sessions are not migrated.
+Bind failures during activation trigger rollback to the previous configuration,
+but disconnected tunnel sessions are not restored. If rollback fails, Shoes
+exits with status 1. Shutdown waits for buffered UDP tasks to release their
+sockets before rebind. No host route cleanup is necessary.
 
 ## Configuration Structure
 
@@ -1939,13 +1940,27 @@ reload loop: reload-only PEM changes require restarting the embedded instance.
 
 On Linux, if directory permissions prevent watching a readable configuration's parent, startup falls back to direct file watches and logs a warning. In-place edits remain detectable, but atomic replacements may be missed; use SIGHUP or grant directory read permission when replacing files.
 
-Replacement configurations, certificates, and DNS resolvers are prepared while the current listeners continue serving. A preparation failure leaves the current configuration running. Once preparation succeeds, listeners are replaced. A failure to activate replacements exits with status 1; there is no rollback after listeners are retired. Existing TCP connections may drain for `global_limits.reload_grace_secs` during successful reloads; QUIC connections are closed.
+Replacement configurations, certificates, and DNS resolvers are prepared while
+the current listeners continue serving. A preparation failure leaves the current
+configuration running. Unchanged fixed TCP listen addresses retain their sockets
+across generations. New-generation TCP and Unix listeners accept queued
+connections only after activation completes; connections may wait in the kernel
+backlog during that interval.
+
+If activation fails, Shoes stops the candidate services and restores the previous
+configuration, including control state, resource limits, DNS ownership, and
+certificate workers. A successful rollback keeps the process running; if rollback
+also fails, Shoes exits with status 1 rather than serving a partial generation.
+Existing TCP connections begin draining when their old listeners retire, for up
+to `global_limits.reload_grace_secs`. That deadline still applies after rollback.
+TUN, WireGuard, and QUIC services are stopped and restarted; their existing
+sessions are not migrated or restored by rollback.
 
 Certificate-source file changes and ACME renewal do not trigger this full reload.
 They rotate live without replacing listeners or closing QUIC connections; see
 [Certificate Sources](#certificate-sources).
 
-QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. A five-second socket-release guard remains; exceeding it indicates a local cleanup failure and exits with an error rather than announcing a partially ready generation.
+QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. If the previous generation's sockets do not retire within the five-second socket-release guard, Shoes exits with an error rather than announcing a partially ready generation.
 
 Candidate QUIC buffer sizes are used during DNS preparation, but `global_limits` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.
 
