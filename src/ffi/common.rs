@@ -220,9 +220,17 @@ pub async fn start_from_config(
     info!("Parsing config for TUN server");
 
     let config_yaml = config_yaml.to_owned();
-    let configs: Vec<Config> = tokio::task::spawn_blocking(move || load_config_str(&config_yaml))
-        .await
-        .map_err(std::io::Error::other)??;
+    let mut configs: Vec<Config> =
+        tokio::task::spawn_blocking(move || load_config_str(&config_yaml))
+            .await
+            .map_err(std::io::Error::other)??;
+
+    if !crate::rule_set::remote_sources(&mut configs)?.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remote rule refresh requires the process runtime and is not supported by FFI",
+        ));
+    }
 
     let (configs, pem_count) = convert_cert_paths(configs).await?;
     if pem_count > 0 {
@@ -231,12 +239,6 @@ pub async fn start_from_config(
 
     let mut validated = crate::config::compile_configs(configs).await?;
     validated.validate_ffi_support()?;
-    if !validated.remote_rules.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "remote rule refresh requires the process runtime and is not supported by FFI",
-        ));
-    }
     crate::dns::check_interception(&validated.configs, &validated.dns_groups).await?;
     let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
     #[cfg(unix)]
