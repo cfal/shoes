@@ -674,6 +674,17 @@ mod tests {
             })
             .await
             .unwrap();
+            // Native fixture-creation events can arrive after watch registration.
+            // Settle both setup queues before isolating the deliberate key write.
+            let contents = std::fs::read(&config).unwrap();
+            std::fs::write(&config, contents).unwrap();
+            changes.recv().await.unwrap();
+            while tokio::time::timeout(Duration::from_millis(100), watches.changed(&mut changes))
+                .await
+                .is_ok()
+            {}
+            assert!(changes.is_empty());
+            assert!(watches.recovery_changes.is_empty());
             // A renewal while preparation is still in progress must not leak into
             // the active reload queue, even if a notifier callback arrives late.
             eprintln!(
