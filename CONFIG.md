@@ -2225,9 +2225,10 @@ reconcile persisted/current selector choices before fetching, without publishing
 a candidate controller generation. Later refreshes use the active selection view.
 
 `path` is required, relative to the declaring config file. Its directory must
-already exist, be owned by the running user, and not be writable by others (for
+already exist, be owned by the running user, and not be group- or world-writable (for
 example, create it with `install -d -m 700 cache`). Cache files must be owned,
-regular, singly linked, and not writable by others. Symlinks in any path component
+regular, singly linked, not group- or world-writable, and have no setuid, setgid,
+or sticky mode bits. Symlinks in any path component
 and `..` traversal are rejected. The `.shoes-update.lock` and `.shoes-update.tmp`
 suffixes are reserved. Identical declarations sharing a cache are deduplicated;
 conflicting declarations are rejected. Local-only file sources are unchanged.

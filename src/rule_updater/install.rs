@@ -291,7 +291,7 @@ fn check_file(metadata: &Metadata, private: bool) -> io::Result<()> {
         || metadata.mode() & forbidden_mode != 0
     {
         return Err(invalid(
-            "file must be owned, regular, singly linked and not writable by others; sidecars must be private",
+            "file must be owned, regular, singly linked, not group- or world-writable, and have no special mode bits; sidecars must be private",
         ));
     }
     Ok(())
@@ -330,7 +330,7 @@ fn checked_path(path: &Path) -> io::Result<(File, std::ffi::OsString)> {
 fn check_directory(metadata: &Metadata) -> io::Result<()> {
     if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
         return Err(invalid(
-            "destination directory must be owned by current user and not writable by others",
+            "destination directory must be owned by current user and not group- or world-writable",
         ));
     }
     Ok(())
