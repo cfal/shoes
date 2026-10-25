@@ -1547,6 +1547,15 @@ mod tests {
 
     #[tokio::test]
     async fn url_test_hyper_wrapped_errors_preserve_local_remote_classification() {
+        probe_wrapped_errors(false).await;
+    }
+
+    #[tokio::test]
+    async fn url_test_h2_wrapped_errors_preserve_local_remote_classification() {
+        probe_wrapped_errors(true).await;
+    }
+
+    async fn probe_wrapped_errors(h2_proxy: bool) {
         use crate::{
             address::ResolvedLocation,
             async_stream::{AsyncMessageStream, AsyncPing, AsyncStream},
@@ -1650,6 +1659,7 @@ mod tests {
                 },
                 false,
             ),
+            (|| io::ErrorKind::OutOfMemory.into(), true),
             #[cfg(unix)]
             (|| io::Error::from_raw_os_error(libc::EMFILE), true),
             (|| io::ErrorKind::Unsupported.into(), true),
@@ -1659,10 +1669,27 @@ mod tests {
         ];
         for &(make_error, local) in cases {
             let generation = automatic_generation(1, 1, Arc::new(Answers(Vec::new())));
-            let chain = ClientProxyChain::new(
-                vec![InitialHopEntry::Direct(Arc::new(Socket(make_error)))],
-                vec![],
-            );
+            let socket = Arc::new(Socket(make_error));
+            let entry = if h2_proxy {
+                let config = serde_json::from_value(json!({
+                    "address":"proxy.invalid:80", "protocol":{"type":"http", "http_version":"h2"}
+                }))
+                .unwrap();
+                InitialHopEntry::Proxy {
+                    socket,
+                    proxy: Box::new(
+                        crate::tcp::proxy_connector_impl::ProxyConnectorImpl::from_config(
+                            config,
+                            generation.probes.resolver.clone(),
+                        )
+                        .unwrap()
+                        .unwrap(),
+                    ),
+                }
+            } else {
+                InitialHopEntry::Direct(socket)
+            };
+            let chain = ClientProxyChain::new(vec![entry], vec![]);
             generation.probes.connectors.lock().insert(
                 "member-0".into(),
                 Arc::new(ClientChainGroup::new(vec![chain])),
@@ -1688,7 +1715,11 @@ mod tests {
             let error = probe(&service.runtime, &generation, "member-0", &query())
                 .await
                 .unwrap_err();
-            assert!(error.get_ref().unwrap().is::<hyper::Error>(), "{error:?}");
+            if h2_proxy {
+                assert!(error.get_ref().unwrap().is::<h2::Error>(), "{error:?}");
+            } else {
+                assert!(error.get_ref().unwrap().is::<hyper::Error>(), "{error:?}");
+            }
             assert_eq!(
                 generation.catalog.selection.automatic.0["auto"].health("member-0"),
                 if local { "healthy" } else { "dead" },
