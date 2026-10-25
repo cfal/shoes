@@ -21,7 +21,7 @@ async fn load_validated(
     discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
 ) -> io::Result<ValidatedConfigs> {
     let mut configs = config::load_configs(&paths.to_vec()).await?;
-    let result = async {
+    async {
         let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
         let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
         dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
@@ -39,8 +39,8 @@ async fn load_validated(
         .await
         .map_err(io::Error::other)?
     }
-    .await;
-    result.map_err(|error: io::Error| {
+    .await
+    .map_err(|error: io::Error| {
         io::Error::new(
             error.kind(),
             format!("Could not validate config files {paths:?}: {error}"),
