@@ -203,6 +203,17 @@ jobs:
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --lib process:: -- --test-threads=1 --nocapture
 
+    - name: Repeat candidate watcher isolation
+      env:
+        SHOES_TRACE_FILE_WATCHES: '1'
+      run: |
+        for iteration in $(seq 1 200); do
+          echo "Candidate watcher iteration $iteration"
+          .github/require-tests.sh cargo test -p shoes --locked --lib \
+            process::tests::activation_discards_candidate_identity_events_but_preserves_reload_events \
+            -- --exact --test-threads=1 --nocapture
+        done
+
   integration-tests:
     name: Integration (${{ matrix.name }})
     needs: unit-tests
