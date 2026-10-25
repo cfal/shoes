@@ -347,9 +347,15 @@ impl Catalog {
         crate::config::rule_visit::visit(
             configs,
             &mut |rule| {
-                let payload = bounded(
-                    serde_json::to_string(&rule.criteria.expression).map_err(io::Error::other)?,
-                );
+                let mut diagnostic = rule.criteria.expression.clone();
+                diagnostic.visit_sources(&mut |source| {
+                    // Delivery credentials are not part of a rule's diagnostic identity.
+                    source.url = None;
+                    source.download = None;
+                    Ok(())
+                })?;
+                let payload =
+                    bounded(serde_json::to_string(&diagnostic).map_err(io::Error::other)?);
                 rule.criteria.description = Some(Arc::new(RuleDescription {
                     payload,
                     proxy: rule_target(&rule.action),

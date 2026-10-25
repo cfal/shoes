@@ -248,6 +248,79 @@ pub fn attach(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn remote_rule_and_connection_projections_omit_delivery_secrets() {
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("rules.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"rules":[{"domain":["example.com"]}]}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = certificate.signing_key.serialize_pem();
+        let source = json!({"url": "https://example.invalid/rules?token=QUERY_SENTINEL", "path": path,
+        "download": {"bootstrap_url": "system", "client_chain": {
+            "address": "127.0.0.1:443", "protocol": {"type": "tls",
+                "cert": certificate.cert.pem(), "key": key,
+                "protocol": {"type": "socks", "username": "user", "password": "PASSWORD_SENTINEL"}}
+        }}});
+        let configs: Vec<Config> = serde_json::from_value(json!([
+            {"clash_api_address": "127.0.0.1:0", "secret": "controller-secret"},
+            {"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "rules": [
+                {"masks": {"all": [{"any": [source.clone()]}, {"not": {"not": source}}]}, "action": "allow"}
+            ]}
+        ])).unwrap();
+        let mut captured = configs.clone();
+        crate::control::catalog::Catalog::capture(&mut captured).unwrap();
+        let serialized = serde_json::to_string(&captured).unwrap();
+        assert!(serialized.contains("QUERY_SENTINEL"));
+        assert!(serialized.contains("PASSWORD_SENTINEL"));
+        assert!(serialized.contains("PRIVATE KEY"));
+        let mut validated = crate::config::create_server_configs(configs).unwrap();
+        let registry = Arc::new(FlowRegistry::default());
+        let projection = attach(&mut validated, 1, Some(registry.clone())).unwrap();
+        let Config::Server(server) = &validated.configs[0] else {
+            panic!()
+        };
+        let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
+            panic!()
+        };
+        let description = rule.criteria.description.as_ref().unwrap();
+        let guard = description.context.as_ref().unwrap().register(
+            "tcp",
+            &crate::address::NetLocation::from_str("example.com:443", None)
+                .unwrap()
+                .into(),
+            Vec::new(),
+            &description.payload,
+            Default::default(),
+        );
+        for diagnostic in [
+            serde_json::to_string(&projection).unwrap(),
+            guard.entry.rule_payload.clone(),
+        ] {
+            assert!(diagnostic.contains("rules.json"));
+            for secret in [
+                "QUERY_SENTINEL",
+                "PASSWORD_SENTINEL",
+                "PRIVATE KEY",
+                "CERTIFICATE",
+                "download",
+            ] {
+                assert!(
+                    !diagnostic.contains(secret),
+                    "leaked {secret}: {diagnostic}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn sudoku_mask_preserves_nested_rule_scope_and_flow_context() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
