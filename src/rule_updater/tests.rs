@@ -54,7 +54,7 @@ fn configs(source: &RuleSource) -> Vec<Config> {
 }
 
 async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str> {
-    let mut staged = super::stage(
+    let staged = super::stage(
         source,
         &DnsRegistry::new(),
         GlobalLimits::default(),
@@ -63,11 +63,13 @@ async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str>
     )
     .await?;
     validate_staged(configs(source), std::slice::from_ref(&staged)).await?;
-    Ok(if staged.install.finish(staged.digest)?.changed() {
-        "updated"
-    } else {
-        "unchanged"
-    })
+    Ok(
+        if staged.install.finish_async(staged.digest).await?.changed() {
+            "updated"
+        } else {
+            "unchanged"
+        },
+    )
 }
 
 fn response(status: u16, headers: &str, body: &[u8]) -> Vec<u8> {

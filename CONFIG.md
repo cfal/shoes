@@ -2252,6 +2252,10 @@ directory-sync failure reports uncertain durability but still activates the
 validated replacement. New flows use the reloaded rules; existing flows retain
 their previous configuration. Reload/removal/shutdown cancels in-flight refreshes.
 `--no-reload` disables filesystem-triggered reloads, not configured remote refresh.
+Bulk file reads, writes, and synchronization run off the forwarding executor.
+Filesystem work already submitted may finish after cancellation, holding its
+update lock until cleanup; it cannot publish an abandoned pre-rename update.
+The final ownership check and atomic rename remain one synchronous publication step.
 
 HTTPS verifies certificates. An explicit `http://` URL permits cleartext. Redirects,
 URL credentials/fragments, HTTP content compression, and trailers are rejected.

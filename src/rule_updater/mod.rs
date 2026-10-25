@@ -50,13 +50,14 @@ async fn stage(
     limits: Limits,
     state: &mut http::DownloadState,
 ) -> io::Result<Staged> {
-    let mut install = Install::open(&source.path)?;
+    let install = Install::open_async(&source.path).await?;
+    let mut file = tokio::fs::File::from_std(install.file.try_clone()?);
     let digest = crate::control::url_test::BACKGROUND
         .scope(
             (),
             timeout(
                 limits.overall,
-                http::download(source, dns, global, &mut install.file, limits, state),
+                http::download(source, dns, global, &mut file, limits, state),
             ),
         )
         .await
@@ -199,8 +200,8 @@ pub(crate) async fn prepare(
     .map_err(|_| invalid("rule bootstrap preparation deadline exceeded"))??;
     let staged = stage_sources(&sources, &dns, global, MAX_STAGED_BYTES).await?;
     let validated = validate_staged(configs, &staged).await?;
-    for mut item in staged {
-        item.install.finish(item.digest)?;
+    for item in staged {
+        item.install.finish_async(item.digest).await?;
         log::info!(
             "Installed initial remote rules: {}",
             item.source.path.display()
@@ -225,11 +226,13 @@ async fn refresh_source(
     state: &mut http::DownloadState,
 ) -> io::Result<bool> {
     let mut staged = stage(source, dns, global, Limits::default(), state).await?;
-    if staged.install.unchanged(staged.digest)? {
+    let (install, unchanged) = staged.install.check_unchanged(staged.digest).await?;
+    staged.install = install;
+    if unchanged {
         return Ok(false);
     }
     validate_staged(configs.to_vec(), std::slice::from_ref(&staged)).await?;
-    Ok(staged.install.finish(staged.digest)?.changed())
+    Ok(staged.install.finish_async(staged.digest).await?.changed())
 }
 
 /// Polled by the process select loop. Dropping that future cancels the HTTP

@@ -25,6 +25,8 @@ pub(super) struct Install {
     lock_name: CString,
     original: Option<Metadata>,
     old_digest: Option<blake3::Hash>,
+    #[cfg(test)]
+    preparation_gate: Option<PreparationGate>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -41,6 +43,11 @@ impl Outcome {
 }
 
 impl Install {
+    pub(super) async fn open_async(path: &Path) -> io::Result<Self> {
+        let path = path.to_owned();
+        blocking(move || Self::open(&path)).await
+    }
+
     pub(super) fn open(path: &Path) -> io::Result<Self> {
         let (directory, name) = checked_path(path)?;
         let mut lock_name = name.clone();
@@ -106,18 +113,65 @@ impl Install {
             lock_name,
             original,
             old_digest,
+            #[cfg(test)]
+            preparation_gate: None,
         })
     }
 
-    pub(super) fn finish(&mut self, digest: blake3::Hash) -> io::Result<Outcome> {
-        if self.unchanged(digest)? {
+    pub(super) async fn check_unchanged(self, digest: blake3::Hash) -> io::Result<(Self, bool)> {
+        blocking(move || {
+            let unchanged = self.unchanged(digest)?;
+            Ok((self, unchanged))
+        })
+        .await
+    }
+
+    pub(super) async fn finish_async(self, digest: blake3::Hash) -> io::Result<Outcome> {
+        let (install, unchanged) = blocking(move || {
+            let unchanged = self.prepare_finish(digest)?;
+            Ok((self, unchanged))
+        })
+        .await?;
+        if unchanged {
             return Ok(Outcome::Unchanged);
+        }
+        // Only the owning future can publish. A cancelled blocking preparation
+        // drops Install without renaming, even if its filesystem work finishes later.
+        install.publish()?;
+        blocking(move || Ok(install.sync_published())).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish(&mut self, digest: blake3::Hash) -> io::Result<Outcome> {
+        if self.prepare_finish(digest)? {
+            return Ok(Outcome::Unchanged);
+        }
+        self.publish()?;
+        Ok(self.sync_published())
+    }
+
+    fn prepare_finish(&self, digest: blake3::Hash) -> io::Result<bool> {
+        if self.unchanged(digest)? {
+            return Ok(true);
         }
         self.file.set_permissions(std::fs::Permissions::from_mode(
             self.original.as_ref().map_or(0o600, MetadataExt::mode) & 0o777,
         ))?;
         self.file.sync_all()?;
         self.directory.sync_all()?;
+        #[cfg(test)]
+        if let Some(gate) = &self.preparation_gate {
+            gate.entered.notify_one();
+            gate.release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        Ok(false)
+    }
+
+    fn publish(&self) -> io::Result<()> {
         self.check_ownership()?;
         #[cfg(test)]
         self.fail_before_rename()?;
@@ -125,6 +179,10 @@ impl Install {
         if unsafe { libc::renameat(fd, self.stage.as_ptr(), fd, self.destination.as_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
+
+    fn sync_published(&self) -> Outcome {
         let sync = self.directory.sync_all();
         #[cfg(test)]
         let sync = if FAIL_AFTER_RENAME.with(|flag| flag.replace(false)) {
@@ -136,9 +194,9 @@ impl Install {
             log::warn!(
                 "Validated rule file replaced, but directory sync failed; durability uncertain"
             );
-            return Ok(Outcome::DurabilityUncertain);
+            return Outcome::DurabilityUncertain;
         }
-        Ok(Outcome::Updated)
+        Outcome::Updated
     }
 
     pub(super) fn unchanged(&self, digest: blake3::Hash) -> io::Result<bool> {
@@ -178,6 +236,14 @@ impl Install {
         }
         Ok(())
     }
+}
+
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(io::Error::other)?
 }
 
 impl Drop for Install {
@@ -308,3 +374,63 @@ fn hash(file: &mut File) -> io::Result<blake3::Hash> {
 thread_local! { pub(super) static FAIL_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 thread_local! { pub(super) static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+struct PreparationGate {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    dropped: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl Drop for PreparationGate {
+    fn drop(&mut self) {
+        self.dropped.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelled_blocking_preparation_cannot_publish_or_stall_the_runtime() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("rules.json");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut install = Install::open_async(&path).await.unwrap();
+        install.file.write_all(b"new").unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let (release, receiver) = std::sync::mpsc::channel();
+        install.preparation_gate = Some(PreparationGate {
+            entered: entered.clone(),
+            release: std::sync::Mutex::new(receiver),
+            dropped: dropped.clone(),
+        });
+        let task = tokio::spawn(install.finish_async(blake3::hash(b"new")));
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        // The current-thread executor must remain usable while the worker is blocked.
+        assert_eq!(tokio::spawn(async { 42 }).await.unwrap(), 42);
+        assert_eq!(
+            Install::open(&path).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!dir.path().join("rules.json.shoes-update.tmp").exists());
+        drop(Install::open(&path).unwrap());
+    }
+}

@@ -10,9 +10,10 @@ use bytes::Bytes;
 use http::{Request, StatusCode, Uri, header};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::TokioIo;
-use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::sync::Arc;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
 const MAX_HEADER_COUNT: usize = 64;
@@ -231,12 +232,13 @@ pub(super) async fn download(
             if bytes > limits.bytes || length.is_some_and(|length| bytes > length) {
                 return Err(invalid("download exceeds byte limit"));
             }
-            file.write_all(&data)?;
+            file.write_all(&data).await?;
             digest.update(&data);
         }
         if bytes == 0 || length.is_some_and(|length| bytes != length) {
             return Err(invalid("truncated HTTP body"));
         }
+        file.flush().await?;
         Ok(digest.finalize())
     };
     // Drive HTTP in this future, so timeout/cancellation drops the socket too.
