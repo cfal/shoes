@@ -1482,7 +1482,64 @@ async fn staged_candidate_uses_normalized_paths_even_before_cache_creation() {
         .err()
         .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
-    assert!(error.to_string().contains("CIDR"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("staged rule data failed validation"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn staged_alias_errors_redact_downloaded_content_in_cold_and_refresh_paths() {
+    const SECRET: &[u8] = br#"{"version":1,"rules":[{"domain_regex":["DOWNLOADED_SECRET"]}]}"#;
+    for cold in [true, false] {
+        let dir = directory();
+        let path = dir.path().join("rules.json");
+        if !cold {
+            write_rule(&path, OLD);
+        }
+        let (url, fixture) = serve(response(200, "", SECRET)).await;
+        let source = source(&url, &path);
+        let mut config = configs(&source);
+        config.push(
+            serde_json::from_value(serde_json::json!({
+                "rule_source_group": "alias", "rules": [{
+                    "path": path, "format": "mihomo_text", "behavior": "ipcidr"
+                }]
+            }))
+            .unwrap(),
+        );
+        let error = if cold {
+            prepare(config, None, &mut None).await.err().unwrap()
+        } else {
+            refresh_source(
+                &source,
+                &config,
+                &DnsRegistry::new(),
+                GlobalLimits::default(),
+                &mut http::DownloadState::default(),
+            )
+            .await
+            .unwrap_err()
+        }
+        .to_string();
+        fixture.await.unwrap();
+        assert!(
+            error.contains("staged rule data failed validation"),
+            "{error}"
+        );
+        assert!(error.contains(path.to_str().unwrap()), "{error}");
+        assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
+        assert!(!error.contains("QUERY_SECRET"), "{error}");
+        if cold {
+            assert!(!path.exists());
+        } else {
+            assert_eq!(std::fs::read(&path).unwrap(), OLD);
+        }
+        assert!(!stage_path(&path).exists());
+        drop(Install::open(&path).unwrap());
+    }
 }
 
 #[test]

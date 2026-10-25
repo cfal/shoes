@@ -468,12 +468,12 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
         ));
     }
     if let Some(file) = compiler.input_files.get(&source.path) {
-        return read_file(source, file.try_clone()?, source.path.clone(), compiler);
+        return read_staged(source, file.try_clone()?, source.path.clone(), compiler);
     }
     if !compiler.input_files.is_empty() {
         let identity = source_identity(&source.path)?;
         if let Some(file) = compiler.input_files.get(&identity) {
-            return read_file(source, file.try_clone()?, identity, compiler);
+            return read_staged(source, file.try_clone()?, identity, compiler);
         }
     }
     #[cfg(unix)]
@@ -492,7 +492,7 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
     }
     let path = std::fs::canonicalize(&source.path)?;
     if let Some(file) = compiler.input_files.get(&path) {
-        return read_file(source, file.try_clone()?, path, compiler);
+        return read_staged(source, file.try_clone()?, path, compiler);
     }
     if !std::fs::metadata(&path)?.is_file() {
         return Err(invalid("rule source must be a regular file"));
@@ -510,6 +510,21 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
 
 pub(crate) fn validate_file(source: &RuleSource, file: std::fs::File) -> io::Result<()> {
     read_file(source, file, source.path.clone(), &mut Compiler::default()).map(|_| ())
+}
+
+fn read_staged(
+    source: &RuleSource,
+    file: std::fs::File,
+    path: PathBuf,
+    compiler: &mut Compiler,
+) -> io::Result<Arc<Predicate>> {
+    // A local alias may decode these bytes differently and quote the remote payload.
+    read_file(source, file, path, compiler).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            "staged rule data failed validation (details redacted)",
+        )
+    })
 }
 
 fn read_file(
