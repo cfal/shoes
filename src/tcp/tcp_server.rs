@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use log::{debug, error};
@@ -25,7 +25,7 @@ use crate::tun::start_tun_server;
 use crate::util::write_all;
 
 async fn run_tcp_server(
-    listener: tokio::net::TcpListener,
+    listener: Arc<tokio::net::TcpListener>,
     tcp_config: TcpConfig,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
@@ -230,6 +230,8 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                     ));
                 }
             };
+            drop(proxy_selector);
+            drop(resolver);
             let Some(TcpClientSetupResult {
                 mut client_stream,
                 early_data,
@@ -350,6 +352,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             .await
         }
         TcpServerSetupResult::Session(session) => {
+            drop(resolver);
             session.await;
             Ok(())
         }
@@ -397,9 +400,126 @@ pub async fn run_udp_copy(
     copy_result
 }
 
+#[cfg(any(test, target_os = "android", target_os = "ios", feature = "ffi"))]
 pub async fn start_servers(
     config: Config,
     resolver: Arc<dyn Resolver>,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
+    start_servers_with_listeners(config, resolver, &mut TcpListeners::default()).await
+}
+
+/// Socket ownership is independent of handlers and routing generations.
+#[derive(Default)]
+pub(crate) struct TcpListeners {
+    sockets: HashMap<SocketAddr, Arc<tokio::net::TcpListener>>,
+    // Automatic ports participate in overlap checks without extending socket ownership.
+    automatic_sockets: Vec<Weak<tokio::net::TcpListener>>,
+    admission: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl TcpListeners {
+    pub(crate) fn prepare(
+        configs: &[Config],
+        previous: &Self,
+        retiring_http: &[SocketAddr],
+    ) -> std::io::Result<Self> {
+        let mut next = Self::default();
+        next.defer_admission();
+        let mut seen = std::collections::HashSet::new();
+        for config in configs {
+            let Config::Server(server) = config else {
+                continue;
+            };
+            if server.transport != Transport::Tcp {
+                continue;
+            }
+            let BindLocation::Address(addresses) = &server.bind_location else {
+                continue;
+            };
+            for address in addresses.iter() {
+                for address in address.to_socket_addrs()? {
+                    if address.port() == 0 {
+                        continue;
+                    }
+                    if !seen.insert(address) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            format!("duplicate TCP listener at {address}"),
+                        ));
+                    }
+                    if let Some(listener) = previous.sockets.get(&address) {
+                        next.sockets.insert(address, listener.clone());
+                        continue;
+                    }
+                    let automatic_addresses = previous
+                        .automatic_sockets
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .filter_map(|listener| listener.local_addr().ok());
+                    let overlaps_retiring_listener = previous
+                        .sockets
+                        .values()
+                        .filter_map(|listener| listener.local_addr().ok())
+                        .chain(automatic_addresses)
+                        .chain(retiring_http.iter().copied())
+                        .any(|bound| {
+                            let bound_ip = bound.ip().to_canonical();
+                            let requested_ip = address.ip().to_canonical();
+                            bound.port() == address.port()
+                                && (bound_ip == requested_ip
+                                    || bound_ip.is_unspecified()
+                                    || requested_ip.is_unspecified())
+                        });
+                    // SO_REUSEADDR may permit overlapping binds before the old socket retires.
+                    if overlaps_retiring_listener {
+                        continue;
+                    }
+                    next.bind(address)?;
+                }
+            }
+        }
+        Ok(next)
+    }
+
+    pub(crate) fn retain_shared(&mut self, next: &Self) {
+        self.sockets.retain(|address, listener| {
+            next.sockets
+                .get(address)
+                .is_some_and(|next| Arc::ptr_eq(listener, next))
+        });
+    }
+
+    /// Gates subsequently started listeners without affecting already draining flows.
+    pub(crate) fn defer_admission(&mut self) {
+        self.admission = Some(tokio_util::sync::CancellationToken::new());
+    }
+
+    pub(crate) fn activate(&self) {
+        if let Some(admission) = &self.admission {
+            admission.cancel();
+        }
+    }
+
+    fn bind(&mut self, address: SocketAddr) -> std::io::Result<Arc<tokio::net::TcpListener>> {
+        if let Some(listener) = self.sockets.get(&address) {
+            return Ok(listener.clone());
+        }
+        let listener = Arc::new(new_tcp_listener(address, 4096, None)?);
+        if address.port() != 0 {
+            self.sockets.insert(address, listener.clone());
+        } else {
+            self.automatic_sockets
+                .retain(|listener| listener.strong_count() > 0);
+            self.automatic_sockets.push(Arc::downgrade(&listener));
+        }
+        Ok(listener)
+    }
+}
+
+pub(crate) async fn start_servers_with_listeners(
+    config: Config,
+    resolver: Arc<dyn Resolver>,
+    listeners: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
         #[cfg(unix)]
@@ -421,7 +541,9 @@ pub async fn start_servers(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
         )),
-        Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
+        Config::Server(server_config) => {
+            start_tcp_or_quic_servers(server_config, resolver, listeners).await
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Expected a server configuration",
@@ -432,10 +554,11 @@ pub async fn start_servers(
 async fn start_tcp_or_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    listeners: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let bind_location = config.bind_location.to_string();
     let join_handles = match config.transport {
-        Transport::Tcp => start_tcp_servers(config, resolver).await?,
+        Transport::Tcp => start_tcp_servers(config, resolver, listeners).await?,
         Transport::Quic => start_quic_servers(config, resolver).await?,
         Transport::Udp => {
             return Err(std::io::Error::new(
@@ -458,6 +581,7 @@ async fn start_tcp_or_quic_servers(
 async fn start_tcp_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    sockets: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
@@ -491,9 +615,16 @@ async fn start_tcp_servers(
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
             let mut services = super::tcp_server_handler_factory::HandlerServices::default();
             let mut listeners = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
-                    let listener = new_tcp_listener(socket_addr, 4096, None)?;
+                    if socket_addr.port() != 0 && !seen.insert(socket_addr) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            format!("duplicate TCP listener at {socket_addr}"),
+                        ));
+                    }
+                    let listener = sockets.bind(socket_addr)?;
                     let tcp_handler = match handlers.entry(socket_addr.ip()) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
@@ -514,7 +645,12 @@ async fn start_tcp_servers(
             for (listener, tcp_handler) in listeners {
                 let tcp_config = tcp_config.clone();
                 let resolver = resolver.clone();
+                let admission = sockets.admission.clone();
                 handles.push(tokio::spawn(async move {
+                    // Uncommitted flows must not outlive rollback through graceful draining.
+                    if let Some(admission) = admission {
+                        admission.cancelled().await;
+                    }
                     if let Err(error) =
                         run_tcp_server(listener, tcp_config, resolver, tcp_handler).await
                     {
@@ -537,7 +673,11 @@ async fn start_tcp_servers(
                 let tcp_handler: Arc<dyn TcpServerHandler> =
                     create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)?
                         .into();
+                let admission = sockets.admission.clone();
                 let handle = tokio::spawn(async move {
+                    if let Some(admission) = admission {
+                        admission.cancelled().await;
+                    }
                     if let Err(error) = run_unix_server(listener, resolver, tcp_handler).await {
                         error!("Unix listener stopped: {error}");
                     }
@@ -575,6 +715,100 @@ mod lifetime_tests {
     use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
     use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
     use crate::tcp::socket_connector::SocketConnector;
+
+    #[tokio::test]
+    async fn ephemeral_tcp_activation_does_not_cache_automatic_ports() {
+        let mut sockets = TcpListeners::default();
+        let first = sockets.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let second = sockets.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_ne!(first.local_addr().unwrap(), second.local_addr().unwrap());
+        assert!(sockets.sockets.is_empty());
+        assert_eq!(sockets.automatic_sockets.len(), 2);
+        drop((first, second));
+        let _next = sockets.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_eq!(sockets.automatic_sockets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_preparation_defers_reported_http_overlap_before_binding() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let config = format!("- address: '{address}'\n  protocol: {{type: http}}\n");
+        let configs =
+            crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap()).unwrap();
+        drop(reservation);
+        for retiring in [
+            address,
+            SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), address.port()),
+        ] {
+            let next =
+                TcpListeners::prepare(&configs.configs, &TcpListeners::default(), &[retiring])
+                    .unwrap();
+            assert!(next.sockets.is_empty(), "overlapping listener was prebound");
+            std::net::TcpListener::bind(address).expect("preparation claimed a retiring address");
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_preparation_defers_live_automatic_ports_without_retaining_them() {
+        let mut previous = TcpListeners::default();
+        let live = previous.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = live.local_addr().unwrap();
+        let config = format!("- address: '{address}'\n  protocol: {{type: http}}\n");
+        let configs =
+            crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap()).unwrap();
+        let next = TcpListeners::prepare(&configs.configs, &previous, &[]).unwrap();
+        assert!(
+            next.sockets.is_empty(),
+            "automatic port was prebound or reused"
+        );
+        drop(live);
+        let next = TcpListeners::prepare(&configs.configs, &previous, &[]).unwrap();
+        assert!(
+            next.sockets.contains_key(&address),
+            "retired port was still deferred"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_preparation_defers_ipv4_mapped_listener_transitions() {
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(5), async {
+            for (old_ip, new_ip) in [
+                ("127.0.0.1", "::ffff:127.0.0.1"),
+                ("::ffff:127.0.0.1", "127.0.0.1"),
+            ] {
+                let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = reservation.local_addr().unwrap().port();
+                drop(reservation);
+                let mut previous = TcpListeners::default();
+                let live = previous
+                    .bind(SocketAddr::new(old_ip.parse().unwrap(), port))
+                    .unwrap();
+                let address = SocketAddr::new(new_ip.parse().unwrap(), port);
+                let config = format!("- address: '{address}'\n  protocol: {{type: http}}\n");
+                let configs =
+                    crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap())
+                        .unwrap();
+                let mut next = TcpListeners::prepare(&configs.configs, &previous, &[]).unwrap();
+                assert!(next.sockets.is_empty(), "mapped address was prebound");
+                drop(live);
+                previous.retain_shared(&next);
+                let replacement = next.bind(address).unwrap();
+                let mut peer = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .unwrap();
+                let (mut accepted, _) = replacement.accept().await.unwrap();
+                peer.write_all(b"live").await.unwrap();
+                let mut bytes = [0; 4];
+                accepted.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"live");
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn fake_dns_udp_modes() {
@@ -829,6 +1063,60 @@ mod lifetime_tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert!(registry.snapshot(0).connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fixed_tcp_releases_setup_owners_before_relay_and_half_close() {
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(5), async {
+            let (inbound, mut peer) = tokio::io::duplex(64);
+            let (outbound, mut target) = tokio::io::duplex(64);
+            let chain = ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Arc::new(ReadyConnector(
+                    std::sync::Mutex::new(Some(FlushStream {
+                        inner: outbound,
+                        stalled: false,
+                        flushes: Arc::new(AtomicUsize::new(0)),
+                    })),
+                )))],
+                vec![],
+            );
+            let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+                vec![crate::address::NetLocationMask::ANY],
+                ConnectAction::new_allow(None, ClientChainGroup::new(vec![chain])),
+            )]));
+            let resolver: Arc<dyn Resolver> = Arc::new(PendingResolver);
+            let handler = Arc::new(Handler(selector.clone()));
+            let weak_selector = Arc::downgrade(&selector);
+            let weak_resolver = Arc::downgrade(&resolver);
+            let weak_handler = Arc::downgrade(&handler);
+            drop(selector);
+            let relay = tokio::spawn(process_stream(inbound, handler, resolver));
+            let mut response = [0; 8];
+            peer.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"response");
+            let mut request = [0; 7];
+            target.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"request");
+            assert!(weak_selector.upgrade().is_none());
+            assert!(weak_resolver.upgrade().is_none());
+            assert!(weak_handler.upgrade().is_none());
+            assert!(!relay.is_finished());
+
+            peer.write_all(b"live request").await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut bytes = Vec::new();
+            target.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"live request");
+            target.write_all(b"reply after FIN").await.unwrap();
+            target.shutdown().await.unwrap();
+            bytes.clear();
+            peer.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"reply after FIN");
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1198,6 +1486,39 @@ mod lifetime_tests {
                 })
                 .await
                 .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_startup_rejects_duplicate_fixed_but_allows_automatic_ports() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        for port in [address.port(), 0] {
+            let address = SocketAddr::new(address.ip(), port);
+            let config =
+                format!("- address: ['{address}', '{address}']\n  protocol: {{type: http}}\n");
+            let configs =
+                crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap())
+                    .unwrap();
+            let result = start_servers(
+                configs.configs.into_iter().next().unwrap(),
+                Arc::new(crate::resolver::NativeResolver::new()),
+            )
+            .await;
+            if port == 0 {
+                let handles = result.unwrap();
+                assert_eq!(handles.len(), 2);
+                for handle in &handles {
+                    handle.abort();
+                }
+                for handle in handles {
+                    assert!(handle.await.unwrap_err().is_cancelled());
+                }
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AddrInUse);
+                std::net::TcpListener::bind(address).expect("duplicate bind leaked a listener");
             }
         }
     }
