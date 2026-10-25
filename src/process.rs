@@ -39,29 +39,36 @@ async fn load_candidate(
     let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
     dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
     recovery_dependencies.retain(|path| !dependencies.contains(path));
+    let result: io::Result<_> = async {
+        let (mut configs, _) = config::convert_cert_paths(configs).await?;
+        let mut has_remote = false;
+        crate::rule_set::visit_sources(&mut configs, &mut |source| {
+            has_remote |= source.url.is_some();
+            Ok(())
+        })?;
+        let snapshot = if online && has_remote {
+            configs.clone()
+        } else {
+            Vec::new()
+        };
+        #[cfg(unix)]
+        let validated = if online {
+            crate::rule_updater::prepare(configs, previous, control).await?
+        } else {
+            config::compile_configs(configs).await?
+        };
+        #[cfg(not(unix))]
+        let validated = {
+            let _ = (online, previous, control);
+            config::compile_configs(configs).await?
+        };
+        Ok((validated, snapshot))
+    }
+    .await;
+    // Cold installs precede new cache watches. Failed candidates still expose
+    // their dependencies so repairing a file can trigger recovery.
     discovered(&dependencies, &recovery_dependencies);
-    let (mut configs, _) = config::convert_cert_paths(configs).await?;
-    let mut has_remote = false;
-    crate::rule_set::visit_sources(&mut configs, &mut |source| {
-        has_remote |= source.url.is_some();
-        Ok(())
-    })?;
-    let snapshot = if online && has_remote {
-        configs.clone()
-    } else {
-        Vec::new()
-    };
-    #[cfg(unix)]
-    let mut validated = if online {
-        crate::rule_updater::prepare(configs, previous, control).await?
-    } else {
-        config::compile_configs(configs).await?
-    };
-    #[cfg(not(unix))]
-    let mut validated = {
-        let _ = (online, previous, control);
-        config::compile_configs(configs).await?
-    };
+    let (mut validated, snapshot) = result?;
     validated.reload_files = dependencies;
     tokio::task::spawn_blocking(move || {
         if validated.catalog.is_some() {

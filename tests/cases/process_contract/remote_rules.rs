@@ -59,6 +59,53 @@ async fn blocked(address: std::net::SocketAddr) {
 }
 
 #[tokio::test]
+async fn cold_installs_do_not_queue_an_extra_watcher_reload() {
+    let dir = directory();
+    let path = dir.path().join("config.yaml");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    config(
+        &path,
+        address,
+        echo.local_addr(),
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+    );
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config[0]["rules"][0]["update_interval"] = serde_json::json!("7d");
+    std::fs::write(&path, config.to_string()).unwrap();
+    let mut child = Process::start(&path, &[]);
+    for cache in ["cache.json", "replacement.json"] {
+        if cache == "replacement.json" {
+            config[0]["rules"][0]["path"] = serde_json::json!(cache);
+            std::fs::write(&path, config.to_string()).unwrap();
+        }
+        respond(request(&listener).await, MISS).await;
+        child.wait_for("Servers ready").await;
+        roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+        assert!(
+            timeout(Duration::from_secs(6), async {
+                while let Some(line) = child.lines.recv().await {
+                    assert!(!line.contains("Reload rejected"), "{line}");
+                    if line.contains("Servers ready") {
+                        return;
+                    }
+                }
+                panic!("process exited unexpectedly");
+            })
+            .await
+            .is_err(),
+            "cold installation queued a duplicate reload"
+        );
+    }
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+}
+
+#[tokio::test]
 async fn cold_fetch_periodic_reload_noop_last_good_and_offline_restart() {
     let dir = directory();
     let path = dir.path().join("config.yaml");
