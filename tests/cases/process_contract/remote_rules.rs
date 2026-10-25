@@ -77,13 +77,28 @@ async fn cold_installs_do_not_queue_an_extra_watcher_reload() {
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     config[0]["rules"][0]["update_interval"] = serde_json::json!("7d");
     std::fs::write(&path, config.to_string()).unwrap();
+    // A filesystem clock ahead of SystemTime makes freshly installed caches due.
+    // Serve those legitimate no-op refreshes without mistaking them for cold fetches.
+    let fixture = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut requests = 0;
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            requests += 1;
+            assert!(requests <= 4, "unexpected repeated refreshes");
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+                assert!(headers.len() < 16384);
+            }
+            respond(stream, MISS).await;
+        }
+    }));
     let mut child = Process::start(&path, &[]);
     for cache in ["cache.json", "replacement.json"] {
         if cache == "replacement.json" {
             config[0]["rules"][0]["path"] = serde_json::json!(cache);
             std::fs::write(&path, config.to_string()).unwrap();
         }
-        respond(request(&listener).await, MISS).await;
         child.wait_for("Servers ready").await;
         roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
         assert!(
@@ -103,6 +118,8 @@ async fn cold_installs_do_not_queue_an_extra_watcher_reload() {
     }
     child.signal(libc::SIGTERM);
     assert!(child.exit().await.success());
+    fixture.abort();
+    assert!(fixture.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]
