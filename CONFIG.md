@@ -370,6 +370,36 @@ synthetic fake-DNS answers and ICMP are not represented as connections.
 Connection speeds are derived by the dashboard from successive byte counters.
 Process/GeoIP data is not fabricated.
 
+Optional `connection_notes: true` on a Clash API entry (`clash_api_address` or
+`clash_api_path`) adds setup notes to active `/connections` objects, over HTTP and
+WebSocket. It defaults to false; changing it requires a restart.
+If any controller enables it, all controllers expose notes. In zashboard, open a
+connection's details and select **Raw** to inspect `notes` (`elapsedUs`, `phase`,
+`text`), alongside its existing generation, destination, selected chain, and rule
+metadata.
+
+Notes describe preparation, routing choices, inbound-resolver calls, and outbound
+setup. They are best-effort: rejected/failed setup and closed connections have no
+retained history or separate debug endpoint. A dashboard may retain previously
+sampled connections, but short-lived connections can be missed. DNS notes cover
+existing routing/dial call boundaries, not resolver cache/upstream internals or
+remote DNS. Initial UDP prechecks and local-DNS handling are not observed.
+Notes contain hostnames and addresses, never payloads, credentials, or error
+messages; errors use only their kind.
+They may reveal outbound proxy server hostnames and IP addresses not otherwise
+exposed by the API.
+
+At most 256 connections (including pending setup) collect notes at once. Each
+buffer holds 32 events with at most 128 UTF-8 bytes of text each, plus an overflow
+summary when read. New connections skip notes while all slots are occupied.
+Buffers reserve at most 8 KiB each, 2 MiB in aggregate, excluding allocator/RSS
+overhead and snapshot copies/JSON. Closing or abandoning a connection releases
+its buffer when its last reader finishes. The budget is shared across reloads.
+With notes disabled, no note buffers or resolver wrappers are allocated.
+When enabled, notes add setup work and snapshot copying/serialization: the
+controller samples every second even without subscribers; HTTP requests and
+custom-interval WebSocket subscriptions can request additional snapshots.
+
 Delay tests send HTTP HEAD through actual outbounds, verify HTTPS certificates,
 and never follow redirects. A leaf test is standalone, not a test of every chain
 containing that leaf. Unused WireGuard nodes remain inactive and cannot be probed

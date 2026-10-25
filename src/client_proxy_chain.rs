@@ -27,6 +27,7 @@ use log::debug;
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::control::catalog::{MemberOrigin, RuleDescription};
+use crate::control::connection_notes::{self, Phase};
 use crate::control::flows::{FlowContext, FlowGuard, FlowInfo};
 use crate::resolver::Resolver;
 use crate::tcp::carrier_dialer::{CarrierDialer, QuicCarrier, RouteKey};
@@ -1105,7 +1106,7 @@ impl std::fmt::Debug for ClientChainGroup {
 }
 
 impl ClientChainGroup {
-    fn tracking(&self) -> Option<(&RuleDescription, &FlowContext)> {
+    pub(crate) fn tracking(&self) -> Option<(&RuleDescription, &FlowContext)> {
         let description = self.description.as_deref()?;
         Some((description, description.context.as_deref()?))
     }
@@ -1160,10 +1161,23 @@ impl ClientChainGroup {
         let Some((description, context)) = self.tracking() else {
             return chain.connect_tcp(remote_location, resolver).await;
         };
+        if let Some(notes) = &info.notes {
+            notes.event(Phase::Dial, format_args!("begin outbound setup"));
+        }
+        let resolver = connection_notes::resolver(resolver, info.notes.as_ref(), Phase::Dial);
         let mut path = Vec::new();
         let mut result = chain
-            .connect_tcp_observed(remote_location.clone(), resolver, Some(&mut path))
+            .connect_tcp_observed(remote_location.clone(), &resolver, Some(&mut path))
             .await?;
+        if let Some(notes) = &info.notes {
+            notes.event(
+                Phase::Setup,
+                format_args!(
+                    "outbound ready; peer {:?}",
+                    result.client_stream.peer_addr()
+                ),
+            );
+        }
         let guard = register_flow(description, context, "tcp", &remote_location, path, info);
         guard
             .entry
@@ -1195,10 +1209,17 @@ impl ClientChainGroup {
         let Some((description, context)) = self.tracking() else {
             return chain.connect_udp_bidirectional(resolver, target).await;
         };
+        if let Some(notes) = &info.notes {
+            notes.event(Phase::Dial, format_args!("begin outbound setup"));
+        }
+        let resolver = connection_notes::resolver(resolver, info.notes.as_ref(), Phase::Dial);
         let mut path = Vec::new();
         let stream = chain
-            .connect_udp_observed(resolver, target.clone(), Some(&mut path))
+            .connect_udp_observed(&resolver, target.clone(), Some(&mut path))
             .await?;
+        if let Some(notes) = &info.notes {
+            notes.event(Phase::Setup, format_args!("outbound ready"));
+        }
         let guard = register_flow(description, context, "udp", &target, path, info);
         Ok(Box::new(
             crate::control::tracked_stream::TrackedMessageStream::new(stream, guard),

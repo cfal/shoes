@@ -5,6 +5,7 @@ use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision, IngressTarget};
+use crate::control::connection_notes::{self, Phase};
 use crate::resolver::{Resolver, resolve_location};
 
 pub(crate) struct UdpSetup {
@@ -130,12 +131,16 @@ async fn route_prepared_udp<'a>(
         }
         IngressTarget::Forward(target) => target,
     };
-    let info = if selector.tracks_flows() {
+    let mut info = if selector.tracks_flows() {
         target.flow_info()
     } else {
         Default::default()
     };
-    let routed = selector.judge_prepared(target, None, resolver).await?;
+    info.notes = selector.start_notes();
+    let resolver = connection_notes::resolver(resolver, info.notes.as_ref(), Phase::Routing);
+    let routed = selector
+        .judge_prepared_with_notes(target, None, &resolver, info.notes.as_deref())
+        .await?;
     match routed.decision {
         ConnectDecision::Allow {
             chain_group,
@@ -144,7 +149,7 @@ async fn route_prepared_udp<'a>(
             let wire_destination = reply_destination(routed.wire_destination, require_ip_reply);
             let reply_identity =
                 if require_ip_reply && wire_destination.address().hostname().is_some() {
-                    let address = resolve_location(&mut remote_location, resolver).await?;
+                    let address = resolve_location(&mut remote_location, &resolver).await?;
                     NetLocation::from_ip_addr(address.ip(), address.port())
                 } else {
                     wire_destination

@@ -76,9 +76,13 @@ impl ControlService {
     pub fn new(config: ControlConfig) -> io::Result<Self> {
         let owner = SelectionOwner::new(config.cache_file_path.as_deref())?;
         let (commands, receiver) = mpsc::channel(64);
+        let connection_notes = config
+            .listeners
+            .iter()
+            .any(|listener| listener.connection_notes);
         let runtime = Arc::new(ControlRuntime {
             config,
-            flows: Arc::new(FlowRegistry::default()),
+            flows: Arc::new(FlowRegistry::new(connection_notes)),
             shutdown: CancellationToken::new(),
             activating: AtomicBool::new(true),
             connections: Arc::new(tokio::sync::Semaphore::new(64)),
@@ -276,6 +280,43 @@ async fn run_owner(
 mod tests {
     use super::*;
     use crate::control::selection::SelectorDefinition;
+
+    #[tokio::test]
+    async fn connection_notes_budget_survives_reload_without_retaining_generation() {
+        use crate::control::connection_notes::MAX_FLOWS;
+        let config = ControlConfig {
+            listeners: vec![
+                serde_yaml::from_str(
+                    "clash_api_address: '127.0.0.1:0'\nsecret: test\nconnection_notes: true",
+                )
+                .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let mut service = ControlService::new(config).unwrap();
+        let registry = service.runtime.flows.clone();
+        let old = generation(1);
+        let weak = Arc::downgrade(&old);
+        service.runtime.publish(old).await.unwrap();
+        let buffers: Vec<_> = (0..MAX_FLOWS)
+            .map(|_| registry.start_notes().unwrap())
+            .collect();
+        service.runtime.publish(generation(2)).await.unwrap();
+        assert!(weak.upgrade().is_none());
+        assert!(Arc::ptr_eq(&registry, &service.runtime.flows));
+        assert!(registry.start_notes().is_none());
+        drop(buffers);
+        assert!(registry.start_notes().is_some());
+        let mut changed = crate::config::create_server_configs(
+            serde_yaml::from_str("- clash_api_address: '127.0.0.1:0'\n  secret: test").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            service.runtime.prepare(&mut changed).await.is_err(),
+            "changing opt-in requires restart"
+        );
+        service.shutdown().await;
+    }
 
     fn generation(id: u64) -> Arc<Generation> {
         let selection = SelectionOwner::new(None)
