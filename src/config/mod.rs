@@ -17,6 +17,8 @@ pub(crate) mod client_visit;
 mod fake_dns;
 mod pem;
 pub(crate) mod rule_visit;
+#[cfg(test)]
+mod tests;
 mod types;
 mod validate;
 #[cfg(unix)]
@@ -28,6 +30,36 @@ pub(crate) use pem::{is_pem_file_path, pem_candidate_dependencies, pem_reload_de
 pub use types::*;
 pub use validate::{ValidatedConfigs, create_server_configs};
 pub(crate) use validate::{validate_client_vision_protocol, validate_server_vision};
+
+fn parse_config_yaml(config_str: &str) -> Result<Vec<Config>, serde_yaml::Error> {
+    use serde::de::{Deserializer, Error, SeqAccess, Visitor};
+
+    struct ConfigList;
+
+    impl<'de> Visitor<'de> for ConfigList {
+        type Value = Vec<Config>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a sequence of Shoes configuration entries")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut configs = Vec::new();
+            loop {
+                // Custom Value-based deserializers can lose YAML's entry location.
+                let entry = seq.next_element().map_err(|error| {
+                    A::Error::custom(format!("config[{}]: {error}", configs.len()))
+                })?;
+                match entry {
+                    Some(config) => configs.push(config),
+                    None => return Ok(configs),
+                }
+            }
+        }
+    }
+
+    serde_yaml::Deserializer::from_str(config_str).deserialize_seq(ConfigList)
+}
 
 /// Loads configuration files from the provided paths.
 ///
@@ -55,10 +87,9 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
             }
         };
 
-        let parsed =
-            tokio::task::spawn_blocking(move || serde_yaml::from_str::<Vec<Config>>(&config_str))
-                .await
-                .map_err(std::io::Error::other)?;
+        let parsed = tokio::task::spawn_blocking(move || parse_config_yaml(&config_str))
+            .await
+            .map_err(std::io::Error::other)?;
         let mut configs = match parsed {
             Ok(c) => c,
             Err(e) => {
@@ -94,7 +125,7 @@ pub async fn compile_configs(configs: Vec<Config>) -> std::io::Result<ValidatedC
     allow(dead_code)
 )]
 pub fn load_config_str(config_str: &str) -> std::io::Result<Vec<Config>> {
-    serde_yaml::from_str::<Vec<Config>>(config_str).map_err(|e| {
+    parse_config_yaml(config_str).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Could not parse config string as config YAML: {e}"),

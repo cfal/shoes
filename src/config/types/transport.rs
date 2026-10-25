@@ -54,6 +54,7 @@ impl Transport {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpConfig {
     #[serde(default = "default_true")]
     pub no_delay: bool,
