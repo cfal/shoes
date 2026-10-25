@@ -165,6 +165,42 @@ fn policy_and_source_groups_are_explicit_and_roundtrip() {
 }
 
 #[test]
+fn policy_group_errors_preserve_element_details_and_migration_guidance() {
+    for (rules, expected) in [
+        (
+            "[{masks: example.com, acton: block}]",
+            "unknown field `acton`",
+        ),
+        (
+            "{masks: example.com, acton: block}",
+            "unknown field `acton`",
+        ),
+        ("[true]", "a policy rule requires a mapping"),
+        ("[]", "cannot be empty"),
+        (
+            "[a.srs]",
+            "action-free file sources moved to rule_source_group",
+        ),
+        (
+            "a.srs",
+            "action-free file sources moved to rule_source_group",
+        ),
+    ] {
+        let error =
+            serde_yaml::from_str::<Config>(&format!("rule_group: policies\nrules: {rules}"))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(expected), "{rules}: {error}");
+    }
+    let group: RuleConfigGroup =
+        serde_yaml::from_str("rule_group: policies\nrules: [{path: a.srs}]").unwrap();
+    assert!(matches!(
+        group.rules.iter().next().unwrap().action,
+        RuleActionConfig::Allow { .. }
+    ));
+}
+
+#[test]
 fn test_rule_config_group() {
     let original = vec![Config::RuleConfigGroup(RuleConfigGroup {
         rule_group: "test-rule-group".to_string(),

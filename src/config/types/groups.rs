@@ -459,7 +459,14 @@ fn policy_rules<'de, D: serde::Deserializer<'de>>(
                 D::Error::custom(format!("rules: {error}"))
             }
         };
-        policies.push(serde_yaml::from_value(value).map_err(context)?);
+        let policy = if value.is_string() {
+            Err(serde_yaml::Error::custom(
+                "action-free file sources moved to rule_source_group; rule_group requires policy objects",
+            ))
+        } else {
+            serde_yaml::from_value(value)
+        };
+        policies.push(policy.map_err(context)?);
     }
     Ok(if is_list {
         OneOrSome::Some(policies)
