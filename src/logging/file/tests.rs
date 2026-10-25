@@ -105,6 +105,11 @@ fn stalled_storage_does_not_block_current_thread_relay_and_drops_newest_in_order
         done_tx.send(()).unwrap();
     });
     let completed = done_rx.recv_timeout(Duration::from_secs(2));
+    if completed.is_err() {
+        drop(release);
+        relay.join().unwrap();
+        panic!("logging blocked relay progress: {completed:?}");
+    }
     let stats = writer.stats();
     drop(release);
     relay.join().unwrap();
@@ -127,6 +132,9 @@ fn byte_limit_includes_inflight_record_and_escaping_expansion() {
     let large = "\u{202e}".repeat(MAX_RECORD_BYTES);
     emit(&writer, &large);
     entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    let escaped_len = escaped_record(&large).0.len();
+    assert_eq!(writer.stats().pending_records, 1);
+    assert_eq!(writer.stats().pending_bytes, escaped_len);
     for _ in 0..MAX_RECORDS {
         emit(&writer, &large);
     }
@@ -135,6 +143,9 @@ fn byte_limit_includes_inflight_record_and_escaping_expansion() {
     assert!(stats.pending_bytes <= MAX_BYTES);
     assert!(stats.pending_bytes > MAX_BYTES - MAX_RECORD_BYTES);
     assert!(stats.dropped_records > 0);
+    assert_eq!(stats.accepted_records as usize, MAX_BYTES / escaped_len);
+    assert_eq!(stats.pending_records as u64, stats.accepted_records);
+    assert_eq!(stats.pending_bytes, stats.pending_records * escaped_len);
     assert_eq!(stats.truncated_records, stats.accepted_records);
     drop(release);
     writer.shutdown_timeout(Duration::from_secs(2)).unwrap();
@@ -213,7 +224,11 @@ impl Write for FailingWriter {
         }
     }
     fn flush(&mut self) -> io::Result<()> {
-        Err(io::Error::other("private flush error"))
+        if self.fail_on_flush {
+            Err(io::Error::other("private flush error"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -222,13 +237,25 @@ fn write_and_flush_errors_close_sink_without_recursive_logging() {
     for fail_on_flush in [false, true] {
         let writer = FileLogWriter::with_writer(FailingWriter { fail_on_flush }).unwrap();
         emit(&writer, "test");
+        if fail_on_flush {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut state = writer.shared.state.lock();
+            while state.stats.written_records != 1 {
+                assert!(Instant::now() < deadline);
+                writer.shared.changed.wait_until(&mut state, deadline);
+            }
+        }
         assert!(writer.shutdown_timeout(Duration::from_secs(2)).is_err());
+        let failed = writer.stats();
+        assert_eq!(failed.accepted_records, 1);
+        assert_eq!(failed.written_records, u64::from(fail_on_flush));
+        assert_eq!(failed.dropped_records, u64::from(!fail_on_flush));
         emit(&writer, "after failure");
         let stats = writer.stats();
         assert_eq!(stats.io_errors, 1);
         assert_eq!(stats.pending_records, 0);
         assert_eq!(stats.pending_bytes, 0);
-        assert!(stats.dropped_records > 0);
+        assert_eq!(stats.dropped_records, failed.dropped_records + 1);
         assert!(writer.is_finished());
     }
 }
@@ -249,4 +276,246 @@ fn flush_barrier_and_drop_drain_normal_writer() {
 fn open_failure_is_explicit() {
     let directory = tempfile::tempdir().unwrap();
     assert!(FileLogWriter::new(directory.path().to_str().unwrap()).is_err());
+}
+
+struct GatedBufferedWriter {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+    buffered: Vec<u8>,
+    output: Output,
+}
+
+impl Write for GatedBufferedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let _ = self.entered.send(());
+        // Disconnection releases every gate during failed-test cleanup.
+        let _ = self.release.recv_timeout(Duration::from_secs(5));
+        self.buffered.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.write_all(&self.buffered)?;
+        self.buffered.clear();
+        Ok(())
+    }
+}
+
+#[test]
+fn earlier_flush_completes_before_later_flush_or_shutdown_target() {
+    for shutdown in [false, true] {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let output = Output::default();
+        let writer = Arc::new(
+            FileLogWriter::with_writer(GatedBufferedWriter {
+                entered: entered_tx,
+                release: release_rx,
+                buffered: Vec::new(),
+                output: output.clone(),
+            })
+            .unwrap(),
+        );
+        emit(&writer, "A");
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let first_writer = writer.clone();
+        let (first_tx, first_rx) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            let result = first_writer.flush_timeout(Duration::from_secs(2));
+            let _ = first_tx.send(result);
+        });
+        let request_deadline = Instant::now() + Duration::from_secs(1);
+        let mut state = writer.shared.state.lock();
+        while state.flush_target != Some(1) {
+            assert!(Instant::now() < request_deadline);
+            writer
+                .shared
+                .changed
+                .wait_until(&mut state, request_deadline);
+        }
+        drop(state);
+        emit(&writer, "B");
+
+        // Hold the state lock until parked: only the second lifecycle request
+        // can notify us while A is gated and the first flusher is waiting.
+        let mut state = writer.shared.state.lock();
+        let second_writer = writer.clone();
+        let (second_tx, second_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let result = if shutdown {
+                second_writer.shutdown_timeout(Duration::from_secs(2))
+            } else {
+                second_writer.flush_timeout(Duration::from_secs(2))
+            };
+            let _ = second_tx.send(result);
+        });
+        let notified = writer
+            .shared
+            .changed
+            .wait_for(&mut state, Duration::from_secs(1));
+        assert!(!notified.timed_out());
+        assert_eq!(state.flush_target, Some(2));
+        drop(state);
+        assert!(matches!(
+            first_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_tx.send(()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let first_result = first_rx.recv_timeout(Duration::from_secs(1));
+        let first_output = output.0.lock().clone();
+        let second_pending = matches!(second_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        // Release before inspecting results so assertion failures cannot strand B.
+        drop(release_tx);
+        first.join().unwrap();
+        let second_result = second_rx.recv_timeout(Duration::from_secs(2));
+        second.join().unwrap();
+        writer.shutdown_timeout(Duration::from_secs(2)).unwrap();
+        if let Some(worker) = writer.worker.lock().take() {
+            worker.join().unwrap();
+        }
+
+        first_result.unwrap().unwrap();
+        assert_eq!(first_output, b"A\n");
+        assert!(second_pending);
+        second_result.unwrap().unwrap();
+        assert_eq!(*output.0.lock(), b"A\nB\n");
+    }
+}
+
+#[test]
+fn finished_sink_flush_returns_immediately_after_timeout_discards_records() {
+    let (writer, entered, release, _) = stalled(false);
+    emit(&writer, "A");
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    emit(&writer, "B");
+    assert_eq!(
+        writer.shutdown_timeout(Duration::ZERO).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    drop(release);
+    writer.shutdown_timeout(Duration::from_secs(2)).unwrap();
+    assert!(writer.is_finished());
+    let stats = writer.stats();
+    assert_eq!(stats.accepted_records, 2);
+    assert_eq!(stats.written_records, 1);
+    assert_eq!(stats.dropped_records, 1);
+    let began = Instant::now();
+    assert_eq!(
+        writer
+            .flush_timeout(Duration::from_secs(2))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert!(began.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn fresh_sink_flush_completes_without_accepting_records() {
+    let writer = FileLogWriter::with_writer(Output::default()).unwrap();
+    assert_eq!(writer.shared.state.lock().flushed_through, None);
+    let began = Instant::now();
+    writer.flush_timeout(Duration::from_secs(2)).unwrap();
+    assert!(began.elapsed() < Duration::from_secs(1));
+    assert_eq!(writer.shared.state.lock().flushed_through, Some(0));
+    let stats = writer.stats();
+    assert_eq!(stats.accepted_records, 0);
+    assert_eq!(stats.written_records, 0);
+    writer.shutdown_timeout(Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+fn finished_sink_flush_succeeds_after_clean_shutdown() {
+    let writer = FileLogWriter::with_writer(Output::default()).unwrap();
+    emit(&writer, "A");
+    writer.shutdown_timeout(Duration::from_secs(2)).unwrap();
+    assert!(writer.is_finished());
+    writer.flush_timeout(Duration::ZERO).unwrap();
+    assert_eq!(writer.shared.state.lock().flushed_through, Some(1));
+}
+
+#[test]
+fn concurrent_producers_preserve_bounds_and_each_producers_order() {
+    for large in [false, true] {
+        let (writer, entered, release, output) = stalled(false);
+        emit(&writer, "prime");
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let mut producers = Vec::new();
+        for producer in 0..4 {
+            let writer = writer.clone();
+            let start = start.clone();
+            producers.push(std::thread::spawn(move || {
+                let payload = if large {
+                    "peer\u{1b}\n".repeat(1300)
+                } else {
+                    String::new()
+                };
+                start.wait();
+                for sequence in 0..128 {
+                    emit(&writer, &format!("{producer}:{sequence}:{payload}"));
+                }
+            }));
+        }
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        let pending = writer.stats();
+        drop(release);
+        writer.shutdown_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(pending.accepted_records + pending.dropped_records, 513);
+        assert_eq!(pending.pending_records as u64, pending.accepted_records);
+        assert_eq!(pending.written_records, 0);
+        assert!(pending.pending_records <= MAX_RECORDS);
+        assert!(pending.pending_bytes <= MAX_BYTES);
+        assert!(pending.dropped_records > 0);
+
+        let contents = String::from_utf8(output.0.lock().clone()).unwrap();
+        assert_eq!(contents.len(), pending.pending_bytes);
+        assert_eq!(contents.lines().count() as u64, pending.accepted_records);
+        let mut previous = [None; 4];
+        for line in contents.lines().skip(1) {
+            let mut fields = line.splitn(3, ':');
+            let producer: usize = fields.next().unwrap().parse().unwrap();
+            let sequence: usize = fields.next().unwrap().parse().unwrap();
+            assert!(sequence < 128);
+            assert!(previous[producer].is_none_or(|last| last < sequence));
+            previous[producer] = Some(sequence);
+        }
+        let finished = writer.stats();
+        assert_eq!(finished.written_records, pending.accepted_records);
+        assert_eq!(finished.pending_records, 0);
+        assert_eq!(finished.pending_bytes, 0);
+    }
+}
+
+#[test]
+fn concurrent_producers_racing_shutdown_leave_no_pending_records() {
+    let writer = Arc::new(FileLogWriter::with_writer(Output::default()).unwrap());
+    let start = Arc::new(std::sync::Barrier::new(5));
+    let mut producers = Vec::new();
+    emit(&writer, "prime");
+    for _ in 0..4 {
+        let writer = writer.clone();
+        let start = start.clone();
+        producers.push(std::thread::spawn(move || {
+            let text = "peer\u{1b}\n".repeat(1300);
+            start.wait();
+            for _ in 0..128 {
+                emit(&writer, &text);
+            }
+        }));
+    }
+    start.wait();
+    writer.shutdown_timeout(Duration::from_secs(2)).unwrap();
+    for producer in producers {
+        producer.join().unwrap();
+    }
+    let stats = writer.stats();
+    assert_eq!(stats.accepted_records + stats.dropped_records, 513);
+    assert_eq!(stats.written_records, stats.accepted_records);
+    assert_eq!(stats.pending_records, 0);
+    assert_eq!(stats.pending_bytes, 0);
 }

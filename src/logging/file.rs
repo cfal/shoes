@@ -43,8 +43,8 @@ struct Shared {
     changed: Condvar,
 }
 
-/// Dedicated blocking writer with drop-newest overload handling. Only queue
-/// bookkeeping runs under the mutex; filesystem I/O never holds it.
+/// Dedicated blocking writer with drop-newest overload handling. Admission and
+/// accounting share a mutex; escaping and filesystem I/O run outside it.
 pub struct FileLogWriter {
     shared: Arc<Shared>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -117,7 +117,9 @@ impl FileLogWriter {
         if shutdown {
             state.closing = true;
         }
-        state.flush_target = Some(state.flush_target.unwrap_or(0).max(target));
+        if state.flushed_through.is_none_or(|count| count < target) {
+            state.flush_target = Some(state.flush_target.unwrap_or(0).max(target));
+        }
         self.shared.changed.notify_all();
         loop {
             if state.stats.io_errors != 0 && (!shutdown || state.finished) {
@@ -136,6 +138,12 @@ impl FileLogWriter {
                 }
                 return Ok(());
             }
+            if state.finished {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "file log worker closed before flush target",
+                ));
+            }
             if Instant::now() >= deadline {
                 if shutdown {
                     discard_queue(&mut state);
@@ -152,14 +160,21 @@ impl FileLogWriter {
 
 impl LogWriter for FileLogWriter {
     fn write_log(&self, _: &log::Record, formatted: &str) {
-        let mut state = self.shared.state.lock();
-        if state.closing || state.finished || state.stats.pending_records == MAX_RECORDS {
-            state.stats.dropped_records += 1;
-            return;
+        {
+            let mut state = self.shared.state.lock();
+            if state.closing || state.finished || state.stats.pending_records == MAX_RECORDS {
+                state.stats.dropped_records += 1;
+                return;
+            }
         }
         // Escape only a bounded prefix, including expansion and the line delimiter.
         let (line, truncated) = escaped_record(formatted);
-        if state.stats.pending_bytes + line.len() > MAX_BYTES {
+        let mut state = self.shared.state.lock();
+        if state.closing
+            || state.finished
+            || state.stats.pending_records == MAX_RECORDS
+            || state.stats.pending_bytes + line.len() > MAX_BYTES
+        {
             state.stats.dropped_records += 1;
             return;
         }
@@ -238,11 +253,14 @@ fn run_worker(shared: Arc<Shared>, mut writer: impl Write) {
     let mut last_report = Instant::now();
     loop {
         let mut state = shared.state.lock();
-        let flush_target = state
-            .flush_target
-            .filter(|count| *count <= state.stats.written_records);
+        // Acknowledge progress before the next write can stall. Keeping only
+        // the highest target must not postpone earlier callers' barriers.
+        let flush_progress = state.flush_target.is_some()
+            && state
+                .flushed_through
+                .is_none_or(|count| count < state.stats.written_records);
         let shutting_down = state.closing && state.queue.is_empty();
-        let line = if flush_target.is_some() || shutting_down {
+        let line = if flush_progress || shutting_down {
             None
         } else if let Some(line) = state.queue.pop_front() {
             Some(line)
@@ -250,9 +268,6 @@ fn run_worker(shared: Arc<Shared>, mut writer: impl Write) {
             shared.changed.wait(&mut state);
             continue;
         };
-        if flush_target.is_some() {
-            state.flush_target = None;
-        }
         drop(state);
 
         let result = match &line {
@@ -260,6 +275,10 @@ fn run_worker(shared: Arc<Shared>, mut writer: impl Write) {
             None => writer.flush(),
         };
         let mut state = shared.state.lock();
+        let flush_completed = line.is_none()
+            && state
+                .flush_target
+                .is_some_and(|target| target <= state.stats.written_records);
         if let Some(line) = line {
             state.stats.pending_records -= 1;
             state.stats.pending_bytes -= line.len();
@@ -269,7 +288,10 @@ fn run_worker(shared: Arc<Shared>, mut writer: impl Write) {
                 state.stats.dropped_records += 1;
             }
         } else if result.is_ok() {
-            state.flushed_through = flush_target;
+            state.flushed_through = Some(state.stats.written_records);
+            if flush_completed {
+                state.flush_target = None;
+            }
         }
         if result.is_err() {
             state.stats.io_errors += 1;
@@ -285,7 +307,7 @@ fn run_worker(shared: Arc<Shared>, mut writer: impl Write) {
         );
         let report = health != reported_health
             && (should_finish
-                || flush_target.is_some()
+                || flush_completed
                 || last_report.elapsed() >= Duration::from_secs(1));
         shared.changed.notify_all();
         drop(state);
