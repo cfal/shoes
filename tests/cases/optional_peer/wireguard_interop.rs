@@ -86,6 +86,10 @@ async fn wireguard_xray_both_roles_tcp_udp_ipv4_ipv6() -> io::Result<()> {
             };
             drop(reservation);
             let _shoes = start_shoes_server(&serde_yaml::to_string(&shoes).unwrap())?;
+            if !shoes_is_server {
+                // Xray allocates a readiness listener; bind Shoes' SOCKS port first.
+                shoes_test_support::xray::wait_socks(([127, 0, 0, 1], entry).into()).await?;
+            }
             let _peer = shoes_test_support::xray::start(peer).await?;
             ports.wait_for_all_ports().await?;
             for ipv6 in [false, true] {
