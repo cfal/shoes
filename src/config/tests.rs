@@ -1,42 +1,68 @@
-use super::{compile_configs, convert_cert_paths, load_configs};
+use super::{compile_configs, convert_cert_paths, load_configs, parse_config_yaml};
 
 #[tokio::test]
 async fn nested_parse_errors_include_source_and_field_context_without_credentials() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("nested.yaml");
-    let prefix = "- clash_api_address: '127.0.0.1:9090'\n  secret: CONTROLLER_SECRET_SENTINEL\n\
-                  - pem: private\n  data: |\n    -----BEGIN PRIVATE KEY-----\n    PEM_SECRET_SENTINEL\n    -----END PRIVATE KEY-----\n";
+    let prefix = r#"- clash_api_address: '127.0.0.1:9090'
+  secret: CONTROLLER_SECRET_SENTINEL
+- pem: private
+  data: |
+    -----BEGIN PRIVATE KEY-----
+    PEM_SECRET_SENTINEL
+    -----END PRIVATE KEY-----
+"#;
     for (entry, context) in [
         (
-            "- rule_group: imported\n  rules:\n    - path: [VALUE_SECRET_SENTINEL]\n",
+            r#"- rule_group: imported
+  rules:
+    - path: [VALUE_SECRET_SENTINEL]
+"#,
             "rules[0]",
         ),
         (
-            "- rule_group: imported\n  rules:\n    - first.srs\n    - path: second.srs\n      unsupported_policy: VALUE_SECRET_SENTINEL\n",
+            r#"- rule_group: imported
+  rules:
+    - first.srs
+    - path: second.srs
+      unsupported_policy: VALUE_SECRET_SENTINEL
+"#,
             "rules[1]",
         ),
         (
-            "- rule_group: policy\n  rules:\n    action: [VALUE_SECRET_SENTINEL]\n",
+            r#"- rule_group: policy
+  rules:
+    action: [VALUE_SECRET_SENTINEL]
+"#,
             "rules:",
         ),
         (
-            "- global_limits:\n    unsupported_policy: VALUE_SECRET_SENTINEL\n",
+            r#"- global_limits:
+    unsupported_policy: VALUE_SECRET_SENTINEL
+"#,
             "unknown field `unsupported_policy`",
         ),
         (
-            "- address: '127.0.0.1:1080'\n  protocol: {type: socks, password: PASSWORD_SECRET_SENTINEL}\n  tcp_settings:\n    no_delay: [VALUE_SECRET_SENTINEL]\n",
+            r#"- address: '127.0.0.1:1080'
+  protocol: {type: socks, password: PASSWORD_SECRET_SENTINEL}
+  tcp_settings:
+    no_delay: [VALUE_SECRET_SENTINEL]
+"#,
             "tcp_settings",
         ),
         (
-            "- address: '127.0.0.1:1080'\n  protocol: {type: socks, password: PASSWORD_SECRET_SENTINEL}\n  tcp_settings:\n    unsupported_policy: VALUE_SECRET_SENTINEL\n",
+            r#"- address: '127.0.0.1:1080'
+  protocol: {type: socks, password: PASSWORD_SECRET_SENTINEL}
+  tcp_settings:
+    unsupported_policy: VALUE_SECRET_SENTINEL
+"#,
             "unknown field `unsupported_policy`",
         ),
     ] {
         std::fs::write(&path, format!("{prefix}{entry}")).unwrap();
-        let error = load_configs(&vec![path.to_str().unwrap().into()])
-            .await
-            .err()
-            .expect("invalid configuration must reject");
+        let Err(error) = load_configs(&vec![path.to_str().unwrap().into()]).await else {
+            panic!("invalid configuration must reject");
+        };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         let diagnostic = error.to_string();
         assert!(diagnostic.contains(path.to_str().unwrap()), "{diagnostic}");
@@ -50,30 +76,44 @@ async fn nested_parse_errors_include_source_and_field_context_without_credential
 #[test]
 fn loader_preserves_strict_document_structure() {
     for invalid in [
-        "address: '127.0.0.1:1080'\nprotocol: {type: socks}",
-        "[]\n---\n[]",
+        r#"address: '127.0.0.1:1080'
+protocol: {type: socks}"#,
+        r#"[]
+---
+[]"#,
         "- 42",
-        "- global_limits: {}\n  global_limits: {}",
-        "- pem: private\n  data: SECRET_SENTINEL\n  unsupported_policy: true",
-        "- pem: private\n  path: private.pem\n  unsupported_policy: true",
+        r#"- global_limits: {}
+  global_limits: {}"#,
+        r#"- pem: private
+  data: SECRET_SENTINEL
+  unsupported_policy: true"#,
+        r#"- pem: private
+  path: private.pem
+  unsupported_policy: true"#,
     ] {
-        let error = super::parse_config_yaml(invalid)
-            .err()
-            .expect("invalid document must reject")
-            .to_string();
+        let Err(error) = parse_config_yaml(invalid) else {
+            panic!("invalid document must reject");
+        };
+        let error = error.to_string();
         assert!(!error.contains("SECRET_SENTINEL"), "{error}");
     }
-    assert!(super::parse_config_yaml("[]").unwrap().is_empty());
+    assert!(parse_config_yaml("[]").unwrap().is_empty());
 }
 
 #[test]
 fn tcp_settings_reject_unknown_fields_for_servers_and_clients() {
     for yaml in [
-        "- address: '127.0.0.1:1080'\n  protocol: {type: socks}\n  tcp_settings: {unsupported_policy: true}",
-        "- client_group: proxy\n  client_proxies:\n    address: '127.0.0.1:1080'\n    protocol: {type: socks}\n    tcp_settings: {unsupported_policy: true}",
+        r#"- address: '127.0.0.1:1080'
+  protocol: {type: socks}
+  tcp_settings: {unsupported_policy: true}"#,
+        r#"- client_group: proxy
+  client_proxies:
+    address: '127.0.0.1:1080'
+    protocol: {type: socks}
+    tcp_settings: {unsupported_policy: true}"#,
     ] {
-        assert!(super::parse_config_yaml(yaml).is_err());
-        assert!(super::parse_config_yaml(&yaml.replace("unsupported_policy", "no_delay")).is_ok());
+        assert!(parse_config_yaml(yaml).is_err());
+        assert!(parse_config_yaml(&yaml.replace("unsupported_policy", "no_delay")).is_ok());
     }
 }
 

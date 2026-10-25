@@ -8,36 +8,60 @@ fn check_diagnostics_include_file_and_nested_context_without_credentials() {
     let path = directory.path().join("nested.yaml");
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     let valid = format!(
-        "- address: '{}'\n  protocol: {{type: socks}}\n",
+        r#"- address: '{}'
+  protocol: {{type: socks}}
+"#,
         occupied.local_addr().unwrap()
     );
     for (config, context) in [
         (
-            "- rule_group: imported\n  rules:\n    - first.srs\n    - path: [VALUE_SECRET_SENTINEL]\n",
+            r#"- rule_group: imported
+  rules:
+    - first.srs
+    - path: [VALUE_SECRET_SENTINEL]
+"#,
             "rules[1]",
         ),
         (
-            "- global_limits: {unsupported_policy: VALUE_SECRET_SENTINEL}\n",
+            r#"- global_limits: {unsupported_policy: VALUE_SECRET_SENTINEL}
+"#,
             "unknown field `unsupported_policy`",
         ),
         (
-            "- pem: private\n  data: PEM_SECRET_SENTINEL\n  unsupported_policy: true\n",
+            r#"- pem: private
+  data: PEM_SECRET_SENTINEL
+  unsupported_policy: true
+"#,
             "unknown field `unsupported_policy`",
         ),
         (
-            "- proxy-providers:\n    remote:\n      url: 'https://user:URL_SECRET_SENTINEL@example.invalid/nodes'\n",
+            r#"- proxy-providers:
+    remote:
+      url: 'https://user:URL_SECRET_SENTINEL@example.invalid/nodes'
+"#,
             "Unable to determine config type",
         ),
         (
-            "- clash_api_address: '127.0.0.1:9090'\n  secret: CONTROLLER_SECRET_SENTINEL\n- global_limits: {max_connections: 0}\n",
+            r#"- clash_api_address: '127.0.0.1:9090'
+  secret: CONTROLLER_SECRET_SENTINEL
+- global_limits: {max_connections: 0}
+"#,
             "global_limits.max_connections",
         ),
         (
-            "- address: '127.0.0.1:1080'\n  protocol: {type: socks, username: user, password: PASSWORD_SECRET_SENTINEL}\n  rules:\n    - masks: '0.0.0.0/0'\n      client_chain: missing-group\n",
+            r#"- address: '127.0.0.1:1080'
+  protocol: {type: socks, username: user, password: PASSWORD_SECRET_SENTINEL}
+  rules:
+    - masks: '0.0.0.0/0'
+      client_chain: missing-group
+"#,
             "missing-group",
         ),
         (
-            "- address: '127.0.0.1:1080'\n  protocol: {type: socks, password: PASSWORD_SECRET_SENTINEL}\n  tcp_settings: [\n",
+            r#"- address: '127.0.0.1:1080'
+  protocol: {type: socks, password: PASSWORD_SECRET_SENTINEL}
+  tcp_settings: [
+"#,
             "line ",
         ),
     ] {
@@ -75,8 +99,17 @@ fn check_dry_run_validates_all_files_without_forwarding_or_state_writes() {
     std::fs::write(
         &groups,
         format!(
-            "- cache_file_path: '{}'\n- client_group: outbound\n  type: selector\n  default: upstream\n  client_proxies:\n    - name: upstream\n      address: '{}'\n      protocol: {{type: socks}}\n",
-            cache.display(), upstream.local_addr().unwrap()
+            r#"- cache_file_path: '{}'
+- client_group: outbound
+  type: selector
+  default: upstream
+  client_proxies:
+    - name: upstream
+      address: '{}'
+      protocol: {{type: socks}}
+"#,
+            cache.display(),
+            upstream.local_addr().unwrap()
         ),
     )
     .unwrap();
@@ -85,7 +118,12 @@ fn check_dry_run_validates_all_files_without_forwarding_or_state_writes() {
             std::fs::write(
                 &server,
                 format!(
-                    "- address: '{address}'\n  protocol: {{type: socks}}\n  rules:\n    - masks: '0.0.0.0/0'\n      client_chain: {chain}\n"
+                    r#"- address: '{address}'
+  protocol: {{type: socks}}
+  rules:
+    - masks: '0.0.0.0/0'
+      client_chain: {chain}
+"#
                 ),
             )
             .unwrap();
