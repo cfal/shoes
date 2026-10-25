@@ -400,6 +400,10 @@ member in configuration order. This is best-effort routing, not fail-closed rout
 Unambiguous remote connection errors request a rate-limited recheck (at most once
 per second); they do not mark the configured URL dead based on a different user
 destination. Local overload and unsupported operations do not penalize health.
+HTTP/2 adapters preserve matching transport-error causes for this classification.
+This is best effort when a protocol replaces a failure with a generic cancellation:
+for example, XHTTP upload cancellation can lose the original cause and count as a
+remote failure.
 User payloads are never retried across candidates. Probes use HTTP HEAD and accept
 any HTTP response status, without redirects; HTTPS certificates are verified.
 Local probe lookups use guarded system DNS, not a server's configured DNS group.

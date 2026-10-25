@@ -509,6 +509,8 @@ pub(crate) fn local_failure(error: &io::Error) -> bool {
             }
             // io::Error::source can skip the wrapped error itself.
             error.get_ref().map(|inner| inner as &dyn std::error::Error)
+        } else if let Some(error) = error.downcast_ref::<h2::Error>() {
+            return error.get_io().is_some_and(local_failure);
         } else {
             error.source()
         };
@@ -1716,7 +1718,12 @@ mod tests {
                 .await
                 .unwrap_err();
             if h2_proxy {
-                assert!(error.get_ref().unwrap().is::<h2::Error>(), "{error:?}");
+                let recovered = error
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<crate::http2::transport::RecoveredError>()
+                    .expect("H2 transport cause was not restored");
+                assert!(recovered.error.is_io(), "{error:?}");
             } else {
                 assert!(error.get_ref().unwrap().is::<hyper::Error>(), "{error:?}");
             }

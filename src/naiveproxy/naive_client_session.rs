@@ -26,6 +26,7 @@ use tokio::sync::oneshot;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
+use crate::http2::transport::TransportErrors;
 
 use super::h2_multi_stream::H2MultiStream;
 use super::naive_padding_stream::{
@@ -41,6 +42,7 @@ use super::naive_padding_stream::{
 /// H2 connection (via h2's internal `Arc<Mutex<...>>`).
 #[derive(Clone)]
 pub struct NaiveClientSession {
+    pub(super) errors: TransportErrors,
     /// The SendRequest handle - has internal Arc, cheap to clone
     send_request: h2::client::SendRequest<Bytes>,
     driver_handle: Arc<DriverHandle>,
@@ -61,14 +63,16 @@ impl NaiveClientSession {
         const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
         const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
+        let errors = TransportErrors::default();
         let (send_request, mut connection) = h2::client::Builder::new()
             .initial_window_size(WINDOW_SIZE)
             .initial_connection_window_size(WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
             .max_concurrent_streams(1024)
-            .handshake(stream)
+            .handshake(errors.wrap(stream))
             .await
-            .map_err(|e| io::Error::other(format!("H2 client handshake failed: {}", e)))?;
+            .map_err(|e| errors.map_with("H2 client handshake failed", e))?;
+        errors.start_driver();
 
         let (drain_tx, drain_rx) = oneshot::channel();
         let abort_handle = tokio::spawn(async move {
@@ -86,6 +90,7 @@ impl NaiveClientSession {
         debug!("NaiveClientSession: H2 handshake complete, session ready for multiplexing");
 
         Ok(Self {
+            errors,
             send_request,
             driver_handle: Arc::new(DriverHandle {
                 driver: abort_handle,
@@ -132,15 +137,15 @@ impl NaiveClientSession {
 
         std::future::poll_fn(|cx| self.send_request.poll_ready(cx))
             .await
-            .map_err(|e| io::Error::other(format!("H2 session closed: {e}")))?;
+            .map_err(|e| self.errors.map_with("H2 session closed", e))?;
         let (response_future, send_stream) = self
             .send_request
             .send_request(request, false)
-            .map_err(|e| io::Error::other(format!("Failed to send CONNECT: {}", e)))?;
+            .map_err(|e| self.errors.map_with("Failed to send CONNECT", e))?;
 
         let response = response_future
             .await
-            .map_err(|e| io::Error::other(format!("CONNECT response error: {}", e)))?;
+            .map_err(|e| self.errors.map_with("CONNECT response error", e))?;
 
         debug!(
             "NaiveClientSession: CONNECT response: status={}, headers={:?}",
@@ -200,6 +205,47 @@ fn format_authority(location: &NetLocation) -> String {
         Address::Ipv6(addr) => format!("[{}]:{}", addr, location.port()),
         Address::Ipv4(addr) => format!("{}:{}", addr, location.port()),
         Address::Hostname(host) => format!("{}:{}", host, location.port()),
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use crate::http2::transport::tests::{cases, peer};
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn established_stream_preserves_transport_causes() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for (make_error, local) in cases() {
+                let (client, fault, mut sends, driver) = peer(make_error);
+                let mut session = NaiveClientSession::new(Box::new(client)).await.unwrap();
+                let mut stream = session
+                    .open_stream(
+                        &NetLocation::from_str("example.com:80", None).unwrap(),
+                        "Basic test",
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                let _send = sends.recv().await.unwrap();
+                assert_eq!(stream.read_u8().await.unwrap(), b'x');
+                fault.inject();
+                let error = stream.read_u8().await.unwrap_err();
+                assert!(error.to_string().starts_with("H2 recv error: "));
+                assert_eq!(
+                    crate::clash_api::probes::local_failure(&error),
+                    local,
+                    "{error:?}"
+                );
+                drop(stream);
+                drop(session);
+                driver.abort();
+                let _ = driver.await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
 

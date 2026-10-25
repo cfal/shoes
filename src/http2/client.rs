@@ -13,6 +13,7 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 
 use super::stream::H2MultiStream;
+use super::transport::TransportErrors;
 
 #[derive(Clone)]
 pub struct H2ClientSession {
@@ -21,6 +22,7 @@ pub struct H2ClientSession {
 }
 
 struct DriverHandle {
+    errors: TransportErrors,
     driver: tokio::task::AbortHandle,
     _drain: oneshot::Sender<()>,
     active: Arc<ActiveStreams>,
@@ -56,11 +58,22 @@ impl Drop for StreamReservation {
 pub(crate) struct OpenError {
     pub error: h2::Error,
     pub sent: bool,
+    cause: Option<Arc<io::Error>>,
+}
+
+impl OpenError {
+    fn new(error: h2::Error, sent: bool, errors: &TransportErrors) -> Self {
+        Self {
+            cause: errors.cause(&error),
+            error,
+            sent,
+        }
+    }
 }
 
 impl From<OpenError> for io::Error {
     fn from(error: OpenError) -> Self {
-        io::Error::other(error.error)
+        TransportErrors::map_captured(error.error, error.cause)
     }
 }
 
@@ -68,6 +81,7 @@ impl H2ClientSession {
     pub async fn new(stream: Box<dyn AsyncStream>) -> io::Result<Self> {
         const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
+        let errors = TransportErrors::default();
         let (send_request, mut connection) = h2::client::Builder::new()
             .initial_window_size(super::STREAM_WINDOW)
             .initial_connection_window_size(super::CONNECTION_WINDOW)
@@ -75,9 +89,10 @@ impl H2ClientSession {
             .max_frame_size(MAX_FRAME_SIZE)
             .max_header_list_size(16 * 1024)
             .max_concurrent_streams(1024)
-            .handshake(stream)
+            .handshake(errors.wrap(stream))
             .await
-            .map_err(|e| io::Error::other(format!("H2 client handshake failed: {}", e)))?;
+            .map_err(|e| errors.map_with("H2 client handshake failed", e))?;
+        errors.start_driver();
 
         let ping = connection.ping_pong().unwrap();
         let (drain_tx, mut drain_rx) = oneshot::channel();
@@ -117,6 +132,7 @@ impl H2ClientSession {
         Ok(Self {
             send_request,
             driver_handle: Arc::new(DriverHandle {
+                errors,
                 driver: abort_handle,
                 _drain: drain_tx,
                 active,
@@ -192,28 +208,33 @@ async fn keep_alive(mut ping: h2::PingPong) -> io::Result<()> {
 }
 
 impl StreamReservation {
+    pub(super) fn errors(&self) -> &TransportErrors {
+        &self.0.driver_handle.errors
+    }
+
     pub async fn open(
         mut self,
         request: Request<()>,
     ) -> Result<(http::response::Parts, H2MultiStream), OpenError> {
         std::future::poll_fn(|cx| self.0.send_request.poll_ready(cx))
             .await
-            .map_err(|error| OpenError { error, sent: false })?;
+            .map_err(|error| OpenError::new(error, false, self.errors()))?;
         // A reservation may predate keepalive retirement; it must not restart idle draining.
         if self.0.driver_handle.retired.load(Ordering::SeqCst) {
-            return Err(OpenError {
-                error: h2::Reason::REFUSED_STREAM.into(),
-                sent: false,
-            });
+            return Err(OpenError::new(
+                h2::Reason::REFUSED_STREAM.into(),
+                false,
+                self.errors(),
+            ));
         }
         let (response, send) = self
             .0
             .send_request
             .send_request(request, false)
-            .map_err(|error| OpenError { error, sent: false })?;
+            .map_err(|error| OpenError::new(error, false, self.errors()))?;
         let response = response
             .await
-            .map_err(|error| OpenError { error, sent: true })?;
+            .map_err(|error| OpenError::new(error, true, self.errors()))?;
         let (parts, recv) = response.into_parts();
         let mut stream = H2MultiStream::new(send, recv);
         stream.set_reservation(self);
