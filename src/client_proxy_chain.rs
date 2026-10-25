@@ -144,6 +144,25 @@ impl std::fmt::Debug for ClientProxyChain {
 }
 
 impl ClientProxyChain {
+    #[cfg(unix)]
+    pub(crate) fn tcp_selection_indices(&self) -> Vec<u32> {
+        std::iter::once(&self.initial_hop_next_index)
+            .chain(&self.subsequent_next_indices)
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn restore_tcp_selection_indices(&mut self, indices: &[u32]) {
+        assert_eq!(indices.len(), self.num_hops());
+        for (counter, index) in std::iter::once(&mut self.initial_hop_next_index)
+            .chain(&mut self.subsequent_next_indices)
+            .zip(indices)
+        {
+            *counter.get_mut() = *index;
+        }
+    }
+
     fn needs_carrier_dialer(&self) -> bool {
         self.initial_hop.iter().any(|entry| matches!(entry.as_ref(), InitialHopEntry::Proxy { proxy, .. } if proxy.needs_carrier_dialer()))
             || self.subsequent_hops.iter().flatten().any(|proxy| proxy.needs_carrier_dialer())

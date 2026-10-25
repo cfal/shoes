@@ -14,6 +14,7 @@ use install::Install;
 use tokio::time::{Instant, timeout};
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_STAGED_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -47,6 +48,7 @@ async fn stage(
     dns: &DnsRegistry,
     global: GlobalLimits,
     limits: Limits,
+    state: &mut http::DownloadState,
 ) -> io::Result<Staged> {
     let mut install = Install::open(&source.path)?;
     let digest = crate::control::url_test::BACKGROUND
@@ -54,7 +56,7 @@ async fn stage(
             (),
             timeout(
                 limits.overall,
-                http::download(source, dns, global, &mut install.file, limits),
+                http::download(source, dns, global, &mut install.file, limits, state),
             ),
         )
         .await
@@ -80,7 +82,11 @@ async fn validate_staged(configs: Vec<Config>, staged: &[Staged]) -> io::Result<
         .collect::<io::Result<HashMap<_, _>>>()?;
     let validated = crate::config::compile_configs_with_inputs(configs, inputs)
         .await
-        .map_err(|_| invalid("download rejected by whole configuration validation"))?;
+        .map_err(|error| {
+            invalid(format!(
+                "download rejected by whole configuration validation: {error}"
+            ))
+        })?;
     tokio::task::spawn_blocking(move || {
         if validated.catalog.is_some() {
             crate::control::validation::validate_resources(&validated)?;
@@ -89,6 +95,41 @@ async fn validate_staged(configs: Vec<Config>, staged: &[Staged]) -> io::Result<
     })
     .await
     .map_err(io::Error::other)?
+}
+
+async fn stage_sources(
+    sources: &[RuleSource],
+    dns: &DnsRegistry,
+    global: GlobalLimits,
+    mut remaining: u64,
+) -> io::Result<Vec<Staged>> {
+    let mut staged = Vec::new();
+    for source in sources {
+        if remaining == 0 {
+            return Err(invalid("cold rule downloads exceed staging budget"));
+        }
+        let limits = Limits {
+            bytes: MAX_BYTES.min(remaining),
+            ..Limits::default()
+        };
+        let item = stage(
+            source,
+            dns,
+            global,
+            limits,
+            &mut http::DownloadState::default(),
+        )
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("rule download {}: {error}", source.path.display()),
+            )
+        })?;
+        remaining -= item.install.file.metadata()?.len();
+        staged.push(item);
+    }
+    Ok(staged)
 }
 
 pub(crate) async fn prepare(
@@ -156,16 +197,7 @@ pub(crate) async fn prepare(
     )
     .await
     .map_err(|_| invalid("rule bootstrap preparation deadline exceeded"))??;
-    let mut staged = Vec::new();
-    let mut total = 0;
-    for source in &sources {
-        let item = stage(source, &dns, global, Limits::default()).await?;
-        total += item.install.file.metadata()?.len();
-        if total > 512 * 1024 * 1024 {
-            return Err(invalid("cold rule downloads exceed 512 MiB staging budget"));
-        }
-        staged.push(item);
-    }
+    let staged = stage_sources(&sources, &dns, global, MAX_STAGED_BYTES).await?;
     let validated = validate_staged(configs, &staged).await?;
     for mut item in staged {
         item.install.finish(item.digest)?;
@@ -182,6 +214,7 @@ struct Scheduled {
     source: RuleSource,
     due: Instant,
     failures: u32,
+    download: http::DownloadState,
 }
 
 async fn refresh_source(
@@ -189,8 +222,9 @@ async fn refresh_source(
     configs: &[Config],
     dns: &DnsRegistry,
     global: GlobalLimits,
+    state: &mut http::DownloadState,
 ) -> io::Result<bool> {
-    let mut staged = stage(source, dns, global, Limits::default()).await?;
+    let mut staged = stage(source, dns, global, Limits::default(), state).await?;
     if staged.install.unchanged(staged.digest)? {
         return Ok(false);
     }
@@ -231,6 +265,8 @@ impl Refresh {
                 source: source.clone(),
                 due: prior.map_or_else(|| Instant::now() + remaining, |item| item.due),
                 failures: prior.map_or(0, |item| item.failures),
+                download: prior
+                    .map_or_else(http::DownloadState::default, |item| item.download.clone()),
             });
         }
         Ok(Self { configs, scheduled })
@@ -243,7 +279,8 @@ impl Refresh {
                 return;
             };
             tokio::time::sleep_until(item.due).await;
-            let result = refresh_source(&item.source, &self.configs, dns, global).await;
+            let result =
+                refresh_source(&item.source, &self.configs, dns, global, &mut item.download).await;
             let interval = item.source.interval().expect("validated interval");
             let delay = match &result {
                 Ok(_) => {

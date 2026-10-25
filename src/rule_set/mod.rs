@@ -267,17 +267,31 @@ fn cache_paths(path: &Path) -> [PathBuf; 3] {
 }
 
 pub(crate) fn source_identity(path: &Path) -> io::Result<PathBuf> {
-    let absolute = std::path::absolute(path)?;
-    if let Ok(canonical) = absolute.canonicalize() {
-        return Ok(canonical);
+    let mut absolute = std::path::absolute(path)?;
+    for _ in 0..40 {
+        if let Ok(canonical) = absolute.canonicalize() {
+            return Ok(canonical);
+        }
+        // A local alias may point at a remote cache that has not been installed yet.
+        if let Ok(target) = std::fs::read_link(&absolute) {
+            absolute = if target.is_absolute() {
+                target
+            } else {
+                absolute.parent().unwrap().join(target)
+            };
+            continue;
+        }
+        if let Some(parent) = absolute.parent()
+            && let Ok(parent) = parent.canonicalize()
+            && let Some(name) = absolute.file_name()
+        {
+            return Ok(parent.join(name));
+        }
+        return Ok(absolute);
     }
-    if let Some(parent) = absolute.parent()
-        && let Ok(parent) = parent.canonicalize()
-        && let Some(name) = absolute.file_name()
-    {
-        return Ok(parent.join(name));
-    }
-    Ok(absolute)
+    Err(invalid(
+        "rule source symlink chain exceeds 40 links or contains a loop",
+    ))
 }
 
 pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -> io::Result<()> {

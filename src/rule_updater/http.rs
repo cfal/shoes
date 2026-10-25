@@ -18,11 +18,41 @@ use tokio::time::timeout;
 const MAX_HEADER_COUNT: usize = 64;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 
+#[derive(Clone, Default)]
+pub(super) struct DownloadState {
+    indices: Vec<u32>,
+}
+
+struct DownloadAttempt<'a> {
+    chain: crate::client_proxy_chain::ClientProxyChain,
+    state: &'a mut DownloadState,
+}
+
+impl Drop for DownloadAttempt<'_> {
+    fn drop(&mut self) {
+        // Failed and cancelled attempts still advance rotation; connectors remain transient.
+        self.state.indices = self.chain.tcp_selection_indices();
+    }
+}
+
+fn target(url: &url::Url) -> io::Result<crate::address::NetLocation> {
+    use crate::address::{Address, NetLocation};
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| invalid("missing URL port"))?;
+    match url.host().ok_or_else(|| invalid("missing URL host"))? {
+        url::Host::Domain(name) => Ok(NetLocation::new(Address::Hostname(name.to_owned()), port)),
+        url::Host::Ipv4(ip) => Ok(NetLocation::from_ip_addr(ip.into(), port)),
+        url::Host::Ipv6(ip) => Ok(NetLocation::from_ip_addr(ip.into(), port)),
+    }
+}
+
 async fn connect(
     url: &url::Url,
     download: &Download,
     dns: &DnsRegistry,
     global: GlobalLimits,
+    state: &mut DownloadState,
 ) -> io::Result<Box<dyn AsyncStream>> {
     let host = match url.host().ok_or_else(|| invalid("missing URL host"))? {
         url::Host::Domain(name) => name.to_owned(),
@@ -30,8 +60,7 @@ async fn connect(
         url::Host::Ipv6(ip) => ip.to_string(),
     };
     let resolver = dns.rule_bootstrap(&download.bootstrap_url)?;
-    let target =
-        crate::address::NetLocation::from_str(&host, Some(url.port_or_known_default().unwrap()))?;
+    let target = target(url)?;
     let targets = crate::resolver::resolve_addresses(&resolver, &target)
         .await
         .map_err(|_| invalid("rule download bootstrap lookup failed"))?;
@@ -68,15 +97,19 @@ async fn connect(
             }
         }
     }
-    let chain = crate::tcp::chain_builder::build_client_chain_group_with_limits(
-        crate::option_util::NoneOrSome::One(download.client_chain.clone()),
+    let mut chain = crate::tcp::chain_builder::build_client_proxy_chain_with_limits(
+        download.client_chain.hops.clone(),
         resolver.clone(),
         global,
     )?;
+    if !state.indices.is_empty() {
+        chain.restore_tcp_selection_indices(&state.indices);
+    }
+    let attempt = DownloadAttempt { chain, state };
     let mut connected = None;
     for target in targets {
         let target = crate::address::NetLocation::from_ip_addr(target.ip(), target.port());
-        if let Ok(result) = chain.connect_tcp(target.into(), &resolver).await {
+        if let Ok(result) = attempt.chain.connect_tcp(target.into(), &resolver).await {
             connected = Some(result);
             break;
         }
@@ -114,6 +147,7 @@ pub(super) async fn download(
     global: GlobalLimits,
     file: &mut File,
     limits: Limits,
+    state: &mut DownloadState,
 ) -> io::Result<blake3::Hash> {
     let url = source
         .parsed_url()?
@@ -122,7 +156,7 @@ pub(super) async fn download(
         .download
         .as_ref()
         .ok_or_else(|| invalid("download policy required"))?;
-    let stream = timeout(limits.connect, connect(&url, download, dns, global))
+    let stream = timeout(limits.connect, connect(&url, download, dns, global, state))
         .await
         .map_err(|_| invalid("connect/DNS/TLS deadline exceeded"))??;
 
@@ -207,5 +241,32 @@ pub(super) async fn download(
         biased;
         result = &mut receive => result,
         _ = connection => receive.await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_targets_preserve_host_and_port_without_reparsing_authorities() {
+        for (raw, address, port) in [
+            ("http://[::1]:8080/rules", "::1", 8080),
+            (
+                "http://[2001:db8::1:8080]:9090/rules",
+                "2001:db8::1:8080",
+                9090,
+            ),
+            ("https://[::ffff:192.0.2.1]/rules", "::ffff:192.0.2.1", 443),
+            ("https://example.com:8443/rules", "example.com", 8443),
+            ("http://192.0.2.1/rules", "192.0.2.1", 80),
+        ] {
+            let location = target(&url::Url::parse(raw).unwrap()).unwrap();
+            assert_eq!(
+                location.address(),
+                &crate::address::Address::from(address).unwrap()
+            );
+            assert_eq!(location.port(), port, "{raw}");
+        }
     }
 }

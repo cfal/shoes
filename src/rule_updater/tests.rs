@@ -54,8 +54,14 @@ fn configs(source: &RuleSource) -> Vec<Config> {
 }
 
 async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str> {
-    let mut staged =
-        super::stage(source, &DnsRegistry::new(), GlobalLimits::default(), limits).await?;
+    let mut staged = super::stage(
+        source,
+        &DnsRegistry::new(),
+        GlobalLimits::default(),
+        limits,
+        &mut http::DownloadState::default(),
+    )
+    .await?;
     validate_staged(configs(source), std::slice::from_ref(&staged)).await?;
     Ok(if staged.install.finish(staged.digest)?.changed() {
         "updated"
@@ -718,10 +724,166 @@ async fn cold_start_is_validated_as_a_whole_and_offline_checks_do_not_download()
     let (url, fixture) = serve(response(200, "", VALID)).await;
     let mut invalid = configs(&self::source(&url, &path));
     invalid.push(serde_json::from_value(serde_json::json!({"rule_group": "bad", "rules": [{"masks": {"ip_cidr": ["not an IP"]}}]})).unwrap());
-    assert!(prepare(invalid, None, &mut None).await.is_err());
+    let error = prepare(invalid, None, &mut None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("whole configuration validation"), "{error}");
+    assert!(error.contains("IP"), "{error}");
+    assert!(!error.contains("QUERY_SECRET"), "{error}");
     fixture.await.unwrap();
     assert!(!path.exists());
     assert!(!stage_path(&path).exists());
+}
+
+#[tokio::test]
+async fn cold_staging_caps_each_download_by_remaining_capacity() {
+    let dir = directory();
+    for budget in [
+        OLD.len() as u64,
+        (OLD.len() * 2 - 1) as u64,
+        (OLD.len() * 2) as u64,
+    ] {
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("b.json");
+        let (url_a, fixture_a) = serve(response(200, "", OLD)).await;
+        let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (url_b, fixture_b) = if budget == OLD.len() as u64 {
+            (format!("http://{}/rules", trap.local_addr().unwrap()), None)
+        } else {
+            let (url, fixture) = serve(response(200, "", OLD)).await;
+            (url, Some(fixture))
+        };
+        let sources = [source(&url_a, &a), source(&url_b, &b)];
+        let result = stage_sources(
+            &sources,
+            &DnsRegistry::new(),
+            GlobalLimits::default(),
+            budget,
+        )
+        .await;
+        fixture_a.await.unwrap();
+        if let Some(fixture) = fixture_b {
+            fixture.await.unwrap();
+        }
+        if budget == (OLD.len() * 2) as u64 {
+            let staged = result.unwrap();
+            assert_eq!(
+                staged
+                    .iter()
+                    .map(|item| item.install.file.metadata().unwrap().len())
+                    .sum::<u64>(),
+                budget
+            );
+            drop(staged);
+        } else {
+            let error = result.err().unwrap().to_string();
+            if budget == OLD.len() as u64 {
+                assert!(error.contains("staging budget"), "{error}");
+                assert!(
+                    timeout(Duration::from_millis(20), trap.accept())
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(error.contains("size outside permitted range"), "{error}");
+                assert!(error.contains(b.to_str().unwrap()), "{error}");
+            }
+        }
+        for path in [&a, &b] {
+            assert!(!path.exists());
+            assert!(!stage_path(path).exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn cold_download_errors_identify_cache_without_exposing_url() {
+    let dir = directory();
+    let path = dir.path().join("missing-directory/rules.json");
+    let source = source("http://127.0.0.1:1/rules?token=QUERY_SECRET", &path);
+    let error = prepare(configs(&source), None, &mut None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains(path.to_str().unwrap()), "{error}");
+    assert!(!error.contains("QUERY_SECRET"), "{error}");
+    assert!(!stage_path(&path).exists());
+}
+
+#[tokio::test]
+async fn cold_download_validates_dangling_local_aliases_against_staged_bytes() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    let alias = dir.path().join("alias.json");
+    symlink("second.json", &alias).unwrap();
+    symlink("cache.json", dir.path().join("second.json")).unwrap();
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let source = source(&url, &path);
+    let mut config = configs(&source);
+    config.push(
+        serde_json::from_value(
+            serde_json::json!({"rule_source_group": "alias", "rules": [{"path": alias}]}),
+        )
+        .unwrap(),
+    );
+    prepare(config, None, &mut None).await.unwrap();
+    fixture.await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    assert_eq!(std::fs::read(alias).unwrap(), VALID);
+}
+
+#[test]
+fn dangling_sidecar_aliases_and_symlink_cycles_are_rejected() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    let source = source("https://example.invalid/rules.json", &path);
+    for suffix in [".shoes-update.lock", ".shoes-update.tmp"] {
+        let alias = dir.path().join(format!("alias{suffix}.json"));
+        symlink(format!("cache.json{suffix}"), &alias).unwrap();
+        let mut config = configs(&source);
+        config.push(
+            serde_json::from_value(
+                serde_json::json!({"rule_source_group": "alias", "rules": [{"path": alias}]}),
+            )
+            .unwrap(),
+        );
+        let error = crate::rule_set::validate_remote_paths(&mut config, &[]).unwrap_err();
+        assert!(error.to_string().contains("sidecar"), "{error}");
+    }
+    let cycle = dir.path().join("cycle.json");
+    symlink("./cycle.json", &cycle).unwrap();
+    assert!(
+        crate::rule_set::source_identity(&cycle)
+            .unwrap_err()
+            .to_string()
+            .contains("loop")
+    );
+}
+
+#[tokio::test]
+async fn ipv6_literal_download_reaches_the_exact_url_port() {
+    let listener = TcpListener::bind("[::1]:0").await.unwrap();
+    let url = format!("http://{}/rules", listener.local_addr().unwrap());
+    let fixture = tokio::spawn(async move {
+        let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        request(&mut stream).await;
+        stream.write_all(&response(200, "", VALID)).await.unwrap();
+    });
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    assert_eq!(
+        update(&source(&url, &path), Limits::default())
+            .await
+            .unwrap(),
+        "updated"
+    );
+    fixture.await.unwrap();
 }
 
 #[tokio::test]
@@ -829,6 +991,111 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
 }
 
 #[tokio::test]
+async fn refresh_pools_rotate_after_success_failure_and_generation_replacement() {
+    for first_result in ["success", "failure", "cancelled"] {
+        for replace_generation in [false, true] {
+            let dir = directory();
+            let path = dir.path().join("cache.json");
+            write_rule(&path, OLD);
+            let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut source = source(
+                &format!("http://{}/rules", trap.local_addr().unwrap()),
+                &path,
+            );
+            source.download.as_mut().unwrap().client_chain =
+                serde_json::from_value(serde_json::json!([{"pool": [
+                    {"address": a.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+                    {"address": b.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}}
+                ]}]))
+                .unwrap();
+            let fixture = tokio::spawn(async move {
+                let mut selected = Vec::new();
+                let mut stalled = None;
+                for attempt in 0..3 {
+                    let (index, mut stream) = timeout(Duration::from_secs(5), async {
+                        tokio::select! {
+                            result = a.accept() => (0, result.unwrap().0),
+                            result = b.accept() => (1, result.unwrap().0),
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    selected.push(index);
+                    if attempt == 0 {
+                        if first_result == "failure" {
+                            continue;
+                        }
+                        if first_result == "cancelled" {
+                            stalled = Some(stream);
+                            continue;
+                        }
+                    }
+                    let mut greeting = [0; 3];
+                    stream.read_exact(&mut greeting).await.unwrap();
+                    assert_eq!(greeting, [5, 1, 0]);
+                    stream.write_all(&[5, 0]).await.unwrap();
+                    let mut connect = [0; 10];
+                    stream.read_exact(&mut connect).await.unwrap();
+                    stream
+                        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                        .await
+                        .unwrap();
+                    request(&mut stream).await;
+                    stream.write_all(&response(200, "", VALID)).await.unwrap();
+                }
+                drop(stalled);
+                selected
+            });
+            let config = configs(&source);
+            let sources = crate::config::compile_configs(config.clone())
+                .await
+                .unwrap()
+                .remote_rules;
+            let mut refresh = Refresh::new(config.clone(), &sources, None).unwrap();
+            for attempt in 0..3 {
+                let item = &mut refresh.scheduled[0];
+                let dns = DnsRegistry::new();
+                let future = refresh_source(
+                    &item.source,
+                    &config,
+                    &dns,
+                    GlobalLimits::default(),
+                    &mut item.download,
+                );
+                if first_result == "cancelled" && attempt == 0 {
+                    assert!(timeout(Duration::from_millis(100), future).await.is_err());
+                    assert_eq!(std::fs::read(&path).unwrap(), OLD);
+                } else if first_result == "failure" && attempt == 0 {
+                    assert!(
+                        future
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("configured rule download chain failed")
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), OLD);
+                } else {
+                    future.await.unwrap();
+                }
+                if replace_generation {
+                    refresh = Refresh::new(config.clone(), &sources, Some(&refresh)).unwrap();
+                }
+            }
+            assert_eq!(fixture.await.unwrap(), [0, 1, 0]);
+            assert!(
+                timeout(Duration::from_millis(20), trap.accept())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), VALID);
+            assert!(!stage_path(&path).exists());
+        }
+    }
+}
+
+#[tokio::test]
 async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
     let dir = directory();
     let path = dir.path().join("rules.json");
@@ -849,16 +1116,20 @@ async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
             &config,
             &DnsRegistry::new(),
             GlobalLimits::default(),
+            &mut http::DownloadState::default(),
         )
         .await;
         fixture.await.unwrap();
         if body == OLD {
             assert!(!result.unwrap());
         } else {
-            assert_eq!(
-                result.unwrap_err().to_string(),
-                "download rejected by whole configuration validation"
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.starts_with("download rejected by whole configuration validation:"),
+                "{error}"
             );
+            assert!(error.contains("IP"), "{error}");
+            assert!(!error.contains("QUERY_SECRET"), "{error}");
         }
         assert_preserved(&path, &original);
     }
@@ -901,9 +1172,15 @@ async fn explicit_bootstrap_resolves_target_without_system_dns() {
         &path,
     );
     source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
-    let mut staged = super::stage(&source, &dns, GlobalLimits::default(), Limits::default())
-        .await
-        .unwrap();
+    let mut staged = super::stage(
+        &source,
+        &dns,
+        GlobalLimits::default(),
+        Limits::default(),
+        &mut http::DownloadState::default(),
+    )
+    .await
+    .unwrap();
     staged.install.finish(staged.digest).unwrap();
     fixture.await.unwrap();
     assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -973,154 +1250,6 @@ fn cache_conflicts_and_unknown_download_routes_are_rejected_offline() {
     assert!(crate::config::create_server_configs(configs(&missing)).is_err());
 }
 
-#[test]
-fn remote_sources_work_in_source_groups_policies_and_flat_overrides() {
-    let dir = directory();
-    let path = dir.path().join("rules.json");
-    write_rule(&path, VALID);
-    let remote = source("https://example.com/rules.json", &path);
-    let mut flat = serde_json::to_value(&remote).unwrap();
-    flat["action"] = "block".into();
-    let config = serde_json::from_value(serde_json::json!([
-        {"rule_source_group": "sources", "rules": [remote, {"domain": ["inline.example"]}]},
-        {"rule_group": "policies", "rules": [flat]},
-        {"address": "127.0.0.1:0", "rules": ["policies", {
-            "masks": {"rule_source_group": "sources"}, "action": "block"
-        }], "protocol": {"type": "websocket", "targets": [{
-            "protocol": {"type": "socks"}, "override_rules": [flat]
-        }]}}
-    ]))
-    .unwrap();
-    let mut validated = crate::config::create_server_configs(config).unwrap();
-    assert_eq!(validated.remote_rules.len(), 1);
-    let mut count = 0;
-    crate::config::rule_visit::visit(
-        &mut validated.configs,
-        &mut |rule| {
-            assert!(matches!(
-                rule.action,
-                crate::config::RuleActionConfig::Block
-            ));
-            assert!(rule.criteria.compiled.is_some());
-            count += 1;
-            Ok(())
-        },
-        &mut |_| panic!("unexpanded policy group"),
-    )
-    .unwrap();
-    assert_eq!(count, 3);
-}
-
-#[test]
-fn local_source_reuse_does_not_accept_an_empty_remote_cache() {
-    let dir = directory();
-    let path = dir.path().join("rules.json");
-    write_rule(&path, br#"{"version":1,"rules":[]}"#);
-    let remote = source("https://example.com/rules.json", &path);
-    let local = RuleSource::from_path(path);
-    let mut compiler = crate::rules::Compiler::default();
-    crate::rule_set::load_source(&local, &mut compiler).unwrap();
-    assert!(
-        crate::rule_set::load_source(&remote, &mut compiler)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("empty remote")
-    );
-}
-
-#[tokio::test]
-async fn staged_candidate_uses_normalized_paths_even_before_cache_creation() {
-    let dir = directory();
-    let path = dir.path().join("./rules.json");
-    let stage = dir.path().join("staged");
-    write_rule(&stage, VALID);
-    let remote = source("https://example.com/rules.json", &path);
-    let mut config = configs(&remote);
-    config.push(
-        serde_json::from_value(serde_json::json!({
-            "rule_source_group": "local-alias", "rules": [{
-                "path": dir.path().join("rules.json"), "format": "mihomo_text", "behavior": "ipcidr"
-            }]
-        }))
-        .unwrap(),
-    );
-    let inputs = HashMap::from([(path, File::open(stage).unwrap())]);
-    let error = crate::config::compile_configs_with_inputs(config, inputs)
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
-    assert!(error.to_string().contains("CIDR"), "{error}");
-}
-
-#[test]
-fn source_identity_resolves_existing_paths_and_missing_leaf_parents() {
-    use crate::rule_set::source_identity;
-
-    let dir = directory();
-    let parent = dir.path().join("parent");
-    std::fs::create_dir(&parent).unwrap();
-    let alias = dir.path().join("alias");
-    symlink(&parent, &alias).unwrap();
-    let canonical_parent = parent.canonicalize().unwrap();
-
-    write_rule(&parent.join("existing.json"), VALID);
-    for name in ["existing.json", "missing.json"] {
-        assert_eq!(
-            source_identity(&alias.join(name)).unwrap(),
-            canonical_parent.join(name)
-        );
-    }
-    let missing_parent = alias.join("missing/rules.json");
-    assert_eq!(source_identity(&missing_parent).unwrap(), missing_parent);
-}
-
-#[tokio::test]
-async fn caches_cannot_overwrite_config_pem_state_or_other_source_files() {
-    let dir = directory();
-    let path = dir.path().join("cache.json");
-    write_rule(&path, VALID);
-    let source = source("https://example.com/rules.json", &path);
-    for extra in [
-        serde_json::json!({"cache_file_path": path}),
-        serde_json::json!({"dns_group": "dns", "dns_servers": "system", "fake_ip": {"state_file": path}}),
-        serde_json::json!({"path": path, "protocol": {"type": "socks"}}),
-        serde_json::json!({"rule_source_group": "other", "rules": [{"path": stage_path(&path)}]}),
-    ] {
-        let mut config = configs(&source);
-        config.push(serde_json::from_value(extra).unwrap());
-        assert!(
-            prepare(config, None, &mut None)
-                .await
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("overlap")
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), VALID);
-    }
-    let mut config = configs(&source);
-    config.push(serde_json::from_value(serde_json::json!({"pem": "pem", "path": path})).unwrap());
-    assert!(
-        crate::config::convert_cert_paths(config)
-            .await
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("overlap")
-    );
-    // Declaring-file protection runs before any rule decoding or networking.
-    std::fs::write(&path, serde_json::to_vec(&configs(&source)).unwrap()).unwrap();
-    assert!(
-        crate::config::load_configs(&vec![path.to_str().unwrap().into()])
-            .await
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("overlap")
-    );
-}
 #[test]
 fn remote_bootstrap_literals_reject_active_and_retained_synthetic_ranges() {
     let dir = directory();
@@ -1275,3 +1404,151 @@ async fn remote_bootstrap_group_names_take_precedence_over_url_syntax() {
     }
 }
 
+#[test]
+fn remote_sources_work_in_source_groups_policies_and_flat_overrides() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, VALID);
+    let remote = source("https://example.com/rules.json", &path);
+    let mut flat = serde_json::to_value(&remote).unwrap();
+    flat["action"] = "block".into();
+    let config = serde_json::from_value(serde_json::json!([
+        {"rule_source_group": "sources", "rules": [remote, {"domain": ["inline.example"]}]},
+        {"rule_group": "policies", "rules": [flat]},
+        {"address": "127.0.0.1:0", "rules": ["policies", {
+            "masks": {"rule_source_group": "sources"}, "action": "block"
+        }], "protocol": {"type": "websocket", "targets": [{
+            "protocol": {"type": "socks"}, "override_rules": [flat]
+        }]}}
+    ]))
+    .unwrap();
+    let mut validated = crate::config::create_server_configs(config).unwrap();
+    assert_eq!(validated.remote_rules.len(), 1);
+    let mut count = 0;
+    crate::config::rule_visit::visit(
+        &mut validated.configs,
+        &mut |rule| {
+            assert!(matches!(
+                rule.action,
+                crate::config::RuleActionConfig::Block
+            ));
+            assert!(rule.criteria.compiled.is_some());
+            count += 1;
+            Ok(())
+        },
+        &mut |_| panic!("unexpanded policy group"),
+    )
+    .unwrap();
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn local_source_reuse_does_not_accept_an_empty_remote_cache() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, br#"{"version":1,"rules":[]}"#);
+    let remote = source("https://example.com/rules.json", &path);
+    let local = RuleSource::from_path(path);
+    let mut compiler = crate::rules::Compiler::default();
+    crate::rule_set::load_source(&local, &mut compiler).unwrap();
+    assert!(
+        crate::rule_set::load_source(&remote, &mut compiler)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("empty remote")
+    );
+}
+
+#[tokio::test]
+async fn staged_candidate_uses_normalized_paths_even_before_cache_creation() {
+    let dir = directory();
+    let path = dir.path().join("./rules.json");
+    let stage = dir.path().join("staged");
+    write_rule(&stage, VALID);
+    let remote = source("https://example.com/rules.json", &path);
+    let mut config = configs(&remote);
+    config.push(
+        serde_json::from_value(serde_json::json!({
+            "rule_source_group": "local-alias", "rules": [{
+                "path": dir.path().join("rules.json"), "format": "mihomo_text", "behavior": "ipcidr"
+            }]
+        }))
+        .unwrap(),
+    );
+    let inputs = HashMap::from([(path, File::open(stage).unwrap())]);
+    let error = crate::config::compile_configs_with_inputs(config, inputs)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    assert!(error.to_string().contains("CIDR"), "{error}");
+}
+
+#[test]
+fn source_identity_resolves_existing_paths_and_missing_leaf_parents() {
+    use crate::rule_set::source_identity;
+
+    let dir = directory();
+    let parent = dir.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    let alias = dir.path().join("alias");
+    symlink(&parent, &alias).unwrap();
+    let canonical_parent = parent.canonicalize().unwrap();
+
+    write_rule(&parent.join("existing.json"), VALID);
+    for name in ["existing.json", "missing.json"] {
+        assert_eq!(
+            source_identity(&alias.join(name)).unwrap(),
+            canonical_parent.join(name)
+        );
+    }
+    let missing_parent = alias.join("missing/rules.json");
+    assert_eq!(source_identity(&missing_parent).unwrap(), missing_parent);
+}
+
+#[tokio::test]
+async fn caches_cannot_overwrite_config_pem_state_or_other_source_files() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    write_rule(&path, VALID);
+    let source = source("https://example.com/rules.json", &path);
+    for extra in [
+        serde_json::json!({"cache_file_path": path}),
+        serde_json::json!({"dns_group": "dns", "dns_servers": "system", "fake_ip": {"state_file": path}}),
+        serde_json::json!({"path": path, "protocol": {"type": "socks"}}),
+        serde_json::json!({"rule_source_group": "other", "rules": [{"path": stage_path(&path)}]}),
+    ] {
+        let mut config = configs(&source);
+        config.push(serde_json::from_value(extra).unwrap());
+        assert!(
+            prepare(config, None, &mut None)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("overlap")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    }
+    let mut config = configs(&source);
+    config.push(serde_json::from_value(serde_json::json!({"pem": "pem", "path": path})).unwrap());
+    assert!(
+        crate::config::convert_cert_paths(config)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("overlap")
+    );
+    // Declaring-file protection runs before any rule decoding or networking.
+    std::fs::write(&path, serde_json::to_vec(&configs(&source)).unwrap()).unwrap();
+    assert!(
+        crate::config::load_configs(&vec![path.to_str().unwrap().into()])
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("overlap")
+    );
+}
