@@ -6,6 +6,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use super::catalog::Catalog;
 use super::flows::FlowRegistry;
@@ -210,6 +211,13 @@ impl ControlRuntime {
     }
 }
 
+async fn stop_automatic(task: Option<AbortOnDropHandle<()>>) {
+    if let Some(task) = task {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 async fn run_owner(
     mut owner: SelectionOwner,
     mut receiver: mpsc::Receiver<Command>,
@@ -218,7 +226,7 @@ async fn run_owner(
 ) {
     let mut paused = false;
     let mut pending: VecDeque<SelectionCommand> = VecDeque::new();
-    let mut automatic: Option<tokio_util::task::AbortOnDropHandle<()>> = None;
+    let mut automatic: Option<AbortOnDropHandle<()>> = None;
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -260,10 +268,7 @@ async fn run_owner(
                         runtime.activating.store(true, Ordering::Release);
                         runtime.cancel_probes();
                     }
-                    if let Some(task) = automatic.take() {
-                        task.abort();
-                        let _ = task.await;
-                    }
+                    stop_automatic(automatic.take()).await;
                 }
                 let _ = reply.send(result);
             }
@@ -280,16 +285,13 @@ async fn run_owner(
             }
             Command::Resume(reply) => {
                 paused = false;
-                if let Some(task) = automatic.take() {
-                    task.abort();
-                    let _ = task.await;
-                }
+                stop_automatic(automatic.take()).await;
                 if let Some(runtime) = runtime.upgrade() {
                     runtime.activating.store(false, Ordering::Release);
                     if let Ok(generation) = runtime.generation()
                         && !generation.catalog.selection.automatic.0.is_empty()
                     {
-                        automatic = Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                        automatic = Some(AbortOnDropHandle::new(tokio::spawn(
                             crate::clash_api::probes::run_automatic(
                                 Arc::downgrade(&runtime),
                                 generation,
@@ -335,10 +337,7 @@ async fn run_owner(
             }
         }
     }
-    if let Some(task) = automatic {
-        task.abort();
-        let _ = task.await;
-    }
+    stop_automatic(automatic).await;
 }
 
 #[cfg(test)]

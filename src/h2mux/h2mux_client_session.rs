@@ -333,27 +333,23 @@ mod tests {
                             .open_tcp(&NetLocation::from_str("example.com:80", None).unwrap())
                             .await
                             .unwrap();
-                        if !lazy {
+                        let inbound = if lazy {
+                            None
+                        } else {
                             stream.write_all(b"x").await.unwrap();
                             let mut inbound = accepted_rx.await.unwrap();
                             inbound.stream.write_all(b"y").await.unwrap();
                             assert_eq!(stream.read_u8().await.unwrap(), b'y');
-                            fault.inject();
-                            let error = stream.read_u8().await.unwrap_err();
-                            assert_eq!(
-                                crate::clash_api::probes::local_failure(&error),
-                                local,
-                                "padding={padding} lazy={lazy}: {error:?}"
-                            );
-                        } else {
-                            fault.inject();
-                            let error = stream.read_u8().await.unwrap_err();
-                            assert_eq!(
-                                crate::clash_api::probes::local_failure(&error),
-                                local,
-                                "padding={padding} lazy={lazy}: {error:?}"
-                            );
-                        }
+                            Some(inbound)
+                        };
+                        fault.inject();
+                        let error = stream.read_u8().await.unwrap_err();
+                        assert_eq!(
+                            crate::clash_api::probes::local_failure(&error),
+                            local,
+                            "padding={padding} lazy={lazy}: {error:?}"
+                        );
+                        drop(inbound);
                         drop(stream);
                         drop(session);
                         server.abort();

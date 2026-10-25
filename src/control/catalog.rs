@@ -20,20 +20,19 @@ pub struct MemberOrigin {
 }
 
 impl MemberOrigin {
+    fn manages(&self, group: &str) -> bool {
+        self.selection.definitions().contains_key(group)
+            || self.selection.automatic.0.contains_key(group)
+    }
+
     pub fn has_selector(&self) -> bool {
-        self.path.iter().any(|(group, _)| {
-            self.selection.definitions().contains_key(group)
-                || self.selection.automatic.0.contains_key(group)
-        })
+        self.path.iter().any(|(group, _)| self.manages(group))
     }
 
     pub fn selector_path(&self) -> Vec<(String, String)> {
         self.path
             .iter()
-            .filter(|(group, _)| {
-                self.selection.definitions().contains_key(group)
-                    || self.selection.automatic.0.contains_key(group)
-            })
+            .filter(|(group, _)| self.manages(group))
             .cloned()
             .collect()
     }

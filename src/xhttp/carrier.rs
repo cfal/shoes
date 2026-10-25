@@ -603,12 +603,6 @@ impl H2SendError {
     }
 }
 
-impl From<h2::Error> for H2SendError {
-    fn from(error: h2::Error) -> Self {
-        Self::Stream(io::Error::other(error))
-    }
-}
-
 async fn send_h2_tracked(
     mut body: Body,
     send: &mut h2::SendStream<Bytes>,
@@ -1031,7 +1025,9 @@ mod tests {
             let error = H2SendError::Stream(io::ErrorKind::BrokenPipe.into());
             assert!(error.peer_sent_no_error(&mut send));
             // A reset can arrive between the body EOF poll and sending the final DATA frame.
-            let error = H2SendError::from(send.send_data(Bytes::new(), true).unwrap_err());
+            let error = H2SendError::Stream(io::Error::other(
+                send.send_data(Bytes::new(), true).unwrap_err(),
+            ));
             assert!(error.peer_sent_no_error(&mut send));
             let error = H2SendError::Local(io::ErrorKind::UnexpectedEof.into());
             assert!(!error.peer_sent_no_error(&mut send));

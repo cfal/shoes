@@ -22,9 +22,8 @@ pub struct ClientConfigGroup {
     pub client_group: String,
     #[serde(flatten)]
     pub group_type: GroupType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
-    #[serde(alias = "client_proxy")]
     pub client_proxies: OneOrSome<ConfigSelection<ClientConfig>>,
 }
 
@@ -162,6 +161,25 @@ mod group_type_tests {
             serde_json::from_value(json!({"client_group":"rr", "client_proxies":["direct"]}))
                 .unwrap();
         assert_eq!(group.group_type, GroupType::RoundRobin);
+    }
+
+    #[test]
+    fn client_proxy_alias_preserves_canonical_serialization() {
+        let group: ClientConfigGroup = serde_json::from_value(json!({
+            "client_group": "rr",
+            "client_proxy": ["direct"]
+        }))
+        .unwrap();
+        assert_eq!(group.group_type, GroupType::RoundRobin);
+        assert!(group.default.is_none());
+        assert_eq!(
+            serde_json::to_value(group).unwrap(),
+            json!({
+                "client_group": "rr",
+                "type": "round-robin",
+                "client_proxies": ["direct"]
+            })
+        );
     }
 
     #[test]

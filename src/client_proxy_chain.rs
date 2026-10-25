@@ -199,17 +199,18 @@ impl ClientProxyChain {
                     }
                 };
                 let choices = choices.as_ref().filter(|_| self.selector_hops[hop]);
+                let allowed = |index: &usize| {
+                    choices.is_none_or(|choices| {
+                        self.origin(hop, candidate(*index))
+                            .is_none_or(|origin| origin.allowed(choices))
+                    })
+                };
                 if let Some(selection) = &self.selection
                     && !selection.automatic.0.is_empty()
-                    && let Some(choices) = choices
+                    && choices.is_some()
                 {
-                    let mut candidates: Vec<_> = (0..length)
-                        .map(candidate)
-                        .filter(|&index| {
-                            self.origin(hop, index)
-                                .is_none_or(|origin| origin.allowed(choices))
-                        })
-                        .collect();
+                    let mut candidates: Vec<_> =
+                        (0..length).filter(allowed).map(candidate).collect();
                     selection
                         .automatic
                         .filter(&self.origins[hop], &mut candidates, final_udp);
@@ -223,12 +224,6 @@ impl ClientProxyChain {
                         counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
                     return Ok(candidates[ordinal]);
                 }
-                let allowed = |index: &usize| {
-                    choices.is_none_or(|choices| {
-                        self.origin(hop, candidate(*index))
-                            .is_none_or(|origin| origin.allowed(choices))
-                    })
-                };
                 let count = if choices.is_some() {
                     (0..length).filter(allowed).count()
                 } else {
@@ -269,6 +264,22 @@ impl ClientProxyChain {
                 }
             }
         }
+    }
+
+    async fn with_route_activity<T>(
+        &self,
+        indices: &[usize],
+        connect: impl Future<Output = std::io::Result<T>>,
+    ) -> std::io::Result<T> {
+        self.touch_automatic(indices, false);
+        self.initial_hop[indices[0]].socket().record_demand();
+        let result = connect.await;
+        if let Err(error) = &result
+            && crate::control::url_test::remote_failure(error)
+        {
+            self.touch_automatic(indices, true);
+        }
+        result
     }
 
     pub(crate) fn record_carrier_demand(&self) {
@@ -413,17 +424,11 @@ impl ClientProxyChain {
         if let Some(path) = path {
             *path = self.route_names(&indices);
         }
-        self.touch_automatic(&indices, false);
-        self.initial_hop[indices[0]].socket().record_demand();
-        let result = self
-            .connect_tcp_selected(remote_location, resolver, &indices)
-            .await;
-        if let Err(error) = &result
-            && crate::control::url_test::remote_failure(error)
-        {
-            self.touch_automatic(&indices, true);
-        }
-        result
+        self.with_route_activity(
+            &indices,
+            self.connect_tcp_selected(remote_location, resolver, &indices),
+        )
+        .await
     }
 
     async fn connect_tcp_selected(
@@ -565,15 +570,11 @@ impl ClientProxyChain {
         if let Some(path) = path {
             *path = self.route_names(&indices);
         }
-        self.touch_automatic(&indices, false);
-        self.initial_hop[indices[0]].socket().record_demand();
-        let result = self.connect_udp_selected(resolver, target, &indices).await;
-        if let Err(error) = &result
-            && crate::control::url_test::remote_failure(error)
-        {
-            self.touch_automatic(&indices, true);
-        }
-        result
+        self.with_route_activity(
+            &indices,
+            self.connect_udp_selected(resolver, target, &indices),
+        )
+        .await
     }
 
     async fn connect_udp_selected(
@@ -860,10 +861,19 @@ mod carrier_tests {
     #[test]
     fn url_test_deep_udp_selection_survives_dashboard_reads() {
         use serde_json::json;
-        let mut configs: Vec<_> = (0..128).map(|index| json!({
-            "client_group": format!("deep-{index}"),
-            "client_proxies": [if index == 127 { "direct".into() } else { format!("deep-{}", index + 1) }]
-        })).collect();
+        let mut configs: Vec<_> = (0..128)
+            .map(|index| {
+                let member = if index == 127 {
+                    "direct".into()
+                } else {
+                    format!("deep-{}", index + 1)
+                };
+                json!({
+                    "client_group": format!("deep-{index}"),
+                    "client_proxies": [member]
+                })
+            })
+            .collect();
         configs.push(json!({
             "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
             "client_proxies":["deep-0", {"name":"other", "protocol":{"type":"direct"}}]
