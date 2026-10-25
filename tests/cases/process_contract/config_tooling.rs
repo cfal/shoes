@@ -75,7 +75,7 @@ fn check_dry_run_validates_all_files_without_forwarding_or_state_writes() {
     std::fs::write(
         &groups,
         format!(
-            "- cache_file_path: '{}'\n- client_group: outbound\n  strategy: selector\n  default: upstream\n  client_proxies:\n    - name: upstream\n      address: '{}'\n      protocol: {{type: socks}}\n",
+            "- cache_file_path: '{}'\n- client_group: outbound\n  type: selector\n  default: upstream\n  client_proxies:\n    - name: upstream\n      address: '{}'\n      protocol: {{type: socks}}\n",
             cache.display(), upstream.local_addr().unwrap()
         ),
     )
