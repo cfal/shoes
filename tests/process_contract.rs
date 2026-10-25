@@ -601,6 +601,7 @@ fn available_address() -> SocketAddr {
         .unwrap()
 }
 
+#[cfg(unix)]
 fn reserve_address() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
     let address = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
@@ -1037,8 +1038,8 @@ async fn unsupported_quic_allowlists_fail_validation_and_start() {
 async fn initial_partial_bind_failure_exits_and_releases_addresses() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
-    let first = available_address();
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let first = available_address();
     for config in [
         format!(
             "- address: ['{first}', '{}']\n  protocol: {{type: http}}\n",
@@ -1479,8 +1480,8 @@ async fn shutdown_interrupts_dns_preparation_without_retiring_listeners() {
 async fn replacement_bind_failure_is_fatal_and_cleans_partial_generation() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
-    let address = available_address();
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = available_address();
     let config = format!("- address: '{address}'\n  protocol: {{type: http}}\n");
     std::fs::write(&path, &config).unwrap();
     let mut child = Process::start(&path, &["--no-reload"]);

@@ -122,9 +122,9 @@ async fn rotation_roundtrip(named: bool, no_reload: bool) {
         let second = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
         std::fs::write(&cert_path, first.cert.pem()).unwrap();
         std::fs::write(&key_path, first.signing_key.serialize_pem()).unwrap();
+        let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0).await.unwrap();
         let tcp = available_address();
         let quic = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0).await.unwrap();
         let mut config = json!([
             {"certificate_source":"shared", "type":"files", "cert":cert_path, "key":key_path},
             {"address":tcp.to_string(), "protocol":{"type":"tls", "tls_targets":{"proxy.test":{
