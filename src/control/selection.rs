@@ -21,6 +21,7 @@ pub struct SelectionView {
     definitions: SelectorDefinitions,
     choices: RwLock<Arc<Choices>>,
     pub automatic: super::url_test::AutomaticGroups,
+    pub(crate) health: super::health::HealthState,
 }
 
 impl SelectionView {
@@ -62,6 +63,7 @@ impl SelectionOwner {
             choices: RwLock::new(Arc::new(effective(&definitions, &self.explicit))),
             definitions,
             automatic: Default::default(),
+            health: Default::default(),
         }))
     }
 

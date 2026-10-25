@@ -288,6 +288,80 @@ A configuration file is a YAML array containing one or more configuration entrie
   path: /path/to/cert.pem
 ```
 
+## Ordered Healthy Fallback
+
+The CLI supports opt-in ordered fallback without a Clash API listener:
+
+```yaml
+- client_group: outbound
+  type: fallback
+  health_check:
+    url: "https://probe.example.com/generate_204"
+    interval_secs: 30
+    timeout_ms: 5000
+    expected_status: 204
+  client_proxies:
+    - name: primary
+      address: "primary.example.com:1080"
+      protocol: {type: socks}
+    - name: backup
+      address: "backup.example.com:1080"
+      protocol: {type: socks}
+```
+
+Rules use `client_chain: outbound`. `health_check` is required only for fallback
+and rejected on other group types. The removed `strategy` field is not accepted.
+The URL must be HTTP(S), at most 2048 bytes,
+without credentials or fragments. `interval_secs` is required, 1..86400;
+`timeout_ms` defaults to 5000, 1..32767; `expected_status` defaults to 204,
+100..599. Unknown fields, empty groups, duplicate immediate members and
+selector-only `default` are rejected. Anonymous inline members are supported.
+
+For each new flow, explicit nested selector choices and final-hop UDP capability
+are applied first. Fallback chooses the first member with a healthy eligible
+concrete path. If none is healthy, never-sampled paths may be tried in order.
+Failed and stale paths are excluded; all-down returns an error, never implicit
+DIRECT. A sample becomes stale after three intervals plus the probe timeout.
+Probes skip paths excluded by manual selector choices, rechecking those choices
+after admission. Manual choices are never rewritten or persisted by health
+checking. Changing a manual choice conservatively invalidates samples until
+checked again. A fallback containing a selector may choose its next member, but
+never another branch inside
+that selector. When composed with URL-test groups, failed/stale fallback paths
+are excluded before URL-test selection among eligible members. Round-robin pools
+outside fallback retain their existing behavior.
+
+Checks send HEAD through the complete configured TCP chain, require the expected
+status, verify HTTPS certificates, and do not follow redirects. They share the
+controller and URL-test probe engine and its 16 concurrent permits. The total deadline includes
+admission, DNS, connect, TLS and response headers. Admission exhaustion or local
+resource shortages do not mark a path failed. Successful and failed checks both
+wait the configured interval, jittered by +/-10%, before retrying. Unused groups
+do not start transports; checks start when a runtime chain is instantiated.
+
+Health is generation-local and keyed by canonical full-path configuration, resolver
+identity, selector constraints and probe settings, not names or member positions.
+Equivalent checks share one sample; different prefixes/endpoints do not. Each
+chain is limited to 256 concrete paths and each generation to 1024 active checks. Large pool products are
+rejected instead of spawning unbounded probes. Saturation can make samples stale;
+choose intervals/timeouts that fit the shared budget. Reload cancels and joins old
+checks before starting the new generation. Samples are not persisted.
+
+Checks use the existing probe destination restrictions (including loopback,
+link-local and synthetic Fake-IP protection). Forbidden literal URLs, including
+configured or retained Fake-IP ranges, are rejected during validation.
+Proxy-side DNS remains subject to
+the remote proxy's policy. A TCP sample does not prove UDP reachability, nor does
+one probe endpoint measure all destinations. Application errors never update
+health, and application bytes are never replayed. Existing TCP streams, UDP
+associations and pooled transports keep their selected member until reopened.
+There is no latency scoring, passive cooldown, hysteresis, affinity, or all-down
+last-resort mode. FFI rejects fallback because it does not own this scheduler.
+
+Controller delay history remains separate from fallback samples. `Fallback`
+catalog entries expose members and capabilities; there is no single global `now`
+member because selection depends on the concrete chain and transport.
+
 ## Clash Controller
 
 The CLI can expose a documented subset of the Clash API. The controller is
@@ -342,8 +416,8 @@ Opt into manual selection explicitly:
 
 Rules continue to use `client_chain: outbound`. A selector chooses an immediate
 named member or referenced group; inline selector members require `name`.
-The group discriminant is `type`: `round-robin` (the default), `selector`, or
-`url-test`. The removed `strategy` field and unknown types are errors. Nested round-robin weights,
+The group discriminant is `type`: `round-robin` (the default), `selector`,
+`url-test`, or `fallback`. The removed `strategy` field and unknown types are errors. Nested round-robin weights,
 duplicate membership, and existing UDP filtering are preserved. A selected
 branch without UDP support fails new UDP flows instead of silently falling back.
 Selection changes affect new flows only; existing streams, UDP destinations,
@@ -483,7 +557,7 @@ are exempt from header idle expiry and have bounded queues/write deadlines.
 Responses are limited to 32 MiB. An oversized connection snapshot closes its
 WebSocket with code 1009 and reason `response exceeds 32 MiB`; tracking continues
 without truncating the connection list.
-Configuring a controller, `cache_file_path`, or any selector/url-test group enables the
+Configuring a controller, `cache_file_path`, or any selector/url-test/fallback group enables the
 catalog and its 16,384-node limit. Names must be nonempty, unique, at most 256
 bytes, and contain no control characters. `DIRECT`, `REJECT`, and
 `GLOBAL` are reserved. Configuration preparation rejects `/rules` or base

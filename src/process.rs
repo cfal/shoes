@@ -176,7 +176,7 @@ async fn prepare_tracking(
             catalog,
             rules,
             leaf_udp_support,
-            probes: crate::clash_api::probes::ProbeState::new(
+            probes: crate::control::probes::ProbeState::new(
                 dns.get_or_create_default(),
                 dns.forbidden_ranges().to_vec(),
             ),

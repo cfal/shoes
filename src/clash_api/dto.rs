@@ -42,6 +42,7 @@ pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<V
                 GroupType::Selector => "Selector",
                 GroupType::RoundRobin => "LoadBalance",
                 GroupType::UrlTest(_) => "URLTest",
+                GroupType::Fallback { .. } => "Fallback",
             };
             let mut value = json!({
                 "name": name,

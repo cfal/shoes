@@ -34,6 +34,10 @@ use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 
+#[cfg(test)]
+#[path = "client_proxy_chain/health_tests.rs"]
+mod health_tests;
+
 /// Entry in the initial hop (hop 0) pool.
 ///
 /// Each entry pairs socket creation with optional protocol setup,
@@ -91,6 +95,7 @@ pub struct ClientProxyChain {
     origins: Vec<Vec<Option<MemberOrigin>>>,
     selection: Option<Arc<crate::control::selection::SelectionView>>,
     selector_hops: Vec<bool>,
+    health_paths: Vec<HealthPath>,
     /// Initial hop pool: each entry is either Direct or Proxy.
     /// Socket and proxy are paired and selected together.
     initial_hop: Vec<Arc<InitialHopEntry>>,
@@ -113,6 +118,11 @@ pub struct ClientProxyChain {
     /// true = udp_final_hop_indices points to initial_hop
     /// false = udp_final_hop_indices points to last subsequent hop
     udp_uses_initial_hop: bool,
+}
+
+struct HealthPath {
+    indices: Vec<usize>,
+    checks: Vec<Arc<crate::control::health::ProbeJob>>,
 }
 
 impl std::fmt::Debug for ClientProxyChain {
@@ -164,7 +174,7 @@ impl ClientProxyChain {
             .iter()
             .flatten()
             .flatten()
-            .find(|origin| origin.has_selector())
+            .find(|origin| origin.has_selector() || origin.has_fallback())
             .map(|origin| origin.selection.clone());
         self.origins = origins;
         self
@@ -175,6 +185,9 @@ impl ClientProxyChain {
             .selection
             .as_ref()
             .map(|selection| selection.snapshot());
+        if !self.health_paths.is_empty() {
+            return self.select_healthy(udp, choices.as_deref().unwrap());
+        }
         (0..self.num_hops())
             .map(|hop| {
                 let final_udp = udp && hop + 1 == self.num_hops();
@@ -300,6 +313,252 @@ impl ClientProxyChain {
         }
     }
 
+    pub(crate) fn with_health(
+        mut self,
+        hops: &[Vec<crate::config::ClientConfig>],
+        resolver: Arc<dyn Resolver>,
+    ) -> std::io::Result<Self> {
+        use crate::control::health::MAX_PATHS;
+        if !self
+            .origins
+            .iter()
+            .flatten()
+            .flatten()
+            .any(MemberOrigin::has_fallback)
+        {
+            return Ok(self);
+        }
+        let size = hops
+            .iter()
+            .try_fold(1usize, |size, pool| size.checked_mul(pool.len()))
+            .filter(|size| *size <= MAX_PATHS)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "fallback exceeds 256 concrete chain paths",
+                )
+            })?;
+        let selection = self.selection.as_ref().unwrap().clone();
+        let identities: Vec<Vec<serde_json::Value>> = hops
+            .iter()
+            .map(|pool| {
+                pool.iter()
+                    .map(|client| {
+                        let mut nested_paths = Vec::new();
+                        crate::config::client_visit::visit_client(
+                            &mut client.clone(),
+                            &mut |nested| {
+                                nested_paths.push(
+                                    nested.control.as_ref().map(|origin| origin.path.clone()),
+                                );
+                                Ok(())
+                            },
+                        )?;
+                        nested_paths.pop();
+                        let mut value = serde_json::to_value((client, nested_paths))
+                            .map_err(std::io::Error::other)?;
+                        value.sort_all_objects();
+                        Ok(value)
+                    })
+                    .collect()
+            })
+            .collect::<std::io::Result<_>>()?;
+        for ordinal in 0..size {
+            let mut remaining = ordinal;
+            let mut indices = vec![0; hops.len()];
+            for hop in (0..hops.len()).rev() {
+                indices[hop] = remaining % hops[hop].len();
+                remaining /= hops[hop].len();
+            }
+            let configs: Vec<_> = indices
+                .iter()
+                .enumerate()
+                .map(|(hop, index)| &identities[hop][*index])
+                .collect();
+            let fingerprint =
+                *blake3::hash(&serde_json::to_vec(&configs).map_err(std::io::Error::other)?)
+                    .as_bytes();
+            let mut checks = Vec::new();
+            let selectors = indices
+                .iter()
+                .enumerate()
+                .filter_map(|(hop, index)| self.origin(hop, *index))
+                .flat_map(MemberOrigin::selector_path)
+                .collect::<Vec<_>>();
+            for (hop, index) in indices.iter().enumerate() {
+                if let Some(origin) = self.origin(hop, *index) {
+                    for (group, _) in &origin.path {
+                        if let Some(definition) = selection.health.definitions.get(group) {
+                            let job = selection.health.register(
+                                fingerprint,
+                                &definition.check,
+                                resolver.clone(),
+                                selectors.clone(),
+                                || self.pinned(&indices),
+                            )?;
+                            if !checks.iter().any(|existing| Arc::ptr_eq(existing, &job)) {
+                                checks.push(job);
+                            }
+                        }
+                    }
+                }
+            }
+            self.health_paths.push(HealthPath { indices, checks });
+        }
+        Ok(self)
+    }
+
+    fn pinned(&self, indices: &[usize]) -> Self {
+        Self {
+            origins: Vec::new(),
+            selection: None,
+            selector_hops: Vec::new(),
+            health_paths: Vec::new(),
+            initial_hop: vec![self.initial_hop[indices[0]].clone()],
+            initial_hop_next_index: AtomicU32::new(0),
+            subsequent_hops: self
+                .subsequent_hops
+                .iter()
+                .enumerate()
+                .map(|(hop, pool)| vec![pool[indices[hop + 1]].clone()])
+                .collect(),
+            subsequent_next_indices: self
+                .subsequent_hops
+                .iter()
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+            udp_final_hop_indices: Vec::new(),
+            udp_final_hop_next_index: AtomicU32::new(0),
+            udp_uses_initial_hop: self.udp_uses_initial_hop,
+        }
+    }
+
+    fn select_healthy(
+        &self,
+        udp: bool,
+        choices: &crate::control::selection::Choices,
+    ) -> std::io::Result<Vec<usize>> {
+        use crate::control::health::Health;
+        let now = tokio::time::Instant::now();
+        let mut samples = std::collections::HashMap::new();
+        // One health/selection snapshot for the entire flow, including every prefix.
+        let mut candidates: Vec<_> = self
+            .health_paths
+            .iter()
+            .filter_map(|path| {
+                if udp
+                    && !self
+                        .udp_final_hop_indices
+                        .contains(path.indices.last().unwrap())
+                {
+                    return None;
+                }
+                if !path.indices.iter().enumerate().all(|(hop, index)| {
+                    self.origin(hop, *index)
+                        .is_none_or(|origin| origin.allowed(choices))
+                }) {
+                    return None;
+                }
+                let mut healthy = true;
+                for check in &path.checks {
+                    match *samples
+                        .entry(Arc::as_ptr(check))
+                        .or_insert_with(|| check.health(choices, now))
+                    {
+                        Health::Healthy => {}
+                        Health::Unknown => healthy = false,
+                        Health::Failed | Health::Stale => return None,
+                    }
+                }
+                Some((path, healthy))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "fallback has no healthy or unknown eligible path",
+            ));
+        }
+        let selection = self.selection.as_ref().unwrap();
+        let definitions = &selection.health.definitions;
+        let mut result = Vec::with_capacity(self.num_hops());
+        for hop in 0..self.num_hops() {
+            if !selection.automatic.0.is_empty() {
+                let mut indices: Vec<_> = candidates
+                    .iter()
+                    .map(|(path, _)| path.indices[hop])
+                    .collect();
+                indices.sort_unstable();
+                indices.dedup();
+                selection.automatic.filter(
+                    &self.origins[hop],
+                    &mut indices,
+                    udp && hop + 1 == self.num_hops(),
+                );
+                candidates.retain(|(path, _)| indices.contains(&path.indices[hop]));
+            }
+            let mut branches = Vec::new();
+            for origin in self.origins[hop].iter().flatten() {
+                for (depth, (group, _)) in origin.path.iter().enumerate() {
+                    if definitions.contains_key(group) {
+                        let branch = (origin.path[..depth].to_vec(), group.clone());
+                        if !branches.contains(&branch) {
+                            branches.push(branch);
+                        }
+                    }
+                }
+            }
+            for (prefix, group) in branches {
+                let member = |path: &HealthPath| {
+                    self.origin(hop, path.indices[hop]).and_then(|origin| {
+                        if origin.path.starts_with(&prefix) {
+                            origin
+                                .path
+                                .get(prefix.len())
+                                .filter(|(name, _)| name == &group)
+                                .map(|(_, member)| member.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let definition = &definitions[&group];
+                let preferred = [true, false].into_iter().find_map(|healthy| {
+                    definition.members.iter().find(|name| {
+                        candidates.iter().any(|(path, known)| {
+                            *known == healthy && member(path) == Some(name.as_str())
+                        })
+                    })
+                });
+                if let Some(preferred) = preferred {
+                    let known = candidates.iter().any(|(path, healthy)| {
+                        *healthy && member(path) == Some(preferred.as_str())
+                    });
+                    candidates.retain(|(path, healthy)| {
+                        member(path).is_none_or(|name| name == preferred && (!known || *healthy))
+                    });
+                }
+            }
+            let mut indices: Vec<_> = candidates
+                .iter()
+                .map(|(path, _)| path.indices[hop])
+                .collect();
+            indices.sort_unstable();
+            indices.dedup();
+            let counter = if udp && hop + 1 == self.num_hops() {
+                &self.udp_final_hop_next_index
+            } else if hop == 0 {
+                &self.initial_hop_next_index
+            } else {
+                &self.subsequent_next_indices[hop - 1]
+            };
+            let index = indices[counter.fetch_add(1, Ordering::Relaxed) as usize % indices.len()];
+            candidates.retain(|(path, _)| path.indices[hop] == index);
+            result.push(index);
+        }
+        Ok(result)
+    }
+
     fn route_names(&self, indices: &[usize]) -> Vec<String> {
         indices
             .iter()
@@ -361,6 +620,7 @@ impl ClientProxyChain {
             origins: Vec::new(),
             selection: None,
             selector_hops: Vec::new(),
+            health_paths: Vec::new(),
             initial_hop: initial_hop.into_iter().map(Arc::new).collect(),
             initial_hop_next_index: AtomicU32::new(0),
             subsequent_hops: subsequent_hops

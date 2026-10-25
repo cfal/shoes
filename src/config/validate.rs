@@ -37,6 +37,24 @@ pub struct ValidatedConfigs {
     pub wireguard_endpoints: Vec<super::types::wireguard::WireguardDeviceConfig>,
 }
 
+impl ValidatedConfigs {
+    #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi", test))]
+    pub(crate) fn reject_ffi_control(&self) -> std::io::Result<()> {
+        self.control.reject_ffi()?;
+        if self
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.selection.health.definitions.is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fallback groups require the CLI generation lifecycle",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Validates configs and returns startable server configs with expanded DNS groups.
 ///
 /// This function:
@@ -2327,6 +2345,24 @@ fn expand_client_chain(
                 }
             }
         }
+    }
+
+    let mut health = false;
+    let mut paths = Some(1usize);
+    for hop in &expanded_hops {
+        let clients: Vec<_> = match hop {
+            ClientChainHop::Single(selection) => vec![selection],
+            ClientChainHop::Pool(pool) => pool.iter().collect(),
+        };
+        paths = paths.and_then(|paths| paths.checked_mul(clients.len()));
+        health |= clients.iter().any(|client| matches!(client, ConfigSelection::Config(client)
+            if client.control.as_ref().is_some_and(crate::control::catalog::MemberOrigin::has_fallback)));
+    }
+    if health && paths.is_none_or(|paths| paths > crate::control::health::MAX_PATHS) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "fallback exceeds 256 concrete chain paths",
+        ));
     }
 
     *client_chain = if expanded_hops.len() == 1 {

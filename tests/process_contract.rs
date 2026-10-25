@@ -36,6 +36,9 @@ mod clash_api;
 #[cfg(unix)]
 #[path = "cases/process_contract/certificates.rs"]
 mod certificates;
+#[cfg(unix)]
+#[path = "cases/process_contract/health.rs"]
+mod health;
 
 #[cfg(unix)]
 #[tokio::test]

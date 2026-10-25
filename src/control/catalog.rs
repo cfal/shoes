@@ -29,10 +29,18 @@ impl MemberOrigin {
         self.path.iter().any(|(group, _)| self.manages(group))
     }
 
-    pub fn selector_path(&self) -> Vec<(String, String)> {
+    pub(crate) fn has_fallback(&self) -> bool {
         self.path
             .iter()
-            .filter(|(group, _)| self.manages(group))
+            .any(|(group, _)| self.selection.health.definitions.contains_key(group))
+    }
+
+    pub(crate) fn policy_path(&self) -> Vec<(String, String)> {
+        self.path
+            .iter()
+            .filter(|(group, _)| {
+                self.manages(group) || self.selection.health.definitions.contains_key(group)
+            })
             .cloned()
             .collect()
     }
@@ -40,6 +48,14 @@ impl MemberOrigin {
         self.path
             .iter()
             .all(|(group, member)| choices.get(group).is_none_or(|selected| selected == member))
+    }
+
+    pub(crate) fn selector_path(&self) -> Vec<(String, String)> {
+        self.path
+            .iter()
+            .filter(|(group, _)| self.selection.definitions().contains_key(group))
+            .cloned()
+            .collect()
     }
 
     pub fn chains(&self) -> impl Iterator<Item = String> + '_ {
@@ -59,7 +75,7 @@ pub fn chain_selection_key(
                     client
                         .control
                         .as_ref()
-                        .map(MemberOrigin::selector_path)
+                        .map(MemberOrigin::policy_path)
                         .unwrap_or_default(),
                 );
                 Ok(())
@@ -167,6 +183,11 @@ impl Catalog {
             {
                 return Err(invalid("default is only valid for selector groups"));
             }
+            if let Config::ClientConfigGroup(group) = config
+                && let GroupType::Fallback { health_check } = &group.group_type
+            {
+                health_check.validate()?;
+            }
         }
         let enabled = configs.iter().any(|config| match config {
             Config::ClashApi(_) | Config::CacheFile(_) => true,
@@ -250,9 +271,28 @@ impl Catalog {
         }
         let mut definitions = SelectorDefinitions::new();
         let mut automatic = super::url_test::AutomaticGroups::default();
+        let mut fallbacks = std::collections::BTreeMap::new();
         for config in configs.iter() {
             if let Config::ClientConfigGroup(group) = config {
                 let members: Vec<_> = group.client_proxies.iter().map(member_name).collect();
+                if let GroupType::Fallback { health_check } = &group.group_type {
+                    if members.is_empty()
+                        || members
+                            .iter()
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                            != members.len()
+                    {
+                        return Err(invalid("fallback members must be nonempty and distinct"));
+                    }
+                    fallbacks.insert(
+                        group.client_group.clone(),
+                        super::health::FallbackDefinition {
+                            members: members.clone(),
+                            check: health_check.clone(),
+                        },
+                    );
+                }
                 if group.group_type == GroupType::Selector {
                     let has_unnamed_member = group.client_proxies.iter().any(|member| {
                         matches!(member, ConfigSelection::Config(client) if client.name.is_none())
@@ -292,6 +332,7 @@ impl Catalog {
         }
         let mut selection = SelectionOwner::new(None)?.prepare(definitions)?;
         Arc::get_mut(&mut selection).unwrap().automatic = automatic;
+        Arc::get_mut(&mut selection).unwrap().health = super::health::HealthState::new(fallbacks);
         crate::config::client_visit::visit_configs(configs, &mut |client| {
             if let Some(origin) = &mut client.control {
                 origin.selection = selection.clone();

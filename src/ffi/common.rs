@@ -216,7 +216,7 @@ pub async fn start_from_config(
     }
 
     let mut validated = crate::config::compile_configs(configs).await?;
-    validated.control.reject_ffi()?;
+    validated.reject_ffi_control()?;
     if validated
         .catalog
         .as_ref()

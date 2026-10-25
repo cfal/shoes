@@ -1,6 +1,8 @@
 pub mod catalog;
 pub mod flows;
+pub(crate) mod health;
 pub mod logs;
+pub(crate) mod probes;
 pub mod rules;
 pub mod runtime;
 pub mod selection;
