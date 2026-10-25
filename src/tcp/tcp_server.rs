@@ -604,8 +604,15 @@ async fn start_tcp_servers(
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
             let mut services = super::tcp_server_handler_factory::HandlerServices::default();
             let mut listeners = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
+                    if socket_addr.port() != 0 && !seen.insert(socket_addr) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            format!("duplicate TCP listener at {socket_addr}"),
+                        ));
+                    }
                     let listener = sockets.bind(socket_addr)?;
                     let tcp_handler = match handlers.entry(socket_addr.ip()) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -1383,6 +1390,39 @@ mod lifetime_tests {
                 })
                 .await
                 .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_startup_rejects_duplicate_fixed_but_allows_automatic_ports() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        for port in [address.port(), 0] {
+            let address = SocketAddr::new(address.ip(), port);
+            let config =
+                format!("- address: ['{address}', '{address}']\n  protocol: {{type: http}}\n");
+            let configs =
+                crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap())
+                    .unwrap();
+            let result = start_servers(
+                configs.configs.into_iter().next().unwrap(),
+                Arc::new(crate::resolver::NativeResolver::new()),
+            )
+            .await;
+            if port == 0 {
+                let handles = result.unwrap();
+                assert_eq!(handles.len(), 2);
+                for handle in &handles {
+                    handle.abort();
+                }
+                for handle in handles {
+                    assert!(handle.await.unwrap_err().is_cancelled());
+                }
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AddrInUse);
+                std::net::TcpListener::bind(address).expect("duplicate bind leaked a listener");
             }
         }
     }
