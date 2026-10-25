@@ -2961,7 +2961,7 @@ mod tests {
                 ))),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-group".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -2978,13 +2978,13 @@ mod tests {
         // group-b has no dependencies, group-a references group-b
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-a".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-b".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3000,13 +3000,13 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-a".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-b".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-a".to_string())),
@@ -3027,7 +3027,7 @@ mod tests {
         use crate::config::types::ClientConfigGroup;
 
         let configs = vec![Config::ClientConfigGroup(ClientConfigGroup {
-            strategy: Default::default(),
+            group_type: Default::default(),
             default: None,
             client_group: "group-a".to_string(),
             client_proxies: OneOrSome::One(ConfigSelection::GroupName("nonexistent".to_string())),
@@ -3049,25 +3049,25 @@ mod tests {
         // Diamond: a -> b, a -> c, b -> d, c -> d
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-d".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-c".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-b".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "group-a".to_string(),
                 client_proxies: OneOrSome::Some(vec![
@@ -3086,19 +3086,19 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "us-proxies".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "eu-proxies".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "all-proxies".to_string(),
                 client_proxies: OneOrSome::Some(vec![
@@ -3577,7 +3577,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
@@ -3616,7 +3616,7 @@ mod tests {
         // Create a direct chain - should be allowed for UDP (for bind_interface).
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "direct-chain".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3657,7 +3657,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
@@ -3696,7 +3696,7 @@ mod tests {
         // Create a direct chain - should be allowed for H3 (for bind_interface).
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "direct-chain".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3728,7 +3728,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3761,7 +3761,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
@@ -3794,7 +3794,7 @@ mod tests {
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
-                strategy: Default::default(),
+                group_type: Default::default(),
                 default: None,
                 client_group: "test-proxy".to_string(),
                 client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),

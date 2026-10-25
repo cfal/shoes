@@ -67,6 +67,12 @@ impl std::fmt::Debug for InitialHopEntry {
 }
 
 impl InitialHopEntry {
+    fn socket(&self) -> &Arc<dyn SocketConnector> {
+        match self {
+            Self::Direct(socket) | Self::Wireguard(socket) | Self::Proxy { socket, .. } => socket,
+        }
+    }
+
     /// Returns true if this entry supports UDP.
     pub fn supports_udp(&self) -> bool {
         match self {
@@ -142,11 +148,7 @@ impl ClientProxyChain {
             .map(|(i, hop)| hop[indices[i + 1]].clone())
             .collect();
         SelectedRoute {
-            socket: match self.initial_hop[initial_index].as_ref() {
-                InitialHopEntry::Direct(socket)
-                | InitialHopEntry::Wireguard(socket)
-                | InitialHopEntry::Proxy { socket, .. } => socket.clone(),
-            },
+            socket: self.initial_hop[initial_index].socket().clone(),
             initial: Some(self.initial_hop[initial_index].clone()),
             subsequent,
             resolver: resolver.clone(),
@@ -203,6 +205,25 @@ impl ClientProxyChain {
                             .is_none_or(|origin| origin.allowed(choices))
                     })
                 };
+                if let Some(selection) = &self.selection
+                    && !selection.automatic.0.is_empty()
+                    && choices.is_some()
+                {
+                    let mut candidates: Vec<_> =
+                        (0..length).filter(allowed).map(candidate).collect();
+                    selection
+                        .automatic
+                        .filter(&self.origins[hop], &mut candidates, final_udp);
+                    if candidates.is_empty() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "selected branch cannot carry this flow",
+                        ));
+                    }
+                    let ordinal =
+                        counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
+                    return Ok(candidates[ordinal]);
+                }
                 let count = if choices.is_some() {
                     (0..length).filter(allowed).count()
                 } else {
@@ -226,6 +247,57 @@ impl ClientProxyChain {
 
     fn origin(&self, hop: usize, index: usize) -> Option<&MemberOrigin> {
         self.origins.get(hop)?.get(index)?.as_ref()
+    }
+
+    fn touch_automatic(&self, indices: &[usize], failed: bool) {
+        if self
+            .selection
+            .as_ref()
+            .is_none_or(|selection| selection.automatic.0.is_empty())
+        {
+            return;
+        }
+        for (hop, &index) in indices.iter().enumerate() {
+            if let Some(origin) = self.origin(hop, index) {
+                for (group, _) in &origin.path {
+                    origin.selection.automatic.touch(group, failed);
+                }
+            }
+        }
+    }
+
+    async fn with_route_activity<T>(
+        &self,
+        indices: &[usize],
+        connect: impl Future<Output = std::io::Result<T>>,
+    ) -> std::io::Result<T> {
+        self.touch_automatic(indices, false);
+        self.initial_hop[indices[0]].socket().record_demand();
+        let result = connect.await;
+        if let Err(error) = &result
+            && crate::control::url_test::remote_failure(error)
+        {
+            self.touch_automatic(indices, true);
+        }
+        result
+    }
+
+    pub(crate) fn record_carrier_demand(&self) {
+        if crate::control::url_test::is_background() {
+            return;
+        }
+        // Shared carriers can have several pinned associations. Wake their groups
+        // without selecting a new route or attributing a destination failure to them.
+        for origin in self.origins.iter().flatten().flatten() {
+            for (group, _) in &origin.path {
+                origin.selection.automatic.touch(group, false);
+            }
+        }
+        for entry in &self.initial_hop {
+            if let InitialHopEntry::Wireguard(socket) = entry.as_ref() {
+                socket.record_demand();
+            }
+        }
     }
 
     fn route_names(&self, indices: &[usize]) -> Vec<String> {
@@ -352,9 +424,22 @@ impl ClientProxyChain {
         if let Some(path) = path {
             *path = self.route_names(&indices);
         }
+        self.with_route_activity(
+            &indices,
+            self.connect_tcp_selected(remote_location, resolver, &indices),
+        )
+        .await
+    }
+
+    async fn connect_tcp_selected(
+        &self,
+        remote_location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        indices: &[usize],
+    ) -> std::io::Result<TcpClientSetupResult> {
         if self.needs_carrier_dialer() {
             return self
-                .selected_route(resolver, &indices)
+                .selected_route(resolver, indices)
                 .connect(remote_location)
                 .await;
         }
@@ -362,7 +447,7 @@ impl ClientProxyChain {
         let entry = self.initial_hop[indices[0]].as_ref();
 
         // Select proxy connectors for subsequent hops
-        let subsequent_proxies = self.select_subsequent_proxies(&indices);
+        let subsequent_proxies = self.select_subsequent_proxies(indices);
 
         debug!(
             "Chain TCP connect: 1 initial + {} subsequent hop(s) -> {}",
@@ -485,8 +570,21 @@ impl ClientProxyChain {
         if let Some(path) = path {
             *path = self.route_names(&indices);
         }
+        self.with_route_activity(
+            &indices,
+            self.connect_udp_selected(resolver, target, &indices),
+        )
+        .await
+    }
+
+    async fn connect_udp_selected(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+        target: ResolvedLocation,
+        indices: &[usize],
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         if self.needs_carrier_dialer() {
-            let route = self.selected_route(resolver, &indices);
+            let route = self.selected_route(resolver, indices);
             return match route.last_proxy() {
                 Some(proxy) => {
                     proxy
@@ -694,6 +792,130 @@ mod carrier_tests {
     const TRANSPORT_DATA: &[u8] = b"transport";
 
     #[test]
+    fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
+        for route in ["outer", "[inner, inner]"] {
+            let yaml = format!(
+                "
+- client_group: inner
+  type: url-test
+  url: http://inner.invalid/
+  client_proxies:
+    - name: http
+      address: 127.0.0.1:8000
+      protocol: {{type: http}}
+    - name: udp
+      address: 127.0.0.1:8001
+      protocol: {{type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}}
+- client_group: manual
+  type: selector
+  client_proxies: [inner, direct]
+- client_group: outer
+  type: url-test
+  url: http://outer.invalid/
+  client_proxies: [manual, direct]
+- address: 127.0.0.1:1080
+  protocol: {{type: socks}}
+  rules: [{{mask: 0.0.0.0/0, action: allow, client_chain: {route}}}]
+"
+            );
+            let mut validated =
+                crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
+            assert!(validated.control.listeners.is_empty());
+            let catalog = validated.catalog.take().unwrap();
+            let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+                panic!()
+            };
+            let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0)
+            else {
+                panic!()
+            };
+            let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+                panic!()
+            };
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let group =
+                crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver)
+                    .unwrap();
+            let chain = &group.chains[0];
+            let auto = &catalog.selection.automatic;
+            auto.record("http", "http://inner.invalid/", Some(10));
+            auto.record("udp", "http://inner.invalid/", Some(100));
+            auto.record("manual", "http://outer.invalid/", Some(10));
+            auto.record("DIRECT", "http://outer.invalid/", Some(200));
+            if route == "outer" {
+                assert_eq!(chain.select_indices(false).unwrap(), [0]);
+                assert_eq!(chain.select_indices(true).unwrap(), [1]);
+                let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+                owner.activate(catalog.selection.clone()).unwrap();
+                assert!(owner.select("inner", "udp").is_err());
+                owner.select("manual", "DIRECT").unwrap();
+                assert_eq!(chain.select_indices(false).unwrap(), [2]);
+                assert_eq!(chain.select_indices(true).unwrap(), [2]);
+            } else {
+                assert_eq!(chain.select_indices(false).unwrap(), [0, 0]);
+                assert_eq!(chain.select_indices(true).unwrap(), [0, 1]);
+            }
+        }
+    }
+
+    #[test]
+    fn url_test_deep_udp_selection_survives_dashboard_reads() {
+        use serde_json::json;
+        let mut configs: Vec<_> = (0..128)
+            .map(|index| {
+                let member = if index == 127 {
+                    "direct".into()
+                } else {
+                    format!("deep-{}", index + 1)
+                };
+                json!({
+                    "client_group": format!("deep-{index}"),
+                    "client_proxies": [member]
+                })
+            })
+            .collect();
+        configs.push(json!({
+            "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
+            "client_proxies":["deep-0", {"name":"other", "protocol":{"type":"direct"}}]
+        }));
+        configs.push(json!({
+            "address":"127.0.0.1:1080", "protocol":{"type":"socks"},
+            "rules":[{"mask":"0.0.0.0/0", "action":"allow", "client_chain":"auto"}]
+        }));
+        let mut validated =
+            crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
+                .unwrap();
+        let catalog = validated.catalog.take().unwrap();
+        let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+            panic!()
+        };
+        let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
+            panic!()
+        };
+        let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+            panic!()
+        };
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let group = crate::tcp::chain_builder::try_build_client_chain_group(
+            client_chains,
+            resolver.clone(),
+        )
+        .unwrap();
+        let generation = crate::control::runtime::Generation {
+            id: 1,
+            leaf_udp_support: crate::clash_api::dto::leaf_udp_support(&catalog).unwrap(),
+            catalog,
+            rules: Vec::new(),
+            probes: crate::clash_api::probes::ProbeState::new(resolver, Vec::new()),
+        };
+        let chain = &group.chains[0];
+        assert_eq!(chain.select_indices(true).unwrap(), [0]);
+        let nodes = crate::clash_api::dto::proxies(&generation);
+        assert_eq!(chain.select_indices(true).unwrap(), [0]);
+        assert_eq!(nodes["proxies"]["auto"]["udpNow"], "deep-0");
+    }
+
+    #[test]
     fn unselected_large_pools_keep_constant_time_round_robin() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let chain = ClientProxyChain::new(
@@ -723,7 +945,7 @@ mod carrier_tests {
 - client_group: weighted
   client_proxies: [leaves, leaves, direct]
 - client_group: choose
-  strategy: selector
+  type: selector
   client_proxies: [weighted, direct]
 - address: 127.0.0.1:1080
   protocol: {type: socks}
@@ -763,7 +985,7 @@ mod carrier_tests {
     fn udp_selection_rejects_ineligible_member_without_falling_back() {
         let yaml = "
 - client_group: leaves
-  strategy: selector
+  type: selector
   default: http
   client_proxies:
     - name: http
@@ -1226,6 +1448,7 @@ impl ClientChainGroup {
         let index = self.next_udp_index.fetch_add(1, Ordering::Relaxed) as usize;
         let chain = &self.chains[index % self.chains.len()];
         let indices = chain.select_indices(true)?;
+        chain.touch_automatic(&indices, false);
         let InitialHopEntry::Direct(socket) = chain.initial_hop[indices[0]].as_ref() else {
             unreachable!("direct-only chain checked above")
         };

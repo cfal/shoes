@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Breaking: client groups now use `type` instead of `strategy`, with no legacy alias. Replace `strategy: selector` with `type: selector` and `strategy: round-robin` with `type: round-robin`; configurations containing `strategy` are rejected.
+- Added `type: url-test` client groups with automatic URL-scoped health/delay selection, tolerance, lazy checks, and supervised probes without a controller listener. See [upstream group configuration](CONFIG.md#clash-controller) and the [URL-test example](examples/url_test.yaml).
 - Breaking: file-backed inbound TLS/QUIC identities, including legacy `cert`/`key` paths and file-backed named PEMs, now rotate live and require currently valid, leaf-to-issuer certificate chains. Expired or misordered bundles can fail startup after upgrade, and expired sources stop serving new handshakes even to clients using fingerprint pinning or disabled verification. Renew certificates, remove expired cross-signs and certificates outside that chain, and synchronize the system clock before starting Shoes. Child-to-issuer signatures must use TLS-provider-supported algorithms (no SHA-1; RSA issuer keys of at least 2048 bits); reissue certificates with unsupported signatures. Inline-only pairs retain their previous behavior. See [certificate sources](CONFIG.md#certificate-sources).
 
 ## v0.3.4

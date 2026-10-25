@@ -12,6 +12,17 @@ struct RealResolver {
     forbidden: Arc<[IpNetwork]>,
 }
 
+#[derive(Debug)]
+pub(crate) struct SyntheticDnsAnswer;
+
+impl std::fmt::Display for SyntheticDnsAnswer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("real DNS returned a synthetic address (possible DNS loop)")
+    }
+}
+
+impl std::error::Error for SyntheticDnsAnswer {}
+
 pub(crate) fn real_only(
     inner: Arc<dyn Resolver>,
     forbidden: Arc<[IpNetwork]>,
@@ -36,7 +47,7 @@ impl Resolver for RealResolver {
             }) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "real DNS returned a synthetic address (possible DNS loop)",
+                    SyntheticDnsAnswer,
                 ));
             }
             Ok(addresses)
@@ -69,7 +80,7 @@ impl RealResolver {
             }) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "real DNS returned a synthetic address (possible DNS loop)",
+                    SyntheticDnsAnswer,
                 ));
             }
             Ok(bytes)

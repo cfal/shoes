@@ -6,6 +6,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use super::catalog::Catalog;
 use super::flows::FlowRegistry;
@@ -30,6 +31,7 @@ pub struct ControlRuntime {
     pub probes: Arc<tokio::sync::Semaphore>,
     pub logs: Arc<super::logs::LogHub>,
     active: RwLock<Option<Arc<Generation>>>,
+    probe_epoch: RwLock<CancellationToken>,
     next_generation: AtomicU64,
     commands: mpsc::Sender<Command>,
     selections: Arc<tokio::sync::Semaphore>,
@@ -86,6 +88,7 @@ impl ControlService {
             probes: Arc::new(tokio::sync::Semaphore::new(16)),
             logs: Arc::new(super::logs::LogHub::new()),
             active: RwLock::new(None),
+            probe_epoch: RwLock::new(CancellationToken::new()),
             next_generation: AtomicU64::new(1),
             commands,
             selections: Arc::new(tokio::sync::Semaphore::new(64)),
@@ -108,6 +111,34 @@ impl ControlService {
 }
 
 impl ControlRuntime {
+    pub(crate) fn probe_epoch(&self) -> CancellationToken {
+        self.probe_epoch.read().clone()
+    }
+
+    fn cancel_probes(&self) {
+        let mut epoch = self.probe_epoch.write();
+        epoch.cancel();
+        *epoch = CancellationToken::new();
+    }
+
+    pub(crate) fn with_probe_generation<T>(
+        &self,
+        generation: u64,
+        apply: impl FnOnce() -> T,
+    ) -> io::Result<T> {
+        let active = self.active.read();
+        if self.shutdown.is_cancelled()
+            || self.activating.load(Ordering::Acquire)
+            || active.as_ref().is_none_or(|active| active.id != generation)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "probe generation is no longer active",
+            ));
+        }
+        Ok(apply())
+    }
+
     async fn request(&self, make: impl FnOnce(Reply) -> Command) -> io::Result<()> {
         let (reply, received) = oneshot::channel();
         tokio::select! {
@@ -162,10 +193,14 @@ impl ControlRuntime {
                 "controller listeners, credentials, origins, and cache_file_path require a restart",
             ));
         }
-        if let Some(catalog) = &validated.catalog {
-            self.request(|reply| Command::Prepare(catalog.selection.clone(), reply))
-                .await?;
-        }
+        // Removing the last managed group still needs an empty publication to
+        // retire the previous generation's automatic checks.
+        let catalog = validated.catalog.get_or_insert_with(|| Catalog {
+            nodes: Default::default(),
+            selection: Default::default(),
+        });
+        self.request(|reply| Command::Prepare(catalog.selection.clone(), reply))
+            .await?;
         let id = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let rules = super::rules::attach(
             validated,
@@ -173,6 +208,13 @@ impl ControlRuntime {
             (!self.config.listeners.is_empty()).then(|| self.flows.clone()),
         )?;
         Ok((id, rules))
+    }
+}
+
+async fn stop_automatic(task: Option<AbortOnDropHandle<()>>) {
+    if let Some(task) = task {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -184,6 +226,7 @@ async fn run_owner(
 ) {
     let mut paused = false;
     let mut pending: VecDeque<SelectionCommand> = VecDeque::new();
+    let mut automatic: Option<AbortOnDropHandle<()>> = None;
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -199,6 +242,13 @@ async fn run_owner(
             let command = tokio::select! {
                 _ = shutdown.cancelled() => break,
                 command = receiver.recv() => command,
+                result = async { automatic.as_mut().unwrap().await }, if automatic.is_some() => {
+                    automatic = None;
+                    if let Err(error) = result {
+                        log::error!("Automatic group probe supervisor stopped: {error}");
+                    }
+                    continue;
+                }
             };
             let Some(command) = command else {
                 break;
@@ -214,8 +264,11 @@ async fn run_owner(
                 if result.is_ok() {
                     paused = true;
                     if let Some(runtime) = runtime.upgrade() {
+                        let _active = runtime.active.write();
                         runtime.activating.store(true, Ordering::Release);
+                        runtime.cancel_probes();
                     }
+                    stop_automatic(automatic.take()).await;
                 }
                 let _ = reply.send(result);
             }
@@ -224,14 +277,28 @@ async fn run_owner(
                 if result.is_ok()
                     && let Some(runtime) = runtime.upgrade()
                 {
-                    *runtime.active.write() = Some(generation);
+                    let mut active = runtime.active.write();
+                    runtime.cancel_probes();
+                    *active = Some(generation);
                 }
                 let _ = reply.send(result);
             }
             Command::Resume(reply) => {
                 paused = false;
+                stop_automatic(automatic.take()).await;
                 if let Some(runtime) = runtime.upgrade() {
                     runtime.activating.store(false, Ordering::Release);
+                    if let Ok(generation) = runtime.generation()
+                        && !generation.catalog.selection.automatic.0.is_empty()
+                    {
+                        automatic = Some(AbortOnDropHandle::new(tokio::spawn(
+                            crate::clash_api::probes::run_automatic(
+                                Arc::downgrade(&runtime),
+                                generation,
+                                runtime.probe_epoch(),
+                            ),
+                        )));
+                    }
                 }
                 let _ = reply.send(Ok(()));
             }
@@ -270,6 +337,7 @@ async fn run_owner(
             }
         }
     }
+    stop_automatic(automatic).await;
 }
 
 #[cfg(test)]
@@ -309,7 +377,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let cache = directory.path().join("cache.db");
             let mut configs = serde_json::json!([
-                {"client_group":"outbound", "strategy":if mode == "selector" { "selector" } else { "round-robin" }, "client_proxies":[
+                {"client_group":"outbound", "type":if mode == "selector" { "selector" } else { "round-robin" }, "client_proxies":[
                     {"name":"proxy", "address":"proxy.invalid:8080", "protocol":{"type":"http"}}
                 ]},
                 {"name":"entry", "address":"127.0.0.1:0", "protocol":{"type":"socks"}, "rules":[

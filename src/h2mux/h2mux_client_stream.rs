@@ -107,9 +107,10 @@ impl H2MuxClientStream {
                 }
                 Poll::Ready(Err(e)) => {
                     self.recv_pending = None;
-                    Poll::Ready(Err(io::Error::other(format!(
-                        "CONNECT response error: {e}"
-                    ))))
+                    Poll::Ready(Err(self
+                        .session
+                        .errors
+                        .map_with("CONNECT response error", e)))
                 }
                 Poll::Pending => Poll::Pending,
             }
@@ -213,7 +214,7 @@ impl H2MuxClientStream {
                 Poll::Ready(Ok(Some(data)))
             }
             Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Err(io::Error::other(format!("H2 recv error: {e}"))))
+                Poll::Ready(Err(self.session.errors.map_with("H2 recv error", e)))
             }
             Poll::Ready(None) => Poll::Ready(Ok(None)),
             Poll::Pending => Poll::Pending,
@@ -263,12 +264,13 @@ impl H2MuxClientStream {
                 let to_send = buf.len().min(capacity);
                 self.send
                     .send_data(Bytes::copy_from_slice(&buf[..to_send]), false)
-                    .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;
+                    .map_err(|e| self.session.errors.map_with("H2 send_data failed", e))?;
                 Poll::Ready(Ok(to_send))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(format!(
-                "H2 poll_capacity error: {e}"
-            )))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(self
+                .session
+                .errors
+                .map_with("H2 poll_capacity error", e))),
             Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "H2 stream closed",
@@ -380,7 +382,7 @@ impl AsyncWrite for H2MuxClientStream {
                     let to_send = remaining.len().min(capacity);
                     self.send
                         .send_data(pending_data.slice(sent..sent + to_send), false)
-                        .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;
+                        .map_err(|e| self.session.errors.map_with("H2 send_data failed", e))?;
 
                     let new_sent = sent + to_send;
                     if new_sent < pending_data.len() {
@@ -392,9 +394,10 @@ impl AsyncWrite for H2MuxClientStream {
                     return Poll::Ready(Ok(user_len));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::other(format!(
-                        "H2 poll_capacity error: {e}"
-                    ))));
+                    return Poll::Ready(Err(self
+                        .session
+                        .errors
+                        .map_with("H2 poll_capacity error", e)));
                 }
                 Poll::Ready(None) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -427,7 +430,7 @@ impl AsyncWrite for H2MuxClientStream {
                     let to_send = combined.len().min(capacity);
                     self.send
                         .send_data(combined.slice(..to_send), false)
-                        .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;
+                        .map_err(|e| self.session.errors.map_with("H2 send_data failed", e))?;
 
                     if to_send < combined.len() {
                         // Partial write - track remaining data
@@ -439,9 +442,10 @@ impl AsyncWrite for H2MuxClientStream {
                         Poll::Ready(Ok(buf.len()))
                     }
                 }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(format!(
-                    "H2 poll_capacity error: {e}"
-                )))),
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Err(self
+                    .session
+                    .errors
+                    .map_with("H2 poll_capacity error", e))),
                 Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "H2 stream closed",
@@ -466,9 +470,10 @@ impl AsyncWrite for H2MuxClientStream {
             match self.send.send_data(Bytes::new(), true) {
                 Ok(()) => self.shutdown_sent = true,
                 Err(e) => {
-                    return Poll::Ready(Err(io::Error::other(format!(
-                        "H2 send END_STREAM failed: {e}"
-                    ))));
+                    return Poll::Ready(Err(self
+                        .session
+                        .errors
+                        .map_with("H2 send END_STREAM failed", e)));
                 }
             }
         }

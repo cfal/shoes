@@ -16,6 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use super::stream::{Body, Memory, Reader, Tasks, Upload, UploadSignal, UploadWatch, Writer, pipe};
+use crate::http2::transport::TransportErrors;
 use crate::{
     async_stream::AsyncStream, config::xhttp::XhttpVersion, tcp::carrier_dialer::QuicCarrier,
 };
@@ -80,7 +81,10 @@ impl Timeouts {
 
 enum Sender {
     H1(tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<Body>>),
-    H2(h2::client::SendRequest<Bytes>),
+    H2 {
+        sender: h2::client::SendRequest<Bytes>,
+        errors: TransportErrors,
+    },
     H3 {
         sender: H3Sender,
         opener: super::h3::Opener,
@@ -131,13 +135,15 @@ impl Carrier {
             });
             Sender::H1(tokio::sync::Mutex::new(sender))
         } else {
+            let errors = TransportErrors::default();
             let (sender, mut connection) = h2::client::Builder::new()
                 .initial_window_size(stream_window)
                 .initial_connection_window_size(connection_window)
                 .max_header_list_size(header_limit as u32)
-                .handshake(stream)
+                .handshake(errors.wrap(stream))
                 .await
-                .map_err(io::Error::other)?;
+                .map_err(|error| errors.map(error))?;
+            errors.start_driver();
             let mut ping = connection.ping_pong().unwrap();
             tasks.spawn(async move {
                 if let Err(error) = connection.await {
@@ -147,8 +153,8 @@ impl Carrier {
             // The handshake alone does not read peer SETTINGS. PONG follows their application.
             ping.ping(h2::Ping::opaque())
                 .await
-                .map_err(io::Error::other)?;
-            Sender::H2(sender)
+                .map_err(|error| errors.map(error))?;
+            Sender::H2 { sender, errors }
         };
         Ok(Arc::new(Self {
             sender,
@@ -191,7 +197,7 @@ impl Carrier {
         }
         match &self.sender {
             Sender::H1(sender) => sender.try_lock().is_ok_and(|s| s.is_closed()),
-            Sender::H2(sender) => matches!(
+            Sender::H2 { sender, .. } => matches!(
                 sender
                     .clone()
                     .poll_ready(&mut std::task::Context::from_waker(std::task::Waker::noop())),
@@ -214,7 +220,7 @@ impl Carrier {
     pub fn capacity(&self, limit: usize) -> usize {
         match &self.sender {
             Sender::H1(_) => 1,
-            Sender::H2(sender) => limit.min(sender.current_max_send_streams()),
+            Sender::H2 { sender, .. } => limit.min(sender.current_max_send_streams()),
             Sender::H3 { .. } => limit,
         }
     }
@@ -347,27 +353,28 @@ impl Carrier {
                 });
                 Response::from_parts(parts, reader)
             }
-            Sender::H2(sender) => {
+            Sender::H2 { sender, errors } => {
                 let (parts, body) = request.into_parts();
                 let empty = hyper::body::Body::is_end_stream(&body);
                 let streaming = matches!(&body, Body::Stream { .. });
                 let mut sender = tokio::time::timeout(timeouts.headers, sender.clone().ready())
                     .await?
-                    .map_err(io::Error::other)?;
+                    .map_err(|error| errors.map(error))?;
                 let (response, mut send) = sender
                     .send_request(Request::from_parts(parts, ()), empty)
-                    .map_err(io::Error::other)?;
+                    .map_err(|error| errors.map(error))?;
                 let request_cancel = tasks.cancel.child_token();
                 let guard = request_cancel.clone().drop_guard();
                 if !empty {
                     let carrier = self.clone();
                     let cancel = tasks.cancel.clone();
+                    let errors = errors.clone();
                     tasks.spawn(async move {
                         let _carrier = carrier;
                         let result = tokio::select! {
                             biased;
                             _ = request_cancel.cancelled() => Err(H2SendError::Local(io::ErrorKind::ConnectionAborted.into())),
-                            result = send_h2_tracked(body, &mut send, upload) => result,
+                            result = send_h2_tracked(body, &mut send, upload, &errors) => result,
                         };
                         if let Err(error) = result {
                             // RFC 9113 section 8.1 allows an early response followed by NO_ERROR.
@@ -386,7 +393,7 @@ impl Carrier {
                 }
                 let response = timeouts
                     .response(
-                        async { response.await.map_err(io::Error::other) },
+                        async { response.await.map_err(|error| errors.map(error)) },
                         watch,
                         &tasks.cancel,
                     )
@@ -400,9 +407,10 @@ impl Carrier {
                 guard.disarm();
                 let (parts, incoming) = response.into_parts();
                 let carrier = self.clone();
+                let errors = errors.clone();
                 tasks.spawn(async move {
                     let _carrier = carrier;
-                    receive_h2(incoming, writer).await;
+                    receive_h2_with_errors(incoming, writer, &errors).await;
                 });
                 Response::from_parts(parts, reader)
             }
@@ -539,14 +547,22 @@ pub async fn receive_hyper(
     }
 }
 
-pub async fn receive_h2(mut body: h2::RecvStream, mut writer: Writer) {
+pub async fn receive_h2(body: h2::RecvStream, writer: Writer) {
+    receive_h2_with_errors(body, writer, &TransportErrors::default()).await;
+}
+
+async fn receive_h2_with_errors(
+    mut body: h2::RecvStream,
+    mut writer: Writer,
+    errors: &TransportErrors,
+) {
     let result: io::Result<()> = async {
         while let Some(data) = body.data().await {
-            let data = data.map_err(io::Error::other)?;
+            let data = data.map_err(|error| errors.map(error))?;
             writer.write_all(&data).await?;
             body.flow_control()
                 .release_capacity(data.len())
-                .map_err(io::Error::other)?;
+                .map_err(|error| errors.map(error))?;
         }
         writer.shutdown().await
     }
@@ -558,7 +574,7 @@ pub async fn receive_h2(mut body: h2::RecvStream, mut writer: Writer) {
 }
 
 pub async fn send_h2(body: Body, mut send: h2::SendStream<Bytes>) -> io::Result<()> {
-    send_h2_tracked(body, &mut send, None)
+    send_h2_tracked(body, &mut send, None, &TransportErrors::default())
         .await
         .map_err(H2SendError::into_io)
 }
@@ -587,16 +603,11 @@ impl H2SendError {
     }
 }
 
-impl From<h2::Error> for H2SendError {
-    fn from(error: h2::Error) -> Self {
-        Self::Stream(io::Error::other(error))
-    }
-}
-
 async fn send_h2_tracked(
     mut body: Body,
     send: &mut h2::SendStream<Bytes>,
     mut upload: Option<Upload>,
+    errors: &TransportErrors,
 ) -> Result<(), H2SendError> {
     'frames: loop {
         let frame = tokio::select! {
@@ -604,7 +615,8 @@ async fn send_h2_tracked(
             reset = futures::future::poll_fn(|cx| send.poll_reset(cx)) => return Err(H2SendError::Stream(io::Error::other(format!("XHTTP H2 stream reset: {reset:?}")))),
         };
         let Some(frame) = frame else {
-            send.send_data(Bytes::new(), true)?;
+            send.send_data(Bytes::new(), true)
+                .map_err(|error| H2SendError::Stream(errors.map(error)))?;
             break;
         };
         let Ok(mut data) = frame.map_err(H2SendError::Local)?.into_data() else {
@@ -614,14 +626,16 @@ async fn send_h2_tracked(
             send.reserve_capacity(data.len());
             let capacity = futures::future::poll_fn(|cx| send.poll_capacity(cx))
                 .await
-                .ok_or_else(|| H2SendError::Stream(io::ErrorKind::BrokenPipe.into()))??;
+                .ok_or_else(|| H2SendError::Stream(io::ErrorKind::BrokenPipe.into()))?
+                .map_err(|error| H2SendError::Stream(errors.map(error)))?;
             let len = capacity.min(data.len());
             if len == 0 {
                 continue;
             }
             // Known-length peers may respond and reset immediately after the final bytes.
             let end = len == data.len() && hyper::body::Body::is_end_stream(&body);
-            send.send_data(data.split_to(len), end)?;
+            send.send_data(data.split_to(len), end)
+                .map_err(|error| H2SendError::Stream(errors.map(error)))?;
             if let Some(upload) = &upload {
                 upload.activity.touch();
             }
@@ -641,6 +655,50 @@ mod tests {
     use super::*;
     use crate::resources::Budget;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn h2_readiness_and_established_receive_preserve_transport_causes() {
+        use crate::http2::transport::tests::{cases, peer};
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for ready in [false, true] {
+                for (make_error, local) in cases() {
+                    let (client, fault, mut sends, driver) = peer(make_error);
+                    if !ready {
+                        fault.inject();
+                    }
+                    let result = Carrier::tcp(Box::new(client), XhttpVersion::H2, 8192).await;
+                    let error = if ready {
+                        let carrier = result.unwrap();
+                        let tasks = Tasks::new();
+                        let memory = Memory::new(Arc::new(Budget::new(Some(16384))), Some(16384));
+                        let request = Request::get("http://example.com/")
+                            .body(Body::Empty)
+                            .unwrap();
+                        let mut response = carrier
+                            .request(request, memory, &tasks, Duration::from_secs(1))
+                            .await
+                            .unwrap()
+                            .into_body();
+                        let _send = sends.recv().await.unwrap();
+                        assert_eq!(response.read_u8().await.unwrap(), b'x');
+                        fault.inject();
+                        response.read_u8().await.unwrap_err()
+                    } else {
+                        result.err().expect("readiness PING must fail")
+                    };
+                    assert_eq!(
+                        crate::clash_api::probes::local_failure(&error),
+                        local,
+                        "ready={ready}: {error:?}"
+                    );
+                    driver.abort();
+                    let _ = driver.await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     async fn h2_peer() -> (
         Arc<Carrier>,
@@ -939,7 +997,7 @@ mod tests {
     async fn h2_no_error_does_not_hide_body_errors_or_finish_server_sends() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (carrier, mut requests, _server) = h2_peer().await;
-            let Sender::H2(sender) = &carrier.sender else {
+            let Sender::H2 { sender, .. } = &carrier.sender else {
                 unreachable!()
             };
             let mut sender = sender.clone().ready().await.unwrap();
@@ -967,7 +1025,9 @@ mod tests {
             let error = H2SendError::Stream(io::ErrorKind::BrokenPipe.into());
             assert!(error.peer_sent_no_error(&mut send));
             // A reset can arrive between the body EOF poll and sending the final DATA frame.
-            let error = H2SendError::from(send.send_data(Bytes::new(), true).unwrap_err());
+            let error = H2SendError::Stream(io::Error::other(
+                send.send_data(Bytes::new(), true).unwrap_err(),
+            ));
             assert!(error.peer_sent_no_error(&mut send));
             let error = H2SendError::Local(io::ErrorKind::UnexpectedEof.into());
             assert!(!error.peer_sent_no_error(&mut send));

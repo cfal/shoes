@@ -18,6 +18,7 @@ use tokio::time::interval;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
+use crate::http2::transport::TransportErrors;
 
 use super::H2MuxOptions;
 use super::activity_tracker::{
@@ -40,6 +41,7 @@ const MAX_FRAME_SIZE: u32 = 16 * 1024;
 /// - Driver ownership shared by sessions and active streams
 #[derive(Clone)]
 pub struct H2MuxClientSession {
+    pub(super) errors: TransportErrors,
     send_request: h2::client::SendRequest<Bytes>,
     _driver_handle: Arc<DriverHandle>,
     padding_enabled: bool,
@@ -104,14 +106,16 @@ impl H2MuxClientSession {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let errors = TransportErrors::default();
         let (send_request, mut connection) = h2::client::Builder::new()
             .initial_window_size(STREAM_WINDOW_SIZE)
             .initial_connection_window_size(CONNECTION_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
             .max_concurrent_streams(1024)
-            .handshake(conn)
+            .handshake(errors.wrap(conn))
             .await
-            .map_err(|e| io::Error::other(format!("H2 client handshake failed: {}", e)))?;
+            .map_err(|e| errors.map_with("H2 client handshake failed", e))?;
+        errors.start_driver();
 
         // Take ping_pong handle before spawning - can only be called once
         let ping_pong = connection.ping_pong();
@@ -142,6 +146,7 @@ impl H2MuxClientSession {
         debug!("H2MuxClientSession: ready for multiplexing");
 
         Ok(Self {
+            errors,
             send_request,
             _driver_handle: Arc::new(DriverHandle {
                 _drain: drain_tx,
@@ -276,7 +281,7 @@ impl H2MuxClientSession {
         let (response_future, send_stream) = self
             .send_request
             .send_request(http_request, false)
-            .map_err(|e| io::Error::other(format!("Failed to send CONNECT: {}", e)))?;
+            .map_err(|e| self.errors.map_with("Failed to send CONNECT", e))?;
 
         // Create unified client stream with lazy response resolution
         let client_stream = H2MuxClientStream::new(
@@ -300,6 +305,62 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn stream_errors_preserve_transport_causes_with_and_without_padding() {
+        use crate::http2::transport::tests::{Fault, cases};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for padding in [false, true] {
+                for lazy in [false, true] {
+                    for (make_error, local) in cases() {
+                        let fault = Fault::new(make_error);
+                        let (client, peer) = tokio::io::duplex(8192);
+                        let (accepted_tx, accepted_rx) = oneshot::channel();
+                        let server = tokio::spawn(async move {
+                            let mut session =
+                                super::super::H2MuxServerSession::new(peer).await.unwrap();
+                            let inbound = session.accept().await.unwrap();
+                            accepted_tx.send(inbound).ok().unwrap();
+                            while session.accept().await.is_some() {}
+                        });
+                        let options = H2MuxOptions {
+                            padding,
+                            ..Default::default()
+                        };
+                        let mut session = H2MuxClientSession::new(fault.wrap(client), &options)
+                            .await
+                            .unwrap();
+                        let mut stream = session
+                            .open_tcp(&NetLocation::from_str("example.com:80", None).unwrap())
+                            .await
+                            .unwrap();
+                        let inbound = if lazy {
+                            None
+                        } else {
+                            stream.write_all(b"x").await.unwrap();
+                            let mut inbound = accepted_rx.await.unwrap();
+                            inbound.stream.write_all(b"y").await.unwrap();
+                            assert_eq!(stream.read_u8().await.unwrap(), b'y');
+                            Some(inbound)
+                        };
+                        fault.inject();
+                        let error = stream.read_u8().await.unwrap_err();
+                        assert_eq!(
+                            crate::clash_api::probes::local_failure(&error),
+                            local,
+                            "padding={padding} lazy={lazy}: {error:?}"
+                        );
+                        drop(inbound);
+                        drop(stream);
+                        drop(session);
+                        server.abort();
+                        let _ = server.await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
     #[tokio::test]
     async fn streams_own_driver_until_last_stream_is_dropped() {
         for _ in 0..16 {

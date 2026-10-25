@@ -21,7 +21,7 @@ mod parsed;
 mod proxy_runtime;
 mod system;
 
-pub(crate) use guard::real_only;
+pub(crate) use guard::{SyntheticDnsAnswer, real_only};
 
 /// Binds a TCP listener and a UDP socket on one loopback port, as DNS servers listen. A
 /// free TCP port does not imply a free UDP port, so retry with new ports.

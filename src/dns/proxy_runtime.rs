@@ -273,7 +273,7 @@ mod tests {
     async fn new_dns_sockets_follow_direct_selector_changes() {
         let config = r#"
 - client_group: dns-route
-  strategy: selector
+  type: selector
   default: usable
   client_proxies:
     - name: unavailable
