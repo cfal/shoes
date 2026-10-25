@@ -196,8 +196,12 @@ async fn exercise() {
         })
         .await;
         let mut candidate = prepare(&paths, Some(&prepared.dns)).await.unwrap();
+        candidate.tcp =
+            TcpListeners::prepare(&candidate.validated.configs, &prepared.tcp, &[]).unwrap();
         running.stop().await;
+        prepared.tcp.retain_shared(&candidate.tcp);
         running.start(&mut candidate).await.unwrap();
+        candidate.tcp.activate();
         drop(prepared);
         echo(&mut live, cycle).await;
         let mut replacement = connect(forward).await;
