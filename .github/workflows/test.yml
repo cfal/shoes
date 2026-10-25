@@ -395,7 +395,7 @@ jobs:
     - name: Run integration tests
       env:
         TEST_FILTERS: ${{ matrix.filters }}
-        RUST_LOG: warn
+        RUST_LOG: ${{ matrix.name == 'external DNS' && 'warn,shoes::dns=debug,hickory_net=debug,hickory_resolver=debug,quinn_proto=trace' || 'warn' }}
       run: |
         if [ -z "$TEST_FILTERS" ]; then
           cargo test -p shoes --locked \
@@ -410,3 +410,15 @@ jobs:
               --verbose "$filter::" -- --test-threads=1
           done
         fi
+
+    - name: Trace Cloudflare H3 cancellation
+      if: matrix.name == 'external DNS'
+      env:
+        RUST_LOG: warn,shoes::dns=debug,hickory_net=debug,hickory_resolver=debug,quinn_proto=trace
+      run: |
+        for iteration in $(seq 1 30); do
+          printf '\nCloudflare H3 attempt %s\n' "$iteration"
+          .github/require-tests.sh cargo test -p shoes --locked \
+            --features external-network-tests --test external_network \
+            dns::test_dns_h3_cloudflare -- --exact --nocapture --test-threads=1
+        done
