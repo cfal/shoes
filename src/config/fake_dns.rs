@@ -174,15 +174,22 @@ pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
 impl ValidatedConfigs {
     pub(crate) fn validate_network_endpoints(&mut self, ranges: &[IpNetwork]) -> io::Result<()> {
         for source in &self.remote_rules {
-            for value in source
-                .url
-                .iter()
-                .chain(source.download.iter().map(|d| &d.bootstrap_url))
-            {
+            let bootstrap = source
+                .download
+                .as_ref()
+                .map(|download| &download.bootstrap_url)
+                .filter(|name| {
+                    !self
+                        .dns_groups
+                        .iter()
+                        .any(|group| group.name == name.as_str())
+                });
+            for value in source.url.iter().chain(bootstrap) {
                 if let Ok(url) = url::Url::parse(value) {
                     let ip = match url.host() {
                         Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
                         Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+                        Some(url::Host::Domain(host)) => host.parse::<IpAddr>().ok(),
                         _ => None,
                     };
                     if let Some(ip) = ip {

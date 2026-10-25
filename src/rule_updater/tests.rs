@@ -1121,3 +1121,157 @@ async fn caches_cannot_overwrite_config_pem_state_or_other_source_files() {
             .contains("overlap")
     );
 }
+#[test]
+fn remote_bootstrap_literals_reject_active_and_retained_synthetic_ranges() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, VALID);
+    let ranges = [
+        "100.64.0.0/10".parse().unwrap(),
+        "fd00::/64".parse().unwrap(),
+    ];
+    for scheme in ["udp", "tcp", "tls", "https", "h3"] {
+        for host in ["100.64.0.2", "[::ffff:100.64.0.2]", "[fd00::2]"] {
+            let mut source = source("https://remote.invalid/rules.json", &path);
+            source.download.as_mut().unwrap().bootstrap_url = format!("{scheme}://{host}");
+            let mut config = configs(&source);
+            config.push(
+                serde_json::from_value(serde_json::json!({
+                    "dns_group": "fake", "dns_servers": "system",
+                    "fake_ip": {"ipv4_range": "100.64.0.0/10", "ipv6_range": "fd00::/64"}
+                }))
+                .unwrap(),
+            );
+            let error = crate::config::create_server_configs(config)
+                .err()
+                .expect("active synthetic bootstrap endpoint accepted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("rule download/bootstrap endpoint"),
+                "{scheme}://{host}: {error}"
+            );
+
+            let mut validated = crate::config::create_server_configs(configs(&source)).unwrap();
+            let error = validated.validate_network_endpoints(&ranges).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("rule download/bootstrap endpoint"),
+                "{scheme}://{host}: {error}"
+            );
+            validated
+                .validate_network_endpoints(&["192.0.2.0/24".parse().unwrap()])
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn cold_rule_bootstrap_rejects_synthetic_upstreams_before_lookup() {
+    let dir = directory();
+    let path = dir.path().join("missing.json");
+    let state = dir.path().join("fake.json");
+    for scheme in ["udp", "tcp", "tls", "https", "h3"] {
+        let mut source = source("https://remote.invalid/rules.json", &path);
+        let bootstrap = format!("{scheme}://100.64.0.2");
+        source.download.as_mut().unwrap().bootstrap_url = bootstrap.clone();
+        let mut config = configs(&source);
+        config.push(
+            serde_json::from_value(serde_json::json!({
+                "dns_group": "fake", "dns_servers": "system",
+                "fake_ip": {"ipv4_range": "100.64.0.0/10", "state_file": state}
+            }))
+            .unwrap(),
+        );
+        let context = crate::config::rule_download_context(config.clone()).unwrap();
+        let dns = DnsRegistry::for_rule_downloads(
+            context.groups,
+            context.limits,
+            &context.sources,
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+        let error = dns
+            .rule_bootstrap(&bootstrap)
+            .err()
+            .expect("cold synthetic bootstrap endpoint accepted");
+        assert!(
+            error.to_string().contains("synthetic endpoint"),
+            "{bootstrap}: {error}"
+        );
+        for (candidate, previous) in [(config.clone(), None), (configs(&source), Some(&dns))] {
+            let error = prepare(candidate, previous, &mut None).await.err().unwrap();
+            assert!(
+                error.to_string().contains("synthetic endpoint"),
+                "{bootstrap}: {error}"
+            );
+            assert!(!stage_path(&path).exists());
+        }
+        assert!(!state.exists());
+        assert!(!path.exists());
+    }
+}
+
+#[tokio::test]
+async fn synthetic_bootstrap_is_rejected_before_sending_a_dns_packet() {
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dir = directory();
+    let path = dir.path().join("missing.json");
+    let mut source = source("http://remote.invalid/rules.json", &path);
+    source.download.as_mut().unwrap().bootstrap_url =
+        format!("udp://{}", udp.local_addr().unwrap());
+    let mut config = configs(&source);
+    config.push(
+        serde_json::from_value(serde_json::json!({
+            "dns_group": "fake", "dns_servers": "system", "fake_ip": {"ipv4_range": "127.0.0.0/24"}
+        }))
+        .unwrap(),
+    );
+    let error = prepare(config, None, &mut None).await.err().unwrap();
+    assert!(error.to_string().contains("synthetic endpoint"), "{error}");
+    assert!(
+        timeout(Duration::from_millis(20), udp.recv(&mut [0; 512]))
+            .await
+            .is_err()
+    );
+    assert!(!path.exists());
+    assert!(!stage_path(&path).exists());
+}
+
+#[tokio::test]
+async fn remote_bootstrap_group_names_take_precedence_over_url_syntax() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, VALID);
+    for name in ["udp://100.64.0.2", "https://100.64.0.2"] {
+        let mut source = source("https://remote.invalid/rules.json", &path);
+        source.download.as_mut().unwrap().bootstrap_url = name.into();
+        let mut config = configs(&source);
+        config.push(
+            serde_json::from_value(serde_json::json!({
+                "dns_group": name, "dns_servers": "udp://127.0.0.1:9",
+                "fake_ip": {"ipv4_range": "100.64.0.0/10"}
+            }))
+            .unwrap(),
+        );
+        let mut validated = crate::config::create_server_configs(config.clone()).unwrap();
+        validated
+            .validate_network_endpoints(&["100.64.0.0/10".parse().unwrap()])
+            .unwrap();
+        let context = crate::config::rule_download_context(config.clone()).unwrap();
+        let dns = DnsRegistry::for_rule_downloads(
+            context.groups,
+            context.limits,
+            &context.sources,
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+        dns.rule_bootstrap(name).unwrap();
+    }
+}
+

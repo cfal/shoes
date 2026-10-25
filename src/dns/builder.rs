@@ -110,6 +110,23 @@ impl DnsRegistry {
         let server = parsed
             .to_parsed_server(None)
             .map_err(std::io::Error::other)?;
+        let endpoint = match &server {
+            ParsedDnsServer::System => None,
+            ParsedDnsServer::Udp { addr }
+            | ParsedDnsServer::Tcp { addr }
+            | ParsedDnsServer::Tls { addr, .. }
+            | ParsedDnsServer::Https { addr, .. }
+            | ParsedDnsServer::H3 { addr, .. } => Some(addr.ip()),
+        };
+        if endpoint.is_some_and(|ip| {
+            self.forbidden
+                .iter()
+                .any(|range| range.contains(ip) || range.contains(ip.to_canonical()))
+        }) {
+            return Err(crate::rules::invalid(
+                "rule bootstrap endpoint overlaps a synthetic endpoint",
+            ));
+        }
         let native = real_only(Arc::new(NativeResolver::new()), self.forbidden.clone());
         let entry = ParsedDnsServerEntry::new(
             server,
