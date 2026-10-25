@@ -453,6 +453,48 @@ async fn udp_chain_preserves_preparation_order_and_ignores_intermediate_early_da
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn pinned_later_endpoint_does_not_replace_the_same_directly_dialed_hostname() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let proxy = || {
+        Box::new(Proxy {
+            location: NetLocation::from_str("same.test:443", None).unwrap(),
+            lazy: false,
+            early_data: None,
+            calls: calls.clone(),
+        }) as Box<dyn ProxyConnector>
+    };
+    let chain = ClientProxyChain::new(
+        vec![InitialHopEntry::Proxy {
+            socket: Arc::new(Socket(0, calls.clone())),
+            proxy: proxy(),
+        }],
+        vec![vec![proxy()]],
+    );
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let mut route = chain.selected_route(&resolver, &[0, 0]);
+    route.pinned_proxies = Some(Arc::new(std::collections::HashMap::from([(
+        NetLocation::from_str("same.test:443", None).unwrap(),
+        NetLocation::from_str("127.0.0.2:443", None).unwrap(),
+    )])));
+    route
+        .connect(NetLocation::from_str("192.0.2.1:80", None).unwrap().into())
+        .await
+        .unwrap();
+    let calls = calls.lock().unwrap();
+    assert!(
+        calls.iter().any(|call| call == "socket 0 -> same.test:443"),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == "same.test:443 -> 127.0.0.2:443"),
+        "{calls:?}"
+    );
+}
+
 #[test]
 fn pooled_prefix_does_not_retain_its_own_proxy() {
     let calls = Arc::new(Mutex::new(Vec::new()));

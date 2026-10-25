@@ -725,6 +725,8 @@ impl ClientProxyChain {
             for proxy in initial
                 .into_iter()
                 .chain(route.subsequent.iter().map(AsRef::as_ref))
+                // The directly dialed proxy retains the socket connector's address fallback.
+                .skip(1)
             {
                 let location = proxy.proxy_location();
                 if pinned.contains_key(location) {
@@ -1069,16 +1071,19 @@ impl SelectedRoute {
     }
 
     fn prefix(&self, target: ResolvedLocation) -> Arc<dyn CarrierDialer> {
-        let target = self
-            .pinned_proxies
-            .as_ref()
-            .and_then(|pinned| pinned.get(target.location()))
-            .map_or(target.clone(), |location| location.clone().into());
         let mut route = self.clone();
         if route.subsequent.pop().is_none() {
             // A pooled prefix must not retain the connector that owns its pool.
             route.initial = None;
         }
+        let target = if route.last_proxy().is_some() {
+            self.pinned_proxies
+                .as_ref()
+                .and_then(|pinned| pinned.get(target.location()))
+                .map_or(target.clone(), |location| location.clone().into())
+        } else {
+            target
+        };
         let mut identities = vec![Arc::as_ptr(&route.socket) as *const () as usize];
         if let Some(initial) = &route.initial {
             identities.push(Arc::as_ptr(initial) as usize);

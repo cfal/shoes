@@ -1308,7 +1308,7 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
             .unwrap();
         assert_eq!(
             *resolver.calls.lock().unwrap(),
-            ["remote.invalid", "first.invalid", "second.invalid"]
+            ["remote.invalid", "second.invalid", "first.invalid"]
         );
     }
 }
@@ -1333,6 +1333,76 @@ async fn chunked_body_is_bounded_and_validated() {
     );
     fixture.await.unwrap();
     assert_eq!(std::fs::read(path).unwrap(), VALID);
+}
+
+#[tokio::test]
+async fn first_download_proxy_retains_bootstrap_address_fallback() {
+    #[derive(Debug)]
+    struct Bootstrap(Vec<std::net::SocketAddr>);
+    impl crate::resolver::Resolver for Bootstrap {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.address().to_string(), "proxy.invalid");
+            let addresses = self.0.clone();
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+    for direct_first in [false, true] {
+        let dir = directory();
+        let path = dir.path().join("rules.json");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_address = refused.local_addr().unwrap();
+        drop(refused);
+        let mut dns = DnsRegistry::new();
+        dns.register(
+            "bootstrap".into(),
+            Arc::new(Bootstrap(vec![refused_address, address])),
+        );
+        let mut source = source("http://192.0.2.1:8080/rules", &path);
+        let proxy = serde_json::json!({"address": format!("proxy.invalid:{}", address.port()), "protocol": {"type": "socks"}});
+        let hops = if direct_first {
+            serde_json::json!([{"protocol": {"type": "direct"}}, proxy])
+        } else {
+            serde_json::json!([proxy])
+        };
+        source.download.as_mut().unwrap().client_chain = serde_json::from_value(hops).unwrap();
+        source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut connect = [0; 10];
+            stream.read_exact(&mut connect).await.unwrap();
+            assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, 1, 31, 144]);
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+            request(&mut stream).await;
+            stream.write_all(&response(200, "", VALID)).await.unwrap();
+        });
+        drop(
+            stage(
+                &source,
+                &dns,
+                GlobalLimits::default(),
+                Limits::default(),
+                &mut http::DownloadState::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        fixture.await.unwrap();
+    }
 }
 
 #[tokio::test]
