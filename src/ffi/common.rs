@@ -231,6 +231,12 @@ pub async fn start_from_config(
 
     let mut validated = crate::config::compile_configs(configs).await?;
     validated.validate_ffi_support()?;
+    if !validated.remote_rules.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remote rule refresh requires the process runtime and is not supported by FFI",
+        ));
+    }
     crate::dns::check_interception(&validated.configs, &validated.dns_groups).await?;
     let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
     #[cfg(unix)]

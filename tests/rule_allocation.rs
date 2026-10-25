@@ -22,6 +22,9 @@ fn load_peak(bytes: &[u8], format: Format, precharged: usize) -> (std::io::Resul
     let path = dir.path().join("source");
     std::fs::write(&path, bytes).unwrap();
     let source = RuleSource {
+        url: None,
+        download: None,
+        update_interval: None,
         path,
         format: Some(format),
         behavior: (format == Format::MihomoYaml).then_some(Behavior::Domain),

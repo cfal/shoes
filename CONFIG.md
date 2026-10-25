@@ -2181,6 +2181,88 @@ rules:
       client_chain: my-upstream  # Reference by name
 ```
 
+### Remote Rule Sources
+
+Add `url` to a file source to manage its local cache automatically. The same
+source object works in `rule_source_group.rules`, under `masks` (including
+`all`/`any`/`not`), or flat alongside `action` in a policy group's rules, a server's
+`rules`, or supported `override_rules`. A flat source cannot also specify `masks`.
+
+```yaml
+- rule_source_group: regional
+  rules:
+    - url: https://example.net/geoip-cn.srs
+      path: ./cache/geoip-cn.srs
+      update_interval: 7d
+      download:
+        client_chain: direct
+        bootstrap_url: system
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: {rule_source_group: regional}
+      action: block
+    - url: https://example.net/blocked.json
+      path: ./cache/blocked.json
+      download:
+        client_chain: fetch-proxy
+        bootstrap_url: system
+      action: block
+    - masks: {any_destination: true}
+      action: allow
+```
+
+`fetch-proxy` must be a configured client group. `download.client_chain` accepts
+the existing chain, pool, inline-client, and group syntax. It is independent of
+the outer policy's `client_chain`, which routes matched traffic. Both
+`download.client_chain` and `download.bootstrap_url` are required. Bootstrap may
+be `system`, an IP-based DNS URL, or a named DNS group. Target and proxy hostnames
+use this resolver; failed fetch routing never falls back to direct. Cold downloads
+reconcile persisted/current selector choices before fetching, without publishing
+a candidate controller generation. Later refreshes use the active selection view.
+
+`path` is required, relative to the declaring config file. Its directory must
+already exist, be owned by the running user, and not be writable by others (for
+example, create it with `install -d -m 700 cache`). Cache files must be owned,
+regular, singly linked, and not writable by others. Symlinks in any path component
+and `..` traversal are rejected. The `.shoes-update.lock` and `.shoes-update.tmp`
+suffixes are reserved. Identical declarations sharing a cache are deduplicated;
+conflicting declarations are rejected. Local-only file sources are unchanged.
+
+`format` remains optional: explicit override, recognized SRS/MRS signature, URL
+pathname extension (ignoring query), then cache-path extension. All local decoders
+are supported; DAT still needs explicit format/code, and Mihomo YAML/text needs
+behavior. Invalid decoding never retries a different format.
+
+`update_interval` defaults to `24h`; use a positive integer with `s`, `m`, `h`, or
+`d`, from `1s` through `365d`. Valid cached files allow offline startup. Missing,
+invalid, or empty remote caches require a successful download and whole-candidate
+validation before listeners start. `check` and `--dry-run` stay offline and fail
+if a usable required cache is missing. A future cache mtime is treated as due.
+
+The process refreshes due sources serially, with 10% jitter and capped exponential
+failure backoff. Downloaded files pass Shoes' actual decoders, compilation budgets,
+and whole-configuration validation before atomic replacement. Failures keep the
+last-good file and active rules; identical bytes preserve inode/mtime and do not
+reload. Each file replacement is atomic, not a multi-file transaction. A post-rename
+directory-sync failure reports uncertain durability but still activates the
+validated replacement. New flows use the reloaded rules; existing flows retain
+their previous configuration. Reload/removal/shutdown cancels in-flight refreshes.
+`--no-reload` disables filesystem-triggered reloads, not configured remote refresh.
+
+HTTPS verifies certificates. An explicit `http://` URL permits cleartext. Redirects,
+URL credentials/fragments, HTTP content compression, and trailers are rejected.
+Chunked and close-delimited bodies are accepted within the same limits: 64 MiB
+download, 64 headers/32 KiB, 10-second connect/DNS/TLS and header/body-idle deadlines,
+and a 120-second total download deadline. Decoder-specific decompression limits
+still apply. Cold-start staging is capped at 512 MiB in aggregate. Logs report
+actual updated/unchanged/failed results without URL query values or downloaded data.
+
+Remote refresh currently requires the Unix process runtime. FFI startup and
+WireGuard-dependent download/bootstrap routes reject it explicitly. It does not
+add proxy subscriptions, dynamic provider groups, or provider API endpoints.
+
 ### Rule Group
 
 A `rule_group` contains ordered policies; omitted `action` still means `allow`.

@@ -93,7 +93,7 @@ fn visit_dns(
 }
 
 pub(crate) fn visit_configs(configs: &mut [Config], visitor: &mut Visitor<'_>) -> io::Result<()> {
-    for config in configs {
+    for config in configs.iter_mut() {
         match config {
             Config::ClientConfigGroup(group) => {
                 for member in group.client_proxies.iter_mut() {
@@ -122,7 +122,12 @@ pub(crate) fn visit_configs(configs: &mut [Config], visitor: &mut Visitor<'_>) -
             _ => {}
         }
     }
-    Ok(())
+    crate::rule_set::visit_sources(configs, &mut |source| {
+        if let Some(download) = &mut source.download {
+            visit_chain(&mut download.client_chain, visitor)?;
+        }
+        Ok(())
+    })
 }
 
 fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> io::Result<()> {
@@ -190,6 +195,11 @@ impl ValidatedConfigs {
     }
 
     pub(crate) fn visit_clients(&mut self, visitor: &mut Visitor<'_>) -> io::Result<()> {
+        for source in &mut self.remote_rules {
+            if let Some(download) = &mut source.download {
+                visit_chain(&mut download.client_chain, visitor)?;
+            }
+        }
         for config in &mut self.configs {
             match config {
                 Config::Server(server) => {

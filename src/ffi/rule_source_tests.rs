@@ -4,6 +4,41 @@ use std::{io, os::fd::AsRawFd, os::unix::net::UnixDatagram, time::Duration};
 use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
 
 #[tokio::test]
+async fn remote_refresh_is_rejected_before_ffi_opens_resources() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("cache.json");
+    std::fs::write(
+        &path,
+        include_bytes!("../../tests/fixtures/rule_sets/singbox.json"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (_wire, tun) = UnixDatagram::pair().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let flags = unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) };
+    let config = json!([
+        {"device_fd": tun.as_raw_fd(), "rules": [{
+            "url": "http://127.0.0.1:1/cache.json", "path": path,
+            "download": {"client_chain": "direct", "bootstrap_url": "system"}, "action": "block"
+        }]},
+        {"address": listener.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}}
+    ]);
+    let (_shutdown, rx) = oneshot::channel();
+    let error = start_from_config(&config.to_string(), rx)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("remote rule refresh"), "{error}");
+    assert_eq!(
+        unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) },
+        flags
+    );
+    assert!(!dir.path().join("cache.json.shoes-update.tmp").exists());
+}
+
+#[tokio::test]
 async fn invalid_sources_fail_before_ffi_opens_listeners_or_tun() {
     let dir = tempfile::tempdir().unwrap();
     let corrupt = dir.path().join("corrupt.srs");

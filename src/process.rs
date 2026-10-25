@@ -18,26 +18,59 @@ const RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
 async fn validate_configs(
     paths: &[String],
-    mut configs: Vec<Config>,
+    configs: Vec<Config>,
     discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
 ) -> io::Result<ValidatedConfigs> {
-    async {
-        let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
-        let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
-        dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
-        recovery_dependencies.retain(|path| !dependencies.contains(path));
-        discovered(&dependencies, &recovery_dependencies);
-        let (configs, _) = config::convert_cert_paths(configs).await?;
-        let mut validated = config::compile_configs(configs).await?;
-        validated.reload_files = dependencies;
-        tokio::task::spawn_blocking(move || {
-            if validated.catalog.is_some() {
-                crate::control::validation::validate_resources(&validated)?;
-            }
-            Ok(validated)
-        })
+    load_candidate(paths, configs, discovered, false, None, &mut None)
         .await
-        .map_err(io::Error::other)?
+        .map(|(validated, _)| validated)
+}
+
+async fn load_candidate(
+    paths: &[String],
+    mut configs: Vec<Config>,
+    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
+    online: bool,
+    previous: Option<&DnsRegistry>,
+    control: &mut Option<crate::control::runtime::ControlService>,
+) -> io::Result<(ValidatedConfigs, Vec<Config>)> {
+    async {
+    let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
+    let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
+    dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
+    recovery_dependencies.retain(|path| !dependencies.contains(path));
+    discovered(&dependencies, &recovery_dependencies);
+    let (mut configs, _) = config::convert_cert_paths(configs).await?;
+    let mut has_remote = false;
+    crate::rule_set::visit_sources(&mut configs, &mut |source| {
+        has_remote |= source.url.is_some();
+        Ok(())
+    })?;
+    let snapshot = if online && has_remote {
+        configs.clone()
+    } else {
+        Vec::new()
+    };
+    #[cfg(unix)]
+    let mut validated = if online {
+        crate::rule_updater::prepare(configs, previous, control).await?
+    } else {
+        config::compile_configs(configs).await?
+    };
+    #[cfg(not(unix))]
+    let mut validated = {
+        let _ = (online, previous, control);
+        config::compile_configs(configs).await?
+    };
+    validated.reload_files = dependencies;
+    tokio::task::spawn_blocking(move || {
+        if validated.catalog.is_some() {
+            crate::control::validation::validate_resources(&validated)?;
+        }
+        Ok((validated, snapshot))
+    })
+    .await
+    .map_err(io::Error::other)?
     }
     .await
     .map_err(|error: io::Error| {
@@ -51,6 +84,8 @@ async fn validate_configs(
 struct PreparedServers {
     #[cfg(target_os = "linux")]
     managed: Option<std::sync::Arc<crate::desktop::Ingress>>,
+    #[cfg(unix)]
+    remote_rules: crate::rule_updater::Refresh,
     generation: Option<std::sync::Arc<crate::control::runtime::Generation>>,
     certificates: crate::certificates::Registry,
     validated: ValidatedConfigs,
@@ -85,7 +120,8 @@ async fn prepare_tracking(
     control: &mut Option<crate::control::runtime::ControlService>,
     network: &crate::desktop::NetworkSession,
 ) -> io::Result<PreparedServers> {
-    let mut validated = validate_configs(paths, configs, discovered).await?;
+    let (mut validated, snapshot) =
+        load_candidate(paths, configs, discovered, true, previous, control).await?;
     network.validate(&validated.configs)?;
     for config in &mut validated.configs {
         if let Config::TunServer(tun) = config
@@ -237,6 +273,12 @@ async fn prepare_tracking(
     Ok(PreparedServers {
         #[cfg(target_os = "linux")]
         managed: network.ingress(),
+        #[cfg(unix)]
+        remote_rules: crate::rule_updater::Refresh::new(
+            snapshot,
+            &validated.remote_rules,
+            previous_servers.map(|servers| &servers.remote_rules),
+        )?,
         generation,
         certificates,
         validated,
@@ -755,6 +797,7 @@ async fn run_inner(
                 }
                 continue;
             },
+            _ = remote_rule_change(&mut prepared) => !no_reload,
             _ = watches.changed(&mut changes) => true,
         };
         if debounce {
@@ -859,6 +902,19 @@ async fn run_inner(
         let mut retired = std::mem::replace(&mut prepared, candidate);
         retired.certificates.shutdown().await;
         println!("Servers ready");
+    }
+}
+
+async fn remote_rule_change(prepared: &mut PreparedServers) {
+    #[cfg(unix)]
+    prepared
+        .remote_rules
+        .changed(&prepared.dns, prepared.validated.global_limits)
+        .await;
+    #[cfg(not(unix))]
+    {
+        let _ = prepared;
+        std::future::pending::<()>().await;
     }
 }
 

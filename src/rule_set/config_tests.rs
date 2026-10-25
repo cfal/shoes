@@ -193,6 +193,31 @@ fn source_group_depth_is_order_independent_and_includes_callers() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn staged_inputs_also_validate_local_aliases_of_remote_caches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.json");
+    let alias = dir.path().join("alias.json");
+    let stage = dir.path().join("staged");
+    write_domains(&path, "old.example");
+    write_domains(&stage, "new.example");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    let mut compiler = Compiler::default();
+    compiler
+        .input_files
+        .insert(path, std::fs::File::open(stage).unwrap());
+    let predicate = load_source(&RuleSource::from_path(alias), &mut compiler).unwrap();
+    assert_eq!(
+        predicate.evaluate(Some("new.example"), None, 443),
+        Outcome::Match
+    );
+    assert_eq!(
+        predicate.evaluate(Some("old.example"), None, 443),
+        Outcome::Miss
+    );
+}
+
 #[test]
 fn inline_and_named_sources_share_the_same_predicate() {
     let dir = tempfile::tempdir().unwrap();

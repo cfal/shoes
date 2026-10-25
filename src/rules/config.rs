@@ -82,7 +82,7 @@ impl Expression {
                 }
                 Self::parse_children(values, depth).map(Self::Any)
             }
-            Value::Object(fields) if fields.contains_key("path") => {
+            Value::Object(fields) if fields.contains_key("path") || fields.contains_key("url") => {
                 decode(Value::Object(fields)).map(Self::Source)
             }
             Value::Object(fields) => {

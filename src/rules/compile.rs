@@ -20,6 +20,7 @@ pub struct Compiler {
     resolving_groups: HashSet<String>,
     pub(crate) policy_groups: HashSet<String>,
     pub(crate) sources: HashMap<crate::rule_set::SourceKey, Arc<Predicate>>,
+    pub(crate) input_files: HashMap<std::path::PathBuf, std::fs::File>,
     bytes: usize,
     entries: usize,
 }

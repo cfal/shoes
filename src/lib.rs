@@ -72,6 +72,8 @@ pub mod resolver;
 pub mod resources;
 mod routing;
 pub mod rule_set;
+#[cfg(unix)]
+mod rule_updater;
 pub mod rules;
 mod rustls_config_util;
 mod rustls_connection_util;

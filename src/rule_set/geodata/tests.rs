@@ -158,6 +158,9 @@ fn equivalent_geosite_options_share_cached_predicates() {
     .encode_to_vec();
     std::fs::write(&path, bytes).unwrap();
     let mut source = RuleSource {
+        url: None,
+        download: None,
+        update_interval: None,
         path,
         format: Some(Format::GeositeDat),
         behavior: None,
@@ -216,6 +219,9 @@ fn geoip_cache_preserves_distinct_categories() {
     .encode_to_vec();
     std::fs::write(&path, bytes).unwrap();
     let mut source = RuleSource {
+        url: None,
+        download: None,
+        update_interval: None,
         path,
         format: Some(Format::GeoipDat),
         behavior: None,

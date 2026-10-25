@@ -96,6 +96,126 @@ pub struct DnsRegistry {
 }
 
 impl DnsRegistry {
+    pub(crate) fn rule_bootstrap(&self, url: &str) -> std::io::Result<Arc<dyn Resolver>> {
+        if let Some(resolver) = self.get_by_name(url) {
+            return Ok(real_only(resolver, self.forbidden.clone()));
+        }
+        let parsed = ParsedDnsUrl::parse(url)
+            .map_err(|_| crate::rules::invalid("invalid rule bootstrap_url"))?;
+        if parsed.has_hostname() {
+            return Err(crate::rules::invalid(
+                "rule bootstrap URL must use an IP address",
+            ));
+        }
+        let server = parsed
+            .to_parsed_server(None)
+            .map_err(std::io::Error::other)?;
+        let native = real_only(Arc::new(NativeResolver::new()), self.forbidden.clone());
+        let entry = ParsedDnsServerEntry::new(
+            server,
+            Arc::new(build_direct_chain_group(native.clone())),
+            native,
+            super::IpStrategy::default(),
+            10,
+            5,
+            2,
+        );
+        Ok(real_only(
+            build_resolver_with_limits(vec![entry], self.limits, self.forbidden.clone())?,
+            self.forbidden.clone(),
+        ))
+    }
+
+    pub(crate) async fn for_rule_downloads(
+        mut groups: Vec<ExpandedDnsGroup>,
+        limits: GlobalLimits,
+        sources: &[crate::rule_set::RuleSource],
+        configs: &[crate::config::Config],
+        previous: Option<&DnsRegistry>,
+    ) -> std::io::Result<Self> {
+        // Bootstrap real answers without opening, closing, or mutating Fake-IP stores.
+        let inline = configs
+            .iter()
+            .filter_map(|config| match config {
+                crate::config::Config::Server(server) => server.dns.as_ref(),
+                crate::config::Config::TunServer(tun) => tun.dns.as_ref(),
+                _ => None,
+            })
+            .filter_map(|dns| dns.fake_ip.as_ref().and_then(|policy| policy.options()))
+            .collect::<Vec<_>>();
+        let mut forbidden = groups
+            .iter()
+            .filter_map(|group| group.fake_ip.as_ref())
+            .chain(inline.iter())
+            .flat_map(|policy| policy.ipv4_range.iter().chain(policy.ipv6_range.iter()))
+            .map(|range| range.parse())
+            .collect::<Result<Vec<IpNetwork>, _>>()
+            .map_err(std::io::Error::other)?;
+        if let Some(previous) = previous {
+            forbidden.extend_from_slice(previous.forbidden_ranges());
+        }
+        let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(configs).collect();
+        if !forbidden.is_empty() {
+            crate::config::validate_tun_endpoints(synthetic_endpoints.iter().copied(), &forbidden)?;
+            forbidden.extend(
+                synthetic_endpoints
+                    .iter()
+                    .map(|ip| IpNetwork::from(ip.to_canonical())),
+            );
+        }
+        let guard = Self {
+            forbidden: forbidden.into(),
+            ..Self::new()
+        };
+        let mut required: std::collections::HashSet<String> = sources
+            .iter()
+            .filter_map(|source| source.download.as_ref().map(|d| d.bootstrap_url.clone()))
+            .collect();
+        for group in groups.iter().rev() {
+            if required.contains(&group.name) {
+                required.extend(
+                    group
+                        .specs
+                        .iter()
+                        .filter_map(|spec| spec.bootstrap_url.clone()),
+                );
+            }
+        }
+        groups.retain(|group| required.contains(&group.name));
+        for group in &mut groups {
+            group.fake_ip = None;
+            for spec in &mut group.specs {
+                for chain in &mut spec.client_chains {
+                    for hop in chain.hops.iter_mut() {
+                        crate::config::client_visit::visit_hop(hop, &mut |client| {
+                            if client.protocol.is_wireguard() {
+                                return Err(crate::rules::invalid(
+                                    "rule bootstrap cannot use WireGuard",
+                                ));
+                            }
+                            if client
+                                .address
+                                .to_socket_addr_nonblocking()
+                                .is_some_and(|addr| {
+                                    guard
+                                        .forbidden
+                                        .iter()
+                                        .any(|range| range.contains(addr.ip().to_canonical()))
+                                })
+                            {
+                                return Err(crate::rules::invalid(
+                                    "rule bootstrap proxy overlaps a synthetic endpoint",
+                                ));
+                            }
+                            Ok(())
+                        })?;
+                    }
+                }
+            }
+        }
+        build_dns_registry_for_runtime(groups, limits, Some(&guard), &synthetic_endpoints).await
+    }
+
     /// Creates a new empty registry.
     pub fn new() -> Self {
         Self {

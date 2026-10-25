@@ -254,7 +254,7 @@ impl<'de> Deserialize<'de> for RuleConfig {
             ));
         }
         if let Some(fields) = value.as_object_mut()
-            && fields.contains_key("path")
+            && (fields.contains_key("path") || fields.contains_key("url"))
         {
             if fields.contains_key("masks") || fields.contains_key("mask") {
                 return Err(D::Error::custom(
@@ -262,7 +262,16 @@ impl<'de> Deserialize<'de> for RuleConfig {
                 ));
             }
             let mut source = serde_json::Map::new();
-            for key in ["path", "format", "behavior", "code", "attributes"] {
+            for key in [
+                "path",
+                "url",
+                "format",
+                "behavior",
+                "code",
+                "attributes",
+                "download",
+                "update_interval",
+            ] {
                 if let Some(value) = fields.remove(key) {
                     source.insert(key.into(), value);
                 }

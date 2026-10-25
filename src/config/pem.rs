@@ -21,6 +21,10 @@ use crate::config::ConfigSelection;
 pub async fn convert_cert_paths(
     mut all_configs: Vec<Config>,
 ) -> std::io::Result<(Vec<Config>, usize)> {
+    if !crate::rule_set::remote_sources(&mut all_configs)?.is_empty() {
+        let paths = pem_candidate_dependencies(&mut all_configs)?;
+        crate::rule_set::validate_remote_paths(&mut all_configs, &paths)?;
+    }
     crate::certificates::configure(&mut all_configs)?;
     let mut path_pem_names: HashMap<String, String> = HashMap::new();
     let mut data_configs = vec![];
@@ -189,6 +193,14 @@ fn pem_dependencies(
 }
 
 fn visit_config_pems(config: &mut Config, visitor: &mut PemVisitor<'_>) -> std::io::Result<()> {
+    crate::rule_set::visit_sources(std::slice::from_mut(config), &mut |source| {
+        if let Some(download) = &mut source.download {
+            for hop in download.client_chain.hops.iter_mut() {
+                gather_pem_file_paths_from_chain_hop(hop, visitor);
+            }
+        }
+        Ok(())
+    })?;
     match config {
         Config::Server(server) => gather_pem_file_paths_from_server_config(server, visitor)?,
         Config::ClientConfigGroup(group) => {

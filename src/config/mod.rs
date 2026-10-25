@@ -29,6 +29,7 @@ pub(crate) use fake_dns::{tun_endpoint_ips, validate_tun_endpoints};
 pub use pem::convert_cert_paths;
 pub(crate) use pem::{is_pem_file_path, pem_candidate_dependencies, pem_reload_dependencies};
 pub use types::*;
+pub(crate) use validate::rule_download_context;
 pub use validate::{ValidatedConfigs, create_server_configs};
 pub(crate) use validate::{validate_client_vision_protocol, validate_server_vision};
 
@@ -102,16 +103,31 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
         all_configs.append(&mut configs)
     }
 
+    let files: Vec<_> = args.iter().map(std::path::PathBuf::from).collect();
+    crate::rule_set::validate_remote_paths(&mut all_configs, &files)?;
     Ok(all_configs)
 }
 
 pub async fn compile_configs(configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    compile_configs_with_inputs(configs, std::collections::HashMap::new()).await
+}
+
+pub(crate) async fn compile_configs_with_inputs(
+    configs: Vec<Config>,
+    inputs: std::collections::HashMap<std::path::PathBuf, std::fs::File>,
+) -> std::io::Result<ValidatedConfigs> {
+    blocking_compile(move || validate::create_server_configs_with_inputs(configs, inputs)).await
+}
+
+pub(crate) async fn blocking_compile<T: Send + 'static>(
+    compile: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
     static COMPILER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let permit = COMPILER.acquire().await.map_err(std::io::Error::other)?;
     tokio::task::spawn_blocking(move || {
         // A canceled caller cannot release the permit while its build is still running.
         let _permit = permit;
-        create_server_configs(configs)
+        compile()
     })
     .await
     .map_err(std::io::Error::other)?

@@ -30,6 +30,10 @@ mod fake_dns;
 mod rule_sets;
 
 #[cfg(unix)]
+#[path = "cases/process_contract/remote_rules.rs"]
+mod remote_rules;
+
+#[cfg(unix)]
 #[path = "cases/process_contract/clash_api.rs"]
 mod clash_api;
 
