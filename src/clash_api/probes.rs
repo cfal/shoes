@@ -1591,8 +1591,10 @@ mod tests {
             task::{Context, Poll},
         };
 
+        type ErrorFactory = fn() -> io::Error;
+
         struct FailingStream {
-            error: fn() -> io::Error,
+            error: ErrorFactory,
             written: bool,
         }
 
@@ -1642,7 +1644,7 @@ mod tests {
         impl AsyncStream for FailingStream {}
 
         #[derive(Debug)]
-        struct Socket(fn() -> io::Error);
+        struct Socket(ErrorFactory);
 
         #[async_trait::async_trait]
         impl SocketConnector for Socket {
@@ -1668,7 +1670,7 @@ mod tests {
             }
         }
 
-        let cases: &[(fn() -> io::Error, bool)] = &[
+        let cases: &[(ErrorFactory, bool)] = &[
             (|| io::ErrorKind::ConnectionReset.into(), false),
             (
                 || io::Error::new(io::ErrorKind::InvalidInput, "remote protocol rejection"),
