@@ -67,6 +67,33 @@ function createScratchDirectory() {
   return fs.mkdtempSync(path.join(scratch, 'reload-harness-test-'));
 }
 
+function killRecordedProcess(pidFile) {
+  if (!fs.existsSync(pidFile)) return;
+  try {
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    if (!Number.isInteger(pid) || pid <= 0) return;
+    process.kill(pid, 'SIGKILL');
+  } catch (error) {
+    if (error.code !== 'ESRCH') throw error;
+  }
+}
+
+test('fixture cleanup signals only positive integer PIDs', t => {
+  const directory = createScratchDirectory();
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const pidFile = path.join(directory, 'fixture.pid');
+  const kill = t.mock.method(process, 'kill', () => true);
+  killRecordedProcess(pidFile);
+  for (const contents of ['', ' \n', '0', '-1', '2.5', 'not-a-pid', 'Infinity']) {
+    fs.writeFileSync(pidFile, contents);
+    killRecordedProcess(pidFile);
+  }
+  assert.equal(kill.mock.callCount(), 0);
+  fs.writeFileSync(pidFile, '12345\n');
+  killRecordedProcess(pidFile);
+  assert.deepEqual(kill.mock.calls.map(call => call.arguments), [[12345, 'SIGKILL']]);
+});
+
 function runHarness(t, source, {
   success = false,
   rustcSource,
@@ -77,14 +104,7 @@ function runHarness(t, source, {
   t.after(() => {
     if (rustcSource) {
       for (const name of ['rustc.pid', 'reload.json.pid']) {
-        const pidFile = path.join(directory, name);
-        if (!fs.existsSync(pidFile)) continue;
-        try {
-          const pid = Number(fs.readFileSync(pidFile, 'utf8'));
-          process.kill(pid, 'SIGKILL');
-        } catch (error) {
-          if (error.code !== 'ESRCH') throw error;
-        }
+        killRecordedProcess(path.join(directory, name));
       }
     }
     fs.rmSync(directory, { recursive: true, force: true });
@@ -152,7 +172,7 @@ test('FD cleanup does not accept a stable retained descriptor count', { skip: pr
   await assert.rejects(waitForFds(process.pid, 0, { timeout: 20 }), /FD cleanup deadline/);
 });
 
-function forwardingFixture({ reload, closeOnReload = false }) {
+function forwardingFixture({ reload, closeOnReload = false, retainFdOnReload = false }) {
   return `
 import fs from 'node:fs';
 import net from 'node:net';
@@ -172,6 +192,7 @@ net.createServer(socket => {
 process.on('SIGHUP', () => {
   ${reload ? 'config = load();' : ''}
   ${closeOnReload ? 'for (const socket of sockets) socket.destroy();' : ''}
+  ${retainFdOnReload ? "fs.openSync(process.argv.at(-1), 'r');" : ''}
   console.log('Servers ready');
 });
 `;
@@ -239,6 +260,12 @@ test('reload harness rejects loss of a pinned connection after reload', { skip: 
   const { result, log } = runHarness(t, forwardingFixture({ reload: true, closeOnReload: true }));
   assert.match(result.stderr, /premature echo close/);
   assert.equal(log.match(/Servers ready/g).length, 2);
+});
+
+test('reload harness rejects descriptors retained after reload', { skip: process.platform !== 'linux' }, t => {
+  const { result, log } = runHarness(t, forwardingFixture({ reload: true, retainFdOnReload: true }));
+  assert.match(result.stderr, /FD cleanup deadline/);
+  assert.equal(log.match(/Servers ready/g).length, 3);
 });
 
 test('a stalled toolchain probe is killed and the server is cleaned up', { skip: process.platform !== 'linux' }, t => {
