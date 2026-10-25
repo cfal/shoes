@@ -891,68 +891,72 @@ async fn ipv6_literal_download_reaches_the_exact_url_port() {
 #[tokio::test]
 async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
     use crate::control::selection::{SelectionOwner, SelectorDefinition};
-    let dir = directory();
-    let path = dir.path().join("cache.json");
-    let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_address = proxy.local_addr().unwrap();
-    let fixture = tokio::spawn(async move {
-        let (mut stream, _) = proxy.accept().await.unwrap();
-        let mut greeting = [0; 3];
-        stream.read_exact(&mut greeting).await.unwrap();
-        assert_eq!(greeting, [5, 1, 0]);
-        stream.write_all(&[5, 0]).await.unwrap();
-        let mut connect = [0; 10];
-        stream.read_exact(&mut connect).await.unwrap();
-        assert_eq!(&connect[..4], &[5, 1, 0, 1]);
-        stream
-            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
-            .await
-            .unwrap();
-        request(&mut stream).await;
-        stream.write_all(&response(200, "", VALID)).await.unwrap();
-    });
-    let mut source = source(
-        &format!("http://{}/rules", trap.local_addr().unwrap()),
-        &path,
-    );
-    source.download.as_mut().unwrap().client_chain =
-        serde_json::from_value(serde_json::json!("fetch")).unwrap();
-    let mut config = configs(&source);
-    let store = dir.path().join("selections.json");
-    let mut owner = SelectionOwner::new(Some(&store)).unwrap();
-    let view = owner
-        .prepare(std::collections::BTreeMap::from([(
-            "fetch".into(),
-            SelectorDefinition {
-                members: vec!["unavailable".into(), "working".into()],
-                default: Some("unavailable".into()),
-            },
-        )]))
-        .unwrap();
-    owner.activate(view).unwrap();
-    owner.select("fetch", "working").unwrap();
-    drop(owner);
-    config.insert(
-        0,
-        serde_json::from_value(serde_json::json!({"cache_file_path": store})).unwrap(),
-    );
-    config.insert(1, serde_json::from_value(serde_json::json!({"client_group": "fetch", "type": "selector", "default": "unavailable", "client_proxies": [
-        {"name": "unavailable", "address": "127.0.0.1:1", "protocol": {"type": "socks"}},
+    for persisted in [false, true] {
+        let dir = directory();
+        let path = dir.path().join("cache.json");
+        let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut connect = [0; 10];
+            stream.read_exact(&mut connect).await.unwrap();
+            assert_eq!(&connect[..4], &[5, 1, 0, 1]);
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+            request(&mut stream).await;
+            stream.write_all(&response(200, "", VALID)).await.unwrap();
+        });
+        let mut source = source(
+            &format!("http://{}/rules", trap.local_addr().unwrap()),
+            &path,
+        );
+        source.download.as_mut().unwrap().client_chain =
+            serde_json::from_value(serde_json::json!("fetch")).unwrap();
+        let mut config = configs(&source);
+        let store = dir.path().join("selections.json");
+        if persisted {
+            let mut owner = SelectionOwner::new(Some(&store)).unwrap();
+            let view = owner
+                .prepare(std::collections::BTreeMap::from([(
+                    "fetch".into(),
+                    SelectorDefinition {
+                        members: vec!["DIRECT".into(), "working".into()],
+                        default: Some("DIRECT".into()),
+                    },
+                )]))
+                .unwrap();
+            owner.activate(view).unwrap();
+            owner.select("fetch", "working").unwrap();
+            drop(owner);
+            config.insert(
+                0,
+                serde_json::from_value(serde_json::json!({"cache_file_path": store})).unwrap(),
+            );
+        }
+        config.insert(0, serde_json::from_value(serde_json::json!({"client_group": "fetch", "type": "selector", "default": if persisted { "DIRECT" } else { "working" }, "client_proxies": [
+        "direct",
         {"name": "working", "address": proxy_address.to_string(), "protocol": {"type": "socks"}}
     ]})).unwrap());
-    let mut control = None;
-    prepare(config.clone(), None, &mut control).await.unwrap();
-    fixture.await.unwrap();
-    std::fs::remove_file(&path).unwrap();
-    assert!(prepare(config, None, &mut control).await.is_err());
-    assert!(
-        timeout(Duration::from_millis(50), trap.accept())
-            .await
-            .is_err()
-    );
-    assert!(!path.exists());
-    control.as_mut().unwrap().shutdown().await;
+        let mut control = None;
+        prepare(config.clone(), None, &mut control).await.unwrap();
+        fixture.await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(prepare(config, None, &mut control).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(50), trap.accept())
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+        control.as_mut().unwrap().shutdown().await;
+    }
 }
 
 #[tokio::test]

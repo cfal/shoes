@@ -111,17 +111,9 @@ pub(super) fn create_server_configs_with_inputs(
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
         HashMap::new();
-    let mut direct = ClientConfig::default();
-    if let Some(catalog) = &catalog {
-        direct.control = Some(crate::control::catalog::MemberOrigin {
-            name: std::sync::Arc::from("DIRECT"),
-            path: Vec::new(),
-            selection: catalog.selection.clone(),
-        });
-    }
     raw_client_groups.insert(
         String::from("direct"),
-        OneOrSome::One(ConfigSelection::Config(direct)),
+        OneOrSome::One(ConfigSelection::Config(direct_client(catalog.as_ref()))),
     );
 
     let mut rule_groups: HashMap<String, Vec<RuleConfig>> = HashMap::new();
@@ -489,6 +481,18 @@ pub(crate) struct RuleDownloadContext {
     pub control: super::ControlConfig,
 }
 
+fn direct_client(catalog: Option<&crate::control::catalog::Catalog>) -> ClientConfig {
+    let mut direct = ClientConfig::default();
+    if let Some(catalog) = catalog {
+        direct.control = Some(crate::control::catalog::MemberOrigin {
+            name: std::sync::Arc::from("DIRECT"),
+            path: Vec::new(),
+            selection: catalog.selection.clone(),
+        });
+    }
+    direct
+}
+
 pub(crate) fn rule_download_context(
     mut configs: Vec<Config>,
 ) -> std::io::Result<RuleDownloadContext> {
@@ -498,7 +502,7 @@ pub(crate) fn rule_download_context(
     let mut sources = crate::rule_set::remote_sources(&mut configs)?;
     let mut clients = HashMap::from([(
         "direct".into(),
-        OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+        OneOrSome::One(ConfigSelection::Config(direct_client(catalog.as_ref()))),
     )]);
     let mut pems = HashMap::new();
     let mut dns = HashMap::new();
