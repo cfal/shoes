@@ -256,6 +256,7 @@ struct Fixture {
     config: Value,
     api: SocketAddr,
     entry: SocketAddr,
+    reservations: Option<[std::net::TcpListener; 2]>,
     _egress: Vec<AbortOnDropHandle<()>>,
 }
 
@@ -284,8 +285,10 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let api = available_address();
-        let entry = available_address();
+        let api_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let entry_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let api = SocketAddr::from(([127, 0, 0, 1], api_listener.local_addr().unwrap().port()));
+        let entry = SocketAddr::from(([127, 0, 0, 1], entry_listener.local_addr().unwrap().port()));
         let config = json!([
             {"clash_api_address":format!("0.0.0.0:{}", api.port()), "secret":SECRET, "cors_origins":["https://dashboard.example"]},
             {"clash_api_path":directory.path().join("api.sock"), "secret":SECRET},
@@ -301,6 +304,7 @@ impl Fixture {
             config,
             api,
             entry,
+            reservations: Some([api_listener, entry_listener]),
             _egress: vec![east_task, west_task],
         }
     }
@@ -311,8 +315,9 @@ impl Fixture {
         )
         .unwrap();
     }
-    async fn start(&self) -> Process {
+    async fn start(&mut self) -> Process {
         self.write();
+        drop(self.reservations.take());
         let mut process =
             Process::start(&self.directory.path().join("config.yaml"), &["--no-reload"]);
         process.wait_for("Servers ready").await;
@@ -335,6 +340,28 @@ impl Fixture {
                 .0,
             204
         );
+    }
+}
+
+#[tokio::test]
+async fn fixture_reserves_distinct_listener_ports_until_startup() {
+    let mut fixture = Fixture::new().await;
+    assert_ne!(fixture.api.port(), fixture.entry.port());
+    for address in [fixture.api, fixture.entry] {
+        assert_eq!(
+            std::net::TcpListener::bind(address).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+    for _ in 0..2 {
+        let mut process = fixture.start().await;
+        assert!(fixture.reservations.is_none());
+        assert_eq!(
+            api(fixture.api, "GET", "/version", Value::Null).await.0,
+            200
+        );
+        drop(flow(fixture.entry, b'E').await);
+        fixture.stop(&mut process).await;
     }
 }
 
@@ -695,7 +722,7 @@ async fn auth_errors_rules_providers_and_outbound_probes() {
 
 #[tokio::test]
 async fn controller_dispatch_preserves_preflight_and_error_ordering() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let origin = "https://dashboard.example";
     for (method, status) in [("PUT", 204), ("TRACE", 403)] {
@@ -977,7 +1004,7 @@ async fn udp_payload_totals_and_destination_cancellation_are_isolated() {
 
 #[tokio::test]
 async fn stalled_requests_release_shared_connection_budget() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let mut subscriptions = Vec::new();
     for _ in 0..16 {
@@ -1031,7 +1058,7 @@ async fn stalled_requests_release_shared_connection_budget() {
 #[tokio::test]
 async fn websocket_ping_before_first_frame_preserves_snapshot() {
     use hyper_tungstenite::tungstenite::Message;
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let mut ws = websocket_path(fixture.api, "/connections?interval=60000").await;
     ws.send(Message::Ping(b"before-first-frame".to_vec().into()))
@@ -1062,7 +1089,7 @@ async fn websocket_ping_before_first_frame_preserves_snapshot() {
 
 #[tokio::test]
 async fn shared_rates_live_connection_snapshots_and_ndjson_streams() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let mut live = flow(fixture.entry, b'E').await;
     let mut connections = websocket(fixture.api).await;
@@ -1138,7 +1165,7 @@ async fn shared_rates_live_connection_snapshots_and_ndjson_streams() {
 
 #[tokio::test]
 async fn failed_save_keeps_routing_and_streams_real_logs_in_both_formats() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let mut logs = websocket_path(fixture.api, "/logs?level=warning").await;
     let mut structured = websocket_path(fixture.api, "/logs?level=error&format=structured").await;
