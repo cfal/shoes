@@ -392,7 +392,7 @@ async fn failed_activation_restores_control_generation_and_selection() {
         ["shoesGeneration"]
         .clone();
     let live = fixture.config.clone();
-    fixture.config[3]["default"] = json!("west");
+    fixture.outbound_mut()["default"] = json!("west");
     let partial = available_address();
     fixture.config.as_array_mut().unwrap().extend([
         json!({"address":partial.to_string(), "protocol":{"type":"socks"}}),

@@ -449,22 +449,24 @@ impl TcpListeners {
                         next.sockets.insert(address, listener.clone());
                         continue;
                     }
-                    match next.bind(address) {
-                        Ok(_) => {}
-                        Err(error)
-                            if error.kind() == std::io::ErrorKind::AddrInUse
-                                && previous
-                                    .sockets
-                                    .values()
-                                    .filter_map(|listener| listener.local_addr().ok())
-                                    .chain(retiring_http.iter().copied())
-                                    .any(|bound| {
-                                        bound.port() == address.port()
-                                            && (bound.ip() == address.ip()
-                                                || bound.ip().is_unspecified()
-                                                || address.ip().is_unspecified())
-                                    }) => {}
-                        Err(error) => return Err(error),
+                    if let Err(error) = next.bind(address) {
+                        if error.kind() != std::io::ErrorKind::AddrInUse {
+                            return Err(error);
+                        }
+                        let overlaps_retiring_listener = previous
+                            .sockets
+                            .values()
+                            .filter_map(|listener| listener.local_addr().ok())
+                            .chain(retiring_http.iter().copied())
+                            .any(|bound| {
+                                bound.port() == address.port()
+                                    && (bound.ip() == address.ip()
+                                        || bound.ip().is_unspecified()
+                                        || address.ip().is_unspecified())
+                            });
+                        if !overlaps_retiring_listener {
+                            return Err(error);
+                        }
                     }
                 }
             }

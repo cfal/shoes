@@ -169,14 +169,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn activation_retirement_timeout_retains_pending_socket_releases() {
         let retirements = QuicRetirements::default();
-        let (_socket, released) = oneshot::channel();
+        let (socket, released) = oneshot::channel();
         retirements.0.lock().push(released);
         assert_eq!(
             retirements.wait().await.unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
         assert_eq!(retirements.0.lock().len(), 1);
-        drop(_socket);
+        drop(socket);
         retirements.wait().await.unwrap();
         assert!(retirements.0.lock().is_empty());
     }

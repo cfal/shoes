@@ -214,17 +214,17 @@ impl Registry {
     }
 
     pub(crate) fn listener_addresses(&self) -> Vec<std::net::SocketAddr> {
-        self.workers
-            .iter()
-            .flat_map(|worker| {
+        let mut addresses = Vec::new();
+        for worker in &self.workers {
+            addresses.extend(
                 worker
                     .listeners
                     .lock()
                     .iter()
-                    .filter_map(|listener| listener.local_addr().ok())
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+                    .filter_map(|listener| listener.local_addr().ok()),
+            );
+        }
+        addresses
     }
 
     pub(crate) async fn start(&self) {

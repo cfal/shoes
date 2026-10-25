@@ -362,6 +362,24 @@ impl RunningServers {
         }
     }
 
+    async fn activate(
+        &mut self,
+        prepared: &mut PreparedServers,
+        control: Option<&crate::control::runtime::ControlService>,
+    ) -> io::Result<()> {
+        self.start_retry(prepared).await?;
+        if let Some(control) = control {
+            if let Some(generation) = &prepared.generation {
+                control.runtime.publish(generation.clone()).await?;
+            }
+            control.runtime.resume().await?;
+        }
+        // Workers can update durable ACME state, so activation starts them last.
+        prepared.certificates.start().await;
+        prepared.tcp.activate();
+        Ok(())
+    }
+
     async fn rollback(
         &mut self,
         previous: &mut PreparedServers,
@@ -374,6 +392,7 @@ impl RunningServers {
             .retire_unused(&previous.certificates)
             .await;
         candidate.certificates.shutdown().await;
+        // Candidate-only sockets can overlap addresses the previous listeners rebind.
         candidate.tcp = TcpListeners::default();
         self.quic_retirements.wait().await?;
         // Pools may be shared with the live registry: rejection is not terminal shutdown.
@@ -381,16 +400,7 @@ impl RunningServers {
             log::warn!("Rejected candidate Fake DNS checkpoint failed: {error}");
         }
         previous.tcp.defer_admission();
-        self.start_retry(previous).await?;
-        if let Some(control) = control {
-            if let Some(generation) = &previous.generation {
-                control.runtime.publish(generation.clone()).await?;
-            }
-            control.runtime.resume().await?;
-        }
-        previous.certificates.start().await;
-        previous.tcp.activate();
-        Ok(())
+        self.activate(previous, control).await
     }
 }
 
@@ -703,23 +713,10 @@ async fn run_inner(
                 return Err(error);
             },
         }
-        let activation = async {
-            running.start_retry(&mut candidate).await?;
-            if let Some(control) = control.as_ref() {
-                if let Some(generation) = &candidate.generation {
-                    control.runtime.publish(generation.clone()).await?;
-                }
-                control.runtime.resume().await?;
-            }
-            // Workers can update durable ACME state, so activation starts them last.
-            candidate.certificates.start().await;
-            candidate.tcp.activate();
-            Ok::<_, io::Error>(())
-        };
         let result = tokio::select! {
             biased;
             _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
-            result = activation => result,
+            result = running.activate(&mut candidate, control.as_ref()) => result,
         };
         if let Err(error) = result {
             let rollback = tokio::select! {
