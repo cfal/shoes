@@ -601,6 +601,12 @@ fn available_address() -> SocketAddr {
         .unwrap()
 }
 
+fn reserve_address() -> (std::net::TcpListener, SocketAddr) {
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let address = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+    (listener, address)
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn tun_worker_failure_exits_nonzero_and_releases_other_listeners() {

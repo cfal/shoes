@@ -1,4 +1,4 @@
-use super::{Process, available_address};
+use super::{Process, available_address, reserve_address};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -285,10 +285,8 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let api_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let entry_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let api = SocketAddr::from(([127, 0, 0, 1], api_listener.local_addr().unwrap().port()));
-        let entry = SocketAddr::from(([127, 0, 0, 1], entry_listener.local_addr().unwrap().port()));
+        let (api_listener, api) = reserve_address();
+        let (entry_listener, entry) = reserve_address();
         let config = json!([
             {"clash_api_address":format!("0.0.0.0:{}", api.port()), "secret":SECRET, "cors_origins":["https://dashboard.example"]},
             {"clash_api_path":directory.path().join("api.sock"), "secret":SECRET},
@@ -349,7 +347,9 @@ async fn fixture_reserves_distinct_listener_ports_until_startup() {
     assert_ne!(fixture.api.port(), fixture.entry.port());
     for address in [fixture.api, fixture.entry] {
         assert_eq!(
-            std::net::TcpListener::bind(address).unwrap_err().kind(),
+            std::net::TcpListener::bind(("0.0.0.0", address.port()))
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::AddrInUse
         );
     }
@@ -1320,9 +1320,9 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
             client = json!({"type":"tls", "sni_hostname":"localhost", "verify":false, "alpn_protocols":[alpn], "protocol":client});
         }
         let directory = tempfile::tempdir().unwrap();
-        let controller = available_address();
-        let remote = available_address();
-        let entry = available_address();
+        let (controller_listener, controller) = reserve_address();
+        let (remote_listener, remote) = reserve_address();
+        let (entry_listener, entry) = reserve_address();
         let server_path = directory.path().join("server.yaml");
         let client_path = directory.path().join("client.yaml");
         let mut server_config = json!([
@@ -1341,8 +1341,11 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
         }
         std::fs::write(&server_path, serde_yaml::to_string(&server_config).unwrap()).unwrap();
         std::fs::write(&client_path, serde_yaml::to_string(&client_config).unwrap()).unwrap();
+        drop(controller_listener);
+        drop(remote_listener);
         let mut server = Process::start(&server_path, &["--no-reload"]);
         server.wait_for("Servers ready").await;
+        drop(entry_listener);
         let mut client = Process::start(&client_path, &["--no-reload"]);
         client.wait_for("Servers ready").await;
         let payload = vec![b'x'; 4096];

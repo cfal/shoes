@@ -1,4 +1,4 @@
-use crate::{Process, available_address};
+use crate::{Process, available_address, reserve_address};
 use serde_json::json;
 use std::{process::Command, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,11 +23,15 @@ async fn persisted_acme_retry_is_reported_once_without_contacting_the_ca() {
         })).unwrap()).unwrap();
         std::fs::set_permissions(&state_file, std::fs::Permissions::from_mode(0o600)).unwrap();
         let path = directory.path().join("config.yaml");
+        let (challenge_listener, challenge) = reserve_address();
+        let (proxy_listener, proxy) = reserve_address();
         std::fs::write(&path, serde_yaml::to_string(&json!([
             {"certificate_source": "managed", "type": "acme", "domains": ["proxy.test"], "directory_url": url,
-             "state_dir": state, "challenge": {"type": "http01", "listen": [available_address().to_string()]}},
-            {"address": available_address().to_string(), "protocol": {"type": "socks"}}
+             "state_dir": state, "challenge": {"type": "http01", "listen": [challenge.to_string()]}},
+            {"address": proxy.to_string(), "protocol": {"type": "socks"}}
         ])).unwrap()).unwrap();
+        drop(challenge_listener);
+        drop(proxy_listener);
         let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
             .args(["-t", "1"]).arg(&path).env_remove("RUST_LOG")
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
@@ -74,13 +78,17 @@ async fn certificate_failures_are_visible_with_default_logging() {
             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
         });
         let path = directory.path().join("config.yaml");
+        let (challenge_listener, challenge) = reserve_address();
+        let (proxy_listener, proxy) = reserve_address();
         std::fs::write(&path, serde_yaml::to_string(&json!([
             {"certificate_source": "files", "type": "files", "cert": cert, "key": key},
             {"certificate_source": "managed", "type": "acme", "domains": ["proxy.test"], "directory_url": url,
-                "state_dir": directory.path().join("state"), "challenge": {"type": "http01", "listen": [available_address().to_string()]}},
-            {"address": available_address().to_string(), "protocol": {"type": "tls", "default_tls_target": {
+                "state_dir": directory.path().join("state"), "challenge": {"type": "http01", "listen": [challenge.to_string()]}},
+            {"address": proxy.to_string(), "protocol": {"type": "tls", "default_tls_target": {
                 "certificate_source": "files", "protocol": {"type": "socks"}}}}
         ])).unwrap()).unwrap();
+        drop(challenge_listener);
+        drop(proxy_listener);
         let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
             .args(["-t", "1"]).arg(&path).env_remove("RUST_LOG")
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
@@ -293,8 +301,8 @@ async fn reload_releases_retired_http01_ports_before_starting_proxy_listeners() 
     timeout(Duration::from_secs(20), async {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.yaml");
-        let challenge = available_address();
-        let proxy = available_address();
+        let (challenge_listener, challenge) = reserve_address();
+        let (proxy_listener, proxy) = reserve_address();
         let mut config = json!([
             {"certificate_source": "managed", "type": "acme", "domains": ["proxy.test"],
                 "directory_url": "http://127.0.0.1:9/directory", "state_dir": directory.path().join("state"),
@@ -303,6 +311,8 @@ async fn reload_releases_retired_http01_ports_before_starting_proxy_listeners() 
                 "certificate_source": "managed", "protocol": {"type": "socks"}}}}
         ]);
         std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        drop(challenge_listener);
+        drop(proxy_listener);
         let mut child = Process::start(&path, &[]);
         child.wait_for("Servers ready").await;
         config[0]["challenge"] = json!({"type": "tls_alpn01"});
