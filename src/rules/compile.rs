@@ -21,6 +21,7 @@ pub struct Compiler {
     pub(crate) policy_groups: HashSet<String>,
     pub(crate) sources: HashMap<crate::rule_set::SourceKey, Arc<Predicate>>,
     pub(crate) input_files: HashMap<std::path::PathBuf, std::fs::File>,
+    pub(crate) remote_files: HashSet<std::path::PathBuf>,
     bytes: usize,
     entries: usize,
     evaluation_work: usize,

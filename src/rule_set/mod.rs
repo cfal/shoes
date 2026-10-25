@@ -401,6 +401,12 @@ pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
 }
 
 pub fn load(configs: &mut [Config], compiler: &mut Compiler) -> io::Result<()> {
+    visit_sources(configs, &mut |source| {
+        if source.url.is_some() {
+            compiler.remote_files.insert(source_identity(&source.path)?);
+        }
+        Ok(())
+    })?;
     compiler
         .policy_groups
         .extend(["allow-all-direct".into(), "block-all".into()]);
@@ -563,6 +569,7 @@ fn read_file(
             "code and attributes are only valid for DAT formats",
         ));
     }
+    let remote = source.url.is_some() || compiler.remote_files.contains(&path);
     let key = SourceKey::new(path, format, source);
     if let Some(predicate) = compiler.sources.get(&key) {
         if source.url.is_some() && matches!(predicate.kind, crate::rules::Kind::Constant(false)) {
@@ -575,41 +582,52 @@ fn read_file(
             "rule source limit exceeded (1024 distinct sources)",
         ));
     }
-    let predicate = compiler.source(|compiler| {
-        // JSON may retain doubled escape scratch alongside an owned map key.
-        let factor = if format == Format::SingboxJson { 4 } else { 2 };
-        compiler.charge(size.saturating_mul(factor).saturating_add(64), 0)?;
-        let mut bytes = Vec::with_capacity(size + 1);
-        file.take(size as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() != size {
-            return Err(invalid(
-                "rule source changed while reading; retry with an atomic file replacement",
-            ));
-        }
-        match format {
-            Format::Srs => srs::decode(&bytes, compiler),
-            Format::SingboxJson => singbox::decode(&bytes, compiler),
-            Format::MihomoYaml | Format::MihomoText => mihomo::decode(
-                &bytes,
-                format == Format::MihomoYaml,
-                source
-                    .behavior
-                    .ok_or_else(|| invalid("Mihomo YAML/text requires behavior"))?,
-                compiler,
-            ),
-            Format::Mrs => mrs::decode(&bytes, source.behavior, compiler),
-            Format::GeositeDat | Format::GeoipDat => geodata::decode(
-                &bytes,
-                format == Format::GeoipDat,
-                source
-                    .code
-                    .as_deref()
-                    .ok_or_else(|| invalid("DAT sources require an explicit code"))?,
-                &source.attributes,
-                compiler,
-            ),
-        }
-    })?;
+    let predicate = compiler
+        .source(|compiler| {
+            // JSON may retain doubled escape scratch alongside an owned map key.
+            let factor = if format == Format::SingboxJson { 4 } else { 2 };
+            compiler.charge(size.saturating_mul(factor).saturating_add(64), 0)?;
+            let mut bytes = Vec::with_capacity(size + 1);
+            file.take(size as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() != size {
+                return Err(invalid(
+                    "rule source changed while reading; retry with an atomic file replacement",
+                ));
+            }
+            match format {
+                Format::Srs => srs::decode(&bytes, compiler),
+                Format::SingboxJson => singbox::decode(&bytes, compiler),
+                Format::MihomoYaml | Format::MihomoText => mihomo::decode(
+                    &bytes,
+                    format == Format::MihomoYaml,
+                    source
+                        .behavior
+                        .ok_or_else(|| invalid("Mihomo YAML/text requires behavior"))?,
+                    compiler,
+                ),
+                Format::Mrs => mrs::decode(&bytes, source.behavior, compiler),
+                Format::GeositeDat | Format::GeoipDat => geodata::decode(
+                    &bytes,
+                    format == Format::GeoipDat,
+                    source
+                        .code
+                        .as_deref()
+                        .ok_or_else(|| invalid("DAT sources require an explicit code"))?,
+                    &source.attributes,
+                    compiler,
+                ),
+            }
+        })
+        .map_err(|error| {
+            if remote {
+                io::Error::new(
+                    error.kind(),
+                    "remote rule data failed validation (details redacted)",
+                )
+            } else {
+                error
+            }
+        })?;
     if source.url.is_some() && matches!(predicate.kind, crate::rules::Kind::Constant(false)) {
         return Err(invalid("refusing an empty remote rule set"));
     }

@@ -1739,6 +1739,71 @@ async fn staged_alias_errors_redact_downloaded_content_in_cold_and_refresh_paths
     }
 }
 
+#[tokio::test]
+async fn existing_remote_cache_errors_and_local_aliases_redact_payloads() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    let source = source("http://127.0.0.1:1/rules?QUERY_SECRET", &path);
+    write_rule(
+        &path,
+        br#"{"version":1,"rules":[{"DOWNLOADED_SECRET":true}]}"#,
+    );
+    let error = crate::config::compile_configs(configs(&source))
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("remote rule data failed validation"),
+        "{error}"
+    );
+    assert!(error.contains(path.to_str().unwrap()), "{error}");
+    assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
+    assert!(!error.contains("QUERY_SECRET"), "{error}");
+
+    write_rule(
+        &path,
+        br#"{"version":1,"rules":[{"domain_regex":["DOWNLOADED_SECRET"]}]}"#,
+    );
+    let alias = dir.path().join("alias.json");
+    symlink(&path, &alias).unwrap();
+    let mut config = configs(&source);
+    config.insert(
+        0,
+        serde_json::from_value(serde_json::json!({
+            "rule_source_group": "alias", "rules": [{
+                "path": alias, "format": "mihomo_text", "behavior": "ipcidr"
+            }]
+        }))
+        .unwrap(),
+    );
+    for online in [false, true] {
+        let result = if online {
+            prepare(config.clone(), None, &mut None).await
+        } else {
+            crate::config::compile_configs(config.clone()).await
+        };
+        let error = result.err().unwrap().to_string();
+        assert!(
+            error.contains("remote rule data failed validation"),
+            "{error}"
+        );
+        assert!(error.contains(alias.to_str().unwrap()), "{error}");
+        assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
+    }
+    config.remove(1);
+    let error = crate::config::compile_configs(config)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("invalid CIDR"), "{error}");
+    assert!(
+        error.contains("DOWNLOADED_SECRET"),
+        "ordinary local errors retain detail: {error}"
+    );
+}
+
 #[test]
 fn source_identity_resolves_existing_paths_and_missing_leaf_parents() {
     use crate::rule_set::source_identity;
