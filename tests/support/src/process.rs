@@ -172,7 +172,8 @@ impl Drop for ProcessGuard {
     }
 }
 
-fn stop_child(process: &mut Child, graceful: bool, name: &str) {
+/// Stops an owned, unreaped child; the caller must check liveness first and reap it.
+pub fn stop_child(process: &mut Child, graceful: bool, name: &str) {
     #[cfg(target_os = "linux")]
     if graceful && terminate_child(process, GRACEFUL_STOP_TIMEOUT) {
         return;
