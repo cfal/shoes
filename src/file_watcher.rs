@@ -6,6 +6,9 @@ use std::time::Duration;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
+#[cfg(unix)]
+pub(crate) mod managed;
+
 pub(crate) fn watch<P: AsRef<Path>>(
     paths: &[P],
     tx: mpsc::Sender<()>,
@@ -52,7 +55,16 @@ pub(crate) fn watch<P: AsRef<Path>>(
                 if matches!(
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) && event.paths.iter().any(|path| files.contains(path)) =>
+                ) && event.paths.iter().any(|path| {
+                    if !files.contains(path) {
+                        return false;
+                    }
+                    #[cfg(unix)]
+                    if managed::is_installed_version(path) {
+                        return false;
+                    }
+                    true
+                }) =>
             {
                 let _ = tx.try_send(());
             }

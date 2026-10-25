@@ -7,7 +7,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) fn cache_file(path: &Path) -> io::Result<File> {
     let (directory, name) = checked_path(path)?;
@@ -17,6 +17,7 @@ pub(crate) fn cache_file(path: &Path) -> io::Result<File> {
 }
 
 pub(super) struct Install {
+    path: PathBuf,
     directory: File,
     destination: CString,
     stage: CString,
@@ -50,6 +51,7 @@ impl Install {
 
     pub(super) fn open(path: &Path) -> io::Result<Self> {
         let (directory, name) = checked_path(path)?;
+        let path = crate::rule_set::source_identity(path)?;
         let mut lock_name = name.clone();
         lock_name.push(CACHE_LOCK_SUFFIX);
         let lock_name = c_name(&lock_name)?;
@@ -105,6 +107,7 @@ impl Install {
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
         )?;
         Ok(Self {
+            path,
             directory,
             destination,
             stage,
@@ -176,10 +179,14 @@ impl Install {
         #[cfg(test)]
         self.fail_before_rename()?;
         let fd = self.directory.as_raw_fd();
-        if unsafe { libc::renameat(fd, self.stage.as_ptr(), fd, self.destination.as_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        crate::file_watcher::managed::publish(&self.path, &self.file.metadata()?, || {
+            if unsafe { libc::renameat(fd, self.stage.as_ptr(), fd, self.destination.as_ptr()) }
+                != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })
     }
 
     fn sync_published(&self) -> Outcome {

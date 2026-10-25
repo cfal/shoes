@@ -39,6 +39,7 @@ async fn load_candidate(
     let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
     dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
     recovery_dependencies.retain(|path| !dependencies.contains(path));
+    discovered(&dependencies, &recovery_dependencies);
     let result: io::Result<_> = async {
         let (mut configs, _) = config::convert_cert_paths(configs).await?;
         let mut has_remote = false;
@@ -65,9 +66,6 @@ async fn load_candidate(
         Ok((validated, snapshot))
     }
     .await;
-    // Cold installs precede new cache watches. Failed candidates still expose
-    // their dependencies so repairing a file can trigger recovery.
-    discovered(&dependencies, &recovery_dependencies);
     let (mut validated, snapshot) = result?;
     validated.reload_files = dependencies;
     tokio::task::spawn_blocking(move || {

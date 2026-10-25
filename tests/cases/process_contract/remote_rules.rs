@@ -84,7 +84,7 @@ async fn cold_installs_do_not_queue_an_extra_watcher_reload() {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             requests += 1;
-            assert!(requests <= 4, "unexpected repeated refreshes");
+            assert!(requests <= 8, "unexpected repeated refreshes");
             let mut headers = Vec::new();
             while !headers.ends_with(b"\r\n\r\n") {
                 headers.push(stream.read_u8().await.unwrap());
@@ -94,10 +94,36 @@ async fn cold_installs_do_not_queue_an_extra_watcher_reload() {
         }
     }));
     let mut child = Process::start(&path, &[]);
-    for cache in ["cache.json", "replacement.json"] {
-        if cache == "replacement.json" {
-            config[0]["rules"][0]["path"] = serde_json::json!(cache);
-            std::fs::write(&path, config.to_string()).unwrap();
+    let cache = dir.path().join("replacement.json");
+    for change in [
+        "startup",
+        "new cache",
+        "deleted cache",
+        "external replacement",
+        "touch",
+    ] {
+        match change {
+            "startup" => {}
+            "new cache" => {
+                config[0]["rules"][0]["path"] = serde_json::json!("replacement.json");
+                std::fs::write(&path, config.to_string()).unwrap();
+            }
+            "deleted cache" => std::fs::remove_file(&cache).unwrap(),
+            "external replacement" => {
+                let external = dir.path().join("external.json");
+                std::fs::write(&external, MISS).unwrap();
+                std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                std::fs::rename(external, &cache).unwrap();
+            }
+            "touch" => {
+                let file = std::fs::File::open(&cache).unwrap();
+                let modified =
+                    file.metadata().unwrap().modified().unwrap() + Duration::from_secs(1);
+                file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            }
+            _ => unreachable!(),
         }
         child.wait_for("Servers ready").await;
         roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
@@ -113,9 +139,48 @@ async fn cold_installs_do_not_queue_an_extra_watcher_reload() {
             })
             .await
             .is_err(),
-            "cold installation queued a duplicate reload"
+            "{change} queued a duplicate reload"
         );
     }
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+    fixture.abort();
+    assert!(fixture.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn config_edits_during_cold_download_are_not_suppressed() {
+    let dir = directory();
+    let path = dir.path().join("config.yaml");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    config(
+        &path,
+        address,
+        echo.local_addr(),
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+    );
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config[0]["rules"][0]["update_interval"] = serde_json::json!("7d");
+    std::fs::write(&path, config.to_string()).unwrap();
+    let mut child = Process::start(&path, &[]);
+    let pending = request(&listener).await;
+    config[0]["rules"][1]["action"] = serde_json::json!("block");
+    std::fs::write(&path, config.to_string()).unwrap();
+    respond(pending, MISS).await;
+    let fixture = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        loop {
+            respond(request(&listener).await, MISS).await;
+        }
+    }));
+    child.wait_for("Servers ready").await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    child.wait_for("Servers ready").await;
+    blocked(address).await;
     child.signal(libc::SIGTERM);
     assert!(child.exit().await.success());
     fixture.abort();

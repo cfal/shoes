@@ -250,6 +250,44 @@ async fn activation_discards_candidate_identity_events_but_preserves_reload_even
     .unwrap();
 }
 
+#[tokio::test]
+async fn dependencies_are_discovered_before_the_candidate_reads_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("local.json");
+    let config = dir.path().join("config.yaml");
+    std::fs::write(
+        &source,
+        r#"{"version":1,"rules":[{"domain":["example.com"]}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &config,
+        serde_json::json!([{
+            "address": "127.0.0.1:0", "protocol": {"type": "socks"},
+            "rules": [{"path": source, "action": "block"}]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let paths = [config.to_str().unwrap().to_owned()];
+    let configs = config::load_configs(&paths).await.unwrap();
+    let error = load_candidate(
+        &paths,
+        configs,
+        &mut |paths, _| {
+            assert!(paths.contains(&source));
+            std::fs::write(&source, "invalid").unwrap();
+        },
+        true,
+        None,
+        &mut None,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("rule source"), "{error}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn reload_debounce_includes_candidate_recovery_events() {
     let (tx, mut changes) = mpsc::channel(1);
