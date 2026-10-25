@@ -248,14 +248,12 @@ impl<'de> Deserialize<'de> for RuleConfig {
         }
 
         let mut value = serde_json::Value::deserialize(deserializer)?;
-        if !value.is_object() {
+        let Some(fields) = value.as_object_mut() else {
             return Err(D::Error::custom(
                 "a policy rule requires a mapping with masks or a source",
             ));
-        }
-        if let Some(fields) = value.as_object_mut()
-            && (fields.contains_key("path") || fields.contains_key("url"))
-        {
+        };
+        if fields.contains_key("path") || fields.contains_key("url") {
             if fields.contains_key("masks") || fields.contains_key("mask") {
                 return Err(D::Error::custom(
                     "a flat rule source cannot also specify masks",

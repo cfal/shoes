@@ -1,12 +1,13 @@
-use super::*;
+use super::MAX_BYTES;
+use crate::rule_set::{CACHE_LOCK_SUFFIX, CACHE_STAGE_SUFFIX};
+use crate::rules::invalid;
 use std::ffi::{CString, OsStr};
-use std::fs::Metadata;
+use std::fs::{File, Metadata};
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Component;
-const LOCK_SUFFIX: &str = ".shoes-update.lock";
-const STAGE_SUFFIX: &str = ".shoes-update.tmp";
+use std::path::{Component, Path};
 
 pub(crate) fn cache_file(path: &Path) -> io::Result<File> {
     let (directory, name) = checked_path(path)?;
@@ -20,7 +21,7 @@ pub(super) struct Install {
     destination: CString,
     stage: CString,
     pub(super) file: File,
-    _lock: File,
+    lock: File,
     lock_name: CString,
     original: Option<Metadata>,
     old_digest: Option<blake3::Hash>,
@@ -43,7 +44,7 @@ impl Install {
     pub(super) fn open(path: &Path) -> io::Result<Self> {
         let (directory, name) = checked_path(path)?;
         let mut lock_name = name.clone();
-        lock_name.push(LOCK_SUFFIX);
+        lock_name.push(CACHE_LOCK_SUFFIX);
         let lock_name = c_name(&lock_name)?;
         let lock = open_at(&directory, &lock_name, libc::O_RDWR | libc::O_CREAT)?;
         check_file(&lock.metadata()?, true)?;
@@ -72,15 +73,15 @@ impl Install {
             Err(error) => return Err(error),
         };
         let mut stage_name = name;
-        stage_name.push(STAGE_SUFFIX);
+        stage_name.push(CACHE_STAGE_SUFFIX);
         let stage = c_name(&stage_name)?;
         match open_at(&directory, &stage, libc::O_RDONLY) {
             Ok(file) => {
                 let metadata = file.metadata()?;
                 check_file(&metadata, false)?;
-                if metadata.mode() & 0o077 & !original.as_ref().map_or(0o600, MetadataExt::mode)
-                    != 0
-                {
+                let destination_mode = original.as_ref().map_or(0o600, MetadataExt::mode);
+                let excess_permissions = metadata.mode() & 0o077 & !destination_mode;
+                if excess_permissions != 0 {
                     return Err(invalid(
                         "stale staging permissions exceed destination permissions",
                     ));
@@ -101,7 +102,7 @@ impl Install {
             destination,
             stage,
             file,
-            _lock: lock,
+            lock,
             lock_name,
             original,
             old_digest,
@@ -160,7 +161,7 @@ impl Install {
             Err(error) if error.kind() == io::ErrorKind::NotFound && self.original.is_none() => {}
             Err(error) => return Err(error),
         }
-        for (name, file) in [(&self.lock_name, &self._lock), (&self.stage, &self.file)] {
+        for (name, file) in [(&self.lock_name, &self.lock), (&self.stage, &self.file)] {
             let current = open_at(&self.directory, name, libc::O_RDONLY)?.metadata()?;
             check_file(&current, false)?;
             if stamp(&current) != stamp(&file.metadata()?) {
@@ -217,10 +218,11 @@ fn unlink_at(directory: &File, name: &CString) -> io::Result<()> {
 }
 
 fn check_file(metadata: &Metadata, private: bool) -> io::Result<()> {
+    let forbidden_mode = if private { 0o7077 } else { 0o7022 };
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.nlink() != 1
-        || metadata.mode() & if private { 0o7077 } else { 0o7022 } != 0
+        || metadata.mode() & forbidden_mode != 0
     {
         return Err(invalid(
             "file must be owned, regular, singly linked and not writable by others; sidecars must be private",
@@ -241,7 +243,7 @@ fn checked_path(path: &Path) -> io::Result<(File, std::ffi::OsString)> {
         .file_name()
         .ok_or_else(|| invalid("destination must name a file"))?
         .to_string_lossy();
-    if name.ends_with(LOCK_SUFFIX) || name.ends_with(STAGE_SUFFIX) {
+    if name.ends_with(CACHE_LOCK_SUFFIX) || name.ends_with(CACHE_STAGE_SUFFIX) {
         return Err(invalid("updater sidecar suffixes are reserved"));
     }
     let parent = path.parent().unwrap();
@@ -300,10 +302,6 @@ fn hash(file: &mut File) -> io::Result<blake3::Hash> {
         digest.update(&buffer[..count]);
     }
     Ok(digest.finalize())
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 #[cfg(test)]

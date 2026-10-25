@@ -3,9 +3,7 @@ mod http;
 mod install;
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read};
-use std::path::Path;
+use std::io;
 use std::time::{Duration, SystemTime};
 
 use crate::config::{Config, GlobalLimits, ValidatedConfigs};
@@ -51,7 +49,7 @@ async fn stage(
     limits: Limits,
 ) -> io::Result<Staged> {
     let mut install = Install::open(&source.path)?;
-    let (_, digest) = crate::control::url_test::BACKGROUND
+    let digest = crate::control::url_test::BACKGROUND
         .scope(
             (),
             timeout(
@@ -64,12 +62,8 @@ async fn stage(
     let validation_source = source.clone();
     let file = install.file.try_clone()?;
     crate::config::blocking_compile(move || {
-        let predicate = crate::rule_set::validate_file(&validation_source, file)
-            .map_err(|_| invalid("download failed Shoes rule validation"))?;
-        if matches!(predicate.kind, crate::rules::Kind::Constant(false)) {
-            return Err(invalid("refusing an empty remote rule set"));
-        }
-        Ok(())
+        crate::rule_set::validate_file(&validation_source, file)
+            .map_err(|_| invalid("download failed Shoes rule validation"))
     })
     .await?;
     Ok(Staged {
@@ -190,6 +184,20 @@ struct Scheduled {
     failures: u32,
 }
 
+async fn refresh_source(
+    source: &RuleSource,
+    configs: &[Config],
+    dns: &DnsRegistry,
+    global: GlobalLimits,
+) -> io::Result<bool> {
+    let mut staged = stage(source, dns, global, Limits::default()).await?;
+    if staged.install.unchanged(staged.digest)? {
+        return Ok(false);
+    }
+    validate_staged(configs.to_vec(), std::slice::from_ref(&staged)).await?;
+    Ok(staged.install.finish(staged.digest)?.changed())
+}
+
 /// Polled by the process select loop. Dropping that future cancels the HTTP
 /// connection and removes its stage; no detached task retains a generation.
 pub(crate) struct Refresh {
@@ -230,29 +238,12 @@ impl Refresh {
 
     pub(crate) async fn changed(&mut self, dns: &DnsRegistry, global: GlobalLimits) {
         loop {
-            let Some((index, next)) = self
-                .scheduled
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, item)| item.due)
-            else {
+            let Some(item) = self.scheduled.iter_mut().min_by_key(|item| item.due) else {
                 std::future::pending::<()>().await;
                 return;
             };
-            tokio::time::sleep_until(next.due).await;
-            let item = &mut self.scheduled[index];
-            let result = async {
-                let mut staged = stage(&item.source, dns, global, Limits::default()).await?;
-                if staged.install.unchanged(staged.digest)? {
-                    return Ok(false);
-                }
-                validate_staged(self.configs.clone(), std::slice::from_ref(&staged)).await?;
-                staged
-                    .install
-                    .finish(staged.digest)
-                    .map(|outcome| outcome.changed())
-            }
-            .await;
+            tokio::time::sleep_until(item.due).await;
+            let result = refresh_source(&item.source, &self.configs, dns, global).await;
             let interval = item.source.interval().expect("validated interval");
             let delay = match &result {
                 Ok(_) => {

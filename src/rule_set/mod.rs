@@ -24,6 +24,8 @@ pub use mihomo::Behavior;
 pub const YAML_PARSER_SCRATCH_BYTES: usize = 64 * 1024 * 1024;
 
 const MAX_INPUT: usize = 64 * 1024 * 1024;
+pub(crate) const CACHE_LOCK_SUFFIX: &str = ".shoes-update.lock";
+pub(crate) const CACHE_STAGE_SUFFIX: &str = ".shoes-update.tmp";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -127,9 +129,17 @@ impl RuleSource {
                 _ => None,
             }
         }
-        self.parsed_url()?.and_then(|url| extension(Path::new(url.path())))
-            .or_else(|| extension(&self.path))
-            .ok_or_else(|| invalid("cannot detect rule source format; specify format explicitly (DAT requires geosite_dat or geoip_dat)"))
+        if let Some(url) = self.parsed_url()?
+            && let Some(format) = extension(Path::new(url.path()))
+        {
+            return Ok(format);
+        }
+        if let Some(format) = extension(&self.path) {
+            return Ok(format);
+        }
+        Err(invalid(
+            "cannot detect rule source format; specify format explicitly (DAT requires geosite_dat or geoip_dat)",
+        ))
     }
 
     pub(crate) fn interval(&self) -> io::Result<std::time::Duration> {
@@ -220,29 +230,30 @@ pub fn dependencies(configs: &mut [Config]) -> io::Result<Vec<PathBuf>> {
 pub(crate) fn remote_sources(configs: &mut [Config]) -> io::Result<Vec<RuleSource>> {
     let mut sources = std::collections::BTreeMap::<PathBuf, RuleSource>::new();
     visit_sources(configs, &mut |source| {
-        if source.parsed_url()?.is_some() {
-            if !source.path.is_absolute() {
-                return Err(invalid(
-                    "remote cache paths must be absolute for string configs",
-                ));
-            }
-            if let Some(previous) = sources.get(&source.path) {
-                if serde_json::to_value(previous)? != serde_json::to_value(&source)? {
-                    return Err(invalid("conflicting remote sources share a cache path"));
-                }
-            } else {
-                if sources.len() >= 1024 {
-                    return Err(invalid("remote source limit exceeded (1024)"));
-                }
-                sources.insert(source.path.clone(), source.clone());
-            }
+        if source.parsed_url()?.is_none() {
+            return Ok(());
         }
+        if !source.path.is_absolute() {
+            return Err(invalid(
+                "remote cache paths must be absolute for string configs",
+            ));
+        }
+        if let Some(previous) = sources.get(&source.path) {
+            if serde_json::to_value(previous)? != serde_json::to_value(&source)? {
+                return Err(invalid("conflicting remote sources share a cache path"));
+            }
+            return Ok(());
+        }
+        if sources.len() >= 1024 {
+            return Err(invalid("remote source limit exceeded (1024)"));
+        }
+        sources.insert(source.path.clone(), source.clone());
         Ok(())
     })?;
     Ok(sources.into_values().collect())
 }
 
-pub(crate) fn cache_paths(path: &Path) -> [PathBuf; 3] {
+fn cache_paths(path: &Path) -> [PathBuf; 3] {
     let sidecar = |suffix| {
         let mut name = path.as_os_str().to_os_string();
         name.push(suffix);
@@ -250,20 +261,23 @@ pub(crate) fn cache_paths(path: &Path) -> [PathBuf; 3] {
     };
     [
         path.into(),
-        sidecar(".shoes-update.lock"),
-        sidecar(".shoes-update.tmp"),
+        sidecar(CACHE_LOCK_SUFFIX),
+        sidecar(CACHE_STAGE_SUFFIX),
     ]
 }
 
 pub(crate) fn source_identity(path: &Path) -> io::Result<PathBuf> {
     let absolute = std::path::absolute(path)?;
-    Ok(absolute.canonicalize().unwrap_or_else(|_| {
-        absolute
-            .parent()
-            .and_then(|parent| parent.canonicalize().ok())
-            .zip(absolute.file_name())
-            .map_or_else(|| absolute.clone(), |(parent, name)| parent.join(name))
-    }))
+    if let Ok(canonical) = absolute.canonicalize() {
+        return Ok(canonical);
+    }
+    if let Some(parent) = absolute.parent()
+        && let Ok(parent) = parent.canonicalize()
+        && let Some(name) = absolute.file_name()
+    {
+        return Ok(parent.join(name));
+    }
+    Ok(absolute)
 }
 
 pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -> io::Result<()> {
@@ -480,11 +494,8 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
     read_file(source, options.open(&path)?, path, compiler)
 }
 
-pub(crate) fn validate_file(
-    source: &RuleSource,
-    file: std::fs::File,
-) -> io::Result<Arc<Predicate>> {
-    read_file(source, file, source.path.clone(), &mut Compiler::default())
+pub(crate) fn validate_file(source: &RuleSource, file: std::fs::File) -> io::Result<()> {
+    read_file(source, file, source.path.clone(), &mut Compiler::default()).map(|_| ())
 }
 
 fn read_file(

@@ -1,9 +1,9 @@
 use super::install::FAIL_RENAME;
 use super::*;
-use std::fs::Metadata;
-use std::io::Write;
+use std::fs::{File, Metadata};
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 const STAGE_SUFFIX: &str = ".shoes-update.tmp";
@@ -219,6 +219,22 @@ async fn rejects_http_and_parser_failures_without_touching_last_good() {
         assert!(!error.contains(&url), "{error}");
         assert_preserved(&path, &original);
     }
+}
+
+#[tokio::test]
+async fn empty_download_keeps_the_validation_error_and_last_good_file() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    let (url, fixture) = serve(response(200, "", br#"{"version":1,"rules":[]}"#)).await;
+    let error = update(&source(&url, &path), Limits::default())
+        .await
+        .unwrap_err();
+    fixture.await.unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(error.to_string(), "download failed Shoes rule validation");
+    assert_preserved(&path, &original);
 }
 
 #[tokio::test]
@@ -813,6 +829,42 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
 }
 
 #[tokio::test]
+async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    for body in [OLD, VALID] {
+        let (url, fixture) = serve(response(200, "", body)).await;
+        let source = source(&url, &path);
+        let mut config = configs(&source);
+        config.push(
+            serde_json::from_value(serde_json::json!({
+                "rule_group": "invalid", "rules": [{"masks": {"ip_cidr": ["not an IP"]}}]
+            }))
+            .unwrap(),
+        );
+        let result = refresh_source(
+            &source,
+            &config,
+            &DnsRegistry::new(),
+            GlobalLimits::default(),
+        )
+        .await;
+        fixture.await.unwrap();
+        if body == OLD {
+            assert!(!result.unwrap());
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "download rejected by whole configuration validation"
+            );
+        }
+        assert_preserved(&path, &original);
+    }
+}
+
+#[tokio::test]
 async fn explicit_bootstrap_resolves_target_without_system_dns() {
     #[derive(Debug)]
     struct Bootstrap {
@@ -1000,6 +1052,28 @@ async fn staged_candidate_uses_normalized_paths_even_before_cache_creation() {
         .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
     assert!(error.to_string().contains("CIDR"), "{error}");
+}
+
+#[test]
+fn source_identity_resolves_existing_paths_and_missing_leaf_parents() {
+    use crate::rule_set::source_identity;
+
+    let dir = directory();
+    let parent = dir.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    let alias = dir.path().join("alias");
+    symlink(&parent, &alias).unwrap();
+    let canonical_parent = parent.canonicalize().unwrap();
+
+    write_rule(&parent.join("existing.json"), VALID);
+    for name in ["existing.json", "missing.json"] {
+        assert_eq!(
+            source_identity(&alias.join(name)).unwrap(),
+            canonical_parent.join(name)
+        );
+    }
+    let missing_parent = alias.join("missing/rules.json");
+    assert_eq!(source_identity(&missing_parent).unwrap(), missing_parent);
 }
 
 #[tokio::test]
