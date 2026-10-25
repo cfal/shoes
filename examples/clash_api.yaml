@@ -6,7 +6,7 @@
 - cache_file_path: "./cache.db"
 
 - client_group: outbound
-  strategy: selector
+  type: selector
   default: us-east
   client_proxies:
     - name: us-east

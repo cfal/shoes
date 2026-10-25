@@ -1906,11 +1906,11 @@ mod tests {
 - client_group: west
   client_proxies: [{name: west-direct, protocol: {type: direct}, bind_interface: west}]
 - client_group: first
-  strategy: selector
+  type: selector
   default: east
   client_proxies: [east, west]
 - client_group: second
-  strategy: selector
+  type: selector
   default: west
   client_proxies: [east, west]
 - dns_group: selected

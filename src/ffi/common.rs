@@ -217,6 +217,16 @@ pub async fn start_from_config(
 
     let mut validated = crate::config::compile_configs(configs).await?;
     validated.control.reject_ffi()?;
+    if validated
+        .catalog
+        .as_ref()
+        .is_some_and(|catalog| !catalog.selection.automatic.0.is_empty())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "url-test groups require the process runtime and are not supported by FFI",
+        ));
+    }
     let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
@@ -354,6 +364,20 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn url_test_configuration_is_rejected_without_a_process_supervisor() {
+        let config = r#"
+- client_group: automatic
+  type: url-test
+  url: http://probe.invalid/
+  client_proxies: [direct]
+"#;
+        let (_shutdown, shutdown) = oneshot::channel();
+        let error = start_from_config(config, shutdown).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("url-test groups"));
+    }
 
     #[test]
     fn lifecycle_requires_a_non_runtime_thread() {

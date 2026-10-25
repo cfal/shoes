@@ -23,6 +23,13 @@ pub struct H2MultiStream {
 }
 
 impl H2MultiStream {
+    fn map_error(&self, error: h2::Error) -> io::Error {
+        match &self.reservation {
+            Some(reservation) => reservation.errors().map(error),
+            None => io::Error::other(error),
+        }
+    }
+
     pub fn new(send: h2::SendStream<Bytes>, recv: h2::RecvStream) -> Self {
         Self {
             send: Arc::new(parking_lot::Mutex::new(send)),
@@ -61,12 +68,12 @@ impl AsyncRead for H2MultiStream {
                 self.recv
                     .flow_control()
                     .release_capacity(count)
-                    .map_err(io::Error::other)?;
+                    .map_err(|error| self.map_error(error))?;
                 return Poll::Ready(Ok(()));
             }
             match std::task::ready!(self.recv.poll_data(cx)) {
                 Some(Ok(data)) => self.recv_buf = data,
-                Some(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+                Some(Err(e)) => return Poll::Ready(Err(self.map_error(e))),
                 None => return Poll::Ready(Ok(())),
             }
         }
@@ -95,12 +102,12 @@ impl AsyncWrite for H2MultiStream {
             if capacity != 0 {
                 let count = wanted.min(capacity);
                 send.send_data(Bytes::copy_from_slice(&buf[..count]), false)
-                    .map_err(io::Error::other)?;
+                    .map_err(|error| self.map_error(error))?;
                 return Poll::Ready(Ok(count));
             }
             match std::task::ready!(send.poll_capacity(cx)) {
                 Some(Ok(_)) => continue,
-                Some(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+                Some(Err(e)) => return Poll::Ready(Err(self.map_error(e))),
                 None => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
             }
         }
@@ -117,9 +124,13 @@ impl AsyncWrite for H2MultiStream {
             match result {
                 Ok(()) => self.shutdown_sent = true,
                 Err(e) => {
-                    return Poll::Ready(Err(io::Error::other(format!(
-                        "H2 send END_STREAM failed: {e}"
-                    ))));
+                    let error = match &self.reservation {
+                        Some(reservation) => reservation
+                            .errors()
+                            .map_with("H2 send END_STREAM failed", e),
+                        None => io::Error::other(format!("H2 send END_STREAM failed: {e}")),
+                    };
+                    return Poll::Ready(Err(error));
                 }
             }
         }

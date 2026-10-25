@@ -290,7 +290,7 @@ impl Fixture {
             {"clash_api_address":format!("0.0.0.0:{}", api.port()), "secret":SECRET, "cors_origins":["https://dashboard.example"]},
             {"clash_api_path":directory.path().join("api.sock"), "secret":SECRET},
             {"cache_file_path":directory.path().join("cache.db")},
-            {"client_group":"outbound", "strategy":"selector", "default":"east", "client_proxies":[
+            {"client_group":"outbound", "type":"selector", "default":"east", "client_proxies":[
                 {"name":"east", "address":east.to_string(), "protocol":{"type":"socks"}},
                 {"name":"west", "address":west.to_string(), "protocol":{"type":"socks"}}
             ]},
@@ -336,6 +336,51 @@ impl Fixture {
             204
         );
     }
+}
+
+#[tokio::test]
+async fn url_test_routes_without_controller_and_can_be_removed_on_reload() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .config
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry.get("client_group").is_some() || entry.get("rules").is_some());
+    let group = fixture.outbound_mut();
+    group.as_object_mut().unwrap().remove("default");
+    group["type"] = json!("url-test");
+    group["url"] = json!("http://probe.invalid/");
+    group["interval"] = json!(1);
+    group["timeout"] = json!(500);
+    group["client_proxies"][0]["address"] = json!(available_address().to_string());
+    let mut process = fixture.start().await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let result = shoes_test_support::wireguard::connect(
+                fixture.entry.port(),
+                "192.0.2.100:80".parse().unwrap(),
+            )
+            .await;
+            if let Ok(mut stream) = result {
+                check_flow(&mut stream, b'W').await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!fixture.directory.path().join("cache.db").exists());
+    let west = fixture.outbound_mut()["client_proxies"][1].clone();
+    *fixture.outbound_mut() = json!({
+        "client_group":"outbound", "type":"round-robin", "client_proxies":[west]
+    });
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process.wait_for("Servers ready").await;
+    let _flow = flow(fixture.entry, b'W').await;
+    fixture.stop(&mut process).await;
+    std::net::TcpListener::bind(fixture.entry).unwrap();
 }
 
 #[tokio::test]

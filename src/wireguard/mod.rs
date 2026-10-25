@@ -44,9 +44,15 @@ fn canonical_socket_addr(mut address: SocketAddr) -> SocketAddr {
 
 struct Connector {
     name: String,
-    active: Mutex<Option<StackHandle>>,
+    active: Mutex<Option<ActiveEndpoint>>,
     addresses: Vec<IpAddr>,
     routes: Vec<IpNetwork>,
+}
+
+#[derive(Clone)]
+struct ActiveEndpoint {
+    handle: StackHandle,
+    carrier: Option<Arc<crate::client_proxy_chain::ClientProxyChain>>,
 }
 impl fmt::Debug for Connector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -57,12 +63,16 @@ impl fmt::Debug for Connector {
 }
 impl Connector {
     fn handle(&self) -> stdio::Result<StackHandle> {
-        self.active.lock().clone().ok_or_else(|| {
+        let active = self.active.lock().clone().ok_or_else(|| {
             stdio::Error::new(
                 stdio::ErrorKind::NotConnected,
                 format!("WireGuard endpoint {} is not active", self.name),
             )
-        })
+        })?;
+        if let Some(carrier) = active.carrier {
+            carrier.record_carrier_demand();
+        }
+        Ok(active.handle)
     }
     fn reachable(&self, address: SocketAddr) -> bool {
         self.addresses
@@ -99,6 +109,17 @@ impl Connector {
 }
 #[async_trait]
 impl SocketConnector for Connector {
+    fn record_demand(&self) {
+        let carrier = self
+            .active
+            .lock()
+            .as_ref()
+            .and_then(|active| active.carrier.clone());
+        if let Some(carrier) = carrier {
+            carrier.record_carrier_demand();
+        }
+    }
+
     async fn connect(
         &self,
         resolver: &Arc<dyn Resolver>,
@@ -262,9 +283,7 @@ impl Prepared {
             }
             Ok(())
         })?;
-        if !validated.control.listeners.is_empty()
-            && let Some(catalog) = &mut validated.catalog
-        {
+        if let Some(catalog) = &mut validated.catalog {
             for node in catalog.nodes.values_mut() {
                 if let crate::control::catalog::CatalogNode::Leaf(client) = node {
                     crate::config::client_visit::visit_client(client, &mut |client| {
@@ -417,11 +436,12 @@ impl PreparedEndpoint {
         )?;
         let resolver = self.outer_resolver.clone();
         // Rebuilding after preflight gives each start fresh pool indices and handler lifetimes.
-        let (udp, released, peers) = if let Some(chain) = self.build_outer_chain()? {
+        let outer_chain = self.build_outer_chain()?;
+        let (udp, released, peers) = if let Some(chain) = &outer_chain {
             let peers = self.peers_for_socket(None)?;
             let (sender, receiver, released) = detour::start(
                 config.id.clone(),
-                chain,
+                chain.clone(),
                 resolver,
                 peers.iter().map(|peer| peer.endpoint.unwrap()),
                 stack.drops.clone(),
@@ -456,7 +476,10 @@ impl PreparedEndpoint {
             .map_err(|error| {
                 stdio::Error::other(format!("WireGuard device startup failed: {error}"))
             })?;
-        *self.connector.active.lock() = Some(stack.handle.clone());
+        *self.connector.active.lock() = Some(ActiveEndpoint {
+            handle: stack.handle.clone(),
+            carrier: outer_chain,
+        });
         let connector = self.connector.clone();
         let name = config.id.clone();
         let cancel = CancellationToken::new();

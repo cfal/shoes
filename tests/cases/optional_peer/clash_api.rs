@@ -177,7 +177,7 @@ async fn clash_api_pinned_mihomo_contract() {
         &shoes_config,
         serde_yaml::to_string(&json!([
             {"clash_api_address":format!("0.0.0.0:{}", shoes.port()), "secret":SECRET},
-            {"client_group":"outbound", "strategy":"selector", "client_proxies":["direct"]}
+            {"client_group":"outbound", "type":"selector", "client_proxies":["direct"]}
         ]))
         .unwrap(),
     )

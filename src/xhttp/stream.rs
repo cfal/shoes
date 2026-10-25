@@ -531,9 +531,15 @@ impl Tasks {
     }
     pub fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
         let cancel = self.cancel.clone();
-        self.tracker.spawn(async move {
+        let task = async move {
             tokio::select! { biased; _ = cancel.cancelled() => {}, _ = future => {} }
-        });
+        };
+        if crate::control::url_test::is_background() {
+            self.tracker
+                .spawn(crate::control::url_test::BACKGROUND.scope((), task));
+        } else {
+            self.tracker.spawn(task);
+        }
     }
     pub async fn wait(&self) {
         self.tracker.close();

@@ -20,6 +20,7 @@ pub type Choices = BTreeMap<String, String>;
 pub struct SelectionView {
     definitions: SelectorDefinitions,
     choices: RwLock<Arc<Choices>>,
+    pub automatic: super::url_test::AutomaticGroups,
 }
 
 impl SelectionView {
@@ -60,6 +61,7 @@ impl SelectionOwner {
         Ok(Arc::new(SelectionView {
             choices: RwLock::new(Arc::new(effective(&definitions, &self.explicit))),
             definitions,
+            automatic: Default::default(),
         }))
     }
 

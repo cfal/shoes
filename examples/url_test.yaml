@@ -1,0 +1,26 @@
+# Replace the probe URL and upstream addresses with your own endpoints.
+- client_group: fastest
+  type: url-test
+  url: "https://probe.example.com/generate_204"
+  interval: 300
+  timeout: 5000
+  tolerance: 50
+  lazy: true
+  client_proxies:
+    - name: east
+      address: "east.example.com:443"
+      protocol:
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
+    - name: west
+      address: "west.example.com:443"
+      protocol:
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
+
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+  rules:
+    - mask: "0.0.0.0/0"
+      action: allow
+      client_chain: fastest
