@@ -23,6 +23,7 @@ pub struct Compiler {
     pub(crate) input_files: HashMap<std::path::PathBuf, std::fs::File>,
     bytes: usize,
     entries: usize,
+    evaluation_work: usize,
 }
 
 impl Compiler {
@@ -32,14 +33,16 @@ impl Compiler {
         &mut self,
         decode: impl FnOnce(&mut Self) -> io::Result<Expression>,
     ) -> io::Result<Arc<Predicate>> {
-        let (bytes, entries) = (self.bytes, self.entries);
+        let (bytes, entries, work) = (self.bytes, self.entries, self.evaluation_work);
         self.entries = 0;
+        self.evaluation_work = 0;
         let result = decode(self).and_then(|expression| {
             self.entries = 0;
             self.compile(expression)
         });
         self.bytes = bytes;
         self.entries = entries;
+        self.evaluation_work = work;
         let predicate = result?;
         self.charge(predicate.retained_bytes(), 0)?;
         Ok(predicate)
@@ -61,7 +64,14 @@ impl Compiler {
     }
 
     pub fn compile(&mut self, expression: Expression) -> io::Result<Arc<Predicate>> {
-        self.visit(expression, 0)
+        let predicate = self.visit(expression, 0)?;
+        self.evaluation_work = self
+            .evaluation_work
+            .saturating_add(predicate.evaluation_work);
+        if self.evaluation_work > MAX_ENTRIES {
+            return Err(invalid("expanded rule evaluation budget exceeded"));
+        }
+        Ok(predicate)
     }
 
     fn strings(&mut self, values: &[String]) -> io::Result<()> {

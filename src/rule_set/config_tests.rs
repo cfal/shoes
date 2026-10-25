@@ -193,6 +193,67 @@ fn source_group_depth_is_order_independent_and_includes_callers() {
     );
 }
 
+#[test]
+fn source_group_work_budget_counts_repeated_references_and_caller_compositions() {
+    let groups = |levels: usize| {
+        let mut configs =
+            vec![json!({"rule_source_group": "g0", "rules": [{"ip_cidr": ["192.0.2.0/24"]}]})];
+        for level in 1..=levels {
+            let child = json!({"rule_source_group": format!("g{}", level - 1)});
+            configs.push(
+                json!({"rule_source_group": format!("g{level}"), "rules": [child.clone(), child]}),
+            );
+        }
+        configs
+    };
+    for reversed in [false, true] {
+        let mut configs = groups(40);
+        if reversed {
+            configs.reverse();
+        }
+        configs.push(server(
+            json!([{"masks": {"rule_source_group": "g40"}, "action": "block"}]),
+        ));
+        let error = create_server_configs(serde_json::from_value(json!(configs)).unwrap())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("expanded rule evaluation budget"),
+            "{error}"
+        );
+    }
+    for copies in [1, 32] {
+        let mut configs = groups(16);
+        configs.push(server(json!([{"masks": {"any": vec![json!({"rule_source_group": "g16"}); copies]}, "action": "block"}])));
+        let result = create_server_configs(serde_json::from_value(json!(configs)).unwrap());
+        if copies == 1 {
+            let validated = result.unwrap();
+            let Config::Server(server) = &validated.configs[0] else {
+                panic!()
+            };
+            let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
+                panic!()
+            };
+            let predicate = rule.criteria.compiled.as_ref().unwrap();
+            assert!(!predicate.has_no_resolve_ip());
+            assert_eq!(
+                predicate.evaluate(None, Some("198.51.100.1".parse().unwrap()), 80),
+                Outcome::Miss
+            );
+        } else {
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("expanded rule evaluation budget")
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn staged_inputs_also_validate_local_aliases_of_remote_caches() {
