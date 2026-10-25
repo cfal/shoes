@@ -394,6 +394,11 @@ impl RunningServers {
         candidate.certificates.shutdown().await;
         // Candidate-only sockets can overlap addresses the previous listeners rebind.
         candidate.tcp = TcpListeners::default();
+        // Rejected reloads retain inherited descriptors for a corrected configuration.
+        #[cfg(unix)]
+        for (fd, descriptor) in candidate.tun_fds.drain() {
+            previous.tun_fds.entry(fd).or_insert(descriptor);
+        }
         self.quic_retirements.wait().await?;
         // Pools may be shared with the live registry: rejection is not terminal shutdown.
         if let Err(error) = candidate.dns.checkpoint().await {

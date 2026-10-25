@@ -1599,6 +1599,17 @@ async fn partial_quic_activation_rolls_back_or_shuts_down_without_leaking_listen
 #[cfg(unix)]
 #[tokio::test]
 async fn descriptor_tun_can_restart_after_failed_activation_and_releases_on_exit() {
+    check_descriptor_tun_reload(true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn candidate_only_tun_descriptor_survives_rejected_reload() {
+    check_descriptor_tun_reload(false).await;
+}
+
+#[cfg(unix)]
+async fn check_descriptor_tun_reload(initially_enabled: bool) {
     use std::os::fd::OwnedFd;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
@@ -1610,7 +1621,12 @@ async fn descriptor_tun_can_restart_after_failed_activation_and_releases_on_exit
         "{}- device_fd: 0\n  rules: allow-all-direct\n",
         forward(address, echo.local_addr())
     );
-    std::fs::write(&path, &config).unwrap();
+    let initial = if initially_enabled {
+        config.clone()
+    } else {
+        forward(address, echo.local_addr())
+    };
+    std::fs::write(&path, initial).unwrap();
     let (mut peer, device) = std::os::unix::net::UnixStream::pair().unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
@@ -1623,18 +1639,22 @@ async fn descriptor_tun_can_restart_after_failed_activation_and_releases_on_exit
         .unwrap();
     let mut child = Process::from_child(child);
     child.wait_for("Servers ready").await;
+    // Proxy entries start first; a second TUN forces failure after descriptor adoption.
     std::fs::write(
         &path,
-        format!(
-            "{config}- path: '{}'\n  protocol: {{type: socks}}\n",
-            directory.path().join("missing/listener.sock").display()
-        ),
+        format!("{config}- device_fd: -1\n  rules: allow-all-direct\n"),
     )
     .unwrap();
     child.signal(libc::SIGHUP);
     child
         .wait_for("Reload rejected; previous servers restored")
         .await;
+    let error = std::io::Read::read(&mut peer, &mut [0])
+        .expect_err("rejected reload closed the inherited TUN descriptor");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
     roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
     std::fs::write(&path, config).unwrap();
     child.signal(libc::SIGHUP);
