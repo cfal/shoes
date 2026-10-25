@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use log::debug;
 
-use crate::address::ResolvedLocation;
+use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::control::catalog::{MemberOrigin, RuleDescription};
 use crate::control::connection_notes::{self, Phase};
@@ -181,6 +181,7 @@ impl ClientProxyChain {
             initial: Some(self.initial_hop[initial_index].clone()),
             subsequent,
             resolver: resolver.clone(),
+            pinned_proxies: None,
         }
     }
 
@@ -707,6 +708,50 @@ impl ClientProxyChain {
             .await
     }
 
+    #[cfg(unix)]
+    pub(crate) async fn connect_rule_download(
+        &self,
+        target: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let indices = self.select_indices(false)?;
+        self.with_route_activity(&indices, async {
+            let mut route = self.selected_route(resolver, &indices);
+            let initial = match route.initial.as_deref() {
+                Some(InitialHopEntry::Proxy { proxy, .. }) => Some(proxy.as_ref()),
+                _ => None,
+            };
+            let mut pinned = std::collections::HashMap::new();
+            for proxy in initial
+                .into_iter()
+                .chain(route.subsequent.iter().map(AsRef::as_ref))
+            {
+                let location = proxy.proxy_location();
+                if pinned.contains_key(location) {
+                    continue;
+                }
+                let address = crate::resolver::resolve_addresses(resolver, &location)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "rule download proxy resolved to no addresses",
+                        )
+                    })?;
+                pinned.insert(
+                    location.clone(),
+                    NetLocation::from_ip_addr(address.ip(), address.port()),
+                );
+            }
+            // Pin wire endpoints, not connector configurations: TLS still verifies the original name.
+            route.pinned_proxies = Some(Arc::new(pinned));
+            route.connect(target).await
+        })
+        .await
+    }
+
     async fn connect_tcp_observed(
         &self,
         remote_location: ResolvedLocation,
@@ -1005,6 +1050,7 @@ struct SelectedRoute {
     initial: Option<Arc<InitialHopEntry>>,
     subsequent: Vec<Arc<dyn ProxyConnector>>,
     resolver: Arc<dyn Resolver>,
+    pinned_proxies: Option<Arc<std::collections::HashMap<NetLocation, NetLocation>>>,
 }
 
 impl SelectedRoute {
@@ -1023,6 +1069,11 @@ impl SelectedRoute {
     }
 
     fn prefix(&self, target: ResolvedLocation) -> Arc<dyn CarrierDialer> {
+        let target = self
+            .pinned_proxies
+            .as_ref()
+            .and_then(|pinned| pinned.get(target.location()))
+            .map_or(target.clone(), |location| location.clone().into());
         let mut route = self.clone();
         if route.subsequent.pop().is_none() {
             // A pooled prefix must not retain the connector that owns its pool.

@@ -109,7 +109,11 @@ async fn connect(
     let mut connected = None;
     for target in targets {
         let target = crate::address::NetLocation::from_ip_addr(target.ip(), target.port());
-        if let Ok(result) = attempt.chain.connect_tcp(target.into(), &resolver).await {
+        if let Ok(result) = attempt
+            .chain
+            .connect_rule_download(target.into(), &resolver)
+            .await
+        {
             connected = Some(result);
             break;
         }

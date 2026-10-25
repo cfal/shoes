@@ -1187,6 +1187,127 @@ async fn explicit_bootstrap_resolves_target_without_system_dns() {
 }
 
 #[tokio::test]
+async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names() {
+    #[derive(Debug)]
+    struct Bootstrap {
+        first: std::net::SocketAddr,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::resolver::Resolver for Bootstrap {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            let name = location.address().to_string();
+            let address = match name.as_str() {
+                "first.invalid" => self.first,
+                "second.invalid" => "127.0.0.2:1080".parse().unwrap(),
+                "remote.invalid" => "192.0.2.10:8080".parse().unwrap(),
+                _ => panic!("unexpected bootstrap lookup: {location}"),
+            };
+            self.calls.lock().unwrap().push(name);
+            Box::pin(async move { Ok(vec![address]) })
+        }
+    }
+    async fn socks(
+        stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+        expected: [u8; 10],
+    ) {
+        let mut greeting = [0; 3];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).await.unwrap();
+        let mut connect = [0; 10];
+        stream.read_exact(&mut connect).await.unwrap();
+        assert_eq!(connect, expected);
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+    }
+    async fn serve_second(mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin) {
+        socks(&mut stream, [5, 1, 0, 1, 192, 0, 2, 10, 31, 144]).await;
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(stream.read_u8().await.unwrap());
+            assert!(request.len() < 16384);
+        }
+        assert!(
+            String::from_utf8(request)
+                .unwrap()
+                .contains("host: remote.invalid:8080")
+        );
+        stream.write_all(&response(200, "", VALID)).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+    for tls in [false, true] {
+        let dir = directory();
+        let path = dir.path().join("cache.json");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let resolver = Arc::new(Bootstrap {
+            first: listener.local_addr().unwrap(),
+            calls: Default::default(),
+        });
+        let mut dns = DnsRegistry::new();
+        dns.register("bootstrap".into(), resolver.clone());
+        let mut source = source("http://remote.invalid:8080/rules", &path);
+        let second = if tls {
+            serde_json::json!({"type": "tls", "verify": false, "protocol": {"type": "socks"}})
+        } else {
+            serde_json::json!({"type": "socks"})
+        };
+        source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
+        source.download.as_mut().unwrap().client_chain = serde_json::from_value(serde_json::json!([
+            {"address": format!("first.invalid:{}", resolver.first.port()), "protocol": {"type": "socks"}},
+            {"address": "second.invalid:1080", "protocol": second}
+        ])).unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            socks(&mut stream, [5, 1, 0, 1, 127, 0, 0, 2, 4, 56]).await;
+            if tls {
+                let certificate =
+                    rcgen::generate_simple_self_signed(vec!["second.invalid".into()]).unwrap();
+                let config = crate::rustls_config_util::try_create_server_config(
+                    certificate.cert.pem().as_bytes(),
+                    certificate.signing_key.serialize_pem().as_bytes(),
+                    vec![],
+                    &[],
+                    &[],
+                    &Default::default(),
+                )
+                .unwrap();
+                let stream = tokio_rustls::TlsAcceptor::from(Arc::new(config))
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                assert_eq!(stream.get_ref().1.server_name(), Some("second.invalid"));
+                serve_second(stream).await;
+            } else {
+                serve_second(stream).await;
+            }
+        });
+        let staged = stage(
+            &source,
+            &dns,
+            GlobalLimits::default(),
+            Limits::default(),
+            &mut http::DownloadState::default(),
+        )
+        .await
+        .unwrap();
+        drop(staged);
+        timeout(Duration::from_secs(5), fixture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *resolver.calls.lock().unwrap(),
+            ["remote.invalid", "first.invalid", "second.invalid"]
+        );
+    }
+}
+
+#[tokio::test]
 async fn chunked_body_is_bounded_and_validated() {
     let dir = directory();
     let path = dir.path().join("rules.json");
