@@ -146,6 +146,14 @@ jobs:
     - name: Run retention allocation and matcher invariants
       run: cargo test -p shoes --locked --test retention_allocation --test matcher_invariants -- --nocapture
 
+    - name: Run bounded rule property corpus
+      env:
+        CARGO_BUILD_JOBS: 1
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: timeout --kill-after=5s 30s
+      run: >-
+        .github/require-tests.sh timeout --kill-after=10s 10m cargo test -p shoes --locked
+        --test rule_properties -- --test-threads=1
+
     - name: Run host FFI tests
       run: cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
 
@@ -160,7 +168,7 @@ jobs:
         node-version: '24'
         package-manager-cache: false
     - name: Test benchmark harness and manifests
-      run: node --test benches/*.test.mjs
+      run: node --test benches/*.test.mjs scripts/coverage-lines.test.mjs scripts/require-tests.test.mjs
 
   tun-macos:
     name: Rootless TUN (macOS)
