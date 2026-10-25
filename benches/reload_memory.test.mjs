@@ -79,8 +79,12 @@ function runHarness(t, source, {
       for (const name of ['rustc.pid', 'reload.json.pid']) {
         const pidFile = path.join(directory, name);
         if (!fs.existsSync(pidFile)) continue;
-        try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 'SIGKILL'); }
-        catch (error) { if (error.code !== 'ESRCH') throw error; }
+        try {
+          const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+          process.kill(pid, 'SIGKILL');
+        } catch (error) {
+          if (error.code !== 'ESRCH') throw error;
+        }
       }
     }
     fs.rmSync(directory, { recursive: true, force: true });
@@ -148,7 +152,7 @@ test('FD cleanup does not accept a stable retained descriptor count', { skip: pr
   await assert.rejects(waitForFds(process.pid, 0, { timeout: 20 }), /FD cleanup deadline/);
 });
 
-function forwardingFixture(reload, { closeOnReload = false } = {}) {
+function forwardingFixture({ reload, closeOnReload = false }) {
   return `
 import fs from 'node:fs';
 import net from 'node:net';
@@ -174,7 +178,7 @@ process.on('SIGHUP', () => {
 }
 
 test('reload harness verifies target changes, exact payloads and drained FDs', { skip: process.platform !== 'linux' }, t => {
-  const { result } = runHarness(t, forwardingFixture(true), { success: true });
+  const { result } = runHarness(t, forwardingFixture({ reload: true }), { success: true });
   const report = JSON.parse(result.stdout);
   assert.deepEqual(report.samples.map(s => s.phase), ['idle_warm', 'pinned', 'pinned', 'pinned', 'drained']);
   assert.deepEqual(report.samples.filter(s => s.phase === 'pinned').map(s => s.target), [0, 1, 0]);
@@ -210,7 +214,7 @@ test('reload provenance preserves dirty patch bytes independently of Git setting
   git('config', 'diff.fixture.textconv', 'false');
   git('config', 'diff.context', '0');
 
-  const { result } = runHarness(t, forwardingFixture(true), {
+  const { result } = runHarness(t, forwardingFixture({ reload: true }), {
     success: true, cwd, env: { GIT_DIFF_OPTS: '-u0' },
   });
   const report = JSON.parse(result.stdout);
@@ -226,19 +230,19 @@ test('reload provenance preserves dirty patch bytes independently of Git setting
 });
 
 test('readiness alone cannot pass a reload with an unchanged datapath', { skip: process.platform !== 'linux' }, t => {
-  const { result, log } = runHarness(t, forwardingFixture(false));
+  const { result, log } = runHarness(t, forwardingFixture({ reload: false }));
   assert.match(result.stderr, /committed target not observed/);
   assert.equal(log.match(/Servers ready/g).length, 2);
 });
 
 test('reload harness rejects loss of a pinned connection after reload', { skip: process.platform !== 'linux' }, t => {
-  const { result, log } = runHarness(t, forwardingFixture(true, { closeOnReload: true }));
+  const { result, log } = runHarness(t, forwardingFixture({ reload: true, closeOnReload: true }));
   assert.match(result.stderr, /premature echo close/);
   assert.equal(log.match(/Servers ready/g).length, 2);
 });
 
 test('a stalled toolchain probe is killed and the server is cleaned up', { skip: process.platform !== 'linux' }, t => {
-  const source = forwardingFixture(true) + `
+  const source = forwardingFixture({ reload: true }) + `
 fs.writeFileSync(process.argv.at(-1) + '.pid', String(process.pid));
 `;
   const rustcSource = `

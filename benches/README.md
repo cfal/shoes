@@ -120,10 +120,10 @@ Corpus revisions: Loyalsoldier/clash-rules `335129e29eb0b32bb783d4164bcce1d35b53
 
 ## Lifetime Regressions
 
-The current reload harness adds a warmed idle sample, a post-payload sample per
+The reload harness records a warmed idle sample, a post-payload sample per
 pinned generation, and a drained sample after all test connections close.
-`BENCH_GENERATIONS` selects 2-16 generations (default 4). The existing 60-second
-whole-run deadline and reload grace still apply. Each committed generation
+`BENCH_GENERATIONS` selects 2-16 generations (default 4). The 60-second
+whole-run deadline and reload grace apply. Each committed generation
 alternates between two local upstreams: exact payload echo is necessary but not
 sufficient; the new connection must reach the newly configured upstream. Old
 connections must keep echoing exact bytes. FDs must return to the pre-connection
@@ -171,11 +171,11 @@ retain memory reservations until destruction. The separate system-allocator
 test performs 64 generation/failed-compilation cycles after eight warmups,
 checking exact live-byte/allocation-count recovery with four temporary owners.
 This models immutable predicate ownership, not full daemon heap retention.
-`rule_allocation` keeps its existing adversarial compilation peak budgets.
+`rule_allocation` enforces adversarial compilation peak budgets.
 `matcher_invariants` adds 128 fixed-seed port-range cases with linear membership,
 boundary, negation, and composition checks; production domain storage is untouched.
 
 Linux CI gates these correctness and bounded-retention tests. Full daemon live
 heap, asynchronous task counts in the subprocess, mobile devices, and arbitrary
-long-lived generation overlap remain outside these measurements. Feature streams
-can reuse the sampling helpers in isolated tests without adding production metrics.
+long-lived generation overlap remain outside these measurements. Other isolated
+tests can reuse the sampling helpers without adding production metrics.

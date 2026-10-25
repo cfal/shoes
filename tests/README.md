@@ -126,7 +126,7 @@ samples in concurrently running tests. Allocation tests have one test per
 executable, warm up first, and sample equivalent owner states before printing.
 The allocator counts successful allocations/reallocations and requested live
 bytes/blocks, not jemalloc arenas, foreign allocations, or RSS. Retention checks
-require exact return to baseline; existing compilation peak budgets are unchanged.
+require exact return to baseline; compilation peak budgets remain enforced.
 
 Important remaining limitations:
 

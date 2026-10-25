@@ -34,14 +34,9 @@ pub(super) async fn exercise(baseline: &Snapshot) {
             tokio::join!(
                 async { client.connect(address, "localhost").unwrap().await.unwrap() },
                 async {
-                    server
-                        .accept()
-                        .await
-                        .unwrap()
-                        .accept()
-                        .unwrap()
-                        .await
-                        .unwrap()
+                    let incoming = server.accept().await.unwrap();
+                    let connecting = incoming.accept().unwrap();
+                    connecting.await.unwrap()
                 },
             )
         })
