@@ -198,21 +198,8 @@ jobs:
         .github/require-tests.sh cargo test -p shoes --locked --test process_contract --features ffi rule_sets:: -- --test-threads=1
 
     - name: Run process filesystem watcher unit tests
-      env:
-        SHOES_TRACE_FILE_WATCHES: '1'
       run: >-
-        .github/require-tests.sh cargo test -p shoes --locked --lib process:: -- --test-threads=1 --nocapture
-
-    - name: Repeat candidate watcher isolation
-      env:
-        SHOES_TRACE_FILE_WATCHES: '1'
-      run: |
-        for iteration in $(seq 1 200); do
-          echo "Candidate watcher iteration $iteration"
-          .github/require-tests.sh cargo test -p shoes --locked --lib \
-            process::tests::activation_discards_candidate_identity_events_but_preserves_reload_events \
-            -- --exact --test-threads=1 --nocapture
-        done
+        .github/require-tests.sh cargo test -p shoes --locked --lib process:: -- --test-threads=1
 
   integration-tests:
     name: Integration (${{ matrix.name }})

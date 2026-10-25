@@ -46,11 +46,6 @@ pub(crate) fn watch<P: AsRef<Path>>(
         .filter(|path| path.is_file())
         .collect();
     files.extend(direct_files.iter().cloned());
-    #[cfg(test)]
-    let trace_id = std::env::var_os("SHOES_TRACE_FILE_WATCHES").map(|_| {
-        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    });
     let mut watcher =
         notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
             Ok(event)
@@ -59,13 +54,7 @@ pub(crate) fn watch<P: AsRef<Path>>(
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) && event.paths.iter().any(|path| files.contains(path)) =>
             {
-                let _sent = tx.try_send(());
-                #[cfg(test)]
-                if let Some(id) = trace_id {
-                    eprintln!(
-                        "file watcher {id}: watched={files:?}, event={event:?}, send={_sent:?}"
-                    );
-                }
+                let _ = tx.try_send(());
             }
             Err(error) => log::warn!("File watcher failed: {error}"),
             _ => {}
