@@ -471,13 +471,15 @@ pub async fn resolve_location(
 }
 
 /// Native resolver with application-level caching.
-/// The default for servers without DNS configuration. OS lookups expose no DNS
+/// The default for servers without configured DNS servers. OS lookups expose no DNS
 /// TTL; successful results are reused for at most 60 seconds by default, measured
 /// from lookup completion. Errors and empty results are never cached.
 ///
 /// At most 1,024 callers participate in coalesced misses (owners plus subscribers).
 /// Excess callers perform independent lookups, preserving existing failure
 /// semantics without adding an unbounded admission queue or detached tasks.
+/// Cancelling an owner makes surviving subscribers start a new lookup, which
+/// may exceed their remaining deadlines. Already-running OS calls cannot be stopped.
 pub struct CachingNativeResolver {
     state: Arc<Mutex<NativeResolverState>>,
     participants: Arc<Semaphore>,
@@ -493,14 +495,14 @@ struct NativeResolverState {
 }
 
 struct CachedResolveResult {
-    timestamp: tokio::time::Instant,
+    completed_at: tokio::time::Instant,
     addrs: Arc<[SocketAddr]>,
 }
 
 impl NativeResolverState {
     fn cached(&mut self, address: &Address, max_age: Duration) -> Option<Arc<[SocketAddr]>> {
         if let Some(cached) = self.cache.get(address)
-            && cached.timestamp.elapsed() < max_age
+            && cached.completed_at.elapsed() < max_age
         {
             return Some(cached.addrs.clone());
         }
@@ -515,6 +517,11 @@ struct NativeLookupOwner {
     registered: bool,
 }
 
+enum NativeLookupRole {
+    Owner(NativeLookupOwner),
+    Subscriber(broadcast::Receiver<NativeLookupResult>),
+}
+
 impl NativeLookupOwner {
     fn publish(mut self, result: &NativeLookupResult) {
         let mut state = self.state.lock();
@@ -522,16 +529,18 @@ impl NativeLookupOwner {
             state.cache.put(
                 self.address.clone(),
                 CachedResolveResult {
-                    timestamp: tokio::time::Instant::now(),
+                    completed_at: tokio::time::Instant::now(),
                     addrs: addrs.clone(),
                 },
             );
         }
-        // Cache insertion, publication, and removal are atomic with subscription.
+        // Cache insertion and flight removal are atomic with subscription.
         if self.registered {
             let sender = state.inflight.remove(&self.address).unwrap();
-            let _ = sender.send(result.clone());
+            // A panicking waker must not let Drop remove a replacement flight.
             self.registered = false;
+            drop(state);
+            let _ = sender.send(result.clone());
         }
     }
 }
@@ -539,8 +548,9 @@ impl NativeLookupOwner {
 impl Drop for NativeLookupOwner {
     fn drop(&mut self) {
         if self.registered {
-            // Closing the channel wakes subscribers to elect a replacement owner.
-            self.state.lock().inflight.remove(&self.address);
+            // Closing outside the lock wakes subscribers to elect a replacement owner.
+            let sender = self.state.lock().inflight.remove(&self.address);
+            drop(sender);
         }
     }
 }
@@ -603,16 +613,16 @@ impl Default for CachingNativeResolver {
 impl Resolver for CachingNativeResolver {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
         let max_age = Duration::from_secs(self.result_timeout_secs);
-        let port = location.port();
+        let caller_port = location.port();
         if let Some(addrs) = self.state.lock().cached(location.address(), max_age) {
-            let addrs = native_addrs_with_port(&addrs, port);
+            let addrs = native_addrs_with_port(&addrs, caller_port);
             return Box::pin(async move { Ok(addrs) });
         }
 
         // Tokio's (host, u16) lookup delegates to std, which passes a null service
         // to getaddrinfo and sets ports afterward. Only the exact host is a key;
         // socket candidates retain order, duplicates, IPv6 scope IDs and flowinfo.
-        let location = NetLocation::new(location.address().clone(), 0);
+        let query_location = NetLocation::new(location.address().clone(), 0);
         let state = self.state.clone();
         let participants = self.participants.clone();
         let lookup = self.lookup.clone();
@@ -620,63 +630,64 @@ impl Resolver for CachingNativeResolver {
         Box::pin(async move {
             let permit = participants.try_acquire().ok();
             loop {
-                let (owner, subscriber) = {
+                let role = {
                     let mut locked = state.lock();
                     // Rechecks after future creation or cancellation of an owner.
-                    if let Some(addrs) = locked.cached(location.address(), max_age) {
-                        return Ok(native_addrs_with_port(&addrs, port));
+                    if let Some(addrs) = locked.cached(query_location.address(), max_age) {
+                        return Ok(native_addrs_with_port(&addrs, caller_port));
                     }
-                    if let Some(sender) = locked.inflight.get(location.address())
+                    if let Some(sender) = locked.inflight.get(query_location.address())
                         && permit.is_some()
                     {
-                        (None, Some(sender.subscribe()))
+                        NativeLookupRole::Subscriber(sender.subscribe())
                     } else {
                         let registered = permit.is_some();
                         if registered {
                             let (sender, _) = broadcast::channel(1);
-                            locked.inflight.insert(location.address().clone(), sender);
+                            locked
+                                .inflight
+                                .insert(query_location.address().clone(), sender);
                         }
-                        (
-                            Some(NativeLookupOwner {
-                                state: state.clone(),
-                                address: location.address().clone(),
-                                registered,
-                            }),
-                            None,
-                        )
+                        NativeLookupRole::Owner(NativeLookupOwner {
+                            state: state.clone(),
+                            address: query_location.address().clone(),
+                            registered,
+                        })
                     }
                 };
 
-                if let Some(mut subscriber) = subscriber {
-                    match subscriber.recv().await {
-                        Ok(result) => {
-                            return result
-                                .map(|addrs| native_addrs_with_port(&addrs, port))
-                                .map_err(native_lookup_error);
-                        }
+                let result = match role {
+                    NativeLookupRole::Subscriber(mut subscriber) => match subscriber.recv().await {
+                        Ok(result) => result,
                         Err(_) => continue,
+                    },
+                    NativeLookupRole::Owner(owner) => {
+                        let result = lookup
+                            .resolve_location(&query_location)
+                            .await
+                            .and_then(|mut addrs| {
+                                addrs.retain(|addr| !addr.ip().is_unspecified());
+                                if addrs.is_empty() {
+                                    Err(std::io::Error::other(format!(
+                                        "DNS lookup returned no addresses for {}",
+                                        query_location.address()
+                                    )))
+                                } else {
+                                    Ok(Arc::from(addrs))
+                                }
+                            })
+                            .map_err(Arc::new);
+                        owner.publish(&result);
+                        result
                     }
-                }
-
-                let result = lookup
-                    .resolve_location(&location)
-                    .await
-                    .and_then(|mut addrs| {
-                        addrs.retain(|addr| !addr.ip().is_unspecified());
-                        if addrs.is_empty() {
-                            Err(std::io::Error::other(format!(
-                                "DNS lookup returned no addresses for {}",
-                                location.address()
-                            )))
-                        } else {
-                            Ok(Arc::from(addrs))
-                        }
-                    })
-                    .map_err(Arc::new);
-                owner.unwrap().publish(&result);
-                return result
-                    .map(|addrs| native_addrs_with_port(&addrs, port))
-                    .map_err(native_lookup_error);
+                };
+                let addrs = result.map_err(native_lookup_error)?;
+                let addrs = native_addrs_with_port(&addrs, caller_port);
+                debug!(
+                    "CachingNativeResolver resolved {}:{caller_port} -> {addrs:?}",
+                    query_location.address()
+                );
+                return Ok(addrs);
             }
         })
     }

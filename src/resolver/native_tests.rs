@@ -88,6 +88,10 @@ fn assert_idle(resolver: &CachingNativeResolver, lookup: &FakeLookup) {
     assert_eq!(lookup.active.load(Ordering::Relaxed), 0);
 }
 
+fn ready_result(future: ResolveFuture) -> LookupReply {
+    future.now_or_never().expect("lookup unexpectedly pending")
+}
+
 async fn complete_lookup(resolver: &CachingNativeResolver, lookup: &FakeLookup, port: u16) {
     let mut future = resolver.resolve_location(&location(port));
     assert!(futures::poll!(&mut future).is_pending());
@@ -119,19 +123,13 @@ async fn cold_misses_coalesce_across_ports_and_preserve_complete_candidates() {
     let owner = futures.remove(0);
     assert_eq!(owner.await.unwrap(), candidates());
     assert!(resolver.state.lock().inflight.is_empty());
-    assert_eq!(
-        resolver
-            .state
-            .lock()
-            .cache
-            .peek(location(0).address())
-            .unwrap()
-            .addrs
-            .as_ref(),
-        candidates()
-    );
+    {
+        let state = resolver.state.lock();
+        let cached = state.cache.peek(location(0).address()).unwrap();
+        assert_eq!(cached.addrs.as_ref(), candidates());
+    }
     // A new caller sees the cache even before subscribers consume the publication.
-    let mut hit = resolver.resolve_location(&location(8080)).await.unwrap();
+    let mut hit = ready_result(resolver.resolve_location(&location(8080))).unwrap();
     assert_eq!(hit, native_addrs_with_port(&candidates(), 8080));
     hit.clear();
     for (future, &port) in futures.into_iter().zip(&ports[1..]) {
@@ -152,7 +150,7 @@ async fn unpolled_miss_rechecks_cache_and_allocates_no_inflight_state() {
     assert_idle(&resolver, &lookup);
     complete_lookup(&resolver, &lookup, 443).await;
     assert_eq!(
-        unpolled.await.unwrap(),
+        ready_result(unpolled).unwrap(),
         native_addrs_with_port(&candidates(), 80)
     );
     assert_eq!(lookup.calls(), 1);
@@ -188,6 +186,67 @@ async fn publisher_cancellation_reelects_exactly_one_subscriber() {
     assert_idle(&resolver, &lookup);
 }
 
+#[tokio::test]
+async fn publication_and_cancellation_wake_subscribers_outside_resolver_lock() {
+    struct WakeProbe {
+        state: Arc<Mutex<NativeResolverState>>,
+        wakes: AtomicUsize,
+        locked_wakes: AtomicUsize,
+    }
+
+    impl futures::task::ArcWake for WakeProbe {
+        fn wake_by_ref(probe: &Arc<Self>) {
+            probe.wakes.fetch_add(1, Ordering::Relaxed);
+            if probe.state.try_lock().is_none() {
+                probe.locked_wakes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    for cancel_owner in [false, true] {
+        let (resolver, lookup) = fixture(60);
+        let mut owner = resolver.resolve_location(&location(80));
+        assert!(futures::poll!(&mut owner).is_pending());
+        let mut waiter = resolver.resolve_location(&location(443));
+        let probe = Arc::new(WakeProbe {
+            state: resolver.state.clone(),
+            wakes: AtomicUsize::new(0),
+            locked_wakes: AtomicUsize::new(0),
+        });
+        let waker = futures::task::waker_ref(&probe);
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        if cancel_owner {
+            drop(owner);
+            lookup.discard_cancelled();
+        } else {
+            lookup.reply(Ok(candidates()));
+            ready_result(owner).unwrap();
+        }
+        assert!(probe.wakes.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            probe.locked_wakes.load(Ordering::Relaxed),
+            0,
+            "cancel_owner={cancel_owner}"
+        );
+
+        if cancel_owner {
+            assert!(futures::poll!(&mut waiter).is_pending());
+            lookup.reply(Ok(candidates()));
+        }
+        assert_eq!(
+            ready_result(waiter).unwrap(),
+            native_addrs_with_port(&candidates(), 443)
+        );
+        assert_idle(&resolver, &lookup);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_subscribers_wake_after_publisher_cancellation() {
     #[derive(Debug, Default)]
@@ -212,9 +271,10 @@ async fn concurrent_subscribers_wake_after_publisher_cancellation() {
     let mut owner = resolver.resolve_location(&location(80));
     assert!(futures::poll!(&mut owner).is_pending());
 
-    let barrier = Arc::new(tokio::sync::Barrier::new(129));
+    let ports = 0..128;
+    let barrier = Arc::new(tokio::sync::Barrier::new(ports.len() + 1));
     let mut tasks = Vec::new();
-    for port in 0..128 {
+    for port in ports {
         let resolver = resolver.clone();
         let barrier = barrier.clone();
         tasks.push(tokio::spawn(async move {
@@ -227,16 +287,16 @@ async fn concurrent_subscribers_wake_after_publisher_cancellation() {
             );
         }));
     }
-    barrier.wait().await;
-    assert_eq!(lookup.0.load(Ordering::Relaxed), 1);
-    drop(owner);
     tokio::time::timeout(Duration::from_secs(5), async {
+        barrier.wait().await;
+        assert_eq!(lookup.0.load(Ordering::Relaxed), 1);
+        drop(owner);
         for task in tasks {
             task.await.unwrap();
         }
     })
     .await
-    .expect("subscribers remained stuck after cancellation");
+    .expect("subscribers failed to rendezvous or finish after cancellation");
     assert_eq!(lookup.0.load(Ordering::Relaxed), 2);
     assert!(resolver.state.lock().inflight.is_empty());
     assert_eq!(
@@ -379,6 +439,7 @@ async fn failures_share_errno_kind_and_message_without_negative_caching() {
         let mut waiter = resolver.resolve_location(&location(443));
         assert!(futures::poll!(&mut owner).is_pending());
         assert!(futures::poll!(&mut waiter).is_pending());
+        assert_eq!(lookup.calls(), 1);
         lookup.reply(failure);
         let first_error = owner.await.unwrap_err();
         // A new flight can start before an old subscriber consumes its error.
@@ -395,7 +456,7 @@ async fn failures_share_errno_kind_and_message_without_negative_caching() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn result_age_starts_at_completion_hits_do_not_extend_it_and_zero_disables_reuse() {
+async fn result_age_starts_at_completion_and_hits_do_not_extend_it() {
     assert_eq!(CachingNativeResolver::DEFAULT_RESULT_TIMEOUT_SECS, 60);
     let (resolver, lookup) = fixture(60);
     let mut first = resolver.resolve_location(&location(80));
@@ -405,7 +466,7 @@ async fn result_age_starts_at_completion_hits_do_not_extend_it_and_zero_disables
     first.await.unwrap();
     tokio::time::advance(Duration::from_secs(59)).await;
     assert_eq!(
-        resolver.resolve_location(&location(443)).await.unwrap(),
+        ready_result(resolver.resolve_location(&location(443))).unwrap(),
         native_addrs_with_port(&candidates(), 443)
     );
     assert_eq!(lookup.calls(), 1);
@@ -420,12 +481,16 @@ async fn result_age_starts_at_completion_hits_do_not_extend_it_and_zero_disables
     );
     assert_eq!(lookup.calls(), 2);
     assert_idle(&resolver, &lookup);
+}
 
+#[tokio::test(start_paused = true)]
+async fn zero_result_age_disables_reuse_but_coalesces_misses() {
     let (resolver, lookup) = fixture(0);
     let mut first = resolver.resolve_location(&location(80));
     let mut second = resolver.resolve_location(&location(443));
     assert!(futures::poll!(&mut first).is_pending());
     assert!(futures::poll!(&mut second).is_pending());
+    assert_eq!(lookup.calls(), 1);
     lookup.reply(Ok(candidates()));
     first.await.unwrap();
     second.await.unwrap();
@@ -443,43 +508,39 @@ async fn cache_evicts_least_recent_host_and_keeps_exact_host_identity() {
         .lock()
         .cache
         .resize(NonZeroUsize::new(2).unwrap());
-    for host in [
-        "example.test",
-        "EXAMPLE.test",
-        "example.test",
-        "example.test.",
+    for (host, expect_lookup) in [
+        ("example.test", true),
+        ("EXAMPLE.test", true),
+        ("example.test", false),
+        ("example.test.", true),
     ] {
         let target = NetLocation::new(Address::Hostname(host.into()), 443);
         let mut future = resolver.resolve_location(&target);
-        if host == "example.test" && lookup.calls() == 2 {
-            future.await.unwrap();
-            continue;
+        if expect_lookup {
+            assert!(futures::poll!(&mut future).is_pending());
+            lookup.reply(Ok(candidates()));
         }
-        assert!(futures::poll!(&mut future).is_pending());
-        lookup.reply(Ok(candidates()));
-        future.await.unwrap();
+        ready_result(future).unwrap();
     }
-    let state = resolver.state.lock();
-    assert_eq!(state.cache.len(), 2);
-    assert!(
-        state
-            .cache
-            .peek(&Address::Hostname("example.test".into()))
-            .is_some()
-    );
-    assert!(
-        state
-            .cache
-            .peek(&Address::Hostname("EXAMPLE.test".into()))
-            .is_none()
-    );
-    assert!(
-        state
-            .cache
-            .peek(&Address::Hostname("example.test.".into()))
-            .is_some()
-    );
-    drop(state);
+    {
+        let state = resolver.state.lock();
+        assert_eq!(state.cache.len(), 2);
+        assert!(
+            state
+                .cache
+                .contains(&Address::Hostname("example.test".into()))
+        );
+        assert!(
+            !state
+                .cache
+                .contains(&Address::Hostname("EXAMPLE.test".into()))
+        );
+        assert!(
+            state
+                .cache
+                .contains(&Address::Hostname("example.test.".into()))
+        );
+    }
     assert_eq!(lookup.calls(), 3);
     let evicted = NetLocation::new(Address::Hostname("EXAMPLE.test".into()), 443);
     let mut retry = resolver.resolve_location(&evicted);
@@ -498,18 +559,13 @@ fn default_cache_capacity_is_bounded() {
         state.cache.put(
             Address::Hostname(format!("{index}.test")),
             CachedResolveResult {
-                timestamp: tokio::time::Instant::now(),
+                completed_at: tokio::time::Instant::now(),
                 addrs: Arc::from(candidates()),
             },
         );
     }
     assert_eq!(state.cache.len(), CACHING_NATIVE_RESOLVER_CACHE_CAPACITY);
-    assert!(
-        state
-            .cache
-            .peek(&Address::Hostname("0.test".into()))
-            .is_none()
-    );
+    assert!(!state.cache.contains(&Address::Hostname("0.test".into())));
 }
 
 #[tokio::test]
@@ -553,7 +609,7 @@ async fn participants_and_inflight_are_bounded_without_new_overload_errors() {
         // Overflow completion must not remove another caller's flight.
         assert_eq!(resolver.state.lock().inflight.len(), expected);
         assert_eq!(
-            resolver.resolve_location(&location(80)).await.unwrap(),
+            ready_result(resolver.resolve_location(&location(80))).unwrap(),
             native_addrs_with_port(&candidates(), 80)
         );
         assert_eq!(resolver.participants.available_permits(), 0);
@@ -566,6 +622,51 @@ async fn participants_and_inflight_are_bounded_without_new_overload_errors() {
         complete_lookup(&resolver, &lookup, 443).await;
         assert_idle(&resolver, &lookup);
     }
+}
+
+#[tokio::test]
+async fn overflow_cancellation_preserves_flight_and_publication_retains_waiter_permits() {
+    let (resolver, lookup) = fixture(60);
+    let mut callers: Vec<_> = (0..CACHING_NATIVE_RESOLVER_MAX_PARTICIPANTS)
+        .map(|port| resolver.resolve_location(&location(port as u16)))
+        .collect();
+    for caller in &mut callers {
+        assert!(futures::poll!(caller).is_pending());
+    }
+    assert_eq!(resolver.participants.available_permits(), 0);
+    let mut overflow = resolver.resolve_location(&location(8443));
+    assert!(futures::poll!(&mut overflow).is_pending());
+    assert_eq!(lookup.calls(), 2);
+    drop(overflow);
+    assert!(lookup.replies.lock().pop_back().unwrap().is_closed());
+    assert_eq!(lookup.active.load(Ordering::Relaxed), 1);
+    assert_eq!(resolver.state.lock().inflight.len(), 1);
+    assert_eq!(resolver.participants.available_permits(), 0);
+
+    lookup.reply(Ok(candidates()));
+    let owner = callers.remove(0);
+    assert_eq!(ready_result(owner).unwrap(), candidates());
+    assert!(resolver.state.lock().inflight.is_empty());
+    assert_eq!(resolver.participants.available_permits(), 1);
+    assert_eq!(lookup.active.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        ready_result(resolver.resolve_location(&location(443))).unwrap(),
+        native_addrs_with_port(&candidates(), 443)
+    );
+    assert_eq!(resolver.participants.available_permits(), 1);
+
+    let waiter = callers.remove(0);
+    assert_eq!(
+        ready_result(waiter).unwrap(),
+        native_addrs_with_port(&candidates(), 1)
+    );
+    assert_eq!(resolver.participants.available_permits(), 2);
+    drop(callers);
+    assert_idle(&resolver, &lookup);
+    assert_eq!(lookup.calls(), 2);
+    resolver.state.lock().cache.clear();
+    complete_lookup(&resolver, &lookup, 443).await;
+    assert_idle(&resolver, &lookup);
 }
 
 #[tokio::test]
@@ -596,7 +697,7 @@ async fn numeric_literals_preserve_native_filtering_and_ports() {
 }
 
 #[tokio::test]
-#[ignore = "manual native-cache microbenchmark; run under the shared heavy.lock"]
+#[ignore = "manual native-cache microbenchmark; run alone in release mode"]
 async fn benchmark_native_cache_hits_and_cold_miss_suppression() {
     let (resolver, lookup) = fixture(60);
     const CONCURRENCY: usize = 512;
