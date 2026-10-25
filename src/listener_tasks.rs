@@ -21,15 +21,18 @@ impl QuicRetirements {
     }
 
     pub async fn wait(&self) -> io::Result<()> {
-        let releases = std::mem::take(&mut *self.0.lock());
-        tokio::time::timeout(Duration::from_secs(5), async {
-            for released in releases {
+        let mut releases = std::mem::take(&mut *self.0.lock());
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(released) = releases.last_mut() {
                 // Sender destruction, rather than a sent value, confirms socket release.
                 let _ = released.await;
+                releases.pop();
             }
         })
-        .await
-        .map_err(|_| {
+        .await;
+        // A rollback must still prove release after an activation wait times out.
+        self.0.lock().extend(releases);
+        result.map_err(|_| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 "QUIC listener sockets did not retire",
@@ -164,14 +167,18 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn retirement_timeout_is_an_error() {
+    async fn activation_retirement_timeout_retains_pending_socket_releases() {
         let retirements = QuicRetirements::default();
-        let (_socket, released) = oneshot::channel();
+        let (socket, released) = oneshot::channel();
         retirements.0.lock().push(released);
         assert_eq!(
             retirements.wait().await.unwrap_err().kind(),
             io::ErrorKind::TimedOut
         );
+        assert_eq!(retirements.0.lock().len(), 1);
+        drop(socket);
+        retirements.wait().await.unwrap();
+        assert!(retirements.0.lock().is_empty());
     }
 
     #[tokio::test]

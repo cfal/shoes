@@ -490,6 +490,8 @@ async fn handle_h2mux_tcp(
     let route =
         timeout_stream_setup(prepared.route(&mut stream, &proxy_selector, &resolver)).await?;
     let routed = timeout_stream_setup(route.connect(&resolver)).await?;
+    drop(proxy_selector);
+    drop(resolver);
     match routed.setup {
         Some(client_result) => {
             debug!(

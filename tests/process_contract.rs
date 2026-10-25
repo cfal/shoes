@@ -1155,6 +1155,23 @@ async fn connection_budget_changes_only_with_accepted_reloads_and_counts_drainin
     assert_rejected(address).await;
     roundtrip(&mut draining).await;
 
+    // Activation applies the candidate cap, then fails after starting its TCP listener.
+    std::fs::write(
+        &path,
+        format!(
+            "{}- path: '{}'\n  protocol: {{type: http}}\n",
+            config(2),
+            directory.path().join("missing/listener.sock").display(),
+        ),
+    )
+    .unwrap();
+    child.signal(libc::SIGHUP);
+    child
+        .wait_for("Reload rejected; previous servers restored")
+        .await;
+    assert_rejected(address).await;
+    roundtrip(&mut draining).await;
+
     // The accepted generation's budget still counts the previous generation's flow.
     std::fs::write(&path, config(2)).unwrap();
     child.signal(libc::SIGHUP);
@@ -1477,24 +1494,212 @@ async fn shutdown_interrupts_dns_preparation_without_retiring_listeners() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn replacement_bind_failure_is_fatal_and_cleans_partial_generation() {
+async fn replacement_bind_failure_retains_service_and_allows_subsequent_reload() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = available_address();
-    let config = format!("- address: '{address}'\n  protocol: {{type: http}}\n");
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let (address_reservation, address) = reserve_address();
+    let (candidate_reservation, candidate_address) = reserve_address();
+    let config = forward(address, echo.local_addr());
     std::fs::write(&path, &config).unwrap();
+    drop(address_reservation);
     let mut child = Process::start(&path, &["--no-reload"]);
     child.wait_for("Servers ready").await;
+    let mut retained = TcpStream::connect(address).await.unwrap();
+    roundtrip(&mut retained).await;
     std::fs::write(
         &path,
         format!(
-            "{config}- address: '{}'\n  protocol: {{type: http}}\n",
+            "{config}- address: '{candidate_address}'\n  protocol: {{type: http}}\n- address: '{}'\n  protocol: {{type: http}}\n",
             occupied.local_addr().unwrap()
         ),
     )
     .unwrap();
+    drop(candidate_reservation);
     child.signal(libc::SIGHUP);
+    child
+        .wait_for("Reload rejected; current servers retained")
+        .await;
+    roundtrip(&mut retained).await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    drop(std::net::TcpListener::bind(candidate_address).unwrap());
+    std::fs::write(
+        &path,
+        format!("{config}- address: '{candidate_address}'\n  protocol: {{type: http}}\n"),
+    )
+    .unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    roundtrip(&mut retained).await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    TcpStream::connect(candidate_address).await.unwrap();
+    child.signal(libc::SIGTERM);
+    assert_eq!(child.exit().await.code(), Some(0));
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_reuseaddr(true).unwrap();
+    socket.bind(address).unwrap();
+    socket.listen(128).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn partial_quic_activation_rolls_back_or_shuts_down_without_leaking_listeners() {
+    for cancel in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+            .await
+            .unwrap();
+        let address = available_address();
+        let live = forward(address, echo.local_addr())
+            .replace("reload_grace_secs: 2", "reload_grace_secs: 60");
+        std::fs::write(&path, &live).unwrap();
+        let mut child = Process::start(&path, &["--no-reload"]);
+        child.wait_for("Servers ready").await;
+        let mut retained = TcpStream::connect(address).await.unwrap();
+        roundtrip(&mut retained).await;
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let partial = reservation.local_addr().unwrap();
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let blocked = occupied.local_addr().unwrap();
+        drop(reservation);
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let quic = |address: SocketAddr| {
+            serde_json::json!({
+                "address": address.to_string(), "transport":"quic",
+                "quic_settings":{"cert":certificate.cert.pem(), "key":certificate.signing_key.serialize_pem(), "num_endpoints":1},
+                "protocol":{"type":"forward", "target":echo.local_addr().to_string()}
+            })
+        };
+        let mut candidate: serde_json::Value = serde_yaml::from_str(&live).unwrap();
+        candidate
+            .as_array_mut()
+            .unwrap()
+            .extend([quic(partial), quic(blocked)]);
+        std::fs::write(&path, candidate.to_string()).unwrap();
+        child.signal(libc::SIGHUP);
+        if cancel {
+            child.wait_for(&format!("QUIC server at {blocked}")).await;
+        } else {
+            child
+                .wait_for("Reload rejected; previous servers restored")
+                .await;
+            roundtrip(&mut retained).await;
+            roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+            drop(std::net::UdpSocket::bind(partial).unwrap());
+            candidate.as_array_mut().unwrap().pop();
+            std::fs::write(&path, candidate.to_string()).unwrap();
+            child.signal(libc::SIGHUP);
+            child.wait_for("Servers ready").await;
+        }
+        child.signal(libc::SIGTERM);
+        assert!(child.exit().await.success());
+        drop(std::net::UdpSocket::bind(partial).unwrap());
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket.bind(address).unwrap();
+        socket.listen(128).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn descriptor_tun_can_restart_after_failed_activation_and_releases_on_exit() {
+    check_descriptor_tun_reload(true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn candidate_only_tun_descriptor_survives_rejected_reload() {
+    check_descriptor_tun_reload(false).await;
+}
+
+#[cfg(unix)]
+async fn check_descriptor_tun_reload(initially_enabled: bool) {
+    use std::os::fd::OwnedFd;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    let config = format!(
+        "{}- device_fd: 0\n  rules: allow-all-direct\n",
+        forward(address, echo.local_addr())
+    );
+    let initial = if initially_enabled {
+        config.clone()
+    } else {
+        forward(address, echo.local_addr())
+    };
+    std::fs::write(&path, initial).unwrap();
+    let (mut peer, device) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+        .args(["-t", "1", "--no-reload"])
+        .arg(&path)
+        .stdin(Stdio::from(OwnedFd::from(device)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = Process::from_child(child);
+    child.wait_for("Servers ready").await;
+    // Proxy entries start first; a second TUN forces failure after descriptor adoption.
+    std::fs::write(
+        &path,
+        format!("{config}- device_fd: -1\n  rules: allow-all-direct\n"),
+    )
+    .unwrap();
+    child.signal(libc::SIGHUP);
+    child
+        .wait_for("Reload rejected; previous servers restored")
+        .await;
+    let error = std::io::Read::read(&mut peer, &mut [0])
+        .expect_err("rejected reload closed the inherited TUN descriptor");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    std::fs::write(&path, config).unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    std::fs::write(&path, forward(address, echo.local_addr())).unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    assert_eq!(std::io::Read::read(&mut peer, &mut [0]).unwrap(), 0);
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rollback_failure_is_reported_and_partial_services_are_stopped() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path().join("old");
+    std::fs::create_dir(&parent).unwrap();
+    let socket = parent.join("listener.sock");
+    let path = directory.path().join("config.yaml");
+    std::fs::write(
+        &path,
+        format!(
+            "- path: '{}'\n  protocol: {{type: socks}}\n",
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let mut child = Process::start(&path, &["--no-reload"]);
+    child.wait_for("Servers ready").await;
+    std::fs::remove_file(&socket).unwrap();
+    std::fs::remove_dir(parent).unwrap();
+    let partial = available_address();
+    std::fs::write(&path, format!("- address: '{partial}'\n  protocol: {{type: socks}}\n- path: '{}'\n  protocol: {{type: socks}}\n", directory.path().join("missing/listener.sock").display())).unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("rollback failed").await;
     assert_eq!(child.exit().await.code(), Some(1));
-    std::net::TcpListener::bind(address).unwrap();
+    std::net::TcpListener::bind(partial).unwrap();
 }

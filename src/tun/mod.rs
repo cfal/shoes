@@ -303,6 +303,8 @@ pub(crate) async fn handle_tcp_connection(
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN TCP setup timed out"))
     .and_then(|result| result)
     .inspect_err(|error| warn!("Failed to connect to {}: {}", target, error))?;
+    drop(proxy_selector);
+    drop(resolver);
 
     let Some((mut remote, wire_destination)) = connected else {
         debug!("TCP connection blocked by rules");
@@ -356,6 +358,14 @@ pub async fn start_tun_server(
     config: TunConfig,
     resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
 ) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
+    start_tun_server_with_fd_ownership(config, resolver, true).await
+}
+
+pub(crate) async fn start_tun_server_with_fd_ownership(
+    config: TunConfig,
+    resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
+    close_fd_on_drop: bool,
+) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
 
@@ -363,7 +373,8 @@ pub async fn start_tun_server(
         let _keep_alive = shutdown_tx;
         let mut ready = Some(ready_tx);
         let result =
-            run_tun_from_config_inner(config, shutdown_rx, true, resolver, &mut ready).await;
+            run_tun_from_config_inner(config, shutdown_rx, close_fd_on_drop, resolver, &mut ready)
+                .await;
         if let Some(ready) = ready.take() {
             let _ = ready.send(result);
             Ok(())

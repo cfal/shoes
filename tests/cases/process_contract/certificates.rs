@@ -317,6 +317,16 @@ async fn reload_releases_retired_http01_ports_before_starting_proxy_listeners() 
         child.wait_for("Servers ready").await;
         config[0]["challenge"] = json!({"type": "tls_alpn01"});
         config.as_array_mut().unwrap().push(json!({"address": challenge.to_string(), "protocol": {"type": "socks"}}));
+        config.as_array_mut().unwrap().push(json!({"path":directory.path().join("missing/listener.sock"), "protocol":{"type":"socks"}}));
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        child.signal(libc::SIGHUP);
+        child.wait_for("Reload rejected; previous servers restored").await;
+        let mut restored = TcpStream::connect(challenge).await.unwrap();
+        restored.write_all(b"GET / HTTP/1.1\r\nHost: proxy.test\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        restored.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+        config.as_array_mut().unwrap().pop();
         std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
         child.signal(libc::SIGHUP);
         child.wait_for("Servers ready").await;
@@ -340,6 +350,16 @@ async fn reload_releases_retired_http01_ports_before_starting_proxy_listeners() 
         drop(stream);
 
         config[0]["challenge"]["listen"] = json!([challenge.to_string()]);
+        config.as_array_mut().unwrap().push(json!({"path":directory.path().join("missing/listener.sock"), "protocol":{"type":"socks"}}));
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        child.signal(libc::SIGHUP);
+        child.wait_for("Reload rejected; previous servers restored").await;
+        let mut stream = TcpStream::connect(challenge).await.unwrap();
+        stream.write_all(&[5, 1, 0]).await.unwrap();
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [5, 0], "failed HTTP-01 activation must restore the proxy");
+        drop(stream);
+        config.as_array_mut().unwrap().pop();
         std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
         child.signal(libc::SIGHUP);
         child.wait_for("Servers ready").await;
