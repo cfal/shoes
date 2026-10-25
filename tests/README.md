@@ -15,6 +15,7 @@ cargo test --workspace --locked --lib --bins
 cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
 cargo test -p shoes --locked --test process_contract -- --test-threads=1
 cargo test -p shoes --locked --test rule_allocation
+cargo test -p shoes --locked --test retention_allocation --test matcher_invariants -- --nocapture
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
@@ -37,6 +38,8 @@ the reported test count when renaming modules or changing CI filters.
 | `integration` | `integration-tests` | Local endpoints, Shoes subprocesses, and sing-box for peer cases. Includes TCP/UDP protocols, chaining, sniffing, Fake DNS, resource lifecycle, and userspace WireGuard. |
 | `process_contract` | None | Shoes subprocesses; Unix-only cases exercise signals and filesystem reloads. |
 | `rule_allocation` | None | Local rule compilation and allocation limits. |
+| `retention_allocation` | None | Isolated requested-heap retention across failed compilation, generation replacement, retained owners, and final destruction. |
+| `matcher_invariants` | None | Fixed-seed port-range membership against a linear oracle, including Boolean composition and boundary cases. |
 | `optional_peer` | `optional-peer-tests` | sing-box, Mihomo, Xray, and Naive Caddy as required by each case. Includes carrier sharing and idle reuse. |
 | `xhttp_interop` | `integration-tests` | Local-only filters or pinned Xray and Mihomo; see [XHTTP.md](XHTTP.md). |
 | `reality_interop` | `optional-peer-tests` | Pinned Xray and local TLS camouflage endpoints. |
@@ -104,6 +107,26 @@ fragmentation, cancellation, credit accounting, and parser rejection; use
 process/kernel tests for descriptor ownership, real routing, and reload behavior.
 Bound network waits, assert exact payloads and EOF/error outcomes, and propagate
 fixture-task failures rather than accepting a timeout as proof of rejection.
+
+The `process::retention_tests::` library case launches an exact-filter child to
+isolate process-global budgets and descriptor counts from parallel tests. The
+child must run exactly one passing test, so a stale filter cannot silently pass.
+The case repeats partial listener startup failures, malformed and cancelled SOCKS
+handshakes, TCP generation retirement with live and stalled sessions, owner
+destruction, and QUIC endpoint/stream ownership. Every cycle must restore its
+known baseline within five seconds, including Tokio live tasks and active
+connection/stream/QUIC reservations. Linux also gates FD recovery; other
+platforms explicitly report FD/RSS as unavailable (`None`). RSS is informational.
+These are lifecycle primitives, not a replacement for process activation tests.
+The real SIGHUP datapath measurement remains in `benches/reload_memory.mjs`.
+
+`shoes_test_support::measure` supplies the shared counting system allocator,
+Linux process samples, and bounded state polling. Do not use process-wide
+samples in concurrently running tests. Allocation tests have one test per
+executable, warm up first, and sample equivalent owner states before printing.
+The allocator counts successful allocations/reallocations and requested live
+bytes/blocks, not jemalloc arenas, foreign allocations, or RSS. Retention checks
+require exact return to baseline; compilation peak budgets remain enforced.
 
 Important remaining limitations:
 

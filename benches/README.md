@@ -117,3 +117,65 @@ CPU 2 to avoid the selector benchmark. Both ran in the shared VM.
 Corpus revisions: Loyalsoldier/clash-rules `335129e29eb0b32bb783d4164bcce1d35b53d9e1`
 (`reject.txt`), SagerNet/sing-geoip `eb32cd6ed4a16fcb3bf9a36ccebf28e45716ae84`
 (`geoip-cn.srs`, `geoip-us.srs`). The large corpus files are not committed.
+
+## Lifetime Regressions
+
+The reload harness records a warmed idle sample, a post-payload sample per
+pinned generation, and a drained sample after all test connections close.
+`BENCH_GENERATIONS` selects 2-16 generations (default 4). The 60-second
+whole-run deadline and reload grace apply. Each committed generation
+alternates between two local upstreams: exact payload echo is necessary but not
+sufficient; the new connection must reach the newly configured upstream. Old
+connections must keep echoing exact bytes. FDs must return to the pre-connection
+idle ceiling within five seconds after warmup and final drain.
+A fresh post-drain connection must still reach the final committed upstream and
+echo exact bytes before the final idle sample is taken.
+The asynchronous toolchain probe has a five-second deadline and also observes
+whole-run cancellation. The reported RSS peak includes every recorded sample.
+
+The measurement requires Linux `/proc`; missing metrics are errors, never zero.
+RSS/HWM and reload time are informational, without slope or nanosecond gates.
+RSS includes allocator retention and cannot establish that live allocations
+leak. The report records source revision/tree, tracked patch, untracked Rust
+source hashes, lockfile, binary, harness, inputs, server log, toolchain, supplied
+build command, and command arguments. `source.patch_base64` preserves raw patch
+bytes, with color, external diffs and text conversions disabled, fixed path
+prefixes and three context lines; `source.patch_sha256` hashes the decoded bytes.
+`BENCH_CONTENTION` records observed outside
+load; its default is explicitly `not recorded`. Use a fresh output directory:
+the harness refuses to overwrite `server.log`.
+
+For a small reproducible correctness/measurement cycle, without downloading a
+large corpus, use a YAML file containing `payload: [blocked.invalid]` and the
+committed `tests/fixtures/rule_sets/singbox-v2.srs` for both SRS arguments. That
+fixture run is not comparable to the historical 197,553-entry results above.
+Preserve stdout JSON and the output directory's `server.log` together.
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test --locked --lib process::retention_tests:: -- --nocapture
+CARGO_BUILD_JOBS=1 cargo test --locked --test retention_allocation --test matcher_invariants -- --nocapture
+CARGO_BUILD_JOBS=1 cargo test --locked --test rule_allocation -- --nocapture
+TMPDIR="$PWD/target/tmp" node --test benches/reload_memory.test.mjs
+```
+
+Create `target/tmp` first when using the last command. On shared hosts, run builds,
+heavy tests, and measurements under the same exclusive `flock`, with one Cargo
+build job and worktree-local target/scratch paths. Release the lock between
+commands. Do not compare timing/RSS across contested runs as if they were isolated.
+
+The isolated Rust lifetime case samples live Tokio tasks, active resource
+reservations, and Linux FDs at matching lifecycle states. Its TCP tests use a
+one-second drain grace and five-second cleanup deadline, including stalled
+handshakes and live exact-byte sessions; QUIC checks that application handles
+retain memory reservations until destruction. The separate system-allocator
+test performs 64 generation/failed-compilation cycles after eight warmups,
+checking exact live-byte/allocation-count recovery with four temporary owners.
+This models immutable predicate ownership, not full daemon heap retention.
+`rule_allocation` enforces adversarial compilation peak budgets.
+`matcher_invariants` adds 128 fixed-seed port-range cases with linear membership,
+boundary, negation, and composition checks; production domain storage is untouched.
+
+Linux CI gates these correctness and bounded-retention tests. Full daemon live
+heap, asynchronous task counts in the subprocess, mobile devices, and arbitrary
+long-lived generation overlap remain outside these measurements. Other isolated
+tests can reuse the sampling helpers without adding production metrics.

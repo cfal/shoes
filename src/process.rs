@@ -640,6 +640,10 @@ async fn run_inner(
 }
 
 #[cfg(test)]
+#[path = "../tests/cases/retention/process.rs"]
+mod retention_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
