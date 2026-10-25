@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
@@ -12,9 +13,9 @@ use futures::future::FutureExt;
 use log::debug;
 use lru::LruCache;
 use parking_lot::Mutex;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, broadcast};
 
-use crate::address::{NetLocation, ResolvedLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 
 pub type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 pub type DnsExchangeFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send>>;
@@ -50,6 +51,7 @@ pub(crate) fn dns_setup_pending(error: &std::io::Error) -> bool {
 }
 
 const CACHING_NATIVE_RESOLVER_CACHE_CAPACITY: usize = 10_000;
+const CACHING_NATIVE_RESOLVER_MAX_PARTICIPANTS: usize = 1_024;
 const RESOLVER_CACHE_CAPACITY: usize = 1_024;
 
 /// Constructs a bounded LRU without eagerly reserving storage for every entry.
@@ -469,16 +471,106 @@ pub async fn resolve_location(
 }
 
 /// Native resolver with application-level caching.
-/// Uses tokio::net::lookup_host (OS resolver) with TTL-based cache.
-/// This is used as the default resolver when no DNS config is specified.
+/// The default for servers without configured DNS servers. OS lookups expose no DNS
+/// TTL; successful results are reused for at most 60 seconds by default, measured
+/// from lookup completion. Errors and empty results are never cached.
+///
+/// At most 1,024 callers participate in coalesced misses (owners plus subscribers).
+/// Excess callers perform independent lookups, preserving existing failure
+/// semantics without adding an unbounded admission queue or detached tasks.
+/// Cancelling an owner makes surviving subscribers start a new lookup, which
+/// may exceed their remaining deadlines. Already-running OS calls cannot be stopped.
 pub struct CachingNativeResolver {
-    cache: Arc<parking_lot::Mutex<LruCache<NetLocation, CachedResolveResult>>>,
+    state: Arc<Mutex<NativeResolverState>>,
+    participants: Arc<Semaphore>,
+    lookup: Arc<dyn Resolver>,
     result_timeout_secs: u64,
 }
 
+type NativeLookupResult = Result<Arc<[SocketAddr]>, Arc<std::io::Error>>;
+
+struct NativeResolverState {
+    cache: LruCache<Address, CachedResolveResult>,
+    inflight: HashMap<Address, broadcast::Sender<NativeLookupResult>>,
+}
+
 struct CachedResolveResult {
-    timestamp: Instant,
-    addrs: Vec<SocketAddr>,
+    completed_at: tokio::time::Instant,
+    addrs: Arc<[SocketAddr]>,
+}
+
+impl NativeResolverState {
+    fn cached(&mut self, address: &Address, max_age: Duration) -> Option<Arc<[SocketAddr]>> {
+        if let Some(cached) = self.cache.get(address)
+            && cached.completed_at.elapsed() < max_age
+        {
+            return Some(cached.addrs.clone());
+        }
+        self.cache.pop(address);
+        None
+    }
+}
+
+struct NativeLookupOwner {
+    state: Arc<Mutex<NativeResolverState>>,
+    address: Address,
+    registered: bool,
+}
+
+enum NativeLookupRole {
+    Owner(NativeLookupOwner),
+    Subscriber(broadcast::Receiver<NativeLookupResult>),
+}
+
+impl NativeLookupOwner {
+    fn publish(mut self, result: &NativeLookupResult) {
+        let mut state = self.state.lock();
+        if let Ok(addrs) = result {
+            state.cache.put(
+                self.address.clone(),
+                CachedResolveResult {
+                    completed_at: tokio::time::Instant::now(),
+                    addrs: addrs.clone(),
+                },
+            );
+        }
+        // Cache insertion and flight removal are atomic with subscription.
+        if self.registered {
+            let sender = state.inflight.remove(&self.address).unwrap();
+            // A panicking waker must not let Drop remove a replacement flight.
+            self.registered = false;
+            drop(state);
+            let _ = sender.send(result.clone());
+        }
+    }
+}
+
+impl Drop for NativeLookupOwner {
+    fn drop(&mut self) {
+        if self.registered {
+            // Closing outside the lock wakes subscribers to elect a replacement owner.
+            let sender = self.state.lock().inflight.remove(&self.address);
+            drop(sender);
+        }
+    }
+}
+
+fn native_addrs_with_port(addrs: &[SocketAddr], port: u16) -> Vec<SocketAddr> {
+    addrs
+        .iter()
+        .map(|addr| {
+            let mut addr = *addr;
+            addr.set_port(port);
+            addr
+        })
+        .collect()
+}
+
+fn native_lookup_error(error: Arc<std::io::Error>) -> std::io::Error {
+    match error.raw_os_error() {
+        Some(errno) => std::io::Error::from_raw_os_error(errno),
+        None => std::io::Error::new(error.kind(), error),
+    }
 }
 
 impl std::fmt::Debug for CachingNativeResolver {
@@ -490,17 +582,23 @@ impl std::fmt::Debug for CachingNativeResolver {
 }
 
 impl CachingNativeResolver {
-    pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
+    /// Conservative application result age, not an authoritative DNS record TTL.
+    pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 60;
 
     pub fn new() -> Self {
         Self::with_timeout(Self::DEFAULT_RESULT_TIMEOUT_SECS)
     }
 
+    /// Sets the maximum successful result age, not a lookup deadline or DNS TTL.
+    /// Zero disables completed-result reuse but still coalesces concurrent misses.
     pub fn with_timeout(result_timeout_secs: u64) -> Self {
         Self {
-            cache: Arc::new(parking_lot::Mutex::new(bounded_lru(
-                CACHING_NATIVE_RESOLVER_CACHE_CAPACITY,
-            ))),
+            state: Arc::new(Mutex::new(NativeResolverState {
+                cache: bounded_lru(CACHING_NATIVE_RESOLVER_CACHE_CAPACITY),
+                inflight: HashMap::new(),
+            })),
+            participants: Arc::new(Semaphore::new(CACHING_NATIVE_RESOLVER_MAX_PARTICIPANTS)),
+            lookup: Arc::new(NativeResolver::new()),
             result_timeout_secs,
         }
     }
@@ -514,49 +612,89 @@ impl Default for CachingNativeResolver {
 
 impl Resolver for CachingNativeResolver {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
-        // Check cache first
-        {
-            let mut cache = self.cache.lock();
-            if let Some(cached) = cache.get(location)
-                && Instant::now().duration_since(cached.timestamp)
-                    <= Duration::from_secs(self.result_timeout_secs)
-            {
-                let addrs = cached.addrs.clone();
-                return Box::pin(async move { Ok(addrs) });
-            }
-            cache.pop(location);
+        let max_age = Duration::from_secs(self.result_timeout_secs);
+        let caller_port = location.port();
+        if let Some(addrs) = self.state.lock().cached(location.address(), max_age) {
+            let addrs = native_addrs_with_port(&addrs, caller_port);
+            return Box::pin(async move { Ok(addrs) });
         }
 
-        let location = location.clone();
-        let cache = self.cache.clone();
+        // Tokio's (host, u16) lookup delegates to std, which passes a null service
+        // to getaddrinfo and sets ports afterward. Only the exact host is a key;
+        // socket candidates retain order, duplicates, IPv6 scope IDs and flowinfo.
+        let query_location = NetLocation::new(location.address().clone(), 0);
+        let state = self.state.clone();
+        let participants = self.participants.clone();
+        let lookup = self.lookup.clone();
 
         Box::pin(async move {
-            let address = location.address().to_string();
-            let port = location.port();
+            let permit = participants.try_acquire().ok();
+            loop {
+                let role = {
+                    let mut locked = state.lock();
+                    // Rechecks after future creation or cancellation of an owner.
+                    if let Some(addrs) = locked.cached(query_location.address(), max_age) {
+                        return Ok(native_addrs_with_port(&addrs, caller_port));
+                    }
+                    if let Some(sender) = locked.inflight.get(query_location.address())
+                        && permit.is_some()
+                    {
+                        NativeLookupRole::Subscriber(sender.subscribe())
+                    } else {
+                        let registered = permit.is_some();
+                        if registered {
+                            let (sender, _) = broadcast::channel(1);
+                            locked
+                                .inflight
+                                .insert(query_location.address().clone(), sender);
+                        }
+                        NativeLookupRole::Owner(NativeLookupOwner {
+                            state: state.clone(),
+                            address: query_location.address().clone(),
+                            registered,
+                        })
+                    }
+                };
 
-            let result = tokio::net::lookup_host((address.clone(), port)).await?;
-            let addrs: Vec<SocketAddr> =
-                result.filter(|addr| !addr.ip().is_unspecified()).collect();
-
-            if addrs.is_empty() {
-                return Err(std::io::Error::other(format!(
-                    "DNS lookup returned no addresses for {address}"
-                )));
+                let result = match role {
+                    NativeLookupRole::Subscriber(mut subscriber) => match subscriber.recv().await {
+                        Ok(result) => result,
+                        Err(_) => continue,
+                    },
+                    NativeLookupRole::Owner(owner) => {
+                        let result = lookup
+                            .resolve_location(&query_location)
+                            .await
+                            .and_then(|mut addrs| {
+                                addrs.retain(|addr| !addr.ip().is_unspecified());
+                                if addrs.is_empty() {
+                                    Err(std::io::Error::other(format!(
+                                        "DNS lookup returned no addresses for {}",
+                                        query_location.address()
+                                    )))
+                                } else {
+                                    Ok(Arc::from(addrs))
+                                }
+                            })
+                            .map_err(Arc::new);
+                        owner.publish(&result);
+                        result
+                    }
+                };
+                let addrs = result.map_err(native_lookup_error)?;
+                let addrs = native_addrs_with_port(&addrs, caller_port);
+                debug!(
+                    "CachingNativeResolver resolved {}:{caller_port} -> {addrs:?}",
+                    query_location.address()
+                );
+                return Ok(addrs);
             }
-
-            cache.lock().put(
-                location,
-                CachedResolveResult {
-                    timestamp: Instant::now(),
-                    addrs: addrs.clone(),
-                },
-            );
-
-            debug!("CachingNativeResolver resolved {address}:{port} -> {addrs:?}");
-            Ok(addrs)
         })
     }
 }
+
+#[cfg(test)]
+mod native_tests;
 
 /// Poll-based resolver cache for use in Future/Stream implementations.
 /// Wraps any Resolver and provides poll_resolve_location for manual polling.
@@ -1083,64 +1221,6 @@ mod tests {
         assert_eq!(initial.0.load(Ordering::Relaxed), 4);
         assert_eq!(fresh.call_count.load(Ordering::Relaxed), 0);
         assert_eq!(builds.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn test_caching_native_resolver_cache_is_bounded() {
-        let resolver = CachingNativeResolver::new();
-        let mut cache = resolver.cache.lock();
-
-        for index in 0..CACHING_NATIVE_RESOLVER_CACHE_CAPACITY + 1 {
-            cache.put(
-                unique_location(index),
-                CachedResolveResult {
-                    timestamp: Instant::now(),
-                    addrs: vec!["127.0.0.1:443".parse().unwrap()],
-                },
-            );
-        }
-
-        assert_eq!(cache.len(), CACHING_NATIVE_RESOLVER_CACHE_CAPACITY);
-        assert!(cache.peek(&unique_location(0)).is_none());
-    }
-
-    #[tokio::test]
-    async fn native_cache_preserves_all_candidates_and_order() {
-        let resolver = CachingNativeResolver::new();
-        let location = test_location();
-        let addrs = vec![
-            "[2001:db8::1]:80".parse().unwrap(),
-            "192.0.2.1:80".parse().unwrap(),
-            "192.0.2.2:80".parse().unwrap(),
-        ];
-        resolver.cache.lock().put(
-            location.clone(),
-            CachedResolveResult {
-                timestamp: Instant::now(),
-                addrs: addrs.clone(),
-            },
-        );
-        let mut result = resolver.resolve_location(&location).await.unwrap();
-        assert_eq!(result, addrs);
-        result.clear();
-        assert_eq!(resolver.resolve_location(&location).await.unwrap(), addrs);
-    }
-
-    #[tokio::test]
-    async fn native_cache_expires_and_stores_the_complete_cold_result() {
-        let resolver = CachingNativeResolver::with_timeout(1);
-        let location = NetLocation::from_str("127.0.0.1:80", None).unwrap();
-        resolver.cache.lock().put(
-            location.clone(),
-            CachedResolveResult {
-                timestamp: Instant::now() - Duration::from_secs(2),
-                addrs: vec!["192.0.2.1:80".parse().unwrap()],
-            },
-        );
-        let cold = resolver.resolve_location(&location).await.unwrap();
-        assert_eq!(cold, vec!["127.0.0.1:80".parse::<SocketAddr>().unwrap()]);
-        assert_eq!(resolver.cache.lock().peek(&location).unwrap().addrs, cold);
-        assert_eq!(resolver.resolve_location(&location).await.unwrap(), cold);
     }
 
     #[tokio::test]

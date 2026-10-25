@@ -57,6 +57,14 @@ name = "rule_allocation"
 path = "tests/rule_allocation.rs"
 
 [[test]]
+name = "retention_allocation"
+path = "tests/retention_allocation.rs"
+
+[[test]]
+name = "matcher_invariants"
+path = "tests/matcher_invariants.rs"
+
+[[test]]
 name = "integration"
 path = "tests/integration.rs"
 required-features = ["integration-tests"]

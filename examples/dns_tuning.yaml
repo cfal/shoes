@@ -4,6 +4,21 @@
 # - timeout_secs: overall lookup timeout inside hickory
 # - connect_timeout_secs: connection setup timeout for TCP/TLS/HTTPS/H3 upstreams
 # - attempts: retry count for failed queries
+#
+# With no dns field, or a dns field with omitted or empty servers, destination
+# lookups use the OS resolver. Shoes caches successful results for 60 seconds from
+# lookup completion, across ports, with at most 10,000 cached hosts.
+# This is an application result-age policy, not a DNS record TTL: OS/getaddrinfo
+# lookups do not expose authoritative TTLs and may themselves return OS-cached
+# data. Failed and empty results are not cached.
+# Concurrent misses share a lookup, up to 1,024 participating callers per resolver.
+# Excess callers look up independently; this is not an OS lookup concurrency cap.
+# Cancelling the owner makes surviving callers retry. The resolver sets no lookup
+# deadline; caller timeouts must bound the retry, which may not finish in time.
+# Already-running OS calls cannot be stopped. Expired results are not served on
+# refresh failure; expiry during a DNS outage can therefore fail new lookups.
+# These defaults leave configured upstream resolvers, raw DNS exchange, and
+# bootstrap unchanged.
 
 # Direct DNS group with fast-fail tuning.
 - dns_group: tuned-direct-dns
