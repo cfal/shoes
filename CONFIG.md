@@ -2003,8 +2003,9 @@ root dot and lowercases ASCII without changing the dial target.
 
 ### Local Rule Sources
 
-Declare an action-free `rule_group` containing file paths, or load a file inline
-under `masks`. Sources are read and compiled during validation, including `--dry-run`,
+Declare an action-free `rule_source_group` containing matching expressions and file
+paths, or load a file inline under `masks` or alongside `action`. Sources are read
+and compiled during validation, including `--dry-run`,
 before a reload stops existing listeners. Invalid sources reject the candidate.
 Automatic reload watches imported files as well as configs. A parseable rejected
 candidate keeps its source paths watched, so creating or repairing a missing file
@@ -2015,18 +2016,24 @@ Established connections retain their original rules until they drain. New routin
 caches belong to the new configuration; Fake DNS pools are preserved separately.
 
 ```yaml
-- rule_group: blocked
+- rule_source_group: blocked
   rules:
     - lists/domains.srs
     - path: lists/addresses.json
       format: singbox_json
+    - domain_suffix: [ads.example, tracking.example]
+    - all:
+        - domain_suffix: [restricted.example]
+        - destination_port: [443]
 
 - address: "0.0.0.0:1080"
   protocol: {type: socks}
   rules:
-    - masks: {rule_group: blocked}
+    - masks: {rule_source_group: blocked}
       action: block
     - masks: {path: lists/extra.srs}
+      action: block
+    - path: lists/another.srs
       action: block
     - masks:
         - "192.168.0.0/16"
@@ -2042,13 +2049,14 @@ Sources and groups also compose with typed predicates:
 rules:
   - masks:
       all:
-        - rule_group: blocked
+        - rule_source_group: blocked
         - destination_port: [443]
         - not: {path: lists/exceptions.srs}
     action: block
 ```
 
-File groups OR their sources together. A source is a path string inside a group's
+Source groups OR their entries together, including native predicates, `all`,
+`any`, `not`, source-group references, and file sources. A source is a path string inside a group's
 `rules`, or an object with `path` and optional `format`, `behavior`, `code`, and
 `attributes`. Inline sources under `masks` require the object form; a mask string
 is always an IP/CIDR/hostname. For example, `masks: blocked` matches that hostname,
@@ -2175,16 +2183,18 @@ rules:
 
 ### Rule Group
 
-A group contains either ordered policies or action-free file sources. Member shape
-determines its kind: objects with `masks` are policies, even when `action` is
-omitted; paths and `{path: ...}` objects are sources. Empty groups and mixed kinds
-are rejected. Both kinds share one namespace, including built-in names. `rule` is
+A `rule_group` contains ordered policies; omitted `action` still means `allow`.
+A `rule_source_group` contains action-free matching expressions and file sources.
+The declaration determines the kind, never the presence of an action. Empty
+groups are rejected. Both kinds share one namespace, including built-in names. `rule` is
 an alias for `rules`; either accepts one item directly or a nonempty list.
 
 Policy groups are referenced from `rules` or `override_rules`, preserving order,
 actions, and routing options. Source groups are referenced only with
-`masks: {rule_group: name}`, with the caller's action. Cross-kind references are
-errors: actions are never discarded or invented. Group nesting is not supported.
+`masks: {rule_source_group: name}`, with the caller's action. Cross-kind references are
+errors: actions are never discarded or invented. Source groups can reference
+other source groups; cycles and excessive nesting are rejected. Policy groups
+cannot reference other policy groups.
 
 ```yaml
 - rule_group: standard-rules

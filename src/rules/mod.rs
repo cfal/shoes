@@ -34,7 +34,7 @@ pub enum Expression {
     IpCidr(Vec<String>),
     DestinationPort(Vec<u16>),
     DestinationPortRange(Vec<String>),
-    RuleGroup(String),
+    RuleSourceGroup(String),
     All(Vec<Expression>),
     Any(Vec<Expression>),
     Not(Box<Expression>),

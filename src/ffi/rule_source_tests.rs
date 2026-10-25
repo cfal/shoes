@@ -19,8 +19,8 @@ async fn invalid_sources_fail_before_ffi_opens_listeners_or_tun() {
         for named in [false, true] {
             let mut configs = Vec::new();
             let masks = if named {
-                configs.push(json!({"rule_group": "source", "rule": {"path": path}}));
-                json!({"rule_group": "source"})
+                configs.push(json!({"rule_source_group": "source", "rule": {"path": path}}));
+                json!({"rule_source_group": "source"})
             } else {
                 json!({"path": path})
             };
@@ -102,8 +102,8 @@ async fn route_source(path: &std::path::Path, named: bool) {
     let echo = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let mut configs = Vec::new();
     let masks = if named {
-        configs.push(json!({"rule_group": "source", "rule": path}));
-        json!({"rule_group": "source"})
+        configs.push(json!({"rule_source_group": "source", "rule": path}));
+        json!({"rule_source_group": "source"})
     } else {
         json!({"path": path})
     };

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, RuleGroupRules, rule_visit};
+use crate::config::{Config, rule_visit};
 use crate::rules::{Compiler, Predicate, invalid};
 pub use mihomo::Behavior;
 
@@ -124,11 +124,9 @@ fn visit_sources(
     visitor: &mut dyn FnMut(&mut RuleSource) -> io::Result<()>,
 ) -> io::Result<()> {
     for config in configs.iter_mut() {
-        if let Config::RuleConfigGroup(group) = config
-            && let RuleGroupRules::Sources(sources) = &mut group.rules
-        {
-            for source in sources.iter_mut() {
-                visitor(source)?;
+        if let Config::RuleSourceGroup(group) = config {
+            for expression in &mut group.rules {
+                expression.visit_sources(visitor)?;
             }
         }
     }
@@ -169,44 +167,47 @@ pub fn load(configs: &mut [Config], compiler: &mut Compiler) -> io::Result<()> {
         .extend(["allow-all-direct".into(), "block-all".into()]);
     let mut names: HashSet<_> = compiler.policy_groups.clone();
     for config in configs.iter() {
-        let Config::RuleConfigGroup(group) = config else {
-            continue;
+        let name = match config {
+            Config::RuleConfigGroup(group) => {
+                if group.rules.iter().next().is_none() {
+                    return Err(invalid("rule group cannot be empty"));
+                }
+                compiler.policy_groups.insert(group.rule_group.clone());
+                &group.rule_group
+            }
+            Config::RuleSourceGroup(group) => {
+                compiler.source_groups.insert(
+                    group.rule_source_group.clone(),
+                    crate::rules::Expression::or(group.rules.clone()),
+                );
+                &group.rule_source_group
+            }
+            _ => continue,
         };
-        if group.rule_group.is_empty() || !names.insert(group.rule_group.clone()) {
+        if name.is_empty() || !names.insert(name.clone()) {
             return Err(invalid(format!(
-                "duplicate or empty rule group name: {}",
-                group.rule_group
+                "duplicate or empty rule group name: {name}"
             )));
         }
-        if matches!(group.rules, RuleGroupRules::Policies(_)) {
-            compiler.policy_groups.insert(group.rule_group.clone());
-        }
     }
+    compiler.source_group_depths =
+        crate::rules::Expression::check_source_group_depths(&compiler.source_groups)?;
     rule_visit::visit(configs, &mut |_| Ok(()), &mut |name| {
         if compiler.policy_groups.contains(name) {
             Ok(())
         } else if names.contains(name) {
             Err(invalid(format!(
-                "rule group '{name}' contains file sources; reference it with masks: {{rule_group: {name}}} and an action"
+                "'{name}' is a rule source group; reference it with masks: {{rule_source_group: {name}}} and an action"
             )))
         } else {
             Err(invalid(format!("unknown rule group: {name}")))
         }
     })?;
     for config in configs.iter() {
-        if let Config::RuleConfigGroup(group) = config
-            && let RuleGroupRules::Sources(sources) = &group.rules
-        {
-            let mut predicates = Vec::new();
-            for source in sources.iter() {
-                compiler.charge(128, 0)?;
-                predicates.push(load_source(source, compiler).map_err(|e| {
-                    io::Error::new(e.kind(), format!("rule group {}: {e}", group.rule_group))
-                })?);
-            }
-            compiler
-                .groups
-                .insert(group.rule_group.clone(), Predicate::any(predicates));
+        if let Config::RuleSourceGroup(group) = config {
+            compiler.compile(crate::rules::Expression::RuleSourceGroup(
+                group.rule_source_group.clone(),
+            ))?;
         }
     }
     Ok(())
@@ -442,7 +443,7 @@ mod tests {
         )
         .unwrap();
         let mut configs: Vec<Config> = serde_yaml::from_str(
-            "- rule_group: a\n  rules: [domains.json]\n- rule_group: b\n  rules: [{path: domains.json, format: singbox_json}]"
+            "- rule_source_group: a\n  rules: [domains.json]\n- rule_source_group: b\n  rules: [{path: domains.json, format: singbox_json}]"
         ).unwrap();
         let mut compiler = Compiler::default();
         assert!(load(&mut configs, &mut Compiler::default()).is_err());
@@ -459,8 +460,10 @@ mod tests {
             .is_err()
         );
         assert!(
-            serde_yaml::from_str::<Config>("rule_group: x\nrules: [{path: x.json, unknown: true}]")
-                .is_err()
+            serde_yaml::from_str::<Config>(
+                "rule_source_group: x\nrules: [{path: x.json, unknown: true}]"
+            )
+            .is_err()
         );
     }
 }

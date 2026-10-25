@@ -1,6 +1,6 @@
 use std::io;
 
-use super::{Config, ConfigSelection, RuleConfig, RuleGroupRules, ServerProxyConfig};
+use super::{Config, ConfigSelection, RuleConfig, ServerProxyConfig};
 use crate::option_util::NoneOrSome;
 use crate::rules::Compiler;
 
@@ -79,10 +79,8 @@ pub(crate) fn visit(
             }
             Config::TunServer(tun) => rules(&mut tun.rules, visitor, group)?,
             Config::RuleConfigGroup(group) => {
-                if let RuleGroupRules::Policies(rules) = &mut group.rules {
-                    for rule in rules.iter_mut() {
-                        visitor(rule)?;
-                    }
+                for rule in group.rules.iter_mut() {
+                    visitor(rule)?;
                 }
             }
             _ => {}

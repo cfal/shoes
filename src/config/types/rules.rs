@@ -247,7 +247,29 @@ impl<'de> Deserialize<'de> for RuleConfig {
             client_chains: NoneOrSome<ClientChain>,
         }
 
-        let temp = RuleConfigTemp::deserialize(deserializer)?;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if !value.is_object() {
+            return Err(D::Error::custom(
+                "a policy rule requires a mapping with masks or a source",
+            ));
+        }
+        if let Some(fields) = value.as_object_mut()
+            && fields.contains_key("path")
+        {
+            if fields.contains_key("masks") || fields.contains_key("mask") {
+                return Err(D::Error::custom(
+                    "a flat rule source cannot also specify masks",
+                ));
+            }
+            let mut source = serde_json::Map::new();
+            for key in ["path", "format", "behavior", "code", "attributes"] {
+                if let Some(value) = fields.remove(key) {
+                    source.insert(key.into(), value);
+                }
+            }
+            fields.insert("masks".into(), serde_json::Value::Object(source));
+        }
+        let temp: RuleConfigTemp = serde_json::from_value(value).map_err(D::Error::custom)?;
 
         let expression = Expression::from_config(temp.masks).map_err(D::Error::custom)?;
         let criteria = RuleCriteria {

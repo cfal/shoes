@@ -206,10 +206,7 @@ fn visit_config_pems(config: &mut Config, visitor: &mut PemVisitor<'_>) -> std::
             gather_dns_pem_paths(&mut group.dns_servers, visitor);
         }
         Config::RuleConfigGroup(group) => {
-            let super::RuleGroupRules::Policies(rules) = &mut group.rules else {
-                return Ok(());
-            };
-            for rule in rules.iter_mut() {
+            for rule in group.rules.iter_mut() {
                 if let RuleActionConfig::Allow { client_chains, .. } = &mut rule.action {
                     for chain in client_chains.iter_mut() {
                         for hop in chain.hops.iter_mut() {

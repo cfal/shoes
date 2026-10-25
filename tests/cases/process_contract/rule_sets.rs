@@ -73,8 +73,8 @@ async fn binary_sources_route_inline_and_named_and_reject_corrupt_reloads() {
             std::fs::write(&source, bytes).unwrap();
             let mut config = Vec::new();
             let masks = if named {
-                config.push(json!({"rule_group": "binary", "rule": "list.data"}));
-                json!({"rule_group": "binary"})
+                config.push(json!({"rule_source_group": "binary", "rule": "list.data"}));
+                json!({"rule_source_group": "binary"})
             } else {
                 json!({"path": "list.data"})
             };
@@ -143,12 +143,12 @@ async fn source_groups_route_socks_udp_names_ips_and_ports_without_dns() {
     let address = available_address();
     let config_path = dir.path().join("config.yaml");
     let config = json!([
-        {"rule_group": "sources", "rules": ["domains.mrs", {"path": "ips.mrs"}]},
+        {"rule_source_group": "sources", "rules": ["domains.mrs", {"path": "ips.mrs"}]},
         {"address": address.to_string(), "protocol": {"type": "socks"},
          "dns": {"servers": format!("udp://127.0.0.1:{}", dns.local_addr().unwrap().port())},
          "rules": [
             {"masks": {"not": {"ip_cidr": ["192.0.2.0/24"]}}, "no_resolve": true, "action": "block"},
-            {"masks": {"all": [{"rule_group": "sources"}, {"destination_port": [443]}]},
+            {"masks": {"all": [{"rule_source_group": "sources"}, {"destination_port": [443]}]},
              "no_resolve": true, "override_address": format!("127.0.0.1:{}", echo.local_addr().port())},
             "block-all"
          ]}
@@ -210,9 +210,9 @@ async fn rule_only_reload_rejects_invalid_sources_and_recovers_missing_candidate
     let address = available_address();
     let mut config = json!([
         {"global_limits": {"reload_grace_secs": 60}},
-        {"rule_group": "deny", "rules": ["list.json"]},
+        {"rule_source_group": "deny", "rules": ["list.json"]},
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
-         "rules": [{"masks": {"rule_group": "deny"}, "action": "block"}, {"masks": {"any_destination": true}, "action": "allow"}]}
+         "rules": [{"masks": {"rule_source_group": "deny"}, "action": "block"}, {"masks": {"any_destination": true}, "action": "allow"}]}
     ]);
     source(&list, false);
     std::fs::write(&config_path, config.to_string()).unwrap();
@@ -230,7 +230,7 @@ async fn rule_only_reload_rejects_invalid_sources_and_recovers_missing_candidate
     process.wait_for("Reload rejected").await;
     blocked(address).await;
     roundtrip(&mut established).await;
-    check_config(&config_path, Some("rule group deny"));
+    check_config(&config_path, Some("rule source group deny"));
 
     config[1]["rules"] = json!(["missing/new.json"]);
     std::fs::write(&config_path, config.to_string()).unwrap();
@@ -260,9 +260,9 @@ async fn rule_sources_follow_symlink_retargeting_and_atomic_replacement() {
         .unwrap();
     let address = available_address();
     let config = json!([
-        {"rule_group": "deny", "rules": [{"path": "list.json", "format": "singbox_json"}]},
+        {"rule_source_group": "deny", "rules": [{"path": "list.json", "format": "singbox_json"}]},
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
-         "rules": [{"masks": {"rule_group": "deny"}, "action": "block"}, {"masks": "0.0.0.0/0", "action": "allow"}]}
+         "rules": [{"masks": {"rule_source_group": "deny"}, "action": "block"}, {"masks": "0.0.0.0/0", "action": "allow"}]}
     ]);
     std::fs::write(&config_path, config.to_string()).unwrap();
     let mut process = Process::start(&config_path, &[]);
@@ -296,9 +296,9 @@ async fn rejected_cyclic_source_recovers_without_a_config_edit() {
         .unwrap();
     let address = available_address();
     let mut config = json!([
-        {"rule_group": "deny", "rules": [{"path": list, "format": "singbox_json"}]},
+        {"rule_source_group": "deny", "rules": [{"path": list, "format": "singbox_json"}]},
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
-         "rules": [{"masks": {"rule_group": "deny"}, "action": "block"}, {"masks": {"any_destination": true}, "action": "allow"}]}
+         "rules": [{"masks": {"rule_source_group": "deny"}, "action": "block"}, {"masks": {"any_destination": true}, "action": "allow"}]}
     ]);
     std::fs::write(&config_path, config.to_string()).unwrap();
     let mut process = Process::start(&config_path, &[]);

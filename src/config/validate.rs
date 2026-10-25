@@ -149,7 +149,7 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
                     ));
                 }
             }
-            Config::CertificateSource(_) => {}
+            Config::CertificateSource(_) | Config::RuleSourceGroup(_) => {}
             Config::GlobalLimits(limits) => {
                 if global_limits.replace(limits).is_some() {
                     return Err(std::io::Error::new(
@@ -171,11 +171,8 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
                 }
             }
             Config::RuleConfigGroup(group) => {
-                let super::RuleGroupRules::Policies(rules) = group.rules else {
-                    continue;
-                };
                 if rule_groups
-                    .insert(group.rule_group.clone(), rules.into_vec())
+                    .insert(group.rule_group.clone(), group.rules.into_vec())
                     .is_some()
                 {
                     return Err(std::io::Error::new(

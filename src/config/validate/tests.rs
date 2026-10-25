@@ -1035,13 +1035,13 @@ async fn test_validate_config_success() {
     let configs = vec![
         Config::RuleConfigGroup(RuleConfigGroup {
             rule_group: "test-rules".to_string(),
-            rules: crate::config::RuleGroupRules::Policies(Box::new(OneOrSome::One(RuleConfig {
+            rules: OneOrSome::One(RuleConfig {
                 criteria: Default::default(),
                 action: RuleActionConfig::Allow {
                     override_address: None,
                     client_chains: NoneOrSome::One(ClientChain::default()),
                 },
-            }))),
+            }),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),

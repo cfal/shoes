@@ -431,70 +431,85 @@ mod group_type_tests {
 #[serde(deny_unknown_fields)]
 pub struct RuleConfigGroup {
     pub rule_group: String,
-    #[serde(alias = "rule")]
-    pub rules: RuleGroupRules,
+    #[serde(alias = "rule", deserialize_with = "policy_rules")]
+    pub rules: OneOrSome<RuleConfig>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum RuleGroupRules {
-    Policies(Box<OneOrSome<RuleConfig>>),
-    Sources(OneOrSome<crate::rule_set::RuleSource>),
-}
+fn policy_rules<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<OneOrSome<RuleConfig>, D::Error> {
+    use serde::de::Error;
+    use serde_yaml::Value;
 
-impl<'de> Deserialize<'de> for RuleGroupRules {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        use serde_yaml::Value;
-
-        let value = Value::deserialize(deserializer)?;
-        let is_list = value.is_sequence();
-        let values = match value {
-            Value::Sequence(values) => values,
-            value => vec![value],
-        };
-        if values.is_empty() {
-            return Err(Error::custom("rule group cannot be empty"));
-        }
-        let mut policies = Vec::new();
-        let mut sources = Vec::new();
-        for (index, value) in values.into_iter().enumerate() {
-            let context = |error| {
-                if is_list {
-                    D::Error::custom(format!("rules[{index}]: {error}"))
-                } else {
-                    D::Error::custom(format!("rules: {error}"))
-                }
-            };
-            match value {
-                Value::String(path) => {
-                    sources.push(crate::rule_set::RuleSource::from_path(path.into()))
-                }
-                Value::Mapping(ref fields) if fields.contains_key("path") => {
-                    sources.push(serde_yaml::from_value(value).map_err(context)?);
-                }
-                value => policies.push(serde_yaml::from_value(value).map_err(context)?),
-            }
-        }
-        if !policies.is_empty() && !sources.is_empty() {
-            return Err(Error::custom(
-                "rule group cannot mix policies with file sources",
-            ));
-        }
-        if sources.is_empty() {
-            Ok(Self::Policies(Box::new(if is_list {
-                OneOrSome::Some(policies)
-            } else {
-                OneOrSome::One(policies.pop().unwrap())
-            })))
-        } else {
-            Ok(Self::Sources(if is_list {
-                OneOrSome::Some(sources)
-            } else {
-                OneOrSome::One(sources.pop().unwrap())
-            }))
-        }
+    let value = Value::deserialize(deserializer)?;
+    let is_list = value.is_sequence();
+    let values = match value {
+        Value::Sequence(values) => values,
+        value => vec![value],
+    };
+    if values.is_empty() {
+        return Err(Error::custom("rule group cannot be empty"));
     }
+    let mut policies = Vec::new();
+    for (index, value) in values.into_iter().enumerate() {
+        let context = |error| {
+            if is_list {
+                D::Error::custom(format!("rules[{index}]: {error}"))
+            } else {
+                D::Error::custom(format!("rules: {error}"))
+            }
+        };
+        policies.push(serde_yaml::from_value(value).map_err(context)?);
+    }
+    Ok(if is_list {
+        OneOrSome::Some(policies)
+    } else {
+        OneOrSome::One(policies.pop().unwrap())
+    })
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleSourceGroup {
+    pub rule_source_group: String,
+    #[serde(
+        alias = "rule",
+        deserialize_with = "source_rules",
+        serialize_with = "serialize_source_rules"
+    )]
+    pub rules: Vec<crate::rules::Expression>,
+}
+
+fn source_rules<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<crate::rules::Expression>, D::Error> {
+    use serde::de::Error;
+    use serde_json::Value;
+    let values = match Value::deserialize(deserializer)? {
+        Value::Array(values) => values,
+        value => vec![value],
+    };
+    if values.is_empty() {
+        return Err(Error::custom("rule source group cannot be empty"));
+    }
+    values
+        .into_iter()
+        .map(|value| match value {
+            Value::String(path) => Ok(crate::rules::Expression::Source(
+                crate::rule_set::RuleSource::from_path(path.into()),
+            )),
+            value => crate::rules::Expression::from_config(value).map_err(Error::custom),
+        })
+        .collect()
+}
+
+fn serialize_source_rules<S: serde::Serializer>(
+    rules: &[crate::rules::Expression],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde_json::to_value(rules)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
 }
 
 #[derive(Debug, Clone)]
@@ -624,6 +639,7 @@ pub enum Config {
     TunServer(TunConfig),
     ClientConfigGroup(ClientConfigGroup),
     RuleConfigGroup(RuleConfigGroup),
+    RuleSourceGroup(RuleSourceGroup),
     DnsConfigGroup(DnsConfigGroup),
     NamedPem(NamedPem),
 }
@@ -674,7 +690,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         // Try to determine which variant based on fields
         if map.contains_key(Value::String("rule_set".to_string())) {
             Err(Error::custom(
-                "rule_set was replaced by rule_group with file paths in rules",
+                "rule_set was replaced by rule_source_group with file paths in rules",
             ))
         } else if map.contains_key(Value::String("global_limits".to_string())) {
             #[derive(Deserialize)]
@@ -701,6 +717,10 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             serde_yaml::from_value(value)
                 .map(Config::ClientConfigGroup)
                 .map_err(|e| Error::custom(format!("invalid client config group: {e}")))
+        } else if map.contains_key("rule_source_group") {
+            serde_yaml::from_value(value)
+                .map(Config::RuleSourceGroup)
+                .map_err(|e| Error::custom(format!("invalid rule source group: {e}")))
         } else if has_rule_group {
             // RuleConfigGroup
             serde_yaml::from_value(value)
@@ -759,6 +779,7 @@ impl serde::ser::Serialize for Config {
             Config::TunServer(tun) => tun.serialize(serializer),
             Config::ClientConfigGroup(group) => group.serialize(serializer),
             Config::RuleConfigGroup(group) => group.serialize(serializer),
+            Config::RuleSourceGroup(group) => group.serialize(serializer),
             Config::DnsConfigGroup(group) => group.serialize(serializer),
             Config::NamedPem(pem) => pem.serialize(serializer),
         }

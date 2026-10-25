@@ -101,10 +101,8 @@ pub(crate) fn visit_configs(configs: &mut [Config], visitor: &mut Visitor<'_>) -
                 }
             }
             Config::RuleConfigGroup(group) => {
-                if let super::RuleGroupRules::Policies(rules) = &mut group.rules {
-                    for rule in rules.iter_mut() {
-                        visit_action(&mut rule.action, visitor)?;
-                    }
+                for rule in group.rules.iter_mut() {
+                    visit_action(&mut rule.action, visitor)?;
                 }
             }
             Config::Server(server) => {
