@@ -2263,7 +2263,11 @@ URL credentials/fragments, HTTP content compression, and trailers are rejected.
 Chunked and close-delimited bodies are accepted within the same limits: 64 MiB
 download, 64 headers/32 KiB, 10-second connect/DNS/TLS and header/body-idle deadlines,
 and a 120-second total download deadline. Decoder-specific decompression limits
-still apply. Cold-start staging is capped at 512 MiB in aggregate. Logs report
+still apply. Cold-start staging is capped at 512 MiB and 128 missing/invalid sources
+in aggregate. The source ceiling is reduced to `(soft RLIMIT_NOFILE - 128) / 4`
+when lower, leaving nominal descriptor headroom for the running generation;
+it does not reserve descriptors against other activity. Larger cold batches require
+prepopulated caches. Logs report
 actual updated/unchanged/failed results without URL query values or downloaded data.
 
 Remote refresh currently requires the Unix process runtime. FFI startup and

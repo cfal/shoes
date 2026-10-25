@@ -801,6 +801,45 @@ async fn cold_staging_caps_each_download_by_remaining_capacity() {
 }
 
 #[tokio::test]
+async fn cold_staging_limits_descriptors_before_any_download() {
+    for (descriptors, expected) in [
+        (64, 0),
+        (128, 0),
+        (132, 1),
+        (512, 96),
+        (1024, 128),
+        (u64::MAX, 128),
+    ] {
+        assert_eq!(cold_source_limit(descriptors), expected);
+    }
+    let dir = directory();
+    let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/rules", trap.local_addr().unwrap());
+    let sources = (0..129)
+        .map(|index| source(&url, &dir.path().join(format!("{index}.json"))))
+        .collect::<Vec<_>>();
+    let error = stage_sources(
+        &sources,
+        &DnsRegistry::new(),
+        GlobalLimits::default(),
+        MAX_STAGED_BYTES,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(
+        error.to_string().contains("staging source limit"),
+        "{error}"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), trap.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
 async fn cold_download_errors_identify_cache_without_exposing_url() {
     let dir = directory();
     let path = dir.path().join("missing-directory/rules.json");
