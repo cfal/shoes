@@ -858,6 +858,54 @@ mod carrier_tests {
     }
 
     #[test]
+    fn url_test_deep_udp_selection_survives_dashboard_reads() {
+        use serde_json::json;
+        let mut configs: Vec<_> = (0..128).map(|index| json!({
+            "client_group": format!("deep-{index}"),
+            "client_proxies": [if index == 127 { "direct".into() } else { format!("deep-{}", index + 1) }]
+        })).collect();
+        configs.push(json!({
+            "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
+            "client_proxies":["deep-0", {"name":"other", "protocol":{"type":"direct"}}]
+        }));
+        configs.push(json!({
+            "address":"127.0.0.1:1080", "protocol":{"type":"socks"},
+            "rules":[{"mask":"0.0.0.0/0", "action":"allow", "client_chain":"auto"}]
+        }));
+        let mut validated =
+            crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
+                .unwrap();
+        let catalog = validated.catalog.take().unwrap();
+        let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+            panic!()
+        };
+        let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
+            panic!()
+        };
+        let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+            panic!()
+        };
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let group = crate::tcp::chain_builder::try_build_client_chain_group(
+            client_chains,
+            resolver.clone(),
+        )
+        .unwrap();
+        let generation = crate::control::runtime::Generation {
+            id: 1,
+            leaf_udp_support: crate::clash_api::dto::leaf_udp_support(&catalog).unwrap(),
+            catalog,
+            rules: Vec::new(),
+            probes: crate::clash_api::probes::ProbeState::new(resolver, Vec::new()),
+        };
+        let chain = &group.chains[0];
+        assert_eq!(chain.select_indices(true).unwrap(), [0]);
+        let nodes = crate::clash_api::dto::proxies(&generation);
+        assert_eq!(chain.select_indices(true).unwrap(), [0]);
+        assert_eq!(nodes["proxies"]["auto"]["udpNow"], "deep-0");
+    }
+
+    #[test]
     fn unselected_large_pools_keep_constant_time_round_robin() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let chain = ClientProxyChain::new(

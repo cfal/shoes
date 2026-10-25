@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 use crate::config::{ClientChain, ClientChainHop, ConfigSelection, GroupType};
@@ -28,7 +28,7 @@ pub fn leaf_udp_support(catalog: &Catalog) -> io::Result<HashMap<String, bool>> 
 
 pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<Value> {
     let node = generation.catalog.nodes.get(name)?;
-    let udp = supports_udp(generation, choices, name, 0);
+    let udp = supports_udp(generation, choices, name);
     let mut value = match node {
         CatalogNode::Leaf(client) => {
             json!({"name":name,"type":protocol_type(&client.protocol),"udp":udp})
@@ -78,37 +78,44 @@ fn automatic_member(
     let eligible = group
         .members
         .iter()
-        .filter(|name| !udp || supports_udp(generation, choices, name, 1))
+        .filter(|name| !udp || supports_udp(generation, choices, name))
         .map(String::as_str)
         .collect();
     group.choose(&eligible, udp)
 }
 
-fn supports_udp(generation: &Generation, choices: &Choices, name: &str, depth: usize) -> bool {
-    if depth > 128 {
-        return false;
-    }
-    match generation.catalog.nodes.get(name) {
-        Some(CatalogNode::Group {
-            members,
-            group_type,
-        }) => {
-            if *group_type == GroupType::Selector {
-                choices
-                    .get(name)
-                    .is_some_and(|name| supports_udp(generation, choices, name, depth + 1))
-            } else {
-                members
-                    .iter()
-                    .any(|name| supports_udp(generation, choices, name, depth + 1))
-            }
+fn supports_udp(generation: &Generation, choices: &Choices, name: &str) -> bool {
+    let mut pending = vec![name];
+    let mut visited = HashSet::new();
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name) {
+            continue;
         }
-        _ => generation
-            .leaf_udp_support
-            .get(name)
-            .copied()
-            .unwrap_or(false),
+        match generation.catalog.nodes.get(name) {
+            Some(CatalogNode::Group {
+                members,
+                group_type,
+            }) => {
+                if *group_type == GroupType::Selector {
+                    if let Some(selected) = choices.get(name) {
+                        pending.push(selected);
+                    }
+                } else {
+                    pending.extend(members.iter().map(String::as_str));
+                }
+            }
+            _ if generation
+                .leaf_udp_support
+                .get(name)
+                .copied()
+                .unwrap_or(false) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
     }
+    false
 }
 
 pub fn proxies(generation: &Generation) -> Value {
