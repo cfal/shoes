@@ -34,6 +34,7 @@ struct UrlHistory {
 
 #[derive(Default)]
 struct FullBudgetAttempts {
+    configured: IndexMap<String, tokio::time::Instant>,
     unfiltered: IndexMap<String, tokio::time::Instant>,
     filtered: IndexMap<String, tokio::time::Instant>,
 }
@@ -123,27 +124,42 @@ impl ProbeState {
         let attempts = self.full_budget_attempts.lock();
         indices.sort_by_key(|&index| {
             attempts.get(&members[index]).and_then(|attempts| {
-                let urls = if query.expected.is_empty() {
-                    &attempts.unfiltered
+                let at = if query.expected.is_empty() {
+                    attempts
+                        .configured
+                        .get(query.url.as_str())
+                        .or_else(|| attempts.unfiltered.get(query.url.as_str()))
                 } else {
-                    &attempts.filtered
+                    attempts.filtered.get(query.url.as_str())
                 };
-                urls.get(query.url.as_str()).copied()
+                at.copied()
             })
         });
     }
 
-    fn record_full_budget_attempt(&self, name: &str, query: &ProbeQuery) {
+    fn record_full_budget_attempt(
+        &self,
+        name: &str,
+        query: &ProbeQuery,
+        automatic: &crate::control::url_test::AutomaticGroups,
+    ) {
+        let configured = query.expected.is_empty()
+            && automatic.0.values().any(|group| {
+                group.config.url == query.url.as_str()
+                    && group.members.iter().any(|member| member == name)
+            });
         let mut attempts = self.full_budget_attempts.lock();
         let attempts = attempts.entry(name.into()).or_default();
-        // Filtered probes must not update or evict automatic scheduling metadata.
-        let urls = if query.expected.is_empty() {
-            &mut attempts.unfiltered
-        } else {
+        // Configured keys are bounded by the catalog, not arbitrary API URL eviction.
+        let urls = if configured {
+            &mut attempts.configured
+        } else if !query.expected.is_empty() {
             &mut attempts.filtered
+        } else {
+            &mut attempts.unfiltered
         };
         urls.shift_remove(query.url.as_str());
-        if urls.len() >= 8 {
+        if !configured && urls.len() >= 8 {
             urls.shift_remove_index(0);
         }
         urls.insert(query.url.to_string(), tokio::time::Instant::now());
@@ -423,7 +439,11 @@ async fn probe_until(
             ));
         }
         if !queued {
-            generation.probes.record_full_budget_attempt(name, query);
+            generation.probes.record_full_budget_attempt(
+                name,
+                query,
+                &generation.catalog.selection.automatic,
+            );
         }
         Ok(())
     })??;
@@ -478,24 +498,32 @@ pub(crate) fn local_failure(error: &io::Error) -> bool {
     if crate::resources::is_exhausted(error) {
         return true;
     }
-    if let Some(inner) = error
-        .get_ref()
-        .and_then(|error| error.downcast_ref::<io::Error>())
-        && local_failure(inner)
-    {
-        return true;
+    let mut error: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if error.is::<ProbePolicyDenied>() || error.is::<crate::dns::SyntheticDnsAnswer>() {
+            return true;
+        }
+        let source = if let Some(error) = error.downcast_ref::<io::Error>() {
+            if local_io_failure(error) {
+                return true;
+            }
+            // io::Error::source can skip the wrapped error itself.
+            error.get_ref().map(|inner| inner as &dyn std::error::Error)
+        } else {
+            error.source()
+        };
+        let Some(source) = source else { return false };
+        error = source;
     }
+}
+
+fn local_io_failure(error: &io::Error) -> bool {
     #[cfg(unix)]
     if error.raw_os_error().is_some_and(|code| {
         matches!(
             code,
             libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM
         )
-    }) {
-        return true;
-    }
-    if error.get_ref().is_some_and(|error| {
-        error.is::<ProbePolicyDenied>() || error.is::<crate::dns::SyntheticDnsAnswer>()
     }) {
         return true;
     }
@@ -984,31 +1012,53 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn url_test_filtered_url_eviction_does_not_change_admission() {
-        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
-        let occupied = service.runtime.probes.acquire_many(15).await.unwrap();
-        let resolver = Arc::new(ScheduledAnswers::default());
-        let generation = scheduled_generation(&[("auto", 2, 10, 1000)], resolver.clone());
-        generation
-            .probes
-            .record_full_budget_attempt("auto-0", &query());
-        let mut filtered = query();
-        filtered.expected = vec![(204, 204)];
-        for index in 0..8 {
-            filtered.url = url::Url::parse(&format!("http://other.invalid/{index}")).unwrap();
-            generation
-                .probes
-                .record_full_budget_attempt("auto-0", &filtered);
+    async fn url_test_other_url_eviction_does_not_change_admission() {
+        for filtered in [true, false] {
+            let mut service =
+                crate::control::runtime::ControlService::new(Default::default()).unwrap();
+            let occupied = service.runtime.probes.acquire_many(15).await.unwrap();
+            let resolver = Arc::new(ScheduledAnswers {
+                local_failures: ["auto-0.invalid".into()].into(),
+                ..Default::default()
+            });
+            let generation = scheduled_generation(&[("auto", 2, 10, 1000)], resolver.clone());
+            service.runtime.publish(generation.clone()).await.unwrap();
+            service
+                .runtime
+                .activating
+                .store(false, std::sync::atomic::Ordering::Release);
+            assert!(
+                probe(&service.runtime, &generation, "auto-0", &query())
+                    .await
+                    .is_err()
+            );
+            let mut other = query();
+            if filtered {
+                other.expected = vec![(204, 204)];
+            }
+            for index in 0..8 {
+                other.url = url::Url::parse(&format!("http://other.invalid/{index}")).unwrap();
+                assert!(
+                    probe(&service.runtime, &generation, "auto-0", &other)
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(resolver.calls.lock().len(), 9);
+            resolver.calls.lock().clear();
+            service.runtime.resume().await.unwrap();
+            advance_rounds(2).await;
+            assert_eq!(
+                *resolver.calls.lock(),
+                ["auto-1.invalid"],
+                "filtered={filtered}"
+            );
+            let automatic = &generation.catalog.selection.automatic.0["auto"];
+            assert_eq!(automatic.health("auto-0"), "unprobed");
+            assert_eq!(automatic.health("auto-1"), "dead");
+            drop(occupied);
+            service.shutdown().await;
         }
-        service.runtime.publish(generation.clone()).await.unwrap();
-        service.runtime.resume().await.unwrap();
-        advance_rounds(2).await;
-        assert_eq!(*resolver.calls.lock(), ["auto-1.invalid"]);
-        let automatic = &generation.catalog.selection.automatic.0["auto"];
-        assert_eq!(automatic.health("auto-0"), "unprobed");
-        assert_eq!(automatic.health("auto-1"), "dead");
-        drop(occupied);
-        service.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1493,6 +1543,168 @@ mod tests {
             assert!(!crate::control::url_test::remote_failure(&crate::resources::exhausted()));
             service.shutdown().await;
         });
+    }
+
+    #[tokio::test]
+    async fn url_test_hyper_wrapped_errors_preserve_local_remote_classification() {
+        use crate::{
+            address::ResolvedLocation,
+            async_stream::{AsyncMessageStream, AsyncPing, AsyncStream},
+            client_proxy_chain::{ClientProxyChain, InitialHopEntry},
+            tcp::socket_connector::SocketConnector,
+        };
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+
+        struct FailingStream {
+            error: fn() -> io::Error,
+            written: bool,
+        }
+
+        impl tokio::io::AsyncRead for FailingStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if self.written {
+                    Poll::Ready(Err((self.error)()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        impl tokio::io::AsyncWrite for FailingStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.written = true;
+                cx.waker().wake_by_ref();
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncPing for FailingStream {
+            fn supports_ping(&self) -> bool {
+                false
+            }
+            fn poll_write_ping(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<io::Result<bool>> {
+                Poll::Ready(Ok(false))
+            }
+        }
+        impl AsyncStream for FailingStream {}
+
+        #[derive(Debug)]
+        struct Socket(fn() -> io::Error);
+
+        #[async_trait::async_trait]
+        impl SocketConnector for Socket {
+            async fn connect(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: &ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncStream>> {
+                Ok(Box::new(FailingStream {
+                    error: self.0,
+                    written: false,
+                }))
+            }
+            async fn connect_udp_bidirectional(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncMessageStream>> {
+                unreachable!()
+            }
+            fn bind_interface(&self) -> Option<&str> {
+                None
+            }
+        }
+
+        let cases: &[(fn() -> io::Error, bool)] = &[
+            (|| io::ErrorKind::ConnectionReset.into(), false),
+            (
+                || io::Error::new(io::ErrorKind::InvalidInput, "remote protocol rejection"),
+                false,
+            ),
+            (
+                || {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "remote authentication rejection",
+                    )
+                },
+                false,
+            ),
+            #[cfg(unix)]
+            (|| io::Error::from_raw_os_error(libc::EMFILE), true),
+            (|| io::ErrorKind::Unsupported.into(), true),
+            (|| io::Error::other(ProbePolicyDenied), true),
+            (|| io::Error::other(crate::dns::SyntheticDnsAnswer), true),
+            (crate::resources::exhausted, true),
+        ];
+        for &(make_error, local) in cases {
+            let generation = automatic_generation(1, 1, Arc::new(Answers(Vec::new())));
+            let chain = ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Arc::new(Socket(make_error)))],
+                vec![],
+            );
+            generation.probes.connectors.lock().insert(
+                "member-0".into(),
+                Arc::new(ClientChainGroup::new(vec![chain])),
+            );
+            generation.catalog.selection.automatic.record(
+                "member-0",
+                "http://probe.invalid/",
+                Some(5),
+            );
+            generation
+                .probes
+                .record("member-0", "http://probe.invalid/", 5, true);
+            let history = generation
+                .probes
+                .url_history("member-0", "http://probe.invalid/");
+            let mut service =
+                crate::control::runtime::ControlService::new(Default::default()).unwrap();
+            service.runtime.publish(generation.clone()).await.unwrap();
+            service
+                .runtime
+                .activating
+                .store(false, std::sync::atomic::Ordering::Release);
+            let error = probe(&service.runtime, &generation, "member-0", &query())
+                .await
+                .unwrap_err();
+            assert!(error.get_ref().unwrap().is::<hyper::Error>(), "{error:?}");
+            assert_eq!(
+                generation.catalog.selection.automatic.0["auto"].health("member-0"),
+                if local { "healthy" } else { "dead" },
+                "{error:?}"
+            );
+            let recorded = generation
+                .probes
+                .url_history("member-0", "http://probe.invalid/");
+            if local {
+                assert_eq!(recorded, history);
+            } else {
+                assert_eq!(recorded.as_array().unwrap().len(), 2);
+                assert_eq!(recorded[1]["delay"], 0);
+            }
+            service.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -1990,24 +2202,25 @@ mod tests {
     #[test]
     fn full_budget_order_is_url_scoped_bounded_and_independent_of_health() {
         let state = ProbeState::new(Arc::new(Answers(Vec::new())), Vec::new());
+        let automatic = Default::default();
         let members = vec!["a".into(), "b".into()];
         let mut indices = vec![0, 1];
         let mut probe = query();
         probe.url = url::Url::parse("https://probe.invalid/0").unwrap();
-        state.record_full_budget_attempt("a", &probe);
+        state.record_full_budget_attempt("a", &probe, &automatic);
         state.order_members(&mut indices, &members, &probe);
         assert_eq!(indices, [1, 0]);
         indices = vec![0, 1];
         probe.expected = vec![(204, 204)];
         state.order_members(&mut indices, &members, &probe);
         assert_eq!(indices, [0, 1]);
-        state.record_full_budget_attempt("b", &probe);
+        state.record_full_budget_attempt("b", &probe, &automatic);
         indices = vec![1, 0];
         state.order_members(&mut indices, &members, &probe);
         assert_eq!(indices, [0, 1]);
         for index in 1..=8 {
             probe.url = url::Url::parse(&format!("https://filtered.invalid/{index}")).unwrap();
-            state.record_full_budget_attempt("a", &probe);
+            state.record_full_budget_attempt("a", &probe, &automatic);
         }
         probe.expected.clear();
         probe.url = url::Url::parse("https://probe.invalid/0").unwrap();
@@ -2020,9 +2233,10 @@ mod tests {
         assert_eq!(indices, [0, 1]);
         for index in 1..=8 {
             probe.url = url::Url::parse(&format!("https://probe.invalid/{index}")).unwrap();
-            state.record_full_budget_attempt("a", &probe);
+            state.record_full_budget_attempt("a", &probe, &automatic);
         }
         let attempts = state.full_budget_attempts.lock();
+        assert!(attempts["a"].configured.is_empty());
         assert_eq!(attempts["a"].unfiltered.len(), 8);
         assert_eq!(attempts["a"].filtered.len(), 8);
         assert!(
@@ -2031,6 +2245,49 @@ mod tests {
                 .contains_key("https://probe.invalid/0")
         );
         assert!(state.history.lock().is_empty());
+    }
+
+    #[test]
+    fn configured_attempt_urls_survive_filtered_and_unfiltered_api_eviction() {
+        let state = ProbeState::new(Arc::new(Answers(Vec::new())), Vec::new());
+        let mut automatic = crate::control::url_test::AutomaticGroups::default();
+        let mut probe = query();
+        for index in 0..12 {
+            probe.url = url::Url::parse(&format!("http://probe.invalid/{index}")).unwrap();
+            automatic
+                .insert(
+                    format!("group-{index}"),
+                    crate::config::UrlTestConfig {
+                        url: probe.url.to_string(),
+                        interval: 10,
+                        timeout: 1000,
+                        tolerance: 50,
+                        lazy: false,
+                    },
+                    vec!["a".into(), "b".into()],
+                )
+                .unwrap();
+            state.record_full_budget_attempt("a", &probe, &automatic);
+        }
+        for index in 0..12 {
+            probe.url = url::Url::parse(&format!("http://other.invalid/{index}")).unwrap();
+            probe.expected.clear();
+            state.record_full_budget_attempt("a", &probe, &automatic);
+            probe.url = url::Url::parse(&format!("http://probe.invalid/{index}")).unwrap();
+            probe.expected = vec![(204, 204)];
+            state.record_full_budget_attempt("a", &probe, &automatic);
+        }
+        probe.expected.clear();
+        for index in 0..12 {
+            probe.url = url::Url::parse(&format!("http://probe.invalid/{index}")).unwrap();
+            let mut indices = [0, 1];
+            state.order_members(&mut indices, &["a".into(), "b".into()], &probe);
+            assert_eq!(indices, [1, 0]);
+        }
+        let attempts = state.full_budget_attempts.lock();
+        assert_eq!(attempts["a"].configured.len(), 12);
+        assert_eq!(attempts["a"].unfiltered.len(), 8);
+        assert_eq!(attempts["a"].filtered.len(), 8);
     }
 
     #[test]

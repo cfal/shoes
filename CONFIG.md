@@ -426,8 +426,10 @@ The controller reports `type: URLTest`, effective TCP `now`, optional `udpNow`,
 `testUrl`, and selected-member `health` (`unprobed`, `healthy`, `dead`, or `stale`).
 Its `alive` is true only for fresh healthy results. Manual selection PUTs for
 automatic groups are rejected; automatic choices are neither pinned nor persisted.
-Leaf histories remain bounded to ten samples per URL and eight URLs; automatic
-selection retains its configured-URL sample independently of API history eviction.
+Leaf histories remain bounded to ten samples per URL and eight URLs. Automatic
+selection retains its configured-URL samples and full-budget attempt timestamps
+independently of API eviction; other attempt URLs are capped at eight per member
+for each of filtered and unfiltered probes.
 Automatic checks test each immediate member as a standalone outbound, not every
 surrounding chain or destination. URL-test groups are not supported by FFI.
 
