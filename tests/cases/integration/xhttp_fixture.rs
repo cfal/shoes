@@ -536,8 +536,9 @@ impl Fixture {
         xray::wait_socks(([127, 0, 0, 1], self.destination_ready).into()).await?;
         assert!(peer != Peer::Mihomo || protocol == "vless");
         assert!(peer != Peer::Mihomo || !shoes_client || version != "h3");
-        let mut remote_reservation = Some(PortReservation::new()?);
-        let remote = remote_reservation.as_ref().unwrap().port();
+        let remote_reservation = PortReservation::new()?;
+        let remote = remote_reservation.port();
+        let mut remote_reservation = Some(remote_reservation);
         assert!(
             version != "h3" || self.latency_ms == 0,
             "latency relay is TCP-only"
@@ -547,8 +548,9 @@ impl Fixture {
             "latency qualification requires a separate peer process"
         );
         let (client_remote, relay) = LatencyRelay::start(remote, self.latency_ms).await?;
-        let mut socks_reservation = Some(PortReservation::new()?);
-        let socks_port = socks_reservation.as_ref().unwrap().port();
+        let socks_reservation = PortReservation::new()?;
+        let socks_port = socks_reservation.port();
+        let mut socks_reservation = Some(socks_reservation);
         let readiness_reservation = PortReservation::new()?;
         let readiness = readiness_reservation.port();
         let socks = ([127, 0, 0, 1], socks_port).into();
