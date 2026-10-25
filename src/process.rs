@@ -676,13 +676,28 @@ mod tests {
             .unwrap();
             // A renewal while preparation is still in progress must not leak into
             // the active reload queue, even if a notifier callback arrives late.
+            eprintln!(
+                "before candidate renewal: reload_pending={}, recovery_pending={}",
+                !changes.is_empty(),
+                !watches.recovery_changes.is_empty()
+            );
             let late_callback = watches.recovery_tx.clone();
             std::fs::write(&key, pair.signing_key.serialize_pem()).unwrap();
             while watches.recovery_changes.is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            eprintln!(
+                "candidate event received: reload_pending={}, recovery_pending={}",
+                !changes.is_empty(),
+                !watches.recovery_changes.is_empty()
+            );
             assert!(changes.is_empty());
             watches.activated(&validated.reload_files);
+            eprintln!(
+                "candidate activated: reload_pending={}, recovery_pending={}",
+                !changes.is_empty(),
+                !watches.recovery_changes.is_empty()
+            );
             assert!(late_callback.try_send(()).is_err());
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), watches.changed(&mut changes))

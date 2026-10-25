@@ -198,8 +198,10 @@ jobs:
         .github/require-tests.sh cargo test -p shoes --locked --test process_contract --features ffi rule_sets:: -- --test-threads=1
 
     - name: Run process filesystem watcher unit tests
+      env:
+        SHOES_TRACE_FILE_WATCHES: '1'
       run: >-
-        .github/require-tests.sh cargo test -p shoes --locked --lib process:: -- --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --lib process:: -- --test-threads=1 --nocapture
 
   integration-tests:
     name: Integration (${{ matrix.name }})
