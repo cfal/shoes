@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use log::{debug, error};
@@ -412,6 +412,8 @@ pub async fn start_servers(
 #[derive(Default)]
 pub(crate) struct TcpListeners {
     sockets: HashMap<SocketAddr, Arc<tokio::net::TcpListener>>,
+    // Automatic ports participate in overlap checks without extending socket ownership.
+    automatic_sockets: Vec<Weak<tokio::net::TcpListener>>,
     admission: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -449,25 +451,30 @@ impl TcpListeners {
                         next.sockets.insert(address, listener.clone());
                         continue;
                     }
-                    if let Err(error) = next.bind(address) {
-                        if error.kind() != std::io::ErrorKind::AddrInUse {
-                            return Err(error);
-                        }
-                        let overlaps_retiring_listener = previous
-                            .sockets
-                            .values()
-                            .filter_map(|listener| listener.local_addr().ok())
-                            .chain(retiring_http.iter().copied())
-                            .any(|bound| {
-                                bound.port() == address.port()
-                                    && (bound.ip() == address.ip()
-                                        || bound.ip().is_unspecified()
-                                        || address.ip().is_unspecified())
-                            });
-                        if !overlaps_retiring_listener {
-                            return Err(error);
-                        }
+                    let automatic_addresses = previous
+                        .automatic_sockets
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .filter_map(|listener| listener.local_addr().ok());
+                    let overlaps_retiring_listener = previous
+                        .sockets
+                        .values()
+                        .filter_map(|listener| listener.local_addr().ok())
+                        .chain(automatic_addresses)
+                        .chain(retiring_http.iter().copied())
+                        .any(|bound| {
+                            let bound_ip = bound.ip().to_canonical();
+                            let requested_ip = address.ip().to_canonical();
+                            bound.port() == address.port()
+                                && (bound_ip == requested_ip
+                                    || bound_ip.is_unspecified()
+                                    || requested_ip.is_unspecified())
+                        });
+                    // SO_REUSEADDR may permit overlapping binds before the old socket retires.
+                    if overlaps_retiring_listener {
+                        continue;
                     }
+                    next.bind(address)?;
                 }
             }
         }
@@ -500,6 +507,10 @@ impl TcpListeners {
         let listener = Arc::new(new_tcp_listener(address, 4096, None)?);
         if address.port() != 0 {
             self.sockets.insert(address, listener.clone());
+        } else {
+            self.automatic_sockets
+                .retain(|listener| listener.strong_count() > 0);
+            self.automatic_sockets.push(Arc::downgrade(&listener));
         }
         Ok(listener)
     }
@@ -712,6 +723,91 @@ mod lifetime_tests {
         let second = sockets.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         assert_ne!(first.local_addr().unwrap(), second.local_addr().unwrap());
         assert!(sockets.sockets.is_empty());
+        assert_eq!(sockets.automatic_sockets.len(), 2);
+        drop((first, second));
+        let _next = sockets.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_eq!(sockets.automatic_sockets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_preparation_defers_reported_http_overlap_before_binding() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let config = format!("- address: '{address}'\n  protocol: {{type: http}}\n");
+        let configs =
+            crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap()).unwrap();
+        drop(reservation);
+        for retiring in [
+            address,
+            SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), address.port()),
+        ] {
+            let next =
+                TcpListeners::prepare(&configs.configs, &TcpListeners::default(), &[retiring])
+                    .unwrap();
+            assert!(next.sockets.is_empty(), "overlapping listener was prebound");
+            std::net::TcpListener::bind(address).expect("preparation claimed a retiring address");
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_preparation_defers_live_automatic_ports_without_retaining_them() {
+        let mut previous = TcpListeners::default();
+        let live = previous.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = live.local_addr().unwrap();
+        let config = format!("- address: '{address}'\n  protocol: {{type: http}}\n");
+        let configs =
+            crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap()).unwrap();
+        let next = TcpListeners::prepare(&configs.configs, &previous, &[]).unwrap();
+        assert!(
+            next.sockets.is_empty(),
+            "automatic port was prebound or reused"
+        );
+        drop(live);
+        let next = TcpListeners::prepare(&configs.configs, &previous, &[]).unwrap();
+        assert!(
+            next.sockets.contains_key(&address),
+            "retired port was still deferred"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_preparation_defers_ipv4_mapped_listener_transitions() {
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(5), async {
+            for (old_ip, new_ip) in [
+                ("127.0.0.1", "::ffff:127.0.0.1"),
+                ("::ffff:127.0.0.1", "127.0.0.1"),
+            ] {
+                let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = reservation.local_addr().unwrap().port();
+                drop(reservation);
+                let mut previous = TcpListeners::default();
+                let live = previous
+                    .bind(SocketAddr::new(old_ip.parse().unwrap(), port))
+                    .unwrap();
+                let address = SocketAddr::new(new_ip.parse().unwrap(), port);
+                let config = format!("- address: '{address}'\n  protocol: {{type: http}}\n");
+                let configs =
+                    crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap())
+                        .unwrap();
+                let mut next = TcpListeners::prepare(&configs.configs, &previous, &[]).unwrap();
+                assert!(next.sockets.is_empty(), "mapped address was prebound");
+                drop(live);
+                previous.retain_shared(&next);
+                let replacement = next.bind(address).unwrap();
+                let mut peer = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .unwrap();
+                let (mut accepted, _) = replacement.accept().await.unwrap();
+                peer.write_all(b"live").await.unwrap();
+                let mut bytes = [0; 4];
+                accepted.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"live");
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
