@@ -23,6 +23,10 @@ rustls = { git = "https://github.com/cfal/rustls", rev = "d17d0fc304c03fe6e2c96a
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "cd98c1c4112ed3b2cf2140e1844f266b3d665b53" }
 h3 = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
 h3-quinn = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
+# Backports hickory-dns/hickory-dns#3861 and preserves H3 connection-close failover.
+hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "4a8a51dacc485717e9dea812c5da1228e0a07c01" }
+hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "4a8a51dacc485717e9dea812c5da1228e0a07c01" }
+hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "4a8a51dacc485717e9dea812c5da1228e0a07c01" }
 # Includes nix-rust/nix#2821 for iOS socket feature compatibility.
 nix = { git = "https://github.com/nix-rust/nix", rev = "3eae6d68ec6382fef7b38cd58f97458e59a71af9" }
 # Preserves TCP ACK sequences during retransmission.
