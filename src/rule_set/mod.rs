@@ -621,7 +621,7 @@ fn read_file(
     path: PathBuf,
     compiler: &mut Compiler,
 ) -> io::Result<Arc<Predicate>> {
-    source.parsed_url()?;
+    let url = source.parsed_url()?;
     let start = std::time::Instant::now();
     file.rewind()?;
     let metadata = file.metadata()?;
@@ -637,7 +637,8 @@ fn read_file(
     file.read_exact(prefix)?;
     file.rewind()?;
     let remote_hint = compiler.remote_files.get(&path).copied().flatten();
-    let format = source.format_with_hint(prefix, source.url_format()?.or(remote_hint))?;
+    let url_hint = url.and_then(|url| extension(Path::new(url.path())));
+    let format = source.format_with_hint(prefix, url_hint.or(remote_hint))?;
     if !matches!(
         format,
         Format::MihomoYaml | Format::MihomoText | Format::Mrs
