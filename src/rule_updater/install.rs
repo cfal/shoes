@@ -440,7 +440,7 @@ mod tests {
             return;
         };
         unsafe {
-            libc::umask(u32::from_str_radix(mask.to_str().unwrap(), 8).unwrap());
+            libc::umask(libc::mode_t::from_str_radix(mask.to_str().unwrap(), 8).unwrap());
         }
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
