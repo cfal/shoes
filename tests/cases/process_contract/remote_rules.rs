@@ -247,6 +247,56 @@ async fn explicit_update_overrides_routing_and_respects_root_ownership() {
 }
 
 #[tokio::test]
+async fn explicit_update_creates_private_root_under_restrictive_umasks() {
+    use std::os::unix::process::CommandExt;
+
+    for mask in [0o200, 0o400, 0o600, 0o777] {
+        let dir = directory();
+        let root = dir.path().join("cache");
+        std::fs::remove_dir(&root).unwrap();
+        let path = dir.path().join("config.yaml");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = available_address();
+        config(
+            &path,
+            address,
+            address,
+            &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+            "7d",
+        );
+        let update = tokio::task::spawn_blocking(move || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_shoes"));
+            command
+                .args(["-t", "1", "update-rules", "--direct"])
+                .arg(path);
+            unsafe {
+                command.pre_exec(move || {
+                    libc::umask(mask);
+                    Ok(())
+                });
+            }
+            command.output().unwrap()
+        });
+        let fixture = async { respond(request(&listener).await, MISS).await };
+        let (output, ()) = tokio::join!(update, fixture);
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "umask {mask:o}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read(root.join("rules.json")).unwrap(), MISS);
+        assert!(
+            command(&dir.path().join("config.yaml"), &["--dry-run"])
+                .await
+                .status
+                .success()
+        );
+    }
+}
+
+#[tokio::test]
 async fn explicit_update_keeps_completed_files_when_a_later_download_fails() {
     let dir = directory();
     let path = dir.path().join("config.yaml");
