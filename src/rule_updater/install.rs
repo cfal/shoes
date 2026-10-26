@@ -499,7 +499,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let path = dir.path().join("rules.json");
+        let path = dir.path().canonicalize().unwrap().join("rules.json");
         for bytes in [b"first".as_slice(), b"second"] {
             let mut install = Install::open(&path).unwrap();
             assert_eq!(install.lock.metadata().unwrap().mode() & 0o777, 0o600);
