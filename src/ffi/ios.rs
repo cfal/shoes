@@ -240,13 +240,93 @@ mod tests {
         if std::env::var_os(marker).is_some() {
             return false;
         }
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test_name, "--nocapture"])
             .env(marker, "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "subprocess {test_name} failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+            "subprocess did not execute exactly one test: {test_name}\n{stdout}\n{stderr}"
+        );
         true
+    }
+
+    #[test]
+    #[should_panic(expected = "subprocess did not execute exactly one test")]
+    fn subprocess_rejects_missing_test() {
+        run_in_subprocess(
+            "ffi::ios::tests::__missing_subprocess_case__",
+            "SHOES_FILE_LOG_MISSING_CHILD",
+        );
+    }
+
+    #[test]
+    fn file_logging_stop_flushes_buffered_records_without_closing_sink() {
+        if run_in_subprocess(
+            "ffi::ios::tests::file_logging_stop_flushes_buffered_records_without_closing_sink",
+            "SHOES_FILE_LOG_BUFFERED_CHILD",
+        ) {
+            return;
+        }
+        struct BufferedOutput {
+            pending: Vec<u8>,
+            visible: Arc<Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for BufferedOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.pending.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.visible.lock().append(&mut self.pending);
+                Ok(())
+            }
+        }
+
+        assert_eq!(unsafe { shoes_init(std::ptr::null()) }, 0);
+        let visible = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::new(
+            crate::logging::FileLogWriter::with_test_writer(BufferedOutput {
+                pending: Vec::new(),
+                visible: visible.clone(),
+            })
+            .unwrap(),
+        );
+        *LOG_FILE.get().unwrap().lock() = Some(writer.clone());
+        info!("buffered before stop");
+        assert!(visible.lock().is_empty());
+
+        shoes_stop(0);
+
+        let contents = String::from_utf8(visible.lock().clone()).unwrap();
+        assert!(
+            contents.contains("buffered before stop"),
+            "stop must flush pending file records"
+        );
+        assert!(contents.contains("TUN service stop completed"));
+        assert!(!writer.is_finished());
+        assert!(Arc::ptr_eq(
+            &writer,
+            LOG_FILE.get().unwrap().lock().as_ref().unwrap()
+        ));
+        let stats = writer.stats();
+        assert_eq!(stats.written_records, stats.accepted_records);
+        assert_eq!(stats.pending_records, 0);
+
+        LOG_FILE.get().unwrap().lock().take();
+        writer
+            .shutdown_timeout(crate::logging::FILE_LOG_FLUSH_TIMEOUT)
+            .unwrap();
     }
 
     #[test]
