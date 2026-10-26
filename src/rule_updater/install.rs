@@ -55,7 +55,21 @@ impl Install {
         let mut lock_name = name.clone();
         lock_name.push(CACHE_LOCK_SUFFIX);
         let lock_name = c_name(&lock_name)?;
-        let lock = open_at(&directory, &lock_name, libc::O_RDWR | libc::O_CREAT)?;
+        let lock = match open_at(
+            &directory,
+            &lock_name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        ) {
+            Ok(lock) => {
+                check_file(&lock.metadata()?, true)?;
+                lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                lock
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                open_at(&directory, &lock_name, libc::O_RDWR)?
+            }
+            Err(error) => return Err(error),
+        };
         check_file(&lock.metadata()?, true)?;
         lock.try_lock().map_err(|_| {
             io::Error::new(
@@ -106,7 +120,7 @@ impl Install {
             &stage,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
         )?;
-        Ok(Self {
+        let install = Self {
             path,
             directory,
             destination,
@@ -118,7 +132,12 @@ impl Install {
             old_digest,
             #[cfg(test)]
             preparation_gate: None,
-        })
+        };
+        check_file(&install.file.metadata()?, true)?;
+        install
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(install)
     }
 
     pub(super) async fn check_unchanged(self, digest: blake3::Hash) -> io::Result<(Self, bool)> {
@@ -402,6 +421,42 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn new_sidecars_are_private_and_usable_under_restrictive_umasks() {
+        const CHILD: &str = "SHOES_RULE_UMASK_TEST";
+        let Some(mask) = std::env::var_os(CHILD) else {
+            for mask in ["200", "400", "600", "777"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "rule_updater::install::tests::new_sidecars_are_private_and_usable_under_restrictive_umasks", "--nocapture"])
+                    .env(CHILD, mask).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "umask {mask}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        unsafe {
+            libc::umask(u32::from_str_radix(mask.to_str().unwrap(), 8).unwrap());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("rules.json");
+        for bytes in [b"first".as_slice(), b"second"] {
+            let mut install = Install::open(&path).unwrap();
+            assert_eq!(install.lock.metadata().unwrap().mode() & 0o777, 0o600);
+            assert_eq!(install.file.metadata().unwrap().mode() & 0o777, 0o600);
+            install.file.write_all(bytes).unwrap();
+            assert_eq!(
+                install.finish(blake3::hash(bytes)).unwrap(),
+                Outcome::Updated
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_blocking_preparation_cannot_publish_or_stall_the_runtime() {
