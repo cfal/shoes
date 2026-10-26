@@ -1610,6 +1610,43 @@ fn source_identity_resolves_existing_paths_and_missing_leaf_parents() {
         source_identity(&missing_parent).unwrap(),
         canonical_parent.join("missing/rules.json")
     );
+    assert_eq!(
+        source_identity(&parent.join("../parent/existing.json")).unwrap(),
+        canonical_parent.join("existing.json")
+    );
+}
+
+#[tokio::test]
+async fn namespace_preflight_rejects_unresolved_parent_traversal_before_creating_resources() {
+    let dir = directory();
+    let cache = dir.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    let missing = dir.path().join("missing");
+    let alias = missing.join("../cache");
+    let path = dir.path().join("config.json");
+    for extra in [
+        serde_json::json!({"certificate_source": "acme", "type": "acme", "domains": ["example.com"],
+            "directory_url": "https://ca.invalid/directory", "state_dir": alias.join("acme"),
+            "challenge": {"type": "tls_alpn01"}}),
+        serde_json::json!({"cache_file_path": alias.join("state")}),
+        serde_json::json!({"dns_group": "dns", "dns_servers": "system", "fake_ip": {"state_file": alias.join("fake")}}),
+        serde_json::json!({"path": alias.join("socket"), "protocol": {"type": "socks"}}),
+    ] {
+        std::fs::write(
+            &path,
+            serde_json::json!([
+                {"rule_cache_dir": cache}, extra
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let error = crate::config::load_configs(&[path.to_string_lossy().into_owned()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unresolved parent"), "{error}");
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+    }
 }
 
 #[test]
@@ -1662,8 +1699,12 @@ fn remote_declarations_require_one_root_and_direct_unreserved_children() {
         "../outside.json",
         "nested/rules.json",
         "owner.lock",
+        "OWNER.LOCK",
+        "Owner.Lock",
         "rules.json.shoes-update.lock",
+        "rules.json.SHOES-UPDATE.LOCK",
         "rules.json.shoes-update.tmp",
+        "rules.json.Shoes-Update.Tmp",
     ] {
         let remote = source("https://example.com/rules.json", &root.join(name));
         let mut config = configs(&remote);

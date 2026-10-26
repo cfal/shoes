@@ -359,7 +359,8 @@ fn checked_path(path: &Path) -> io::Result<(File, std::ffi::OsString)> {
     let name = path
         .file_name()
         .ok_or_else(|| invalid("destination must name a file"))?
-        .to_string_lossy();
+        .to_string_lossy()
+        .to_ascii_lowercase();
     if name.ends_with(CACHE_LOCK_SUFFIX) || name.ends_with(CACHE_STAGE_SUFFIX) {
         return Err(invalid("updater sidecar suffixes are reserved"));
     }
@@ -462,6 +463,19 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn sidecar_names_are_reserved_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["rules.SHOES-UPDATE.LOCK", "rules.Shoes-Update.Tmp"] {
+            let path = root.join(name);
+            let error = Install::open(&path).err().unwrap();
+            assert!(error.to_string().contains("reserved"), "{error}");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]

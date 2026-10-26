@@ -307,7 +307,10 @@ pub(crate) fn source_identity(path: &Path) -> io::Result<PathBuf> {
                 continue 'links;
             }
             let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
-                return Ok(absolute);
+                return Err(invalid(format!(
+                    "rule resource path {} has an unresolved parent or inaccessible root",
+                    path.display()
+                )));
             };
             suffix.push(name.to_os_string());
             ancestor = parent;
@@ -346,6 +349,7 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
                 name == "owner.lock"
                     || name.ends_with(CACHE_LOCK_SUFFIX)
                     || name.ends_with(CACHE_STAGE_SUFFIX)
