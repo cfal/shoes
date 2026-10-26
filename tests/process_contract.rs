@@ -567,8 +567,12 @@ impl Process {
     }
 
     async fn wait_for(&mut self, marker: &str) {
+        self.wait_for_timeout(marker, Duration::from_secs(8)).await;
+    }
+
+    async fn wait_for_timeout(&mut self, marker: &str, duration: Duration) {
         let mut seen = String::new();
-        let result = timeout(Duration::from_secs(8), async {
+        let result = timeout(duration, async {
             while let Some(line) = self.lines.recv().await {
                 seen.push_str(&line);
                 seen.push('\n');
