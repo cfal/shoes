@@ -794,7 +794,7 @@ async fn public_https_bootstrap_and_refresh_use_verified_tls() {
         }
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         if refresh {
-            cached(&cache, MISS);
+            cached(&cache, BLOCK);
             std::fs::File::open(&cache)
                 .unwrap()
                 .set_times(
