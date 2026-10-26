@@ -808,7 +808,7 @@ async fn cold_staging_limits_descriptors_before_any_download() {
         (132, 1),
         (512, 96),
         (1024, 128),
-        (u64::MAX, 128),
+        (libc::rlim_t::MAX, 128),
     ] {
         assert_eq!(cold_source_limit(descriptors), expected);
     }
@@ -833,6 +833,45 @@ async fn cold_staging_limits_descriptors_before_any_download() {
     );
     assert!(
         timeout(Duration::from_millis(50), trap.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn cold_descriptor_admission_precedes_dns_bootstrap_preparation() {
+    let dir = directory();
+    let trap = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Vec::new();
+    for index in 0..129 {
+        let mut source = source(
+            "http://remote.invalid/rules",
+            &dir.path().join(format!("{index}.json")),
+        );
+        source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
+        config.extend(configs(&source));
+    }
+    config.push(
+        serde_json::from_value(serde_json::json!({
+            "dns_group": "bootstrap", "dns_servers": [{
+                "url": "https://bootstrap.invalid/dns-query",
+                "bootstrap_url": format!("udp://{}", trap.local_addr().unwrap())
+            }]
+        }))
+        .unwrap(),
+    );
+    let error = timeout(Duration::from_secs(2), prepare(config, None, &mut None))
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("staging source limit"),
+        "{error}"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), trap.recv(&mut [0; 512]))
             .await
             .is_err()
     );

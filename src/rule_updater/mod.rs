@@ -104,16 +104,7 @@ async fn stage_sources(
     global: GlobalLimits,
     mut remaining: u64,
 ) -> io::Result<Vec<Staged>> {
-    let mut descriptors = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, descriptors.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let limit = cold_source_limit(unsafe { descriptors.assume_init() }.rlim_cur as u64);
-    if sources.len() > limit {
-        return Err(invalid(format!(
-            "cold rule downloads exceed staging source limit ({limit}); prepopulate caches or raise the file descriptor limit"
-        )));
-    }
+    validate_cold_source_count(sources.len())?;
     let mut staged = Vec::new();
     for source in sources {
         if remaining == 0 {
@@ -143,7 +134,21 @@ async fn stage_sources(
     Ok(staged)
 }
 
-fn cold_source_limit(descriptors: u64) -> usize {
+fn validate_cold_source_count(count: usize) -> io::Result<()> {
+    let mut descriptors = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, descriptors.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let limit = cold_source_limit(unsafe { descriptors.assume_init() }.rlim_cur);
+    if count > limit {
+        return Err(invalid(format!(
+            "cold rule downloads exceed staging source limit ({limit}); prepopulate caches or raise the file descriptor limit"
+        )));
+    }
+    Ok(())
+}
+
+fn cold_source_limit(descriptors: libc::rlim_t) -> usize {
     // Directory, lock, stage, and validation duplicate per source; leave headroom
     // for the running generation. This is admission, not a descriptor reservation.
     ((descriptors.saturating_sub(128) / 4).min(128)) as usize
@@ -177,6 +182,7 @@ pub(crate) async fn prepare(
     if missing.is_empty() {
         return Err(initial_error);
     }
+    validate_cold_source_count(missing.len())?;
     let context = configs.clone();
     let mut context =
         crate::config::blocking_compile(move || crate::config::rule_download_context(context))
