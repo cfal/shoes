@@ -396,8 +396,13 @@ async fn unsupported_bootstrap_routes_only_fail_when_caches_are_missing() {
         std::fs::write(&path, value.to_string()).unwrap();
         let output = command(&path, &[]).await;
         assert!(!output.status.success(), "{route}");
+        let expected = if route == "named-dns" {
+            "named DNS groups are not supported"
+        } else {
+            "missing-cache bootstrap supports only"
+        };
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("bootstrap"),
+            String::from_utf8_lossy(&output.stderr).contains(expected),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );

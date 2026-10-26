@@ -34,6 +34,22 @@ pub(crate) async fn prepare(
         return Ok(configs);
     }
     let dns = DnsRegistry::for_rule_bootstrap(&configs, retained_ranges, limits)?;
+    for source in &missing {
+        let download = source.download.as_ref().expect("remote source checked");
+        let result = async {
+            let url = source.parsed_url()?.expect("remote source checked");
+            http::validate_literal_endpoints(&url, download, &dns)?;
+            dns.rule_bootstrap(&download.bootstrap_url).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                format!("rule bootstrap {}: {error}", source.path.display()),
+            )
+        })?;
+    }
     for source in missing {
         log::info!("Bootstrapping missing rule cache {}", source.path.display());
         let result = async {

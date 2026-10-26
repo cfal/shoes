@@ -2210,14 +2210,16 @@ source object works in `rule_source_group.rules`, under `masks` (including
     - url: https://example.net/blocked.json
       path: ./cache/blocked.json
       download:
-        client_chain: fetch-proxy
+        client_chain:
+          address: "proxy.example.net:1080"
+          protocol: {type: socks}
         bootstrap_url: system
       action: block
     - masks: {any_destination: true}
       action: allow
 ```
 
-`fetch-proxy` must be a configured client group. `download.client_chain` accepts
+Replace `proxy.example.net:1080` with your proxy address. `download.client_chain` accepts
 the existing chain, pool, inline-client, and group syntax. It is independent of
 the outer policy's `client_chain`, which routes matched traffic. Both
 `download.client_chain` and `download.bootstrap_url` are required. Bootstrap may

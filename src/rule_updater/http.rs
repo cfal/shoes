@@ -48,28 +48,19 @@ fn target(url: &url::Url) -> io::Result<crate::address::NetLocation> {
     }
 }
 
-async fn connect(
+pub(super) fn validate_literal_endpoints(
     url: &url::Url,
     download: &Download,
     dns: &DnsRegistry,
-    global: GlobalLimits,
-    state: &mut DownloadState,
-) -> io::Result<Box<dyn AsyncStream>> {
-    let host = match url.host().ok_or_else(|| invalid("missing URL host"))? {
-        url::Host::Domain(name) => name.to_owned(),
-        url::Host::Ipv4(ip) => ip.to_string(),
-        url::Host::Ipv6(ip) => ip.to_string(),
-    };
-    let resolver = dns.rule_bootstrap(&download.bootstrap_url).await?;
-    let target = target(url)?;
-    let targets = crate::resolver::resolve_addresses(&resolver, &target)
-        .await
-        .map_err(|_| invalid("rule download bootstrap lookup failed"))?;
-    if targets.iter().any(|target| {
-        dns.forbidden_ranges()
-            .iter()
-            .any(|range| range.contains(target.ip().to_canonical()))
-    }) {
+) -> io::Result<()> {
+    if target(url)?
+        .to_socket_addr_nonblocking()
+        .is_some_and(|target| {
+            dns.forbidden_ranges()
+                .iter()
+                .any(|range| range.contains(target.ip().to_canonical()))
+        })
+    {
         return Err(invalid(
             "rule download destination overlaps a synthetic endpoint",
         ));
@@ -97,6 +88,36 @@ async fn connect(
                 return Err(invalid("rule download proxy overlaps a synthetic endpoint"));
             }
         }
+    }
+    Ok(())
+}
+
+async fn connect(
+    url: &url::Url,
+    download: &Download,
+    dns: &DnsRegistry,
+    global: GlobalLimits,
+    state: &mut DownloadState,
+) -> io::Result<Box<dyn AsyncStream>> {
+    validate_literal_endpoints(url, download, dns)?;
+    let host = match url.host().ok_or_else(|| invalid("missing URL host"))? {
+        url::Host::Domain(name) => name.to_owned(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    };
+    let resolver = dns.rule_bootstrap(&download.bootstrap_url).await?;
+    let target = target(url)?;
+    let targets = crate::resolver::resolve_addresses(&resolver, &target)
+        .await
+        .map_err(|_| invalid("rule download bootstrap lookup failed"))?;
+    if targets.iter().any(|target| {
+        dns.forbidden_ranges()
+            .iter()
+            .any(|range| range.contains(target.ip().to_canonical()))
+    }) {
+        return Err(invalid(
+            "rule download destination overlaps a synthetic endpoint",
+        ));
     }
     let mut chain = crate::tcp::chain_builder::build_client_proxy_chain_with_limits(
         download.client_chain.hops.clone(),

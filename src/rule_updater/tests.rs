@@ -247,6 +247,64 @@ async fn bootstrap_preserves_inline_tls_names_and_loads_local_pems() {
 }
 
 #[tokio::test]
+async fn bootstrap_preflights_later_synthetic_endpoints_before_any_download() {
+    for retained in [false, true] {
+        for endpoint in ["destination", "proxy", "DNS"] {
+            let dir = directory();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+            let mut first = source(&url, &dir.path().join("first.json"));
+            first.download.as_mut().unwrap().bootstrap_url = "tcp://127.0.0.1:1".into();
+            let mut second = first.clone();
+            second.path = dir.path().join("second.json");
+            match endpoint {
+                "destination" => second.url = Some("http://198.18.0.1/rules.json".into()),
+                "proxy" => {
+                    second.download.as_mut().unwrap().client_chain =
+                        serde_json::from_value(serde_json::json!([{"pool": ["direct", {
+                            "address": "198.18.0.1:1080", "protocol": {"type": "socks"}
+                        }]}]))
+                        .unwrap()
+                }
+                "DNS" => {
+                    second.download.as_mut().unwrap().bootstrap_url = "tcp://198.18.0.1".into()
+                }
+                _ => unreachable!(),
+            }
+            let mut config = configs(&first);
+            config.extend(configs(&second).into_iter().skip(1));
+            let ranges = if retained {
+                vec!["198.18.0.0/15".parse().unwrap()]
+            } else {
+                config.push(
+                    serde_json::from_value(serde_json::json!({
+                        "dns_group": "fake", "dns_servers": "system", "fake_ip": {}
+                    }))
+                    .unwrap(),
+                );
+                Vec::new()
+            };
+            let error = timeout(Duration::from_secs(3), super::bootstrap(config, &ranges))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("synthetic"),
+                "{endpoint}: {error}"
+            );
+            assert!(error.to_string().contains("second.json"), "{error}");
+            assert!(!first.path.exists());
+            assert!(!second.path.exists());
+            assert!(
+                timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn bootstrap_rejects_retained_synthetic_addresses_before_connecting() {
     let dir = directory();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
