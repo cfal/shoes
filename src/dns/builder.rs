@@ -89,6 +89,7 @@ impl PoolState {
 pub struct DnsRegistry {
     limits: GlobalLimits,
     groups: FxHashMap<String, Arc<dyn Resolver>>,
+    system_groups: std::collections::HashMap<String, bool>,
     /// Default resolver, created lazily only if needed.
     default_resolver: Option<Arc<dyn Resolver>>,
     forbidden: Arc<[IpNetwork]>,
@@ -96,8 +97,11 @@ pub struct DnsRegistry {
 }
 
 impl DnsRegistry {
-    pub(crate) fn rule_bootstrap(&self, url: &str) -> std::io::Result<Arc<dyn Resolver>> {
+    pub(crate) async fn rule_bootstrap(&self, url: &str) -> std::io::Result<Arc<dyn Resolver>> {
         if let Some(resolver) = self.get_by_name(url) {
+            if self.system_groups.get(url) == Some(&true) {
+                SystemResolver::check_native_configuration(self.forbidden.clone()).await?;
+            }
             return Ok(real_only(resolver, self.forbidden.clone()));
         }
         let parsed = ParsedDnsUrl::parse(url)
@@ -111,7 +115,10 @@ impl DnsRegistry {
             .to_parsed_server(None)
             .map_err(std::io::Error::other)?;
         let endpoint = match &server {
-            ParsedDnsServer::System => None,
+            ParsedDnsServer::System => {
+                SystemResolver::check_native_configuration(self.forbidden.clone()).await?;
+                None
+            }
             ParsedDnsServer::Udp { addr }
             | ParsedDnsServer::Tcp { addr }
             | ParsedDnsServer::Tls { addr, .. }
@@ -199,6 +206,14 @@ impl DnsRegistry {
             }
         }
         groups.retain(|group| required.contains(&group.name));
+        let mut system_groups = std::collections::HashMap::new();
+        for group in &mut groups {
+            let system = group_uses_system(group, &system_groups)?;
+            system_groups.insert(group.name.clone(), system);
+        }
+        if system_groups.values().any(|system| *system) {
+            SystemResolver::check_native_configuration(guard.forbidden.clone()).await?;
+        }
         for group in &mut groups {
             group.fake_ip = None;
             for spec in &mut group.specs {
@@ -238,6 +253,7 @@ impl DnsRegistry {
         Self {
             limits: crate::resources::limits(),
             groups: FxHashMap::default(),
+            system_groups: Default::default(),
             default_resolver: None,
             forbidden: Arc::from([]),
             pools: FxHashMap::default(),
@@ -339,6 +355,41 @@ impl DnsRegistry {
             }
         })))
     }
+}
+
+fn group_uses_system(
+    group: &mut ExpandedDnsGroup,
+    system_groups: &std::collections::HashMap<String, bool>,
+) -> std::io::Result<bool> {
+    if group.use_default_resolver {
+        return Ok(true);
+    }
+    for spec in &mut group.specs {
+        if spec.url == "system" {
+            return Ok(true);
+        }
+        let mut native_proxy = false;
+        for chain in &mut spec.client_chains {
+            for hop in chain.hops.iter_mut() {
+                crate::config::client_visit::visit_hop(hop, &mut |client| {
+                    native_proxy |= client.address.address().hostname().is_some();
+                    Ok(())
+                })?;
+            }
+        }
+        if native_proxy
+            || (ParsedDnsUrl::parse(&spec.url).is_ok_and(|url| url.has_hostname())
+                && spec.bootstrap_url.as_ref().is_none_or(|bootstrap| {
+                    system_groups
+                        .get(bootstrap)
+                        .copied()
+                        .unwrap_or(bootstrap == "system")
+                }))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn checkpoint_pools(pools: Vec<Arc<FakeIpPool>>) -> std::io::Result<()> {
@@ -881,7 +932,9 @@ pub async fn build_dns_registry_for_runtime(
     };
 
     let mut bootstraps = FxHashMap::default();
-    for group in groups {
+    for mut group in groups {
+        let system = group_uses_system(&mut group, &registry.system_groups)?;
+        registry.system_groups.insert(group.name.clone(), system);
         for spec in &group.specs {
             for endpoint in std::iter::once(spec.url.as_str()).chain(spec.bootstrap_url.as_deref())
             {

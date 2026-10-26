@@ -1679,8 +1679,8 @@ async fn cold_rule_bootstrap_rejects_synthetic_upstreams_before_lookup() {
         .unwrap();
         let error = dns
             .rule_bootstrap(&bootstrap)
-            .err()
-            .expect("cold synthetic bootstrap endpoint accepted");
+            .await
+            .expect_err("cold synthetic bootstrap endpoint accepted");
         assert!(
             error.to_string().contains("synthetic endpoint"),
             "{bootstrap}: {error}"
@@ -1754,7 +1754,7 @@ async fn remote_bootstrap_group_names_take_precedence_over_url_syntax() {
         )
         .await
         .unwrap();
-        dns.rule_bootstrap(name).unwrap();
+        dns.rule_bootstrap(name).await.unwrap();
     }
 }
 

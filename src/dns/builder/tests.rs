@@ -155,6 +155,71 @@ async fn native_cache_policy_distinguishes_implicit_and_explicit_system() {
 }
 
 #[tokio::test]
+async fn rule_system_bootstrap_checks_current_and_retained_forbidden_upstreams() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("fake.json");
+    let forbidden: Arc<[IpNetwork]> =
+        Arc::from(["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()]);
+    let guard = DnsRegistry {
+        forbidden: forbidden.clone(),
+        ..DnsRegistry::new()
+    };
+    let source: crate::rule_set::RuleSource = serde_json::from_value(serde_json::json!({
+        "url": "https://remote.invalid/rules.json", "path": dir.path().join("cache.json"),
+        "download": {"client_chain": "direct", "bootstrap_url": "fake"}
+    }))
+    .unwrap();
+    for url in ["system", "https://upstream.invalid/dns-query"] {
+        let mut groups = fake_groups(true);
+        groups[0].specs = vec![make_spec(url)];
+        groups[0].fake_ip.as_mut().unwrap().state_file = Some(state.clone());
+        let error = DnsRegistry::for_rule_downloads(
+            groups,
+            GlobalLimits::default(),
+            std::slice::from_ref(&source),
+            &[],
+            Some(&guard),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("system DNS"), "{url}: {error}");
+        assert!(!state.exists());
+    }
+    let mut cached = build_dns_registry(fake_groups(false)).await.unwrap();
+    cached.forbidden = forbidden;
+    for bootstrap in ["system", "fake"] {
+        let error = cached.rule_bootstrap(bootstrap).await.err().unwrap();
+        assert!(
+            error.to_string().contains("system DNS"),
+            "{bootstrap}: {error}"
+        );
+    }
+}
+
+#[test]
+fn system_bootstrap_dependencies_preserve_named_group_precedence() {
+    let mut groups = fake_groups(false);
+    let group = &mut groups[0];
+    let mut known = std::collections::HashMap::from([("system".into(), false)]);
+    group.specs[0] = make_spec("https://upstream.invalid/dns-query");
+    assert!(group_uses_system(group, &known).unwrap());
+    group.specs[0].bootstrap_url = Some("system".into());
+    assert!(!group_uses_system(group, &known).unwrap());
+    known.insert("system".into(), true);
+    assert!(group_uses_system(group, &known).unwrap());
+    group.specs[0] = make_spec("udp://127.0.0.1:53");
+    assert!(!group_uses_system(group, &known).unwrap());
+    group.specs[0].client_chains = vec![
+        serde_json::from_value(serde_json::json!({
+            "address": "proxy.invalid:1080", "protocol": {"type": "socks"}
+        }))
+        .unwrap(),
+    ];
+    assert!(group_uses_system(group, &known).unwrap());
+}
+
+#[tokio::test]
 async fn omitted_servers_keeps_default_cache_and_retired_pools_freeze_on_shutdown() {
     let configs = crate::config::create_server_configs(
         serde_yaml::from_str(

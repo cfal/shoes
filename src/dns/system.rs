@@ -27,6 +27,29 @@ pub(super) struct SystemResolver {
 }
 
 impl SystemResolver {
+    pub(super) async fn check_native_configuration(forbidden: Arc<[IpNetwork]>) -> io::Result<()> {
+        if forbidden.is_empty() {
+            return Ok(());
+        }
+        tokio::task::spawn_blocking(move || {
+            let (mut config, _) = discover()?;
+            // Native lookup uses the OS configuration, not our filtered copy.
+            if config.name_servers.iter().any(|server| {
+                forbidden
+                    .iter()
+                    .any(|range| range.contains(server.ip.to_canonical()))
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "system DNS endpoint overlaps a synthetic endpoint",
+                ));
+            }
+            filter_endpoints(&mut config, &forbidden)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     pub(super) async fn check_configuration(forbidden: Arc<[IpNetwork]>) -> io::Result<()> {
         if crate::socket_policy::bootstrap().is_some() {
             return Ok(());

@@ -60,7 +60,7 @@ async fn connect(
         url::Host::Ipv4(ip) => ip.to_string(),
         url::Host::Ipv6(ip) => ip.to_string(),
     };
-    let resolver = dns.rule_bootstrap(&download.bootstrap_url)?;
+    let resolver = dns.rule_bootstrap(&download.bootstrap_url).await?;
     let target = target(url)?;
     let targets = crate::resolver::resolve_addresses(&resolver, &target)
         .await
