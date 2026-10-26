@@ -1129,13 +1129,17 @@ same default resolver serves controller probes. The window starts when a
 successful lookup finishes; an entry expires at the window boundary. All returned
 usable addresses and their original order are retained.
 Errors and empty results are not cached, and expired answers are not served on
-failure. Each cache has a lazy, bounded 10,000-entry LRU keyed by hostname and
-requested port; eviction can cause earlier refresh. Concurrent misses may each
-perform a lookup, with no background refresh or miss queue.
+failure. Each cache has a lazy, bounded 10,000-entry LRU keyed by exact hostname;
+results are shared across ports, with each caller receiving its requested port.
+Eviction can cause earlier refresh. Concurrent misses share a lookup, up to
+1,024 participating callers per resolver. Excess callers look up independently;
+this is not an OS lookup concurrency cap. Cancelling the owner makes surviving
+callers retry within their remaining deadlines. No background refresh is added,
+and already-running OS calls cannot be stopped.
 
 Explicit `dns: {servers: system}` continues to use OS/NSS lookup **without
-application memoization**. To select a different fixed window, use a system
-server options object, inline or in a named DNS group:
+application memoization or concurrent lookup sharing**. To select a different
+fixed window, use a system server options object, inline or in a named DNS group:
 
 ```yaml
 dns:
