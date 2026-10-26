@@ -322,6 +322,7 @@ OPTIONS:
 
 COMMANDS:
     check <config.yaml>                       Alias for --dry-run
+    update-rules --direct <config.yaml>       Update managed rule caches while Shoes is stopped
     version                                  Alias for --version
     generate-reality-keypair                  Generate a new Reality X25519 keypair
     generate-reality-mldsa65-keypair           Generate optional Reality ML-DSA-65 keys

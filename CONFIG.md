@@ -2191,6 +2191,8 @@ source object works in `rule_source_group.rules`, under `masks` (including
 `rules`, or supported `override_rules`. A flat source cannot also specify `masks`.
 
 ```yaml
+- rule_cache_dir: ./cache
+
 - rule_source_group: regional
   rules:
     - url: https://example.net/geoip-cn.srs
@@ -2220,17 +2222,23 @@ the existing chain, pool, inline-client, and group syntax. It is independent of
 the outer policy's `client_chain`, which routes matched traffic. Both
 `download.client_chain` and `download.bootstrap_url` are required. Bootstrap may
 be `system`, an IP-based DNS URL, or a named DNS group. Target and proxy hostnames
-use this resolver; failed fetch routing never falls back to direct. Cold downloads
-reconcile persisted/current selector choices before fetching, without publishing
-a candidate controller generation. Later refreshes use the active selection view.
+use this resolver; failed refresh routing never falls back to direct. Automatic
+refresh uses the active generation's DNS, proxy clients, and selector choices.
 
-`path` is required, relative to the declaring config file. Its directory must
-already exist, be owned by the running user, and not be group- or world-writable (for
-example, create it with `install -d -m 700 cache`). Cache files must be owned,
+`rule_cache_dir` declares one private managed directory across all config files.
+Its value is relative to the declaring file and fixed for the process lifetime:
+adding, changing, or removing it requires a restart, even without remote sources.
+Every remote `path` must be a direct child of that directory. Configuration, local
+rule sources (including aliases), PEMs, sockets, and other state must be outside
+it. ACME state directories cannot contain or be contained by the cache directory.
+The directory must be owned by the running user and not group- or world-writable
+(for example, create it with `install -d -m 700 cache`). Cache files must be owned,
 regular, singly linked, not group- or world-writable, and have no setuid, setgid,
 or sticky mode bits. Symlinks in any path component
-and `..` traversal are rejected. The `.shoes-update.lock` and `.shoes-update.tmp`
-suffixes are reserved. Identical declarations sharing a cache are deduplicated;
+and `..` traversal are rejected. `owner.lock`, `.shoes-update.lock`, and
+`.shoes-update.tmp` sidecars are reserved. The daemon holds an exclusive directory
+lease; another daemon or update command cannot use the same directory concurrently.
+Identical declarations sharing a cache are deduplicated;
 conflicting declarations are rejected. Local-only file sources are unchanged.
 
 `format` remains optional: explicit override, recognized SRS/MRS signature, URL
@@ -2239,20 +2247,48 @@ are supported; DAT still needs explicit format/code, and Mihomo YAML/text needs
 behavior. Invalid decoding never retries a different format.
 
 `update_interval` defaults to `24h`; use a positive integer with `s`, `m`, `h`, or
-`d`, from `1s` through `365d`. Valid cached files allow offline startup. Missing,
-invalid, or empty remote caches require a successful download and whole-candidate
-validation before listeners start. `check` and `--dry-run` stay offline and fail
-if a usable required cache is missing. A future cache mtime is treated as due.
+`d`, from `1s` through `365d`. Startup, reload, `check`, and `--dry-run` never fetch
+rules. Missing, invalid, or empty required caches fail validation; a rejected
+reload retains the running generation. Bootstrap or update caches explicitly,
+with the owning Shoes process stopped:
+
+```sh
+shoes update-rules --direct config.yaml
+shoes check config.yaml
+shoes config.yaml
+```
+
+The required `--direct` flag overrides every declared download route with direct
+TCP and system DNS for this command only. It does not bypass OS VPN/TUN routing.
+Named groups, selectors, proxy PEMs, and listeners are not prepared. If direct
+access is unsuitable, populate the files externally instead. The command creates
+the final cache directory if missing, preflights namespace conflicts, then fetches,
+decoder-validates, and atomically installs one file at a time. It can replace valid
+caches. On failure it exits nonzero; earlier successful replacements remain. It
+does not validate the whole configuration or promise rollback. Run `shoes check`
+afterward before restarting. Neither `--dry-run` nor `--no-reload` can be combined
+with this command.
 
 The process refreshes due sources serially, with 10% jitter and capped exponential
 failure backoff. Downloaded files pass Shoes' actual decoders, compilation budgets,
-and whole-configuration validation before atomic replacement. Failures keep the
+and validation against the active configuration snapshot before atomic replacement.
+The initial due time is based on cache mtime; future mtimes are treated as due.
+Successful check times are remembered only in memory. Changing a URL without
+changing its cache path can serve the old bytes until the next due time; use a new
+cache name and bootstrap it when immediate replacement is needed. Failures keep the
 last-good file and active rules; identical bytes preserve inode/mtime and do not
 reload. Each file replacement is atomic, not a multi-file transaction. A post-rename
 directory-sync failure reports uncertain durability but still activates the
 validated replacement. New flows use the reloaded rules; existing flows retain
 their previous configuration. Reload/removal/shutdown cancels in-flight refreshes.
 `--no-reload` disables filesystem-triggered reloads, not configured remote refresh.
+Managed caches are excluded from generic filesystem watching. An automatic changed
+install requests one immediate reload; external edits require SIGHUP or restart.
+Reload reads the configuration files, including any unrelated edits. If activation
+fails, the new cache can remain on disk while old rules remain active. Correct the
+configuration and reload explicitly; a later byte-identical fetch does not retry
+activation. Atomic installation does not provide a disk/activation or power-loss
+transaction.
 Bulk file reads, writes, and synchronization run off the forwarding executor.
 Filesystem work already submitted may finish after cancellation, holding its
 update lock until cleanup; it cannot publish an abandoned pre-rename update.
@@ -2263,11 +2299,8 @@ URL credentials/fragments, HTTP content compression, and trailers are rejected.
 Chunked and close-delimited bodies are accepted within the same limits: 64 MiB
 download, 64 headers/32 KiB, 10-second connect/DNS/TLS and header/body-idle deadlines,
 and a 120-second total download deadline. Decoder-specific decompression limits
-still apply. Cold-start staging is capped at 512 MiB and 128 missing/invalid sources
-in aggregate. The source ceiling is reduced to `(soft RLIMIT_NOFILE - 128) / 4`
-when lower, leaving nominal descriptor headroom for the running generation;
-it does not reserve descriptors against other activity. Larger cold batches require
-prepopulated caches. Logs report
+still apply. A truncated close-delimited cleartext response can be indistinguishable
+from a shorter valid rule list; prefer HTTPS. Logs report
 actual updated/unchanged/failed results without URL query values or downloaded data.
 
 Remote refresh currently requires the Unix process runtime. FFI startup and
@@ -2736,6 +2769,7 @@ OPTIONS:
 
 COMMANDS:
   check <config.yaml>                           Alias for --dry-run
+  update-rules --direct <config.yaml>           Update managed rule caches while Shoes is stopped
   version                                      Alias for --version
   generate-reality-keypair                       Generate Reality X25519 keypair
   generate-reality-mldsa65-keypair                Generate optional Reality ML-DSA-65 keys
