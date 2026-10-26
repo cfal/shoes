@@ -1563,6 +1563,111 @@ async fn first_download_proxy_retains_bootstrap_address_fallback() {
 }
 
 #[tokio::test]
+async fn cold_download_cannot_replace_removed_controller_state() {
+    let dir = directory();
+    let state = dir.path().join("selection.json");
+    let snapshot = crate::control::store::encoded(&Default::default()).unwrap();
+    write_rule(&state, &snapshot);
+    let mut control = Some(
+        crate::control::runtime::ControlService::new(crate::config::ControlConfig {
+            cache_file_path: Some(state.clone()),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+    let before = stamp(&std::fs::metadata(&state).unwrap());
+    let error = timeout(
+        Duration::from_secs(1),
+        prepare(
+            configs(&source(&url, &state)),
+            Some(&DnsRegistry::new()),
+            &mut control,
+        ),
+    )
+    .await
+    .unwrap()
+    .err()
+    .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("controller settings require a restart"),
+        "{error}"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), snapshot);
+    assert_eq!(stamp(&std::fs::metadata(&state).unwrap()), before);
+    assert!(!stage_path(&state).exists());
+    control.as_mut().unwrap().shutdown().await;
+}
+
+#[tokio::test]
+async fn cold_download_cannot_reuse_active_or_retained_fake_ip_state() {
+    let dir = directory();
+    let state = dir.path().join("fake.json");
+    let lock = crate::control::store::lock_path(&state);
+    let config = crate::config::create_server_configs(
+        serde_json::from_value(serde_json::json!([{
+            "dns_group": "fake", "dns_servers": "udp://127.0.0.1:53",
+            "fake_ip": {"state_file": state, "max_entries": 16}
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let active = crate::dns::build_dns_registry(config.dns_groups)
+        .await
+        .unwrap();
+    active.checkpoint().await.unwrap();
+    let snapshot = std::fs::read(&state).unwrap();
+    let state_stamp = stamp(&std::fs::metadata(&state).unwrap());
+    let lock_stamp = stamp(&std::fs::metadata(&lock).unwrap());
+    let retained =
+        crate::dns::build_dns_registry_reusing(Vec::new(), GlobalLimits::default(), Some(&active))
+            .await
+            .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+    for previous in [&active, &retained] {
+        for path in [&state, &lock] {
+            let error = timeout(
+                Duration::from_secs(1),
+                prepare(configs(&source(&url, path)), Some(previous), &mut None),
+            )
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+            assert!(error.to_string().contains("overlaps"), "{error}");
+            assert!(!stage_path(path).exists());
+            assert!(
+                !path
+                    .with_file_name(format!(
+                        "{}.shoes-update.lock",
+                        path.file_name().unwrap().to_str().unwrap()
+                    ))
+                    .exists()
+            );
+        }
+    }
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&state).unwrap(), snapshot);
+    assert_eq!(stamp(&std::fs::metadata(&state).unwrap()), state_stamp);
+    assert_eq!(stamp(&std::fs::metadata(&lock).unwrap()), lock_stamp);
+    retained.shutdown_checkpoint().await.unwrap();
+    assert_eq!(std::fs::read(&state).unwrap(), snapshot);
+}
+
+#[tokio::test]
 async fn cold_bootstrap_does_not_open_fake_ip_state_and_rejects_synthetic_targets() {
     let dir = directory();
     let state = dir.path().join("fake.json");

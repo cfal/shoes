@@ -163,6 +163,13 @@ pub(crate) async fn prepare(
     if sources.is_empty() {
         return crate::config::compile_configs(configs).await;
     }
+    if let Some(previous) = previous {
+        let reserved: Vec<_> = previous
+            .state_files()
+            .flat_map(|path| [path.to_path_buf(), crate::control::store::lock_path(path)])
+            .collect();
+        crate::rule_set::validate_remote_paths(&mut configs, &reserved)?;
+    }
     let initial_error = match crate::config::compile_configs(configs.clone()).await {
         Ok(validated) => return Ok(validated),
         Err(error) => error,
@@ -187,6 +194,11 @@ pub(crate) async fn prepare(
     let mut context =
         crate::config::blocking_compile(move || crate::config::rule_download_context(context))
             .await?;
+    if let Some(control) = control.as_ref()
+        && control.runtime.config != context.control
+    {
+        return Err(invalid("controller settings require a restart"));
+    }
     if let Some(catalog) = &context.catalog {
         if control.is_none() {
             if previous.is_some()
@@ -202,9 +214,6 @@ pub(crate) async fn prepare(
             )?);
         }
         let runtime = &control.as_ref().unwrap().runtime;
-        if runtime.config != context.control {
-            return Err(invalid("controller settings require a restart"));
-        }
         runtime
             .prepare_rule_download_selection(catalog.selection.clone())
             .await?;

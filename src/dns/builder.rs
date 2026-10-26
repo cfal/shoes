@@ -312,6 +312,13 @@ impl DnsRegistry {
             .collect()
     }
 
+    #[cfg(unix)]
+    pub(crate) fn state_files(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.pools
+            .values()
+            .filter_map(|state| state.pool.state_file())
+    }
+
     pub async fn checkpoint(&self) -> std::io::Result<()> {
         let pools = self.pool_handles();
         tokio::task::spawn_blocking(move || checkpoint_pools(pools))
