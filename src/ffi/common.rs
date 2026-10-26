@@ -230,17 +230,7 @@ pub async fn start_from_config(
     }
 
     let mut validated = crate::config::compile_configs(configs).await?;
-    validated.control.reject_ffi()?;
-    if validated
-        .catalog
-        .as_ref()
-        .is_some_and(|catalog| !catalog.selection.automatic.0.is_empty())
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "url-test groups require the process runtime and are not supported by FFI",
-        ));
-    }
+    validated.validate_ffi_support()?;
     let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;

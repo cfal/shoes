@@ -44,7 +44,7 @@ impl ClientRegistry {
                 carrier
                     .control
                     .as_ref()
-                    .map(crate::control::catalog::MemberOrigin::selector_path)
+                    .map(crate::control::catalog::MemberOrigin::policy_path)
                     .unwrap_or_default(),
             );
             if carrier.bind_interface.is_unspecified() {

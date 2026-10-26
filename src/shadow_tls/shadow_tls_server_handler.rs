@@ -68,7 +68,7 @@ pub enum ShadowTlsServerTargetHandshake {
     Local(Arc<rustls::ServerConfig>),
     Remote {
         location: NetLocation,
-        client_chain: ClientProxyChain,
+        client_chain: Box<ClientProxyChain>,
     },
 }
 
@@ -80,7 +80,7 @@ impl ShadowTlsServerTargetHandshake {
     pub fn new_remote(location: NetLocation, client_chain: ClientProxyChain) -> Self {
         ShadowTlsServerTargetHandshake::Remote {
             location,
-            client_chain,
+            client_chain: Box::new(client_chain),
         }
     }
 }

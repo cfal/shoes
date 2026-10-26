@@ -15,12 +15,34 @@ pub struct SelectorDefinition {
 
 pub type SelectorDefinitions = BTreeMap<String, SelectorDefinition>;
 pub type Choices = BTreeMap<String, String>;
+pub type ManualSelectorPath = Vec<(String, String)>;
+
+pub(crate) fn manual_choices_changed(
+    paths: &[ManualSelectorPath],
+    previous: &Choices,
+    current: &Choices,
+) -> bool {
+    paths.iter().any(|path| {
+        for (group, member) in path {
+            let was_selected = previous.get(group) == Some(member);
+            let is_selected = current.get(group) == Some(member);
+            if was_selected != is_selected {
+                return true;
+            }
+            if !was_selected {
+                break;
+            }
+        }
+        false
+    })
+}
 
 #[derive(Debug, Default)]
 pub struct SelectionView {
     definitions: SelectorDefinitions,
     choices: RwLock<Arc<Choices>>,
     pub automatic: super::url_test::AutomaticGroups,
+    pub(crate) health: super::health::HealthState,
 }
 
 impl SelectionView {
@@ -30,6 +52,12 @@ impl SelectionView {
 
     pub fn definitions(&self) -> &SelectorDefinitions {
         &self.definitions
+    }
+
+    fn publish_choices(&self, choices: Arc<Choices>) {
+        let mut previous = self.choices.write();
+        self.health.choices_changed(&previous, &choices);
+        *previous = choices;
     }
 }
 
@@ -62,6 +90,7 @@ impl SelectionOwner {
             choices: RwLock::new(Arc::new(effective(&definitions, &self.explicit))),
             definitions,
             automatic: Default::default(),
+            health: Default::default(),
         }))
     }
 
@@ -87,7 +116,7 @@ impl SelectionOwner {
 
     pub fn reconcile(&self, candidate: &SelectionView) -> io::Result<()> {
         self.check_capacity(&candidate.definitions)?;
-        *candidate.choices.write() = Arc::new(effective(&candidate.definitions, &self.explicit));
+        candidate.publish_choices(Arc::new(effective(&candidate.definitions, &self.explicit)));
         Ok(())
     }
 
@@ -112,7 +141,7 @@ impl SelectionOwner {
             })?;
         }
         self.explicit = explicit;
-        *self.active.choices.write() = choices;
+        self.active.publish_choices(choices);
         Ok(())
     }
 

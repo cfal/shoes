@@ -39,6 +39,9 @@ mod config_tooling;
 #[cfg(unix)]
 #[path = "cases/process_contract/certificates.rs"]
 mod certificates;
+#[cfg(unix)]
+#[path = "cases/process_contract/health.rs"]
+mod health;
 
 #[cfg(unix)]
 #[path = "cases/process_contract/file_logging.rs"]

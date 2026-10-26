@@ -17,7 +17,7 @@ pub struct Generation {
     pub id: u64,
     pub catalog: Catalog,
     pub rules: Vec<serde_json::Value>,
-    pub probes: crate::clash_api::probes::ProbeState,
+    pub probes: super::probes::ProbeState,
     pub leaf_udp_support: std::collections::HashMap<String, bool>,
 }
 
@@ -89,7 +89,9 @@ impl ControlService {
             activating: AtomicBool::new(true),
             connections: Arc::new(tokio::sync::Semaphore::new(64)),
             subscribers: Arc::new(tokio::sync::Semaphore::new(16)),
-            probes: Arc::new(tokio::sync::Semaphore::new(16)),
+            probes: Arc::new(tokio::sync::Semaphore::new(
+                super::probes::PROBE_CONCURRENCY,
+            )),
             logs: Arc::new(super::logs::LogHub::new()),
             active: RwLock::new(None),
             probe_epoch: RwLock::new(CancellationToken::new()),
@@ -222,6 +224,12 @@ async fn stop_automatic(task: Option<AbortOnDropHandle<()>>) {
     }
 }
 
+async fn stop_health(service: Option<super::health::HealthService>) {
+    if let Some(service) = service {
+        service.shutdown().await;
+    }
+}
+
 async fn run_owner(
     mut owner: SelectionOwner,
     mut receiver: mpsc::Receiver<Command>,
@@ -229,6 +237,7 @@ async fn run_owner(
     shutdown: CancellationToken,
 ) {
     let mut paused = false;
+    let mut health: Option<super::health::HealthService> = None;
     let mut pending: VecDeque<SelectionCommand> = VecDeque::new();
     let mut automatic: Option<AbortOnDropHandle<()>> = None;
     loop {
@@ -266,6 +275,7 @@ async fn run_owner(
             Command::Begin(view, reply) => {
                 let result = owner.reconcile(&view);
                 if result.is_ok() {
+                    stop_health(health.take()).await;
                     paused = true;
                     if let Some(runtime) = runtime.upgrade() {
                         let _active = runtime.active.write();
@@ -277,6 +287,7 @@ async fn run_owner(
                 let _ = reply.send(result);
             }
             Command::Publish(generation, reply) => {
+                stop_health(health.take()).await;
                 let result = owner.activate(generation.catalog.selection.clone());
                 if result.is_ok()
                     && let Some(runtime) = runtime.upgrade()
@@ -291,12 +302,23 @@ async fn run_owner(
                 paused = false;
                 stop_automatic(automatic.take()).await;
                 if let Some(runtime) = runtime.upgrade() {
+                    let generation = runtime.generation();
+                    if health.is_none()
+                        && let Ok(generation) = &generation
+                        && !generation.catalog.selection.health.definitions.is_empty()
+                    {
+                        health = Some(super::health::HealthService::start(
+                            generation.catalog.selection.clone(),
+                            runtime.probes.clone(),
+                            generation.probes.forbidden_ranges(),
+                        ));
+                    }
                     runtime.activating.store(false, Ordering::Release);
-                    if let Ok(generation) = runtime.generation()
+                    if let Ok(generation) = generation
                         && !generation.catalog.selection.automatic.0.is_empty()
                     {
                         automatic = Some(AbortOnDropHandle::new(tokio::spawn(
-                            crate::clash_api::probes::run_automatic(
+                            super::probes::run_automatic(
                                 Arc::downgrade(&runtime),
                                 generation,
                                 runtime.probe_epoch(),
@@ -342,6 +364,7 @@ async fn run_owner(
         }
     }
     stop_automatic(automatic).await;
+    stop_health(health).await;
 }
 
 #[cfg(test)]

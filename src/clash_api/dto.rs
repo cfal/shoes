@@ -42,6 +42,7 @@ pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<V
                 GroupType::Selector => "Selector",
                 GroupType::RoundRobin => "LoadBalance",
                 GroupType::UrlTest(_) => "URLTest",
+                GroupType::Fallback { .. } => "Fallback",
             };
             let mut value = json!({
                 "name": name,
@@ -146,6 +147,39 @@ mod tests {
     use super::*;
     use crate::control::selection::SelectionOwner;
     use std::sync::Arc;
+
+    #[test]
+    fn health_review9_fallback_dto_is_not_a_manual_selector() {
+        let configs = serde_json::from_value(json!([
+            {"client_group":"out", "type":"fallback", "health_check":{"url":"http://probe.invalid/", "interval_secs":30},
+             "client_proxies":[{"name":"tcp", "address":"proxy.invalid:80", "protocol":{"type":"http"}}, "direct"]}
+        ])).unwrap();
+        let catalog = crate::config::create_server_configs(configs)
+            .unwrap()
+            .catalog
+            .unwrap();
+        let generation = Generation {
+            id: 1,
+            leaf_udp_support: leaf_udp_support(&catalog).unwrap(),
+            catalog,
+            rules: Vec::new(),
+            probes: super::super::probes::ProbeState::new(
+                Arc::new(crate::resolver::NativeResolver::new()),
+                Vec::new(),
+            ),
+        };
+        let mut owner = SelectionOwner::new(None).unwrap();
+        owner
+            .activate(generation.catalog.selection.clone())
+            .unwrap();
+        let before = proxies(&generation)["proxies"]["out"].clone();
+        assert_eq!(before["type"], "Fallback");
+        assert_eq!(before["all"], json!(["tcp", "DIRECT"]));
+        assert_eq!(before["udp"], true);
+        assert!(before.get("now").is_none());
+        assert!(owner.select("out", "DIRECT").is_err());
+        assert_eq!(proxies(&generation)["proxies"]["out"], before);
+    }
 
     #[test]
     fn url_test_dto_reports_transport_eligible_members_and_url_health() {
