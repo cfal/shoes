@@ -445,6 +445,18 @@ pub enum ClientChainHop {
     Pool(OneOrSome<ConfigSelection<ClientConfig>>),
 }
 
+#[cfg(unix)]
+impl ClientChainHop {
+    pub(crate) fn selections(&self) -> &[ConfigSelection<ClientConfig>] {
+        match self {
+            Self::Single(member) | Self::Pool(OneOrSome::One(member)) => {
+                std::slice::from_ref(member)
+            }
+            Self::Pool(OneOrSome::Some(members)) => members.as_slice(),
+        }
+    }
+}
+
 impl<'de> serde::de::Deserialize<'de> for ClientChainHop {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

@@ -1,9 +1,8 @@
 use super::Limits;
 use crate::async_stream::AsyncStream;
-use crate::config::{ClientChainHop, ConfigSelection, GlobalLimits};
+use crate::config::{ConfigSelection, GlobalLimits};
 use crate::crypto::{CryptoTlsStream, TlsConnection, TlsReadMode};
 use crate::dns::DnsRegistry;
-use crate::option_util::OneOrSome;
 use crate::rule_set::{Download, RuleSource};
 use crate::rules::invalid;
 use bytes::Bytes;
@@ -11,6 +10,7 @@ use http::{Request, StatusCode, Uri, header};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::TokioIo;
 use std::io;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -48,6 +48,12 @@ fn target(url: &url::Url) -> io::Result<crate::address::NetLocation> {
     }
 }
 
+fn overlaps_synthetic(dns: &DnsRegistry, ip: IpAddr) -> bool {
+    dns.forbidden_ranges()
+        .iter()
+        .any(|range| range.contains(ip.to_canonical()))
+}
+
 pub(super) fn validate_literal_endpoints(
     url: &url::Url,
     download: &Download,
@@ -55,35 +61,21 @@ pub(super) fn validate_literal_endpoints(
 ) -> io::Result<()> {
     if target(url)?
         .to_socket_addr_nonblocking()
-        .is_some_and(|target| {
-            dns.forbidden_ranges()
-                .iter()
-                .any(|range| range.contains(target.ip().to_canonical()))
-        })
+        .is_some_and(|target| overlaps_synthetic(dns, target.ip()))
     {
         return Err(invalid(
             "rule download destination overlaps a synthetic endpoint",
         ));
     }
     for hop in download.client_chain.hops.iter() {
-        let members = match hop {
-            ClientChainHop::Single(member) | ClientChainHop::Pool(OneOrSome::One(member)) => {
-                std::slice::from_ref(member)
-            }
-            ClientChainHop::Pool(OneOrSome::Some(members)) => members.as_slice(),
-        };
-        for member in members {
+        for member in hop.selections() {
             let ConfigSelection::Config(client) = member else {
                 return Err(invalid("unexpanded rule download chain"));
             };
             if client
                 .address
                 .to_socket_addr_nonblocking()
-                .is_some_and(|addr| {
-                    dns.forbidden_ranges()
-                        .iter()
-                        .any(|range| range.contains(addr.ip().to_canonical()))
-                })
+                .is_some_and(|addr| overlaps_synthetic(dns, addr.ip()))
             {
                 return Err(invalid("rule download proxy overlaps a synthetic endpoint"));
             }
@@ -110,11 +102,10 @@ async fn connect(
     let targets = crate::resolver::resolve_addresses(&resolver, &target)
         .await
         .map_err(|_| invalid("rule download bootstrap lookup failed"))?;
-    if targets.iter().any(|target| {
-        dns.forbidden_ranges()
-            .iter()
-            .any(|range| range.contains(target.ip().to_canonical()))
-    }) {
+    if targets
+        .iter()
+        .any(|target| overlaps_synthetic(dns, target.ip()))
+    {
         return Err(invalid(
             "rule download destination overlaps a synthetic endpoint",
         ));

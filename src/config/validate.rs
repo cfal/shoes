@@ -548,12 +548,7 @@ pub(crate) fn validate_rule_bootstrap(
                 ));
             }
             for hop in download.client_chain.hops.iter() {
-                let members = match hop {
-                    ClientChainHop::Single(member)
-                    | ClientChainHop::Pool(OneOrSome::One(member)) => std::slice::from_ref(member),
-                    ClientChainHop::Pool(OneOrSome::Some(members)) => members.as_slice(),
-                };
-                for member in members {
+                for member in hop.selections() {
                     match member {
                         ConfigSelection::GroupName(name) if name == "direct" => {}
                         ConfigSelection::Config(client)

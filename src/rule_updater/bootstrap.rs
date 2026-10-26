@@ -7,7 +7,7 @@ pub(crate) async fn prepare(
     configs: Vec<Config>,
     retained_ranges: &[ipnetwork::IpNetwork],
 ) -> io::Result<Vec<Config>> {
-    let (configs, missing, limits) = crate::config::blocking_compile(move || {
+    let (configs, missing, global) = crate::config::blocking_compile(move || {
         let mut configs = configs;
         let mut missing = Vec::new();
         for source in crate::rule_set::remote_sources(&mut configs)? {
@@ -22,18 +22,18 @@ pub(crate) async fn prepare(
                 }
             }
         }
-        let limits = if missing.is_empty() {
+        let global = if missing.is_empty() {
             Default::default()
         } else {
             crate::config::validate_rule_bootstrap(&configs, &mut missing)?
         };
-        Ok((configs, missing, limits))
+        Ok((configs, missing, global))
     })
     .await?;
     if missing.is_empty() {
         return Ok(configs);
     }
-    let dns = DnsRegistry::for_rule_bootstrap(&configs, retained_ranges, limits)?;
+    let dns = DnsRegistry::for_rule_bootstrap(&configs, retained_ranges, global)?;
     for source in &missing {
         let download = source.download.as_ref().expect("remote source checked");
         let result = async {
@@ -59,7 +59,7 @@ pub(crate) async fn prepare(
                 &source,
                 install,
                 &dns,
-                limits,
+                global,
                 Limits::default(),
                 &mut http::DownloadState::default(),
             )
