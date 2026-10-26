@@ -57,13 +57,32 @@ async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
             Box::pin(std::future::pending())
         }
     }
-    let mut validated = crate::config::create_server_configs(serde_json::from_value(serde_json::json!([
-            {"client_group": "out", "type": "fallback",
-             "health_check": {"url": "http://192.0.2.1/", "interval_secs": 30},
-             "client_proxies": [{"address": "private-proxy.invalid:80", "protocol": {"type": "http"}}]},
-            {"dns_group": "dns", "dns_servers": [{"url": "tcp://192.0.2.53", "bootstrap_url": "system", "client_chain": "out"}]},
-            {"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "dns": {"servers": "dns"}}
-        ])).unwrap()).unwrap();
+    let configs = serde_json::from_value(serde_json::json!([
+        {
+            "client_group": "out",
+            "type": "fallback",
+            "health_check": {"url": "http://192.0.2.1/", "interval_secs": 30},
+            "client_proxies": [{
+                "address": "private-proxy.invalid:80",
+                "protocol": {"type": "http"}
+            }]
+        },
+        {
+            "dns_group": "dns",
+            "dns_servers": [{
+                "url": "tcp://192.0.2.53",
+                "bootstrap_url": "system",
+                "client_chain": "out"
+            }]
+        },
+        {
+            "address": "127.0.0.1:0",
+            "protocol": {"type": "socks"},
+            "dns": {"servers": "dns"}
+        }
+    ]))
+    .unwrap();
+    let mut validated = crate::config::create_server_configs(configs).unwrap();
     let (sent, mut calls) = tokio::sync::mpsc::unbounded_channel();
     let mut registry = DnsRegistry::new();
     registry.register("system".into(), Arc::new(Bootstrap(sent)));

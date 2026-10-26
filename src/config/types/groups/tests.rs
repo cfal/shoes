@@ -77,15 +77,13 @@ fn test_client_config_group() {
     let deserialized: Vec<Config> = serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
 
     assert_eq!(deserialized.len(), 1);
-    if let Config::ClientConfigGroup(group) = &deserialized[0] {
-        assert_eq!(group.client_group, "test-client-group");
-        // Check that we have the correct number of proxies by converting to vec
-        match &group.client_proxies {
-            OneOrSome::Some(vec) => assert_eq!(vec.len(), 2),
-            OneOrSome::One(_) => panic!("Expected Some(vec), got One"),
-        }
-    } else {
+    let Config::ClientConfigGroup(group) = &deserialized[0] else {
         panic!("Expected client config group");
+    };
+    assert_eq!(group.client_group, "test-client-group");
+    match &group.client_proxies {
+        OneOrSome::Some(vec) => assert_eq!(vec.len(), 2),
+        OneOrSome::One(_) => panic!("Expected Some(vec), got One"),
     }
 }
 
@@ -181,16 +179,14 @@ fn test_rule_config_group() {
     let deserialized: Vec<Config> = serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
 
     assert_eq!(deserialized.len(), 1);
-    if let Config::RuleConfigGroup(group) = &deserialized[0] {
-        assert_eq!(group.rule_group, "test-rule-group");
-        // Check that we have the correct number of rules by pattern matching
-        let RuleGroupRules::Policies(rules) = &group.rules else {
-            panic!("Expected policies");
-        };
-        assert!(matches!(rules.as_ref(), OneOrSome::Some(values) if values.len() == 2));
-    } else {
+    let Config::RuleConfigGroup(group) = &deserialized[0] else {
         panic!("Expected rule config group");
-    }
+    };
+    assert_eq!(group.rule_group, "test-rule-group");
+    let RuleGroupRules::Policies(rules) = &group.rules else {
+        panic!("Expected policies");
+    };
+    assert!(matches!(rules.as_ref(), OneOrSome::Some(values) if values.len() == 2));
 }
 
 #[test]
