@@ -1318,6 +1318,61 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn native_cache_refresh_changes_new_flow_routing_without_retargeting_pinned_flow() {
+        #[derive(Debug)]
+        struct ChangingLookup(parking_lot::Mutex<SocketAddr>);
+        impl Resolver for ChangingLookup {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                let address = *self.0.lock();
+                Box::pin(async move { Ok(vec![address]) })
+            }
+        }
+
+        let first = "192.0.2.1:443".parse().unwrap();
+        let lookup = Arc::new(ChangingLookup(parking_lot::Mutex::new(first)));
+        let resolver: Arc<dyn Resolver> = Arc::new(
+            crate::resolver::CachingNativeResolver::with_lookup(lookup.clone(), 60),
+        );
+        let selector = selector_with_cache(vec![
+            block_rule(vec!["127.0.0.0/8"]),
+            allow_rule(vec!["0.0.0.0/0"], "direct"),
+        ]);
+        let hostname = NetLocation::from_str("changing.test:443", None).unwrap();
+        let ConnectDecision::Allow {
+            mut remote_location,
+            ..
+        } = selector
+            .judge(hostname.clone().into(), &resolver)
+            .await
+            .unwrap()
+        else {
+            panic!("initial address should be allowed");
+        };
+        assert_eq!(remote_location.resolved_addr(), Some(first));
+        *lookup.0.lock() = "127.0.0.1:443".parse().unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        assert!(matches!(
+            selector
+                .judge(hostname.clone().into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(matches!(
+            selector.judge(hostname.into(), &resolver).await.unwrap(),
+            ConnectDecision::Block
+        ));
+        assert_eq!(
+            resolve_location(&mut remote_location, &resolver)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(selector.cache_size(), 0);
+    }
+
     #[tokio::test]
     async fn domain_rules_agree_with_cache_on_case_and_root_dot() {
         for capacity in [0, 10] {

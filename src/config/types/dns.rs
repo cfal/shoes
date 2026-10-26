@@ -23,9 +23,16 @@ fn default_attempts() -> usize {
     1
 }
 
+/// Rejects explicit null; Serde defaults an omitted field to None.
+fn deserialize_native_cache_secs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    u32::deserialize(deserializer).map(Some)
+}
+
 /// A DNS server specification in config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum DnsServerSpec {
     /// Simple URL string: "system", "udp://8.8.8.8", etc.
@@ -59,6 +66,13 @@ pub enum DnsServerSpec {
         /// Number of retry attempts for failed queries. Defaults to 1.
         #[serde(default = "default_attempts")]
         attempts: usize,
+        /// Fixed OS/NSS lookup memoization window. System only; omitted or 0 disables it.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_native_cache_secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        native_cache_secs: Option<u32>,
     },
 }
 
@@ -158,6 +172,18 @@ impl DnsServerSpec {
             default_attempts()
         }
     }
+
+    /// Keeps omission distinct from an explicit zero for system-only validation.
+    pub fn native_cache_secs(&self) -> Option<u32> {
+        if let Self::WithOptions {
+            native_cache_secs, ..
+        } = self
+        {
+            *native_cache_secs
+        } else {
+            None
+        }
+    }
 }
 
 /// DNS group configuration.
@@ -218,6 +244,8 @@ pub struct ExpandedDnsSpec {
     pub connect_timeout_secs: u32,
     /// Number of retry attempts for failed queries.
     pub attempts: usize,
+    /// Fixed system lookup memoization window in seconds. 0 disables it.
+    pub native_cache_secs: u32,
 }
 
 /// A DNS group with all specs expanded.
@@ -232,6 +260,67 @@ pub struct ExpandedDnsGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_cache_defaults_and_explicit_values_round_trip() {
+        for (yaml, expected) in [
+            ("system", None),
+            ("url: system", None),
+            ("url: system\nnative_cache_secs: 0", Some(0)),
+            ("url: system\nnative_cache_secs: 7", Some(7)),
+            ("url: system\nnative_cache_secs: 4294967295", Some(u32::MAX)),
+        ] {
+            let spec: DnsServerSpec = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(spec.native_cache_secs(), expected);
+            let yaml = serde_yaml::to_string(&spec).unwrap();
+            let json = serde_json::to_string(&spec).unwrap();
+            assert_eq!(
+                serde_yaml::from_str::<DnsServerSpec>(&yaml)
+                    .unwrap()
+                    .native_cache_secs(),
+                expected
+            );
+            assert_eq!(
+                serde_json::from_str::<DnsServerSpec>(&json)
+                    .unwrap()
+                    .native_cache_secs(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn native_cache_rejects_invalid_values_and_unknown_fields() {
+        for value in [
+            "-1",
+            "1.5",
+            "4294967296",
+            "null",
+            "true",
+            "[]",
+            "{}",
+            "'60'",
+        ] {
+            let yaml = format!("url: system\nnative_cache_secs: {value}");
+            assert!(
+                serde_yaml::from_str::<DnsServerSpec>(&yaml).is_err(),
+                "accepted {yaml}"
+            );
+        }
+        for yaml in [
+            "url: system\nnative_cache_sec: 0",
+            "url: system\nnative_cache_secs: 0\nextra: true",
+            "url: udp://192.0.2.1\nextra: true",
+        ] {
+            assert!(
+                serde_yaml::from_str::<DnsServerSpec>(yaml).is_err(),
+                "accepted {yaml}"
+            );
+        }
+        assert!(
+            serde_yaml::from_str::<DnsConfig>("servers: system\nnative_cache_secs: 0").is_err()
+        );
+    }
 
     #[test]
     fn test_dns_server_spec_simple() {
@@ -390,6 +479,7 @@ servers: my-dns-group
             timeout_secs: default_timeout_secs(),
             connect_timeout_secs: default_connect_timeout_secs(),
             attempts: default_attempts(),
+            native_cache_secs: None,
         };
         assert!(!spec.as_group_ref().is_some());
         assert!(spec.as_group_ref().is_none());

@@ -55,8 +55,7 @@ impl FakeLookup {
 
 fn fixture(max_age_secs: u64) -> (CachingNativeResolver, Arc<FakeLookup>) {
     let lookup = Arc::new(FakeLookup::default());
-    let mut resolver = CachingNativeResolver::with_timeout(max_age_secs);
-    resolver.lookup = lookup.clone();
+    let resolver = CachingNativeResolver::with_lookup(lookup.clone(), max_age_secs);
     (resolver, lookup)
 }
 
@@ -458,29 +457,31 @@ async fn failures_share_errno_kind_and_message_without_negative_caching() {
 #[tokio::test(start_paused = true)]
 async fn result_age_starts_at_completion_and_hits_do_not_extend_it() {
     assert_eq!(CachingNativeResolver::DEFAULT_RESULT_TIMEOUT_SECS, 60);
-    let (resolver, lookup) = fixture(60);
-    let mut first = resolver.resolve_location(&location(80));
-    assert!(futures::poll!(&mut first).is_pending());
-    tokio::time::advance(Duration::from_secs(120)).await;
-    lookup.reply(Ok(candidates()));
-    first.await.unwrap();
-    tokio::time::advance(Duration::from_secs(59)).await;
-    assert_eq!(
-        ready_result(resolver.resolve_location(&location(443))).unwrap(),
-        native_addrs_with_port(&candidates(), 443)
-    );
-    assert_eq!(lookup.calls(), 1);
-    tokio::time::advance(Duration::from_secs(1)).await;
-    let mut refreshed = resolver.resolve_location(&location(443));
-    assert!(futures::poll!(&mut refreshed).is_pending());
-    assert!(resolver.state.lock().cache.is_empty());
-    lookup.reply(Ok(vec!["192.0.2.99:0".parse().unwrap()]));
-    assert_eq!(
-        refreshed.await.unwrap(),
-        vec!["192.0.2.99:443".parse::<SocketAddr>().unwrap()]
-    );
-    assert_eq!(lookup.calls(), 2);
-    assert_idle(&resolver, &lookup);
+    for window in [CachingNativeResolver::DEFAULT_RESULT_TIMEOUT_SECS, 7] {
+        let (resolver, lookup) = fixture(window);
+        let mut first = resolver.resolve_location(&location(80));
+        assert!(futures::poll!(&mut first).is_pending());
+        tokio::time::advance(Duration::from_secs(120)).await;
+        lookup.reply(Ok(candidates()));
+        first.await.unwrap();
+        tokio::time::advance(Duration::from_secs(window) - Duration::from_nanos(1)).await;
+        assert_eq!(
+            ready_result(resolver.resolve_location(&location(443))).unwrap(),
+            native_addrs_with_port(&candidates(), 443)
+        );
+        assert_eq!(lookup.calls(), 1);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        let mut refreshed = resolver.resolve_location(&location(443));
+        assert!(futures::poll!(&mut refreshed).is_pending());
+        assert!(resolver.state.lock().cache.is_empty());
+        lookup.reply(Ok(vec!["192.0.2.99:0".parse().unwrap()]));
+        assert_eq!(
+            refreshed.await.unwrap(),
+            vec!["192.0.2.99:443".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(lookup.calls(), 2);
+        assert_idle(&resolver, &lookup);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -495,9 +496,74 @@ async fn zero_result_age_disables_reuse_but_coalesces_misses() {
     first.await.unwrap();
     second.await.unwrap();
     assert_eq!(lookup.calls(), 1);
+    assert!(resolver.state.lock().cache.is_empty());
     complete_lookup(&resolver, &lookup, 80).await;
     assert_eq!(lookup.calls(), 2);
+    assert!(resolver.state.lock().cache.is_empty());
     assert_idle(&resolver, &lookup);
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_result_age_does_not_read_or_replace_seeded_cache_entries() {
+    let (resolver, lookup) = fixture(0);
+    let seeded: Arc<[SocketAddr]> = Arc::from(vec!["192.0.2.99:0".parse().unwrap()]);
+    resolver.state.lock().cache.put(
+        location(0).address().clone(),
+        CachedResolveResult {
+            completed_at: tokio::time::Instant::now(),
+            addrs: seeded.clone(),
+        },
+    );
+    complete_lookup(&resolver, &lookup, 80).await;
+    complete_lookup(&resolver, &lookup, 443).await;
+    assert_eq!(lookup.calls(), 2);
+    assert!(Arc::ptr_eq(
+        &resolver
+            .state
+            .lock()
+            .cache
+            .peek(location(0).address())
+            .unwrap()
+            .addrs,
+        &seeded,
+    ));
+    assert_idle(&resolver, &lookup);
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_answers_are_not_served_when_refresh_fails() {
+    let (resolver, lookup) = fixture(7);
+    complete_lookup(&resolver, &lookup, 80).await;
+    tokio::time::advance(Duration::from_secs(7)).await;
+    for failure in [
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing")),
+        Ok(vec![]),
+    ] {
+        let mut refresh = resolver.resolve_location(&location(443));
+        assert!(futures::poll!(&mut refresh).is_pending());
+        lookup.reply(failure);
+        assert!(refresh.await.is_err());
+        assert!(resolver.state.lock().cache.is_empty());
+        assert_idle(&resolver, &lookup);
+    }
+    complete_lookup(&resolver, &lookup, 443).await;
+    assert_eq!(lookup.calls(), 4);
+    assert_idle(&resolver, &lookup);
+}
+
+#[tokio::test]
+async fn zero_result_age_overflow_completion_does_not_cache() {
+    let (resolver, lookup) = fixture(0);
+    let _permits = resolver
+        .participants
+        .acquire_many(CACHING_NATIVE_RESOLVER_MAX_PARTICIPANTS as u32)
+        .await
+        .unwrap();
+    complete_lookup(&resolver, &lookup, 80).await;
+    assert_eq!(lookup.calls(), 1);
+    assert!(resolver.state.lock().cache.is_empty());
+    assert!(resolver.state.lock().inflight.is_empty());
+    assert_eq!(lookup.active.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
