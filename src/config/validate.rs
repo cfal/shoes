@@ -1434,6 +1434,7 @@ fn validate_client_proxy_config(
     default_sni: Option<&str>,
 ) -> std::io::Result<()> {
     match client_proxy_config {
+        ClientProxyConfig::Shadowsocks { config, .. } => config.validate_key_len()?,
         ClientProxyConfig::Vmess {
             user_id, cipher, ..
         } => {
@@ -1689,7 +1690,7 @@ fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
             if let ShadowsocksConfig::Legacy { password, .. } = config {
                 validate_nonempty_secret(password, "Shadowsocks")?;
             }
-            config.validate_key_len()?;
+            config.validate_server_key()?;
         }
         ServerProxyConfig::Anytls { users, .. } => {
             for user in users.iter() {
@@ -2539,10 +2540,49 @@ mod tests {
             config: ShadowsocksConfig::Aead2022 {
                 cipher: "aes-128-gcm".try_into().unwrap(),
                 key_bytes: vec![0; 1].into_boxed_slice(),
+                identity_keys: Vec::new(),
             },
             udp_enabled: true,
         };
         assert!(validate_server_auth(&protocol).is_err());
+    }
+
+    #[test]
+    fn shadowsocks_identity_keys_validate_programmatic_clients_and_reject_servers() {
+        for cipher in ["aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"] {
+            let cipher: crate::shadowsocks::ShadowsocksCipher = cipher.try_into().unwrap();
+            let required = cipher.key_len();
+            for (user_len, identity_len) in [
+                (required, 0),
+                (required, required),
+                (required, required + 1),
+                (0, required),
+                (required + 1, required),
+            ] {
+                let config = ShadowsocksConfig::Aead2022 {
+                    key_bytes: vec![0x33; user_len].into_boxed_slice(),
+                    identity_keys: vec![vec![0x11; identity_len].into_boxed_slice()],
+                    cipher,
+                };
+                let mut client = ClientProxyConfig::Shadowsocks {
+                    config: config.clone(),
+                    udp_enabled: true,
+                };
+                assert_eq!(
+                    validate_client_proxy_config(&mut client, &HashMap::new(), None).is_ok(),
+                    user_len == required
+                        && identity_len == required
+                        && matches!(cipher.name(), "aes-128-gcm" | "aes-256-gcm")
+                );
+                assert!(
+                    validate_server_auth(&ServerProxyConfig::Shadowsocks {
+                        config,
+                        udp_enabled: true,
+                    })
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]

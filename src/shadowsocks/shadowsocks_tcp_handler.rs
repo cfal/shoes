@@ -110,12 +110,16 @@ impl ShadowsocksTcpHandler {
     pub fn new_aead2022_client(
         cipher: ShadowsocksCipher,
         key_bytes: &[u8],
+        identity_keys: Vec<Box<[u8]>>,
         udp_enabled: bool,
     ) -> Self {
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
-            key_bytes.to_vec().into_boxed_slice(),
-            cipher.algorithm().key_len(),
-        )));
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(
+            Blake3Key::new(
+                key_bytes.to_vec().into_boxed_slice(),
+                cipher.algorithm().key_len(),
+            )
+            .with_identity_keys(identity_keys),
+        ));
         Self {
             cipher,
             key,
