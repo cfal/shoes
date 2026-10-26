@@ -3,8 +3,8 @@ mod bootstrap;
 mod http;
 mod install;
 
-use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use crate::config::{Config, GlobalLimits, ValidatedConfigs};
@@ -39,7 +39,6 @@ pub(crate) use bootstrap::prepare as bootstrap;
 pub(crate) use install::{cache_file, cache_lease, create_cache_directory};
 
 struct Staged {
-    source: RuleSource,
     install: Install,
     digest: blake3::Hash,
 }
@@ -70,19 +69,16 @@ async fn stage(
             .map_err(|_| invalid("download failed Shoes rule validation"))
     })
     .await?;
-    Ok(Staged {
-        source: source.clone(),
-        install,
-        digest,
-    })
+    Ok(Staged { install, digest })
 }
 
-async fn validate_staged(configs: Vec<Config>, staged: &[Staged]) -> io::Result<ValidatedConfigs> {
-    let inputs = staged
-        .iter()
-        .map(|item| Ok((item.source.path.clone(), item.install.file.try_clone()?)))
-        .collect::<io::Result<HashMap<_, _>>>()?;
-    let validated = crate::config::compile_configs_with_inputs(configs, inputs)
+async fn validate_staged(
+    configs: Vec<Config>,
+    path: &Path,
+    staged: &Staged,
+) -> io::Result<ValidatedConfigs> {
+    let input = (path.to_owned(), staged.install.file.try_clone()?);
+    let validated = crate::config::compile_configs_with_input(configs, Some(input))
         .await
         .map_err(|error| {
             invalid(format!(
@@ -121,7 +117,7 @@ async fn refresh_source(
     if unchanged {
         return Ok(false);
     }
-    validate_staged(configs.to_vec(), std::slice::from_ref(&staged)).await?;
+    validate_staged(configs.to_vec(), &source.path, &staged).await?;
     Ok(staged.install.finish_async(staged.digest).await?.changed())
 }
 

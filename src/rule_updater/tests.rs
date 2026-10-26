@@ -366,7 +366,7 @@ async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str>
         &mut http::DownloadState::default(),
     )
     .await?;
-    validate_staged(configs(source), std::slice::from_ref(&staged)).await?;
+    validate_staged(configs(source), &source.path, &staged).await?;
     Ok(
         if staged.install.finish_async(staged.digest).await?.changed() {
             "updated"
@@ -1419,6 +1419,67 @@ async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
         }
         assert_preserved(&path, &original);
     }
+}
+
+#[tokio::test]
+async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
+    let dir = directory();
+    let mut first = source(
+        "https://example.com/first.json",
+        &dir.path().join("first.txt"),
+    );
+    first.format = None;
+    let second = source(
+        "https://example.com/second.json",
+        &dir.path().join("second.json"),
+    );
+    write_rule(&first.path, b"invalid old cache");
+    write_rule(&second.path, OLD);
+    let mut install = Install::open(&first.path).unwrap();
+    install.file.write_all(VALID).unwrap();
+    let staged = Staged {
+        install,
+        digest: blake3::hash(VALID),
+    };
+    let config: Vec<Config> = serde_json::from_value(serde_json::json!([
+        {"rule_cache_dir": dir.path()},
+        {"rule_source_group": "shared", "rules": [first]},
+        {"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "rules": [
+            {"masks": first, "action": "block"},
+            {"masks": {"rule_source_group": "shared"}, "action": "block"},
+            {"masks": second, "action": "block"}
+        ]}
+    ]))
+    .unwrap();
+    let validated = validate_staged(config.clone(), &first.path, &staged)
+        .await
+        .unwrap();
+    let Config::Server(server) = &validated.configs[0] else {
+        panic!("expected server");
+    };
+    let predicates: Vec<_> = server
+        .rules
+        .iter()
+        .map(|rule| {
+            let crate::config::ConfigSelection::Config(rule) = rule else {
+                panic!("unexpanded rule");
+            };
+            rule.criteria.compiled.as_ref().unwrap()
+        })
+        .collect();
+    assert!(Arc::ptr_eq(predicates[0], predicates[1]));
+    assert!(!Arc::ptr_eq(predicates[0], predicates[2]));
+    assert_eq!(std::fs::read(&first.path).unwrap(), b"invalid old cache");
+
+    std::fs::remove_file(&second.path).unwrap();
+    let error = validate_staged(config, &first.path, &staged)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("remote cache unavailable"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

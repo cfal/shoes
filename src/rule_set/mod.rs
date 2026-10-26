@@ -561,7 +561,9 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             "rule source path must be absolute for string configs; file configs anchor paths to their declaring file",
         ));
     }
-    if let Some(file) = compiler.input_files.get(&source.path) {
+    if let Some((path, file)) = &compiler.input_file
+        && path == &source.path
+    {
         return read_staged(source, file.try_clone()?, source.path.clone(), compiler);
     }
     #[cfg(unix)]

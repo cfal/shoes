@@ -115,14 +115,14 @@ pub(crate) async fn load_config_files(args: &[String]) -> std::io::Result<Vec<Co
 }
 
 pub async fn compile_configs(configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
-    compile_configs_with_inputs(configs, std::collections::HashMap::new()).await
+    compile_configs_with_input(configs, None).await
 }
 
-pub(crate) async fn compile_configs_with_inputs(
+pub(crate) async fn compile_configs_with_input(
     configs: Vec<Config>,
-    inputs: std::collections::HashMap<std::path::PathBuf, std::fs::File>,
+    input: Option<(std::path::PathBuf, std::fs::File)>,
 ) -> std::io::Result<ValidatedConfigs> {
-    blocking_compile(move || validate::create_server_configs_with_inputs(configs, inputs)).await
+    blocking_compile(move || validate::create_server_configs_with_input(configs, input)).await
 }
 
 pub(crate) async fn blocking_compile<T: Send + 'static>(
