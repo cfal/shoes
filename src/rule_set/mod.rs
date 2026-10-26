@@ -324,39 +324,45 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
     let mut reserved = extra.to_vec();
     let mut state_dirs = Vec::new();
     let mut reserve_state = |path: &Path| {
+        if path.file_name().is_none() {
+            return Err(invalid(
+                "reserved socket, PEM, or state path must name a file",
+            ));
+        }
         reserved.push(path.into());
         reserved.push(crate::control::store::lock_path(path));
+        Ok(())
     };
     for config in configs.iter() {
         let dns = match config {
             Config::Server(server) => {
                 if let crate::config::BindLocation::Path(path) = &server.bind_location {
-                    reserve_state(path);
+                    reserve_state(path)?;
                 }
                 server.dns.as_ref().and_then(|dns| dns.fake_ip.as_ref())
             }
             Config::TunServer(tun) => tun.dns.as_ref().and_then(|dns| dns.fake_ip.as_ref()),
             Config::DnsConfigGroup(group) => group.fake_ip.as_ref(),
             Config::CacheFile(config) => {
-                reserve_state(&config.cache_file_path);
+                reserve_state(&config.cache_file_path)?;
                 None
             }
             Config::ClashApi(config) => {
                 if let crate::config::BindLocation::Path(path) = &config.bind {
-                    reserve_state(path);
+                    reserve_state(path)?;
                 }
                 None
             }
             Config::CertificateSource(source) => {
                 match &source.source {
                     crate::certificates::SourceConfig::Files { cert, key } => {
-                        reserve_state(cert);
-                        reserve_state(key);
+                        reserve_state(cert)?;
+                        reserve_state(key)?;
                     }
                     crate::certificates::SourceConfig::Acme(acme) => {
                         state_dirs.push(identity(&acme.state_dir)?);
                         if let Some(path) = &acme.ca_cert {
-                            reserve_state(path);
+                            reserve_state(path)?;
                         }
                     }
                 }
@@ -368,7 +374,7 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
             .and_then(|policy| policy.options())
             .and_then(|options| options.state_file)
         {
-            reserve_state(&path);
+            reserve_state(&path)?;
         }
     }
     for path in reserved {

@@ -188,6 +188,57 @@ async fn config_edits_during_cold_download_are_not_suppressed() {
 }
 
 #[tokio::test]
+async fn malformed_reserved_paths_reject_reload_without_terminating_servers() {
+    let dir = directory();
+    let path = dir.path().join("config.yaml");
+    let cache = dir.path().join("cache.json");
+    std::fs::write(&cache, MISS).unwrap();
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::File::open(&cache)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(1)),
+        )
+        .unwrap();
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    config(
+        &path,
+        address,
+        echo.local_addr(),
+        "http://127.0.0.1:1/rules.json",
+    );
+    let mut good: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    good[0]["rules"][0]["update_interval"] = serde_json::json!("7d");
+    std::fs::write(&path, good.to_string()).unwrap();
+    let mut child = Process::start(&path, &["--no-reload"]);
+    child.wait_for("Servers ready").await;
+    for invalid in [
+        serde_json::json!({"dns_group": "fake", "dns_servers": "system", "fake_ip": {"state_file": ""}}),
+        serde_json::json!({"path": "/", "protocol": {"type": "socks"}}),
+        serde_json::json!({"cache_file_path": ".."}),
+    ] {
+        let mut candidate = good.clone();
+        candidate.as_array_mut().unwrap().push(invalid);
+        std::fs::write(&path, candidate.to_string()).unwrap();
+        child.signal(libc::SIGHUP);
+        child
+            .wait_for("Reload rejected; current servers retained")
+            .await;
+        roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    }
+    std::fs::write(&path, good.to_string()).unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+}
+
+#[tokio::test]
 async fn cold_fetch_periodic_reload_noop_last_good_and_offline_restart() {
     let dir = directory();
     let path = dir.path().join("config.yaml");
