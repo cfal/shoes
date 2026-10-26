@@ -90,7 +90,209 @@ const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
 
 #[cfg(test)]
 mod tests {
+    use super::super::blake3_key::Blake3Key;
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn client_identity_headers_survive_backpressure_and_preserve_responses() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for algorithm in [&aws_lc_rs::aead::AES_128_GCM, &aws_lc_rs::aead::AES_256_GCM] {
+                for count in [0, 1, 2] {
+                    for capacity in [7, 1024] {
+                        let len = algorithm.key_len();
+                        let user_key = vec![0x33; len].into_boxed_slice();
+                        let client_key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(
+                            Blake3Key::new(user_key.clone(), len).with_identity_keys(
+                                (0..count)
+                                    .map(|i| vec![i + 1; len].into_boxed_slice())
+                                    .collect(),
+                            ),
+                        ));
+                        let (client_io, mut peer_io) = tokio::io::duplex(capacity);
+                        let mut client = ShadowsocksStream::new(
+                            Box::new(client_io),
+                            ShadowsocksStreamType::AEAD2022Client,
+                            algorithm,
+                            len,
+                            client_key.clone(),
+                            None,
+                        );
+                        let payload = vec![0x5a; 80_000];
+                        let send = async {
+                            client.write_all(b"request").await.unwrap();
+                            client.write_all(&payload).await.unwrap();
+                            client.flush().await.unwrap();
+                            client.shutdown().await.unwrap();
+                            let mut response = Vec::new();
+                            client.read_to_end(&mut response).await.unwrap();
+                            assert_eq!(response, b"response");
+                        };
+                        let receive = async {
+                            let mut salt = vec![0; len];
+                            peer_io.read_exact(&mut salt).await.unwrap();
+                            let mut headers = vec![0; usize::from(count) * 16];
+                            peer_io.read_exact(&mut headers).await.unwrap();
+                            assert_eq!(headers, client_key.create_identity_headers(&salt).unwrap());
+                            let transport = crate::prepend_stream::PrependStream::new(
+                                peer_io,
+                                Some(salt.into_boxed_slice()),
+                            );
+                            let mut server = ShadowsocksStream::new(
+                                Box::new(transport),
+                                ShadowsocksStreamType::AEAD2022Server,
+                                algorithm,
+                                len,
+                                Arc::new(Box::new(Blake3Key::new(user_key, len))),
+                                None,
+                            );
+                            let mut request = Vec::new();
+                            server.read_to_end(&mut request).await.unwrap();
+                            assert_eq!(&request[..7], b"request");
+                            assert_eq!(&request[7..], payload);
+                            server.write_all(b"response").await.unwrap();
+                            server.flush().await.unwrap();
+                            server.shutdown().await.unwrap();
+                        };
+                        tokio::join!(send, receive);
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn client_identity_responses_require_user_key_and_matching_request_salt() {
+        for algorithm in [&aws_lc_rs::aead::AES_128_GCM, &aws_lc_rs::aead::AES_256_GCM] {
+            for (response_key, matching_salt) in
+                [(0x33, true), (0x11, true), (0x22, true), (0x33, false)]
+            {
+                let len = algorithm.key_len();
+                let (transport, _peer) = tokio::io::duplex(1);
+                let mut client = ShadowsocksStream::new(
+                    Box::new(transport),
+                    ShadowsocksStreamType::AEAD2022Client,
+                    algorithm,
+                    len,
+                    Arc::new(Box::new(
+                        Blake3Key::new(vec![0x33; len].into_boxed_slice(), len).with_identity_keys(
+                            vec![
+                                vec![0x11; len].into_boxed_slice(),
+                                vec![0x22; len].into_boxed_slice(),
+                            ],
+                        ),
+                    )),
+                    None,
+                );
+                let (transport, _peer) = tokio::io::duplex(1);
+                let mut server = ShadowsocksStream::new(
+                    Box::new(transport),
+                    ShadowsocksStreamType::AEAD2022Server,
+                    algorithm,
+                    len,
+                    Arc::new(Box::new(Blake3Key::new(
+                        vec![response_key; len].into_boxed_slice(),
+                        len,
+                    ))),
+                    None,
+                );
+                server.is_initial_read = false;
+                let mut request_salt = client.encrypt_iv.clone();
+                if !matching_salt {
+                    request_salt[0] ^= 1;
+                }
+                server.decrypt_iv = Some(request_salt);
+                server.process_write_header(b"response").unwrap();
+                let wire = &server.write_cache[..server.write_cache_end_offset];
+                client.unprocessed_buf[..wire.len()].copy_from_slice(wire);
+                client.unprocessed_end_offset = wire.len();
+
+                if response_key != 0x33 || !matching_salt {
+                    let error = client.process_read_header().unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                    if !matching_salt {
+                        assert_eq!(
+                            error.to_string(),
+                            "server returned request salt does not match"
+                        );
+                    }
+                } else {
+                    client.process_read_header().unwrap();
+                    assert!(matches!(
+                        client.try_decrypt().unwrap(),
+                        DecryptState::Success
+                    ));
+                    assert_eq!(
+                        &client.processed_buf[..client.processed_end_offset],
+                        b"response"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn client_identity_initial_write_limits_leave_rejected_requests_unqueued() {
+        for algorithm in [&aws_lc_rs::aead::AES_128_GCM, &aws_lc_rs::aead::AES_256_GCM] {
+            for count in [0, 1, 2, 64] {
+                let len = algorithm.key_len();
+                let user_key = vec![0x33; len].into_boxed_slice();
+                let client_key = Blake3Key::new(user_key.clone(), len).with_identity_keys(
+                    (0..count)
+                        .map(|i| vec![i as u8; len].into_boxed_slice())
+                        .collect(),
+                );
+                let (transport, _peer) = tokio::io::duplex(1);
+                let mut client = ShadowsocksStream::new(
+                    Box::new(transport),
+                    ShadowsocksStreamType::AEAD2022Client,
+                    algorithm,
+                    len,
+                    Arc::new(Box::new(client_key)),
+                    None,
+                );
+                let max_initial = client.write_cache.len() - len - 11 - 2 * TAG_LEN;
+                let oversized = vec![0x5a; max_initial + 1];
+                assert_eq!(
+                    client.process_write_header(&oversized).unwrap_err().kind(),
+                    std::io::ErrorKind::InvalidInput
+                );
+                assert_eq!(
+                    client.write_cache_end_offset, 0,
+                    "{len}-byte key, {count} identities"
+                );
+                assert_eq!(client.write_cache_start_offset, 0);
+
+                let payload = &oversized[..max_initial];
+                assert_eq!(client.process_write_header(payload).unwrap(), payload.len());
+                assert_eq!(client.write_cache_end_offset, client.write_cache.len());
+                let (transport, _peer) = tokio::io::duplex(1);
+                let mut server = ShadowsocksStream::new(
+                    Box::new(transport),
+                    ShadowsocksStreamType::AEAD2022Server,
+                    algorithm,
+                    len,
+                    Arc::new(Box::new(Blake3Key::new(user_key, len))),
+                    None,
+                );
+                server.unprocessed_buf[..len].copy_from_slice(&client.write_cache[..len]);
+                let chunks = &client.write_cache[len + count * 16..client.write_cache_end_offset];
+                server.unprocessed_buf[len..len + chunks.len()].copy_from_slice(chunks);
+                server.unprocessed_end_offset = len + chunks.len();
+                server.process_read_header().unwrap();
+                assert!(matches!(
+                    server.try_decrypt().unwrap(),
+                    DecryptState::Success
+                ));
+                assert_eq!(
+                    &server.processed_buf[..server.processed_end_offset],
+                    payload
+                );
+            }
+        }
+    }
 
     #[test]
     fn timestamp_window_is_symmetric_and_inclusive() {
@@ -659,28 +861,40 @@ impl ShadowsocksStream {
                 Ok(handled_len)
             }
             ShadowsocksStreamType::AEAD2022Client => {
+                let mut request_header = [0; 1 + 8 + 2];
+                let buf_len = buf.len();
+                let base_cache_len = self.stream_type.max_payload_len() + METADATA_SIZE;
+                // The complete address/padding header must fit before any handshake bytes are queued.
+                if buf_len
+                    > base_cache_len - self.salt_len - (request_header.len() + TAG_LEN) - TAG_LEN
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Shadowsocks initial request is too large",
+                    ));
+                }
+                let headers = self.key.create_identity_headers(&self.encrypt_iv)?;
+                let cache_len = base_cache_len.checked_add(headers.len()).ok_or_else(|| {
+                    std::io::Error::other("Shadowsocks identity headers are too large")
+                })?;
+                if cache_len != self.write_cache.len() {
+                    let mut cache = std::mem::take(&mut self.write_cache).into_vec();
+                    cache
+                        .try_reserve_exact(cache_len - cache.len())
+                        .map_err(std::io::Error::other)?;
+                    cache.resize(cache_len, 0);
+                    self.write_cache = cache.into_boxed_slice();
+                }
                 self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
-                self.write_cache_end_offset = self.salt_len;
-
-                let mut request_header = allocate_vec(1 + 8 + 2);
+                // EIH precedes the ordinary user-key AEAD chunks and consumes no AEAD nonce.
+                self.write_cache[self.salt_len..self.salt_len + headers.len()]
+                    .copy_from_slice(&headers);
+                self.write_cache_end_offset = self.salt_len + headers.len();
 
                 // HeaderTypeClientStream = 0
                 request_header[0] = 0;
                 request_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
-
-                // This is a bit hacky. We expect/know that the first packet will be the "variable-length header"
-                // with the address and padding, and we need to send it all off in a single packet.
-                let buf_len = buf.len();
-                assert!(
-                    buf_len
-                        <= self.write_cache.len()
-                            - self.salt_len
-                            - (request_header.len() + TAG_LEN)
-                            - TAG_LEN
-                );
-
-                request_header[9] = (buf_len >> 8) as u8;
-                request_header[10] = (buf_len & 0xff) as u8;
+                request_header[9..11].copy_from_slice(&(buf_len as u16).to_be_bytes());
 
                 self.encrypt_single(&request_header, false)
                     .map_err(|_| std::io::Error::other("failed to encrypt response header"))?;

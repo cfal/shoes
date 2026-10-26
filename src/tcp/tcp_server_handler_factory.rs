@@ -194,15 +194,15 @@ fn create_handler(
                     resolver.clone(),
                 ))
             }
-            ShadowsocksConfig::Aead2022 { cipher, key_bytes } => {
-                Box::new(ShadowsocksTcpHandler::new_aead2022_server(
-                    cipher,
-                    &key_bytes,
-                    udp_enabled,
-                    client_proxy_selector.clone(),
-                    resolver.clone(),
-                ))
-            }
+            ShadowsocksConfig::Aead2022 {
+                cipher, key_bytes, ..
+            } => Box::new(ShadowsocksTcpHandler::new_aead2022_server(
+                cipher,
+                &key_bytes,
+                udp_enabled,
+                client_proxy_selector.clone(),
+                resolver.clone(),
+            )),
         },
         ServerProxyConfig::Snell {
             cipher,

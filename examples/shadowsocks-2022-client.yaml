@@ -1,0 +1,14 @@
+# Replace both sample keys and the upstream address before use.
+# AES-128 uses two independently base64-encoded 16-byte keys: server:user.
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - mask: 0.0.0.0/0
+      action: allow
+      client_chain:
+        - address: ss.example.com:8388
+          protocol:
+            type: shadowsocks
+            cipher: 2022-blake3-aes-128-gcm
+            password: "EREREREREREREREREREREQ==:MzMzMzMzMzMzMzMzMzMzMw=="

@@ -42,7 +42,7 @@ the reported test count when renaming modules or changing CI filters.
 | `retention_allocation` | None | Isolated requested-heap retention across failed compilation, generation replacement, retained owners, and final destruction. |
 | `matcher_invariants` | None | Fixed-seed port-range membership against a linear oracle, including Boolean composition and boundary cases. |
 | `rule_properties` | None | Bounded deterministic rule parser mutations and cross-format properties; no peers or network. |
-| `optional_peer` | `optional-peer-tests` | sing-box, Mihomo, Xray, and Naive Caddy as required by each case. Includes carrier sharing and idle reuse. |
+| `optional_peer` | `optional-peer-tests` | sing-box, Mihomo, Xray, shadowsocks-rust, and Naive Caddy as required by each case. Includes carrier sharing and idle reuse. |
 | `xhttp_interop` | `integration-tests` | Local-only filters or pinned Xray and Mihomo; see [XHTTP.md](XHTTP.md). |
 | `reality_interop` | `optional-peer-tests` | Pinned Xray and local TLS camouflage endpoints. |
 | `vless_encryption_interop` | `optional-peer-tests` | Pinned Xray, Mihomo, and sing-box; see the [fixture guide](fixtures/vless_encryption/README.md). |
@@ -62,14 +62,32 @@ SHOES_TEST_SING_BOX_BIN=/absolute/path/to/sing-box \
 
 # Includes same-name device replacement and active-flow teardown.
 cargo test --locked --features privileged-tests --test privileged tun_kernel:: -- --test-threads=1
+
+# SS2022 client identity headers: Xray, shadowsocks-rust, and sing-box UoT.
+SHOES_TEST_XRAY_BIN=/absolute/path/to/xray \
+SHOES_TEST_SSSERVER_BIN=/absolute/path/to/ssserver \
+SHOES_TEST_SING_BOX_BIN=/absolute/path/to/sing-box \
+  cargo test --locked --features optional-peer-tests --test optional_peer \
+    shadowsocks_identity:: -- --test-threads=1
 ```
 
 Use absolute peer paths to avoid accidentally testing a different installed
 version. Most fixtures accept `SHOES_TEST_SING_BOX_BIN`, `SHOES_TEST_MIHOMO_BIN`,
-`SHOES_TEST_XRAY_BIN`, or `SHOES_TEST_NAIVE_CADDY_BIN`. The dedicated VLESS/REALITY
-fixtures additionally use `XRAY_BINARY` and `MIHOMO_BINARY`; their fixture guide
-and workflow specify the exact pins. Requested but unavailable peers should
-fail, not silently skip.
+`SHOES_TEST_XRAY_BIN`, `SHOES_TEST_SSSERVER_BIN`, or `SHOES_TEST_NAIVE_CADDY_BIN`.
+The dedicated VLESS/REALITY fixtures additionally use `XRAY_BINARY` and
+`MIHOMO_BINARY`; their fixture guide and workflow specify the exact pins.
+Requested but unavailable peers should fail, not silently skip.
+
+The SS2022 identity tests use Xray 26.10.21, shadowsocks-rust `ssserver` 1.25.0,
+and sing-box 1.14.1 with multi-user Shadowsocks and SagerNet UoT. They cover
+both AES key sizes, concurrent users, ordered relays, wrong/missing/reordered
+identity rejection, large bidirectional transfers, half-close, server-first data,
+and TCP/UoT behind an HTTP proxy hop. CI installs all three peers for this suite;
+`ssserver` uses `SHOES_TEST_SSSERVER_BIN` locally.
+Xray and shadowsocks-rust must return the complete payload after client upload
+EOF. sing-box uses reply-first exchanges: the pinned build truncates replies
+after early upload EOF even with a single-key SS2022 configuration. All three
+peers must deliver server-first data and clean EOF after the acknowledged exchange.
 
 ## Measuring Coverage
 
