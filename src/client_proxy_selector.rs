@@ -14,6 +14,8 @@ use std::sync::Arc;
 use crate::address::NetLocationMask;
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::client_proxy_chain::ClientChainGroup;
+use crate::control::connection_notes::{ConnectionNotes, Phase};
+use crate::control::flows::FlowRegistry;
 use crate::dns::fake_ip::FakeDnsContext;
 use crate::resolver::{Resolver, resolve_location};
 #[cfg(test)]
@@ -229,6 +231,7 @@ pub struct ClientProxySelector {
     has_hostname_rules: bool,
     sniff_enabled: bool,
     tracks_flows: bool,
+    notes_registry: Option<Arc<FlowRegistry>>,
     fake_dns: Option<Arc<FakeDnsContext>>,
 }
 
@@ -319,6 +322,16 @@ impl ClientProxySelector {
             ConnectAction::Allow { chain_group, .. } => chain_group.tracks_flows(),
             ConnectAction::Block => false,
         });
+        let notes_registry = rules.iter().find_map(|rule| match &rule.action {
+            ConnectAction::Allow { chain_group, .. } => {
+                let (_, context) = chain_group.tracking()?;
+                context
+                    .registry
+                    .notes_enabled()
+                    .then(|| context.registry.clone())
+            }
+            ConnectAction::Block => None,
+        });
         let has_hostname_rules = rules
             .iter()
             .any(|rule| rule.predicate.dependencies.hostname);
@@ -329,6 +342,7 @@ impl ClientProxySelector {
             has_hostname_rules,
             sniff_enabled: false,
             tracks_flows,
+            notes_registry,
             fake_dns: None,
         }
     }
@@ -340,6 +354,10 @@ impl ClientProxySelector {
 
     pub(crate) fn tracks_flows(&self) -> bool {
         self.tracks_flows
+    }
+
+    pub(crate) fn start_notes(&self) -> Option<Arc<ConnectionNotes>> {
+        self.notes_registry.as_ref()?.start_notes()
     }
 
     pub(crate) fn inherit_inbound_policy(mut self, parent: &Self) -> std::io::Result<Self> {
@@ -461,6 +479,51 @@ impl ClientProxySelector {
             wire_destination: target.wire_destination,
             decision,
         })
+    }
+
+    pub(crate) async fn judge_prepared_with_notes<'a>(
+        &'a self,
+        target: PreparedDestination,
+        hostname: Option<&str>,
+        resolver: &Arc<dyn Resolver>,
+        notes: Option<&ConnectionNotes>,
+    ) -> std::io::Result<RoutedDestination<'a>> {
+        if let Some(notes) = notes {
+            notes.event(
+                Phase::Routing,
+                format_args!(
+                    "target {}; fake-ip {}",
+                    target.connection_target.location(),
+                    target.is_fake_dns()
+                ),
+            );
+            if let Some(hostname) = hostname {
+                notes.event(Phase::Routing, format_args!("sniff hint {hostname}"));
+            }
+        }
+        let routed = self.judge_prepared(target, hostname, resolver).await?;
+        if let Some(notes) = notes
+            && let ConnectDecision::Allow {
+                chain_group,
+                remote_location,
+            } = &routed.decision
+        {
+            if let Some((description, _)) = chain_group.tracking() {
+                notes.event(
+                    Phase::Routing,
+                    format_args!("selected rule: {}", description.payload),
+                );
+            }
+            notes.event(
+                Phase::Routing,
+                format_args!(
+                    "effective target {}; pinned {:?}",
+                    remote_location.location(),
+                    remote_location.resolved_addr()
+                ),
+            );
+        }
+        Ok(routed)
     }
 
     /// Judge a connection request, using the cache for faster repeated lookups.
@@ -1253,6 +1316,61 @@ mod tests {
             selector.judge(private, &resolver).await.unwrap(),
             ConnectDecision::Block
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_cache_refresh_changes_new_flow_routing_without_retargeting_pinned_flow() {
+        #[derive(Debug)]
+        struct ChangingLookup(parking_lot::Mutex<SocketAddr>);
+        impl Resolver for ChangingLookup {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                let address = *self.0.lock();
+                Box::pin(async move { Ok(vec![address]) })
+            }
+        }
+
+        let first = "192.0.2.1:443".parse().unwrap();
+        let lookup = Arc::new(ChangingLookup(parking_lot::Mutex::new(first)));
+        let resolver: Arc<dyn Resolver> = Arc::new(
+            crate::resolver::CachingNativeResolver::with_lookup(lookup.clone(), 60),
+        );
+        let selector = selector_with_cache(vec![
+            block_rule(vec!["127.0.0.0/8"]),
+            allow_rule(vec!["0.0.0.0/0"], "direct"),
+        ]);
+        let hostname = NetLocation::from_str("changing.test:443", None).unwrap();
+        let ConnectDecision::Allow {
+            mut remote_location,
+            ..
+        } = selector
+            .judge(hostname.clone().into(), &resolver)
+            .await
+            .unwrap()
+        else {
+            panic!("initial address should be allowed");
+        };
+        assert_eq!(remote_location.resolved_addr(), Some(first));
+        *lookup.0.lock() = "127.0.0.1:443".parse().unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        assert!(matches!(
+            selector
+                .judge(hostname.clone().into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(matches!(
+            selector.judge(hostname.into(), &resolver).await.unwrap(),
+            ConnectDecision::Block
+        ));
+        assert_eq!(
+            resolve_location(&mut remote_location, &resolver)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(selector.cache_size(), 0);
     }
 
     #[tokio::test]

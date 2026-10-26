@@ -387,6 +387,119 @@ mod tests {
     use crate::control::runtime::ControlService;
     use futures::FutureExt;
 
+    #[tokio::test]
+    async fn connection_notes_reach_http_and_websocket_snapshots() {
+        use crate::control::connection_notes::Phase;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for enabled in [false, true] {
+                let config = crate::config::ControlConfig {
+                    listeners: vec![
+                        serde_yaml::from_str(&format!(
+                            "clash_api_address: '127.0.0.1:0'\nsecret: test\nconnection_notes: {enabled}"
+                        ))
+                        .unwrap(),
+                    ],
+                    ..Default::default()
+                };
+                let mut service = ControlService::new(config).unwrap();
+                let (sender, samples) = watch::channel(Sample::initial());
+                let state = Arc::new(ApiState {
+                    runtime: service.runtime.clone(),
+                    samples,
+                    tasks: Default::default(),
+                    cancel: CancellationToken::new(),
+                    snapshots: Arc::new(tokio::sync::Semaphore::new(2)),
+                });
+                let context = FlowContext {
+                    registry: service.runtime.flows.clone(),
+                    generation: 1,
+                    inbound: "test".into(),
+                    scope: "root".into(),
+                    protocol: "Socks5".into(),
+                };
+                let notes = context.registry.start_notes();
+                if let Some(notes) = &notes {
+                    notes.event(Phase::Routing, format_args!("fixture route"));
+                }
+                let guard = context.register(
+                    "tcp",
+                    &crate::address::NetLocation::from_str("fixture.test:443", None)
+                        .unwrap()
+                        .into(),
+                    vec!["DIRECT".into()],
+                    "all",
+                    FlowInfo {
+                        notes,
+                        ..Default::default()
+                    },
+                );
+                let http: serde_json::Value =
+                    serde_json::from_slice(&connections(&state).await.unwrap()).unwrap();
+                assert_eq!(http["connections"][0].get("notes").is_some(), enabled);
+                if enabled {
+                    assert_eq!(http["connections"][0]["notes"][0]["text"], "fixture route");
+                }
+
+                let (client, server) = tokio::io::duplex(65536);
+                let server = hyper_tungstenite::WebSocketStream::from_raw_socket(
+                    server,
+                    hyper_tungstenite::tungstenite::protocol::Role::Server,
+                    None,
+                )
+                .await;
+                let mut client = hyper_tungstenite::WebSocketStream::from_raw_socket(
+                    client,
+                    hyper_tungstenite::tungstenite::protocol::Role::Client,
+                    None,
+                )
+                .await;
+                let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(serve_websocket(
+                    state.clone(),
+                    server,
+                    Subscription::parse("connections", &HashMap::new()).unwrap(),
+                    service.runtime.subscribers.clone().try_acquire_owned().unwrap(),
+                    Arc::new(service.runtime.connections.clone().try_acquire_owned().unwrap()),
+                )));
+                let first = client.next().await.unwrap().unwrap().into_data();
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&first).unwrap(), http);
+
+                if let Some(notes) = &guard.entry.notes {
+                    notes.event(Phase::Setup, format_args!("outbound ready"));
+                }
+                let sample = SerializedConnections::new(context.registry.snapshot(0));
+                let updated = sample.bytes.as_ref().unwrap().clone();
+                sender.send_replace(Sample {
+                    sequence: sample.sequence,
+                    connections: sample.bytes,
+                    ..Sample::initial()
+                });
+                assert_eq!(
+                    client.next().await.unwrap().unwrap().into_data().as_ref(),
+                    updated.as_ref()
+                );
+                if enabled {
+                    let updated: serde_json::Value = serde_json::from_slice(&updated).unwrap();
+                    assert_eq!(updated["connections"][0]["notes"][1]["phase"], "setup");
+                }
+                drop(guard);
+                let sample = SerializedConnections::new(context.registry.snapshot(0));
+                sender.send_replace(Sample {
+                    sequence: sample.sequence,
+                    connections: sample.bytes,
+                    ..Sample::initial()
+                });
+                let closed = client.next().await.unwrap().unwrap().into_data();
+                let closed: serde_json::Value = serde_json::from_slice(&closed).unwrap();
+                assert_eq!(closed["connections"], json!([]));
+                state.cancel.cancel();
+                task.await.unwrap();
+                service.shutdown().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn websocket_write_deadline_releases_subscription_and_connection() {
         let service = ControlService::new(Default::default()).unwrap();

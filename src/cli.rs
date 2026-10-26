@@ -1,6 +1,8 @@
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::engine::{Engine as _, general_purpose::STANDARD};
 use log::debug;
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::runtime::Builder;
 
 use crate::reality::generate_keypair;
@@ -16,7 +18,9 @@ fn print_usage_and_exit(arg0: String) -> ! {
     eprintln!(
         "    -l, --log-file PATH  Log to file (repeatable; \"-\" means stderr; default: stderr)"
     );
-    eprintln!("    -d, --dry-run        Parse the config and exit");
+    eprintln!(
+        "    -d, --dry-run        Validate config and certificates without starting listeners"
+    );
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
     eprintln!(
         "    global_limits.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
@@ -54,6 +58,23 @@ fn print_usage_and_exit(arg0: String) -> ! {
 }
 
 pub fn main() {
+    std::process::exit(run());
+}
+
+struct FileLogShutdownGuard {
+    writers: Vec<Arc<logging::FileLogWriter>>,
+}
+
+impl Drop for FileLogShutdownGuard {
+    fn drop(&mut self) {
+        let deadline = Instant::now() + logging::FILE_LOG_FLUSH_TIMEOUT;
+        for writer in &self.writers {
+            let _ = writer.shutdown_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+}
+
+fn run() -> i32 {
     let mut args: Vec<String> = std::env::args().collect();
     let arg0 = args.remove(0);
     if args.first().is_some_and(|arg| arg == "check") {
@@ -92,7 +113,7 @@ pub fn main() {
             "--no-reload" => no_reload = true,
             "--version" | "-V" => {
                 println!("shoes {}", env!("CARGO_PKG_VERSION"));
-                return;
+                return 0;
             }
             other => {
                 eprintln!("Invalid argument: {other}");
@@ -103,6 +124,9 @@ pub fn main() {
 
     let directives = logging::resolve_directives();
     let mut writers: Vec<Box<dyn logging::LogWriter>> = Vec::new();
+    let mut file_log_guard = FileLogShutdownGuard {
+        writers: Vec::new(),
+    };
     writers.push(Box::new(crate::control::logs::Writer));
 
     if log_files.is_empty() || log_files.iter().any(|p| p == "-") {
@@ -113,15 +137,22 @@ pub fn main() {
             continue;
         }
         match logging::FileLogWriter::new(path) {
-            Ok(w) => writers.push(Box::new(w)),
+            Ok(writer) => {
+                let writer = Arc::new(writer);
+                file_log_guard.writers.push(writer.clone());
+                writers.push(Box::new(writer));
+            }
             Err(e) => {
                 eprintln!("Failed to open log file {path}: {e}");
-                std::process::exit(1);
+                return 1;
             }
         }
     }
 
-    logging::init_multi_logger(writers, directives);
+    if let Err(error) = logging::init_multi_logger(writers, directives) {
+        eprintln!("Failed to initialize logger: {error}");
+        return 1;
+    }
 
     if args
         .first()
@@ -134,10 +165,10 @@ pub fn main() {
             }
             Err(error) => {
                 eprintln!("VLESS encryption generation failed: {error}");
-                std::process::exit(1);
+                return 1;
             }
         }
-        return;
+        return 0;
     }
 
     if args.iter().any(|s| s == "generate-reality-mldsa65-keypair") {
@@ -148,10 +179,10 @@ pub fn main() {
             }
             Err(error) => {
                 eprintln!("ML-DSA-65 key generation failed: {error}");
-                std::process::exit(1);
+                return 1;
             }
         }
-        return;
+        return 0;
     }
 
     if args.iter().any(|s| s == "generate-reality-keypair") {
@@ -164,7 +195,7 @@ pub fn main() {
         println!(
             "--------------------------------------------------------------------------------"
         );
-        return;
+        return 0;
     }
 
     if let Some(pos) = args
@@ -181,7 +212,7 @@ pub fn main() {
                         eprintln!(
                             "Password generation is only necessary for shadowsocks 2022 ciphers."
                         );
-                        std::process::exit(1);
+                        return 1;
                     }
                 };
                 match ShadowsocksCipher::try_from(base_cipher) {
@@ -205,7 +236,7 @@ pub fn main() {
                         eprintln!("  2022-blake3-aes-128-gcm");
                         eprintln!("  2022-blake3-aes-256-gcm");
                         eprintln!("  2022-blake3-chacha20-poly1305");
-                        std::process::exit(1);
+                        return 1;
                     }
                 }
             }
@@ -218,10 +249,10 @@ pub fn main() {
                 eprintln!("  2022-blake3-aes-128-gcm");
                 eprintln!("  2022-blake3-aes-256-gcm");
                 eprintln!("  2022-blake3-chacha20-poly1305");
-                std::process::exit(1);
+                return 1;
             }
         }
-        return;
+        return 0;
     }
 
     if args.iter().any(|s| s == "generate-vless-user-id") {
@@ -233,7 +264,7 @@ pub fn main() {
         println!(
             "--------------------------------------------------------------------------------"
         );
-        return;
+        return 0;
     }
 
     if args.is_empty() {
@@ -283,6 +314,5 @@ pub fn main() {
         }
     };
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
-    log::logger().flush();
-    std::process::exit(code);
+    code
 }

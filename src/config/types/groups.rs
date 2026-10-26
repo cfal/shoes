@@ -458,15 +458,22 @@ impl<'de> Deserialize<'de> for RuleGroupRules {
         }
         let mut policies = Vec::new();
         let mut sources = Vec::new();
-        for value in values {
+        for (index, value) in values.into_iter().enumerate() {
+            let context = |error| {
+                if is_list {
+                    D::Error::custom(format!("rules[{index}]: {error}"))
+                } else {
+                    D::Error::custom(format!("rules: {error}"))
+                }
+            };
             match value {
                 Value::String(path) => {
                     sources.push(crate::rule_set::RuleSource::from_path(path.into()))
                 }
                 Value::Mapping(ref fields) if fields.contains_key("path") => {
-                    sources.push(serde_yaml::from_value(value).map_err(Error::custom)?);
+                    sources.push(serde_yaml::from_value(value).map_err(context)?);
                 }
-                value => policies.push(serde_yaml::from_value(value).map_err(Error::custom)?),
+                value => policies.push(serde_yaml::from_value(value).map_err(context)?),
             }
         }
         if !policies.is_empty() && !sources.is_empty() {
@@ -548,8 +555,7 @@ impl<'de> Deserialize<'de> for NamedPem {
                             data = Some(map.next_value()?);
                         }
                         _ => {
-                            // Ignore unknown fields
-                            let _: serde::de::IgnoredAny = map.next_value()?;
+                            return Err(Error::unknown_field(&key, &["pem", "path", "data"]));
                         }
                     }
                 }

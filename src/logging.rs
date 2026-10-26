@@ -5,8 +5,11 @@
 //! then passes the resulting `&str` to all writers.
 
 use std::cell::Cell;
-use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::Arc;
+
+mod file;
+pub use file::{FILE_LOG_FLUSH_TIMEOUT, FileLogStats, FileLogWriter};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
@@ -32,6 +35,16 @@ pub trait LogWriter: Send + Sync {
     fn flush(&self);
 }
 
+impl<T: LogWriter> LogWriter for Arc<T> {
+    fn write_log(&self, record: &Record, formatted: &str) {
+        (**self).write_log(record, formatted);
+    }
+
+    fn flush(&self) {
+        (**self).flush();
+    }
+}
+
 /// Writes to stderr with ASCII sanitization to prevent terminal escape sequences.
 pub struct StderrWriter;
 
@@ -55,81 +68,35 @@ impl LogWriter for StderrWriter {
     }
 }
 
-/// Writes to a file opened at init time. Each log line is a single write() syscall
-/// to the kernel page cache (no BufWriter needed -- the kernel handles writeback).
-pub struct FileLogWriter {
-    file: parking_lot::Mutex<File>,
-}
-
-fn escaped_file_record(formatted: &str) -> String {
-    let mut line = String::with_capacity(formatted.len() + 1);
-    for c in formatted.chars() {
-        if c.is_control()
-            || matches!(c, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        {
-            line.extend(c.escape_default());
-        } else {
-            line.push(c);
-        }
-    }
-    line.push('\n');
-    line
-}
-
-impl FileLogWriter {
-    pub fn new(path: &str) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self {
-            file: parking_lot::Mutex::new(file),
-        })
-    }
-}
-
-impl LogWriter for FileLogWriter {
-    fn write_log(&self, _record: &Record, formatted: &str) {
-        let line = escaped_file_record(formatted);
-        let mut guard = self.file.lock();
-        let _ = guard.write_all(line.as_bytes());
-    }
-
-    fn flush(&self) {
-        let _ = self.file.lock().flush();
-    }
-}
-
 /// Writes to a file that may be set after logger init (FFI use case).
-/// References a global `OnceLock<parking_lot::Mutex<Option<File>>>`.
 // Used by iOS/Android FFI targets (ffi/ios.rs, ffi/android.rs).
 #[allow(dead_code)]
 pub struct DynamicFileLogWriter {
-    file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<File>>>,
+    file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<Arc<FileLogWriter>>>>,
 }
 
 // Used by iOS/Android FFI targets (ffi/ios.rs, ffi/android.rs).
 #[allow(dead_code)]
 impl DynamicFileLogWriter {
-    pub fn new(file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<File>>>) -> Self {
+    pub fn new(
+        file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<Arc<FileLogWriter>>>>,
+    ) -> Self {
         Self { file }
     }
 }
 
 impl LogWriter for DynamicFileLogWriter {
-    fn write_log(&self, _record: &Record, formatted: &str) {
-        if let Some(mutex) = self.file.get() {
-            let mut guard = mutex.lock();
-            if let Some(ref mut file) = *guard {
-                let line = escaped_file_record(formatted);
-                let _ = file.write_all(line.as_bytes());
-            }
+    fn write_log(&self, record: &Record, formatted: &str) {
+        let file = self.file.get().and_then(|slot| slot.lock().clone());
+        if let Some(file) = file {
+            file.write_log(record, formatted);
         }
     }
 
     fn flush(&self) {
-        if let Some(mutex) = self.file.get() {
-            let mut guard = mutex.lock();
-            if let Some(ref mut file) = *guard {
-                let _ = file.flush();
-            }
+        let file = self.file.get().and_then(|slot| slot.lock().clone());
+        if let Some(file) = file {
+            file.flush();
         }
     }
 }
@@ -194,6 +161,11 @@ impl Log for MultiLogger {
                 writer.write_log(record, &buf);
             }
 
+            // Preserve existing sink formatting without retaining a huge record
+            // on every async worker after an unusually large diagnostic.
+            if buf.capacity() > 16 * 1024 {
+                buf = String::with_capacity(256);
+            }
             cell.set(buf);
         });
     }
@@ -208,15 +180,15 @@ impl Log for MultiLogger {
 /// Installs a `MultiLogger` as the global logger.
 /// Directives are sorted by name length; `log::set_max_level` is set to the
 /// maximum level across all directives so records reach our `log()` method.
-pub fn init_multi_logger(writers: Vec<Box<dyn LogWriter>>, mut directives: Vec<Directive>) {
-    DEFAULT_LEVEL.store(
-        directives
-            .iter()
-            .rev()
-            .find(|directive| directive.name.is_none())
-            .map_or(LevelFilter::Off, |directive| directive.level) as usize,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+pub fn init_multi_logger(
+    writers: Vec<Box<dyn LogWriter>>,
+    mut directives: Vec<Directive>,
+) -> Result<(), log::SetLoggerError> {
+    let default_level = directives
+        .iter()
+        .rev()
+        .find(|directive| directive.name.is_none())
+        .map_or(LevelFilter::Off, |directive| directive.level);
     directives.sort_by_key(|d| d.name.as_ref().map_or(0, |n| n.len()));
     let max_level = directives
         .iter()
@@ -227,8 +199,10 @@ pub fn init_multi_logger(writers: Vec<Box<dyn LogWriter>>, mut directives: Vec<D
         writers,
         directives,
     };
-    log::set_boxed_logger(Box::new(logger)).expect("logger already initialized");
+    log::set_boxed_logger(Box::new(logger))?;
+    DEFAULT_LEVEL.store(default_level as usize, std::sync::atomic::Ordering::Relaxed);
     log::set_max_level(max_level);
+    Ok(())
 }
 
 /// Parses a level string (case-insensitive). Returns `None` for unrecognized values.
@@ -340,7 +314,7 @@ mod tests {
 
     #[test]
     fn dynamic_file_writer_escapes_records_after_installation() {
-        static FILE: std::sync::OnceLock<parking_lot::Mutex<Option<File>>> =
+        static FILE: std::sync::OnceLock<parking_lot::Mutex<Option<Arc<FileLogWriter>>>> =
             std::sync::OnceLock::new();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("log");
@@ -351,12 +325,41 @@ mod tests {
         let file = FILE.get_or_init(|| parking_lot::Mutex::new(None));
         writer.write_log(&record, "before installation");
         writer.flush();
-        *file.lock() = Some(File::create(&path).unwrap());
+        *file.lock() = Some(Arc::new(
+            FileLogWriter::new(path.to_str().unwrap()).unwrap(),
+        ));
         check_file_records(&writer, &path);
         *file.lock() = None;
         writer.write_log(&record, "after removal");
         writer.flush();
         assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn repeated_logger_init_returns_error_and_drains_rejected_writer() {
+        let _capture = test_capture::Capture::new();
+        let original_default = default_level();
+        let original_max = log::max_level();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rejected.log");
+        let writer = FileLogWriter::new(path.to_str().unwrap()).unwrap();
+        writer.write_log(&Record::builder().build(), "before rejected init");
+        assert!(
+            init_multi_logger(
+                vec![Box::new(writer)],
+                vec![Directive {
+                    name: None,
+                    level: LevelFilter::Off
+                }],
+            )
+            .is_err()
+        );
+        assert_eq!(default_level(), original_default);
+        assert_eq!(log::max_level(), original_max);
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "before rejected init\n"
+        );
     }
 
     /// Builds a MultiLogger (no writers) from directives for testing matches().

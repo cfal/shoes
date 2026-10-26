@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+use super::connection_notes::{ConnectionNotes, MAX_FLOWS, Note};
 use crate::address::{NetLocation, ResolvedLocation};
 
 #[derive(Debug, Default)]
@@ -45,6 +46,7 @@ pub struct FlowInfo {
     pub restored_host: Option<String>,
     pub sniff_host: Option<String>,
     pub fake_dns: bool,
+    pub notes: Option<Arc<ConnectionNotes>>,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -79,6 +81,7 @@ pub struct FlowEntry {
     pub rule_payload: String,
     pub counters: FlowCounters,
     pub cancel: CancellationToken,
+    pub notes: Option<Arc<ConnectionNotes>>,
 }
 
 #[derive(Serialize)]
@@ -94,6 +97,8 @@ pub struct ConnectionSnapshot {
     pub upload: u64,
     pub download: u64,
     pub shoes_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<Note>>,
 }
 
 #[derive(Serialize)]
@@ -118,6 +123,7 @@ struct RegistryState {
 #[derive(Debug, Default)]
 pub struct FlowRegistry {
     state: Mutex<RegistryState>,
+    notes_slots: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[derive(Debug)]
@@ -185,6 +191,7 @@ impl FlowContext {
             rule_payload: format!("{} ({}): {}", self.inbound, self.scope, rule_payload),
             counters: FlowCounters::default(),
             cancel: CancellationToken::new(),
+            notes: info.notes,
         });
         self.registry
             .state
@@ -199,6 +206,27 @@ impl FlowContext {
 }
 
 impl FlowRegistry {
+    pub fn new(connection_notes: bool) -> Self {
+        Self {
+            notes_slots: connection_notes.then(|| Arc::new(tokio::sync::Semaphore::new(MAX_FLOWS))),
+            ..Default::default()
+        }
+    }
+
+    pub fn notes_enabled(&self) -> bool {
+        self.notes_slots.is_some()
+    }
+
+    pub fn start_notes(&self) -> Option<Arc<ConnectionNotes>> {
+        let permit = self
+            .notes_slots
+            .as_ref()?
+            .clone()
+            .try_acquire_owned()
+            .ok()?;
+        Some(Arc::new(ConnectionNotes::new(permit)))
+    }
+
     pub fn cancel(&self, id: &str) {
         let entry = self.state.lock().entries.get(id).cloned();
         if let Some(entry) = entry {
@@ -247,6 +275,7 @@ impl FlowRegistry {
                     upload,
                     download,
                     shoes_generation: entry.generation,
+                    notes: entry.notes.as_ref().map(|notes| notes.snapshot()),
                 }
             })
             .collect();
@@ -294,6 +323,96 @@ pub(crate) fn test_guard() -> FlowGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_notes_are_optional_and_disappear_with_active_connections() {
+        use super::super::connection_notes::Phase;
+        for enabled in [false, true] {
+            let registry = Arc::new(FlowRegistry::new(enabled));
+            let context = FlowContext {
+                registry: registry.clone(),
+                generation: 7,
+                inbound: "test".into(),
+                scope: "root".into(),
+                protocol: "Socks5".into(),
+            };
+            let notes = registry.start_notes();
+            let weak = notes.as_ref().map(Arc::downgrade);
+            if let Some(notes) = &notes {
+                notes.event(Phase::Routing, format_args!("fixture rule"));
+            }
+            assert!(registry.snapshot(0).connections.is_empty());
+            let guard = context.register(
+                "tcp",
+                &NetLocation::from_str("fixture.test:443", None)
+                    .unwrap()
+                    .into(),
+                vec!["DIRECT".into()],
+                "all",
+                FlowInfo {
+                    notes,
+                    ..Default::default()
+                },
+            );
+            guard.entry.counters.upload(13);
+            guard.entry.counters.download(27);
+            let snapshot = serde_json::to_value(registry.snapshot(0)).unwrap();
+            let connection = &snapshot["connections"][0];
+            assert_eq!(connection["id"], guard.entry.id);
+            assert_eq!(connection["shoesGeneration"], 7);
+            assert_eq!(connection["chains"], serde_json::json!(["DIRECT"]));
+            assert_eq!(connection.get("notes").is_some(), enabled);
+            if enabled {
+                assert_eq!(connection["notes"][0]["text"], "fixture rule");
+                assert!(connection["notes"][0]["elapsedUs"].is_u64());
+            }
+            registry.cancel(&guard.entry.id);
+            assert!(guard.entry.cancel.is_cancelled());
+            drop(guard);
+            assert!(weak.is_none_or(|notes| notes.upgrade().is_none()));
+            let snapshot = registry.snapshot(0);
+            assert!(snapshot.connections.is_empty());
+            assert_eq!((snapshot.upload_total, snapshot.download_total), (13, 27));
+        }
+    }
+
+    #[test]
+    fn connection_notes_allow_concurrent_snapshots_and_close() {
+        use super::super::connection_notes::Phase;
+        let registry = Arc::new(FlowRegistry::new(true));
+        let context = FlowContext {
+            registry: registry.clone(),
+            generation: 1,
+            inbound: "test".into(),
+            scope: "root".into(),
+            protocol: "fixture".into(),
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..1000 {
+                    registry.snapshot(0);
+                }
+            });
+            for _ in 0..1000 {
+                let notes = registry.start_notes().unwrap();
+                let guard = context.register(
+                    "tcp",
+                    &NetLocation::from_str("fixture.test:443", None)
+                        .unwrap()
+                        .into(),
+                    vec![],
+                    "all",
+                    FlowInfo {
+                        notes: Some(notes.clone()),
+                        ..Default::default()
+                    },
+                );
+                notes.event(Phase::Setup, format_args!("outbound ready"));
+                drop(guard);
+            }
+        });
+        assert!(registry.snapshot(0).connections.is_empty());
+    }
     #[test]
     fn metadata_keeps_wire_restored_sniffed_and_effective_targets_separate() {
         let context = FlowContext {
@@ -316,6 +435,7 @@ mod tests {
                 restored_host: Some("restored.example".into()),
                 sniff_host: Some("sniffed.example".into()),
                 fake_dns: true,
+                ..Default::default()
             },
         );
         let metadata = &guard.entry.metadata;

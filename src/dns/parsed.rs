@@ -56,6 +56,8 @@ pub struct ParsedDnsServerEntry {
     pub connect_timeout_secs: u32,
     /// Number of retry attempts for failed queries.
     pub attempts: usize,
+    /// Fixed system lookup memoization window in seconds. 0 disables it.
+    pub native_cache_secs: u32,
 }
 
 impl ParsedDnsServerEntry {
@@ -76,6 +78,7 @@ impl ParsedDnsServerEntry {
             timeout_secs,
             connect_timeout_secs,
             attempts,
+            native_cache_secs: 0,
         }
     }
 }

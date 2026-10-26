@@ -1,0 +1,86 @@
+name: Advisory verification evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        type: choice
+        options: [coverage, performance]
+        default: coverage
+        description: Evidence to collect (no timing or coverage percentage gates)
+      coverage_mode:
+        type: choice
+        options: [smoke, full]
+        default: smoke
+        description: Linux unit/process scope
+      base_revision:
+        type: string
+        default: HEAD^
+        description: Local revision for changed-line coverage (not checked out)
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_INCREMENTAL: 0
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - uses: dtolnay/rust-toolchain@1.99.1
+      with:
+        components: llvm-tools-preview
+    - uses: actions/setup-node@v7
+      with:
+        node-version: '24'
+        package-manager-cache: false
+    - name: Report parser and zero-test guard regressions
+      run: node --test benches/*.test.mjs scripts/coverage-lines.test.mjs scripts/require-tests.test.mjs
+    - uses: taiki-e/install-action@v2
+      if: inputs.suite == 'coverage'
+      with:
+        tool: cargo-llvm-cov@0.9.1
+    - name: Linux unit/process coverage
+      if: inputs.suite == 'coverage'
+      env:
+        COVERAGE_MODE: ${{ inputs.coverage_mode }}
+        BASE_REVISION: ${{ inputs.base_revision }}
+      run: bash scripts/coverage-linux.sh coverage-evidence "$COVERAGE_MODE" "$BASE_REVISION"
+    - name: Bounded performance evidence
+      if: inputs.suite == 'performance'
+      env:
+        BENCH_PROFILE: release
+        BENCH_SELECTOR_BUILD_COMMAND: cargo test --locked --release --lib measurement_bench --no-run --message-format=json
+        BENCH_BUILD_COMMAND: cargo build --locked --release --bin shoes
+      run: |
+        mkdir -p performance-build
+        cargo test --locked --release --lib measurement_bench --no-run --message-format=json > performance-build/selector.jsonl
+        cargo build --locked --release --bin shoes 2>&1 | tee performance-build/server.log
+        binary=$(node --input-type=module -e '
+          import fs from "node:fs";
+          const artifacts = fs.readFileSync("performance-build/selector.jsonl", "utf8")
+            .trim().split("\n").map(JSON.parse);
+          const testExecutables = artifacts.filter(artifact =>
+            artifact.reason === "compiler-artifact" && artifact.profile.test &&
+            artifact.target.kind.includes("rlib") && artifact.executable);
+          if (testExecutables.length !== 1) throw Error("expected one selector test executable");
+          console.log(testExecutables[0].executable);
+        ')
+        node benches/run_advisory.mjs "$binary" "$CARGO_TARGET_DIR/release/shoes" performance-evidence
+    - name: Retain raw runs, provenance, skipped scopes and reports
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: verification-${{ inputs.suite }}-${{ github.sha }}
+        if-no-files-found: error
+        path: |
+          coverage-evidence/
+          performance-build/
+          performance-evidence/

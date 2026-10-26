@@ -1,4 +1,4 @@
-use crate::{Process, available_address, roundtrip};
+use crate::{Process, available_address, reserve_address, roundtrip};
 use serde_json::json;
 use std::{path::Path, process::Command, time::Duration};
 use tokio::{
@@ -326,8 +326,8 @@ async fn inline_sources_reload_and_missing_nested_sources_recover() {
     let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("0.0.0.0", 0)
         .await
         .unwrap();
-    let address = available_address();
-    let nested_address = available_address();
+    let (listener, address) = reserve_address();
+    let (nested_listener, nested_address) = reserve_address();
     let mut config = json!([
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
          "rules": [{"masks": {"all": [{"path": "list.json"}, {"any_destination": true}]}, "action": "block"},
@@ -338,6 +338,8 @@ async fn inline_sources_reload_and_missing_nested_sources_recover() {
         }]}}
     ]);
     std::fs::write(&config_path, config.to_string()).unwrap();
+    drop(listener);
+    drop(nested_listener);
     let mut process = Process::start(&config_path, &[]);
     process.wait_for("Servers ready").await;
     roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;

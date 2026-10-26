@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { parseSelector } from './advisory_report.mjs';
 
 const [oldPath, newPath] = process.argv.slice(2);
 if (!oldPath || !newPath) throw Error('usage: node benches/compare_selector.mjs OLD.log NEW.log');
@@ -6,10 +7,7 @@ const key = r => [r.count, r.policies, r.mode, r.workload, r.ports].join('/');
 const median = xs => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 function read(path) {
   const groups = new Map();
-  for (const line of fs.readFileSync(path, 'utf8').split('\n')) {
-    const marker = line.indexOf('SELECTOR_BENCH ');
-    if (marker === -1) continue;
-    const r = JSON.parse(line.slice(marker + 'SELECTOR_BENCH '.length));
+  for (const r of parseSelector(fs.readFileSync(path, 'utf8'))) {
     const id = key(r);
     if (!groups.has(id)) groups.set(id, []);
     groups.get(id).push(r);

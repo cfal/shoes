@@ -5,6 +5,7 @@ use tokio::io::AsyncRead;
 
 use crate::address::NetLocation;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision, IngressTarget};
+use crate::control::connection_notes::{self, ConnectionNotes, Phase};
 use crate::resolver::Resolver;
 use crate::sniff::{SNIFF_TIMEOUT, StreamProbe};
 
@@ -15,6 +16,7 @@ pub(crate) struct PreparedTcp {
     prefix: Vec<u8>,
     probe: Option<StreamProbe>,
     source: Option<std::net::SocketAddr>,
+    notes: Option<Arc<ConnectionNotes>>,
 }
 
 pub(crate) struct RoutedTcp {
@@ -69,7 +71,12 @@ impl PreparedTcp {
         target: NetLocation,
         mut prefix: Vec<u8>,
     ) -> io::Result<Self> {
+        let notes = selector.start_notes();
+        if let Some(notes) = &notes {
+            notes.event(Phase::Prepare, format_args!("destination {target}"));
+        }
         let target = selector.prepare(target.into())?;
+        let notes = notes.filter(|_| matches!(target, IngressTarget::Forward(_)));
         let probe = match &target {
             IngressTarget::Forward(target) if selector.should_sniff(target) => {
                 Some(StreamProbe::from_prefix(std::mem::take(&mut prefix)))
@@ -81,6 +88,7 @@ impl PreparedTcp {
             prefix,
             probe,
             source: None,
+            notes,
         })
     }
 
@@ -127,14 +135,22 @@ impl PreparedTcp {
             info.source = self.source;
             info.sniff_host = hostname.clone();
         }
+        info.notes = self.notes;
         let (wire_destination, target) = match self.target {
             IngressTarget::LocalDns {
                 wire_destination,
                 context,
             } => (wire_destination, TcpRouteTarget::LocalDns(context)),
             IngressTarget::Forward(target) => {
+                let resolver =
+                    connection_notes::resolver(resolver, info.notes.as_ref(), Phase::Routing);
                 let routed = selector
-                    .judge_prepared(target, hostname.as_deref(), resolver)
+                    .judge_prepared_with_notes(
+                        target,
+                        hostname.as_deref(),
+                        &resolver,
+                        info.notes.as_deref(),
+                    )
                     .await?;
                 (
                     routed.wire_destination,
@@ -163,6 +179,213 @@ pub(crate) mod tests {
     use tokio::task::JoinSet;
 
     pub(crate) const TARGET: &str = "203.0.113.1:443";
+
+    fn notes_fixture(
+        mode: &'static str,
+    ) -> (
+        ClientProxySelector,
+        Arc<dyn Resolver>,
+        Arc<crate::control::flows::FlowRegistry>,
+    ) {
+        use crate::control::catalog::RuleDescription;
+        use crate::control::flows::{FlowContext, FlowRegistry};
+        #[derive(Debug)]
+        struct Fixture(&'static str);
+        impl Resolver for Fixture {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                let mode = self.0;
+                Box::pin(async move {
+                    if mode == "dns_failed" {
+                        Err(io::Error::new(io::ErrorKind::NotFound, "secret DNS error"))
+                    } else {
+                        Ok(vec!["192.0.2.1:443".parse().unwrap()])
+                    }
+                })
+            }
+        }
+        #[async_trait::async_trait]
+        impl SocketConnector for Fixture {
+            async fn connect(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: &ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncStream>> {
+                if self.0 == "aborted" {
+                    std::future::pending().await
+                } else if self.0 == "dial_failed" {
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "secret dial error",
+                    ))
+                } else {
+                    Ok(Box::new(tokio::io::duplex(128).0))
+                }
+            }
+            async fn connect_udp_bidirectional(
+                &self,
+                resolver: &Arc<dyn Resolver>,
+                target: ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncMessageStream>> {
+                Ok(Box::new(crate::vless::VlessMessageStream::new(
+                    self.connect(resolver, &target).await?,
+                )))
+            }
+            fn bind_interface(&self) -> Option<&str> {
+                None
+            }
+        }
+        let registry = Arc::new(FlowRegistry::new(true));
+        let group = ClientChainGroup::new(vec![ClientProxyChain::new(
+            vec![InitialHopEntry::Direct(Arc::new(Fixture(mode)))],
+            vec![],
+        )])
+        .with_description(Some(Arc::new(RuleDescription {
+            payload: "all".into(),
+            proxy: "DIRECT".into(),
+            context: Some(Arc::new(FlowContext {
+                registry: registry.clone(),
+                generation: 11,
+                inbound: "test".into(),
+                scope: "root".into(),
+                protocol: "fixture".into(),
+            })),
+        })));
+        let mut rules = Vec::new();
+        if mode == "blocked" {
+            rules.push(ConnectRule::new(
+                vec![NetLocationMask::ANY],
+                ConnectAction::Block,
+            ));
+        }
+        rules.push(ConnectRule::new(
+            vec![NetLocationMask::from("192.0.2.1").unwrap()],
+            ConnectAction::new_allow(None, group),
+        ));
+        (
+            ClientProxySelector::new(rules),
+            Arc::new(Fixture(mode)),
+            registry,
+        )
+    }
+
+    #[tokio::test]
+    async fn connection_notes_tcp_udp_setup_and_failures_have_no_history() {
+        use crate::control::connection_notes::MAX_FLOWS;
+        use futures::FutureExt;
+        for udp in [false, true] {
+            for mode in ["success", "blocked", "dns_failed", "dial_failed", "aborted"] {
+                let (selector, resolver, registry) = notes_fixture(mode);
+                let target = NetLocation::from_str("fixture.test:443", None).unwrap();
+                let check_active = || {
+                    let snapshot = serde_json::to_value(registry.snapshot(0)).unwrap();
+                    let connection = &snapshot["connections"][0];
+                    assert_eq!(connection["shoesGeneration"], 11);
+                    let notes = connection["notes"].as_array().unwrap();
+                    let text = serde_json::to_string(notes).unwrap();
+                    assert!(text.contains("DNS answer"));
+                    assert!(text.contains("selected rule: all"));
+                    assert!(text.contains("outbound ready"));
+                    assert!(!text.contains("secret"));
+                };
+                let operation = async {
+                    if udp {
+                        let stream = crate::routing::ingress::connect_udp(
+                            &selector, target, &resolver, None,
+                        )
+                        .await?;
+                        check_active();
+                        drop(stream);
+                    } else {
+                        let setup = PreparedTcp::new(&selector, target, vec![])?
+                            .connect(&mut tokio::io::empty(), &selector, &resolver)
+                            .await?;
+                        if setup.setup.is_some() {
+                            check_active();
+                        } else {
+                            assert_eq!(mode, "blocked");
+                        }
+                        drop(setup);
+                    }
+                    Ok::<_, io::Error>(())
+                };
+                let mut operation = Box::pin(operation);
+                if mode == "aborted" {
+                    assert!(operation.as_mut().now_or_never().is_none());
+                    drop(operation);
+                } else {
+                    let result = operation.await;
+                    assert_eq!(
+                        result.is_err(),
+                        matches!(mode, "dns_failed" | "dial_failed") || udp && mode == "blocked"
+                    );
+                }
+                assert!(registry.snapshot(0).connections.is_empty());
+                let slots: Vec<_> = (0..MAX_FLOWS)
+                    .map(|_| registry.start_notes().unwrap())
+                    .collect();
+                assert!(registry.start_notes().is_none());
+                drop(slots);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_notes_local_dns_releases_admission_before_routing() {
+        use crate::control::connection_notes::MAX_FLOWS;
+        let (selector, resolver, registry) = notes_fixture("success");
+        let context = Arc::new(
+            crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone()).unwrap(),
+        );
+        let selector = selector.with_fake_dns_context(Some(context)).unwrap();
+        let prepared = PreparedTcp::new(
+            &selector,
+            NetLocation::from_str("192.0.2.1:53", None).unwrap(),
+            vec![],
+        )
+        .unwrap();
+        assert!(prepared.notes.is_none());
+        let slots: Vec<_> = (0..MAX_FLOWS)
+            .map(|_| registry.start_notes().unwrap())
+            .collect();
+        let route = prepared
+            .route(&mut tokio::io::empty(), &selector, &resolver)
+            .await
+            .unwrap();
+        assert!(route.info.notes.is_none());
+        assert!(matches!(route.target, TcpRouteTarget::LocalDns(_)));
+        drop(slots);
+    }
+
+    #[tokio::test]
+    async fn connection_notes_saturated_ingress_does_not_retry_at_dial() {
+        use crate::control::connection_notes::MAX_FLOWS;
+        for udp in [false, true] {
+            let (selector, resolver, registry) = notes_fixture("success");
+            let mut slots: Vec<_> = (0..MAX_FLOWS)
+                .map(|_| registry.start_notes().unwrap())
+                .collect();
+            let target = NetLocation::from_str("fixture.test:443", None).unwrap();
+            if udp {
+                let route = crate::routing::ingress::route_udp(&selector, target, &resolver)
+                    .await
+                    .unwrap();
+                drop(slots.pop());
+                let stream = route.connect(&resolver).await.unwrap().stream;
+                assert!(stream.flow().unwrap().notes.is_none());
+            } else {
+                let prepared = PreparedTcp::new(&selector, target, vec![]).unwrap();
+                drop(slots.pop());
+                let setup = prepared
+                    .connect(&mut tokio::io::empty(), &selector, &resolver)
+                    .await
+                    .unwrap()
+                    .setup
+                    .unwrap();
+                assert!(setup.client_stream.flow().unwrap().notes.is_none());
+            }
+            assert!(registry.start_notes().is_some());
+        }
+    }
 
     #[derive(Debug)]
     struct FailedConnector;

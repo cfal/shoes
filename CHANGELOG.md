@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Breaking: named PEM entries and `tcp_settings` now reject unknown fields instead of silently ignoring them. Named PEMs accept only `pem` and exactly one of `path` or `data`; `tcp_settings` accepts only `no_delay`. Remove other keys before upgrading, or configuration loading will fail.
 - Breaking: client groups now use `type` instead of `strategy`, with no legacy alias. Replace `strategy: selector` with `type: selector` and `strategy: round-robin` with `type: round-robin`; configurations containing `strategy` are rejected.
 - Added `type: url-test` client groups with automatic URL-scoped health/delay selection, tolerance, lazy checks, and supervised probes without a controller listener. See [upstream group configuration](CONFIG.md#clash-controller) and the [URL-test example](examples/url_test.yaml).
 - Failed reload activation now restores the previous services instead of terminating, unless rollback also fails. Unchanged fixed-address TCP listeners retain their sockets, with new-generation TCP and Unix connections admitted only after activation completes. Existing TCP flows still obey the reload grace period after rollback; TUN, WireGuard, and QUIC remain stop/start. See [hot reloading](CONFIG.md#hot-reloading).
