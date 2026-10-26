@@ -38,10 +38,10 @@ fn source(url: &str, path: &Path) -> RuleSource {
     let mut source = RuleSource::from_path(path.into());
     source.url = Some(url.into());
     source.format = Some(crate::rule_set::Format::SingboxJson);
-    source.download = Some(crate::rule_set::Download {
+    source.download = Some(Box::new(crate::rule_set::Download {
         client_chain: crate::config::ClientChain::default(),
         bootstrap_url: "system".into(),
-    });
+    }));
     source
 }
 

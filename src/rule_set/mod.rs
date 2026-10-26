@@ -46,7 +46,7 @@ pub struct RuleSource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub download: Option<Download>,
+    pub download: Option<Box<Download>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_interval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

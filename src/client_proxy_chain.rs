@@ -732,7 +732,7 @@ impl ClientProxyChain {
                 if pinned.contains_key(location) {
                     continue;
                 }
-                let address = crate::resolver::resolve_addresses(resolver, &location)
+                let address = crate::resolver::resolve_addresses(resolver, location)
                     .await?
                     .into_iter()
                     .next()
