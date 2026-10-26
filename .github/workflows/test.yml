@@ -142,13 +142,6 @@ jobs:
     - name: Run process contract tests
       run: cargo test -p shoes --locked --test process_contract --verbose -- --test-threads=1
 
-    - name: Run public HTTPS rule delivery
-      env:
-        CARGO_BUILD_JOBS: 1
-      run: >-
-        .github/require-tests.sh cargo test -p shoes --locked --features external-network-tests
-        --test process_contract remote_rules::public_https -- --test-threads=1
-
     - name: Run rule compilation allocation regression
       run: cargo test -p shoes --locked --test rule_allocation --verbose
 
@@ -222,6 +215,16 @@ jobs:
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --lib file_watcher:: -- --test-threads=1
 
+    - name: Run remote-rule installer tests
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi
+        rule_updater:: -- --test-threads=1
+
+    - name: Run remote-rule process tests
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --test process_contract --features ffi
+        remote_rules:: -- --test-threads=1
+
     - name: Run WebSocket unit and configuration tests
       env:
         CARGO_BUILD_JOBS: 1
@@ -236,13 +239,6 @@ jobs:
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --features ffi,integration-tests
         --test ws_early_data -- --test-threads=1
-
-    - name: Run remote-rule installation and reload tests
-      env:
-        CARGO_BUILD_JOBS: 1
-      run: >-
-        .github/require-tests.sh cargo test -p shoes --locked --lib --test process_contract
-        --features ffi -- rule_updater:: remote_rules:: --test-threads=1
 
   integration-tests:
     name: Integration (${{ matrix.name }})
@@ -492,3 +488,9 @@ jobs:
               --verbose "$filter::" -- --test-threads=1
           done
         fi
+
+    - name: Run public HTTPS rule delivery
+      if: matrix.name == 'external proxies'
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --features external-network-tests
+        --test process_contract remote_rules::public_https -- --test-threads=1
