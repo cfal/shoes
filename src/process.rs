@@ -31,7 +31,7 @@ async fn load_candidate(
     paths: &[String],
     mut configs: Vec<Config>,
     discovered: &mut DiscoverDependencies<'_>,
-    retain_template: bool,
+    for_runtime: bool,
     expected_cache_dir: Option<&Option<PathBuf>>,
     cache_lease: &mut Option<std::sync::Arc<std::fs::File>>,
     retained_ranges: &[ipnetwork::IpNetwork],
@@ -58,7 +58,7 @@ async fn load_candidate(
         ));
     }
     #[cfg(unix)]
-    if retain_template
+    if for_runtime
         && cache_lease.is_none()
         && let Some(directory) = cache_dir
     {
@@ -73,27 +73,22 @@ async fn load_candidate(
     }
     #[cfg(not(unix))]
     let _ = (cache_lease, retained_ranges);
-    let result: io::Result<_> = async {
-        let (mut configs, _) = config::convert_cert_paths(configs).await?;
-        #[cfg(unix)]
-        if retain_template {
-            configs = crate::rule_updater::bootstrap(configs, retained_ranges).await?;
-        }
-        let mut has_remote = false;
-        crate::rule_set::visit_sources(&mut configs, &mut |source| {
-            has_remote |= source.url.is_some();
-            Ok(())
-        })?;
-        let snapshot = if retain_template && has_remote {
-            configs.clone()
-        } else {
-            Vec::new()
-        };
-        let validated = config::compile_configs(configs).await?;
-        Ok((validated, snapshot))
+    let (mut configs, _) = config::convert_cert_paths(configs).await?;
+    #[cfg(unix)]
+    if for_runtime {
+        configs = crate::rule_updater::bootstrap(configs, retained_ranges).await?;
     }
-    .await;
-    let (mut validated, snapshot) = result?;
+    let mut has_remote = false;
+    crate::rule_set::visit_sources(&mut configs, &mut |source| {
+        has_remote |= source.url.is_some();
+        Ok(())
+    })?;
+    let snapshot = if for_runtime && has_remote {
+        configs.clone()
+    } else {
+        Vec::new()
+    };
+    let mut validated = config::compile_configs(configs).await?;
     validated.reload_files = dependencies;
     tokio::task::spawn_blocking(move || {
         if validated.catalog.is_some() {
