@@ -1,6 +1,6 @@
 # Configuration Tooling Follow-Ups
 
-Status: optional, not implemented by R21. Native Shoes types and the existing
+Status: optional, not implemented. Native Shoes types and the existing
 load/PEM/compile/resource-validation pipeline remain authoritative. No alternate
 runtime configuration model, permissive compatibility mode, or DIRECT fallback
 is proposed.
@@ -8,8 +8,8 @@ is proposed.
 ## Typed Reference and Editor Support
 
 Start with a small reference generated from configuration types, defaults, and
-Serde attributes, checked into documentation only if it demonstrably reduces
-drift. Preserve hand-written explanations of transport composition, group graph
+deserialization attributes, checked into documentation only if it demonstrably
+reduces drift. Preserve hand-written explanations of transport composition, group graph
 validation, resource limits, selector identities, and deployment prerequisites.
 Custom deserializers, flattened/tagged protocols, aliases, and one-or-many fields
 need explicit tests; deriving a schema alone does not describe their behavior.
@@ -22,9 +22,9 @@ examples through Shoes rather than only through a schema validator.
 
 ## Strict Subset Converter
 
-A standalone converter could support a documented subset of Clash proxy/group
-definitions. It must reject unsupported fields, protocols, policies, ambiguous
-defaults, and lossy mappings, with source location and a nonzero exit code. Never
+A standalone converter could support a documented subset of external proxy/group
+configuration formats. It must reject unsupported fields, protocols, policies,
+ambiguous defaults, and lossy mappings, with source location and a nonzero exit code. Never
 silently skip nodes, drop policy, or substitute DIRECT. Output must pass the same
 native Shoes validation path before publication; keep selector identities stable
 and report unsupported composition rather than guessing.
@@ -48,16 +48,19 @@ including malformed input and future additions, before adding an output flag.
 
 Continue improving paths at custom deserialization boundaries without duplicating
 the runtime model. Untagged alternatives and custom parsers can hide the innermost
-field; source locations may identify the containing entry rather than the leaf.
+field. For `config[N]` decoding errors, a trailing line/column (if any) marks the
+start of the file's top-level list, not entry N or the failing field; use the
+`config[N]` and `rules[N]` paths for that context. YAML syntax and duplicate-key
+errors retain the parser's original locations when available.
 Exact semantic source attribution across multiple files requires provenance that
 survives group expansion and composition. Do not claim one input file caused a
 cross-file error without that provenance.
 
-R21 tightens unknown-field handling for named PEMs and TCP settings only. Some
-other baseline types (for example TLS server settings and DNS server options)
+Named PEMs and TCP settings reject unknown fields. Some other configuration
+types (for example TLS server settings and DNS server options)
 lack `deny_unknown_fields`. Audit those separately with their owners rather than
 adding blanket attributes to flattened/untagged types without compatibility and
-composition tests. This delivery does not claim a whole-model strictness audit.
+composition tests. A whole-model strictness audit remains deferred.
 
 Parser errors are not a general-purpose redacted export. In particular, arbitrary
 values placed in non-secret fields and user-controlled names can appear in errors.

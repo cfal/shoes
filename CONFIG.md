@@ -2022,12 +2022,15 @@ Check the same set of files that will be used at startup:
 shoes check groups.yaml listeners.yaml
 ```
 
-Parse failures identify the input file and, when decoding a list entry, its
+Configuration decoding failures identify the input file and the entry's
 zero-based `config[N]` index. Rule-group decoding also identifies `rules[N]`
 (or `rules` for a single object). For example, an unsupported field in the second
 rule source of the third entry reports `config[2]`, `rules[1]`, and the unknown
-field. YAML syntax errors retain the parser's line/column information when
-available. Custom deserializers do not always retain an exact leaf location.
+field. YAML syntax and duplicate-key errors retain the parser's original
+diagnostic and line/column information when available, rather than adding an
+entry prefix. For `config[N]` decoding errors, a trailing line/column (if any)
+marks the start of the file's top-level list, not entry N or the failing field;
+use the `config[N]` and `rules[N]` paths for that context.
 
 Errors during certificate loading and semantic validation name the input file
 set, not an inferred single culprit: group references can span files. Checks use
