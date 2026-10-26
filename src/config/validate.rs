@@ -414,6 +414,25 @@ pub(super) fn create_server_configs_with_inputs(
         }
     }
 
+    let mut evaluation_work = 0usize;
+    super::rule_visit::visit(
+        &mut result,
+        &mut |rule| {
+            let predicate =
+                rule.criteria.compiled.as_ref().ok_or_else(|| {
+                    crate::rules::invalid("rule is missing its compiled predicate")
+                })?;
+            evaluation_work = evaluation_work.saturating_add(predicate.evaluation_work);
+            if evaluation_work > crate::rules::MAX_ENTRIES {
+                return Err(crate::rules::invalid(
+                    "expanded rule evaluation budget exceeded",
+                ));
+            }
+            Ok(())
+        },
+        &mut |_| Ok(()),
+    )?;
+
     let mut validated = ValidatedConfigs {
         catalog,
         control,

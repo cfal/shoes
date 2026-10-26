@@ -252,6 +252,36 @@ fn source_group_work_budget_counts_repeated_references_and_caller_compositions()
             );
         }
     }
+    for copies in [1, 32] {
+        let references = json!(vec!["p"; copies]);
+        let mut websocket = server(json!([]));
+        websocket["protocol"] = json!({"type": "websocket", "targets": [{
+            "protocol": {"type": "socks"}, "override_rules": references
+        }]});
+        for destination in [
+            server(references.clone()),
+            json!({"device_name": "tun-test", "address": "10.0.0.1", "netmask": "255.255.255.0", "rules": references}),
+            websocket,
+        ] {
+            let mut configs = groups(16);
+            configs.push(json!({"rule_group": "p", "rules": [{
+                "masks": {"rule_source_group": "g16"}, "action": "block"
+            }]}));
+            configs.push(destination);
+            let result = create_server_configs(serde_json::from_value(json!(configs)).unwrap());
+            if copies == 1 {
+                assert!(result.is_ok(), "{}", result.err().unwrap());
+            } else {
+                let error = result.err().unwrap();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("expanded rule evaluation budget"),
+                    "{error}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
