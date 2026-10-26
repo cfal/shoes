@@ -49,22 +49,7 @@ pub(crate) fn cache_lease(directory: &Path) -> io::Result<File> {
     (|| {
         let (directory, name) = checked_path(&directory.join("owner.lock"))?;
         let name = c_name(&name)?;
-        let file = match open_at(
-            &directory,
-            &name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-        ) {
-            Ok(file) => {
-                check_file(&file.metadata()?, true)?;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                file
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                open_at(&directory, &name, libc::O_RDWR)?
-            }
-            Err(error) => return Err(error),
-        };
-        check_file(&file.metadata()?, true)?;
+        let file = open_lock_file(&directory, &name)?;
         file.try_lock()
             .map_err(|_| invalid("already owned by another Shoes process"))?;
         Ok(file)
@@ -123,22 +108,7 @@ impl Install {
         let mut lock_name = name.clone();
         lock_name.push(CACHE_LOCK_SUFFIX);
         let lock_name = c_name(&lock_name)?;
-        let lock = match open_at(
-            &directory,
-            &lock_name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-        ) {
-            Ok(lock) => {
-                check_file(&lock.metadata()?, true)?;
-                lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                lock
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                open_at(&directory, &lock_name, libc::O_RDWR)?
-            }
-            Err(error) => return Err(error),
-        };
-        check_file(&lock.metadata()?, true)?;
+        let lock = open_lock_file(&directory, &lock_name)?;
         lock.try_lock().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -363,6 +333,22 @@ fn open_at(directory: &File, name: &CString, flags: i32) -> io::Result<File> {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_lock_file(directory: &File, name: &CString) -> io::Result<File> {
+    let file = match open_at(directory, name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) {
+        Ok(file) => {
+            check_file(&file.metadata()?, true)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_at(directory, name, libc::O_RDWR)?
+        }
+        Err(error) => return Err(error),
+    };
+    check_file(&file.metadata()?, true)?;
+    Ok(file)
 }
 
 fn unlink_at(directory: &File, name: &CString) -> io::Result<()> {
@@ -623,7 +609,10 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let path = dir.path().canonicalize().unwrap().join("rules.json");
+        let directory = dir.path().canonicalize().unwrap();
+        let lease = cache_lease(&directory).unwrap();
+        assert_eq!(lease.metadata().unwrap().mode() & 0o777, 0o600);
+        let path = directory.join("rules.json");
         for bytes in [b"first".as_slice(), b"second"] {
             let mut install = Install::open(&path).unwrap();
             assert_eq!(install.lock.metadata().unwrap().mode() & 0o777, 0o600);
