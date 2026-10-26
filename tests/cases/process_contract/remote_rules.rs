@@ -386,7 +386,7 @@ async fn unsupported_bootstrap_routes_only_fail_when_caches_are_missing() {
             _ => {
                 let mut group = serde_json::json!({"client_group": "outbound", "type": route, "client_proxies": ["direct"]});
                 if route == "url-test" {
-                    group["url"] = serde_json::json!("http://127.0.0.1:1/");
+                    group["url"] = serde_json::json!("http://probe.invalid/");
                     group["lazy"] = serde_json::json!(true);
                 }
                 value.as_array_mut().unwrap().push(group);
