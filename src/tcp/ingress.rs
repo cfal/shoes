@@ -136,13 +136,14 @@ impl PreparedTcp {
             info.sniff_host = hostname.clone();
         }
         info.notes = self.notes;
-        let resolver = connection_notes::resolver(resolver, info.notes.as_ref(), Phase::Routing);
         let (wire_destination, target) = match self.target {
             IngressTarget::LocalDns {
                 wire_destination,
                 context,
             } => (wire_destination, TcpRouteTarget::LocalDns(context)),
             IngressTarget::Forward(target) => {
+                let resolver =
+                    connection_notes::resolver(resolver, info.notes.as_ref(), Phase::Routing);
                 let routed = selector
                     .judge_prepared_with_notes(
                         target,
@@ -182,7 +183,7 @@ pub(crate) mod tests {
     fn notes_fixture(
         mode: &'static str,
     ) -> (
-        Arc<ClientProxySelector>,
+        ClientProxySelector,
         Arc<dyn Resolver>,
         Arc<crate::control::flows::FlowRegistry>,
     ) {
@@ -261,7 +262,7 @@ pub(crate) mod tests {
             ConnectAction::new_allow(None, group),
         ));
         (
-            Arc::new(ClientProxySelector::new(rules)),
+            ClientProxySelector::new(rules),
             Arc::new(Fixture(mode)),
             registry,
         )
@@ -335,10 +336,7 @@ pub(crate) mod tests {
         let context = Arc::new(
             crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone()).unwrap(),
         );
-        let selector = Arc::try_unwrap(selector)
-            .unwrap()
-            .with_fake_dns_context(Some(context))
-            .unwrap();
+        let selector = selector.with_fake_dns_context(Some(context)).unwrap();
         let prepared = PreparedTcp::new(
             &selector,
             NetLocation::from_str("192.0.2.1:53", None).unwrap(),

@@ -23,9 +23,10 @@ pub struct Text {
 
 impl Write for Text {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        let count = value.floor_char_boundary((TEXT_BYTES - self.len).min(value.len()));
+        let count = value.floor_char_boundary(TEXT_BYTES - self.len);
         self.bytes[self.len..self.len + count].copy_from_slice(&value.as_bytes()[..count]);
         self.len += count;
+        // Stop subsequent formatters even when this fragment fits exactly.
         if self.len == TEXT_BYTES || count < value.len() {
             Err(fmt::Error)
         } else {
@@ -164,12 +165,12 @@ impl Resolver for NotedResolver {
             format_args!("DNS via inbound resolver: {location}"),
         );
         let future = self.inner.resolve_location(location);
-        let notes = self.notes.clone();
+        let weak_notes = self.notes.clone();
         let phase = self.phase;
         let began = Instant::now();
         Box::pin(async move {
             let result = future.await;
-            if let Some(notes) = notes.upgrade() {
+            if let Some(notes) = weak_notes.upgrade() {
                 match &result {
                     Ok(addresses) => notes.event(
                         phase,
