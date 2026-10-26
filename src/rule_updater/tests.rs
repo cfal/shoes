@@ -23,6 +23,249 @@ use tokio::net::TcpListener;
 const VALID: &[u8] = include_bytes!("../../tests/fixtures/rule_sets/singbox.json");
 const OLD: &[u8] = br#"{"version":1,"rules":[{"domain":["old.example"]}]}"#;
 
+#[test]
+fn bootstrap_routes_are_inline_tcp_and_preserve_dns_name_precedence() {
+    let dir = directory();
+    let remote = source(
+        "https://example.com/rules.json",
+        &dir.path().join("cache.json"),
+    );
+    let proxy = serde_json::json!({"address": "127.0.0.1:1080", "protocol": {"type": "socks"}});
+    for chain in [
+        serde_json::json!("direct"),
+        proxy.clone(),
+        serde_json::json!([{"pool": ["direct", proxy.clone()]}]),
+    ] {
+        for dns in [
+            "system",
+            "udp://127.0.0.1",
+            "tcp://127.0.0.1",
+            "tls://127.0.0.1",
+            "https://127.0.0.1/dns-query",
+        ] {
+            let mut source = remote.clone();
+            source.download.as_mut().unwrap().client_chain =
+                serde_json::from_value(chain.clone()).unwrap();
+            source.download.as_mut().unwrap().bootstrap_url = dns.into();
+            crate::config::validate_rule_bootstrap(
+                &configs(&source),
+                std::slice::from_mut(&mut source),
+            )
+            .unwrap();
+        }
+    }
+    for chain in [
+        serde_json::json!("named"),
+        serde_json::json!([{"pool": [proxy.clone(), "named"]}]),
+        serde_json::json!({"address": "127.0.0.1:443", "transport": "quic", "protocol": {"type": "socks"}}),
+        serde_json::json!([proxy, "direct"]),
+    ] {
+        let mut source = remote.clone();
+        source.download.as_mut().unwrap().client_chain = serde_json::from_value(chain).unwrap();
+        assert!(
+            crate::config::validate_rule_bootstrap(
+                &configs(&source),
+                std::slice::from_mut(&mut source)
+            )
+            .is_err()
+        );
+    }
+    for dns in ["h3://127.0.0.1", "udp://dns.invalid", "named"] {
+        let mut source = remote.clone();
+        source.download.as_mut().unwrap().bootstrap_url = dns.into();
+        assert!(
+            crate::config::validate_rule_bootstrap(
+                &configs(&source),
+                std::slice::from_mut(&mut source)
+            )
+            .is_err()
+        );
+    }
+    let mut config = configs(&remote);
+    config.push(
+        serde_json::from_value(
+            serde_json::json!({"dns_group": "system", "dns_servers": "tcp://127.0.0.1"}),
+        )
+        .unwrap(),
+    );
+    let error = crate::config::validate_rule_bootstrap(&config, &mut [remote]).unwrap_err();
+    assert!(error.to_string().contains("named DNS"), "{error}");
+}
+
+#[tokio::test]
+async fn bootstrap_only_fetches_missing_caches_and_preflights_all_required_routes() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let remote = source(&url, &path);
+    let config = super::bootstrap(configs(&remote), &[]).await.unwrap();
+    fixture.await.unwrap();
+    crate::config::compile_configs(config).await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
+
+    write_rule(&path, b"DOWNLOADED_SECRET invalid");
+    let mut unsupported = remote.clone();
+    unsupported.download.as_mut().unwrap().bootstrap_url = "named".into();
+    let config = super::bootstrap(configs(&unsupported), &[]).await.unwrap();
+    let error = crate::config::compile_configs(config)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("repair or remove"), "{error}");
+    assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"DOWNLOADED_SECRET invalid");
+
+    std::fs::remove_file(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = source(
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+        &path,
+    );
+    unsupported.url = remote.url.clone();
+    unsupported.path = dir.path().join("second.json");
+    let mut config = configs(&remote);
+    config.extend(configs(&unsupported).into_iter().skip(1));
+    assert!(
+        super::bootstrap(config, &[])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid rule bootstrap_url")
+    );
+    assert!(!path.exists());
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_does_not_replace_a_cache_created_after_probing() {
+    let dir = directory();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+    let first = source(&url, &dir.path().join("first.json"));
+    let second = source(&url, &dir.path().join("second.json"));
+    let mut config = configs(&first);
+    config.extend(configs(&second).into_iter().skip(1));
+    let task = tokio::spawn(super::bootstrap(config, &[]));
+    let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    request(&mut stream).await;
+    write_rule(&second.path, OLD);
+    stream.write_all(&response(200, "", VALID)).await.unwrap();
+    let error = task.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("cache appeared"), "{error}");
+    assert_eq!(std::fs::read(&first.path).unwrap(), VALID);
+    assert_eq!(std::fs::read(&second.path).unwrap(), OLD);
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(!stage_path(&second.path).exists());
+}
+
+#[tokio::test]
+async fn bootstrap_preserves_inline_tls_names_and_loads_local_pems() {
+    let dir = directory();
+    let cache = dir.path().join("cache");
+    install::create_cache_directory(&cache).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["proxy.invalid".into()]).unwrap();
+    let cert_path = dir.path().join("client.pem");
+    std::fs::write(&cert_path, certificate.cert.pem()).unwrap();
+    let mut remote = source(
+        "http://192.0.2.10:8080/rules.json",
+        &cache.join("rules.json"),
+    );
+    remote.download.as_mut().unwrap().client_chain = serde_json::from_value(serde_json::json!({
+        "address": listener.local_addr().unwrap().to_string(),
+        "protocol": {"type": "tls", "sni_hostname": "proxy.invalid", "verify": false,
+            "key": "client-key", "cert": cert_path,
+            "protocol": {"type": "socks"}}
+    }))
+    .unwrap();
+    let mut config = configs(&remote);
+    config.push(
+        serde_json::from_value(serde_json::json!({
+            "pem": "client-key", "data": certificate.signing_key.serialize_pem()
+        }))
+        .unwrap(),
+    );
+    let (config, _) = crate::config::convert_cert_paths(config).await.unwrap();
+    let tls = crate::rustls_config_util::try_create_server_config(
+        certificate.cert.pem().as_bytes(),
+        certificate.signing_key.serialize_pem().as_bytes(),
+        vec![],
+        &[],
+        &[],
+        &Default::default(),
+    )
+    .unwrap();
+    let fixture = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
+            .accept(stream)
+            .await
+            .unwrap();
+        assert_eq!(stream.get_ref().1.server_name(), Some("proxy.invalid"));
+        let mut greeting = [0; 3];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).await.unwrap();
+        let mut connect = [0; 10];
+        stream.read_exact(&mut connect).await.unwrap();
+        assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, 10, 31, 144]);
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(stream.read_u8().await.unwrap());
+        }
+        assert!(
+            String::from_utf8(headers)
+                .unwrap()
+                .contains("host: 192.0.2.10:8080")
+        );
+        stream.write_all(&response(200, "", VALID)).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+    let config = timeout(Duration::from_secs(5), super::bootstrap(config, &[]))
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.await.unwrap();
+    crate::config::compile_configs(config).await.unwrap();
+    assert_eq!(std::fs::read(&remote.path).unwrap(), VALID);
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_retained_synthetic_addresses_before_connecting() {
+    let dir = directory();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source = source(
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+        &dir.path().join("cache.json"),
+    );
+    let error = super::bootstrap(configs(&source), &["127.0.0.0/8".parse().unwrap()])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("synthetic"), "{error}");
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(!source.path.exists());
+}
+
 fn directory() -> tempfile::TempDir {
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -58,6 +301,7 @@ fn configs(source: &RuleSource) -> Vec<Config> {
 async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str> {
     let staged = super::stage(
         source,
+        Install::open_async(&source.path).await?,
         &DnsRegistry::new(),
         GlobalLimits::default(),
         limits,
@@ -766,6 +1010,7 @@ async fn stalled_url_address_does_not_block_another_guarded_candidate() {
             Duration::from_secs(2),
             stage(
                 &source,
+                Install::open_async(&source.path).await.unwrap(),
                 &dns,
                 GlobalLimits::default(),
                 Limits::default(),
@@ -1157,6 +1402,7 @@ async fn explicit_bootstrap_resolves_target_without_system_dns() {
     source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
     let mut staged = super::stage(
         &source,
+        Install::open_async(&source.path).await.unwrap(),
         &dns,
         GlobalLimits::default(),
         Limits::default(),
@@ -1271,6 +1517,7 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
         });
         let staged = stage(
             &source,
+            Install::open_async(&source.path).await.unwrap(),
             &dns,
             GlobalLimits::default(),
             Limits::default(),
@@ -1370,6 +1617,7 @@ async fn first_download_proxy_retains_bootstrap_address_fallback() {
         drop(
             stage(
                 &source,
+                Install::open_async(&source.path).await.unwrap(),
                 &dns,
                 GlobalLimits::default(),
                 Limits::default(),
@@ -1771,18 +2019,28 @@ async fn normalized_sources_preserve_url_format_hints_without_retaining_delivery
 }
 
 #[test]
-fn explicit_bootstrap_uses_only_declared_synthetic_guards_not_runtime_state() {
+fn bootstrap_guards_include_declared_and_retained_ranges_without_runtime_state() {
     let configs: Vec<Config> = serde_json::from_value(serde_json::json!([
         {"dns_group": "unavailable", "dns_servers": "system", "fake_ip": {"state_file": "/unavailable/state"}},
         {"address": "10.12.0.1", "netmask": "255.255.255.0", "device_name": "tun0", "rules": "allow-all-direct"}
     ])).unwrap();
-    let dns = DnsRegistry::for_direct_rule_update(&configs).unwrap();
+    let dns = DnsRegistry::for_rule_bootstrap(
+        &configs,
+        &["203.0.113.0/24".parse().unwrap()],
+        GlobalLimits::default(),
+    )
+    .unwrap();
     assert!(
         dns.forbidden_ranges()
             .iter()
             .any(|range| range.contains("198.18.0.53".parse::<std::net::IpAddr>().unwrap()))
     );
     assert!(dns.get_by_name("unavailable").is_none());
+    assert!(
+        dns.forbidden_ranges()
+            .iter()
+            .any(|range| range.contains("203.0.113.1".parse().unwrap()))
+    );
 }
 
 #[tokio::test]

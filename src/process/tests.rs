@@ -281,6 +281,7 @@ async fn dependencies_are_discovered_before_the_candidate_reads_them() {
         true,
         None,
         &mut None,
+        &[],
     )
     .await
     .err()

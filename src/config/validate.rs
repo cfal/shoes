@@ -494,6 +494,93 @@ fn validate_rule_downloads(
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) fn validate_rule_bootstrap(
+    configs: &[Config],
+    sources: &mut [crate::rule_set::RuleSource],
+) -> std::io::Result<GlobalLimits> {
+    use crate::rules::invalid;
+
+    let mut limits = None;
+    let mut pems = HashMap::new();
+    let mut dns_names = HashSet::new();
+    for config in configs {
+        match config {
+            Config::GlobalLimits(value) => {
+                value.validate()?;
+                if limits.replace(*value).is_some() {
+                    return Err(invalid("global_limits may only be specified once"));
+                }
+            }
+            Config::NamedPem(pem) => {
+                let PemSource::Data(data) = &pem.source else {
+                    return Err(invalid(
+                        "bootstrap PEM paths must be loaded before validation",
+                    ));
+                };
+                if pems.insert(pem.pem.clone(), data.clone()).is_some() {
+                    return Err(invalid("named pem already exists"));
+                }
+            }
+            Config::DnsConfigGroup(group) => {
+                dns_names.insert(group.dns_group.as_str());
+            }
+            Config::ClientConfigGroup(group) if group.client_group == "direct" => {
+                return Err(invalid("client group already exists: direct"));
+            }
+            _ => {}
+        }
+    }
+    let limits = limits.unwrap_or_default();
+    let clients = HashMap::from([("direct".into(), vec![direct_client(None)])]);
+    for source in sources {
+        let result = (|| {
+            let download = source.download.as_mut().expect("remote source checked");
+            if dns_names.contains(download.bootstrap_url.as_str()) {
+                return Err(invalid(
+                    "named DNS groups are not supported for missing-cache bootstrap",
+                ));
+            }
+            let dns = ParsedDnsUrl::parse(&download.bootstrap_url)
+                .map_err(|_| invalid("invalid rule bootstrap_url"))?;
+            if dns.has_hostname() || matches!(dns, ParsedDnsUrl::H3 { .. }) {
+                return Err(invalid(
+                    "missing-cache bootstrap requires system or an IP-based UDP/TCP/TLS/HTTPS DNS URL",
+                ));
+            }
+            for hop in download.client_chain.hops.iter() {
+                let members = match hop {
+                    ClientChainHop::Single(member)
+                    | ClientChainHop::Pool(OneOrSome::One(member)) => std::slice::from_ref(member),
+                    ClientChainHop::Pool(OneOrSome::Some(members)) => members.as_slice(),
+                };
+                for member in members {
+                    match member {
+                        ConfigSelection::GroupName(name) if name == "direct" => {}
+                        ConfigSelection::Config(client)
+                            if client.transport == Transport::Tcp
+                                && !client.protocol.is_wireguard()
+                                && client.control.is_none() => {}
+                        _ => {
+                            return Err(invalid(
+                                "missing-cache bootstrap supports only direct and inline TCP clients; named client groups, selectors, WireGuard and QUIC are unsupported",
+                            ));
+                        }
+                    }
+                }
+            }
+            validate_client_chain(&mut download.client_chain.hops, 0, &clients, &pems, limits)
+        })();
+        result.map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("rule bootstrap {}: {error}", source.path.display()),
+            )
+        })?;
+    }
+    Ok(limits)
+}
+
 fn direct_client(catalog: Option<&crate::control::catalog::Catalog>) -> ClientConfig {
     let mut direct = ClientConfig::default();
     if let Some(catalog) = catalog {

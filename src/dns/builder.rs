@@ -98,10 +98,12 @@ pub struct DnsRegistry {
 
 impl DnsRegistry {
     #[cfg(unix)]
-    pub(crate) fn for_direct_rule_update(
+    pub(crate) fn for_rule_bootstrap(
         configs: &[crate::config::Config],
+        retained_ranges: &[IpNetwork],
+        limits: GlobalLimits,
     ) -> std::io::Result<Self> {
-        let mut forbidden = Vec::new();
+        let mut forbidden = retained_ranges.to_vec();
         for config in configs {
             let policy = match config {
                 crate::config::Config::DnsConfigGroup(group) => group.fake_ip.as_ref(),
@@ -127,6 +129,7 @@ impl DnsRegistry {
             );
         }
         Ok(Self {
+            limits,
             forbidden: forbidden.into(),
             ..Self::new()
         })

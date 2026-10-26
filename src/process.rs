@@ -22,7 +22,7 @@ async fn validate_configs(
     configs: Vec<Config>,
     discovered: &mut DiscoverDependencies<'_>,
 ) -> io::Result<ValidatedConfigs> {
-    load_candidate(paths, configs, discovered, false, None, &mut None)
+    load_candidate(paths, configs, discovered, false, None, &mut None, &[])
         .await
         .map(|(validated, _)| validated)
 }
@@ -34,6 +34,7 @@ async fn load_candidate(
     retain_template: bool,
     expected_cache_dir: Option<&Option<PathBuf>>,
     cache_lease: &mut Option<std::sync::Arc<std::fs::File>>,
+    retained_ranges: &[ipnetwork::IpNetwork],
 ) -> io::Result<(ValidatedConfigs, Vec<Config>)> {
     async {
     let cache_dir = crate::rule_set::cache_directory(&configs)?;
@@ -62,15 +63,22 @@ async fn load_candidate(
         && let Some(directory) = cache_dir
     {
         *cache_lease = Some(std::sync::Arc::new(
-            tokio::task::spawn_blocking(move || crate::rule_updater::cache_lease(&directory))
-                .await
-                .map_err(io::Error::other)??,
+            tokio::task::spawn_blocking(move || {
+                crate::rule_updater::create_cache_directory(&directory)?;
+                crate::rule_updater::cache_lease(&directory)
+            })
+            .await
+            .map_err(io::Error::other)??,
         ));
     }
     #[cfg(not(unix))]
-    let _ = cache_lease;
+    let _ = (cache_lease, retained_ranges);
     let result: io::Result<_> = async {
         let (mut configs, _) = config::convert_cert_paths(configs).await?;
+        #[cfg(unix)]
+        if retain_template {
+            configs = crate::rule_updater::bootstrap(configs, retained_ranges).await?;
+        }
         let mut has_remote = false;
         crate::rule_set::visit_sources(&mut configs, &mut |source| {
             has_remote |= source.url.is_some();
@@ -153,6 +161,7 @@ async fn prepare_tracking(
         true,
         previous_servers.map(|previous| &previous.validated.rule_cache_dir),
         &mut cache_lease,
+        previous.map_or(&[], DnsRegistry::forbidden_ranges),
     )
     .await?;
     network.validate(&validated.configs)?;

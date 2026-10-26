@@ -21,14 +21,14 @@ pub(crate) fn cache_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-pub(super) fn create_cache_directory(directory: &Path) -> io::Result<()> {
+pub(crate) fn create_cache_directory(directory: &Path) -> io::Result<()> {
     (|| {
         match std::fs::DirBuilder::new().mode(0o700).create(directory) {
             Ok(()) => {
                 let metadata = directory.symlink_metadata()?;
                 if !metadata.is_dir() || metadata.mode() & 0o700 != 0o700 {
                     return Err(invalid(
-                        "new directory lacks owner access or was replaced; create it with install -d -m 700 before updating rules",
+                        "new directory lacks owner access or was replaced; create it with install -d -m 700 before starting Shoes",
                     ));
                 }
             }
@@ -66,7 +66,7 @@ pub(crate) fn cache_lease(directory: &Path) -> io::Result<File> {
         };
         check_file(&file.metadata()?, true)?;
         file.try_lock()
-            .map_err(|_| invalid("already owned by another Shoes process or updater"))?;
+            .map_err(|_| invalid("already owned by another Shoes process"))?;
         Ok(file)
     })()
     .map_err(|error: io::Error| {
@@ -104,6 +104,15 @@ impl Outcome {
 }
 
 impl Install {
+    pub(super) fn require_missing(&self) -> io::Result<()> {
+        if self.original.is_some() {
+            return Err(invalid(
+                "cache appeared before bootstrap; retry configuration loading",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn open_async(path: &Path) -> io::Result<Self> {
         let path = path.to_owned();
         blocking(move || Self::open(&path)).await
@@ -540,7 +549,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("already owned by another Shoes process or updater"),
+                .contains("already owned by another Shoes process"),
             "{error}"
         );
     }

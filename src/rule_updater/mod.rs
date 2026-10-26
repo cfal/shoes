@@ -1,4 +1,5 @@
 //! Staged delivery of immutable rule files. No updater state enters forwarding.
+mod bootstrap;
 mod http;
 mod install;
 
@@ -34,60 +35,8 @@ impl Default for Limits {
     }
 }
 
-pub(crate) use install::{cache_file, cache_lease};
-
-pub(crate) async fn update_direct(paths: &[String]) -> io::Result<()> {
-    let mut configs = crate::config::load_configs(paths).await?;
-    let sources = crate::rule_set::remote_sources(&mut configs)?;
-    if sources.is_empty() {
-        return Err(invalid("update-rules requires at least one remote source"));
-    }
-    let directory =
-        crate::rule_set::cache_directory(&configs)?.expect("remote namespace validated");
-    let _lease = tokio::task::spawn_blocking(move || {
-        install::create_cache_directory(&directory)?;
-        cache_lease(&directory)
-    })
-    .await
-    .map_err(io::Error::other)??;
-    let dns = DnsRegistry::for_direct_rule_update(&configs)?;
-    println!("Using direct TCP and system DNS; configured download routes are overridden.");
-    for mut source in sources {
-        source.download = Some(Box::new(crate::rule_set::Download {
-            client_chain: crate::config::ClientChain::default(),
-            bootstrap_url: "system".into(),
-        }));
-        let result = async {
-            let staged = stage(
-                &source,
-                &dns,
-                GlobalLimits::default(),
-                Limits::default(),
-                &mut http::DownloadState::default(),
-            )
-            .await?;
-            staged.install.finish_async(staged.digest).await
-        }
-        .await
-        .map_err(|error: io::Error| {
-            io::Error::new(
-                error.kind(),
-                format!("rule download {}: {error}", source.path.display()),
-            )
-        })?;
-        println!(
-            "{}: {}",
-            if result.changed() {
-                "Updated"
-            } else {
-                "Unchanged"
-            },
-            source.path.display()
-        );
-    }
-    println!("Rule files validated; run shoes check before starting Shoes.");
-    Ok(())
-}
+pub(crate) use bootstrap::prepare as bootstrap;
+pub(crate) use install::{cache_file, cache_lease, create_cache_directory};
 
 struct Staged {
     source: RuleSource,
@@ -97,12 +46,12 @@ struct Staged {
 
 async fn stage(
     source: &RuleSource,
+    install: Install,
     dns: &DnsRegistry,
     global: GlobalLimits,
     limits: Limits,
     state: &mut http::DownloadState,
 ) -> io::Result<Staged> {
-    let install = Install::open_async(&source.path).await?;
     let mut file = tokio::fs::File::from_std(install.file.try_clone()?);
     let digest = crate::control::url_test::BACKGROUND
         .scope(
@@ -165,7 +114,8 @@ async fn refresh_source(
     global: GlobalLimits,
     state: &mut http::DownloadState,
 ) -> io::Result<bool> {
-    let mut staged = stage(source, dns, global, Limits::default(), state).await?;
+    let install = Install::open_async(&source.path).await?;
+    let mut staged = stage(source, install, dns, global, Limits::default(), state).await?;
     let (install, unchanged) = staged.install.check_unchanged(staged.digest).await?;
     staged.install = install;
     if unchanged {

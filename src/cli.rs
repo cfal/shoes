@@ -36,9 +36,6 @@ fn print_usage_and_exit(arg0: String) -> ! {
     eprintln!();
     eprintln!("COMMANDS:");
     eprintln!("    check <config.yaml>                            Validate configuration and exit");
-    eprintln!(
-        "    update-rules --direct <config.yaml> [...]      Populate rule caches using direct/system routing"
-    );
     eprintln!("    version                                        Print version information");
     #[cfg(target_os = "linux")]
     eprintln!(
@@ -274,23 +271,6 @@ fn run() -> i32 {
         return 0;
     }
 
-    let update_rules = args.first().is_some_and(|arg| arg == "update-rules");
-    if update_rules {
-        if dry_run || no_reload {
-            eprintln!("update-rules cannot be combined with --dry-run or --no-reload");
-            std::process::exit(1);
-        }
-        args.remove(0);
-        if args.first().is_none_or(|arg| arg != "--direct") || args.len() < 2 {
-            eprintln!("Usage: {arg0} update-rules --direct <config.yaml> [config.yaml...]");
-            eprintln!(
-                "This command uses direct/system routing, not configured download routes. Stop the owning Shoes process first."
-            );
-            std::process::exit(1);
-        }
-        args.remove(0);
-    }
-
     if args.is_empty() {
         println!("No config specified, assuming loading from file config.shoes.yaml");
         args.push("config.shoes.yaml".to_string())
@@ -334,15 +314,6 @@ fn run() -> i32 {
         #[cfg(target_os = "linux")]
         if !dry_run && args.len() == 1 && args[0] == "cleanup-tun" {
             return crate::desktop::cleanup().await;
-        }
-        if update_rules {
-            #[cfg(unix)]
-            return crate::rule_updater::update_direct(&args).await;
-            #[cfg(not(unix))]
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "update-rules requires Unix",
-            ));
         }
         process::run(args, dry_run, no_reload).await
     });
