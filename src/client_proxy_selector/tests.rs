@@ -1,8 +1,6 @@
 use super::*;
 use crate::resolver::Resolver;
-use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
 
 #[derive(Debug)]
 struct NoDns;
@@ -27,10 +25,8 @@ fn prepared(selector: &ClientProxySelector, location: &str) -> PreparedDestinati
 async fn same_policy_can_avoid_dns_but_later_policy_cannot() {
     let no_dns: Arc<dyn Resolver> = Arc::new(NoDns);
     let location = NetLocation::from_str("allowed.example:443", None).unwrap();
-    let selector = ClientProxySelector::new(vec![allow_rule(
-        vec!["10.0.0.0/8", "allowed.example"],
-        "direct",
-    )]);
+    let selector =
+        ClientProxySelector::new(vec![allow_rule(vec!["10.0.0.0/8", "allowed.example"])]);
     assert!(matches!(
         selector
             .judge(location.clone().into(), &no_dns)
@@ -40,7 +36,7 @@ async fn same_policy_can_avoid_dns_but_later_policy_cannot() {
     ));
     let selector = ClientProxySelector::new(vec![
         block_rule(vec!["10.0.0.0/8"]),
-        allow_rule(vec!["allowed.example"], "direct"),
+        allow_rule(vec!["allowed.example"]),
     ]);
     assert!(
         selector
@@ -61,7 +57,7 @@ async fn no_resolve_negation_uses_known_ips_not_unavailable_facts() {
     let selector = ClientProxySelector::with_options(
         vec![
             ConnectRule::compiled(predicate, true, ConnectAction::Block),
-            allow_rule(vec!["0.0.0.0/0"], "direct"),
+            allow_rule(vec!["0.0.0.0/0"]),
         ],
         true,
     );
@@ -92,7 +88,7 @@ async fn ip_only_no_resolve_block_falls_through_without_sniffing_or_dns() {
     let selector = ClientProxySelector::with_options(
         vec![
             ConnectRule::compiled(predicate, true, ConnectAction::Block),
-            allow_rule(vec!["0.0.0.0/0"], "direct"),
+            allow_rule(vec!["0.0.0.0/0"]),
         ],
         true,
     );
@@ -123,7 +119,7 @@ async fn ip_only_no_resolve_block_falls_through_without_sniffing_or_dns() {
 
 #[tokio::test]
 async fn catch_all_rejects_invalid_supplied_names_but_ignores_bad_hints() {
-    let selector = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"], "direct")]);
+    let selector = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"])]);
     for name in ["", "example.com..", "a b", "é.example"] {
         assert!(
             selector
@@ -149,7 +145,7 @@ async fn sniff_preserves_real_ip_and_order_without_dns() {
     for ip_first in [true, false] {
         let mut rules = vec![
             block_rule(vec!["127.0.0.0/8"]),
-            allow_rule(vec!["allowed.example"], "direct"),
+            allow_rule(vec!["allowed.example"]),
         ];
         if !ip_first {
             rules.swap(0, 1);
@@ -189,11 +185,11 @@ async fn sniff_bypasses_warmed_allow_and_block_caches() {
     let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
     let mut rules = vec![
         block_rule(vec!["blocked.example"]),
-        allow_rule(vec!["allowed.example"], "direct"),
+        allow_rule(vec!["allowed.example"]),
         block_rule(vec!["203.0.113.8"]),
     ];
     rules.extend((0..17).map(|_| block_rule(vec!["irrelevant.example"])));
-    rules.push(allow_rule(vec!["0.0.0.0/0"], "direct"));
+    rules.push(allow_rule(vec!["0.0.0.0/0"]));
     let selector = ClientProxySelector::new(rules).with_sniff(true);
     for (destination, ordinary_allowed, name) in [
         ("203.0.113.7:443", true, "blocked.example"),
@@ -238,7 +234,6 @@ async fn sniff_bypasses_warmed_allow_and_block_caches() {
 async fn sniff_override_preserves_wire_identity_and_inherits_port() {
     let selector = ClientProxySelector::new(vec![allow_rule_with_override(
         vec!["allowed.example"],
-        "direct",
         "192.0.2.9",
     )]);
     let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
@@ -276,8 +271,8 @@ async fn prepared_fake_names_survive_recycling_with_and_without_sni() {
         .unwrap(),
     );
     let selector = ClientProxySelector::new(vec![
-        allow_rule(vec!["first.example"], "direct"),
-        allow_rule(vec!["third.example"], "direct"),
+        allow_rule(vec!["first.example"]),
+        allow_rule(vec!["third.example"]),
     ])
     .with_sniff(true)
     .with_fake_dns_context(Some(context.clone()))
@@ -348,7 +343,7 @@ async fn fake_dns_sni_bypasses_cached_hostname_rules_without_resolving() {
     );
     let mut rules = vec![
         block_rule(vec!["restored.example"]),
-        allow_rule(vec!["sniff.example"], "direct"),
+        allow_rule(vec!["sniff.example"]),
     ];
     rules.extend((0..17).map(|_| block_rule(vec!["irrelevant.example"])));
     let selector = ClientProxySelector::new(rules)
@@ -404,7 +399,7 @@ async fn fake_dns_sni_bypasses_cached_hostname_rules_without_resolving() {
 async fn fake_dns_sni_ip_rules_resolve_only_the_restored_target_in_rule_order() {
     for ip_first in [false, true] {
         for blocked in [false, true] {
-            let mut resolver = MockResolver::new();
+            let mut resolver = MockResolver::default();
             let resolved = if blocked {
                 "127.0.0.1:443"
             } else {
@@ -423,7 +418,7 @@ async fn fake_dns_sni_ip_rules_resolve_only_the_restored_target_in_rule_order() 
                 Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
             let mut rules = vec![
                 block_rule(vec!["127.0.0.0/8"]),
-                allow_rule(vec!["sniff.example"], "direct"),
+                allow_rule(vec!["sniff.example"]),
             ];
             if !ip_first {
                 rules.swap(0, 1);
@@ -465,8 +460,8 @@ async fn fake_dns_sni_ip_rules_resolve_only_the_restored_target_in_rule_order() 
 
 #[tokio::test]
 async fn supplied_hostnames_remain_ineligible_for_sniffing() {
-    let selector = ClientProxySelector::new(vec![allow_rule(vec!["sniff.example"], "direct")])
-        .with_sniff(true);
+    let selector =
+        ClientProxySelector::new(vec![allow_rule(vec!["sniff.example"])]).with_sniff(true);
     let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
     let target = prepared(&selector, "supplied.example:443");
     assert!(!selector.should_sniff(&target));
@@ -534,11 +529,11 @@ fn domain_encoded_ips_restore_without_changing_wire_identity() {
 async fn preparation_precedes_dns_dispatch_and_nested_rule_gates() {
     let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
     let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
-    let parent = ClientProxySelector::new(vec![allow_rule(vec!["parent.example"], "direct")])
+    let parent = ClientProxySelector::new(vec![allow_rule(vec!["parent.example"])])
         .with_sniff(true)
         .with_fake_dns_context(Some(context.clone()))
         .unwrap();
-    let child = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"], "direct")])
+    let child = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"])])
         .inherit_inbound_policy(&parent)
         .unwrap();
     assert!(Arc::ptr_eq(child.fake_dns.as_ref().unwrap(), &context));
@@ -566,7 +561,6 @@ async fn preparation_precedes_dns_dispatch_and_nested_rule_gates() {
     }
     let override_selector = ClientProxySelector::new(vec![allow_rule_with_override(
         vec!["0.0.0.0/0"],
-        "direct",
         "198.18.0.9:53",
     )]);
     assert!(
@@ -581,7 +575,7 @@ async fn cached_route_rechecks_changed_ip() {
     let selector = ClientProxySelector::with_options(
         vec![
             block_rule(vec!["127.0.0.0/8"]),
-            allow_rule(vec!["0.0.0.0/0"], "direct"),
+            allow_rule(vec!["0.0.0.0/0"]),
         ],
         true,
     );
@@ -617,7 +611,7 @@ async fn native_cache_refresh_changes_new_flow_routing_without_retargeting_pinne
     );
     let selector = selector_with_cache(vec![
         block_rule(vec!["127.0.0.0/8"]),
-        allow_rule(vec!["0.0.0.0/0"], "direct"),
+        allow_rule(vec!["0.0.0.0/0"]),
     ]);
     let hostname = NetLocation::from_str("changing.test:443", None).unwrap();
     let ConnectDecision::Allow {
@@ -660,7 +654,7 @@ async fn domain_rules_agree_with_cache_on_case_and_root_dot() {
         let selector = ClientProxySelector::with_options_and_cache_size(
             vec![
                 block_rule(vec!["Blocked.Example."]),
-                allow_rule(vec!["0.0.0.0/0"], "direct"),
+                allow_rule(vec!["0.0.0.0/0"]),
             ],
             true,
             capacity,
@@ -685,25 +679,13 @@ async fn domain_rules_agree_with_cache_on_case_and_root_dot() {
     }
 }
 
-/// A mock resolver for testing that returns predefined results
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct MockResolver {
     mappings: std::collections::HashMap<String, Vec<SocketAddr>>,
 }
 
-impl MockResolver {
-    fn new() -> Self {
-        Self {
-            mappings: std::collections::HashMap::new(),
-        }
-    }
-}
-
 impl Resolver for MockResolver {
-    fn resolve_location(
-        &self,
-        location: &NetLocation,
-    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+    fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
         let key = format!("{}:{}", location.address(), location.port());
         let result = self.mappings.get(&key).cloned();
         Box::pin(async move {
@@ -717,40 +699,26 @@ impl Resolver for MockResolver {
     }
 }
 
-/// Helper to create a mock resolver as Arc<dyn Resolver>
 fn mock_resolver() -> Arc<dyn Resolver> {
-    Arc::new(MockResolver::new())
+    Arc::new(MockResolver::default())
 }
 
-/// Create a mock ClientChainGroup for testing (single chain with direct connector)
+// Rule-matching fixtures use a single direct chain; rotation is tested in client_proxy_chain.
 fn mock_chain_group() -> ClientChainGroup {
     use crate::resolver::NativeResolver;
-    use crate::tcp::chain_builder::build_client_chain_group;
+    use crate::tcp::chain_builder::build_direct_chain_group;
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-    build_client_chain_group(crate::option_util::NoneOrSome::None, resolver)
+    build_direct_chain_group(resolver)
 }
 
-/// Helper to create an allow rule (for rule matching tests)
-fn allow_rule(masks: Vec<&str>, _proxy_name: &str) -> ConnectRule {
+fn allow_rule(masks: Vec<&str>) -> ConnectRule {
     let masks: Vec<NetLocationMask> = masks
         .into_iter()
         .map(|s| NetLocationMask::from(s).unwrap())
         .collect();
-    // For tests, we just use a mock chain group since we're testing rule matching
     ConnectRule::new(masks, ConnectAction::new_allow(None, mock_chain_group()))
 }
 
-/// Helper to create an allow rule with multiple proxies (for rule matching tests)
-fn allow_rule_multi(masks: Vec<&str>, _proxy_names: Vec<&str>) -> ConnectRule {
-    let masks: Vec<NetLocationMask> = masks
-        .into_iter()
-        .map(|s| NetLocationMask::from(s).unwrap())
-        .collect();
-    // For tests, we just use a mock chain group since we're testing rule matching
-    ConnectRule::new(masks, ConnectAction::new_allow(None, mock_chain_group()))
-}
-
-/// Helper to create a block rule
 fn block_rule(masks: Vec<&str>) -> ConnectRule {
     let masks: Vec<NetLocationMask> = masks
         .into_iter()
@@ -759,12 +727,7 @@ fn block_rule(masks: Vec<&str>) -> ConnectRule {
     ConnectRule::new(masks, ConnectAction::new_block())
 }
 
-/// Helper to create an allow rule with address override
-fn allow_rule_with_override(
-    masks: Vec<&str>,
-    _proxy_name: &str,
-    override_addr: &str,
-) -> ConnectRule {
+fn allow_rule_with_override(masks: Vec<&str>, override_addr: &str) -> ConnectRule {
     let masks: Vec<NetLocationMask> = masks
         .into_iter()
         .map(|s| NetLocationMask::from(s).unwrap())
@@ -834,8 +797,8 @@ fn test_matches_domain_single_label() {
 #[tokio::test]
 async fn test_ipv4_exact_match() {
     let rules = vec![
-        allow_rule(vec!["192.168.1.1/32"], "proxy1"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.1/32"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -851,8 +814,8 @@ async fn test_ipv4_exact_match() {
 #[tokio::test]
 async fn test_ipv4_exact_match_no_match() {
     let rules = vec![
-        allow_rule(vec!["192.168.1.1/32"], "proxy1"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.1/32"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -869,8 +832,8 @@ async fn test_ipv4_exact_match_no_match() {
 #[tokio::test]
 async fn test_ipv4_cidr_24() {
     let rules = vec![
-        allow_rule(vec!["192.168.1.0/24"], "lan"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.0/24"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -897,10 +860,10 @@ async fn test_ipv4_cidr_24() {
 #[tokio::test]
 async fn test_ipv4_cidr_16() {
     let rules = vec![
-        allow_rule(vec!["10.0.0.0/8"], "private_a"),
-        allow_rule(vec!["172.16.0.0/12"], "private_b"),
-        allow_rule(vec!["192.168.0.0/16"], "private_c"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["10.0.0.0/8"]),
+        allow_rule(vec!["172.16.0.0/12"]),
+        allow_rule(vec!["192.168.0.0/16"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -941,8 +904,8 @@ async fn test_ipv4_cidr_16() {
 #[tokio::test]
 async fn test_ipv4_localhost() {
     let rules = vec![
-        allow_rule(vec!["127.0.0.0/8"], "loopback"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["127.0.0.0/8"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -965,10 +928,7 @@ async fn test_ipv4_localhost() {
 
 #[tokio::test]
 async fn test_ipv6_exact_match() {
-    let rules = vec![
-        allow_rule(vec!["::1/128"], "loopback"),
-        allow_rule(vec!["::/0"], "default"),
-    ];
+    let rules = vec![allow_rule(vec!["::1/128"]), allow_rule(vec!["::/0"])];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
@@ -983,9 +943,9 @@ async fn test_ipv6_exact_match() {
 #[tokio::test]
 async fn test_ipv6_cidr() {
     let rules = vec![
-        allow_rule(vec!["fe80::/10"], "link_local"),
-        allow_rule(vec!["fc00::/7"], "unique_local"),
-        allow_rule(vec!["::/0"], "default"),
+        allow_rule(vec!["fe80::/10"]),
+        allow_rule(vec!["fc00::/7"]),
+        allow_rule(vec!["::/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1018,8 +978,8 @@ async fn test_ipv6_cidr() {
 #[tokio::test]
 async fn test_hostname_exact_match() {
     let rules = vec![
-        allow_rule(vec!["example.com"], "example_proxy"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["example.com"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1035,8 +995,8 @@ async fn test_hostname_exact_match() {
 #[tokio::test]
 async fn test_hostname_subdomain_match() {
     let rules = vec![
-        allow_rule(vec!["example.com"], "example_proxy"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["example.com"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1062,8 +1022,8 @@ async fn test_hostname_subdomain_match() {
 async fn test_hostname_no_false_subdomain_match() {
     // malicious-example.com should NOT match example.com rule
     let rules = vec![
-        allow_rule(vec!["example.com"], "example_proxy"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["example.com"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1086,8 +1046,8 @@ async fn test_hostname_no_false_subdomain_match() {
 #[tokio::test]
 async fn test_hostname_different_tld() {
     let rules = vec![
-        allow_rule(vec!["example.com"], "example_proxy"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["example.com"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1104,14 +1064,14 @@ async fn test_hostname_different_tld() {
 #[tokio::test]
 async fn test_port_specific_rule() {
     let rules = vec![
-        allow_rule(vec!["0.0.0.0/0:443"], "https_proxy"),
-        allow_rule(vec!["0.0.0.0/0:80"], "http_proxy"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["0.0.0.0/0:443"]),
+        allow_rule(vec!["0.0.0.0/0:80"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
-    // Port 443 should match https_proxy
+    // Port 443 should match the first rule.
     let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 443);
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     match decision {
@@ -1119,7 +1079,7 @@ async fn test_port_specific_rule() {
         ConnectDecision::Block => panic!("Expected Allow"),
     }
 
-    // Port 80 should match http_proxy
+    // Port 80 should match the second rule.
     let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 80);
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     match decision {
@@ -1139,14 +1099,14 @@ async fn test_port_specific_rule() {
 #[tokio::test]
 async fn test_port_with_ip_restriction() {
     let rules = vec![
-        allow_rule(vec!["192.168.1.0/24:22"], "ssh_lan"),
-        allow_rule(vec!["0.0.0.0/0:22"], "ssh_default"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.0/24:22"]),
+        allow_rule(vec!["0.0.0.0/0:22"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
-    // LAN SSH should match ssh_lan
+    // LAN SSH should match the first rule.
     let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(192, 168, 1, 100)), 22);
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     match decision {
@@ -1154,7 +1114,7 @@ async fn test_port_with_ip_restriction() {
         ConnectDecision::Block => panic!("Expected Allow"),
     }
 
-    // External SSH should match ssh_default
+    // External SSH should match the second rule.
     let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), 22);
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     match decision {
@@ -1162,7 +1122,7 @@ async fn test_port_with_ip_restriction() {
         ConnectDecision::Block => panic!("Expected Allow"),
     }
 
-    // LAN HTTP should go to default (not ssh_lan because port doesn't match)
+    // LAN HTTP should reach the catch-all because neither SSH rule matches the port.
     let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(192, 168, 1, 100)), 80);
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     match decision {
@@ -1174,9 +1134,9 @@ async fn test_port_with_ip_restriction() {
 #[tokio::test]
 async fn test_first_rule_wins() {
     let rules = vec![
-        allow_rule(vec!["192.168.1.0/24"], "specific"),
-        allow_rule(vec!["192.168.0.0/16"], "less_specific"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.0/24"]),
+        allow_rule(vec!["192.168.0.0/16"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1203,9 +1163,9 @@ async fn test_rule_order_matters_security() {
     // SECURITY: If a block rule comes after an allow rule for overlapping ranges,
     // the allow rule takes precedence
     let rules = vec![
-        allow_rule(vec!["192.168.1.0/24"], "allowed"),
+        allow_rule(vec!["192.168.1.0/24"]),
         block_rule(vec!["192.168.0.0/16"]),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1231,7 +1191,7 @@ async fn test_rule_order_matters_security() {
 async fn test_block_rule() {
     let rules = vec![
         block_rule(vec!["192.168.1.0/24"]),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1257,7 +1217,7 @@ async fn test_block_rule() {
 async fn test_block_hostname() {
     let rules = vec![
         block_rule(vec!["blocked.com"]),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1281,7 +1241,7 @@ async fn test_block_hostname() {
 
 #[tokio::test]
 async fn test_no_default_rule_blocks() {
-    let rules = vec![allow_rule(vec!["192.168.1.0/24"], "lan")];
+    let rules = vec![allow_rule(vec!["192.168.1.0/24"])];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
@@ -1296,13 +1256,8 @@ async fn test_no_default_rule_blocks() {
 
 #[tokio::test]
 async fn test_round_robin_proxy_selection() {
-    // Note: Since ClientProxyChain now handles round-robin internally,
-    // we just verify that multiple calls succeed. Actual round-robin testing
-    // is done at the ClientProxyChain level.
-    let rules = vec![allow_rule_multi(
-        vec!["0.0.0.0/0"],
-        vec!["proxy1", "proxy2", "proxy3"],
-    )];
+    // Only repeated judging is exercised here; ClientProxyChain tests cover rotation.
+    let rules = vec![allow_rule(vec!["0.0.0.0/0"])];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
@@ -1310,9 +1265,7 @@ async fn test_round_robin_proxy_selection() {
         let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 80);
         let decision = selector.judge(location.into(), &resolver).await.unwrap();
         match decision {
-            ConnectDecision::Allow { .. } => {
-                // Round-robin selection now happens in ClientProxyChain
-            }
+            ConnectDecision::Allow { .. } => {}
             ConnectDecision::Block => panic!("Expected Allow"),
         }
     }
@@ -1320,7 +1273,7 @@ async fn test_round_robin_proxy_selection() {
 
 #[tokio::test]
 async fn test_single_proxy_no_rotation() {
-    let rules = vec![allow_rule(vec!["0.0.0.0/0"], "only_proxy")];
+    let rules = vec![allow_rule(vec!["0.0.0.0/0"])];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
@@ -1336,11 +1289,7 @@ async fn test_single_proxy_no_rotation() {
 
 #[tokio::test]
 async fn test_address_override() {
-    let rules = vec![allow_rule_with_override(
-        vec!["0.0.0.0/0"],
-        "proxy",
-        "10.0.0.1:8080",
-    )];
+    let rules = vec![allow_rule_with_override(vec!["0.0.0.0/0"], "10.0.0.1:8080")];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
@@ -1360,11 +1309,7 @@ async fn test_address_override() {
 #[tokio::test]
 async fn test_address_override_preserve_port() {
     // Override with port 0 should preserve the original port
-    let rules = vec![allow_rule_with_override(
-        vec!["0.0.0.0/0"],
-        "proxy",
-        "10.0.0.1:0",
-    )];
+    let rules = vec![allow_rule_with_override(vec!["0.0.0.0/0"], "10.0.0.1:0")];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
@@ -1384,16 +1329,13 @@ async fn test_address_override_preserve_port() {
 #[tokio::test]
 async fn test_multiple_masks_in_rule() {
     let rules = vec![
-        allow_rule(
-            vec!["192.168.1.0/24", "192.168.2.0/24", "10.0.0.0/8"],
-            "internal",
-        ),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.0/24", "192.168.2.0/24", "10.0.0.0/8"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
-    // All three ranges should match "internal"
+    // All three ranges should match the first rule.
     for ip in [
         Ipv4Addr::new(192, 168, 1, 1),
         Ipv4Addr::new(192, 168, 2, 100),
@@ -1402,9 +1344,7 @@ async fn test_multiple_masks_in_rule() {
         let location = NetLocation::new(Address::Ipv4(ip), 80);
         let decision = selector.judge(location.into(), &resolver).await.unwrap();
         match decision {
-            ConnectDecision::Allow { .. } => {
-                // assertion removed - client_proxy no longer available
-            }
+            ConnectDecision::Allow { .. } => {}
             ConnectDecision::Block => panic!("Expected Allow for {}", ip),
         }
     }
@@ -1421,11 +1361,8 @@ async fn test_multiple_masks_in_rule() {
 #[tokio::test]
 async fn test_multiple_hostnames_in_rule() {
     let rules = vec![
-        allow_rule(
-            vec!["google.com", "youtube.com", "gmail.com"],
-            "google_proxy",
-        ),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["google.com", "youtube.com", "gmail.com"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1439,9 +1376,7 @@ async fn test_multiple_hostnames_in_rule() {
         let location = NetLocation::new(Address::Hostname(hostname.to_string()), 80);
         let decision = selector.judge(location.into(), &resolver).await.unwrap();
         match decision {
-            ConnectDecision::Allow { .. } => {
-                // assertion removed - client_proxy no longer available
-            }
+            ConnectDecision::Allow { .. } => {}
             ConnectDecision::Block => panic!("Expected Allow for {}", hostname),
         }
     }
@@ -1465,8 +1400,8 @@ async fn test_empty_rules_blocks_all() {
 async fn test_ipv4_mapped_ipv6() {
     // IPv4-mapped IPv6 addresses (::ffff:192.168.1.1) should be handled correctly
     let rules = vec![
-        allow_rule(vec!["192.168.1.0/24"], "lan"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.0/24"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1485,7 +1420,7 @@ async fn test_broadcast_and_special_addresses() {
     let rules = vec![
         block_rule(vec!["255.255.255.255/32"]), // Broadcast
         block_rule(vec!["0.0.0.0/32"]),         // Unspecified
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1510,35 +1445,25 @@ async fn test_broadcast_and_special_addresses() {
 #[tokio::test]
 async fn test_case_sensitivity_hostname() {
     let rules = vec![
-        allow_rule(vec!["Example.COM"], "example_proxy"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["Example.COM"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
 
-    // Note: DNS hostnames are case-insensitive by spec, but our implementation
-    // does case-sensitive matching. This test documents current behavior.
     let location = NetLocation::new(Address::Hostname("example.com".to_string()), 80);
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     match decision {
-        ConnectDecision::Allow { .. } => {
-            // Current behavior: case-sensitive, so this goes to default
-            // If we want case-insensitive, this should be "example_proxy"
-        }
+        ConnectDecision::Allow { .. } => {}
         ConnectDecision::Block => panic!("Expected Allow"),
     }
 }
 
 #[tokio::test]
 async fn test_concurrent_access_round_robin() {
-    // Test that concurrent access to round-robin is safe (uses AtomicU32)
-    use std::sync::Arc as StdArc;
-
-    let rules = vec![allow_rule_multi(
-        vec!["0.0.0.0/0"],
-        vec!["p1", "p2", "p3", "p4"],
-    )];
-    let selector = StdArc::new(ClientProxySelector::new(rules));
+    // Concurrent judging must not panic; this does not exercise proxy rotation.
+    let rules = vec![allow_rule(vec!["0.0.0.0/0"])];
+    let selector = Arc::new(ClientProxySelector::new(rules));
     let resolver = mock_resolver();
 
     let mut handles = vec![];
@@ -1554,7 +1479,6 @@ async fn test_concurrent_access_round_robin() {
     for handle in handles {
         handle.await.unwrap();
     }
-    // If we got here without panic, concurrent access is safe
 }
 
 #[tokio::test]
@@ -1562,9 +1486,9 @@ async fn test_localhost_bypass() {
     // Common pattern: bypass proxy for localhost
     // A hostname policy before IP policies avoids a destination lookup.
     let rules = vec![
-        allow_rule(vec!["localhost"], "direct_host"), // Hostname rule first
-        allow_rule_with_override(vec!["127.0.0.0/8"], "direct", "127.0.0.1:0"),
-        allow_rule(vec!["0.0.0.0/0"], "proxy"),
+        allow_rule(vec!["localhost"]), // Hostname rule first
+        allow_rule_with_override(vec!["127.0.0.0/8"], "127.0.0.1:0"),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1577,7 +1501,7 @@ async fn test_localhost_bypass() {
         ConnectDecision::Block => panic!("Expected Allow"),
     }
 
-    // localhost hostname should use direct_host (matches hostname rule)
+    // The localhost hostname should match the first rule without DNS.
     let location = NetLocation::new(Address::Hostname("localhost".to_string()), 8080);
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     match decision {
@@ -1591,9 +1515,9 @@ async fn test_mixed_ip_and_hostname_rules() {
     // Hostname policies before IP policies can decide routing without DNS.
     let rules = vec![
         block_rule(vec!["malware.com"]),
-        allow_rule(vec!["trusted.com"], "trusted"), // Hostname rules before IP rules
-        allow_rule(vec!["192.168.0.0/16"], "lan"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["trusted.com"]), // Hostname rules before IP rules
+        allow_rule(vec!["192.168.0.0/16"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     let resolver = mock_resolver();
@@ -1603,7 +1527,7 @@ async fn test_mixed_ip_and_hostname_rules() {
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     assert!(matches!(decision, ConnectDecision::Block));
 
-    // LAN IP allowed through lan proxy
+    // The LAN IP should match the subnet rule.
     let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(192, 168, 1, 1)), 80);
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     match decision {
@@ -1611,7 +1535,7 @@ async fn test_mixed_ip_and_hostname_rules() {
         ConnectDecision::Block => panic!("Expected Allow"),
     }
 
-    // Trusted hostname allowed through trusted proxy
+    // The trusted hostname should match its domain rule.
     let location = NetLocation::new(Address::Hostname("api.trusted.com".to_string()), 443);
     let decision = selector.judge(location.into(), &resolver).await.unwrap();
     match decision {
@@ -1812,8 +1736,8 @@ fn selector_with_cache(rules: Vec<ConnectRule>) -> ClientProxySelector {
 async fn test_selector_cache_disabled_for_few_rules() {
     // With few rules, cache should be disabled by default.
     let rules = vec![
-        allow_rule(vec!["192.168.1.0/24"], "lan"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.0/24"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::new(rules);
     assert!(!selector.is_cache_enabled());
@@ -1832,8 +1756,8 @@ async fn test_selector_cache_disabled_for_few_rules() {
 async fn test_selector_cache_enabled_explicitly() {
     // Force caching even with few rules.
     let rules = vec![
-        allow_rule(vec!["192.168.1.0/24"], "lan"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.0/24"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = ClientProxySelector::with_options(rules, true);
     assert!(selector.is_cache_enabled());
@@ -1843,9 +1767,9 @@ async fn test_selector_cache_enabled_explicitly() {
 async fn test_selector_cache_enabled_with_many_rules() {
     // With many rules (>16), cache should be enabled even without DNS resolution
     let mut rules: Vec<ConnectRule> = (0..20)
-        .map(|i| allow_rule(vec![&format!("10.0.{}.0/24", i)], &format!("rule{}", i)))
+        .map(|i| allow_rule(vec![&format!("10.0.{}.0/24", i)]))
         .collect();
-    rules.push(allow_rule(vec!["0.0.0.0/0"], "default"));
+    rules.push(allow_rule(vec!["0.0.0.0/0"]));
 
     let selector = ClientProxySelector::new(rules);
     assert!(selector.is_cache_enabled());
@@ -1855,8 +1779,8 @@ async fn test_selector_cache_enabled_with_many_rules() {
 async fn test_selector_cache_hit() {
     // Use selector_with_cache to ensure caching is enabled for this test
     let rules = vec![
-        allow_rule(vec!["192.168.1.0/24"], "lan"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.1.0/24"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = selector_with_cache(rules);
     let resolver = mock_resolver();
@@ -1892,7 +1816,7 @@ async fn test_selector_cache_hit() {
 async fn test_selector_cache_block_decision() {
     let rules = vec![
         block_rule(vec!["192.168.1.0/24"]),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = selector_with_cache(rules);
     let resolver = mock_resolver();
@@ -1914,7 +1838,7 @@ async fn test_selector_cache_block_decision() {
 
 #[tokio::test]
 async fn test_selector_clear_cache() {
-    let rules = vec![allow_rule(vec!["0.0.0.0/0"], "default")];
+    let rules = vec![allow_rule(vec!["0.0.0.0/0"])];
     let selector = selector_with_cache(rules);
     let resolver = mock_resolver();
 
@@ -1932,7 +1856,7 @@ async fn test_selector_clear_cache() {
 
 #[tokio::test]
 async fn test_selector_judge_uncached() {
-    let rules = vec![allow_rule(vec!["0.0.0.0/0"], "default")];
+    let rules = vec![allow_rule(vec!["0.0.0.0/0"])];
     let selector = selector_with_cache(rules);
     let resolver = mock_resolver();
 
@@ -1955,9 +1879,9 @@ async fn test_selector_judge_uncached() {
 #[tokio::test]
 async fn test_selector_cache_different_destinations() {
     let rules = vec![
-        allow_rule(vec!["192.168.0.0/16"], "lan"),
-        allow_rule(vec!["10.0.0.0/8"], "private"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["192.168.0.0/16"]),
+        allow_rule(vec!["10.0.0.0/8"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = selector_with_cache(rules);
     let resolver = mock_resolver();
@@ -2008,8 +1932,8 @@ async fn test_selector_cache_different_destinations() {
 #[tokio::test]
 async fn test_selector_cache_hostname_destinations() {
     let rules = vec![
-        allow_rule(vec!["google.com"], "google"),
-        allow_rule(vec!["0.0.0.0/0"], "default"),
+        allow_rule(vec!["google.com"]),
+        allow_rule(vec!["0.0.0.0/0"]),
     ];
     let selector = selector_with_cache(rules);
     let resolver = mock_resolver();
@@ -2046,7 +1970,7 @@ async fn test_selector_cache_hostname_destinations() {
 #[tokio::test]
 async fn test_selector_cache_with_custom_size() {
     // Force caching with a custom capacity.
-    let rules = vec![allow_rule(vec!["0.0.0.0/0"], "default")];
+    let rules = vec![allow_rule(vec!["0.0.0.0/0"])];
     let selector = ClientProxySelector::with_options_and_cache_size(rules, true, 5);
     let resolver = mock_resolver();
 
@@ -2072,10 +1996,8 @@ async fn test_selector_cache_with_custom_size() {
 
 #[tokio::test]
 async fn test_selector_concurrent_cache_access() {
-    use std::sync::Arc as StdArc;
-
-    let rules = vec![allow_rule(vec!["0.0.0.0/0"], "default")];
-    let selector = StdArc::new(selector_with_cache(rules));
+    let rules = vec![allow_rule(vec!["0.0.0.0/0"])];
+    let selector = Arc::new(selector_with_cache(rules));
     let resolver = mock_resolver();
 
     // Spawn multiple tasks accessing the cache concurrently
@@ -2109,10 +2031,10 @@ async fn test_selector_concurrent_cache_access() {
 async fn test_selector_cache_preserves_rule_priority() {
     // Ensure caching doesn't break rule priority
     let rules = vec![
-        allow_rule(vec!["192.168.1.100/32"], "specific"), // Rule 0
-        allow_rule(vec!["192.168.1.0/24"], "subnet"),     // Rule 1
-        allow_rule(vec!["192.168.0.0/16"], "network"),    // Rule 2
-        allow_rule(vec!["0.0.0.0/0"], "default"),         // Rule 3
+        allow_rule(vec!["192.168.1.100/32"]), // Rule 0
+        allow_rule(vec!["192.168.1.0/24"]),   // Rule 1
+        allow_rule(vec!["192.168.0.0/16"]),   // Rule 2
+        allow_rule(vec!["0.0.0.0/0"]),        // Rule 3
     ];
     let selector = selector_with_cache(rules);
     let resolver = mock_resolver();
@@ -2128,7 +2050,7 @@ async fn test_selector_cache_preserves_rule_priority() {
         _ => panic!("Expected specific"),
     }
 
-    // Verify from cache - should still be "specific"
+    // The cached decision should still allow the specific IP.
     let decision_cached = selector
         .judge(loc_specific.into(), &resolver)
         .await
