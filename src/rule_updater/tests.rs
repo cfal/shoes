@@ -366,7 +366,7 @@ async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str>
         &mut http::DownloadState::default(),
     )
     .await?;
-    validate_staged(configs(source), &source.path, &staged).await?;
+    validate_staged(configs(source), &source.path, &staged.install).await?;
     Ok(
         if staged.install.finish_async(staged.digest).await?.changed() {
             "updated"
@@ -1381,6 +1381,37 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
     }
 }
 
+#[test]
+fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    write_rule(&path, OLD);
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let mut source = source("https://example.com/first.json", &path);
+    let mut previous = Refresh::new(configs(&source), std::slice::from_ref(&source), None).unwrap();
+    previous.scheduled[0].due = Instant::now() + Duration::from_secs(3600);
+    previous.scheduled[0].failures = 3;
+
+    let next = Refresh::new(
+        configs(&source),
+        std::slice::from_ref(&source),
+        Some(&previous),
+    )
+    .unwrap();
+    assert_eq!(next.scheduled[0].due, previous.scheduled[0].due);
+    assert_eq!(next.scheduled[0].failures, 3);
+
+    source.url = Some("https://example.com/second.json".into());
+    let changed = Refresh::new(configs(&source), &[source], Some(&previous)).unwrap();
+    assert!(changed.scheduled[0].due <= Instant::now());
+    assert_eq!(changed.scheduled[0].failures, 0);
+}
+
 #[tokio::test]
 async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
     let dir = directory();
@@ -1451,7 +1482,7 @@ async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
         ]}
     ]))
     .unwrap();
-    let validated = validate_staged(config.clone(), &first.path, &staged)
+    let validated = validate_staged(config.clone(), &first.path, &staged.install)
         .await
         .unwrap();
     let Config::Server(server) = &validated.configs[0] else {
@@ -1472,7 +1503,7 @@ async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
     assert_eq!(std::fs::read(&first.path).unwrap(), b"invalid old cache");
 
     std::fs::remove_file(&second.path).unwrap();
-    let error = validate_staged(config, &first.path, &staged)
+    let error = validate_staged(config, &first.path, &staged.install)
         .await
         .err()
         .unwrap();

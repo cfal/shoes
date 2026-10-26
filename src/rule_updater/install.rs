@@ -258,7 +258,7 @@ impl Install {
         Outcome::Updated
     }
 
-    pub(super) fn unchanged(&self, digest: blake3::Hash) -> io::Result<bool> {
+    fn unchanged(&self, digest: blake3::Hash) -> io::Result<bool> {
         self.check_ownership()?;
         Ok(Some(digest) == self.old_digest)
     }

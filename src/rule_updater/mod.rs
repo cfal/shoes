@@ -75,9 +75,9 @@ async fn stage(
 async fn validate_staged(
     configs: Vec<Config>,
     path: &Path,
-    staged: &Staged,
+    install: &Install,
 ) -> io::Result<ValidatedConfigs> {
-    let input = (path.to_owned(), staged.install.file.try_clone()?);
+    let input = (path.to_owned(), install.file.try_clone()?);
     let validated = crate::config::compile_configs_with_input(configs, Some(input))
         .await
         .map_err(|error| {
@@ -111,14 +111,14 @@ async fn refresh_source(
     state: &mut http::DownloadState,
 ) -> io::Result<bool> {
     let install = Install::open_async(&source.path).await?;
-    let mut staged = stage(source, install, dns, global, Limits::default(), state).await?;
-    let (install, unchanged) = staged.install.check_unchanged(staged.digest).await?;
-    staged.install = install;
+    let Staged { install, digest } =
+        stage(source, install, dns, global, Limits::default(), state).await?;
+    let (install, unchanged) = install.check_unchanged(digest).await?;
     if unchanged {
         return Ok(false);
     }
-    validate_staged(configs.to_vec(), &source.path, &staged).await?;
-    Ok(staged.install.finish_async(staged.digest).await?.changed())
+    validate_staged(configs.to_vec(), &source.path, &install).await?;
+    Ok(install.finish_async(digest).await?.changed())
 }
 
 /// Polled by the process select loop. Dropping that future cancels the HTTP
@@ -141,18 +141,23 @@ impl Refresh {
                 previous
                     .scheduled
                     .iter()
-                    .find(|item| item.identity == identity)
+                    .find(|item| item.source.path == source.path && item.identity == identity)
             });
             let interval = source.interval()?;
-            let remaining = std::fs::metadata(&source.path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
-                .map_or(Duration::ZERO, |age| interval.saturating_sub(age));
+            let due = if let Some(prior) = prior {
+                prior.due
+            } else {
+                let remaining = std::fs::metadata(&source.path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+                    .map_or(Duration::ZERO, |age| interval.saturating_sub(age));
+                Instant::now() + remaining
+            };
             scheduled.push(Scheduled {
                 identity,
                 source: source.clone(),
-                due: prior.map_or_else(|| Instant::now() + remaining, |item| item.due),
+                due,
                 failures: prior.map_or(0, |item| item.failures),
                 download: prior
                     .map_or_else(http::DownloadState::default, |item| item.download.clone()),
