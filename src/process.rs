@@ -763,6 +763,33 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn validation_errors_preserve_io_kind_and_file_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let missing = directory.path().join("missing.pem");
+        let yaml = serde_yaml::to_string(&serde_json::json!([
+            {"pem": "missing", "path": missing}
+        ]))
+        .unwrap();
+        std::fs::write(&path, yaml).unwrap();
+        let paths = [path.to_str().unwrap().to_owned()];
+
+        let Err(error) = load_validated(&paths, &mut |_, _| {}).await else {
+            panic!("missing PEM file must reject");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains(&format!("Could not validate config files {paths:?}:")),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("Failed to read PEM file"),
+            "{diagnostic}"
+        );
+    }
+
+    #[tokio::test]
     async fn unchanged_tcp_socket_queues_connections_between_generations() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         tokio::time::timeout(Duration::from_secs(5), async {
