@@ -76,7 +76,7 @@ async fn nested_parse_errors_include_source_and_field_context_without_credential
         ),
     ] {
         std::fs::write(&path, format!("{prefix}{entry}")).unwrap();
-        let Err(error) = load_configs(&vec![path.to_str().unwrap().into()]).await else {
+        let Err(error) = load_configs(&[path.to_str().unwrap().into()]).await else {
             panic!("invalid configuration must reject");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -186,7 +186,7 @@ async fn representative_examples_pass_native_validation() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples")
             .join(example);
-        let configs = load_configs(&vec![path.to_str().unwrap().into()])
+        let configs = load_configs(&[path.to_str().unwrap().into()])
             .await
             .unwrap_or_else(|error| panic!("{example}: {error}"));
         let (configs, _) = convert_cert_paths(configs)

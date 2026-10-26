@@ -40,7 +40,7 @@ fn check_diagnostics_include_file_and_nested_context_without_credentials() {
     );
     for (config, context) in [
         (
-            r#"- rule_group: imported
+            r#"- rule_source_group: imported
   rules:
     - first.srs
     - path: [VALUE_SECRET_SENTINEL]
