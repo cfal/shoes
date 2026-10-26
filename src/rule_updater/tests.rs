@@ -2125,7 +2125,7 @@ async fn caches_cannot_overwrite_config_pem_state_or_other_source_files() {
     // Declaring-file protection runs before any rule decoding or networking.
     std::fs::write(&path, serde_json::to_vec(&configs(&source)).unwrap()).unwrap();
     assert!(
-        crate::config::load_configs(&vec![path.to_str().unwrap().into()])
+        crate::config::load_configs(&[path.to_str().unwrap().into()])
             .await
             .err()
             .unwrap()
