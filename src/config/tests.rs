@@ -101,6 +101,47 @@ protocol: {type: socks}"#,
 }
 
 #[test]
+fn loader_preserves_yaml_error_locations() {
+    for prefix in ["# lead\n", "---\n", "\n", ""] {
+        for invalid in [
+            "- address: '127.0.0.1:1080'\n  tcp_settings: [\n",
+            "- global_limits: {}\n  global_limits: {}\n",
+            "- global_limits: {}\n- global_limits: {}\n  global_limits: {}\n",
+        ] {
+            let yaml = format!("{prefix}{invalid}");
+            let Err(expected) = serde_yaml::from_str::<Vec<super::Config>>(&yaml) else {
+                panic!("invalid YAML must reject");
+            };
+            let Err(error) = parse_config_yaml(&yaml) else {
+                panic!("invalid YAML must reject");
+            };
+            assert_eq!(error.to_string(), expected.to_string());
+            let expected = expected.location().unwrap();
+            let actual = error.location().unwrap();
+            assert_eq!(actual.line(), expected.line());
+            assert_eq!(actual.column(), expected.column());
+        }
+    }
+}
+
+#[test]
+fn loader_reports_first_invalid_entry_before_decoding_later_entries() {
+    let yaml = r#"- global_limits: {unsupported_policy: true}
+- global_limits: {}
+  global_limits: {}
+"#;
+    let Err(error) = parse_config_yaml(yaml) else {
+        panic!("invalid configuration must reject");
+    };
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("config[0]"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("unknown field `unsupported_policy`"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
 fn tcp_settings_reject_unknown_fields_for_servers_and_clients() {
     for yaml in [
         r#"- address: '127.0.0.1:1080'

@@ -45,11 +45,11 @@ fn parse_config_yaml(config_str: &str) -> Result<Vec<Config>, serde_yaml::Error>
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
             let mut configs = Vec::new();
-            // Custom Value-based deserializers can lose YAML's entry location.
-            while let Some(config) = seq
-                .next_element()
-                .map_err(|error| A::Error::custom(format!("config[{}]: {error}", configs.len())))?
-            {
+            // Keep YAML locations intact; only Config decoding needs an added index.
+            while let Some(value) = seq.next_element::<serde_yaml::Value>()? {
+                let config = serde_yaml::from_value(value).map_err(|error| {
+                    A::Error::custom(format!("config[{}]: {error}", configs.len()))
+                })?;
                 configs.push(config);
             }
             Ok(configs)
