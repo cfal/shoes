@@ -323,29 +323,60 @@ concrete path. If none is healthy, never-sampled paths may be tried in order.
 Failed and stale paths are excluded; all-down returns an error, never implicit
 DIRECT. A sample becomes stale after three intervals plus the probe timeout.
 Probes skip paths excluded by manual selector choices, rechecking those choices
-after admission. Manual choices are never rewritten or persisted by health
-checking. Changing a manual choice conservatively invalidates samples until
-checked again. A fallback containing a selector may choose its next member, but
+after admission. Reselecting a skipped path schedules a check without waiting
+another interval, still subject to shared admission and transport deadlines.
+Previously sampled paths that became stale while unselected remain excluded
+until a new check succeeds; reselection does not make an old sample Unknown.
+New flows can therefore fail closed while rechecks are pending or locally blocked.
+Manual choices are never rewritten or persisted by health checking.
+Resolver-chain selector changes trigger rechecks without erasing
+existing samples: DNS caches and retained connections are not concrete-path
+identity. Relevant selector changes fence in-flight probe results, including
+A-to-B-to-A changes; unrelated selectors and inactive nested branches do not.
+Fixed outer path choices do not erase samples. DNS-chain checks use the same
+configured bootstrap resolver as forwarding.
+A fallback-checked chain cannot contain WireGuard whose `peer_client_chain` has
+more than one member at any hop, including recursively nested WireGuard carriers.
+All configured alternatives count, even branches that cannot carry UDP. It also
+cannot contain NaiveProxy (including wrapped NaiveProxy) after a hop with multiple
+members: its retained H2 session is not scoped to the selected prefix. These
+combinations are rejected, not probed approximately. Fixed WireGuard carriers,
+NaiveProxy at hop 0 or behind a single fixed prefix, and ordinary chains without
+fallback remain supported. The restrictions also cover DNS chains and unused
+groups available to controller/URL-test probes; resolver-only dependencies do
+not count as the fallback chain's transport path.
+A fallback containing a selector may choose its next member, but
 never another branch inside
-that selector. When composed with URL-test groups, failed/stale fallback paths
-are excluded before URL-test selection among eligible members. Round-robin pools
-outside fallback retain their existing behavior.
+that selector. Fallback member and healthy-before-unknown priorities are resolved
+across complete eligible paths before URL-test latency and round-robin pool
+choices. Paths outside each fallback branch remain eligible, so an unrelated
+round-robin branch is not globally overridden by health.
 
 Checks send HEAD through the complete configured TCP chain, require the expected
 status, verify HTTPS certificates, and do not follow redirects. They share the
 controller and URL-test probe engine and its 16 concurrent permits. The total deadline includes
 admission, DNS, connect, TLS and response headers. Admission exhaustion or local
-resource shortages do not mark a path failed. Successful and failed checks both
+resource shortages do not mark a path failed; expiry after queued admission
+preserves the previous sample without refreshing its timestamp. Successful and failed checks both
 wait the configured interval, jittered by +/-10%, before retrying. Unused groups
 do not start transports; checks start when a runtime chain is instantiated.
+Controller delay requests and URL-test targets can instantiate additional fallback
+chains. Their checks last while the cached probe connector lives (normally the
+generation) and obey that target's selectors, not selectors enclosing it in
+routing rules. They share the same check and concurrency limits.
 
 Health is generation-local and keyed by canonical full-path configuration, resolver
 identity, selector constraints and probe settings, not names or member positions.
 Equivalent checks share one sample; different prefixes/endpoints do not. Each
 chain is limited to 256 concrete paths and each generation to 1024 active checks. Large pool products are
-rejected instead of spawning unbounded probes. Saturation can make samples stale;
+rejected instead of spawning unbounded probes. Due checks are admitted oldest-first
+so repeated checks cannot indefinitely overtake waiting paths. Saturation can make samples stale;
 choose intervals/timeouts that fit the shared budget. Reload cancels and joins old
-checks before starting the new generation. Samples are not persisted.
+checks before starting the new generation. Draining sessions keep the old
+generation's health snapshot at cancellation, without further probes or aging;
+rollback/resume restores normal freshness checks. Samples are not persisted.
+Pause time counts toward sample age after resume, so a long rejected activation
+can require successful rechecks before the resumed fallback accepts new flows.
 
 Checks use the existing probe destination restrictions (including loopback,
 link-local and synthetic Fake-IP protection). Forbidden literal URLs, including
