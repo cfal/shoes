@@ -7,25 +7,34 @@ export function changedLines(diff) {
   let file;
   let inHunk = false;
   for (const line of diff.split('\n')) {
-    if (line.startsWith('diff --git ')) { file = undefined; inHunk = false; }
+    if (line.startsWith('diff --git ')) {
+      file = undefined;
+      inHunk = false;
+    }
     if (line.startsWith('+++ ') && !inHunk) {
-      if (line === '+++ /dev/null') { file = null; continue; }
+      if (line === '+++ /dev/null') {
+        file = null;
+        continue;
+      }
       if (!line.startsWith('+++ b/')) throw Error('unsupported quoted diff path');
       file = line.slice(6);
     }
     const match = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
-    if (match) {
-      inHunk = true;
-      if (file === undefined) throw Error('hunk without file');
-      const start = Number(match[1]), count = Number(match[2] ?? 1);
-      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(count) || count > 1000000) throw Error('invalid hunk');
-      if (file === null) {
-        if (count !== 0) throw Error('deleted file has added lines');
-        continue;
-      }
-      if (!files.has(file)) files.set(file, new Set());
-      for (let i = start; i < start + count; i++) files.get(file).add(i);
+    if (!match) continue;
+    inHunk = true;
+    if (file === undefined) throw Error('hunk without file');
+    const start = Number(match[1]);
+    const count = Number(match[2] ?? 1);
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(count) || count > 1000000) {
+      throw Error('invalid hunk');
     }
+    if (file === null) {
+      if (count !== 0) throw Error('deleted file has added lines');
+      continue;
+    }
+    if (!files.has(file)) files.set(file, new Set());
+    const changed = files.get(file);
+    for (let number = start; number < start + count; number++) changed.add(number);
   }
   return files;
 }
@@ -40,17 +49,23 @@ export function coverageLines(lcov, root = process.cwd()) {
       if (!files.has(file)) files.set(file, new Map());
       lines = files.get(file);
     } else if (line.startsWith('DA:')) {
-      const m = /^DA:([1-9]\d*),(\d+)(?:,[^,]+)?$/.exec(line);
-      if (!lines || !m || !Number.isSafeInteger(Number(m[1])) || !Number.isSafeInteger(Number(m[2]))) {
+      const match = /^DA:([1-9]\d*),(\d+)(?:,[^,]+)?$/.exec(line);
+      if (!lines || !match) throw Error('invalid LCOV line count');
+      const number = Number(match[1]);
+      const count = Number(match[2]);
+      if (!Number.isSafeInteger(number) || !Number.isSafeInteger(count)) {
         throw Error('invalid LCOV line count');
       }
-      lines.set(Number(m[1]), Math.max(lines.get(Number(m[1])) || 0, Number(m[2])));
+      const previous = lines.get(number) || 0;
+      lines.set(number, Math.max(previous, count));
     } else if (line === 'end_of_record') {
       if (!lines) throw Error('LCOV terminator without file');
       lines = undefined;
     }
   }
-  if (lines || files.size === 0 || ![...files.values()].some(m => m.size > 0)) throw Error('empty or incomplete coverage');
+  if (lines || ![...files.values()].some(counts => counts.size > 0)) {
+    throw Error('empty or incomplete coverage');
+  }
   return files;
 }
 
@@ -58,22 +73,38 @@ export function changedCoverage(diff, lcov, root) {
   const coverage = coverageLines(lcov, root);
   const files = [...changedLines(diff)].map(([file, changed]) => {
     const counts = coverage.get(file);
-    return { file, changed_lines: changed.size, instrumented: Boolean(counts),
-      covered: [...changed].filter(n => counts?.get(n) > 0),
-      uncovered: [...changed].filter(n => counts?.get(n) === 0),
-      not_in_report: [...changed].filter(n => !counts?.has(n)) };
+    const covered = [];
+    const uncovered = [];
+    const notInReport = [];
+    for (const number of changed) {
+      if (!counts?.has(number)) notInReport.push(number);
+      else if (counts.get(number) > 0) covered.push(number);
+      else uncovered.push(number);
+    }
+    return {
+      file,
+      changed_lines: changed.size,
+      instrumented: Boolean(counts),
+      covered,
+      uncovered,
+      not_in_report: notInReport,
+    };
   });
-  const covered = files.reduce((n, f) => n + f.covered.length, 0);
-  const executable = covered + files.reduce((n, f) => n + f.uncovered.length, 0);
-  return { scope: 'Linux unit/process only; no peers, privileged, FFI or device coverage',
-    changed_executable_lines: executable, covered,
+  const covered = files.reduce((total, file) => total + file.covered.length, 0);
+  const executable = covered + files.reduce((total, file) => total + file.uncovered.length, 0);
+  return {
+    scope: 'Linux unit/process only; no peers, privileged, FFI or device coverage',
+    changed_executable_lines: executable,
+    covered,
     percent: executable ? 100 * covered / executable : null,
     note: 'not_in_report means non-executable OR uninstrumented, never implicitly covered. Untracked files are not in git diff.',
-    files };
+    files,
+  };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [diff, lcov] = process.argv.slice(2);
   if (!lcov) throw Error('usage: node scripts/coverage-lines.mjs CHANGES.diff COVERAGE.lcov');
-  console.log(JSON.stringify(changedCoverage(fs.readFileSync(diff, 'utf8'), fs.readFileSync(lcov, 'utf8')), null, 2));
+  const report = changedCoverage(fs.readFileSync(diff, 'utf8'), fs.readFileSync(lcov, 'utf8'));
+  console.log(JSON.stringify(report, null, 2));
 }
