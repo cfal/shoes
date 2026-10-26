@@ -1,0 +1,787 @@
+use super::*;
+use serde_json::{Value, json};
+
+fn key(byte: u8) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode([byte; 32])
+}
+
+fn client() -> Value {
+    use base64::Engine;
+    let public = PublicKey::from(&StaticSecret::from([41; 32]));
+    json!({
+        "address": "vpn.example:51820",
+        "protocol": {
+            "type": "wireguard", "private_key": key(42),
+            "public_key": base64::engine::general_purpose::STANDARD.encode(public.as_bytes()),
+            "addresses": ["10.77.0.2/32", "fd77::2/128"],
+        },
+    })
+}
+
+fn server() -> Value {
+    use base64::Engine;
+    let public = PublicKey::from(&StaticSecret::from([42; 32]));
+    json!({
+        "address": "[::]:51820",
+        "protocol": {
+            "type": "wireguard", "private_key": key(41), "addresses": ["10.77.0.1/32"],
+            "peers": [{"public_key": base64::engine::general_purpose::STANDARD.encode(public.as_bytes()),
+                       "allowed_ips": ["10.77.0.2/32"]}],
+        },
+        "rules": "block-all",
+    })
+}
+
+#[test]
+fn servers_keep_inbound_sniff_setting() {
+    for sniff in [false, true] {
+        let mut config = server();
+        config["sniff"] = json!(sniff);
+        let validated = validate(json!([config])).unwrap();
+        let inbound = validated.wireguard_endpoints[0].inbound.as_ref().unwrap();
+        assert_eq!(inbound.sniff, sniff);
+    }
+}
+
+#[test]
+fn server_names_and_public_keys_have_separate_stable_identities() {
+    let original = validate(json!([server()]))
+        .unwrap()
+        .wireguard_endpoints
+        .remove(0)
+        .id;
+    assert!(original.starts_with("server:key:"));
+    let mut unnamed = server();
+    unnamed["protocol"]["wireguard_name"] = json!("");
+    let mut equivalent_key = [41; 32];
+    equivalent_key[0] ^= 7;
+    equivalent_key[31] ^= 128;
+    use base64::Engine;
+    unnamed["protocol"]["private_key"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(equivalent_key));
+    assert_eq!(
+        validate(json!([unnamed])).unwrap().wireguard_endpoints[0].id,
+        original
+    );
+    let mut blank = server();
+    blank["protocol"]["wireguard_name"] = Value::Null;
+    assert_eq!(
+        validate(json!([blank])).unwrap().wireguard_endpoints[0].id,
+        original
+    );
+
+    let mut named = server();
+    named["address"] = json!("[::]:51821");
+    named["protocol"]["wireguard_name"] = json!(original.strip_prefix("server:key:").unwrap());
+    let validated = validate(json!([server(), named.clone()])).unwrap();
+    assert_ne!(
+        validated.wireguard_endpoints[0].id,
+        validated.wireguard_endpoints[1].id
+    );
+    let expected = validated.wireguard_endpoints[1].id.clone();
+    named["protocol"]["private_key"] = json!(key(44));
+    let protocol: ServerProxyConfig = serde_yaml::from_str(&named["protocol"].to_string()).unwrap();
+    let roundtrip = serde_yaml::to_string(&protocol).unwrap();
+    let ServerProxyConfig::Wireguard(protocol) = serde_yaml::from_str(&roundtrip).unwrap() else {
+        panic!("expected WireGuard protocol");
+    };
+    assert_eq!(protocol.server_id(), expected);
+    let validated = validate(json!([named])).unwrap();
+    assert_eq!(validated.wireguard_endpoints[0].id, expected);
+}
+
+#[test]
+fn server_identities_cannot_turn_private_dns_references_into_urls() {
+    let mut identities = HashSet::new();
+    for name in [
+        "region://gateway",
+        "//edge",
+        "/",
+        "%2F",
+        "gateway",
+        "Gateway",
+    ] {
+        for fake_ip in [false, true] {
+            let mut config = server();
+            config["protocol"]["wireguard_name"] = json!(name);
+            config["dns"] = json!({"fake_ip": fake_ip});
+            let validated = validate(json!([config])).unwrap();
+            let device = &validated.wireguard_endpoints[0];
+            assert!(!device.id.contains('/'));
+            if fake_ip {
+                assert!(identities.insert(device.id.clone()));
+            }
+            assert_eq!(
+                device
+                    .inbound
+                    .as_ref()
+                    .unwrap()
+                    .dns
+                    .as_ref()
+                    .unwrap()
+                    .resolved_group(),
+                Some(format!("__inline_fake_dns:wireguard:{}", device.id).as_str())
+            );
+        }
+    }
+    for fake_ip in [false, true] {
+        let mut config = server();
+        config["protocol"]["private_key"] = json!("CCUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        config["dns"] = json!({"fake_ip": fake_ip});
+        let validated = validate(json!([config])).unwrap();
+        let device = &validated.wireguard_endpoints[0];
+        assert_eq!(
+            device.id,
+            "server:key:__326N9SoT-V7q8es5GvY-Pop9oC_6MG7LMYJCNWgTs"
+        );
+        assert_eq!(
+            device
+                .inbound
+                .as_ref()
+                .unwrap()
+                .dns
+                .as_ref()
+                .unwrap()
+                .resolved_group(),
+            Some(format!("__inline_fake_dns:wireguard:{}", device.id).as_str())
+        );
+    }
+}
+
+#[test]
+fn duplicate_server_identities_reject_with_or_without_fake_dns() {
+    for name in [None, Some(""), Some("gateway")] {
+        for fake_ip in [None, Some(false), Some(true)] {
+            let mut first = server();
+            if let Some(name) = name {
+                first["protocol"]["wireguard_name"] = json!(name);
+            }
+            if let Some(fake_ip) = fake_ip {
+                first["dns"] = json!({"fake_ip":fake_ip});
+            }
+            let mut second = first.clone();
+            second["address"] = json!("[::]:51821");
+            if name == Some("gateway") {
+                second["protocol"]["private_key"] = json!(key(44));
+            }
+            let error = validate(json!([first, second])).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate WireGuard server identity"),
+                "{error}"
+            );
+            assert!(!error.to_string().contains(&key(41)));
+        }
+    }
+    let mut second = server();
+    second["protocol"]["wireguard_name"] = json!("other");
+    let error = validate(json!([server(), second])).err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate WireGuard server listen address"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn server_private_dns_ownership_survives_reordering_clients_and_key_rotation() {
+    use crate::dns::{build_dns_registry, build_dns_registry_reusing};
+
+    let mut first = server();
+    first["protocol"]["wireguard_name"] = json!("first");
+    first["dns"] = json!({"fake_ip":true});
+    let mut second = first.clone();
+    second["address"] = json!("[::]:51821");
+    second["protocol"]["wireguard_name"] = json!("second");
+    let initial = validate(json!([first.clone(), second.clone()])).unwrap();
+    let group_names: Vec<_> = initial
+        .wireguard_endpoints
+        .iter()
+        .map(|device| {
+            let group = device
+                .inbound
+                .as_ref()
+                .unwrap()
+                .dns
+                .as_ref()
+                .unwrap()
+                .resolved_group()
+                .unwrap();
+            assert_eq!(group, format!("__inline_fake_dns:wireguard:{}", device.id));
+            group.to_owned()
+        })
+        .collect();
+    let mut registry = build_dns_registry(initial.dns_groups).await.unwrap();
+    let mut mappings = Vec::new();
+    for (group, hostname) in group_names.iter().zip(["first.example", "second.example"]) {
+        let context = registry
+            .get_by_name(group)
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        mappings.push((
+            group.clone(),
+            hostname,
+            context.allocate(hostname, false).unwrap(),
+        ));
+    }
+    first["protocol"]["private_key"] = json!(key(44));
+    for enabled in [true, false, true] {
+        first["dns"]["fake_ip"] = json!(enabled);
+        second["dns"]["fake_ip"] = json!(enabled);
+        let mut configs = copies(client());
+        configs
+            .as_array_mut()
+            .unwrap()
+            .extend([second.clone(), first.clone()]);
+        let validated = validate(configs).unwrap();
+        assert!(
+            validated
+                .wireguard_endpoints
+                .iter()
+                .any(|device| device.inbound.is_none())
+        );
+        for device in validated
+            .wireguard_endpoints
+            .iter()
+            .filter(|device| device.inbound.is_some())
+        {
+            let group = device
+                .inbound
+                .as_ref()
+                .unwrap()
+                .dns
+                .as_ref()
+                .unwrap()
+                .resolved_group()
+                .unwrap();
+            let index = match device.listen.unwrap().port() {
+                51820 => 0,
+                51821 => 1,
+                port => panic!("unexpected server port {port}"),
+            };
+            assert_eq!(group, group_names[index]);
+            assert_eq!(group, format!("__inline_fake_dns:wireguard:{}", device.id));
+        }
+        let next = build_dns_registry_reusing(
+            validated.dns_groups,
+            crate::resources::limits(),
+            Some(&registry),
+        )
+        .await
+        .unwrap();
+        for (group, hostname, ip) in &mappings {
+            let context = next.get_by_name(group).unwrap().fake_dns_context();
+            if enabled {
+                assert_eq!(
+                    context.unwrap().restore(*ip).unwrap().as_deref(),
+                    Some(*hostname)
+                );
+            } else {
+                assert!(context.is_none());
+            }
+        }
+        registry = next;
+    }
+}
+
+#[test]
+fn proxied_servers_with_shared_keys_require_distinct_names() {
+    let mut first = server();
+    first.as_object_mut().unwrap().remove("address");
+    first["protocol"]["peer_client_chain"] = json!("direct");
+    first["protocol"]["peers"][0]["endpoint"] = json!("peer.example:51820");
+    first["protocol"]["peers"][0]["persistent_keepalive"] = json!(25);
+    let mut second = first.clone();
+    assert!(
+        validate(json!([first, second]))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("duplicate WireGuard server identity")
+    );
+    first["protocol"]["wireguard_name"] = json!("first");
+    second["protocol"]["wireguard_name"] = json!("second");
+    let validated = validate(json!([first, second])).unwrap();
+    assert_eq!(validated.wireguard_endpoints[0].id, "server:name:Zmlyc3Q");
+    assert_eq!(validated.wireguard_endpoints[1].id, "server:name:c2Vjb25k");
+}
+
+#[test]
+fn servers_parse_literal_binds_and_reject_duplicates_and_implicit_policy() {
+    for address in ["0.0.0.0:51820", "[::]:51820", "[fe80::1%3]:51820"] {
+        let mut config = server();
+        config["address"] = json!(address);
+        let validated = validate(json!([config])).unwrap();
+        assert!(validated.configs.is_empty());
+        assert_eq!(
+            validated.wireguard_endpoints[0].listen,
+            Some(address.parse().unwrap())
+        );
+    }
+    assert!(
+        validate(json!([server(), server()]))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("duplicate")
+    );
+    for address in [
+        json!("0.0.0.0:0"),
+        json!("[::]:0"),
+        json!("[fe80::1%3]:0"),
+        json!("localhost:51820"),
+        json!("127.0.0.1:51820-51821"),
+        json!(["127.0.0.1:51820", "127.0.0.1:51821"]),
+    ] {
+        let mut config = server();
+        config["address"] = address;
+        assert!(validate(json!([config])).is_err());
+    }
+    for rules in [Value::Null, json!([])] {
+        let mut config = server();
+        config["rules"] = rules;
+        assert!(
+            validate(json!([config]))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("WireGuard server requires nonempty explicit rules")
+        );
+    }
+    let mut config = server();
+    config.as_object_mut().unwrap().remove("rules");
+    assert!(validate(json!([config])).is_err());
+}
+
+#[test]
+fn empty_rule_groups_are_rejected_during_deserialization() {
+    let error = serde_yaml::from_str::<super::super::groups::RuleConfigGroup>(
+        "rule_group: empty\nrules: []\n",
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("rule group cannot be empty"),
+        "{error}"
+    );
+}
+
+#[test]
+fn servers_reject_conflicting_bind_fields() {
+    for fields in [
+        json!({"address": "127.0.0.1:51820", "addresses": ["[::]:51820", "127.0.0.1:51821"]}),
+        json!({"address": "127.0.0.1:51820", "path": "/unused.sock"}),
+        json!({"addresses": ["[::]:51820"], "path": "/unused.sock"}),
+    ] {
+        let mut config = server();
+        let object = config.as_object_mut().unwrap();
+        object.remove("address");
+        object.extend(fields.as_object().unwrap().clone());
+        assert!(validate(json!([config])).is_err(), "accepted {fields}");
+    }
+}
+
+#[test]
+fn servers_reject_port_range_syntax_for_a_single_distinct_port() {
+    for address in [
+        "127.0.0.1:51820-51820",
+        "127.0.0.1:51820,51820",
+        "[::]:51820-51820",
+        "[fe80::1%3]:51820,51820",
+    ] {
+        let mut config = server();
+        config["address"] = json!(address);
+        assert!(validate(json!([config])).is_err(), "accepted {address}");
+    }
+}
+
+#[test]
+fn proxied_servers_roundtrip_without_a_listener_and_require_return_mappings() {
+    let mut config = server();
+    config.as_object_mut().unwrap().remove("address");
+    config["protocol"]["peer_client_chain"] = json!("direct");
+    config["protocol"]["peers"][0]["endpoint"] = json!("peer.example:51820");
+    config["protocol"]["peers"][0]["persistent_keepalive"] = json!(25);
+    let raw: Vec<Config> =
+        serde_yaml::from_str(&serde_yaml::to_string(&json!([config])).unwrap()).unwrap();
+    let serialized = serde_yaml::to_value(raw).unwrap();
+    assert!(serialized[0].as_mapping().unwrap().get("address").is_none());
+    let validated =
+        super::super::create_server_configs(serde_yaml::from_value(serialized).unwrap()).unwrap();
+    assert!(validated.wireguard_endpoints[0].listen.is_none());
+    for (pointer, value) in [
+        ("/protocol/peers/0/endpoint", Value::Null),
+        ("/protocol/peers/0/persistent_keepalive", json!(0)),
+        ("/protocol/peer_client_chain", Value::Null),
+    ] {
+        let mut invalid = config.clone();
+        *invalid.pointer_mut(pointer).unwrap() = value;
+        assert!(validate(json!([invalid])).is_err(), "accepted {pointer}");
+    }
+    config["address"] = json!("0.0.0.0:51820");
+    assert!(validate(json!([config])).is_err());
+}
+
+#[test]
+fn wireguard_implies_udp_and_rejects_stream_transport_settings() {
+    for transport in ["tcp", "quic"] {
+        let mut client = client();
+        client["transport"] = json!(transport);
+        assert!(validate(copies(client)).is_err());
+        let mut server = server();
+        server["transport"] = json!(transport);
+        assert!(validate(json!([server])).is_err());
+    }
+    let mut explicit = client();
+    explicit["transport"] = json!("udp");
+    assert_eq!(
+        validate(copies(explicit))
+            .unwrap()
+            .wireguard_endpoints
+            .len(),
+        1
+    );
+    let mut explicit = server();
+    explicit["transport"] = json!("udp");
+    validate(json!([explicit])).unwrap();
+    let mut client = client();
+    client["tcp_settings"] = json!({});
+    assert!(validate(copies(client)).is_err());
+    let mut server = server();
+    server["tcp_settings"] = json!({});
+    assert!(validate(json!([server])).is_err());
+}
+
+#[test]
+fn client_and_server_never_share_a_device() {
+    let client = client();
+    let mut server = server();
+    server["protocol"]["private_key"] = client["protocol"]["private_key"].clone();
+    server["protocol"]["peers"][0]["public_key"] = client["protocol"]["public_key"].clone();
+    let mut configs = copies(client);
+    configs.as_array_mut().unwrap().push(server);
+    assert_eq!(validate(configs).unwrap().wireguard_endpoints.len(), 2);
+}
+
+#[test]
+fn server_overrides_reject_other_active_and_retained_fake_ranges() {
+    let mut inbound = server();
+    inbound["rules"] = json!([{
+        "masks":"0.0.0.0/0", "action":"allow", "override_address":"198.18.0.5:443"
+    }]);
+    let mut config = json!([
+        {"dns_group":"fake", "dns_servers":"system", "fake_ip":true},
+        inbound,
+    ]);
+    let error = validate(config.clone()).err().unwrap();
+    assert!(error.to_string().contains("rule override"), "{error}");
+    config[0]["fake_ip"] = false.into();
+    let mut validated = validate(config).unwrap();
+    let error = validated
+        .validate_network_endpoints(&["198.18.0.0/15".parse().unwrap()])
+        .unwrap_err();
+    assert!(error.to_string().contains("rule override"), "{error}");
+}
+
+fn validate(values: Value) -> io::Result<ValidatedConfigs> {
+    super::super::create_server_configs(
+        serde_yaml::from_str(&serde_yaml::to_string(&values).unwrap()).map_err(io::Error::other)?,
+    )
+}
+
+fn copies(second: Value) -> Value {
+    json!([
+        {"client_group": "one", "client_proxies": [client()]},
+        {"client_group": "two", "client_proxies": [second]},
+        {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
+         "rules": [{"masks": "0.0.0.0/0", "action": "allow",
+                    "client_chain": [{"pool": ["one", "two", client()]}]}]},
+    ])
+}
+
+#[test]
+fn copied_clients_share_after_defaults_and_normalization() {
+    let mut second = client();
+    second["address"] = json!("VPN.EXAMPLE:51820");
+    second["bind_interface"] = Value::Null;
+    let config = &mut second["protocol"];
+    config["mtu"] = json!(1408);
+    config["persistent_keepalive"] = json!(0);
+    config["allowed_ips"] = json!(["::/0", "0.0.0.0/0", "::/0"]);
+    config["addresses"] = json!(["fd77:0::2/128", "10.77.0.2/32"]);
+    config["pre_shared_key"] = json!(key(0));
+    config["resource_limits"] = json!({"max_tcp_connections": 256, "tcp_memory_bytes": 33554432});
+    use base64::Engine;
+    let mut equivalent_key = [42; 32];
+    equivalent_key[0] ^= 7;
+    equivalent_key[31] ^= 128;
+    config["private_key"] = json!(base64::engine::general_purpose::STANDARD.encode(equivalent_key));
+    let mut validated = validate(copies(second)).unwrap();
+    assert_eq!(validated.wireguard_endpoints.len(), 1);
+    assert_eq!(validated.wireguard_endpoints[0].peers.len(), 1);
+    let mut ids = Vec::new();
+    validated
+        .visit_clients(&mut |client| {
+            if let ClientProxyConfig::Wireguard(config) = &client.protocol {
+                ids.push(config.endpoint_id.clone());
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.iter().all(|id| id == &ids[0]));
+}
+
+#[test]
+fn conflicting_copies_reject_every_device_setting_without_disclosing_keys() {
+    for (field, value) in [
+        ("mtu", json!(1280)),
+        ("addresses", json!(["10.77.0.3/32"])),
+        ("allowed_ips", json!(["192.0.2.0/24"])),
+        ("persistent_keepalive", json!(25)),
+        ("pre_shared_key", json!(key(99))),
+        ("resource_limits", json!({"max_udp_sessions": 2})),
+        (
+            "peer_client_chain",
+            json!([{"protocol": {"type": "direct"}}]),
+        ),
+    ] {
+        let mut second = client();
+        second["protocol"][field] = value;
+        let error = validate(copies(second)).err().unwrap().to_string();
+        assert!(
+            error.contains("conflicting WireGuard client settings"),
+            "{field}: {error}"
+        );
+        assert!(!error.contains(&key(42)) && !error.contains(&key(99)));
+    }
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
+    {
+        let mut second = client();
+        second["bind_interface"] = json!("lo");
+        assert!(
+            validate(copies(second))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("conflicting")
+        );
+    }
+}
+
+#[test]
+fn copied_clients_share_with_equivalent_carrier_socket_defaults() {
+    let mut first = client();
+    first["protocol"]["peer_client_chain"] = json!("direct");
+    for chain in [
+        json!("direct"),
+        json!("relay"),
+        json!([{"protocol": {"type": "direct"}}]),
+        json!([{"protocol": {"type": "direct"}, "bind_interface": null}]),
+        json!([{"protocol": {"type": "direct"}, "tcp_settings": {}}]),
+        json!([{"protocol": {"type": "direct"}, "tcp_settings": {"no_delay": true}}]),
+        json!([{"pool": [{"protocol": {"type": "direct"}, "tcp_settings": {}}]}]),
+    ] {
+        let mut second = client();
+        second["protocol"]["peer_client_chain"] = chain.clone();
+        let configs = json!([
+            {"client_group": "one", "client_proxies": [first]},
+            {"client_group": "relay", "client_proxies": [{"protocol": {"type": "direct"}}]},
+            {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
+             "rules": [{"masks": "0.0.0.0/0", "action": "allow",
+                        "client_chain": [{"pool": ["one", second]}]}]},
+        ]);
+        let validated =
+            validate(configs.clone()).unwrap_or_else(|error| panic!("{chain}: {error}"));
+        assert_eq!(validated.wireguard_endpoints.len(), 1);
+
+        let mut conflict = configs;
+        conflict[2]["rules"][0]["client_chain"][0]["pool"][1]["protocol"]["peer_client_chain"] =
+            json!([{"protocol": {"type": "direct"}, "tcp_settings": {"no_delay": false}}]);
+        assert!(
+            validate(conflict)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("conflicting")
+        );
+    }
+}
+
+#[test]
+fn copied_clients_share_local_addresses_with_different_prefix_lengths() {
+    let mut second = client();
+    second["protocol"]["addresses"] = json!(["10.77.0.2/24", "fd77::2/64"]);
+    let validated = validate(copies(second)).unwrap();
+    assert_eq!(validated.wireguard_endpoints.len(), 1);
+    assert_eq!(
+        validated.wireguard_endpoints[0].addresses,
+        ["10.77.0.2/32", "fd77::2/128"]
+    );
+}
+
+#[test]
+fn different_client_identities_do_not_share() {
+    for (pointer, value) in [
+        ("/address", json!("other.example:51820")),
+        ("/protocol/private_key", json!(key(44))),
+        ("/protocol/public_key", json!(key(45))),
+    ] {
+        let mut second = client();
+        *second.pointer_mut(pointer).unwrap() = value;
+        assert_eq!(
+            validate(copies(second)).unwrap().wireguard_endpoints.len(),
+            2
+        );
+    }
+}
+
+#[test]
+fn scoped_endpoints_share_by_address_and_numeric_scope() {
+    let mut first = client();
+    first["address"] = json!("[FE80:0:0::1%03]:51820");
+    let mut second = first.clone();
+    second["address"] = json!("[fe80::1%3]:51820");
+    let configs = json!([
+        {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
+         "rules": [{"masks": "0.0.0.0/0", "action": "allow",
+                    "client_chain": [{"pool": [first, second]}]}]},
+    ]);
+    let validated = validate(configs.clone()).unwrap();
+    assert_eq!(validated.wireguard_endpoints.len(), 1);
+    assert_eq!(
+        validated.wireguard_endpoints[0].peers[0]
+            .endpoint
+            .as_deref(),
+        Some("[fe80::1%3]:51820")
+    );
+    let mut different_scope = configs;
+    different_scope[0]["rules"][0]["client_chain"][0]["pool"][1]["address"] =
+        json!("[fe80::1%4]:51820");
+    assert_eq!(
+        validate(different_scope).unwrap().wireguard_endpoints.len(),
+        2
+    );
+}
+
+#[test]
+fn unused_groups_validate_without_starting_devices() {
+    let configs = json!([{"client_group": "unused", "client_proxies": [client()]}]);
+    assert!(
+        validate(configs.clone())
+            .unwrap()
+            .wireguard_endpoints
+            .is_empty()
+    );
+    let mut invalid = configs;
+    invalid[0]["client_proxies"][0]["protocol"]["mtu"] = json!(9000);
+    assert!(validate(invalid).is_err());
+}
+
+#[test]
+fn selectors_share_wireguard_devices_without_activating_unused_nodes() {
+    let mut configs = json!([
+        {"clash_api_address":"127.0.0.1:9090","secret":"test"},
+        {"client_group":"vpn","client_proxies":[client()]},
+        {"client_group":"outbound","type":"selector","client_proxies":["vpn","direct"]},
+        {"client_group":"another","type":"selector","client_proxies":["outbound","vpn"]}
+    ]);
+    assert!(
+        validate(configs.clone())
+            .unwrap()
+            .wireguard_endpoints
+            .is_empty()
+    );
+    configs.as_array_mut().unwrap().push(json!({
+        "address":"127.0.0.1:1080","protocol":{"type":"socks"},
+        "rules":[{"mask":"0.0.0.0/0","action":"allow","client_chain":"another"}]
+    }));
+    assert_eq!(validate(configs).unwrap().wireguard_endpoints.len(), 1);
+}
+
+#[test]
+fn unused_wireguard_dns_groups_validate_without_starting_devices() {
+    let configs = json!([
+        {"dns_group": "unused", "dns_servers": [{"url": "tcp://192.0.2.53", "client_chain": [client()]}]},
+        {"dns_group": "direct", "dns_servers": ["system"]},
+        {"address": "0.0.0.0:1080", "protocol": {"type": "socks"}},
+    ]);
+    let validated = validate(configs.clone()).unwrap();
+    assert!(validated.wireguard_endpoints.is_empty());
+    assert_eq!(validated.dns_groups.len(), 1);
+    assert_eq!(validated.dns_groups[0].name, "direct");
+
+    let mut invalid = configs.clone();
+    invalid[0]["dns_servers"][0]["client_chain"][0]["protocol"]["mtu"] = json!(9000);
+    assert!(validate(invalid).is_err());
+
+    let mut conflict = configs.clone();
+    let mut second = client();
+    second["protocol"]["pre_shared_key"] = json!(key(99));
+    conflict[0]["dns_servers"][0]["client_chain"] =
+        json!({"chain": [{"pool": [client(), second]}]});
+    let error = validate(conflict).err().unwrap();
+    assert!(error.to_string().contains("conflicting"), "{error}");
+
+    for root in [
+        json!({"address": "0.0.0.0:1080", "protocol": {"type": "socks"}}),
+        json!({"device_fd": 7, "rules": "block-all"}),
+        server(),
+    ] {
+        let mut referenced = configs.clone();
+        referenced[2] = root;
+        referenced[2]["dns"] = json!({"servers": "unused"});
+        let validated = validate(referenced).unwrap();
+        assert!(
+            validated
+                .dns_groups
+                .iter()
+                .any(|group| group.name == "unused")
+        );
+        assert!(
+            validated
+                .wireguard_endpoints
+                .iter()
+                .any(|device| device.inbound.is_none())
+        );
+    }
+
+    let mut composed = configs;
+    composed[2]["dns"] = json!({"servers": ["unused", "direct"]});
+    let validated = validate(composed).unwrap();
+    assert_eq!(validated.wireguard_endpoints.len(), 1);
+    assert_eq!(validated.dns_groups.len(), 2);
+    assert!(
+        validated
+            .dns_groups
+            .iter()
+            .all(|group| group.name != "unused")
+    );
+}
+
+#[test]
+fn old_endpoint_forms_and_client_peer_lists_are_rejected() {
+    for value in [
+        json!([{"wireguard": "old", "private_key": key(42), "addresses": ["10.77.0.2/32"], "peers": []}]),
+        json!([{"client_group": "old", "client_proxies": [{"protocol": {"type": "wireguard", "endpoint": "old"}}]}]),
+    ] {
+        assert!(validate(value).is_err());
+    }
+    for field in [
+        "peers",
+        "endpoint",
+        "wireguard_name",
+        "inbound",
+        "listen",
+        "outer_client_chain",
+        "upstream_client_chain",
+    ] {
+        let mut invalid = client();
+        invalid["protocol"][field] = json!([]);
+        assert!(validate(copies(invalid)).is_err(), "accepted {field}");
+    }
+}
