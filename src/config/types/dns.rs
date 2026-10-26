@@ -23,6 +23,7 @@ fn default_attempts() -> usize {
     1
 }
 
+/// Rejects explicit null; Serde defaults an omitted field to None.
 fn deserialize_native_cache_secs<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<u32>, D::Error> {

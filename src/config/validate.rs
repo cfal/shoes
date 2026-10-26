@@ -811,6 +811,7 @@ fn validate_dns_group_ref(
 /// Expands client chains (resolves group refs to configs) and validates:
 /// - Inline client configs (PEMs, etc.)
 /// - Protocol compatibility (system doesn't support chains, UDP/H3 only direct chains)
+/// - System-only use of native_cache_secs
 /// - Bootstrap URL validity (must be a known group or valid IP-only URL)
 fn expand_dns_specs(
     specs: &[DnsServerSpec],
