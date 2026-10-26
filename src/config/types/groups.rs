@@ -492,7 +492,9 @@ fn source_rules<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Vec<crate::rules::Expression>, D::Error> {
     use serde::de::Error;
     use serde_json::Value;
-    let values = match Value::deserialize(deserializer)? {
+    let value = Value::deserialize(deserializer)?;
+    let is_list = value.is_array();
+    let values = match value {
         Value::Array(values) => values,
         value => vec![value],
     };
@@ -501,11 +503,18 @@ fn source_rules<'de, D: serde::Deserializer<'de>>(
     }
     values
         .into_iter()
-        .map(|value| match value {
+        .enumerate()
+        .map(|(index, value)| match value {
             Value::String(path) => Ok(crate::rules::Expression::Source(
                 crate::rule_set::RuleSource::from_path(path.into()),
             )),
-            value => crate::rules::Expression::from_config(value).map_err(Error::custom),
+            value => crate::rules::Expression::from_config(value).map_err(|error| {
+                if is_list {
+                    Error::custom(format!("rules[{index}]: {error}"))
+                } else {
+                    Error::custom(format!("rules: {error}"))
+                }
+            }),
         })
         .collect()
 }

@@ -14,18 +14,34 @@ async fn nested_parse_errors_include_source_and_field_context_without_credential
 "#;
     for (entry, context) in [
         (
-            r#"- rule_group: imported
+            r#"- rule_source_group: imported
   rules:
     - path: [VALUE_SECRET_SENTINEL]
 "#,
             "rules[0]",
         ),
         (
-            r#"- rule_group: imported
+            r#"- rule_source_group: imported
   rules:
     - first.srs
     - path: second.srs
       unsupported_policy: VALUE_SECRET_SENTINEL
+"#,
+            "rules[1]",
+        ),
+        (
+            r#"- rule_source_group: imported
+  rules:
+    path: second.srs
+    unsupported_policy: VALUE_SECRET_SENTINEL
+"#,
+            "rules:",
+        ),
+        (
+            r#"- rule_group: policy
+  rules:
+    - masks: example.com
+    - action: [VALUE_SECRET_SENTINEL]
 "#,
             "rules[1]",
         ),
