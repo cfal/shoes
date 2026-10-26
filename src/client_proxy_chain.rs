@@ -708,8 +708,7 @@ impl ClientProxyChain {
             .await
     }
 
-    #[cfg(unix)]
-    pub(crate) async fn connect_rule_download(
+    pub(crate) async fn connect_tcp_pinned(
         &self,
         target: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
@@ -739,7 +738,7 @@ impl ClientProxyChain {
                     .ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::NotFound,
-                            "rule download proxy resolved to no addresses",
+                            "proxy resolved to no addresses",
                         )
                     })?;
                 pinned.insert(
@@ -1228,6 +1227,17 @@ impl ClientChainGroup {
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
         self.connect_tcp_with_info(remote_location, resolver, Default::default())
+            .await
+    }
+
+    pub(crate) async fn connect_tcp_pinned(
+        &self,
+        remote_location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let index = self.next_tcp_index.fetch_add(1, Ordering::Relaxed) as usize;
+        self.chains[index % self.chains.len()]
+            .connect_tcp_pinned(remote_location, resolver)
             .await
     }
 

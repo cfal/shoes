@@ -6,6 +6,53 @@ use crate::tcp::chain_builder::build_direct_chain_group;
 use crate::tcp::socket_connector::SocketConnector;
 use async_trait::async_trait;
 
+#[tokio::test]
+async fn synthetic_intermediate_proxy_is_rejected_before_socks_connect() {
+    #[derive(Debug)]
+    struct Bootstrap;
+    impl Resolver for Bootstrap {
+        fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.address().to_string(), "second.invalid");
+            let address = SocketAddr::new("198.18.0.53".parse().unwrap(), location.port());
+            Box::pin(async move { Ok(vec![address]) })
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let resolver = crate::dns::real_only(
+        Arc::new(Bootstrap),
+        Arc::from(["198.18.0.0/15".parse().unwrap()]),
+    );
+    let chain: crate::config::ClientChain = serde_json::from_value(serde_json::json!([
+        {"address": listener.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+        {"address": "second.invalid:1080", "protocol": {"type": "socks"}}
+    ]))
+    .unwrap();
+    let chains = crate::tcp::chain_builder::build_client_chain_group_with_limits(
+        crate::option_util::NoneOrSome::One(chain),
+        resolver.clone(),
+        Default::default(),
+    )
+    .unwrap();
+    let provider = ProxyRuntimeProvider::with_bootstrap(
+        Arc::new(chains),
+        resolver,
+        Duration::from_secs(1),
+    );
+    for _ in 0..2 {
+        let error = provider
+            .connect_tcp("127.0.0.1:53".parse().unwrap(), None, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("synthetic"), "{error}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+}
+
 #[derive(Debug)]
 struct PendingSocketConnector;
 

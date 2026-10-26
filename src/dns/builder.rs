@@ -375,23 +375,22 @@ fn group_uses_system(
         if spec.url == "system" {
             return Ok(true);
         }
-        let mut native_proxy = false;
+        let mut proxy_hostname = false;
         for chain in &mut spec.client_chains {
             for hop in chain.hops.iter_mut() {
                 crate::config::client_visit::visit_hop(hop, &mut |client| {
-                    native_proxy |= client.address.address().hostname().is_some();
+                    proxy_hostname |= client.address.address().hostname().is_some();
                     Ok(())
                 })?;
             }
         }
-        if native_proxy
-            || (ParsedDnsUrl::parse(&spec.url).is_ok_and(|url| url.has_hostname())
-                && spec.bootstrap_url.as_ref().is_none_or(|bootstrap| {
-                    system_groups
-                        .get(bootstrap)
-                        .copied()
-                        .unwrap_or(bootstrap == "system")
-                }))
+        if (proxy_hostname || ParsedDnsUrl::parse(&spec.url).is_ok_and(|url| url.has_hostname()))
+            && spec.bootstrap_url.as_ref().is_none_or(|bootstrap| {
+                system_groups
+                    .get(bootstrap)
+                    .copied()
+                    .unwrap_or(bootstrap == "system")
+            })
         {
             return Ok(true);
         }

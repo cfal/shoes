@@ -217,6 +217,30 @@ fn system_bootstrap_dependencies_preserve_named_group_precedence() {
         .unwrap(),
     ];
     assert!(group_uses_system(group, &known).unwrap());
+    group.specs[0].bootstrap_url = Some("udp://127.0.0.1:53".into());
+    assert!(!group_uses_system(group, &known).unwrap());
+    group.specs[0].bootstrap_url = Some("system".into());
+    assert!(group_uses_system(group, &known).unwrap());
+    known.insert("system".into(), false);
+    assert!(!group_uses_system(group, &known).unwrap());
+}
+
+#[tokio::test]
+async fn explicit_proxy_bootstrap_does_not_require_native_dns_preflight() {
+    let mut groups = fake_groups(false);
+    let spec = &mut groups[0].specs[0];
+    spec.url = "tcp://127.0.0.1:53".into();
+    spec.bootstrap_url = Some("udp://127.0.0.1:54".into());
+    spec.client_chains = vec![
+        serde_json::from_value(serde_json::json!({
+            "address": "proxy.invalid:1080", "protocol": {"type": "socks"}
+        }))
+        .unwrap(),
+    ];
+    let mut registry = build_dns_registry(groups).await.unwrap();
+    registry.forbidden = Arc::from(["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()]);
+    assert!(registry.rule_bootstrap("fake").await.is_ok());
+    assert!(registry.rule_bootstrap("system").await.is_err());
 }
 
 #[tokio::test]

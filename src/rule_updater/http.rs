@@ -110,7 +110,7 @@ async fn connect(
     let chain = &attempt.chain;
     let connected = crate::tcp::socket_connector_impl::connect_tcp_candidates(targets, |target| {
         let target = crate::address::NetLocation::from_ip_addr(target.ip(), target.port());
-        Ok(chain.connect_rule_download(target.into(), &resolver))
+        Ok(chain.connect_tcp_pinned(target.into(), &resolver))
     })
     .await
     .map_err(|_| invalid("configured rule download chain failed"))?;

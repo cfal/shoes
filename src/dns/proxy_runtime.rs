@@ -24,7 +24,7 @@ const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 pub struct ProxyRuntimeProvider {
     chain_group: Arc<ClientChainGroup>,
     /// Resolver for proxy server hostnames (not the DNS queries themselves).
-    /// Uses NativeResolver since we can't use the DNS server we're trying to reach.
+    /// Uses the explicit bootstrap route, or native DNS when none was configured.
     bootstrap_resolver: Arc<dyn Resolver>,
     /// QUIC socket binder that selects from the same direct-only chain.
     quic_binder: ProxyQuicBinder,
@@ -106,7 +106,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
             let target = NetLocation::new(address, server_addr.port());
 
             let started = std::time::Instant::now();
-            let connect_future = chain_group.connect_tcp(target.into(), &resolver);
+            let connect_future = chain_group.connect_tcp_pinned(target.into(), &resolver);
             match tokio::time::timeout(timeout, connect_future).await {
                 Ok(Ok(result)) => {
                     log::debug!(
