@@ -2,8 +2,7 @@
 //!
 //! This module contains platform-independent code that both iOS and Android use.
 
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -13,12 +12,15 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Config, convert_cert_paths, load_config_str};
 use crate::dns::build_dns_registry_for_runtime;
+use crate::logging::{FILE_LOG_FLUSH_TIMEOUT, FileLogWriter, LogWriter};
 use crate::tcp::tcp_server::start_servers;
 #[cfg(unix)]
 use crate::tun::run_tun_from_config;
 
 /// Global log file handle for file-based logging.
-pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<File>>> = OnceLock::new();
+pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<Arc<FileLogWriter>>>> = OnceLock::new();
+static LOG_FILE_SETUP: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+pub static LOGGER_SETUP: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Global flag to track if logger has been initialized.
 pub static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -101,35 +103,45 @@ impl Drop for ServerTasks {
 ///
 /// Returns 0 on success, -1 on error.
 pub fn setup_log_file(path_str: &str) -> i32 {
+    let _setup = LOG_FILE_SETUP.lock();
     let file_mutex = LOG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
-
-    match OpenOptions::new().create(true).append(true).open(path_str) {
-        Ok(file) => {
-            *file_mutex.lock() = Some(file);
-            info!("Log file set to: {}", path_str);
-            0
+    let file = match OpenOptions::new().create(true).append(true).open(path_str) {
+        Ok(file) => file,
+        Err(_) => return -1,
+    };
+    let previous = file_mutex.lock().clone();
+    if let Some(previous) = previous {
+        // Retain a stalled worker and refuse replacement rather than accumulating
+        // uninterruptible threads across repeated set-log-file calls.
+        if previous.shutdown_timeout(FILE_LOG_FLUSH_TIMEOUT).is_err() && !previous.is_finished() {
+            return -1;
         }
-        Err(_) => -1,
     }
+    let writer = match FileLogWriter::from_file(file) {
+        Ok(writer) => Arc::new(writer),
+        Err(_) => return -1,
+    };
+    *file_mutex.lock() = Some(writer);
+    info!("Log file set to: {}", path_str);
+    0
 }
 
 /// Write a log message to the log file if configured.
 pub fn write_to_log_file(level: log::Level, target: &str, message: &str) {
-    if let Some(file_mutex) = LOG_FILE.get() {
-        let mut guard = file_mutex.lock();
-        if let Some(ref mut writer) = *guard {
-            let _ = writeln!(writer, "{} [{}] {}", level, target, message);
-        }
+    let writer = LOG_FILE.get().and_then(|slot| slot.lock().clone());
+    if let Some(writer) = writer {
+        writer.write_log(
+            &log::Record::builder().level(level).target(target).build(),
+            &format!("{} [{}] {}", level, target, message),
+        );
     }
 }
 
 /// Flush the log file.
 pub fn flush_log_file() {
-    if let Some(file_mutex) = LOG_FILE.get() {
-        let mut guard = file_mutex.lock();
-        if let Some(ref mut writer) = *guard {
-            let _ = writer.flush();
-        }
+    let writer = LOG_FILE.get().and_then(|slot| slot.lock().clone());
+    if let Some(writer) = writer {
+        writer.flush();
     }
 }
 
@@ -171,6 +183,8 @@ pub fn stop_service() -> bool {
     }
 
     info!("TUN service stop completed");
+    // The process-global logger survives stop/start; reuse its single worker.
+    flush_log_file();
     true
 }
 
