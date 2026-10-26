@@ -71,8 +71,8 @@ where
     }
 
     let temp = ShadowsocksClientTemp::deserialize(deserializer)?;
-    let config =
-        ShadowsocksConfig::from_fields(&temp.cipher, &temp.password).map_err(Error::custom)?;
+    let config = ShadowsocksConfig::from_client_fields(&temp.cipher, &temp.password)
+        .map_err(Error::custom)?;
 
     Ok((config, temp.udp_enabled))
 }

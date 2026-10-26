@@ -15,6 +15,8 @@ env:
   MIHOMO_SHA256: 04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
   XRAY_VERSION: 26.10.21
   XRAY_SHA256: 0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978
+  SSSERVER_VERSION: 1.25.0
+  SSSERVER_SHA256: 874f817fcf3e6d7681ec715a1c13c686c6eaae936524d102639b38364f3966ae
   XRAY_COMMIT: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
   MIHOMO_ALPHA_COMMIT: 94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f
   NAIVE_CADDY_VERSION: 2.11.7-naive
@@ -324,6 +326,19 @@ jobs:
         binary="$RUNNER_TEMP/xray-peer/xray"
         chmod +x "$binary"
         echo "SHOES_TEST_XRAY_BIN=$binary" >> "$GITHUB_ENV"
+
+    - name: Install shadowsocks-rust test peer
+      if: matrix.target == 'optional_peer'
+      run: |
+        archive="$RUNNER_TEMP/shadowsocks-rust.tar.xz"
+        curl --fail --location --retry 3 \
+          --output "$archive" \
+          "https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${SSSERVER_VERSION}/shadowsocks-v${SSSERVER_VERSION}.x86_64-unknown-linux-gnu.tar.xz"
+        echo "${SSSERVER_SHA256}  ${archive}" | sha256sum --check --strict
+        tar --extract --xz --file "$archive" --directory "$RUNNER_TEMP" ssserver
+        binary="$RUNNER_TEMP/ssserver"
+        chmod +x "$binary"
+        echo "SHOES_TEST_SSSERVER_BIN=$binary" >> "$GITHUB_ENV"
 
     - name: Install native Naive Caddy test peer
       if: matrix.target == 'optional_peer'
