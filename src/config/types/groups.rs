@@ -638,6 +638,7 @@ impl Serialize for NamedPem {
 pub enum Config {
     ClashApi(super::ClashApiConfig),
     CacheFile(super::CacheFileConfig),
+    RuleCacheDirectory(std::path::PathBuf),
     CertificateSource(crate::certificates::NamedSource),
     GlobalLimits(GlobalLimits),
     Server(ServerConfig),
@@ -675,6 +676,16 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         if map.contains_key("cache_file_path") {
             return serde_yaml::from_value(value)
                 .map(Config::CacheFile)
+                .map_err(Error::custom);
+        }
+        if map.contains_key("rule_cache_dir") {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Directory {
+                rule_cache_dir: std::path::PathBuf,
+            }
+            return serde_yaml::from_value::<Directory>(value)
+                .map(|directory| Config::RuleCacheDirectory(directory.rule_cache_dir))
                 .map_err(Error::custom);
         }
 
@@ -775,6 +786,12 @@ impl serde::ser::Serialize for Config {
         match self {
             Config::ClashApi(config) => config.serialize(serializer),
             Config::CacheFile(config) => config.serialize(serializer),
+            Config::RuleCacheDirectory(path) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("rule_cache_dir", path)?;
+                map.end()
+            }
             Config::CertificateSource(source) => source.serialize(serializer),
             Config::GlobalLimits(limits) => {
                 use serde::ser::SerializeMap;

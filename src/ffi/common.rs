@@ -225,7 +225,11 @@ pub async fn start_from_config(
             .await
             .map_err(std::io::Error::other)??;
 
-    if !crate::rule_set::remote_sources(&mut configs)?.is_empty() {
+    if configs
+        .iter()
+        .any(|config| matches!(config, Config::RuleCacheDirectory(_)))
+        || !crate::rule_set::remote_sources(&mut configs)?.is_empty()
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "remote rule refresh requires the process runtime and is not supported by FFI",

@@ -6,12 +6,17 @@ use std::time::Duration;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-#[cfg(unix)]
-pub(crate) mod managed;
-
 pub(crate) fn watch<P: AsRef<Path>>(
     paths: &[P],
     tx: mpsc::Sender<()>,
+) -> io::Result<RecommendedWatcher> {
+    watch_excluding(paths, tx, None)
+}
+
+pub(crate) fn watch_excluding<P: AsRef<Path>>(
+    paths: &[P],
+    tx: mpsc::Sender<()>,
+    excluded: Option<&Path>,
 ) -> io::Result<RecommendedWatcher> {
     let mut files = HashSet::new();
     let mut required_directories = HashSet::new();
@@ -34,6 +39,15 @@ pub(crate) fn watch<P: AsRef<Path>>(
             );
         }
     }
+    let excluded = excluded.map(std::path::absolute).transpose()?;
+    let resolved = excluded
+        .as_ref()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()));
+    let included = |path: &Path| {
+        !excluded.as_ref().is_some_and(|root| path.starts_with(root))
+            && !resolved.as_ref().is_some_and(|root| path.starts_with(root))
+    };
+    files.retain(|path| included(path));
     let required_directories: HashSet<_> = required_directories
         .iter()
         .map(|path| watch_directory(path))
@@ -46,6 +60,7 @@ pub(crate) fn watch<P: AsRef<Path>>(
     let direct_files: HashSet<_> = files
         .iter()
         .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| included(path))
         .filter(|path| path.is_file())
         .collect();
     files.extend(direct_files.iter().cloned());
@@ -55,16 +70,7 @@ pub(crate) fn watch<P: AsRef<Path>>(
                 if matches!(
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) && event.paths.iter().any(|path| {
-                    if !files.contains(path) {
-                        return false;
-                    }
-                    #[cfg(unix)]
-                    if managed::is_installed_version(path) {
-                        return false;
-                    }
-                    true
-                }) =>
+                ) && event.paths.iter().any(|path| files.contains(path)) =>
             {
                 let _ = tx.try_send(());
             }

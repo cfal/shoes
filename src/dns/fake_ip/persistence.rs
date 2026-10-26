@@ -164,11 +164,6 @@ fn state_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 impl SnapshotStore {
-    #[cfg(unix)]
-    pub(super) fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub(super) fn matches_path(&self, path: &Path) -> io::Result<bool> {
         Ok(self.path == state_path(path)?)
     }

@@ -309,6 +309,16 @@ async fn cyclic_source_recovers(with_remote: bool) {
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
          "rules": [{"masks": {"rule_source_group": "deny"}, "action": "block"}, {"masks": {"any_destination": true}, "action": "allow"}]}
     ]);
+    let cache_dir = dir.path().canonicalize().unwrap().join("cache");
+    if with_remote {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(&cache_dir).unwrap();
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        config
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"rule_cache_dir": cache_dir}));
+    }
     std::fs::write(&config_path, config.to_string()).unwrap();
     let mut process = Process::start(&config_path, &[]);
     process.wait_for("Servers ready").await;
@@ -316,7 +326,7 @@ async fn cyclic_source_recovers(with_remote: bool) {
     config[0]["rules"][0]["path"] = json!(loop_path);
     if with_remote {
         use std::os::unix::fs::PermissionsExt;
-        let cache = dir.path().canonicalize().unwrap().join("remote.json");
+        let cache = cache_dir.join("remote.json");
         source(&cache, true);
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();

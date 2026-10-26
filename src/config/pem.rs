@@ -21,10 +21,7 @@ use crate::config::ConfigSelection;
 pub async fn convert_cert_paths(
     mut all_configs: Vec<Config>,
 ) -> std::io::Result<(Vec<Config>, usize)> {
-    if !crate::rule_set::remote_sources(&mut all_configs)?.is_empty() {
-        let paths = pem_candidate_dependencies(&mut all_configs)?;
-        crate::rule_set::validate_remote_paths(&mut all_configs, &paths)?;
-    }
+    crate::rule_set::validate_remote_paths(&mut all_configs, &[])?;
     crate::certificates::configure(&mut all_configs)?;
     let mut path_pem_names: HashMap<String, String> = HashMap::new();
     let mut data_configs = vec![];
@@ -608,7 +605,10 @@ mod tests {
         let key = certificate.signing_key.serialize_pem();
         let cert_path = dir.path().join("client.crt");
         let key_path = dir.path().join("client.key");
-        let cache = dir.path().join("rules.json");
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir(&cache_dir).unwrap();
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = cache_dir.join("rules.json");
         std::fs::write(&cert_path, &cert).unwrap();
         std::fs::write(&key_path, &key).unwrap();
         std::fs::write(
@@ -632,7 +632,8 @@ mod tests {
             } else {
                 json!({"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "rules": [rule.clone()]})
             };
-            let configs = serde_json::from_value(json!([server])).unwrap();
+            let configs =
+                serde_json::from_value(json!([{"rule_cache_dir": cache_dir}, server])).unwrap();
             let (configs, loaded) = convert_cert_paths(configs).await.unwrap();
             assert_eq!(loaded, 2);
             let validated = crate::config::compile_configs(configs).await.unwrap();

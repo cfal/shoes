@@ -286,27 +286,20 @@ fn source_group_work_budget_counts_repeated_references_and_caller_compositions()
 
 #[cfg(unix)]
 #[test]
-fn staged_inputs_also_validate_local_aliases_of_remote_caches() {
+fn managed_cache_namespace_rejects_dangling_local_aliases() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("cache.json");
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir(&cache_dir).unwrap();
+    let path = cache_dir.join("cache.json");
     let alias = dir.path().join("alias.json");
-    let stage = dir.path().join("staged");
-    write_domains(&path, "old.example");
-    write_domains(&stage, "new.example");
     std::os::unix::fs::symlink(&path, &alias).unwrap();
-    let mut compiler = Compiler::default();
-    compiler
-        .input_files
-        .insert(path, std::fs::File::open(stage).unwrap());
-    let predicate = load_source(&RuleSource::from_path(alias), &mut compiler).unwrap();
-    assert_eq!(
-        predicate.evaluate(Some("new.example"), None, 443),
-        Outcome::Match
-    );
-    assert_eq!(
-        predicate.evaluate(Some("old.example"), None, 443),
-        Outcome::Miss
-    );
+    let mut configs: Vec<Config> = serde_json::from_value(json!([
+        {"rule_cache_dir": cache_dir},
+        {"rule_source_group": "local", "rules": [{"path": alias}]}
+    ]))
+    .unwrap();
+    let error = validate_remote_paths(&mut configs, &[]).unwrap_err();
+    assert!(error.to_string().contains("local aliases"), "{error}");
 }
 
 #[test]

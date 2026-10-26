@@ -189,13 +189,6 @@ impl ControlRuntime {
         self.request(Command::Resume).await
     }
 
-    pub(crate) async fn prepare_rule_download_selection(
-        &self,
-        view: Arc<super::selection::SelectionView>,
-    ) -> io::Result<()> {
-        self.request(|reply| Command::Prepare(view, reply)).await
-    }
-
     pub async fn prepare(
         &self,
         validated: &mut ValidatedConfigs,

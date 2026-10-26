@@ -244,11 +244,6 @@ impl FakeIpPool {
         self.store.is_some()
     }
 
-    #[cfg(unix)]
-    pub(crate) fn state_file(&self) -> Option<&std::path::Path> {
-        self.store.as_ref().map(SnapshotStore::path)
-    }
-
     pub(crate) fn state_file_matches(&self, path: Option<&std::path::Path>) -> io::Result<bool> {
         match (&self.store, path) {
             (Some(store), Some(path)) => store.matches_path(path),

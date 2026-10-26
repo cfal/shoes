@@ -46,10 +46,12 @@ fn source(url: &str, path: &Path) -> RuleSource {
 }
 
 fn configs(source: &RuleSource) -> Vec<Config> {
-    serde_json::from_value(serde_json::json!([{
-        "address": "127.0.0.1:0", "protocol": {"type": "socks"},
-        "rules": [{"masks": source, "action": "block"}]
-    }]))
+    serde_json::from_value(
+        serde_json::json!([{"rule_cache_dir": source.path.parent()}, {
+            "address": "127.0.0.1:0", "protocol": {"type": "socks"},
+            "rules": [{"masks": source, "action": "block"}]
+        }]),
+    )
     .unwrap()
 }
 
@@ -702,183 +704,6 @@ async fn every_existing_decoder_validates_downloads() {
 }
 
 #[tokio::test]
-async fn cold_start_is_validated_as_a_whole_and_offline_checks_do_not_download() {
-    let dir = directory();
-    let path = dir.path().join("rules.json");
-    let (url, fixture) = serve(response(200, "", VALID)).await;
-    let source = source(&url, &path);
-    assert!(
-        crate::config::compile_configs(configs(&source))
-            .await
-            .is_err()
-    );
-    let validated = prepare(configs(&source), None, &mut None).await.unwrap();
-    fixture.await.unwrap();
-    assert_eq!(validated.remote_rules.len(), 1);
-    assert_eq!(std::fs::read(&path).unwrap(), VALID);
-    // The fixture is gone; cached startup and offline validation must still work.
-    prepare(configs(&source), None, &mut None).await.unwrap();
-    crate::config::compile_configs(configs(&source))
-        .await
-        .unwrap();
-
-    std::fs::remove_file(&path).unwrap();
-    let (url, fixture) = serve(response(200, "", VALID)).await;
-    let mut invalid = configs(&self::source(&url, &path));
-    invalid.push(serde_json::from_value(serde_json::json!({"rule_group": "bad", "rules": [{"masks": {"ip_cidr": ["not an IP"]}}]})).unwrap());
-    let error = prepare(invalid, None, &mut None)
-        .await
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(error.contains("whole configuration validation"), "{error}");
-    assert!(error.contains("IP"), "{error}");
-    assert!(!error.contains("QUERY_SECRET"), "{error}");
-    fixture.await.unwrap();
-    assert!(!path.exists());
-    assert!(!stage_path(&path).exists());
-}
-
-#[tokio::test]
-async fn cold_staging_caps_each_download_by_remaining_capacity() {
-    let dir = directory();
-    for budget in [
-        OLD.len() as u64,
-        (OLD.len() * 2 - 1) as u64,
-        (OLD.len() * 2) as u64,
-    ] {
-        let a = dir.path().join("a.json");
-        let b = dir.path().join("b.json");
-        let (url_a, fixture_a) = serve(response(200, "", OLD)).await;
-        let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (url_b, fixture_b) = if budget == OLD.len() as u64 {
-            (format!("http://{}/rules", trap.local_addr().unwrap()), None)
-        } else {
-            let (url, fixture) = serve(response(200, "", OLD)).await;
-            (url, Some(fixture))
-        };
-        let sources = [source(&url_a, &a), source(&url_b, &b)];
-        let result = stage_sources(
-            &sources,
-            &DnsRegistry::new(),
-            GlobalLimits::default(),
-            budget,
-        )
-        .await;
-        fixture_a.await.unwrap();
-        if let Some(fixture) = fixture_b {
-            fixture.await.unwrap();
-        }
-        if budget == (OLD.len() * 2) as u64 {
-            let staged = result.unwrap();
-            assert_eq!(
-                staged
-                    .iter()
-                    .map(|item| item.install.file.metadata().unwrap().len())
-                    .sum::<u64>(),
-                budget
-            );
-            drop(staged);
-        } else {
-            let error = result.err().unwrap().to_string();
-            if budget == OLD.len() as u64 {
-                assert!(error.contains("staging budget"), "{error}");
-                assert!(
-                    timeout(Duration::from_millis(20), trap.accept())
-                        .await
-                        .is_err()
-                );
-            } else {
-                assert!(error.contains("size outside permitted range"), "{error}");
-                assert!(error.contains(b.to_str().unwrap()), "{error}");
-            }
-        }
-        for path in [&a, &b] {
-            assert!(!path.exists());
-            assert!(!stage_path(path).exists());
-        }
-    }
-}
-
-#[tokio::test]
-async fn cold_staging_limits_descriptors_before_any_download() {
-    for (descriptors, expected) in [
-        (64, 0),
-        (128, 0),
-        (132, 1),
-        (512, 96),
-        (1024, 128),
-        (libc::rlim_t::MAX, 128),
-    ] {
-        assert_eq!(cold_source_limit(descriptors), expected);
-    }
-    let dir = directory();
-    let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/rules", trap.local_addr().unwrap());
-    let sources = (0..129)
-        .map(|index| source(&url, &dir.path().join(format!("{index}.json"))))
-        .collect::<Vec<_>>();
-    let error = stage_sources(
-        &sources,
-        &DnsRegistry::new(),
-        GlobalLimits::default(),
-        MAX_STAGED_BYTES,
-    )
-    .await
-    .err()
-    .unwrap();
-    assert!(
-        error.to_string().contains("staging source limit"),
-        "{error}"
-    );
-    assert!(
-        timeout(Duration::from_millis(50), trap.accept())
-            .await
-            .is_err()
-    );
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-}
-
-#[tokio::test]
-async fn cold_descriptor_admission_precedes_dns_bootstrap_preparation() {
-    let dir = directory();
-    let trap = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut config = Vec::new();
-    for index in 0..129 {
-        let mut source = source(
-            "http://remote.invalid/rules",
-            &dir.path().join(format!("{index}.json")),
-        );
-        source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
-        config.extend(configs(&source));
-    }
-    config.push(
-        serde_json::from_value(serde_json::json!({
-            "dns_group": "bootstrap", "dns_servers": [{
-                "url": "https://bootstrap.invalid/dns-query",
-                "bootstrap_url": format!("udp://{}", trap.local_addr().unwrap())
-            }]
-        }))
-        .unwrap(),
-    );
-    let error = timeout(Duration::from_secs(2), prepare(config, None, &mut None))
-        .await
-        .unwrap()
-        .err()
-        .unwrap();
-    assert!(
-        error.to_string().contains("staging source limit"),
-        "{error}"
-    );
-    assert!(
-        timeout(Duration::from_millis(50), trap.recv(&mut [0; 512]))
-            .await
-            .is_err()
-    );
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-}
-
-#[tokio::test]
 async fn stalled_url_address_does_not_block_another_guarded_candidate() {
     #[derive(Debug)]
     struct Bootstrap;
@@ -957,43 +782,6 @@ async fn stalled_url_address_does_not_block_another_guarded_candidate() {
         .unwrap();
 }
 
-#[tokio::test]
-async fn cold_download_errors_identify_cache_without_exposing_url() {
-    let dir = directory();
-    let path = dir.path().join("missing-directory/rules.json");
-    let source = source("http://127.0.0.1:1/rules?token=QUERY_SECRET", &path);
-    let error = prepare(configs(&source), None, &mut None)
-        .await
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(error.contains(path.to_str().unwrap()), "{error}");
-    assert!(!error.contains("QUERY_SECRET"), "{error}");
-    assert!(!stage_path(&path).exists());
-}
-
-#[tokio::test]
-async fn cold_download_validates_dangling_local_aliases_against_staged_bytes() {
-    let dir = directory();
-    let path = dir.path().join("cache.json");
-    let alias = dir.path().join("alias.json");
-    symlink("second.json", &alias).unwrap();
-    symlink("cache.json", dir.path().join("second.json")).unwrap();
-    let (url, fixture) = serve(response(200, "", VALID)).await;
-    let source = source(&url, &path);
-    let mut config = configs(&source);
-    config.push(
-        serde_json::from_value(
-            serde_json::json!({"rule_source_group": "alias", "rules": [{"path": alias}]}),
-        )
-        .unwrap(),
-    );
-    prepare(config, None, &mut None).await.unwrap();
-    fixture.await.unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), VALID);
-    assert_eq!(std::fs::read(alias).unwrap(), VALID);
-}
-
 #[test]
 fn dangling_sidecar_aliases_and_symlink_cycles_are_rejected() {
     let dir = directory();
@@ -1010,7 +798,10 @@ fn dangling_sidecar_aliases_and_symlink_cycles_are_rejected() {
             .unwrap(),
         );
         let error = crate::rule_set::validate_remote_paths(&mut config, &[]).unwrap_err();
-        assert!(error.to_string().contains("sidecar"), "{error}");
+        assert!(
+            error.to_string().contains("overlaps rule_cache_dir"),
+            "{error}"
+        );
     }
     let cycle = dir.path().join("cycle.json");
     symlink("./cycle.json", &cycle).unwrap();
@@ -1050,7 +841,11 @@ async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
     use crate::control::selection::{SelectionOwner, SelectorDefinition};
     for persisted in [false, true] {
         let dir = directory();
-        let path = dir.path().join("cache.json");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = cache.join("cache.json");
+        write_rule(&path, OLD);
         let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_address = proxy.local_addr().unwrap();
@@ -1101,18 +896,43 @@ async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
         "direct",
         {"name": "working", "address": proxy_address.to_string(), "protocol": {"type": "socks"}}
     ]})).unwrap());
-        let mut control = None;
-        prepare(config.clone(), None, &mut control).await.unwrap();
+        let mut validated = crate::config::compile_configs(config.clone())
+            .await
+            .unwrap();
+        let mut control =
+            crate::control::runtime::ControlService::new(validated.control.clone()).unwrap();
+        control.runtime.prepare(&mut validated).await.unwrap();
+        let remote = &validated.remote_rules[0];
+        assert!(
+            refresh_source(
+                remote,
+                &config,
+                &DnsRegistry::new(),
+                GlobalLimits::default(),
+                &mut http::DownloadState::default()
+            )
+            .await
+            .unwrap()
+        );
         fixture.await.unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert!(prepare(config, None, &mut control).await.is_err());
+        assert!(
+            refresh_source(
+                remote,
+                &config,
+                &DnsRegistry::new(),
+                GlobalLimits::default(),
+                &mut http::DownloadState::default()
+            )
+            .await
+            .is_err()
+        );
         assert!(
             timeout(Duration::from_millis(50), trap.accept())
                 .await
                 .is_err()
         );
-        assert!(!path.exists());
-        control.as_mut().unwrap().shutdown().await;
+        assert_eq!(std::fs::read(&path).unwrap(), VALID);
+        control.shutdown().await;
     }
 }
 
@@ -1562,128 +1382,6 @@ async fn first_download_proxy_retains_bootstrap_address_fallback() {
     }
 }
 
-#[tokio::test]
-async fn cold_download_cannot_replace_removed_controller_state() {
-    let dir = directory();
-    let state = dir.path().join("selection.json");
-    let snapshot = crate::control::store::encoded(&Default::default()).unwrap();
-    write_rule(&state, &snapshot);
-    let mut control = Some(
-        crate::control::runtime::ControlService::new(crate::config::ControlConfig {
-            cache_file_path: Some(state.clone()),
-            ..Default::default()
-        })
-        .unwrap(),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
-    let before = stamp(&std::fs::metadata(&state).unwrap());
-    let error = timeout(
-        Duration::from_secs(1),
-        prepare(
-            configs(&source(&url, &state)),
-            Some(&DnsRegistry::new()),
-            &mut control,
-        ),
-    )
-    .await
-    .unwrap()
-    .err()
-    .unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("controller settings require a restart"),
-        "{error}"
-    );
-    assert!(
-        timeout(Duration::from_millis(50), listener.accept())
-            .await
-            .is_err()
-    );
-    assert_eq!(std::fs::read(&state).unwrap(), snapshot);
-    assert_eq!(stamp(&std::fs::metadata(&state).unwrap()), before);
-    assert!(!stage_path(&state).exists());
-    control.as_mut().unwrap().shutdown().await;
-}
-
-#[tokio::test]
-async fn cold_download_cannot_reuse_active_or_retained_fake_ip_state() {
-    let dir = directory();
-    let state = dir.path().join("fake.json");
-    let lock = crate::control::store::lock_path(&state);
-    let config = crate::config::create_server_configs(
-        serde_json::from_value(serde_json::json!([{
-            "dns_group": "fake", "dns_servers": "udp://127.0.0.1:53",
-            "fake_ip": {"state_file": state, "max_entries": 16}
-        }]))
-        .unwrap(),
-    )
-    .unwrap();
-    let active = crate::dns::build_dns_registry(config.dns_groups)
-        .await
-        .unwrap();
-    active.checkpoint().await.unwrap();
-    let snapshot = std::fs::read(&state).unwrap();
-    let state_stamp = stamp(&std::fs::metadata(&state).unwrap());
-    let lock_stamp = stamp(&std::fs::metadata(&lock).unwrap());
-    let retained =
-        crate::dns::build_dns_registry_reusing(Vec::new(), GlobalLimits::default(), Some(&active))
-            .await
-            .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
-    for previous in [&active, &retained] {
-        for path in [&state, &lock] {
-            let error = timeout(
-                Duration::from_secs(1),
-                prepare(configs(&source(&url, path)), Some(previous), &mut None),
-            )
-            .await
-            .unwrap()
-            .err()
-            .unwrap();
-            assert!(error.to_string().contains("overlaps"), "{error}");
-            assert!(!stage_path(path).exists());
-            assert!(
-                !path
-                    .with_file_name(format!(
-                        "{}.shoes-update.lock",
-                        path.file_name().unwrap().to_str().unwrap()
-                    ))
-                    .exists()
-            );
-        }
-    }
-    assert!(
-        timeout(Duration::from_millis(50), listener.accept())
-            .await
-            .is_err()
-    );
-    assert_eq!(std::fs::read(&state).unwrap(), snapshot);
-    assert_eq!(stamp(&std::fs::metadata(&state).unwrap()), state_stamp);
-    assert_eq!(stamp(&std::fs::metadata(&lock).unwrap()), lock_stamp);
-    retained.shutdown_checkpoint().await.unwrap();
-    assert_eq!(std::fs::read(&state).unwrap(), snapshot);
-}
-
-#[tokio::test]
-async fn cold_bootstrap_does_not_open_fake_ip_state_and_rejects_synthetic_targets() {
-    let dir = directory();
-    let state = dir.path().join("fake.json");
-    let path = dir.path().join("rules.json");
-    let source = source("http://198.18.0.10/rules.json", &path);
-    let mut config = configs(&source);
-    config.push(serde_json::from_value(serde_json::json!({
-        "dns_group": "unrelated", "dns_servers": "system", "fake_ip": {"state_file": state, "max_entries": 16}
-    })).unwrap());
-    let error = prepare(config, None, &mut None).await.err().unwrap();
-    assert!(error.to_string().contains("synthetic"), "{error}");
-    assert!(!state.exists());
-    assert!(!path.exists());
-    assert!(!stage_path(&path).exists());
-}
-
 #[test]
 fn cache_conflicts_and_unknown_download_routes_are_rejected_offline() {
     let dir = directory();
@@ -1756,80 +1454,6 @@ fn remote_bootstrap_literals_reject_active_and_retained_synthetic_ranges() {
 }
 
 #[tokio::test]
-async fn cold_rule_bootstrap_rejects_synthetic_upstreams_before_lookup() {
-    let dir = directory();
-    let path = dir.path().join("missing.json");
-    let state = dir.path().join("fake.json");
-    for scheme in ["udp", "tcp", "tls", "https", "h3"] {
-        let mut source = source("https://remote.invalid/rules.json", &path);
-        let bootstrap = format!("{scheme}://100.64.0.2");
-        source.download.as_mut().unwrap().bootstrap_url = bootstrap.clone();
-        let mut config = configs(&source);
-        config.push(
-            serde_json::from_value(serde_json::json!({
-                "dns_group": "fake", "dns_servers": "system",
-                "fake_ip": {"ipv4_range": "100.64.0.0/10", "state_file": state}
-            }))
-            .unwrap(),
-        );
-        let context = crate::config::rule_download_context(config.clone()).unwrap();
-        let dns = DnsRegistry::for_rule_downloads(
-            context.groups,
-            context.limits,
-            &context.sources,
-            &config,
-            None,
-        )
-        .await
-        .unwrap();
-        let error = dns
-            .rule_bootstrap(&bootstrap)
-            .await
-            .expect_err("cold synthetic bootstrap endpoint accepted");
-        assert!(
-            error.to_string().contains("synthetic endpoint"),
-            "{bootstrap}: {error}"
-        );
-        for (candidate, previous) in [(config.clone(), None), (configs(&source), Some(&dns))] {
-            let error = prepare(candidate, previous, &mut None).await.err().unwrap();
-            assert!(
-                error.to_string().contains("synthetic endpoint"),
-                "{bootstrap}: {error}"
-            );
-            assert!(!stage_path(&path).exists());
-        }
-        assert!(!state.exists());
-        assert!(!path.exists());
-    }
-}
-
-#[tokio::test]
-async fn synthetic_bootstrap_is_rejected_before_sending_a_dns_packet() {
-    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let dir = directory();
-    let path = dir.path().join("missing.json");
-    let mut source = source("http://remote.invalid/rules.json", &path);
-    source.download.as_mut().unwrap().bootstrap_url =
-        format!("udp://{}", udp.local_addr().unwrap());
-    let mut config = configs(&source);
-    config.push(
-        serde_json::from_value(serde_json::json!({
-            "dns_group": "fake", "dns_servers": "system", "fake_ip": {"ipv4_range": "127.0.0.0/24"}
-        }))
-        .unwrap(),
-    );
-    let error = prepare(config, None, &mut None).await.err().unwrap();
-    assert!(error.to_string().contains("synthetic endpoint"), "{error}");
-    assert!(
-        timeout(Duration::from_millis(20), udp.recv(&mut [0; 512]))
-            .await
-            .is_err()
-    );
-    assert!(!path.exists());
-    assert!(!stage_path(&path).exists());
-}
-
-#[tokio::test]
 async fn remote_bootstrap_group_names_take_precedence_over_url_syntax() {
     let dir = directory();
     let path = dir.path().join("rules.json");
@@ -1849,16 +1473,9 @@ async fn remote_bootstrap_group_names_take_precedence_over_url_syntax() {
         validated
             .validate_network_endpoints(&["100.64.0.0/10".parse().unwrap()])
             .unwrap();
-        let context = crate::config::rule_download_context(config.clone()).unwrap();
-        let dns = DnsRegistry::for_rule_downloads(
-            context.groups,
-            context.limits,
-            &context.sources,
-            &config,
-            None,
-        )
-        .await
-        .unwrap();
+        let dns = crate::dns::build_dns_registry(validated.dns_groups)
+            .await
+            .unwrap();
         dns.rule_bootstrap(name).await.unwrap();
     }
 }
@@ -1872,6 +1489,7 @@ fn remote_sources_work_in_source_groups_policies_and_flat_overrides() {
     let mut flat = serde_json::to_value(&remote).unwrap();
     flat["action"] = "block".into();
     let config = serde_json::from_value(serde_json::json!([
+        {"rule_cache_dir": dir.path()},
         {"rule_source_group": "sources", "rules": [remote, {"domain": ["inline.example"]}]},
         {"rule_group": "policies", "rules": [flat]},
         {"address": "127.0.0.1:0", "rules": ["policies", {
@@ -1920,88 +1538,6 @@ fn local_source_reuse_does_not_accept_an_empty_remote_cache() {
 }
 
 #[tokio::test]
-async fn staged_candidate_uses_normalized_paths_even_before_cache_creation() {
-    let dir = directory();
-    let path = dir.path().join("./rules.json");
-    let stage = dir.path().join("staged");
-    write_rule(&stage, VALID);
-    let remote = source("https://example.com/rules.json", &path);
-    let mut config = configs(&remote);
-    config.push(
-        serde_json::from_value(serde_json::json!({
-            "rule_source_group": "local-alias", "rules": [{
-                "path": dir.path().join("rules.json"), "format": "mihomo_text", "behavior": "ipcidr"
-            }]
-        }))
-        .unwrap(),
-    );
-    let inputs = HashMap::from([(path, File::open(stage).unwrap())]);
-    let error = crate::config::compile_configs_with_inputs(config, inputs)
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
-    assert!(
-        error
-            .to_string()
-            .contains("staged rule data failed validation"),
-        "{error}"
-    );
-}
-
-#[tokio::test]
-async fn staged_alias_errors_redact_downloaded_content_in_cold_and_refresh_paths() {
-    const SECRET: &[u8] = br#"{"version":1,"rules":[{"domain_regex":["DOWNLOADED_SECRET"]}]}"#;
-    for cold in [true, false] {
-        let dir = directory();
-        let path = dir.path().join("rules.json");
-        if !cold {
-            write_rule(&path, OLD);
-        }
-        let (url, fixture) = serve(response(200, "", SECRET)).await;
-        let source = source(&url, &path);
-        let mut config = configs(&source);
-        config.push(
-            serde_json::from_value(serde_json::json!({
-                "rule_source_group": "alias", "rules": [{
-                    "path": path, "format": "mihomo_text", "behavior": "ipcidr"
-                }]
-            }))
-            .unwrap(),
-        );
-        let error = if cold {
-            prepare(config, None, &mut None).await.err().unwrap()
-        } else {
-            refresh_source(
-                &source,
-                &config,
-                &DnsRegistry::new(),
-                GlobalLimits::default(),
-                &mut http::DownloadState::default(),
-            )
-            .await
-            .unwrap_err()
-        }
-        .to_string();
-        fixture.await.unwrap();
-        assert!(
-            error.contains("staged rule data failed validation"),
-            "{error}"
-        );
-        assert!(error.contains(path.to_str().unwrap()), "{error}");
-        assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
-        assert!(!error.contains("QUERY_SECRET"), "{error}");
-        if cold {
-            assert!(!path.exists());
-        } else {
-            assert_eq!(std::fs::read(&path).unwrap(), OLD);
-        }
-        assert!(!stage_path(&path).exists());
-        drop(Install::open(&path).unwrap());
-    }
-}
-
-#[tokio::test]
 async fn existing_remote_cache_errors_and_local_aliases_redact_payloads() {
     let dir = directory();
     let path = dir.path().join("cache.json");
@@ -2039,31 +1575,16 @@ async fn existing_remote_cache_errors_and_local_aliases_redact_payloads() {
         }))
         .unwrap(),
     );
-    for online in [false, true] {
-        let result = if online {
-            prepare(config.clone(), None, &mut None).await
-        } else {
-            crate::config::compile_configs(config.clone()).await
-        };
-        let error = result.err().unwrap().to_string();
-        assert!(
-            error.contains("remote rule data failed validation"),
-            "{error}"
-        );
-        assert!(error.contains(alias.to_str().unwrap()), "{error}");
-        assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
-    }
-    config.remove(1);
     let error = crate::config::compile_configs(config)
         .await
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("invalid CIDR"), "{error}");
     assert!(
-        error.contains("DOWNLOADED_SECRET"),
-        "ordinary local errors retain detail: {error}"
+        error.contains("local rule source overlaps rule_cache_dir"),
+        "{error}"
     );
+    assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
 }
 
 #[test]
@@ -2085,7 +1606,142 @@ fn source_identity_resolves_existing_paths_and_missing_leaf_parents() {
         );
     }
     let missing_parent = alias.join("missing/rules.json");
-    assert_eq!(source_identity(&missing_parent).unwrap(), missing_parent);
+    assert_eq!(
+        source_identity(&missing_parent).unwrap(),
+        canonical_parent.join("missing/rules.json")
+    );
+}
+
+#[test]
+fn cache_namespace_is_reserved_even_without_remote_sources() {
+    let dir = directory();
+    let cache = dir.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    for extra in [
+        serde_json::json!({"cache_file_path": cache.join("state")}),
+        serde_json::json!({"dns_group": "dns", "dns_servers": "system", "fake_ip": {"state_file": cache.join("fake")}}),
+        serde_json::json!({"pem": "key", "path": cache.join("key.pem")}),
+        serde_json::json!({"path": cache.join("socket"), "protocol": {"type": "socks"}}),
+        serde_json::json!({"rule_source_group": "local", "rules": [{"path": cache.join("missing.json")}]}),
+    ] {
+        let mut configs: Vec<Config> = serde_json::from_value(serde_json::json!([
+            {"rule_cache_dir": cache}, extra
+        ]))
+        .unwrap();
+        let error = crate::rule_set::validate_remote_paths(&mut configs, &[]).unwrap_err();
+        assert!(error.to_string().contains("overlap"), "{error}");
+    }
+    let mut configs = vec![Config::RuleCacheDirectory(cache.clone())];
+    assert!(
+        crate::rule_set::validate_remote_paths(&mut configs, &[cache.join("config.yaml")]).is_err()
+    );
+    let alias = cache.join("outside.json");
+    symlink(dir.path().join("outside.json"), &alias).unwrap();
+    configs.push(
+        serde_json::from_value(serde_json::json!({
+            "rule_source_group": "alias", "rules": [{"path": alias}]
+        }))
+        .unwrap(),
+    );
+    assert!(crate::rule_set::validate_remote_paths(&mut configs, &[]).is_err());
+    let outside_alias = dir.path().join("alias");
+    symlink(&cache, &outside_alias).unwrap();
+    let mut configs: Vec<Config> = serde_json::from_value(serde_json::json!([
+        {"rule_cache_dir": cache},
+        {"cache_file_path": outside_alias.join("not-created/state")}
+    ]))
+    .unwrap();
+    assert!(crate::rule_set::validate_remote_paths(&mut configs, &[]).is_err());
+}
+
+#[test]
+fn remote_declarations_require_one_root_and_direct_unreserved_children() {
+    let dir = directory();
+    let root = dir.path().join("cache");
+    for name in [
+        "../outside.json",
+        "nested/rules.json",
+        "owner.lock",
+        "rules.json.shoes-update.lock",
+        "rules.json.shoes-update.tmp",
+    ] {
+        let remote = source("https://example.com/rules.json", &root.join(name));
+        let mut config = configs(&remote);
+        config[0] = Config::RuleCacheDirectory(root.clone());
+        assert!(
+            crate::rule_set::validate_remote_paths(&mut config, &[]).is_err(),
+            "{name}"
+        );
+    }
+    let remote = source("https://example.com/rules.json", &root.join("rules.json"));
+    let mut config = configs(&remote);
+    crate::rule_set::validate_remote_paths(&mut config, &[]).unwrap();
+    let mut duplicate = config.clone();
+    duplicate.push(Config::RuleCacheDirectory(root));
+    assert!(crate::rule_set::validate_remote_paths(&mut duplicate, &[]).is_err());
+    config.remove(0);
+    assert!(
+        crate::rule_set::validate_remote_paths(&mut config, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("require a private rule_cache_dir")
+    );
+}
+
+#[test]
+fn managed_root_cannot_intersect_acme_state_in_either_direction() {
+    let dir = directory();
+    let root = dir.path().join("cache");
+    for state in [dir.path().to_path_buf(), root.clone(), root.join("acme")] {
+        let mut configs: Vec<Config> = serde_json::from_value(serde_json::json!([
+            {"rule_cache_dir": root},
+            {"certificate_source": "acme", "type": "acme", "domains": ["example.com"],
+             "directory_url": "https://ca.invalid/directory", "state_dir": state,
+             "challenge": {"type": "tls_alpn01"}}
+        ]))
+        .unwrap();
+        let error = crate::rule_set::validate_remote_paths(&mut configs, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("ACME state directory"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn normalized_sources_preserve_url_format_hints_without_retaining_delivery_secrets() {
+    let dir = directory();
+    let path = dir.path().join("cache.txt");
+    write_rule(&path, VALID);
+    let mut remote = source("https://example.com/rules.json?SECRET", &path);
+    remote.format = None;
+    let mut validated = crate::config::compile_configs(configs(&remote))
+        .await
+        .unwrap();
+    assert_eq!(validated.remote_rules.len(), 1);
+    crate::rule_set::visit_sources(&mut validated.configs, &mut |source| {
+        assert!(source.url.is_none());
+        assert!(source.download.is_none());
+        assert!(source.update_interval.is_none());
+        Ok(())
+    })
+    .unwrap();
+    assert!(validated.reload_files.is_empty());
+}
+
+#[test]
+fn explicit_bootstrap_uses_only_declared_synthetic_guards_not_runtime_state() {
+    let configs: Vec<Config> = serde_json::from_value(serde_json::json!([
+        {"dns_group": "unavailable", "dns_servers": "system", "fake_ip": {"state_file": "/unavailable/state"}},
+        {"address": "10.12.0.1", "netmask": "255.255.255.0", "device_name": "tun0", "rules": "allow-all-direct"}
+    ])).unwrap();
+    let dns = DnsRegistry::for_direct_rule_update(&configs).unwrap();
+    assert!(
+        dns.forbidden_ranges()
+            .iter()
+            .any(|range| range.contains("198.18.0.53".parse::<std::net::IpAddr>().unwrap()))
+    );
+    assert!(dns.get_by_name("unavailable").is_none());
 }
 
 #[tokio::test]
@@ -2103,7 +1759,7 @@ async fn caches_cannot_overwrite_config_pem_state_or_other_source_files() {
         let mut config = configs(&source);
         config.push(serde_json::from_value(extra).unwrap());
         assert!(
-            prepare(config, None, &mut None)
+            crate::config::compile_configs(config)
                 .await
                 .err()
                 .unwrap()

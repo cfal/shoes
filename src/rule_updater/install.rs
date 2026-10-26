@@ -7,7 +7,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const DIRECTORY_SEARCH: i32 = libc::O_PATH;
@@ -21,8 +21,34 @@ pub(crate) fn cache_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+pub(crate) fn cache_lease(directory: &Path) -> io::Result<File> {
+    let (directory, name) = checked_path(&directory.join("owner.lock"))?;
+    let name = c_name(&name)?;
+    let file = match open_at(
+        &directory,
+        &name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+    ) {
+        Ok(file) => {
+            check_file(&file.metadata()?, true)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_at(&directory, &name, libc::O_RDWR)?
+        }
+        Err(error) => return Err(error),
+    };
+    check_file(&file.metadata()?, true)?;
+    file.try_lock().map_err(|_| {
+        invalid(
+            "rule_cache_dir is already owned; stop its Shoes process before running update-rules",
+        )
+    })?;
+    Ok(file)
+}
+
 pub(super) struct Install {
-    path: PathBuf,
     directory: File,
     destination: CString,
     stage: CString,
@@ -56,7 +82,6 @@ impl Install {
 
     pub(super) fn open(path: &Path) -> io::Result<Self> {
         let (directory, name) = checked_path(path)?;
-        let path = crate::rule_set::source_identity(path)?;
         let mut lock_name = name.clone();
         lock_name.push(CACHE_LOCK_SUFFIX);
         let lock_name = c_name(&lock_name)?;
@@ -126,7 +151,6 @@ impl Install {
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
         )?;
         let install = Self {
-            path,
             directory,
             destination,
             stage,
@@ -203,14 +227,10 @@ impl Install {
         #[cfg(test)]
         self.fail_before_rename()?;
         let fd = self.directory.as_raw_fd();
-        crate::file_watcher::managed::publish(&self.path, &self.file, || {
-            if unsafe { libc::renameat(fd, self.stage.as_ptr(), fd, self.destination.as_ptr()) }
-                != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        })
+        if unsafe { libc::renameat(fd, self.stage.as_ptr(), fd, self.destination.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     fn sync_published(&self) -> Outcome {

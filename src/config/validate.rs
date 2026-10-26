@@ -36,6 +36,7 @@ pub struct ValidatedConfigs {
     pub dns_groups: Vec<ExpandedDnsGroup>,
     pub wireguard_endpoints: Vec<super::types::wireguard::WireguardDeviceConfig>,
     pub(crate) remote_rules: Vec<crate::rule_set::RuleSource>,
+    pub(crate) rule_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl ValidatedConfigs {
@@ -94,13 +95,14 @@ pub(super) fn create_server_configs_with_inputs(
     inputs: HashMap<std::path::PathBuf, std::fs::File>,
 ) -> std::io::Result<ValidatedConfigs> {
     crate::rule_set::validate_remote_paths(&mut all_configs, &[])?;
+    let rule_cache_dir = crate::rule_set::cache_directory(&all_configs)?;
     let certificates = crate::certificates::configure(&mut all_configs)?;
     let catalog = crate::control::catalog::Catalog::capture(&mut all_configs)?;
     let mut control = super::ControlConfig::default();
     let mut compiler = crate::rules::Compiler::default();
     compiler.input_files = inputs
         .into_iter()
-        .map(|(path, file)| Ok((crate::rule_set::source_identity(&path)?, file)))
+        .map(|(path, file)| Ok((std::path::absolute(path)?, file)))
         .collect::<std::io::Result<_>>()?;
     let mut reload_files = crate::rule_set::dependencies(&mut all_configs)?;
     reload_files.extend(super::pem_reload_dependencies(&mut all_configs)?);
@@ -155,7 +157,9 @@ pub(super) fn create_server_configs_with_inputs(
                     ));
                 }
             }
-            Config::CertificateSource(_) | Config::RuleSourceGroup(_) => {}
+            Config::CertificateSource(_)
+            | Config::RuleSourceGroup(_)
+            | Config::RuleCacheDirectory(_) => {}
             Config::GlobalLimits(limits) => {
                 if global_limits.replace(limits).is_some() {
                     return Err(std::io::Error::new(
@@ -443,6 +447,7 @@ pub(super) fn create_server_configs_with_inputs(
         dns_groups: final_dns_groups,
         wireguard_endpoints: Vec::new(),
         remote_rules,
+        rule_cache_dir,
     };
     validate_wireguard_dns(&validated)?;
     #[cfg(unix)]
@@ -489,17 +494,6 @@ fn validate_rule_downloads(
     Ok(())
 }
 
-// Cold downloads need client/DNS definitions before rule files can be compiled.
-// Reuse the same expansion and validation as the final configuration; never
-// construct a startable configuration with missing or placeholder predicates.
-pub(crate) struct RuleDownloadContext {
-    pub sources: Vec<crate::rule_set::RuleSource>,
-    pub groups: Vec<ExpandedDnsGroup>,
-    pub limits: GlobalLimits,
-    pub catalog: Option<crate::control::catalog::Catalog>,
-    pub control: super::ControlConfig,
-}
-
 fn direct_client(catalog: Option<&crate::control::catalog::Catalog>) -> ClientConfig {
     let mut direct = ClientConfig::default();
     if let Some(catalog) = catalog {
@@ -510,102 +504,6 @@ fn direct_client(catalog: Option<&crate::control::catalog::Catalog>) -> ClientCo
         });
     }
     direct
-}
-
-pub(crate) fn rule_download_context(
-    mut configs: Vec<Config>,
-) -> std::io::Result<RuleDownloadContext> {
-    crate::rule_set::validate_remote_paths(&mut configs, &[])?;
-    let catalog = crate::control::catalog::Catalog::capture(&mut configs)?;
-    let mut control = super::ControlConfig::default();
-    let mut sources = crate::rule_set::remote_sources(&mut configs)?;
-    let mut clients = HashMap::from([(
-        "direct".into(),
-        OneOrSome::One(ConfigSelection::Config(direct_client(catalog.as_ref()))),
-    )]);
-    let mut pems = HashMap::new();
-    let mut dns = HashMap::new();
-    let mut limits = None;
-    for config in configs {
-        match config {
-            Config::ClashApi(config) => control.listeners.push(config),
-            Config::CacheFile(config) => {
-                if control
-                    .cache_file_path
-                    .replace(config.cache_file_path)
-                    .is_some()
-                {
-                    return Err(crate::rules::invalid("duplicate cache_file_path"));
-                }
-            }
-            Config::ClientConfigGroup(group) => {
-                if clients
-                    .insert(group.client_group, group.client_proxies)
-                    .is_some()
-                {
-                    return Err(crate::rules::invalid("duplicate download client group"));
-                }
-            }
-            Config::DnsConfigGroup(group) => {
-                if dns.insert(group.dns_group.clone(), group).is_some() {
-                    return Err(crate::rules::invalid("duplicate download DNS group"));
-                }
-            }
-            Config::NamedPem(pem) => {
-                let PemSource::Data(data) = pem.source else {
-                    return Err(crate::rules::invalid("download PEM paths must be embedded"));
-                };
-                if pems.insert(pem.pem, data).is_some() {
-                    return Err(crate::rules::invalid("duplicate download PEM name"));
-                }
-            }
-            Config::GlobalLimits(value) => {
-                value.validate()?;
-                if limits.replace(value).is_some() {
-                    return Err(crate::rules::invalid("duplicate global_limits"));
-                }
-            }
-            _ => {}
-        }
-    }
-    let limits = limits.unwrap_or_default();
-    let mut clients = resolve_client_groups_topologically(clients)?;
-    for members in clients.values_mut() {
-        for client in members {
-            validate_client_config(client, &pems, limits)?;
-        }
-    }
-    let mut policies: HashMap<_, _> = dns
-        .iter()
-        .map(|(name, group)| {
-            (
-                name.clone(),
-                group.fake_ip.as_ref().and_then(|p| p.options()),
-            )
-        })
-        .collect();
-    let dns = expand_dns_groups_composition(dns)?;
-    let names = dns.keys().map(String::as_str).collect();
-    validate_rule_downloads(&mut sources, &clients, &pems, &names, limits)?;
-    let groups = topological_sort_dns_groups_by_bootstrap(&dns)?
-        .into_iter()
-        .map(|name| {
-            let specs = expand_dns_specs(&dns[&name], &clients, &pems, &names, limits)?;
-            Ok(ExpandedDnsGroup {
-                fake_ip: policies.remove(&name).flatten(),
-                use_default_resolver: false,
-                name,
-                specs,
-            })
-        })
-        .collect::<std::io::Result<Vec<_>>>()?;
-    Ok(RuleDownloadContext {
-        sources,
-        groups,
-        limits,
-        catalog,
-        control,
-    })
 }
 
 pub(super) fn refresh_catalog_clients(

@@ -2,7 +2,7 @@ use super::*;
 
 async fn load_validated(
     paths: &[String],
-    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
+    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf], Option<&Path>) + Send),
 ) -> io::Result<ValidatedConfigs> {
     let configs = config::load_config_files(paths).await?;
     validate_configs(paths, configs, discovered).await
@@ -20,7 +20,7 @@ async fn validation_errors_preserve_io_kind_and_file_context() {
     std::fs::write(&path, yaml).unwrap();
     let paths = [path.to_str().unwrap().to_owned()];
 
-    let Err(error) = load_validated(&paths, &mut |_, _| {}).await else {
+    let Err(error) = load_validated(&paths, &mut |_, _, _| {}).await else {
         panic!("missing PEM file must reject");
     };
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
@@ -198,10 +198,10 @@ async fn activation_discards_candidate_identity_events_but_preserves_reload_even
         let paths = [config.to_str().unwrap().to_owned()];
         let (tx, mut changes) = mpsc::channel(1);
         let mut watches = ConfigWatches::new(&paths, tx, false).unwrap();
-        let validated = load_validated(&paths, &mut |reload, recovery| {
+        let validated = load_validated(&paths, &mut |reload, recovery, root| {
             assert!(!reload.contains(&cert) && !reload.contains(&key));
             assert!(recovery.contains(&cert) && recovery.contains(&key));
-            watches.discovered(reload, recovery);
+            watches.discovered(reload, recovery, root);
         })
         .await
         .unwrap();
@@ -233,7 +233,7 @@ async fn activation_discards_candidate_identity_events_but_preserves_reload_even
         );
 
         for changed in [&config, &trust] {
-            watches.discovered(std::slice::from_ref(&trust), &[cert.clone(), key.clone()]);
+            watches.discovered(std::slice::from_ref(&trust), &[cert.clone(), key.clone()], None);
             let contents = std::fs::read(changed).unwrap();
             std::fs::write(changed, contents).unwrap();
             while changes.is_empty() {
@@ -274,7 +274,7 @@ async fn dependencies_are_discovered_before_the_candidate_reads_them() {
     let error = load_candidate(
         &paths,
         configs,
-        &mut |paths, _| {
+        &mut |paths, _, _| {
             assert!(paths.contains(&source));
             std::fs::write(&source, "invalid").unwrap();
         },
@@ -286,6 +286,38 @@ async fn dependencies_are_discovered_before_the_candidate_reads_them() {
     .err()
     .unwrap();
     assert!(error.to_string().contains("rule source"), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejected_candidate_and_recovery_watches_exclude_managed_caches() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("cache");
+    std::fs::create_dir(&root).unwrap();
+    let cache = root.join("rules.json");
+    let alias = directory.path().join("alias.json");
+    std::fs::write(&cache, "old").unwrap();
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+    let config = directory.path().join("config.yaml");
+    std::fs::write(&config, "config").unwrap();
+    let (tx, mut changes) = mpsc::channel(1);
+    let mut watches =
+        ConfigWatches::new(&[config.to_str().unwrap().into()], tx, false).unwrap();
+    watches.discovered(
+        std::slice::from_ref(&alias),
+        std::slice::from_ref(&cache),
+        Some(&root),
+    );
+    std::fs::write(&cache, "new").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), watches.changed(&mut changes))
+            .await
+            .is_err()
+    );
+    std::fs::write(&config, "changed").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), watches.changed(&mut changes))
+        .await
+        .unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -331,7 +363,7 @@ async fn fake_dns_rejected_reload_keeps_inherited_guards_without_freezing_live_p
         r#"[{"dns_group":"ordinary","dns_servers":"udp://198.18.0.5:53"}]"#,
     )
     .unwrap();
-    load_validated(&paths, &mut |_, _| {}).await.unwrap();
+    load_validated(&paths, &mut |_, _, _| {}).await.unwrap();
     let error = prepare(&paths, Some(&live.dns)).await.err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(
@@ -366,7 +398,7 @@ async fn fake_dns_removed_context_rejects_forwarding_and_override_reload_targets
         }]}),
     ] {
         std::fs::write(&path, json!([server]).to_string()).unwrap();
-        load_validated(&paths, &mut |_, _| {}).await.unwrap();
+        load_validated(&paths, &mut |_, _, _| {}).await.unwrap();
         let error = prepare(&paths, Some(&removed.dns)).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
@@ -422,7 +454,7 @@ async fn fake_dns_retained_pools_reject_tun_endpoint_reload_collisions() {
                 let mut tun = json!({"device_name":"tun0", "device_fd":42});
                 tun[field] = endpoint.into();
                 std::fs::write(&path, json!([tun]).to_string()).unwrap();
-                load_validated(&paths, &mut |_, _| {}).await.unwrap();
+                load_validated(&paths, &mut |_, _, _| {}).await.unwrap();
                 let result = prepare(&paths, Some(&retained.dns)).await;
                 if allowed {
                     result.unwrap();

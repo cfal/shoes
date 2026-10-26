@@ -228,8 +228,9 @@ pub(crate) fn visit_sources(
 pub fn dependencies(configs: &mut [Config]) -> io::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     visit_sources(configs, &mut |source| {
-        source.parsed_url()?;
-        paths.push(source.path.clone());
+        if source.parsed_url()?.is_none() {
+            paths.push(source.path.clone());
+        }
         Ok(())
     })?;
     paths.sort();
@@ -248,6 +249,7 @@ pub(crate) fn remote_sources(configs: &mut [Config]) -> io::Result<Vec<RuleSourc
                 "remote cache paths must be absolute for string configs",
             ));
         }
+        source.path = std::path::absolute(&source.path)?;
         if let Some(previous) = sources.get(&source.path) {
             if serde_json::to_value(previous)? != serde_json::to_value(&source)? {
                 return Err(invalid("conflicting remote sources share a cache path"));
@@ -282,46 +284,34 @@ pub(crate) fn normalize_sources(
     Ok(deliveries)
 }
 
-fn cache_paths(path: &Path) -> [PathBuf; 3] {
-    let sidecar = |suffix| {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(suffix);
-        PathBuf::from(name)
-    };
-    [
-        path.into(),
-        sidecar(CACHE_LOCK_SUFFIX),
-        sidecar(CACHE_STAGE_SUFFIX),
-    ]
-}
-
 pub(crate) fn source_identity(path: &Path) -> io::Result<PathBuf> {
     let mut absolute = std::path::absolute(path)?;
     let mut followed = HashSet::new();
-    for _ in 0..40 {
-        if followed.contains(&absolute) {
+    'links: for _ in 0..40 {
+        if !followed.insert(absolute.clone()) {
             break;
         }
-        if let Ok(canonical) = absolute.canonicalize() {
-            return Ok(canonical);
-        }
-        // A local alias may point at a remote cache that has not been installed yet.
-        if let Ok(target) = std::fs::read_link(&absolute) {
-            followed.insert(absolute.clone());
-            absolute = if target.is_absolute() {
-                target
-            } else {
-                absolute.parent().unwrap().join(target)
+        let mut ancestor = absolute.as_path();
+        let mut suffix = Vec::new();
+        loop {
+            if let Ok(mut canonical) = ancestor.canonicalize() {
+                canonical.extend(suffix.iter().rev());
+                return Ok(canonical);
+            }
+            // Resolve aliases before reattaching missing descendants. Otherwise a
+            // not-yet-created state directory could bypass the managed namespace.
+            if let Ok(target) = std::fs::read_link(ancestor) {
+                let mut target = ancestor.parent().unwrap().join(target);
+                target.extend(suffix.iter().rev());
+                absolute = target;
+                continue 'links;
+            }
+            let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
+                return Ok(absolute);
             };
-            continue;
+            suffix.push(name.to_os_string());
+            ancestor = parent;
         }
-        if let Some(parent) = absolute.parent()
-            && let Ok(parent) = parent.canonicalize()
-            && let Some(name) = absolute.file_name()
-        {
-            return Ok(parent.join(name));
-        }
-        return Ok(absolute);
     }
     Err(invalid(
         "rule source symlink chain exceeds 40 links or contains a loop",
@@ -331,31 +321,54 @@ pub(crate) fn source_identity(path: &Path) -> io::Result<PathBuf> {
 pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -> io::Result<()> {
     use source_identity as identity;
     let remotes = remote_sources(configs)?;
-    if remotes.is_empty() {
-        return Ok(());
+    let Some(directory) = cache_directory(configs)? else {
+        return if remotes.is_empty() {
+            Ok(())
+        } else {
+            Err(invalid("remote sources require a private rule_cache_dir"))
+        };
+    };
+    if !cfg!(unix) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "rule_cache_dir requires Unix",
+        ));
     }
-    let mut owned = HashSet::new();
-    let mut sidecars = HashSet::new();
+    let directory_identity = identity(&directory)?;
     for source in &remotes {
-        for (index, path) in cache_paths(&identity(&source.path)?)
-            .into_iter()
-            .enumerate()
+        if std::path::absolute(&source.path)?.parent() != Some(directory.as_path()) {
+            return Err(invalid(
+                "remote caches must be direct children of rule_cache_dir",
+            ));
+        }
+        if source
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name == "owner.lock"
+                    || name.ends_with(CACHE_LOCK_SUFFIX)
+                    || name.ends_with(CACHE_STAGE_SUFFIX)
+            })
         {
-            if !owned.insert(path.clone()) {
-                return Err(invalid("remote cache ownership paths overlap"));
-            }
-            if index != 0 {
-                sidecars.insert(path);
-            }
+            return Err(invalid(
+                "rule_cache_dir owner.lock and updater sidecar suffixes are reserved",
+            ));
         }
     }
     visit_sources(configs, &mut |source| {
-        if sidecars.contains(&identity(&source.path)?) {
-            return Err(invalid("remote sidecar overlaps a rule source"));
+        if source.url.is_none()
+            && (std::path::absolute(&source.path)?.starts_with(&directory)
+                || identity(&source.path)?.starts_with(&directory_identity))
+        {
+            return Err(invalid(
+                "local rule source overlaps rule_cache_dir; managed caches cannot have local aliases",
+            ));
         }
         Ok(())
     })?;
     let mut reserved = extra.to_vec();
+    reserved.extend(crate::config::pem_candidate_dependencies(configs)?);
     let mut state_dirs = Vec::new();
     let mut reserve_state = |path: &Path| {
         if path.file_name().is_none() {
@@ -412,19 +425,43 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
         }
     }
     for path in reserved {
-        if owned.contains(&identity(&path)?) {
+        if std::path::absolute(&path)?.starts_with(&directory)
+            || identity(&path)?.starts_with(&directory_identity)
+        {
             return Err(invalid(
-                "remote cache overlaps a configuration, PEM, socket, or state path",
+                "rule_cache_dir overlaps a configuration, PEM, socket, or state path",
             ));
         }
     }
-    if owned
+    if state_dirs
         .iter()
-        .any(|path| state_dirs.iter().any(|dir| path.starts_with(dir)))
+        .any(|dir| dir.starts_with(&directory_identity) || directory_identity.starts_with(dir))
     {
         return Err(invalid("remote cache overlaps an ACME state directory"));
     }
     Ok(())
+}
+
+pub(crate) fn cache_directory(configs: &[Config]) -> io::Result<Option<PathBuf>> {
+    let mut directory = None;
+    for config in configs {
+        if let Config::RuleCacheDirectory(path) = config {
+            if !path.is_absolute()
+                || path.file_name().is_none()
+                || path
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir)
+            {
+                return Err(invalid(
+                    "rule_cache_dir must be an absolute directory without parent traversal",
+                ));
+            }
+            if directory.replace(std::path::absolute(path)?).is_some() {
+                return Err(invalid("rule_cache_dir may only be specified once"));
+            }
+        }
+    }
+    Ok(directory)
 }
 
 pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
@@ -432,6 +469,16 @@ pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
         .parent()
         .ok_or_else(|| invalid("config path has no parent"))?
         .to_path_buf();
+    for config in configs.iter_mut() {
+        if let Config::RuleCacheDirectory(path) = config {
+            if path.as_os_str().is_empty() {
+                return Err(invalid("rule_cache_dir must not be empty"));
+            }
+            if path.is_relative() {
+                *path = base.join(&*path);
+            }
+        }
+    }
     visit_sources(configs, &mut |source| {
         if source.path.is_relative() {
             source.path = base.join(&source.path);
@@ -513,12 +560,6 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
     if let Some(file) = compiler.input_files.get(&source.path) {
         return read_staged(source, file.try_clone()?, source.path.clone(), compiler);
     }
-    if !compiler.input_files.is_empty() {
-        let identity = source_identity(&source.path)?;
-        if let Some(file) = compiler.input_files.get(&identity) {
-            return read_staged(source, file.try_clone()?, identity, compiler);
-        }
-    }
     #[cfg(unix)]
     if source.url.is_some() || compiler.remote_files.contains_key(&source.path) {
         return read_file(
@@ -526,7 +567,7 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             crate::rule_updater::cache_file(&source.path).map_err(|e| {
                 io::Error::new(
                     e.kind(),
-                    format!("remote cache unavailable (offline checks never download): {e}"),
+                    format!("remote cache unavailable; startup and reload never download (run shoes update-rules explicitly): {e}"),
                 )
             })?,
             source.path.clone(),
@@ -534,9 +575,6 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
         );
     }
     let path = std::fs::canonicalize(&source.path)?;
-    if let Some(file) = compiler.input_files.get(&path) {
-        return read_staged(source, file.try_clone()?, path, compiler);
-    }
     if !std::fs::metadata(&path)?.is_file() {
         return Err(invalid("rule source must be a regular file"));
     }
@@ -561,7 +599,6 @@ fn read_staged(
     path: PathBuf,
     compiler: &mut Compiler,
 ) -> io::Result<Arc<Predicate>> {
-    // A local alias may decode these bytes differently and quote the remote payload.
     read_file(source, file, path, compiler).map_err(|error| {
         io::Error::new(
             error.kind(),

@@ -4,6 +4,15 @@ use std::{io, os::fd::AsRawFd, os::unix::net::UnixDatagram, time::Duration};
 use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
 
 #[tokio::test]
+async fn managed_cache_directory_without_remote_sources_is_rejected_by_ffi() {
+    let (_shutdown, rx) = oneshot::channel();
+    let error = start_from_config("[{\"rule_cache_dir\": \"/unavailable/cache\"}]", rx)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+}
+
+#[tokio::test]
 async fn remote_refresh_is_rejected_before_ffi_opens_resources() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();

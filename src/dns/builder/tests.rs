@@ -156,36 +156,21 @@ async fn native_cache_policy_distinguishes_implicit_and_explicit_system() {
 
 #[tokio::test]
 async fn rule_system_bootstrap_checks_current_and_retained_forbidden_upstreams() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("fake.json");
     let forbidden: Arc<[IpNetwork]> =
         Arc::from(["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()]);
     let guard = DnsRegistry {
         forbidden: forbidden.clone(),
         ..DnsRegistry::new()
     };
-    let source: crate::rule_set::RuleSource = serde_json::from_value(serde_json::json!({
-        "url": "https://remote.invalid/rules.json", "path": dir.path().join("cache.json"),
-        "download": {"client_chain": "direct", "bootstrap_url": "fake"}
-    }))
-    .unwrap();
-    for url in ["system", "https://upstream.invalid/dns-query"] {
-        let mut groups = fake_groups(true);
-        groups[0].specs = vec![make_spec(url)];
-        groups[0].fake_ip.as_mut().unwrap().state_file = Some(state.clone());
-        let error = DnsRegistry::for_rule_downloads(
-            groups,
-            GlobalLimits::default(),
-            std::slice::from_ref(&source),
-            &[],
-            Some(&guard),
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(error.to_string().contains("system DNS"), "{url}: {error}");
-        assert!(!state.exists());
-    }
+    assert!(
+        guard
+            .rule_bootstrap("system")
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("system DNS")
+    );
     let mut cached = build_dns_registry(fake_groups(false)).await.unwrap();
     cached.forbidden = forbidden;
     for bootstrap in ["system", "fake"] {

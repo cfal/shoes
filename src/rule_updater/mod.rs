@@ -14,7 +14,6 @@ use install::Install;
 use tokio::time::{Instant, timeout};
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_STAGED_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -35,7 +34,65 @@ impl Default for Limits {
     }
 }
 
-pub(crate) use install::cache_file;
+pub(crate) use install::{cache_file, cache_lease};
+
+pub(crate) async fn update_direct(paths: &[String]) -> io::Result<()> {
+    let mut configs = crate::config::load_configs(paths).await?;
+    let sources = crate::rule_set::remote_sources(&mut configs)?;
+    if sources.is_empty() {
+        return Err(invalid("update-rules requires at least one remote source"));
+    }
+    let directory =
+        crate::rule_set::cache_directory(&configs)?.expect("remote namespace validated");
+    let _lease = tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        cache_lease(&directory)
+    })
+    .await
+    .map_err(io::Error::other)??;
+    let dns = DnsRegistry::for_direct_rule_update(&configs)?;
+    println!("Using direct TCP and system DNS; configured download routes are overridden.");
+    for mut source in sources {
+        source.download = Some(Box::new(crate::rule_set::Download {
+            client_chain: crate::config::ClientChain::default(),
+            bootstrap_url: "system".into(),
+        }));
+        let result = async {
+            let staged = stage(
+                &source,
+                &dns,
+                GlobalLimits::default(),
+                Limits::default(),
+                &mut http::DownloadState::default(),
+            )
+            .await?;
+            staged.install.finish_async(staged.digest).await
+        }
+        .await
+        .map_err(|error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                format!("rule download {}: {error}", source.path.display()),
+            )
+        })?;
+        println!(
+            "{}: {}",
+            if result.changed() {
+                "Updated"
+            } else {
+                "Unchanged"
+            },
+            source.path.display()
+        );
+    }
+    println!("Rule files validated; run shoes check before starting Shoes.");
+    Ok(())
+}
 
 struct Staged {
     source: RuleSource,
@@ -96,149 +153,6 @@ async fn validate_staged(configs: Vec<Config>, staged: &[Staged]) -> io::Result<
     })
     .await
     .map_err(io::Error::other)?
-}
-
-async fn stage_sources(
-    sources: &[RuleSource],
-    dns: &DnsRegistry,
-    global: GlobalLimits,
-    mut remaining: u64,
-) -> io::Result<Vec<Staged>> {
-    validate_cold_source_count(sources.len())?;
-    let mut staged = Vec::new();
-    for source in sources {
-        if remaining == 0 {
-            return Err(invalid("cold rule downloads exceed staging budget"));
-        }
-        let limits = Limits {
-            bytes: MAX_BYTES.min(remaining),
-            ..Limits::default()
-        };
-        let item = stage(
-            source,
-            dns,
-            global,
-            limits,
-            &mut http::DownloadState::default(),
-        )
-        .await
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("rule download {}: {error}", source.path.display()),
-            )
-        })?;
-        remaining -= item.install.file.metadata()?.len();
-        staged.push(item);
-    }
-    Ok(staged)
-}
-
-fn validate_cold_source_count(count: usize) -> io::Result<()> {
-    let mut descriptors = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, descriptors.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let limit = cold_source_limit(unsafe { descriptors.assume_init() }.rlim_cur);
-    if count > limit {
-        return Err(invalid(format!(
-            "cold rule downloads exceed staging source limit ({limit}); prepopulate caches or raise the file descriptor limit"
-        )));
-    }
-    Ok(())
-}
-
-fn cold_source_limit(descriptors: libc::rlim_t) -> usize {
-    // Directory, lock, stage, and validation duplicate per source; leave headroom
-    // for the running generation. This is admission, not a descriptor reservation.
-    ((descriptors.saturating_sub(128) / 4).min(128)) as usize
-}
-
-pub(crate) async fn prepare(
-    mut configs: Vec<Config>,
-    previous: Option<&DnsRegistry>,
-    control: &mut Option<crate::control::runtime::ControlService>,
-) -> io::Result<ValidatedConfigs> {
-    let sources = crate::rule_set::remote_sources(&mut configs)?;
-    if sources.is_empty() {
-        return crate::config::compile_configs(configs).await;
-    }
-    if let Some(previous) = previous {
-        let reserved: Vec<_> = previous
-            .state_files()
-            .flat_map(|path| [path.to_path_buf(), crate::control::store::lock_path(path)])
-            .collect();
-        crate::rule_set::validate_remote_paths(&mut configs, &reserved)?;
-    }
-    let initial_error = match crate::config::compile_configs(configs.clone()).await {
-        Ok(validated) => return Ok(validated),
-        Err(error) => error,
-    };
-    let missing = crate::config::blocking_compile(move || {
-        Ok(sources
-            .into_iter()
-            .filter(|source| {
-                cache_file(&source.path)
-                    .and_then(|file| crate::rule_set::validate_file(source, file))
-                    .is_err()
-            })
-            .map(|s| s.path)
-            .collect::<Vec<_>>())
-    })
-    .await?;
-    if missing.is_empty() {
-        return Err(initial_error);
-    }
-    validate_cold_source_count(missing.len())?;
-    let context = configs.clone();
-    let mut context =
-        crate::config::blocking_compile(move || crate::config::rule_download_context(context))
-            .await?;
-    if let Some(control) = control.as_ref()
-        && control.runtime.config != context.control
-    {
-        return Err(invalid("controller settings require a restart"));
-    }
-    if let Some(catalog) = &context.catalog {
-        if control.is_none() {
-            if previous.is_some()
-                && (!context.control.listeners.is_empty()
-                    || context.control.cache_file_path.is_some())
-            {
-                return Err(invalid(
-                    "enabling controller or cache_file_path requires a restart",
-                ));
-            }
-            *control = Some(crate::control::runtime::ControlService::new(
-                context.control.clone(),
-            )?);
-        }
-        let runtime = &control.as_ref().unwrap().runtime;
-        runtime
-            .prepare_rule_download_selection(catalog.selection.clone())
-            .await?;
-    }
-    context
-        .sources
-        .retain(|source| missing.contains(&source.path));
-    let sources = context.sources;
-    let global = context.limits;
-    let dns = timeout(
-        Limits::default().overall,
-        DnsRegistry::for_rule_downloads(context.groups, global, &sources, &configs, previous),
-    )
-    .await
-    .map_err(|_| invalid("rule bootstrap preparation deadline exceeded"))??;
-    let staged = stage_sources(&sources, &dns, global, MAX_STAGED_BYTES).await?;
-    let validated = validate_staged(configs, &staged).await?;
-    for item in staged {
-        item.install.finish_async(item.digest).await?;
-        log::info!(
-            "Installed initial remote rules: {}",
-            item.source.path.display()
-        );
-    }
-    Ok(validated)
 }
 
 struct Scheduled {

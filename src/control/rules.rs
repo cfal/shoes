@@ -271,6 +271,7 @@ mod tests {
                 "protocol": {"type": "socks", "username": "user", "password": "PASSWORD_SENTINEL"}}
         }}});
         let configs: Vec<Config> = serde_json::from_value(json!([
+            {"rule_cache_dir": dir.path()},
             {"clash_api_address": "127.0.0.1:0", "secret": "controller-secret"},
             {"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "rules": [
                 {"masks": {"all": [{"any": [source.clone()]}, {"not": {"not": source}}]}, "action": "allow"}
