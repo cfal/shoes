@@ -2,23 +2,23 @@ use super::install::FAIL_RENAME;
 use super::*;
 use std::fs::{File, Metadata};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
 const STAGE_SUFFIX: &str = ".shoes-update.tmp";
 const MAX_HEADERS: usize = 32 * 1024;
+
 fn stamp(m: &Metadata) -> (u64, u64, u64, i64, i64) {
     (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec())
 }
+
 fn c_name(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)
 }
-
-use std::os::unix::fs::symlink;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 const VALID: &[u8] = include_bytes!("../../tests/fixtures/rule_sets/singbox.json");
 const OLD: &[u8] = br#"{"version":1,"rules":[{"domain":["old.example"]}]}"#;
@@ -214,26 +214,13 @@ async fn bootstrap_preserves_inline_tls_names_and_loads_local_pems() {
             .await
             .unwrap();
         assert_eq!(stream.get_ref().1.server_name(), Some("proxy.invalid"));
-        let mut greeting = [0; 3];
-        stream.read_exact(&mut greeting).await.unwrap();
-        assert_eq!(greeting, [5, 1, 0]);
-        stream.write_all(&[5, 0]).await.unwrap();
-        let mut connect = [0; 10];
-        stream.read_exact(&mut connect).await.unwrap();
+        let connect = socks_connect(&mut stream).await;
         assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, 10, 31, 144]);
         stream
             .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
             .await
             .unwrap();
-        let mut headers = Vec::new();
-        while !headers.ends_with(b"\r\n\r\n") {
-            headers.push(stream.read_u8().await.unwrap());
-        }
-        assert!(
-            String::from_utf8(headers)
-                .unwrap()
-                .contains("host: 192.0.2.10:8080")
-        );
+        assert!(request(&mut stream).await.contains("host: 192.0.2.10:8080"));
         stream.write_all(&response(200, "", VALID)).await.unwrap();
         stream.flush().await.unwrap();
     });
@@ -386,13 +373,23 @@ fn response(status: u16, headers: &str, body: &[u8]) -> Vec<u8> {
     result
 }
 
-async fn request(stream: &mut TcpStream) -> String {
+async fn request(stream: &mut (impl AsyncRead + Unpin)) -> String {
     let mut result = Vec::new();
     while !result.ends_with(b"\r\n\r\n") {
         result.push(stream.read_u8().await.unwrap());
         assert!(result.len() < 16 * 1024);
     }
     String::from_utf8(result).unwrap()
+}
+
+async fn socks_connect(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> [u8; 10] {
+    let mut greeting = [0; 3];
+    stream.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [5, 1, 0]);
+    stream.write_all(&[5, 0]).await.unwrap();
+    let mut connect = [0; 10];
+    stream.read_exact(&mut connect).await.unwrap();
+    connect
 }
 
 async fn serve(bytes: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
@@ -1025,12 +1022,7 @@ async fn stalled_url_address_does_not_block_another_guarded_candidate() {
     }
     async fn socks(listener: &TcpListener, ip: u8) -> TcpStream {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut greeting = [0; 3];
-        stream.read_exact(&mut greeting).await.unwrap();
-        assert_eq!(greeting, [5, 1, 0]);
-        stream.write_all(&[5, 0]).await.unwrap();
-        let mut connect = [0; 10];
-        stream.read_exact(&mut connect).await.unwrap();
+        let connect = socks_connect(&mut stream).await;
         assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, ip, 31, 144]);
         stream
     }
@@ -1154,12 +1146,7 @@ async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
         let proxy_address = proxy.local_addr().unwrap();
         let fixture = tokio::spawn(async move {
             let (mut stream, _) = proxy.accept().await.unwrap();
-            let mut greeting = [0; 3];
-            stream.read_exact(&mut greeting).await.unwrap();
-            assert_eq!(greeting, [5, 1, 0]);
-            stream.write_all(&[5, 0]).await.unwrap();
-            let mut connect = [0; 10];
-            stream.read_exact(&mut connect).await.unwrap();
+            let connect = socks_connect(&mut stream).await;
             assert_eq!(&connect[..4], &[5, 1, 0, 1]);
             stream
                 .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
@@ -1318,12 +1305,7 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                             continue;
                         }
                     }
-                    let mut greeting = [0; 3];
-                    stream.read_exact(&mut greeting).await.unwrap();
-                    assert_eq!(greeting, [5, 1, 0]);
-                    stream.write_all(&[5, 0]).await.unwrap();
-                    let mut connect = [0; 10];
-                    stream.read_exact(&mut connect).await.unwrap();
+                    socks_connect(&mut stream).await;
                     stream
                         .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
                         .await
@@ -1588,32 +1570,19 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
             Box::pin(async move { Ok(vec![address]) })
         }
     }
-    async fn socks(
-        stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
-        expected: [u8; 10],
-    ) {
-        let mut greeting = [0; 3];
-        stream.read_exact(&mut greeting).await.unwrap();
-        assert_eq!(greeting, [5, 1, 0]);
-        stream.write_all(&[5, 0]).await.unwrap();
-        let mut connect = [0; 10];
-        stream.read_exact(&mut connect).await.unwrap();
+    async fn socks(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), expected: [u8; 10]) {
+        let connect = socks_connect(stream).await;
         assert_eq!(connect, expected);
         stream
             .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
             .await
             .unwrap();
     }
-    async fn serve_second(mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin) {
+    async fn serve_second(mut stream: impl AsyncRead + AsyncWrite + Unpin) {
         socks(&mut stream, [5, 1, 0, 1, 192, 0, 2, 10, 31, 144]).await;
-        let mut request = Vec::new();
-        while !request.ends_with(b"\r\n\r\n") {
-            request.push(stream.read_u8().await.unwrap());
-            assert!(request.len() < 16384);
-        }
         assert!(
-            String::from_utf8(request)
-                .unwrap()
+            request(&mut stream)
+                .await
                 .contains("host: remote.invalid:8080")
         );
         stream.write_all(&response(200, "", VALID)).await.unwrap();
@@ -1750,12 +1719,7 @@ async fn first_download_proxy_retains_bootstrap_address_fallback() {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut greeting = [0; 3];
-            stream.read_exact(&mut greeting).await.unwrap();
-            assert_eq!(greeting, [5, 1, 0]);
-            stream.write_all(&[5, 0]).await.unwrap();
-            let mut connect = [0; 10];
-            stream.read_exact(&mut connect).await.unwrap();
+            let connect = socks_connect(&mut stream).await;
             assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, 1, 31, 144]);
             stream
                 .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
