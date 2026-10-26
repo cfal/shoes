@@ -39,7 +39,7 @@ pub struct ValidatedConfigs {
 
 impl ValidatedConfigs {
     #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi", test))]
-    pub(crate) fn reject_ffi_control(&self) -> std::io::Result<()> {
+    pub(crate) fn validate_ffi_support(&self) -> std::io::Result<()> {
         self.control.reject_ffi()?;
         if self
             .catalog
@@ -49,6 +49,16 @@ impl ValidatedConfigs {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "fallback groups require the CLI generation lifecycle",
+            ));
+        }
+        if self
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.selection.automatic.0.is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "url-test groups require the process runtime and are not supported by FFI",
             ));
         }
         Ok(())
@@ -207,6 +217,8 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
         for config in configs.iter_mut() {
             validate_client_config(config, &named_pems, global_limits)?;
         }
+        // Unused groups can still be instantiated by controller and URL-test probes.
+        super::health::validate_chain(std::iter::once(configs.iter()))?;
     }
 
     // Extract inline DNS configs from server/tun configs into dns_groups.
@@ -2205,6 +2217,7 @@ fn validate_client_chain(
         validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
     }
     expand_client_chain(hops, client_groups)?;
+    super::health::validate_chain(hops.iter().map(super::health::clients))?;
     validate_connector_positions(hops, chain_index)
 }
 
@@ -2347,24 +2360,33 @@ fn expand_client_chain(
         }
     }
 
-    let mut health = false;
-    let mut paths = Some(1usize);
+    let is_fallback = |selection: &ConfigSelection<ClientConfig>| match selection {
+        ConfigSelection::Config(client) => client
+            .control
+            .as_ref()
+            .is_some_and(crate::control::catalog::MemberOrigin::has_fallback),
+        ConfigSelection::GroupName(_) => false,
+    };
+    let mut has_fallback = false;
+    let mut path_count = Some(1usize);
     for hop in &expanded_hops {
-        let clients: Vec<_> = match hop {
-            ClientChainHop::Single(selection) => vec![selection],
-            ClientChainHop::Pool(pool) => pool.iter().collect(),
-        };
-        paths = paths.and_then(|paths| paths.checked_mul(clients.len()));
-        health |= clients.iter().any(|client| matches!(client, ConfigSelection::Config(client)
-            if client.control.as_ref().is_some_and(crate::control::catalog::MemberOrigin::has_fallback)));
+        match hop {
+            ClientChainHop::Single(selection) => has_fallback |= is_fallback(selection),
+            ClientChainHop::Pool(pool) => {
+                path_count = path_count.and_then(|count| count.checked_mul(pool.iter().count()));
+                has_fallback |= pool.iter().any(is_fallback);
+            }
+        }
     }
-    if health && paths.is_none_or(|paths| paths > crate::control::health::MAX_PATHS) {
+    if has_fallback && path_count.is_none_or(|count| count > crate::control::health::MAX_PATHS) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "fallback exceeds 256 concrete chain paths",
+            format!(
+                "fallback exceeds {} concrete chain paths",
+                crate::control::health::MAX_PATHS
+            ),
         ));
     }
-
     *client_chain = if expanded_hops.len() == 1 {
         OneOrSome::One(expanded_hops.into_iter().next().unwrap())
     } else {

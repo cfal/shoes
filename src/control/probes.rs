@@ -21,7 +21,7 @@ use crate::control::runtime::{ControlRuntime, Generation};
 use crate::option_util::OneOrSome;
 use crate::resolver::Resolver;
 
-const PROBE_CONCURRENCY: usize = 16;
+pub(crate) const PROBE_CONCURRENCY: usize = 16;
 
 #[derive(Default)]
 struct History {
@@ -246,7 +246,7 @@ pub struct ProbeQuery {
 }
 
 impl ProbeQuery {
-    pub(crate) fn validate_automatic_target(&self) -> io::Result<()> {
+    pub(crate) fn validate_automatic_target(&self, label: &str) -> io::Result<()> {
         let denied = match self.url.host() {
             Some(url::Host::Ipv4(ip)) => forbidden(ip.into()),
             Some(url::Host::Ipv6(ip)) => forbidden(ip.into()),
@@ -255,7 +255,7 @@ impl ProbeQuery {
         if denied {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "automatic probe URL is denied by probe destination policy",
+                format!("{label} is denied by probe destination policy"),
             ));
         }
         Ok(())
@@ -511,7 +511,10 @@ pub(crate) fn local_failure(error: &io::Error) -> bool {
     }
     let mut error: &(dyn std::error::Error + 'static) = error;
     loop {
-        if error.is::<ProbePolicyDenied>() || error.is::<crate::dns::SyntheticDnsAnswer>() {
+        if error.is::<ProbePolicyDenied>()
+            || error.is::<crate::dns::SyntheticDnsAnswer>()
+            || error.is::<super::health::HealthCapacity>()
+        {
             return true;
         }
         let source = if let Some(error) = error.downcast_ref::<io::Error>() {
@@ -716,21 +719,29 @@ async fn request_with_tls_config(
     query: &ProbeQuery,
     tls_config: impl FnOnce() -> rustls::ClientConfig,
 ) -> io::Result<(u16, bool)> {
-    let chain = generation.probes.connector(&generation.catalog, name)?;
-    request_via(
-        &chain,
+    let resolver = ProbeResolver::for_query(
         generation.probes.resolver.clone(),
         &generation.probes.forbidden,
         query,
-        tls_config,
-    )
-    .await
+    )?;
+    let chain = generation.probes.connector(&generation.catalog, name)?;
+    request_with_resolver(&chain, resolver, query, tls_config).await
 }
 
 pub(crate) async fn request_via(
     chain: &ClientChainGroup,
     resolver: Arc<dyn Resolver>,
     forbidden_ranges: &[ipnetwork::IpNetwork],
+    query: &ProbeQuery,
+    tls_config: impl FnOnce() -> rustls::ClientConfig,
+) -> io::Result<(u16, bool)> {
+    let resolver = ProbeResolver::for_query(resolver, forbidden_ranges, query)?;
+    request_with_resolver(chain, resolver, query, tls_config).await
+}
+
+async fn request_with_resolver(
+    chain: &ClientChainGroup,
+    resolver: ProbeResolver,
     query: &ProbeQuery,
     tls_config: impl FnOnce() -> rustls::ClientConfig,
 ) -> io::Result<(u16, bool)> {
@@ -741,17 +752,7 @@ pub(crate) async fn request_via(
         .unwrap()
         .trim_start_matches('[')
         .trim_end_matches(']');
-    let port = query.url.port_or_known_default().unwrap();
-    let target = NetLocation::new(crate::address::Address::from(host)?, port);
-    let resolver = ProbeResolver {
-        inner: resolver,
-        target: target.clone(),
-        forbidden_ranges: forbidden_ranges.to_vec(),
-        denied: forbidden,
-    };
-    if let Some(address) = target.to_socket_addr_nonblocking() {
-        resolver.check(&[address])?;
-    }
+    let target = resolver.target.clone();
     let resolver: Arc<dyn Resolver> = Arc::new(resolver);
     let setup = chain.connect_tcp(target.into(), &resolver).await?;
     if setup
@@ -799,9 +800,10 @@ pub(crate) async fn request_via(
     tokio::pin!(response);
     let response = tokio::select! {
         biased;
-        response = &mut response => response.map_err(io::Error::other)?,
-        _ = connection => response.await.map_err(io::Error::other)?,
-    };
+        response = &mut response => response,
+        _ = connection => response.await,
+    }
+    .map_err(io::Error::other)?;
     let status = response.status().as_u16();
     let satisfied = query.expected.is_empty()
         || query
@@ -823,6 +825,33 @@ struct ProbeResolver {
 }
 
 impl ProbeResolver {
+    fn for_query(
+        inner: Arc<dyn Resolver>,
+        forbidden_ranges: &[ipnetwork::IpNetwork],
+        query: &ProbeQuery,
+    ) -> io::Result<Self> {
+        let host = query
+            .url
+            .host_str()
+            .unwrap()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let target = NetLocation::new(
+            crate::address::Address::from(host)?,
+            query.url.port_or_known_default().unwrap(),
+        );
+        let resolver = Self {
+            inner,
+            target,
+            forbidden_ranges: forbidden_ranges.to_vec(),
+            denied: forbidden,
+        };
+        if let Some(address) = resolver.target.to_socket_addr_nonblocking() {
+            resolver.check(&[address])?;
+        }
+        Ok(resolver)
+    }
+
     fn check(&self, addresses: &[std::net::SocketAddr]) -> io::Result<()> {
         if addresses.is_empty()
             || addresses.iter().any(|address| {
@@ -1332,6 +1361,138 @@ mod tests {
         service.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn health_review3_runtime_caps_preserve_probe_history_and_url_test_health() {
+        for path_count in [257, 1] {
+            let clients: Vec<_> = (0..path_count).map(|index| json!({
+                "name":format!("member-{index}"), "address":format!("proxy-{index}.invalid:80"), "protocol":{"type":"http"}
+            })).collect();
+            let catalog = crate::config::create_server_configs(serde_json::from_value(json!([
+                {"client_group":"fallback", "type":"fallback", "health_check":{"url":"http://probe.invalid/", "interval_secs":30}, "client_proxies":clients},
+                {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":["fallback"]}
+            ])).unwrap()).unwrap().catalog.unwrap();
+            let resolver: Arc<dyn Resolver> = Arc::new(Answers(Vec::new()));
+            let generation = Arc::new(generation(catalog, resolver.clone()));
+            let mut held = Vec::new();
+            if path_count == 1 {
+                let check = &generation.catalog.selection.health.definitions["fallback"].check;
+                for index in 0u32..1024 {
+                    let mut key = [0; 32];
+                    key[..4].copy_from_slice(&index.to_be_bytes());
+                    held.push(
+                        generation
+                            .catalog
+                            .selection
+                            .health
+                            .register(key, check, resolver.clone(), Vec::new(), Vec::new(), || {
+                                crate::tcp::chain_builder::try_build_client_proxy_chain(
+                                    OneOrSome::One(ClientChainHop::Single(
+                                        ConfigSelection::Config(ClientConfig::default()),
+                                    )),
+                                    resolver.clone(),
+                                )
+                                .unwrap()
+                            })
+                            .unwrap(),
+                    );
+                }
+            }
+            let mut service =
+                crate::control::runtime::ControlService::new(Default::default()).unwrap();
+            publish_for_api_probes(&service.runtime, &generation).await;
+            generation.catalog.selection.automatic.record(
+                "fallback",
+                "http://probe.invalid/",
+                Some(5),
+            );
+            generation
+                .probes
+                .record("fallback", "http://probe.invalid/", 5, true);
+            let history = generation
+                .probes
+                .url_history("fallback", "http://probe.invalid/");
+            let error = probe(&service.runtime, &generation, "fallback", &query())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                generation.catalog.selection.automatic.0["auto"].health("fallback"),
+                "healthy",
+                "{path_count}"
+            );
+            assert_eq!(
+                generation
+                    .probes
+                    .url_history("fallback", "http://probe.invalid/"),
+                history
+            );
+            assert!(generation.probes.connectors.lock().is_empty());
+            assert_eq!(
+                service.runtime.probes.available_permits(),
+                PROBE_CONCURRENCY
+            );
+            service.shutdown().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_review5_probe_boundary_rejects_dynamic_carriers_without_history_changes() {
+        let mut wireguard = crate::wireguard::test_support::client(51820);
+        wireguard["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("carrier");
+        let mut catalog = crate::config::create_server_configs(serde_json::from_value(json!([
+            wireguard,
+            {"client_group":"carrier", "type":"selector", "client_proxies":[
+                "direct", {"name":"tcp-only", "address":"192.0.2.10:80", "protocol":{"type":"http"}}
+            ]},
+            {"client_group":"out", "type":"fallback", "health_check":{"url":"http://probe.invalid/", "interval_secs":30}, "client_proxies":["direct"]},
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":["out"]}
+        ])).unwrap()).unwrap().catalog.unwrap();
+        // Bypass configuration validation to exercise the administrative builder's guard.
+        let CatalogNode::Group { members, .. } = catalog.nodes.get_mut("out").unwrap() else {
+            panic!()
+        };
+        *members = vec!["wg".into()];
+        let generation = Arc::new(generation(catalog, Arc::new(Answers(Vec::new()))));
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        publish_for_api_probes(&service.runtime, &generation).await;
+        generation
+            .catalog
+            .selection
+            .automatic
+            .record("out", "http://probe.invalid/", Some(5));
+        generation
+            .probes
+            .record("out", "http://probe.invalid/", 5, true);
+        let history = generation
+            .probes
+            .url_history("out", "http://probe.invalid/");
+        let error = probe(&service.runtime, &generation, "out", &query())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            error.to_string(),
+            "fallback does not support WireGuard with multiple carrier paths"
+        );
+        assert_eq!(
+            generation.catalog.selection.automatic.0["auto"].health("out"),
+            "healthy"
+        );
+        assert_eq!(
+            generation
+                .probes
+                .url_history("out", "http://probe.invalid/"),
+            history
+        );
+        assert!(generation.probes.connectors.lock().is_empty());
+        assert_eq!(
+            service.runtime.probes.available_permits(),
+            PROBE_CONCURRENCY
+        );
+        service.shutdown().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn url_test_unchecked_groups_use_catalog_order_for_admission_ties() {
         let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
@@ -1541,14 +1702,15 @@ mod tests {
         const CHILD: &str = "SHOES_URL_TEST_QUIC_BUDGET_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "clash_api::probes::tests::url_test_quic_budget_rejection_preserves_health_in_a_fresh_process", "--nocapture"])
+                .args(["--exact", "control::probes::tests::url_test_quic_budget_rejection_preserves_health_in_a_fresh_process", "--nocapture"])
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
-                output.status.success(),
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
                 "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
+                stdout,
                 String::from_utf8_lossy(&output.stderr)
             );
             return;
@@ -2828,6 +2990,44 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_forbidden_literals_do_not_construct_or_cache_probe_transports() {
+        let mut catalog = catalog();
+        catalog.nodes.insert(
+            "quic".into(),
+            CatalogNode::Leaf(Box::new(
+                serde_json::from_value(json!({
+                    "address": "127.0.0.1:443", "transport": "quic",
+                    "quic_settings": {"verify": false}, "protocol": {"type": "socks"}
+                }))
+                .unwrap(),
+            )),
+        );
+        let mut generation = generation(catalog, Arc::new(Answers(Vec::new())));
+        generation
+            .probes
+            .forbidden
+            .push("100.64.0.0/10".parse().unwrap());
+        for url in [
+            "http://127.0.0.1/",
+            "http://100.64.0.1/",
+            "http://[::ffff:127.0.0.1]/",
+        ] {
+            let mut query = query();
+            query.url = url::Url::parse(url).unwrap();
+            let error = request(&generation, "quic", &query).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(local_failure(&error));
+            assert!(generation.probes.connectors.lock().is_empty(), "{url}");
+            let error = request(&generation, "missing", &query).await.unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "policy must precede connector lookup"
+            );
+        }
     }
 
     #[tokio::test]

@@ -35,7 +35,6 @@ use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 
 #[cfg(test)]
-#[path = "client_proxy_chain/health_tests.rs"]
 mod health_tests;
 
 /// Entry in the initial hop (hop 0) pool.
@@ -316,53 +315,49 @@ impl ClientProxyChain {
     pub(crate) fn with_health(
         mut self,
         hops: &[Vec<crate::config::ClientConfig>],
+        size: usize,
         resolver: Arc<dyn Resolver>,
     ) -> std::io::Result<Self> {
-        use crate::control::health::MAX_PATHS;
-        if !self
-            .origins
-            .iter()
-            .flatten()
-            .flatten()
-            .any(MemberOrigin::has_fallback)
-        {
-            return Ok(self);
-        }
-        let size = hops
-            .iter()
-            .try_fold(1usize, |size, pool| size.checked_mul(pool.len()))
-            .filter(|size| *size <= MAX_PATHS)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "fallback exceeds 256 concrete chain paths",
-                )
-            })?;
         let selection = self.selection.as_ref().unwrap().clone();
-        let identities: Vec<Vec<serde_json::Value>> = hops
+        let identities: Vec<Vec<_>> = hops
             .iter()
             .map(|pool| {
                 pool.iter()
                     .map(|client| {
-                        let mut nested_paths = Vec::new();
+                        let mut nested_origins = Vec::new();
                         crate::config::client_visit::visit_client(
                             &mut client.clone(),
                             &mut |nested| {
-                                nested_paths.push(
-                                    nested.control.as_ref().map(|origin| origin.path.clone()),
-                                );
+                                nested_origins.push(nested.control.clone());
                                 Ok(())
                             },
                         )?;
-                        nested_paths.pop();
+                        // visit_client is post-order: exclude the root, retain nested carrier paths.
+                        nested_origins.pop();
+                        let nested_paths: Vec<_> = nested_origins
+                            .iter()
+                            .map(|origin| {
+                                origin
+                                    .as_ref()
+                                    .map(MemberOrigin::policy_path)
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        let dynamic_selectors: Vec<_> = nested_origins
+                            .iter()
+                            .flatten()
+                            .map(MemberOrigin::manual_selector_path)
+                            .filter(|path| !path.is_empty())
+                            .collect();
                         let mut value = serde_json::to_value((client, nested_paths))
                             .map_err(std::io::Error::other)?;
                         value.sort_all_objects();
-                        Ok(value)
+                        Ok((value, dynamic_selectors))
                     })
                     .collect()
             })
             .collect::<std::io::Result<_>>()?;
+        // Enumerate configured path order, with the last hop varying fastest.
         for ordinal in 0..size {
             let mut remaining = ordinal;
             let mut indices = vec![0; hops.len()];
@@ -370,37 +365,47 @@ impl ClientProxyChain {
                 indices[hop] = remaining % hops[hop].len();
                 remaining /= hops[hop].len();
             }
-            let configs: Vec<_> = indices
+            let path_identities: Vec<_> = indices
                 .iter()
                 .enumerate()
-                .map(|(hop, index)| &identities[hop][*index])
+                .map(|(hop, index)| &identities[hop][*index].0)
                 .collect();
-            let fingerprint =
-                *blake3::hash(&serde_json::to_vec(&configs).map_err(std::io::Error::other)?)
-                    .as_bytes();
+            let mut dynamic_selectors: Vec<_> = indices
+                .iter()
+                .enumerate()
+                .flat_map(|(hop, index)| identities[hop][*index].1.iter().cloned())
+                .collect();
+            dynamic_selectors.sort_unstable();
+            dynamic_selectors.dedup();
+            let fingerprint = *blake3::hash(
+                &serde_json::to_vec(&path_identities).map_err(std::io::Error::other)?,
+            )
+            .as_bytes();
             let mut checks = Vec::new();
-            let selectors = indices
+            let origins: Vec<_> = indices
                 .iter()
                 .enumerate()
                 .filter_map(|(hop, index)| self.origin(hop, *index))
-                .flat_map(MemberOrigin::selector_path)
+                .collect();
+            let selectors = origins
+                .iter()
+                .flat_map(|origin| origin.manual_selector_path())
                 .collect::<Vec<_>>();
-            for (hop, index) in indices.iter().enumerate() {
-                if let Some(origin) = self.origin(hop, *index) {
-                    for (group, _) in &origin.path {
-                        if let Some(definition) = selection.health.definitions.get(group) {
-                            let job = selection.health.register(
-                                fingerprint,
-                                &definition.check,
-                                resolver.clone(),
-                                selectors.clone(),
-                                || self.pinned(&indices),
-                            )?;
-                            if !checks.iter().any(|existing| Arc::ptr_eq(existing, &job)) {
-                                checks.push(job);
-                            }
-                        }
-                    }
+            let definitions = origins
+                .iter()
+                .flat_map(|origin| &origin.path)
+                .filter_map(|(group, _)| selection.health.definitions.get(group));
+            for definition in definitions {
+                let job = selection.health.register(
+                    fingerprint,
+                    &definition.check,
+                    resolver.clone(),
+                    selectors.clone(),
+                    dynamic_selectors.clone(),
+                    || self.pinned(&indices),
+                )?;
+                if !checks.iter().any(|existing| Arc::ptr_eq(existing, &job)) {
+                    checks.push(job);
                 }
             }
             self.health_paths.push(HealthPath { indices, checks });
@@ -409,6 +414,7 @@ impl ClientProxyChain {
     }
 
     fn pinned(&self, indices: &[usize]) -> Self {
+        // Probe chains are TCP-only and already selected; no policy or UDP metadata is needed.
         Self {
             origins: Vec::new(),
             selection: None,
@@ -439,8 +445,10 @@ impl ClientProxyChain {
         choices: &crate::control::selection::Choices,
     ) -> std::io::Result<Vec<usize>> {
         use crate::control::health::Health;
-        let now = tokio::time::Instant::now();
+        let selection = self.selection.as_ref().unwrap();
+        let now = selection.health.sample_time();
         let mut samples = std::collections::HashMap::new();
+        let mut has_compatible_path = false;
         // One health/selection snapshot for the entire flow, including every prefix.
         let mut candidates: Vec<_> = self
             .health_paths
@@ -459,28 +467,75 @@ impl ClientProxyChain {
                 }) {
                     return None;
                 }
-                let mut healthy = true;
+                has_compatible_path = true;
+                let mut fully_healthy = true;
                 for check in &path.checks {
                     match *samples
                         .entry(Arc::as_ptr(check))
                         .or_insert_with(|| check.health(choices, now))
                     {
                         Health::Healthy => {}
-                        Health::Unknown => healthy = false,
+                        Health::Unknown => fully_healthy = false,
                         Health::Failed | Health::Stale => return None,
                     }
                 }
-                Some((path, healthy))
+                Some((path, fully_healthy))
             })
             .collect();
+        if !has_compatible_path {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "selected branch cannot carry this flow",
+            ));
+        }
         if candidates.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 "fallback has no healthy or unknown eligible path",
             ));
         }
-        let selection = self.selection.as_ref().unwrap();
         let definitions = &selection.health.definitions;
+        // Resolve fallback priorities across complete paths before latency or pool choices
+        // can discard a healthy candidate. Paths outside each fallback branch remain eligible.
+        for hop in 0..self.num_hops() {
+            let mut branches = Vec::new();
+            for origin in self.origins[hop].iter().flatten() {
+                for (depth, (group, _)) in origin.path.iter().enumerate() {
+                    if definitions.contains_key(group) {
+                        let branch = (&origin.path[..depth], group);
+                        if !branches.contains(&branch) {
+                            branches.push(branch);
+                        }
+                    }
+                }
+            }
+            for (prefix, group) in branches {
+                let member = |path: &HealthPath| {
+                    let origin = self.origin(hop, path.indices[hop])?;
+                    let (name, member) = origin.path.get(prefix.len())?;
+                    (origin.path.starts_with(prefix) && name == group).then_some(member.as_str())
+                };
+                let definition = &definitions[group];
+                let first_member = |require_healthy| {
+                    definition.members.iter().find(|name| {
+                        candidates.iter().any(|(path, fully_healthy)| {
+                            *fully_healthy == require_healthy && member(path) == Some(name.as_str())
+                        })
+                    })
+                };
+                let preferred = first_member(true)
+                    .map(|member| (member, true))
+                    .or_else(|| first_member(false).map(|member| (member, false)));
+                if let Some((preferred, require_healthy)) = preferred {
+                    candidates.retain(|(path, fully_healthy)| {
+                        let Some(name) = member(path) else {
+                            return true;
+                        };
+                        name == preferred && (!require_healthy || *fully_healthy)
+                    });
+                }
+            }
+        }
         let mut result = Vec::with_capacity(self.num_hops());
         for hop in 0..self.num_hops() {
             if !selection.automatic.0.is_empty() {
@@ -496,48 +551,6 @@ impl ClientProxyChain {
                     udp && hop + 1 == self.num_hops(),
                 );
                 candidates.retain(|(path, _)| indices.contains(&path.indices[hop]));
-            }
-            let mut branches = Vec::new();
-            for origin in self.origins[hop].iter().flatten() {
-                for (depth, (group, _)) in origin.path.iter().enumerate() {
-                    if definitions.contains_key(group) {
-                        let branch = (origin.path[..depth].to_vec(), group.clone());
-                        if !branches.contains(&branch) {
-                            branches.push(branch);
-                        }
-                    }
-                }
-            }
-            for (prefix, group) in branches {
-                let member = |path: &HealthPath| {
-                    self.origin(hop, path.indices[hop]).and_then(|origin| {
-                        if origin.path.starts_with(&prefix) {
-                            origin
-                                .path
-                                .get(prefix.len())
-                                .filter(|(name, _)| name == &group)
-                                .map(|(_, member)| member.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                };
-                let definition = &definitions[&group];
-                let preferred = [true, false].into_iter().find_map(|healthy| {
-                    definition.members.iter().find(|name| {
-                        candidates.iter().any(|(path, known)| {
-                            *known == healthy && member(path) == Some(name.as_str())
-                        })
-                    })
-                });
-                if let Some(preferred) = preferred {
-                    let known = candidates.iter().any(|(path, healthy)| {
-                        *healthy && member(path) == Some(preferred.as_str())
-                    });
-                    candidates.retain(|(path, healthy)| {
-                        member(path).is_none_or(|name| name == preferred && (!known || *healthy))
-                    });
-                }
             }
             let mut indices: Vec<_> = candidates
                 .iter()

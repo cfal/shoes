@@ -44,13 +44,14 @@ impl MemberOrigin {
             .cloned()
             .collect()
     }
+
     pub fn allowed(&self, choices: &Choices) -> bool {
         self.path
             .iter()
             .all(|(group, member)| choices.get(group).is_none_or(|selected| selected == member))
     }
 
-    pub(crate) fn selector_path(&self) -> Vec<(String, String)> {
+    pub(crate) fn manual_selector_path(&self) -> Vec<(String, String)> {
         self.path
             .iter()
             .filter(|(group, _)| self.selection.definitions().contains_key(group))
@@ -275,51 +276,54 @@ impl Catalog {
         for config in configs.iter() {
             if let Config::ClientConfigGroup(group) = config {
                 let members: Vec<_> = group.client_proxies.iter().map(member_name).collect();
-                if let GroupType::Fallback { health_check } = &group.group_type {
-                    if members.is_empty()
-                        || members
-                            .iter()
-                            .collect::<std::collections::HashSet<_>>()
-                            .len()
-                            != members.len()
-                    {
-                        return Err(invalid("fallback members must be nonempty and distinct"));
+                match &group.group_type {
+                    GroupType::Fallback { health_check } => {
+                        if members.is_empty()
+                            || members
+                                .iter()
+                                .collect::<std::collections::HashSet<_>>()
+                                .len()
+                                != members.len()
+                        {
+                            return Err(invalid("fallback members must be nonempty and distinct"));
+                        }
+                        fallbacks.insert(
+                            group.client_group.clone(),
+                            super::health::FallbackDefinition {
+                                members: members.clone(),
+                                check: health_check.clone(),
+                            },
+                        );
                     }
-                    fallbacks.insert(
-                        group.client_group.clone(),
-                        super::health::FallbackDefinition {
-                            members: members.clone(),
-                            check: health_check.clone(),
-                        },
-                    );
-                }
-                if group.group_type == GroupType::Selector {
-                    let has_unnamed_member = group.client_proxies.iter().any(|member| {
-                        matches!(member, ConfigSelection::Config(client) if client.name.is_none())
-                    });
-                    if has_unnamed_member {
-                        return Err(invalid("inline selector members require explicit names"));
+                    GroupType::Selector => {
+                        let has_unnamed_member = group.client_proxies.iter().any(|member| {
+                            matches!(member, ConfigSelection::Config(client) if client.name.is_none())
+                        });
+                        if has_unnamed_member {
+                            return Err(invalid("inline selector members require explicit names"));
+                        }
+                        definitions.insert(
+                            group.client_group.clone(),
+                            SelectorDefinition {
+                                members: members.clone(),
+                                default: group.default.as_ref().map(|name| {
+                                    if members.contains(name) {
+                                        name.clone()
+                                    } else {
+                                        api_group(name).to_owned()
+                                    }
+                                }),
+                            },
+                        );
                     }
-                    definitions.insert(
-                        group.client_group.clone(),
-                        SelectorDefinition {
-                            members: members.clone(),
-                            default: group.default.as_ref().map(|name| {
-                                if members.contains(name) {
-                                    name.clone()
-                                } else {
-                                    api_group(name).to_owned()
-                                }
-                            }),
-                        },
-                    );
-                }
-                if let GroupType::UrlTest(config) = &group.group_type {
-                    automatic.insert(
-                        group.client_group.clone(),
-                        config.clone(),
-                        members.clone(),
-                    )?;
+                    GroupType::UrlTest(config) => {
+                        automatic.insert(
+                            group.client_group.clone(),
+                            config.clone(),
+                            members.clone(),
+                        )?;
+                    }
+                    GroupType::RoundRobin => {}
                 }
                 nodes.insert(
                     group.client_group.clone(),
@@ -331,8 +335,9 @@ impl Catalog {
             }
         }
         let mut selection = SelectionOwner::new(None)?.prepare(definitions)?;
-        Arc::get_mut(&mut selection).unwrap().automatic = automatic;
-        Arc::get_mut(&mut selection).unwrap().health = super::health::HealthState::new(fallbacks);
+        let view = Arc::get_mut(&mut selection).unwrap();
+        view.automatic = automatic;
+        view.health = super::health::HealthState::new(fallbacks);
         crate::config::client_visit::visit_configs(configs, &mut |client| {
             if let Some(origin) = &mut client.control {
                 origin.selection = selection.clone();

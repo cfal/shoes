@@ -64,6 +64,11 @@ fn bounded_lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
 
+    /// Configuration dependencies for health rechecks, not DNS answer provenance.
+    fn manual_selector_paths(&self) -> Vec<crate::control::selection::ManualSelectorPath> {
+        Vec::new()
+    }
+
     fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
         None
     }
@@ -121,6 +126,10 @@ impl<T: Resolver> Debug for TimeoutResolver<T> {
 }
 
 impl<T: Resolver> Resolver for TimeoutResolver<T> {
+    fn manual_selector_paths(&self) -> Vec<crate::control::selection::ManualSelectorPath> {
+        self.inner.manual_selector_paths()
+    }
+
     fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
         self.inner.fake_dns_context()
     }

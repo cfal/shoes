@@ -81,7 +81,14 @@ struct RawClientGroup {
     timeout: Option<u64>,
     tolerance: Option<u16>,
     lazy: Option<bool>,
+    #[serde(default, deserialize_with = "health_check_if_present")]
     health_check: Option<HealthCheckConfig>,
+}
+
+fn health_check_if_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<HealthCheckConfig>, D::Error> {
+    HealthCheckConfig::deserialize(deserializer).map(Some)
 }
 
 fn default_group_type() -> String {
@@ -149,14 +156,14 @@ impl UrlTestConfig {
                 "url-test interval must be 1..86400 seconds; timeout 1..60000 ms and no longer than interval",
             ));
         }
-        crate::clash_api::probes::ProbeQuery::parse(
+        crate::control::probes::ProbeQuery::parse(
             &std::collections::HashMap::from([
                 ("url".into(), self.url.clone()),
                 ("timeout".into(), self.timeout.to_string()),
             ]),
             true,
         )?
-        .validate_automatic_target()
+        .validate_automatic_target("url-test URL")
     }
 }
 
@@ -164,6 +171,56 @@ impl UrlTestConfig {
 mod group_type_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn review_automatic_policy_errors_keep_group_specific_labels() {
+        let automatic = UrlTestConfig {
+            url: "http://127.0.0.1/".into(),
+            interval: 30,
+            timeout: 1000,
+            tolerance: 50,
+            lazy: true,
+        };
+        let error = automatic.validate().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "url-test URL is denied by probe destination policy"
+        );
+        let fallback = HealthCheckConfig {
+            url: automatic.url,
+            interval_secs: 30,
+            timeout_ms: 1000,
+            expected_status: 204,
+        };
+        let error = fallback.validate().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "fallback URL is denied by probe destination policy"
+        );
+    }
+
+    #[test]
+    fn health_review9_invalid_probe_settings_name_health_check_fields() {
+        for (url, timeout_ms) in [
+            ("ftp://probe.invalid/", 1000),
+            ("http://probe.invalid/", 32768),
+        ] {
+            let check = HealthCheckConfig {
+                url: url.into(),
+                interval_secs: 30,
+                timeout_ms,
+                expected_status: 204,
+            };
+            let error = check.validate().unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "health_check url must be HTTP(S), at most 2048 bytes, without credentials or fragments; timeout_ms must be 1..32767"
+            );
+        }
+    }
 
     #[test]
     fn fallback_round_trips_with_type_and_rejects_legacy_or_incompatible_fields() {
@@ -230,6 +287,31 @@ mod group_type_tests {
             assert!(
                 serde_json::from_value::<ClientConfigGroup>(invalid).is_err(),
                 "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn health_review3_null_checks_are_rejected_for_every_group_type() {
+        for kind in ["round-robin", "selector", "url-test", "fallback"] {
+            let mut raw = json!({"client_group":"out", "type":kind,
+                "client_proxies":["direct"], "health_check":null});
+            if kind == "url-test" {
+                raw["url"] = json!("http://probe.invalid/");
+            }
+            assert!(
+                serde_json::from_value::<ClientConfigGroup>(raw.clone()).is_err(),
+                "JSON {kind}"
+            );
+            assert!(
+                serde_yaml::from_str::<ClientConfigGroup>(&serde_yaml::to_string(&raw).unwrap())
+                    .is_err(),
+                "YAML {kind}"
+            );
+            raw.as_object_mut().unwrap().remove("health_check");
+            assert_eq!(
+                serde_json::from_value::<ClientConfigGroup>(raw).is_ok(),
+                kind != "fallback"
             );
         }
     }

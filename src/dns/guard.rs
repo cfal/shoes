@@ -35,6 +35,10 @@ pub(crate) fn real_only(
 }
 
 impl Resolver for RealResolver {
+    fn manual_selector_paths(&self) -> Vec<crate::control::selection::ManualSelectorPath> {
+        self.inner.manual_selector_paths()
+    }
+
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
         let future = self.inner.resolve_location(location);
         let forbidden = self.forbidden.clone();

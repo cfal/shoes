@@ -9,16 +9,31 @@ use parking_lot::Mutex;
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
-use super::probes::{ProbeQuery, local_failure, request_via};
-use super::selection::{Choices, SelectionView};
+use super::probes::{PROBE_CONCURRENCY, ProbeQuery, local_failure, request_via};
+use super::selection::{Choices, ManualSelectorPath, SelectionView, manual_choices_changed};
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain};
 use crate::config::HealthCheckConfig;
 use crate::resolver::Resolver;
 
 pub(crate) const MAX_PATHS: usize = 256;
 const MAX_CHECKS: usize = 1024;
-const CONCURRENCY: usize = 16;
+
+#[derive(Debug)]
+pub(crate) struct HealthCapacity(String);
+
+impl std::fmt::Display for HealthCapacity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HealthCapacity {}
+
+pub(crate) fn capacity_error(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, HealthCapacity(message))
+}
 
 #[cfg(test)]
 mod tests;
@@ -47,7 +62,9 @@ impl HealthCheckConfig {
                 "health_check interval_secs must be 1..86400 and expected_status 100..599",
             ));
         }
-        self.query()?.validate_automatic_target()
+        self.query()
+            .map_err(|_| invalid("health_check url must be HTTP(S), at most 2048 bytes, without credentials or fragments; timeout_ms must be 1..32767"))?
+            .validate_automatic_target("fallback URL")
     }
 
     fn freshness(&self) -> Duration {
@@ -66,6 +83,7 @@ pub(crate) struct HealthState {
     pub definitions: BTreeMap<String, FallbackDefinition>,
     jobs: Mutex<HashMap<ProbeKey, Weak<ProbeJob>>>,
     changed: Notify,
+    stopped_at: Mutex<Option<Instant>>,
 }
 
 // Configuration bytes are hashed, not retained in diagnostics. Resolver identity prevents
@@ -89,12 +107,13 @@ pub(crate) enum Health {
 struct Sample {
     healthy: bool,
     at: Instant,
-    choices: Arc<Choices>,
+    choices: Choices,
 }
 
 struct JobState {
     sample: Option<Sample>,
     due: Instant,
+    revision: u64,
 }
 
 pub(crate) struct ProbeJob {
@@ -103,22 +122,24 @@ pub(crate) struct ProbeJob {
     chain: ClientChainGroup,
     resolver: Arc<dyn Resolver>,
     selectors: Vec<(String, String)>,
+    dynamic_selectors: Vec<ManualSelectorPath>,
+    resolver_selectors: Vec<ManualSelectorPath>,
     state: Mutex<JobState>,
 }
 
-impl std::fmt::Debug for ProbeJob {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProbeJob").finish_non_exhaustive()
-    }
-}
-
 impl ProbeJob {
+    fn selected(&self, choices: &Choices) -> bool {
+        self.selectors
+            .iter()
+            .all(|(group, member)| choices.get(group) == Some(member))
+    }
+
     pub(crate) fn health(&self, choices: &Choices, now: Instant) -> Health {
         let state = self.state.lock();
         let Some(sample) = &state.sample else {
             return Health::Unknown;
         };
-        if sample.choices.as_ref() != choices {
+        if manual_choices_changed(&self.dynamic_selectors, &sample.choices, choices) {
             return Health::Unknown;
         }
         if now.duration_since(sample.at) >= self.check.freshness() {
@@ -130,28 +151,73 @@ impl ProbeJob {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn record(
         &self,
         result: io::Result<(u16, bool)>,
         choices: Arc<Choices>,
         now: Instant,
     ) {
-        let mut state = self.state.lock();
-        if result
-            .as_ref()
-            .err()
-            .is_none_or(|error| !local_failure(error))
-        {
-            state.sample = Some(Sample {
-                healthy: result.is_ok_and(|(_, expected)| expected),
-                at: now,
-                choices,
-            });
+        let revision = self.state.lock().revision;
+        self.record_if_current(result, choices, now, revision);
+    }
+
+    fn record_if_current(
+        &self,
+        result: io::Result<(u16, bool)>,
+        choices: Arc<Choices>,
+        now: Instant,
+        revision: u64,
+    ) {
+        if result.as_ref().is_err_and(local_failure) {
+            return;
         }
+        let mut state = self.state.lock();
+        if revision != state.revision {
+            return;
+        }
+        state.sample = Some(Sample {
+            healthy: result.is_ok_and(|(_, satisfied)| satisfied),
+            at: now,
+            choices: self
+                .dynamic_selectors
+                .iter()
+                .flatten()
+                .filter_map(|(group, _)| {
+                    choices
+                        .get(group)
+                        .map(|member| (group.clone(), member.clone()))
+                })
+                .collect(),
+        });
     }
 }
 
 impl HealthState {
+    pub(crate) fn choices_changed(&self, previous: &Choices, current: &Choices) {
+        let now = Instant::now();
+        for job in self.jobs.lock().values().filter_map(Weak::upgrade) {
+            let path_changed = manual_choices_changed(&job.dynamic_selectors, previous, current);
+            if path_changed
+                || manual_choices_changed(&job.resolver_selectors, previous, current)
+                || job.selected(previous) != job.selected(current)
+            {
+                let mut state = job.state.lock();
+                state.revision = state.revision.wrapping_add(1);
+                state.due = state.due.min(now);
+                if path_changed {
+                    state.sample = None;
+                }
+            }
+        }
+        self.changed.notify_one();
+    }
+
+    pub(crate) fn sample_time(&self) -> Instant {
+        // Draining sessions keep the retired generation's last health snapshot.
+        self.stopped_at.lock().unwrap_or_else(Instant::now)
+    }
+
     pub(crate) fn new(definitions: BTreeMap<String, FallbackDefinition>) -> Self {
         Self {
             definitions,
@@ -165,6 +231,7 @@ impl HealthState {
         check: &HealthCheckConfig,
         resolver: Arc<dyn Resolver>,
         selectors: Vec<(String, String)>,
+        dynamic_selectors: Vec<ManualSelectorPath>,
         chain: impl FnOnce() -> ClientProxyChain,
     ) -> io::Result<Arc<ProbeJob>> {
         let key = ProbeKey {
@@ -179,17 +246,22 @@ impl HealthState {
         }
         jobs.retain(|_, job| job.strong_count() != 0);
         if jobs.len() >= MAX_CHECKS {
-            return Err(invalid("fallback exceeds 1024 active path checks"));
+            return Err(capacity_error(format!(
+                "fallback exceeds {MAX_CHECKS} active path checks"
+            )));
         }
         let job = Arc::new(ProbeJob {
             check: check.clone(),
             query: check.query()?,
             chain: ClientChainGroup::new(vec![chain()]),
+            resolver_selectors: resolver.manual_selector_paths(),
             resolver,
             selectors,
+            dynamic_selectors,
             state: Mutex::new(JobState {
                 sample: None,
                 due: Instant::now(),
+                revision: 0,
             }),
         });
         jobs.insert(key, Arc::downgrade(&job));
@@ -200,7 +272,15 @@ impl HealthState {
 
 pub(crate) struct HealthService {
     cancel: CancellationToken,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: AbortOnDropHandle<()>,
+}
+
+struct HealthLifetime(Arc<SelectionView>);
+
+impl Drop for HealthLifetime {
+    fn drop(&mut self) {
+        *self.0.health.stopped_at.lock() = Some(Instant::now());
+    }
 }
 
 impl HealthService {
@@ -209,37 +289,28 @@ impl HealthService {
         budget: Arc<Semaphore>,
         forbidden: Vec<ipnetwork::IpNetwork>,
     ) -> Self {
+        *view.health.stopped_at.lock() = None;
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run(view, budget, forbidden, cancel.clone()));
+        let task = tokio::spawn(run(HealthLifetime(view), budget, forbidden, cancel.clone()));
         Self {
             cancel,
-            task: Some(task),
+            task: AbortOnDropHandle::new(task),
         }
     }
 
-    pub(crate) async fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(self) {
         self.cancel.cancel();
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-
-impl Drop for HealthService {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-        if let Some(task) = &self.task {
-            task.abort();
-        }
+        let _ = self.task.await;
     }
 }
 
 async fn run(
-    view: Arc<SelectionView>,
+    lifetime: HealthLifetime,
     budget: Arc<Semaphore>,
     forbidden: Vec<ipnetwork::IpNetwork>,
     cancel: CancellationToken,
 ) {
+    let view = &lifetime.0;
     let mut active = HashSet::new();
     let mut pending = FuturesUnordered::new();
     loop {
@@ -252,16 +323,24 @@ async fn run(
             .values()
             .filter_map(Weak::upgrade)
             .collect();
-        for job in jobs {
-            let id = Arc::as_ptr(&job) as usize;
-            if active.contains(&id) {
-                continue;
+        let mut waiting: Vec<_> = jobs
+            .into_iter()
+            .filter(|job| !active.contains(&(Arc::as_ptr(job) as usize)))
+            .map(|job| {
+                let due = job.state.lock().due;
+                (due, job)
+            })
+            .collect();
+        waiting.sort_by_key(|(due, _)| *due);
+        for (due, job) in waiting {
+            if active.len() >= PROBE_CONCURRENCY {
+                break;
             }
-            let due = job.state.lock().due;
-            if due <= now && active.len() < CONCURRENCY {
+            let id = Arc::as_ptr(&job) as usize;
+            if due <= now {
                 active.insert(id);
                 pending.push(check(job, view.clone(), budget.clone(), &forbidden));
-            } else if active.len() < CONCURRENCY {
+            } else {
                 next = next.min(due);
             }
         }
@@ -282,16 +361,29 @@ async fn check(
     budget: Arc<Semaphore>,
     forbidden: &[ipnetwork::IpNetwork],
 ) -> usize {
+    let mut revision = job.state.lock().revision;
+    let mut choices = view.snapshot();
     let deadline = Instant::now() + job.query.timeout;
-    if let Ok(Ok(_permit)) = tokio::time::timeout_at(deadline, budget.acquire()).await
+    let admission = if !job.selected(&choices) {
+        None
+    } else {
+        match budget.try_acquire() {
+            Ok(permit) => Some((permit, false)),
+            Err(_) => tokio::time::timeout_at(deadline, budget.acquire())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(|permit| (permit, true)),
+        }
+    };
+    if let Some((_permit, queued)) = admission
         && Instant::now() < deadline
     {
-        let choices = view.snapshot();
-        if job
-            .selectors
-            .iter()
-            .all(|(group, member)| choices.get(group) == Some(member))
-        {
+        // Read revision before choices: publication updates revisions while holding
+        // the selection write lock, so a concurrent change can only discard this attempt.
+        revision = job.state.lock().revision;
+        choices = view.snapshot();
+        if job.selected(&choices) {
             let result = tokio::time::timeout_at(
                 deadline,
                 super::url_test::BACKGROUND.scope(
@@ -305,14 +397,25 @@ async fn check(
                     ),
                 ),
             )
-            .await
-            .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
-            job.record(result, choices, Instant::now());
+            .await;
+            match result {
+                Ok(result) => job.record_if_current(result, choices, Instant::now(), revision),
+                // Admission shortened this attempt, so expiry says nothing about the path.
+                Err(_) if queued => {}
+                Err(_) => job.record_if_current(
+                    Err(io::ErrorKind::TimedOut.into()),
+                    choices,
+                    Instant::now(),
+                    revision,
+                ),
+            }
         }
     }
     let interval_ms = job.check.interval_secs * 1000;
     let jitter = rand::random::<u64>() % (interval_ms / 5 + 1);
-    job.state.lock().due =
-        Instant::now() + Duration::from_millis(interval_ms - interval_ms / 10 + jitter);
+    let mut state = job.state.lock();
+    if state.revision == revision {
+        state.due = Instant::now() + Duration::from_millis(interval_ms - interval_ms / 10 + jitter);
+    }
     Arc::as_ptr(&job) as usize
 }

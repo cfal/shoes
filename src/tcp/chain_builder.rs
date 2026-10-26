@@ -97,6 +97,28 @@ pub(crate) fn build_client_proxy_chain_with_limits(
             config.validate_quic_key_exchange(index == 0)?;
         }
     }
+    crate::config::health::validate_chain(hops.iter().map(|hop| hop.iter()))?;
+    let health_hops = if hops.iter().flatten().any(|client| {
+        client
+            .control
+            .as_ref()
+            .is_some_and(crate::control::catalog::MemberOrigin::has_fallback)
+    }) {
+        use crate::control::health::MAX_PATHS;
+        // Administrative targets can bypass config-time chain expansion limits.
+        let size = hops
+            .iter()
+            .try_fold(1usize, |size, pool| size.checked_mul(pool.len()))
+            .filter(|size| *size <= MAX_PATHS)
+            .ok_or_else(|| {
+                crate::control::health::capacity_error(format!(
+                    "fallback exceeds {MAX_PATHS} concrete chain paths"
+                ))
+            })?;
+        Some((hops.clone(), size))
+    } else {
+        None
+    };
 
     // Build initial hop entries from hop 0.
     // Each entry pairs socket + optional proxy together to ensure atomic selection.
@@ -141,16 +163,6 @@ pub(crate) fn build_client_proxy_chain_with_limits(
         .iter()
         .map(|pool| pool.iter().map(|client| client.control.clone()).collect())
         .collect();
-    let health_hops = hops
-        .iter()
-        .flatten()
-        .any(|client| {
-            client
-                .control
-                .as_ref()
-                .is_some_and(crate::control::catalog::MemberOrigin::has_fallback)
-        })
-        .then(|| hops.clone());
     let subsequent_hops: Vec<Vec<Box<dyn ProxyConnector>>> = hops
         .into_iter()
         .skip(1) // Skip hop 0, already processed as initial_hop
@@ -184,7 +196,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
 
     let chain = ClientProxyChain::new(initial_hop, subsequent_hops).with_origins(origins);
     match health_hops {
-        Some(hops) => chain.with_health(&hops, resolver),
+        Some((hops, size)) => chain.with_health(&hops, size, resolver),
         None => Ok(chain),
     }
 }

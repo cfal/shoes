@@ -10,6 +10,7 @@ use super::fake_ip::{FakeDnsContext, FakeDnsResolver, FakeIpOptions, FakeIpPool}
 use super::real_only;
 use super::system::SystemResolver;
 use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
+use crate::control::selection::ManualSelectorPath;
 use crate::dns::composite_resolver::CompositeResolver;
 use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
@@ -694,6 +695,7 @@ pub async fn build_dns_registry_for_runtime(
         ..DnsRegistry::new()
     };
 
+    let mut bootstraps = FxHashMap::default();
     for group in groups {
         for spec in &group.specs {
             for endpoint in std::iter::once(spec.url.as_str()).chain(spec.bootstrap_url.as_deref())
@@ -725,7 +727,7 @@ pub async fn build_dns_registry_for_runtime(
         let resolver = if group.use_default_resolver {
             registry.get_or_create_default()
         } else {
-            build_resolver_from_specs(&group.specs, &registry, &group.name).await?
+            build_resolver_from_specs(&group.specs, &registry, &group.name, &mut bootstraps).await?
         };
         let real = real_only(resolver, registry.forbidden.clone());
         let old = previous.and_then(|previous| previous.pools.get(&group.name));
@@ -775,12 +777,76 @@ pub async fn build_dns_registry_for_runtime(
     Ok(registry)
 }
 
+#[derive(Debug)]
+struct SelectionDependentResolver {
+    inner: Arc<dyn Resolver>,
+    paths: Vec<ManualSelectorPath>,
+}
+
+impl Resolver for SelectionDependentResolver {
+    fn manual_selector_paths(&self) -> Vec<ManualSelectorPath> {
+        self.paths.clone()
+    }
+
+    fn resolve_location(
+        &self,
+        location: &crate::address::NetLocation,
+    ) -> crate::resolver::ResolveFuture {
+        self.inner.resolve_location(location)
+    }
+
+    fn exchange(&self, request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+        self.inner.exchange(request)
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> crate::resolver::DnsExchangeFuture {
+        self.inner.exchange_with_deadline(request, deadline)
+    }
+}
+
+fn collect_selector_paths(
+    chain: &crate::config::ClientChain,
+    enclosing: &[(String, String)],
+    paths: &mut Vec<ManualSelectorPath>,
+) {
+    use crate::config::{ClientChainHop, ClientProxyConfig, ConfigSelection};
+    for hop in chain.hops.iter() {
+        let selections: Box<dyn Iterator<Item = &ConfigSelection<crate::config::ClientConfig>>> =
+            match hop {
+                ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
+                ClientChainHop::Pool(pool) => pool.iter(),
+            };
+        for selection in selections {
+            let ConfigSelection::Config(client) = selection else {
+                continue;
+            };
+            let mut path = enclosing.to_vec();
+            if let Some(origin) = &client.control {
+                path.extend(origin.manual_selector_path());
+            }
+            if !path.is_empty() {
+                paths.push(path.clone());
+            }
+            if let ClientProxyConfig::Wireguard(config) = &client.protocol
+                && let Some(carrier) = &config.peer_client_chain
+            {
+                collect_selector_paths(carrier, &path, paths);
+            }
+        }
+    }
+}
+
 /// Build a resolver from expanded DNS specs, wrapping hickory-backed groups
 /// in RefreshingResolver for stale connection mitigation.
 async fn build_resolver_from_specs(
     specs: &[ExpandedDnsSpec],
     registry: &DnsRegistry,
     group_name: &str,
+    bootstraps: &mut FxHashMap<Option<String>, Arc<dyn Resolver>>,
 ) -> std::io::Result<Arc<dyn Resolver>> {
     if specs.is_empty() {
         return Err(std::io::Error::other("no DNS servers configured"));
@@ -789,9 +855,14 @@ async fn build_resolver_from_specs(
     let mut entries: Vec<ParsedDnsServerEntry> = Vec::with_capacity(specs.len());
     let mut plans: Vec<HickoryResolverPlan> = Vec::new();
     let mut has_system = false;
+    let mut paths = Vec::new();
 
     for spec in specs {
-        let (entry, plan) = build_entry_and_plan(spec, registry).await?;
+        let (entry, plan) = build_entry_and_plan(spec, registry, bootstraps).await?;
+        paths.extend(entry.bootstrap_resolver.manual_selector_paths());
+        for chain in &spec.client_chains {
+            collect_selector_paths(chain, &[], &mut paths);
+        }
         if matches!(entry.server, ParsedDnsServer::System) {
             has_system = true;
         }
@@ -803,7 +874,7 @@ async fn build_resolver_from_specs(
 
     // Wrap in RefreshingResolver only if we have hickory-backed resolvers
     // and no system resolver (mixed groups stay as-is for simplicity).
-    if !plans.is_empty() && !has_system {
+    let resolver: Arc<dyn Resolver> = if !plans.is_empty() && !has_system {
         let description = group_name.to_string();
         let plans = plans.clone();
         let factory: ResolverFactory = Arc::new(move || {
@@ -817,9 +888,20 @@ async fn build_resolver_from_specs(
         };
 
         let refreshing = RefreshingResolver::new(factory, policy, description).await?;
-        Ok(Arc::new(refreshing))
+        Arc::new(refreshing)
     } else {
-        build_resolver_with_limits(entries, registry.limits, registry.forbidden.clone())
+        build_resolver_with_limits(entries, registry.limits, registry.forbidden.clone())?
+    };
+    if paths.is_empty() {
+        Ok(resolver)
+    } else {
+        paths.sort_unstable();
+        paths.dedup();
+        // Keep configuration dependencies outside refreshable transports and DNS caches.
+        Ok(Arc::new(SelectionDependentResolver {
+            inner: resolver,
+            paths,
+        }))
     }
 }
 
@@ -828,35 +910,24 @@ async fn build_resolver_from_specs(
 async fn build_entry_and_plan(
     spec: &ExpandedDnsSpec,
     registry: &DnsRegistry,
+    bootstraps: &mut FxHashMap<Option<String>, Arc<dyn Resolver>>,
 ) -> std::io::Result<(ParsedDnsServerEntry, Option<HickoryResolverPlan>)> {
     // Parse URL
     let parsed_url = ParsedDnsUrl::parse_with_server_name(&spec.url, spec.server_name.as_deref())
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    // Build client chain group
-    let chain_resolver = real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone());
-    let chain_group = if spec.client_chains.is_empty() {
-        Arc::new(build_direct_chain_group(chain_resolver))
+    // One resolver identity per bootstrap policy lets equivalent DNS paths share checks.
+    let bootstrap_resolver = if let Some(resolver) = spec
+        .bootstrap_url
+        .as_deref()
+        .and_then(|name| registry.get_by_name(name))
+    {
+        resolver
+    } else if let Some(resolver) = bootstraps.get(&spec.bootstrap_url) {
+        resolver.clone()
     } else {
-        let chains = if spec.client_chains.len() == 1 {
-            NoneOrSome::One(spec.client_chains[0].clone())
-        } else {
-            NoneOrSome::Some(spec.client_chains.clone())
-        };
-        Arc::new(build_client_chain_group_with_limits(
-            chains,
-            chain_resolver,
-            registry.limits,
-        )?)
-    };
-
-    // Build or get bootstrap resolver
-    let bootstrap_resolver: Arc<dyn Resolver> = match &spec.bootstrap_url {
-        Some(bootstrap_url) => {
-            // Try to get from registry first (group reference)
-            if let Some(resolver) = registry.get_by_name(bootstrap_url) {
-                resolver
-            } else {
+        let resolver = match &spec.bootstrap_url {
+            Some(bootstrap_url) => {
                 // Parse as URL and build a simple resolver
                 let bootstrap_parsed = ParsedDnsUrl::parse(bootstrap_url).map_err(|e| {
                     std::io::Error::other(format!(
@@ -890,8 +961,26 @@ async fn build_entry_and_plan(
                     registry.forbidden.clone(),
                 )
             }
-        }
-        None => real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone()),
+            None => real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone()),
+        };
+        bootstraps.insert(spec.bootstrap_url.clone(), resolver.clone());
+        resolver
+    };
+
+    // Construction-time health checks and forwarding must use the same DNS policy.
+    let chain_group = if spec.client_chains.is_empty() {
+        Arc::new(build_direct_chain_group(bootstrap_resolver.clone()))
+    } else {
+        let chains = if spec.client_chains.len() == 1 {
+            NoneOrSome::One(spec.client_chains[0].clone())
+        } else {
+            NoneOrSome::Some(spec.client_chains.clone())
+        };
+        Arc::new(build_client_chain_group_with_limits(
+            chains,
+            bootstrap_resolver.clone(),
+            registry.limits,
+        )?)
     };
 
     let timeout_secs = spec.timeout_secs;
@@ -1010,6 +1099,48 @@ mod tests {
             connect_timeout_secs: 5,
             attempts: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
+        #[derive(Debug)]
+        struct Bootstrap(tokio::sync::mpsc::UnboundedSender<String>);
+        impl Resolver for Bootstrap {
+            fn resolve_location(
+                &self,
+                location: &crate::address::NetLocation,
+            ) -> crate::resolver::ResolveFuture {
+                self.0.send(location.to_string()).unwrap();
+                Box::pin(std::future::pending())
+            }
+        }
+        let mut validated = crate::config::create_server_configs(serde_json::from_value(serde_json::json!([
+            {"client_group": "out", "type": "fallback",
+             "health_check": {"url": "http://192.0.2.1/", "interval_secs": 30},
+             "client_proxies": [{"address": "private-proxy.invalid:80", "protocol": {"type": "http"}}]},
+            {"dns_group": "dns", "dns_servers": [{"url": "tcp://192.0.2.53", "bootstrap_url": "system", "client_chain": "out"}]},
+            {"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "dns": {"servers": "dns"}}
+        ])).unwrap()).unwrap();
+        let (sent, mut calls) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = DnsRegistry::new();
+        registry.register("system".into(), Arc::new(Bootstrap(sent)));
+        let spec = &validated
+            .dns_groups
+            .iter()
+            .find(|group| group.name == "dns")
+            .unwrap()
+            .specs[0];
+        let (_entry, _plan) = build_entry_and_plan(spec, &registry, &mut FxHashMap::default())
+            .await
+            .unwrap();
+        let service = crate::control::health::HealthService::start(
+            validated.catalog.take().unwrap().selection,
+            Arc::new(tokio::sync::Semaphore::new(16)),
+            Vec::new(),
+        );
+        let result = tokio::time::timeout(Duration::from_millis(200), calls.recv()).await;
+        service.shutdown().await;
+        assert_eq!(result.unwrap().unwrap(), "private-proxy.invalid:80");
     }
 
     fn fake_groups(enabled: bool) -> Vec<ExpandedDnsGroup> {
@@ -1878,8 +2009,13 @@ mod tests {
         let spec_a = make_spec("udp://8.8.8.8");
         let spec_b = make_spec("udp://8.8.4.4");
 
-        let (_, plan_a) = build_entry_and_plan(&spec_a, &registry).await.unwrap();
-        let (_, plan_b) = build_entry_and_plan(&spec_b, &registry).await.unwrap();
+        let mut bootstraps = FxHashMap::default();
+        let (_, plan_a) = build_entry_and_plan(&spec_a, &registry, &mut bootstraps)
+            .await
+            .unwrap();
+        let (_, plan_b) = build_entry_and_plan(&spec_b, &registry, &mut bootstraps)
+            .await
+            .unwrap();
         let plans = vec![plan_a.unwrap(), plan_b.unwrap()];
 
         let resolver = build_hickory_resolver_group(&plans).await.unwrap();
@@ -1927,8 +2063,13 @@ mod tests {
             serde_yaml::to_string(&specs[1].client_chains).unwrap()
         );
         let registry = DnsRegistry::new();
-        let (_, first) = build_entry_and_plan(&specs[0], &registry).await.unwrap();
-        let (_, second) = build_entry_and_plan(&specs[1], &registry).await.unwrap();
+        let mut bootstraps = FxHashMap::default();
+        let (_, first) = build_entry_and_plan(&specs[0], &registry, &mut bootstraps)
+            .await
+            .unwrap();
+        let (_, second) = build_entry_and_plan(&specs[1], &registry, &mut bootstraps)
+            .await
+            .unwrap();
         let plans = [first.unwrap(), second.unwrap()];
         assert!(!plans[0].is_pool_compatible_with(&plans[1]));
         assert!(
@@ -1978,8 +2119,13 @@ mod tests {
         let mut spec_b = make_spec("udp://8.8.4.4");
         spec_b.attempts = 3;
 
-        let (_, plan_a) = build_entry_and_plan(&spec_a, &registry).await.unwrap();
-        let (_, plan_b) = build_entry_and_plan(&spec_b, &registry).await.unwrap();
+        let mut bootstraps = FxHashMap::default();
+        let (_, plan_a) = build_entry_and_plan(&spec_a, &registry, &mut bootstraps)
+            .await
+            .unwrap();
+        let (_, plan_b) = build_entry_and_plan(&spec_b, &registry, &mut bootstraps)
+            .await
+            .unwrap();
         let plans = vec![plan_a.unwrap(), plan_b.unwrap()];
 
         let resolver = build_hickory_resolver_group(&plans).await.unwrap();

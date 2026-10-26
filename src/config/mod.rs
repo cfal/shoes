@@ -15,6 +15,7 @@
 
 pub(crate) mod client_visit;
 mod fake_dns;
+pub(crate) mod health;
 mod pem;
 pub(crate) mod rule_visit;
 mod types;
