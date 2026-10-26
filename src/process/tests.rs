@@ -2,7 +2,7 @@ use super::*;
 
 async fn load_validated(
     paths: &[String],
-    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf], Option<&Path>) + Send),
+    discovered: &mut DiscoverDependencies<'_>,
 ) -> io::Result<ValidatedConfigs> {
     let configs = config::load_config_files(paths).await?;
     validate_configs(paths, configs, discovered).await

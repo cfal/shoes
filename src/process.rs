@@ -15,10 +15,12 @@ use crate::tcp::tcp_server::TcpListeners;
 
 const RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
+type DiscoverDependencies<'a> = dyn FnMut(&[PathBuf], &[PathBuf], Option<&Path>) + Send + 'a;
+
 async fn validate_configs(
     paths: &[String],
     configs: Vec<Config>,
-    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf], Option<&Path>) + Send),
+    discovered: &mut DiscoverDependencies<'_>,
 ) -> io::Result<ValidatedConfigs> {
     load_candidate(paths, configs, discovered, false, None, &mut None)
         .await
@@ -28,7 +30,7 @@ async fn validate_configs(
 async fn load_candidate(
     paths: &[String],
     mut configs: Vec<Config>,
-    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf], Option<&Path>) + Send),
+    discovered: &mut DiscoverDependencies<'_>,
     retain_template: bool,
     expected_cache_dir: Option<&Option<PathBuf>>,
     cache_lease: &mut Option<std::sync::Arc<std::fs::File>>,
@@ -139,7 +141,7 @@ async fn prepare_tracking(
     configs: Vec<Config>,
     previous: Option<&DnsRegistry>,
     previous_servers: Option<&PreparedServers>,
-    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf], Option<&Path>) + Send),
+    discovered: &mut DiscoverDependencies<'_>,
     control: &mut Option<crate::control::runtime::ControlService>,
     network: &crate::desktop::NetworkSession,
 ) -> io::Result<PreparedServers> {
