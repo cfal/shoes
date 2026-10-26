@@ -1,5 +1,10 @@
 # Selector measurements
 
+For the small, advisory selector/reload collection and comparison workflow, see
+[ADVISORY.md](ADVISORY.md). It retains raw runs and rejects invalid artifacts;
+it does not reuse the historical comparator's timing gates. The manual
+`Advisory verification evidence` workflow publishes one revision's measurements.
+
 The selector measurement is an ignored unit test so it can exercise the real
 private ingress, cache and routing paths. It is not a standalone Cargo bench.
 

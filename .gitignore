@@ -1,3 +1,4 @@
 /target
+/.workstream-evidence/
 /*.yaml
 *.pem

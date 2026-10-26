@@ -16,6 +16,7 @@ cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
 cargo test -p shoes --locked --test process_contract -- --test-threads=1
 cargo test -p shoes --locked --test rule_allocation
 cargo test -p shoes --locked --test retention_allocation --test matcher_invariants -- --nocapture
+cargo test -p shoes --locked --test rule_properties -- --test-threads=1
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
@@ -40,6 +41,7 @@ the reported test count when renaming modules or changing CI filters.
 | `rule_allocation` | None | Local rule compilation and allocation limits. |
 | `retention_allocation` | None | Isolated requested-heap retention across failed compilation, generation replacement, retained owners, and final destruction. |
 | `matcher_invariants` | None | Fixed-seed port-range membership against a linear oracle, including Boolean composition and boundary cases. |
+| `rule_properties` | None | Bounded deterministic rule parser mutations and cross-format properties; no peers or network. |
 | `optional_peer` | `optional-peer-tests` | sing-box, Mihomo, Xray, and Naive Caddy as required by each case. Includes carrier sharing and idle reuse. |
 | `xhttp_interop` | `integration-tests` | Local-only filters or pinned Xray and Mihomo; see [XHTTP.md](XHTTP.md). |
 | `reality_interop` | `optional-peer-tests` | Pinned Xray and local TLS camouflage endpoints. |
@@ -71,26 +73,72 @@ fail, not silently skip.
 
 ## Measuring Coverage
 
-CI does not collect coverage. To measure it locally with
-[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov), collect the unit,
-integration, and process-contract suites into one profile set and report once:
+The manual `Advisory verification evidence` workflow collects Linux unit/process
+coverage with Rust 1.99.1, `llvm-tools-preview`, and `cargo-llvm-cov` 0.9.1. It has
+no percentage gate. `smoke` selects one rule-loader unit test and one process
+test that verifies a child actually flushes a nonempty LLVM profile. `full` runs
+the library and process-contract suites, without optional features. Each command
+uses the existing nonzero-test guard. Run locally with the same pinned tooling:
 
 ```sh
-export CARGO_BUILD_JOBS=1 SHOES_TEST_GRACEFUL_STOP=1
-export SHOES_TEST_SING_BOX_BIN=/absolute/path/to/sing-box
-cargo llvm-cov clean --workspace
-cargo llvm-cov --no-report --workspace --lib --bins --locked -- --test-threads=2
-cargo llvm-cov --no-report --locked --features integration-tests \
-  --test integration --test process_contract -- --test-threads=1
-cargo llvm-cov report --summary-only
+export CARGO_BUILD_JOBS=1
+bash scripts/coverage-linux.sh NEW_OUTPUT_DIRECTORY smoke BASE_REVISION
 ```
 
-On Linux, `SHOES_TEST_GRACEFUL_STOP` makes test guards send SIGTERM before
-SIGKILL, so instrumented Shoes subprocesses write their profiles. Without it,
-and on other platforms, which ignore it, code reached only through integration
-subprocesses is reported as uncovered. Totals include test modules and
-test-support code, so compare per-file figures rather than the headline
-percentage.
+In the recommendation batch VM, hold the shared foreground build lock around the
+entire script and use its dedicated target, as specified in `EXECUTION_RULES.md`.
+The script uses a fresh, named coverage target under `CARGO_TARGET_DIR`, refuses
+reuse, and never cleans shared artifacts. Tool installation, if needed, is
+`cargo install cargo-llvm-cov --version 0.9.1 --locked`; do not install another
+toolchain just to manufacture local success evidence.
+
+The output retains test logs, commands, toolchain and skip information, LCOV,
+changed-line JSON and profile paths. Raw profiles remain in the named target.
+The changed-line report compares the chosen local base revision to the tracked
+working tree, includes uncovered line numbers, and reports `null` rather than
+100% for no executable changed lines. Untracked files are outside `git diff`;
+missing source instrumentation is distinguished from uncovered executable lines.
+Unknown/non-executable lines are never implicitly called covered.
+
+On Linux, `SHOES_TEST_GRACEFUL_STOP` makes both shared guards and process-contract
+guards send SIGTERM before bounded SIGKILL fallback. The coverage script sets it
+and preserves per-process profile filenames. Forced exits or failed startup can
+still lack profiles; successful smoke verifies a normal server shutdown, not
+every error path. Inline unit-test code can be included, while standalone test
+and support paths may be excluded by cargo-llvm-cov's default report filters.
+Inspect per-file results rather than a headline percentage. Peers, privileged/kernel tests,
+external-network suites, FFI, device and non-Linux coverage remain separate,
+unmeasured categories, not silent skips or part of this percentage.
+
+## Bounded Rule Properties
+
+`rule_properties` is explicitly registered because `autotests = false`. It uses
+the public `load_source` and compiler budget APIs without exposing private
+protocol parsers or adding dependencies. Three existing JSON/SRS/text fixtures
+seed 288 deterministic truncation/bit-flip/insertion/trailing-byte mutations.
+Each is loaded twice with a fresh compiler to compare rejection or predicate
+results; untouched seeds must parse successfully. The fixed seed is
+`0x726c7365745f3234`; failures identify format, case and bytes. Retain a minimal
+reproducer, not a growing generated corpus.
+
+Inputs are capped at 4 KiB. Each mutation has a 72 MiB accounting budget (the
+existing regex compiler conservatively reserves 64 MiB even for small patterns).
+A separate 2 MiB compressed expansion must hit a 4 MiB accounting budget before
+full inflation; generated exact-domain rules compare the shared JSON/text subset
+with normalized queries and Mihomo's pattern case/trailing-dot normalization.
+Sing-box's intentionally different uppercase-literal behavior is not treated as
+a cross-format equivalence. Existing allocator regressions remain authoritative for actual peak
+allocations; accounting budgets are not RSS guarantees. Linux CI bounds the test
+executable to 30 seconds via Cargo's host runner and adds a ten-minute outer
+deadline including compilation, not a timing performance assertion. For
+already-built smoke binaries use `timeout --kill-after=5s 30s TEST_BINARY
+--test-threads=1`. No unbounded randomized runner or stress workload is enabled.
+
+Follow-ups: MRS/DAT, YAML aliases/depth, DNS/HTTP/TLS framing and protocol state
+machines need their own small seeds, decompression/window caps and cancellation
+properties. Broader differential cases must only compare intentionally shared
+semantics with pinned peers and preserve fixture licensing. No new peer or
+libFuzzer toolchain is required for this first surface.
 
 ## CI And Remaining Gaps
 
@@ -130,8 +178,8 @@ require exact return to baseline; compilation peak budgets remain enforced.
 
 Important remaining limitations:
 
-- CI does not measure coverage; see [Measuring Coverage](#measuring-coverage).
-  Passing suites do not establish exhaustive coverage.
+- Coverage is manual and Linux unit/process only; see [Measuring Coverage](#measuring-coverage).
+  Passing suites or increased percentages do not establish exhaustive coverage.
 - Android/iOS device execution and macOS Network Extension kernel-device behavior
   remain separate from host-side tests and cross-compilation.
 - Windows build entries are disabled; ARM and musl builds do not establish

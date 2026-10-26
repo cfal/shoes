@@ -58,5 +58,5 @@ console.log(JSON.stringify({
   aggregate: commands.aggregate,
   checks: 'All 4096 queries per process verified before timing; counted stub DNS asserts exactly one lookup per measured DNS route.',
   artifacts,
-  tooling: Object.fromEntries(['benches/run_selector.sh', 'benches/compare_selector.mjs', 'benches/selector_manifest.mjs'].map(p => [p, file(p)])),
+  tooling: Object.fromEntries(['benches/run_selector.sh', 'benches/compare_selector.mjs', 'benches/advisory_report.mjs', 'benches/selector_manifest.mjs'].map(p => [p, file(p)])),
 }, null, 2));

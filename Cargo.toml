@@ -69,6 +69,10 @@ name = "matcher_invariants"
 path = "tests/matcher_invariants.rs"
 
 [[test]]
+name = "rule_properties"
+path = "tests/rule_properties.rs"
+
+[[test]]
 name = "integration"
 path = "tests/integration.rs"
 required-features = ["integration-tests"]

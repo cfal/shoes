@@ -592,12 +592,54 @@ impl Process {
     fn signal(&self, signal: i32) {
         assert_eq!(unsafe { libc::kill(self.child.id() as i32, signal) }, 0);
     }
+
+    fn stop(&mut self, graceful: bool) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            shoes_test_support::process::stop_child(&mut self.child, graceful, "process-contract");
+        }
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop(std::env::var_os("SHOES_TEST_GRACEFUL_STOP").is_some());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn coverage_process_graceful_stop() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.yaml");
+    std::fs::write(&config, forward(available_address(), available_address())).unwrap();
+    let mut process = Process::start(&config, &["--no-reload"]);
+    process.wait_for("Servers ready").await;
+    let pid = process.child.id();
+    if std::env::var_os("SHOES_TEST_GRACEFUL_STOP").is_some() {
+        drop(process);
+    } else {
+        process.stop(true);
+        assert!(process.child.wait().unwrap().success());
+    }
+    if let Some(pattern) = std::env::var_os("LLVM_PROFILE_FILE") {
+        let parent = Path::new(&pattern).parent().unwrap();
+        let profiles: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.contains(&format!("-{pid}-")) && name.ends_with(".profraw")
+            })
+            .collect();
+        assert!(
+            !profiles.is_empty(),
+            "subprocess {pid} did not flush a profile"
+        );
+        for profile in profiles {
+            assert!(profile.metadata().unwrap().len() > 0);
+        }
     }
 }
 
