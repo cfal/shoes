@@ -179,7 +179,7 @@ impl Install {
         #[cfg(test)]
         self.fail_before_rename()?;
         let fd = self.directory.as_raw_fd();
-        crate::file_watcher::managed::publish(&self.path, &self.file.metadata()?, || {
+        crate::file_watcher::managed::publish(&self.path, &self.file, || {
             if unsafe { libc::renameat(fd, self.stage.as_ptr(), fd, self.destination.as_ptr()) }
                 != 0
             {

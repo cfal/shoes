@@ -410,7 +410,7 @@ async fn managed_changes_coalesce_with_filesystem_watches() {
     respond(request(&listener).await, BLOCK).await;
     let pending = request(&listener).await;
     assert!(
-        timeout(Duration::from_millis(50), child.lines.recv())
+        timeout(Duration::from_secs(6), child.lines.recv())
             .await
             .is_err()
     );

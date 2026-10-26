@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::fs::Metadata;
+use std::fs::{File, Metadata};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ struct Stamp {
     inode: u64,
     size: u64,
     modified: (i64, i64),
+    changed: (i64, i64),
     mode: u32,
     owner: (u32, u32),
     links: u64,
@@ -26,6 +27,7 @@ impl From<&Metadata> for Stamp {
             inode: metadata.ino(),
             size: metadata.len(),
             modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
             mode: metadata.mode(),
             owner: (metadata.uid(), metadata.gid()),
             links: metadata.nlink(),
@@ -35,7 +37,7 @@ impl From<&Metadata> for Stamp {
 
 pub(crate) fn publish(
     path: &Path,
-    metadata: &Metadata,
+    file: &File,
     rename: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     // Serialize callback inspection with rename and receipt insertion. No fsync
@@ -43,7 +45,16 @@ pub(crate) fn publish(
     let mut installed = INSTALLED.lock().unwrap();
     rename()?;
     installed.retain(|(existing, _)| existing != path);
-    installed.push_back((path.to_owned(), Stamp::from(metadata)));
+    // Rename changes ctime. Snapshot the held inode afterwards so an external
+    // rewrite cannot masquerade as the installation by restoring its mtime.
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            log::warn!("Rule file replaced but watcher receipt unavailable: {error}");
+            return Ok(());
+        }
+    };
+    installed.push_back((path.to_owned(), Stamp::from(&metadata)));
     if installed.len() > MAX_RECEIPTS {
         installed.pop_front();
     }
@@ -59,7 +70,6 @@ pub(super) fn is_installed_version(path: &Path) -> bool {
         .map(|(_, stamp)| stamp.clone());
     stamp.is_some_and(|stamp| {
         // Do not follow links: external retargets and replacements must notify.
-        // Rename changes ctime, so it is deliberately excluded from the receipt.
         std::fs::symlink_metadata(path).is_ok_and(|metadata| Stamp::from(&metadata) == stamp)
     })
 }
@@ -73,7 +83,9 @@ mod tests {
 
     #[tokio::test]
     async fn managed_renames_only_suppress_the_installed_version() {
-        for external in ["replace", "touch", "chmod", "symlink", "delete", "config"] {
+        for external in [
+            "replace", "touch", "rewrite", "chmod", "symlink", "delete", "config",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("cache.json");
             let stage = dir.path().join("stage");
@@ -83,7 +95,7 @@ mod tests {
             let (tx, mut changes) = tokio::sync::mpsc::channel(1);
             let _watcher = crate::file_watcher::watch(&[&path, &config], tx).unwrap();
             std::fs::write(&stage, "new").unwrap();
-            publish(&path, &std::fs::metadata(&stage).unwrap(), || {
+            publish(&path, &File::open(&stage).unwrap(), || {
                 std::fs::rename(&stage, &path)
             })
             .unwrap();
@@ -104,6 +116,14 @@ mod tests {
                     let modified =
                         file.metadata().unwrap().modified().unwrap() + Duration::from_secs(1);
                     file.set_times(FileTimes::new().set_modified(modified))
+                        .unwrap();
+                }
+                "rewrite" => {
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    std::fs::write(&path, "NEW").unwrap();
+                    File::open(&path)
+                        .unwrap()
+                        .set_times(FileTimes::new().set_modified(modified))
                         .unwrap();
                 }
                 "chmod" => std::fs::set_permissions(&path, Permissions::from_mode(0o400)).unwrap(),
@@ -130,11 +150,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache");
         std::fs::write(&path, "original").unwrap();
-        publish(&path, &std::fs::metadata(&path).unwrap(), || Ok(())).unwrap();
+        publish(&path, &File::open(&path).unwrap(), || Ok(())).unwrap();
         let stage = dir.path().join("stage");
         std::fs::write(&stage, "replacement").unwrap();
         assert!(
-            publish(&path, &std::fs::metadata(&stage).unwrap(), || Err(
+            publish(&path, &File::open(&stage).unwrap(), || Err(
                 io::Error::other("injected")
             ))
             .is_err()
