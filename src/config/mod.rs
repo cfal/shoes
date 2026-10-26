@@ -65,6 +65,13 @@ fn parse_config_yaml(config_str: &str) -> Result<Vec<Config>, serde_yaml::Error>
 ///
 /// Reads each file, parses it as YAML, and returns the combined list of configs.
 pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
+    let mut configs = load_config_files(args).await?;
+    let files: Vec<_> = args.iter().map(std::path::PathBuf::from).collect();
+    crate::rule_set::validate_remote_paths(&mut configs, &files)?;
+    Ok(configs)
+}
+
+pub(crate) async fn load_config_files(args: &[String]) -> std::io::Result<Vec<Config>> {
     let mut all_configs = vec![];
     for config_filename in args {
         let config_bytes = match tokio::fs::read(config_filename).await {
@@ -103,8 +110,6 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
         all_configs.append(&mut configs)
     }
 
-    let files: Vec<_> = args.iter().map(std::path::PathBuf::from).collect();
-    crate::rule_set::validate_remote_paths(&mut all_configs, &files)?;
     Ok(all_configs)
 }
 

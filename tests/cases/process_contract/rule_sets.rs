@@ -282,6 +282,15 @@ async fn rule_sources_follow_symlink_retargeting_and_atomic_replacement() {
 
 #[tokio::test]
 async fn rejected_cyclic_source_recovers_without_a_config_edit() {
+    cyclic_source_recovers(false).await;
+}
+
+#[tokio::test]
+async fn rejected_cyclic_source_with_remote_cache_recovers_without_a_config_edit() {
+    cyclic_source_recovers(true).await;
+}
+
+async fn cyclic_source_recovers(with_remote: bool) {
     let dir = tempfile::tempdir().unwrap();
     let candidate_dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml");
@@ -305,6 +314,16 @@ async fn rejected_cyclic_source_recovers_without_a_config_edit() {
     process.wait_for("Servers ready").await;
     blocked(address).await;
     config[0]["rules"][0]["path"] = json!(loop_path);
+    if with_remote {
+        let cache = dir.path().join("remote.json");
+        source(&cache, true);
+        config.as_array_mut().unwrap().push(json!({
+            "rule_source_group": "remote", "rules": [{
+                "url": "http://127.0.0.1:1/rules.json", "path": cache,
+                "download": {"client_chain": "direct", "bootstrap_url": "system"}
+            }]
+        }));
+    }
     std::fs::write(&config_path, config.to_string()).unwrap();
     process.wait_for("Reload rejected").await;
     blocked(address).await;

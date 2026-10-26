@@ -4,7 +4,7 @@ async fn load_validated(
     paths: &[String],
     discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
 ) -> io::Result<ValidatedConfigs> {
-    let configs = config::load_configs(&paths.to_vec()).await?;
+    let configs = config::load_config_files(paths).await?;
     validate_configs(paths, configs, discovered).await
 }
 
@@ -270,7 +270,7 @@ async fn dependencies_are_discovered_before_the_candidate_reads_them() {
     )
     .unwrap();
     let paths = [config.to_str().unwrap().to_owned()];
-    let configs = config::load_configs(&paths).await.unwrap();
+    let configs = config::load_config_files(&paths).await.unwrap();
     let error = load_candidate(
         &paths,
         configs,

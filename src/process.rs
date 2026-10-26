@@ -40,6 +40,8 @@ async fn load_candidate(
     dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
     recovery_dependencies.retain(|path| !dependencies.contains(path));
     discovered(&dependencies, &recovery_dependencies);
+    let config_files: Vec<_> = paths.iter().map(PathBuf::from).collect();
+    crate::rule_set::validate_remote_paths(&mut configs, &config_files)?;
     let result: io::Result<_> = async {
         let (mut configs, _) = config::convert_cert_paths(configs).await?;
         let mut has_remote = false;
@@ -106,7 +108,7 @@ struct PreparedServers {
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
     prepare_tracking(
         paths,
-        config::load_configs(&paths.to_vec()).await?,
+        config::load_config_files(paths).await?,
         previous,
         None,
         &mut |_, _| {},
@@ -684,7 +686,7 @@ impl ReloadSignal {
 
 pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Result<()> {
     if dry_run {
-        let configs = config::load_configs(&paths).await?;
+        let configs = config::load_config_files(&paths).await?;
         validate_configs(&paths, configs, &mut |_, _| {}).await?;
         println!("Configuration valid");
         return Ok(());
@@ -735,7 +737,7 @@ async fn run_inner(
     let configs = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = config::load_configs(&paths) => result?,
+        result = config::load_config_files(&paths) => result?,
     };
     *network = crate::desktop::NetworkSession::prepare(&configs).await?;
     let mut discovered =
@@ -833,7 +835,7 @@ async fn run_inner(
                 return Err(error);
             },
             result = async {
-                let configs = config::load_configs(&paths).await?;
+                let configs = config::load_config_files(&paths).await?;
                 prepare_tracking(&paths, configs, Some(&prepared.dns), Some(&prepared), &mut discovered, control, network).await
             } => result,
         };
