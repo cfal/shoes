@@ -1114,8 +1114,7 @@ dependencies = [
 [[package]]
 name = "hickory-net"
 version = "0.26.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c480823ed7c2c5d0f09c41020cb6b7c28029ce60ec42dc942158dcf22f8e0a4d"
+source = "git+https://github.com/cfal/hickory-dns?rev=3fa0a0e3ebd9df778256f18e9264f70d284d31c0#3fa0a0e3ebd9df778256f18e9264f70d284d31c0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1147,8 +1146,7 @@ dependencies = [
 [[package]]
 name = "hickory-proto"
 version = "0.26.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12b92608f679a6fa515dd1d15c1ff89443026e391200a2c840c7afcba482893d"
+source = "git+https://github.com/cfal/hickory-dns?rev=3fa0a0e3ebd9df778256f18e9264f70d284d31c0#3fa0a0e3ebd9df778256f18e9264f70d284d31c0"
 dependencies = [
  "data-encoding",
  "idna",
@@ -1167,8 +1165,7 @@ dependencies = [
 [[package]]
 name = "hickory-resolver"
 version = "0.26.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f3da5255c95d5a716857d54b5b8f4e8d67c3484d3beaaaae2ce25063b3ba981"
+source = "git+https://github.com/cfal/hickory-dns?rev=3fa0a0e3ebd9df778256f18e9264f70d284d31c0#3fa0a0e3ebd9df778256f18e9264f70d284d31c0"
 dependencies = [
  "cfg-if",
  "futures-util",
