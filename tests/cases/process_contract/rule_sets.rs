@@ -315,8 +315,11 @@ async fn cyclic_source_recovers(with_remote: bool) {
     blocked(address).await;
     config[0]["rules"][0]["path"] = json!(loop_path);
     if with_remote {
+        use std::os::unix::fs::PermissionsExt;
         let cache = dir.path().join("remote.json");
         source(&cache, true);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();
         config.as_array_mut().unwrap().push(json!({
             "rule_source_group": "remote", "rules": [{
                 "url": "http://127.0.0.1:1/rules.json", "path": cache,

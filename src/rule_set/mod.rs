@@ -268,12 +268,17 @@ fn cache_paths(path: &Path) -> [PathBuf; 3] {
 
 pub(crate) fn source_identity(path: &Path) -> io::Result<PathBuf> {
     let mut absolute = std::path::absolute(path)?;
+    let mut followed = HashSet::new();
     for _ in 0..40 {
+        if followed.contains(&absolute) {
+            break;
+        }
         if let Ok(canonical) = absolute.canonicalize() {
             return Ok(canonical);
         }
         // A local alias may point at a remote cache that has not been installed yet.
         if let Ok(target) = std::fs::read_link(&absolute) {
+            followed.insert(absolute.clone());
             absolute = if target.is_absolute() {
                 target
             } else {
