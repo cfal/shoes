@@ -65,10 +65,13 @@ jobs:
         cargo build --locked --release --bin shoes 2>&1 | tee performance-build/server.log
         binary=$(node --input-type=module -e '
           import fs from "node:fs";
-          const artifacts = fs.readFileSync("performance-build/selector.jsonl", "utf8").trim().split("\n").map(JSON.parse);
-          const tests = artifacts.filter(a => a.reason === "compiler-artifact" && a.profile.test && a.target.kind.includes("rlib") && a.executable);
-          if (tests.length !== 1) throw Error("expected one selector test executable");
-          console.log(tests[0].executable);
+          const artifacts = fs.readFileSync("performance-build/selector.jsonl", "utf8")
+            .trim().split("\n").map(JSON.parse);
+          const testExecutables = artifacts.filter(artifact =>
+            artifact.reason === "compiler-artifact" && artifact.profile.test &&
+            artifact.target.kind.includes("rlib") && artifact.executable);
+          if (testExecutables.length !== 1) throw Error("expected one selector test executable");
+          console.log(testExecutables[0].executable);
         ')
         node benches/run_advisory.mjs "$binary" "$CARGO_TARGET_DIR/release/shoes" performance-evidence
     - name: Retain raw runs, provenance, skipped scopes and reports
