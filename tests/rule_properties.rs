@@ -15,6 +15,9 @@ fn rule_source(path: &Path, format: Format) -> RuleSource {
         behavior: (format == Format::MihomoText).then_some(Behavior::Domain),
         code: None,
         attributes: vec![],
+        url: None,
+        update_interval: None,
+        download: None,
     }
 }
 
