@@ -102,9 +102,9 @@ pub(super) fn create_server_configs_with_inputs(
         .into_iter()
         .map(|(path, file)| Ok((crate::rule_set::source_identity(&path)?, file)))
         .collect::<std::io::Result<_>>()?;
-    let mut remote_rules = crate::rule_set::remote_sources(&mut all_configs)?;
     let mut reload_files = crate::rule_set::dependencies(&mut all_configs)?;
     reload_files.extend(super::pem_reload_dependencies(&mut all_configs)?);
+    let mut remote_rules = crate::rule_set::normalize_sources(&mut all_configs, &mut compiler)?;
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;

@@ -108,7 +108,18 @@ impl RuleSource {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn format(&self, prefix: &[u8]) -> io::Result<Format> {
+        self.format_with_hint(prefix, self.url_format()?)
+    }
+
+    fn url_format(&self) -> io::Result<Option<Format>> {
+        Ok(self
+            .parsed_url()?
+            .and_then(|url| extension(Path::new(url.path()))))
+    }
+
+    fn format_with_hint(&self, prefix: &[u8], hint: Option<Format>) -> io::Result<Format> {
         if let Some(format) = self.format {
             return Ok(format);
         }
@@ -119,19 +130,7 @@ impl RuleSource {
             // Zstd selects the MRS decoder, which still validates the payload.
             return Ok(Format::Mrs);
         }
-        fn extension(path: &Path) -> Option<Format> {
-            match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-                "srs" => Some(Format::Srs),
-                "mrs" => Some(Format::Mrs),
-                "json" => Some(Format::SingboxJson),
-                "yaml" | "yml" => Some(Format::MihomoYaml),
-                "txt" => Some(Format::MihomoText),
-                _ => None,
-            }
-        }
-        if let Some(url) = self.parsed_url()?
-            && let Some(format) = extension(Path::new(url.path()))
-        {
+        if let Some(format) = hint {
             return Ok(format);
         }
         if let Some(format) = extension(&self.path) {
@@ -197,6 +196,17 @@ impl RuleSource {
     }
 }
 
+fn extension(path: &Path) -> Option<Format> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "srs" => Some(Format::Srs),
+        "mrs" => Some(Format::Mrs),
+        "json" => Some(Format::SingboxJson),
+        "yaml" | "yml" => Some(Format::MihomoYaml),
+        "txt" => Some(Format::MihomoText),
+        _ => None,
+    }
+}
+
 pub(crate) fn visit_sources(
     configs: &mut [Config],
     visitor: &mut dyn FnMut(&mut RuleSource) -> io::Result<()>,
@@ -251,6 +261,25 @@ pub(crate) fn remote_sources(configs: &mut [Config]) -> io::Result<Vec<RuleSourc
         Ok(())
     })?;
     Ok(sources.into_values().collect())
+}
+
+pub(crate) fn normalize_sources(
+    configs: &mut [Config],
+    compiler: &mut Compiler,
+) -> io::Result<Vec<RuleSource>> {
+    let deliveries = remote_sources(configs)?;
+    for source in &deliveries {
+        compiler
+            .remote_files
+            .insert(source.path.clone(), source.url_format()?);
+    }
+    visit_sources(configs, &mut |source| {
+        source.url = None;
+        source.download = None;
+        source.update_interval = None;
+        Ok(())
+    })?;
+    Ok(deliveries)
 }
 
 fn cache_paths(path: &Path) -> [PathBuf; 3] {
@@ -412,12 +441,6 @@ pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
 }
 
 pub fn load(configs: &mut [Config], compiler: &mut Compiler) -> io::Result<()> {
-    visit_sources(configs, &mut |source| {
-        if source.url.is_some() {
-            compiler.remote_files.insert(source_identity(&source.path)?);
-        }
-        Ok(())
-    })?;
     compiler
         .policy_groups
         .extend(["allow-all-direct".into(), "block-all".into()]);
@@ -497,7 +520,7 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
         }
     }
     #[cfg(unix)]
-    if source.url.is_some() {
+    if source.url.is_some() || compiler.remote_files.contains_key(&source.path) {
         return read_file(
             source,
             crate::rule_updater::cache_file(&source.path).map_err(|e| {
@@ -568,7 +591,8 @@ fn read_file(
     let prefix = &mut prefix[..size.min(4)];
     file.read_exact(prefix)?;
     file.rewind()?;
-    let format = source.format(prefix)?;
+    let remote_hint = compiler.remote_files.get(&path).copied().flatten();
+    let format = source.format_with_hint(prefix, source.url_format()?.or(remote_hint))?;
     if !matches!(
         format,
         Format::MihomoYaml | Format::MihomoText | Format::Mrs
@@ -583,10 +607,10 @@ fn read_file(
             "code and attributes are only valid for DAT formats",
         ));
     }
-    let remote = source.url.is_some() || compiler.remote_files.contains(&path);
+    let remote = source.url.is_some() || compiler.remote_files.contains_key(&path);
     let key = SourceKey::new(path, format, source);
     if let Some(predicate) = compiler.sources.get(&key) {
-        if source.url.is_some() && matches!(predicate.kind, crate::rules::Kind::Constant(false)) {
+        if remote && matches!(predicate.kind, crate::rules::Kind::Constant(false)) {
             return Err(invalid("refusing an empty remote rule set"));
         }
         return Ok(predicate.clone());
@@ -642,7 +666,7 @@ fn read_file(
                 error
             }
         })?;
-    if source.url.is_some() && matches!(predicate.kind, crate::rules::Kind::Constant(false)) {
+    if remote && matches!(predicate.kind, crate::rules::Kind::Constant(false)) {
         return Err(invalid("refusing an empty remote rule set"));
     }
     log::info!(

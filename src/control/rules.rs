@@ -283,6 +283,26 @@ mod tests {
         assert!(serialized.contains("PASSWORD_SENTINEL"));
         assert!(serialized.contains("PRIVATE KEY"));
         let mut validated = crate::config::create_server_configs(configs).unwrap();
+        crate::config::rule_visit::visit(
+            &mut validated.configs,
+            &mut |rule| {
+                let retained = serde_json::to_string(&rule.criteria.expression).unwrap();
+                for secret in [
+                    "QUERY_SENTINEL",
+                    "PASSWORD_SENTINEL",
+                    "PRIVATE KEY",
+                    "download",
+                ] {
+                    assert!(
+                        !retained.contains(secret),
+                        "delivery metadata retained in predicates: {secret}"
+                    );
+                }
+                Ok(())
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
         let registry = Arc::new(FlowRegistry::default());
         let projection = attach(&mut validated, 1, Some(registry.clone())).unwrap();
         let Config::Server(server) = &validated.configs[0] else {
