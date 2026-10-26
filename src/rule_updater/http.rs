@@ -107,19 +107,13 @@ async fn connect(
         chain.restore_tcp_selection_indices(&state.indices);
     }
     let attempt = DownloadAttempt { chain, state };
-    let mut connected = None;
-    for target in targets {
+    let chain = &attempt.chain;
+    let connected = crate::tcp::socket_connector_impl::connect_tcp_candidates(targets, |target| {
         let target = crate::address::NetLocation::from_ip_addr(target.ip(), target.port());
-        if let Ok(result) = attempt
-            .chain
-            .connect_rule_download(target.into(), &resolver)
-            .await
-        {
-            connected = Some(result);
-            break;
-        }
-    }
-    let connected = connected.ok_or_else(|| invalid("configured rule download chain failed"))?;
+        Ok(chain.connect_rule_download(target.into(), &resolver))
+    })
+    .await
+    .map_err(|_| invalid("configured rule download chain failed"))?;
     let tcp = crate::prepend_stream::PrependStream::new(
         connected.client_stream,
         connected.early_data.map(Vec::into_boxed_slice),

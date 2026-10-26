@@ -879,6 +879,85 @@ async fn cold_descriptor_admission_precedes_dns_bootstrap_preparation() {
 }
 
 #[tokio::test]
+async fn stalled_url_address_does_not_block_another_guarded_candidate() {
+    #[derive(Debug)]
+    struct Bootstrap;
+    impl crate::resolver::Resolver for Bootstrap {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.address().to_string(), "remote.invalid");
+            Box::pin(async {
+                Ok(vec![
+                    "192.0.2.1:8080".parse().unwrap(),
+                    "192.0.2.2:8080".parse().unwrap(),
+                ])
+            })
+        }
+    }
+    async fn socks(listener: &TcpListener, ip: u8) -> TcpStream {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 3];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).await.unwrap();
+        let mut connect = [0; 10];
+        stream.read_exact(&mut connect).await.unwrap();
+        assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, ip, 31, 144]);
+        stream
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dir = directory();
+    let mut source = source(
+        "http://remote.invalid:8080/rules",
+        &dir.path().join("rules.json"),
+    );
+    let download = source.download.as_mut().unwrap();
+    download.bootstrap_url = "bootstrap".into();
+    download.client_chain = serde_json::from_value(serde_json::json!({
+        "address": listener.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}
+    }))
+    .unwrap();
+    let mut dns = DnsRegistry::new();
+    dns.register("bootstrap".into(), Arc::new(Bootstrap));
+    let fixture = tokio::spawn(async move {
+        let mut stalled = socks(&listener, 1).await;
+        let mut working = socks(&listener, 2).await;
+        working
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+        assert!(
+            request(&mut working)
+                .await
+                .contains("host: remote.invalid:8080")
+        );
+        working.write_all(&response(200, "", VALID)).await.unwrap();
+        assert!(stalled.read_u8().await.is_err());
+    });
+    drop(
+        timeout(
+            Duration::from_secs(2),
+            stage(
+                &source,
+                &dns,
+                GlobalLimits::default(),
+                Limits::default(),
+                &mut http::DownloadState::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    timeout(Duration::from_secs(2), fixture)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn cold_download_errors_identify_cache_without_exposing_url() {
     let dir = directory();
     let path = dir.path().join("missing-directory/rules.json");
