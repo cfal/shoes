@@ -31,18 +31,19 @@ fn protocol(
             reality_targets,
             ..
         } => {
-            for target in tls_targets
-                .values_mut()
-                .chain(default_tls_target.iter_mut().map(|t| t.as_mut()))
-            {
+            for (_, target) in super::client_visit::sorted_targets(tls_targets) {
                 rules(&mut target.override_rules, visitor, group)?;
                 self::protocol(&mut target.protocol, visitor, group)?;
             }
-            for target in shadowtls_targets.values_mut() {
+            if let Some(target) = default_tls_target {
                 rules(&mut target.override_rules, visitor, group)?;
                 self::protocol(&mut target.protocol, visitor, group)?;
             }
-            for target in reality_targets.values_mut() {
+            for (_, target) in super::client_visit::sorted_targets(shadowtls_targets) {
+                rules(&mut target.override_rules, visitor, group)?;
+                self::protocol(&mut target.protocol, visitor, group)?;
+            }
+            for (_, target) in super::client_visit::sorted_targets(reality_targets) {
                 rules(&mut target.override_rules, visitor, group)?;
                 self::protocol(&mut target.protocol, visitor, group)?;
             }

@@ -582,6 +582,68 @@ mod tests {
     }
 
     #[test]
+    fn download_client_names_follow_lexical_tls_target_order() {
+        use serde_json::json;
+        let target = |name: &str| {
+            json!({
+                "protocol": {"type": "socks"},
+                "override_rules": [{
+                    "url": "https://remote.invalid/rules.json", "path": format!("/unused/{name}.json"),
+                    "download": {"bootstrap_url": "system", "client_chain": {
+                        "address": format!("{name}:1080"), "protocol": {"type": "socks"}
+                    }},
+                    "action": "block"
+                }]
+            })
+        };
+        let mut protocol = json!({"type": "tls", "default_tls_target": target("default")});
+        let mut ordered = Vec::new();
+        for category in ["tls", "shadowtls", "reality"] {
+            for letter in 'a'..='h' {
+                let name = format!("{category}-{letter}");
+                let mut config = target(&name);
+                if category == "shadowtls" {
+                    config["password"] = json!("test");
+                    config["handshake"] =
+                        json!({"address": "front.invalid:443", "client_chain": "direct"});
+                } else if category == "reality" {
+                    config["private_key"] = json!("test");
+                    config["dest"] = json!("front.invalid:443");
+                }
+                protocol[format!("{category}_targets")][letter.to_string()] = config;
+                ordered.push(format!("{name}:1080"));
+            }
+            if category == "tls" {
+                ordered.push("default:1080".into());
+            }
+        }
+        let config = json!([
+            {"clash_api_address": "127.0.0.1:0", "secret": "test"},
+            {"address": "127.0.0.1:0", "rules": [{"masks": "0.0.0.0/0", "action": "block"}], "protocol": protocol}
+        ]);
+        let expected: Vec<_> = ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| (format!("client-2-{}", index + 1), address))
+            .collect();
+        for _ in 0..16 {
+            let mut configs: Vec<Config> = serde_json::from_value(config.clone()).unwrap();
+            let catalog = Catalog::capture(&mut configs).unwrap().unwrap();
+            let actual: Vec<_> = catalog
+                .nodes
+                .into_iter()
+                .filter_map(|(name, node)| match node {
+                    CatalogNode::Leaf(client) if name != "DIRECT" => {
+                        Some((name, client.address.to_string()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn names_are_not_connector_identity_and_anonymous_ids_are_repeatable() {
         let mut client: ClientConfig =
             serde_yaml::from_str("name: east\naddress: host:1080\nprotocol: {type: socks}")
