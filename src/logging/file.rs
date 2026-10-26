@@ -59,7 +59,7 @@ impl FileLogWriter {
         Self::with_writer(file)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "ios", all(unix, feature = "ffi"))))]
     pub(crate) fn with_test_writer(writer: impl Write + Send + 'static) -> io::Result<Self> {
         Self::with_writer(writer)
     }
