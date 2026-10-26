@@ -2014,6 +2014,45 @@ COMMANDS:
 
 `check` and `--dry-run` exit with status 0 for valid configuration and 1 for errors. They do not open listeners, create a file watcher, or perform DNS bootstrap networking. Runtime failures such as unavailable bind addresses remain possible after a successful check.
 
+### Configuration Diagnostics
+
+Check the same set of files that will be used at startup:
+
+```bash
+shoes check groups.yaml listeners.yaml
+```
+
+Configuration decoding failures identify the input file and the entry's
+zero-based `config[N]` index. Rule-group decoding also identifies `rules[N]`
+(or `rules` for a single object). For example, an unsupported field in the second
+rule source of the third entry reports `config[2]`, `rules[1]`, and the unknown
+field. YAML syntax and duplicate-key errors retain the parser's original
+diagnostic and line/column information when available, rather than adding an
+entry prefix. For `config[N]` decoding errors, a trailing line/column (if any)
+marks the start of the file's top-level list, not entry N or the failing field;
+use the `config[N]` and `rules[N]` paths for that context.
+
+Errors during certificate loading and semantic validation name the input file
+set, not an inferred single culprit: group references can span files. Checks use
+the native validation path, including graph and transport-composition checks.
+Named PEM entries accept only `pem` and exactly one of `path` or `data`; unknown
+fields are rejected rather than ignored. TCP settings likewise reject unknown
+fields; their only current field is `no_delay` (default `true`).
+
+Diagnostics do not include full YAML excerpts. They are not a redacted config
+export: user-defined names, paths, and some invalid values can appear in errors.
+Review diagnostics before sharing them. No normalized-config output is provided.
+
+Offline regression coverage fully validates the representative
+[SOCKS](examples/socks_basic.yaml), [HTTP-through-SOCKS](examples/http_through_socks.yaml),
+[multi-hop](examples/multi_hop_chain.yaml), [controller](examples/clash_api.yaml),
+and [local rule-source](examples/rule_sources.yaml) examples. Other examples may
+need deployment-specific certificates, keys, files, or platform support; parsing
+an example alone does not establish runtime validity.
+
+Optional reference generation, editor schema support, and strict subset conversion
+are described in [Configuration Tooling Follow-Ups](CONFIG_TOOLING_FOLLOWUP.md).
+
 ## Tips
 
 ### Generate Keys

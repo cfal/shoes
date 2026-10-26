@@ -21,22 +21,31 @@ async fn load_validated(
     discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
 ) -> io::Result<ValidatedConfigs> {
     let mut configs = config::load_configs(&paths.to_vec()).await?;
-    let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
-    let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
-    dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
-    recovery_dependencies.retain(|path| !dependencies.contains(path));
-    discovered(&dependencies, &recovery_dependencies);
-    let (configs, _) = config::convert_cert_paths(configs).await?;
-    let mut validated = config::compile_configs(configs).await?;
-    validated.reload_files = dependencies;
-    tokio::task::spawn_blocking(move || {
-        if validated.catalog.is_some() {
-            crate::control::validation::validate_resources(&validated)?;
-        }
-        Ok(validated)
-    })
+    async {
+        let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
+        let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
+        dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
+        recovery_dependencies.retain(|path| !dependencies.contains(path));
+        discovered(&dependencies, &recovery_dependencies);
+        let (configs, _) = config::convert_cert_paths(configs).await?;
+        let mut validated = config::compile_configs(configs).await?;
+        validated.reload_files = dependencies;
+        tokio::task::spawn_blocking(move || {
+            if validated.catalog.is_some() {
+                crate::control::validation::validate_resources(&validated)?;
+            }
+            Ok(validated)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
     .await
-    .map_err(io::Error::other)?
+    .map_err(|error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("Could not validate config files {paths:?}: {error}"),
+        )
+    })
 }
 
 struct PreparedServers {
@@ -752,6 +761,33 @@ mod retention_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn validation_errors_preserve_io_kind_and_file_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let missing = directory.path().join("missing.pem");
+        let yaml = serde_yaml::to_string(&serde_json::json!([
+            {"pem": "missing", "path": missing}
+        ]))
+        .unwrap();
+        std::fs::write(&path, yaml).unwrap();
+        let paths = [path.to_str().unwrap().to_owned()];
+
+        let Err(error) = load_validated(&paths, &mut |_, _| {}).await else {
+            panic!("missing PEM file must reject");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains(&format!("Could not validate config files {paths:?}:")),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("Failed to read PEM file"),
+            "{diagnostic}"
+        );
+    }
 
     #[tokio::test]
     async fn unchanged_tcp_socket_queues_connections_between_generations() {

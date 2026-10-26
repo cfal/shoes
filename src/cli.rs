@@ -18,7 +18,9 @@ fn print_usage_and_exit(arg0: String) -> ! {
     eprintln!(
         "    -l, --log-file PATH  Log to file (repeatable; \"-\" means stderr; default: stderr)"
     );
-    eprintln!("    -d, --dry-run        Parse the config and exit");
+    eprintln!(
+        "    -d, --dry-run        Validate config and certificates without starting listeners"
+    );
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
     eprintln!(
         "    global_limits.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
