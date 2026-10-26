@@ -471,9 +471,9 @@ pub async fn resolve_location(
 }
 
 /// Native resolver with application-level caching.
-/// The default for servers without configured DNS servers. OS lookups expose no DNS
-/// TTL; successful results are reused for at most 60 seconds by default, measured
-/// from lookup completion. Errors and empty results are never cached.
+/// Used by implicit native resolution and opt-in caching on explicit `system` entries.
+/// OS lookups expose no DNS TTL; successful results are reused for at most 60 seconds
+/// by default, measured from lookup completion. Errors and empty results are never cached.
 ///
 /// At most 1,024 callers participate in coalesced misses (owners plus subscribers).
 /// Excess callers perform independent lookups, preserving existing failure
@@ -501,6 +501,9 @@ struct CachedResolveResult {
 
 impl NativeResolverState {
     fn cached(&mut self, address: &Address, max_age: Duration) -> Option<Arc<[SocketAddr]>> {
+        if max_age.is_zero() {
+            return None;
+        }
         if let Some(cached) = self.cache.get(address)
             && cached.completed_at.elapsed() < max_age
         {
@@ -523,9 +526,9 @@ enum NativeLookupRole {
 }
 
 impl NativeLookupOwner {
-    fn publish(mut self, result: &NativeLookupResult) {
+    fn publish(mut self, result: &NativeLookupResult, cache_enabled: bool) {
         let mut state = self.state.lock();
-        if let Ok(addrs) = result {
+        if cache_enabled && let Ok(addrs) = result {
             state.cache.put(
                 self.address.clone(),
                 CachedResolveResult {
@@ -590,15 +593,19 @@ impl CachingNativeResolver {
     }
 
     /// Sets the maximum successful result age, not a lookup deadline or DNS TTL.
-    /// Zero disables completed-result reuse but still coalesces concurrent misses.
+    /// Zero disables completed-result caching but still coalesces concurrent misses.
     pub fn with_timeout(result_timeout_secs: u64) -> Self {
+        Self::with_lookup(Arc::new(NativeResolver::new()), result_timeout_secs)
+    }
+
+    pub(crate) fn with_lookup(lookup: Arc<dyn Resolver>, result_timeout_secs: u64) -> Self {
         Self {
             state: Arc::new(Mutex::new(NativeResolverState {
                 cache: bounded_lru(CACHING_NATIVE_RESOLVER_CACHE_CAPACITY),
                 inflight: HashMap::new(),
             })),
             participants: Arc::new(Semaphore::new(CACHING_NATIVE_RESOLVER_MAX_PARTICIPANTS)),
-            lookup: Arc::new(NativeResolver::new()),
+            lookup,
             result_timeout_secs,
         }
     }
@@ -613,6 +620,7 @@ impl Default for CachingNativeResolver {
 impl Resolver for CachingNativeResolver {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
         let max_age = Duration::from_secs(self.result_timeout_secs);
+        let cache_enabled = self.result_timeout_secs > 0;
         let caller_port = location.port();
         if let Some(addrs) = self.state.lock().cached(location.address(), max_age) {
             let addrs = native_addrs_with_port(&addrs, caller_port);
@@ -677,7 +685,7 @@ impl Resolver for CachingNativeResolver {
                                 }
                             })
                             .map_err(Arc::new);
-                        owner.publish(&result);
+                        owner.publish(&result, cache_enabled);
                         result
                     }
                 };

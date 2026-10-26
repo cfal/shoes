@@ -10,6 +10,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [WireGuard](#wireguard)
 - [Client Config](#client-config)
 - [Client Protocols](#client-protocols)
+- [Native DNS Freshness](#native-dns-freshness)
 - [Fake DNS](#fake-dns)
 - [Rules System](#rules-system)
 - [Named Groups](#named-groups)
@@ -458,6 +459,36 @@ DNS/carrier traffic, and unauthenticated camouflage/fallback forwarding are excl
 synthetic fake-DNS answers and ICMP are not represented as connections.
 Connection speeds are derived by the dashboard from successive byte counters.
 Process/GeoIP data is not fabricated.
+
+Optional `connection_notes: true` on a Clash API entry (`clash_api_address` or
+`clash_api_path`) adds setup notes to active `/connections` objects, over HTTP and
+WebSocket. It defaults to false; changing it requires a restart.
+If any controller enables it, all controllers expose notes. In zashboard, open a
+connection's details and select **Raw** to inspect `notes` (`elapsedUs`, `phase`,
+`text`), alongside its existing generation, destination, selected chain, and rule
+metadata.
+
+Notes describe preparation, routing choices, inbound-resolver calls, and outbound
+setup. They are best-effort: rejected/failed setup and closed connections have no
+retained history or separate debug endpoint. A dashboard may retain previously
+sampled connections, but short-lived connections can be missed. DNS notes cover
+existing routing/dial call boundaries, not resolver cache/upstream internals or
+remote DNS. Initial UDP prechecks and local-DNS handling are not observed.
+Notes contain hostnames and addresses, never payloads, credentials, or error
+messages; errors use only their kind.
+They may reveal outbound proxy server hostnames and IP addresses not otherwise
+exposed by the API.
+
+At most 256 connections (including pending setup) collect notes at once. Each
+buffer holds 32 events with at most 128 UTF-8 bytes of text each, plus an overflow
+summary when read. New connections skip notes while all slots are occupied.
+Buffers reserve at most 8 KiB each, 2 MiB in aggregate, excluding allocator/RSS
+overhead and snapshot copies/JSON. Closing or abandoning a connection releases
+its buffer when its last reader finishes. The budget is shared across reloads.
+With notes disabled, no note buffers or resolver wrappers are allocated.
+When enabled, notes add setup work and snapshot copying/serialization: the
+controller samples every second even without subscribers; HTTP requests and
+custom-interval WebSocket subscriptions can request additional snapshots.
 
 Delay tests send HTTP HEAD through actual outbounds, verify HTTPS certificates,
 and never follow redirects. A leaf test is standalone, not a test of every chain
@@ -1089,6 +1120,50 @@ receive windows, the H2 library's 16 MiB response-header decoding limit, and no 
 HTTP/2 PING watchdog. Peer stream limits and timeouts still apply. In particular,
 Caddy v2.11.7 defaults to a one-minute request-body idle timeout, which can end a
 quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
+
+## Native DNS Freshness
+
+Omitting a listener's `dns` or leaving `dns.servers` empty uses native OS/NSS
+hostname resolution with a **60-second application memoization window**. The
+same default resolver serves controller probes. The window starts when a
+successful lookup finishes; an entry expires at the window boundary. All returned
+usable addresses and their original order are retained.
+Errors and empty results are not cached, and expired answers are not served on
+failure. Each cache has a lazy, bounded 10,000-entry LRU keyed by exact hostname;
+results are shared across ports, with each caller receiving its requested port.
+Eviction can cause earlier refresh. Concurrent misses share a lookup, up to
+1,024 participating callers per resolver. Excess callers look up independently;
+this is not an OS lookup concurrency cap. Cancelling the owner makes surviving
+callers retry within their remaining deadlines. No background refresh is added,
+and already-running OS calls cannot be stopped.
+
+Explicit `dns: {servers: system}` continues to use OS/NSS lookup **without
+application memoization or concurrent lookup sharing**. To select a different
+fixed window, use a system server options object, inline or in a named DNS group:
+
+```yaml
+dns:
+  servers:
+    url: system
+    native_cache_secs: 15
+```
+
+`native_cache_secs` accepts an integer from 0 to 4294967295 seconds. Omitted or
+`0` disables memoization for this explicit system entry. It is rejected on
+non-system upstreams, including when set to `0`; unknown options and invalid
+values are rejected. The option belongs to the server options object, not the
+outer `dns` object. Existing `timeout_secs` remains a lookup deadline, not cache
+freshness; `connect_timeout_secs` and `attempts` do not control native caching.
+
+This is a load/freshness trade-off, **not DNS TTL compliance**: the OS lookup API
+does not provide record TTLs. Shorter windows increase OS lookups; disabling the
+Shoes cache cannot bypass caches in the OS, NSS modules, or upstream resolvers.
+Native hosts-file/NSS behavior is preserved. New flows can see updated answers
+after expiry; established flows retain their pinned destination. This setting
+controls native hostname lookup caching, not every DNS-related cache. Hickory
+caches and Fake-IP mappings/TTLs are unchanged.
+
+See [the DNS tuning example](examples/dns_tuning.yaml).
 
 ## Fake DNS
 
@@ -2013,6 +2088,45 @@ COMMANDS:
 ```
 
 `check` and `--dry-run` exit with status 0 for valid configuration and 1 for errors. They do not open listeners, create a file watcher, or perform DNS bootstrap networking. Runtime failures such as unavailable bind addresses remain possible after a successful check.
+
+### Configuration Diagnostics
+
+Check the same set of files that will be used at startup:
+
+```bash
+shoes check groups.yaml listeners.yaml
+```
+
+Configuration decoding failures identify the input file and the entry's
+zero-based `config[N]` index. Rule-group decoding also identifies `rules[N]`
+(or `rules` for a single object). For example, an unsupported field in the second
+rule source of the third entry reports `config[2]`, `rules[1]`, and the unknown
+field. YAML syntax and duplicate-key errors retain the parser's original
+diagnostic and line/column information when available, rather than adding an
+entry prefix. For `config[N]` decoding errors, a trailing line/column (if any)
+marks the start of the file's top-level list, not entry N or the failing field;
+use the `config[N]` and `rules[N]` paths for that context.
+
+Errors during certificate loading and semantic validation name the input file
+set, not an inferred single culprit: group references can span files. Checks use
+the native validation path, including graph and transport-composition checks.
+Named PEM entries accept only `pem` and exactly one of `path` or `data`; unknown
+fields are rejected rather than ignored. TCP settings likewise reject unknown
+fields; their only current field is `no_delay` (default `true`).
+
+Diagnostics do not include full YAML excerpts. They are not a redacted config
+export: user-defined names, paths, and some invalid values can appear in errors.
+Review diagnostics before sharing them. No normalized-config output is provided.
+
+Offline regression coverage fully validates the representative
+[SOCKS](examples/socks_basic.yaml), [HTTP-through-SOCKS](examples/http_through_socks.yaml),
+[multi-hop](examples/multi_hop_chain.yaml), [controller](examples/clash_api.yaml),
+and [local rule-source](examples/rule_sources.yaml) examples. Other examples may
+need deployment-specific certificates, keys, files, or platform support; parsing
+an example alone does not establish runtime validity.
+
+Optional reference generation, editor schema support, and strict subset conversion
+are described in [Configuration Tooling Follow-Ups](CONFIG_TOOLING_FOLLOWUP.md).
 
 ## Tips
 

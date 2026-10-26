@@ -95,6 +95,7 @@ mod tests {
             secret: "secret".into(),
             cors_origins: vec!["https://dashboard.example".into()],
             allow_private_network: false,
+            connection_notes: false,
         }
     }
 

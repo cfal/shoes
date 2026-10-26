@@ -54,7 +54,7 @@ async fn matrix_peer(
     let _udp_echo = start_udp_echo_server_with_suffix("0.0.0.0", echo_port, b"").await?;
     let second_udp = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"second").await?;
     let second_target = ([127, 0, 0, 1], second_udp.local_addr().port()).into();
-    let fixture = Fixture::new(peer)?;
+    let fixture = Fixture::new(peer).await?;
     for &version in versions {
         for mode in ["packet-up", "stream-up", "stream-one", "auto"] {
             if mode == "auto" && !matches!(version, "reality" | "h2") {
@@ -165,7 +165,7 @@ async fn mihomo_alpha_client_shoes_server() -> fixture::Result {
 
 #[tokio::test]
 async fn shoes_default_http_versions_follow_the_transport() -> fixture::Result {
-    let fixture = Fixture::new(Peer::Shoes)?;
+    let fixture = Fixture::new(Peer::Shoes).await?;
     let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
     for version in ["plain", "h2", "h3"] {
         let pair = fixture
@@ -209,7 +209,7 @@ async fn udp_datagrams_cross_post_boundaries_without_mixing_associations() -> fi
         (Peer::Mihomo, true),
         (Peer::Mihomo, false),
     ] {
-        let mut fixture = Fixture::new(peer)?;
+        let mut fixture = Fixture::new(peer).await?;
         // Force fragmentation without exceeding the peers' UDP socket buffers.
         fixture.post_bytes = 1024;
         let pair = fixture
@@ -254,7 +254,7 @@ async fn tcp_prefix_and_quic_suffix_chains_carry_tcp_and_udp() -> fixture::Resul
         (Peer::Mihomo, false),
         (Peer::Shoes, true),
     ] {
-        let fixture = Fixture::new(peer)?;
+        let fixture = Fixture::new(peer).await?;
         let hop = port();
         let readiness = port();
         let hop_protocol = if suffix {
@@ -350,7 +350,7 @@ async fn pressure_with_limits(
     use std::sync::Arc;
     use tokio::sync::{Notify, oneshot};
 
-    let mut fixture = Fixture::new(peer)?;
+    let mut fixture = Fixture::new(peer).await?;
     // Small byte budgets force backpressure while retaining the default request-count limits.
     fixture.pressure = tight;
     let pair = fixture
@@ -504,7 +504,7 @@ async fn xray_backpressure_cancellation_and_churn() -> fixture::Result {
 
 #[tokio::test]
 async fn xray_h2_packet_inactivity_bounds_permanent_stalls() -> fixture::Result {
-    let mut fixture = Fixture::new(Peer::Xray)?;
+    let mut fixture = Fixture::new(Peer::Xray).await?;
     fixture.server_packet_timeout_secs = Some(2);
     let pair = fixture.start_with_client_patch(fixture::Case {
         peer: Peer::Xray, shoes_client: false, protocol: "vless", version: "h2", mode: "packet-up",
@@ -571,7 +571,7 @@ async fn xray_h2_explicit_request_cap_stalled_upload() -> fixture::Result {
 }
 
 async fn xray_stalled_upload(version: &str, request_limit: Option<usize>) -> fixture::Result {
-    let mut fixture = Fixture::new(Peer::Xray)?;
+    let mut fixture = Fixture::new(Peer::Xray).await?;
     fixture.server_request_limit = request_limit;
     let pair = fixture.start_with_client_patch(fixture::Case {
             peer: Peer::Xray, shoes_client: false, protocol: "vless", version, mode: "packet-up",
@@ -697,7 +697,7 @@ async fn packet_up_throughput_and_stall_qualification() -> fixture::Result {
                                 direction,
                                 "xray-xray" | "xray-shoes" | "shoes-xray"
                             ));
-                            let mut fixture = Fixture::new(Peer::Xray)?;
+                            let mut fixture = Fixture::new(Peer::Xray).await?;
                             fixture.post_bytes = post as usize;
                             fixture.post_interval_ms = 30;
                             fixture.latency_ms = rtt;
@@ -847,7 +847,7 @@ async fn wrong_credentials_never_reach_the_destination() -> fixture::Result {
         (Peer::Mihomo, true),
         (Peer::Mihomo, false),
     ] {
-        let fixture = Fixture::new(peer)?;
+        let fixture = Fixture::new(peer).await?;
         for mode in ["packet-up", "stream-up", "stream-one"] {
             let destination = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
             let target = ([127, 0, 0, 1], destination.local_addr()?.port()).into();
@@ -914,7 +914,7 @@ async fn mihomo_alpha_client_matching_headers() -> fixture::Result {
 async fn client_matching_headers(peer: Peer) -> fixture::Result {
     let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
     let target: SocketAddr = ([127, 0, 0, 1], echo.local_addr().port()).into();
-    let mut fixture = Fixture::new(peer)?;
+    let mut fixture = Fixture::new(peer).await?;
     fixture.matching_headers = Some(json!({"X-Tunnel-Key":"test-secret"}));
     let start = |version, mode, key: Option<&'static str>| {
         fixture.start_with_client_patch(

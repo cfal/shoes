@@ -537,7 +537,13 @@ fn build_resolver_with_limits(
         let resolver: Arc<dyn Resolver> = match entry.server {
             ParsedDnsServer::System => wrap_resolver(
                 SystemResolver::new(
-                    Arc::new(NativeResolver::new()),
+                    if entry.native_cache_secs == 0 {
+                        Arc::new(NativeResolver::new())
+                    } else {
+                        Arc::new(CachingNativeResolver::with_timeout(
+                            entry.native_cache_secs.into(),
+                        ))
+                    },
                     forbidden.clone(),
                     options.request_timeout.unwrap_or(Duration::from_secs(5)),
                 ),
@@ -952,7 +958,7 @@ async fn build_entry_and_plan(
         .to_parsed_server(resolved_ip)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    let entry = ParsedDnsServerEntry::new(
+    let mut entry = ParsedDnsServerEntry::new(
         server,
         chain_group,
         bootstrap_resolver,
@@ -961,6 +967,7 @@ async fn build_entry_and_plan(
         spec.connect_timeout_secs,
         spec.attempts,
     );
+    entry.native_cache_secs = spec.native_cache_secs;
 
     Ok((entry, plan))
 }
@@ -1009,6 +1016,7 @@ mod tests {
             timeout_secs: 5,
             connect_timeout_secs: 5,
             attempts: 1,
+            native_cache_secs: 0,
         }
     }
 
@@ -1019,6 +1027,47 @@ mod tests {
             fake_ip: enabled.then(FakeIpOptions::default),
             use_default_resolver: false,
         }]
+    }
+
+    #[tokio::test]
+    async fn native_cache_policy_distinguishes_implicit_and_explicit_system() {
+        for (dns, window) in [
+            ("", Some(60)),
+            ("dns: {}", Some(60)),
+            ("dns: {servers: []}", Some(60)),
+            ("dns: {servers: system}", None),
+            ("dns: {servers: {url: system}}", None),
+            ("dns: {servers: {url: system, native_cache_secs: 0}}", None),
+            (
+                "dns: {servers: {url: system, native_cache_secs: 7}}",
+                Some(7),
+            ),
+        ] {
+            let yaml =
+                format!("- address: '127.0.0.1:1080'\n  protocol: {{type: socks}}\n  {dns}\n");
+            let configs =
+                crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
+            let mut registry = build_dns_registry(configs.dns_groups).await.unwrap();
+            let crate::config::Config::Server(server) = &configs.configs[0] else {
+                panic!("expected server")
+            };
+            let resolver = registry.get_for_server(server.dns.as_ref());
+            let debug = format!("{resolver:?}");
+            assert!(debug.contains("SystemResolver"), "{debug}");
+            match window {
+                Some(seconds) => {
+                    let expected =
+                        format!("CachingNativeResolver {{ result_timeout_secs: {seconds} }}");
+                    assert!(debug.contains(&expected), "{dns}: {debug}");
+                }
+                None => assert!(!debug.contains("CachingNativeResolver"), "{dns}: {debug}"),
+            }
+            let literal = crate::address::NetLocation::from_str("127.0.0.1:443", None).unwrap();
+            assert_eq!(
+                resolver.resolve_location(&literal).await.unwrap(),
+                vec!["127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap()]
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,4 +1,9 @@
-use std::{io, net::SocketAddr, path::PathBuf};
+use std::{
+    io,
+    net::{SocketAddr, TcpListener, UdpSocket},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 use shoes_test_support::{
@@ -46,16 +51,57 @@ impl Case<'_> {
 }
 
 pub fn port() -> u16 {
-    static USED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
-        std::sync::LazyLock::new(Default::default);
+    PortReservation::new().unwrap().port()
+}
+
+struct PortReservation {
+    tcp: TcpListener,
+    _udp: UdpSocket,
+}
+
+impl PortReservation {
+    fn new() -> io::Result<Self> {
+        static USED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+            std::sync::LazyLock::new(Default::default);
+        loop {
+            let tcp = TcpListener::bind("0.0.0.0:0")?;
+            let port = tcp.local_addr()?.port();
+            let udp = match UdpSocket::bind(("0.0.0.0", port)) {
+                Ok(udp) => udp,
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
+                Err(error) => return Err(error),
+            };
+            if USED.lock().unwrap().insert(port) {
+                return Ok(Self { tcp, _udp: udp });
+            }
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.tcp.local_addr().unwrap().port()
+    }
+}
+
+async fn wait_shoes_ready(process: &mut ProcessGuard, port: u16) -> io::Result<()> {
+    let address = ([127, 0, 0, 1], port).into();
+    let readiness = xray::wait_socks(address);
+    tokio::pin!(readiness);
+    let mut poll = tokio::time::interval(Duration::from_millis(20));
     loop {
-        let tcp = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        let Ok(_udp) = std::net::UdpSocket::bind(("0.0.0.0", port)) else {
-            continue;
-        };
-        if USED.lock().unwrap().insert(port) {
-            return port;
+        tokio::select! {
+            _ = poll.tick() => {
+                if let Some(status) = process.try_wait()? {
+                    return Err(io::Error::other(format!(
+                        "Shoes PID {} exited before SOCKS readiness at {address}: {status}",
+                        process.id()
+                    )));
+                }
+            }
+            result = &mut readiness => {
+                return result.map_err(|error| io::Error::new(
+                    error.kind(), format!("Shoes SOCKS readiness at {address}: {error}")
+                ));
+            }
         }
     }
 }
@@ -177,7 +223,7 @@ async fn delayed_copy(
 }
 
 impl Fixture {
-    pub fn new(peer: Peer) -> Result<Self> {
+    pub async fn new(peer: Peer) -> Result<Self> {
         // REALITY's combined-flight mimicry needs an encrypted flight over 512 bytes.
         let names: Vec<String> = std::iter::once("localhost".into())
             .chain((0..40).map(|i| format!("fixture-{i}.local.test")))
@@ -194,20 +240,27 @@ impl Fixture {
         std::fs::write(&cert, certificate.cert.pem())?;
         std::fs::write(&key, certificate.signing_key.serialize_pem())?;
         let (private_key, public_key) = generate_reality_keypair();
-        let destination = port();
-        let destination_ready = port();
+        let destination_reservation = PortReservation::new()?;
+        let readiness_reservation = PortReservation::new()?;
+        let destination = destination_reservation.port();
+        let destination_ready = readiness_reservation.port();
         let groups = if peer == Peer::Mihomo {
             vec!["X25519MLKEM768", "X25519"]
         } else {
             vec!["X25519MLKEM768"]
         };
-        let server = start_shoes_server(&serde_yaml::to_string(&json!([
+        let config = serde_yaml::to_string(&json!([
             {"address":format!("0.0.0.0:{destination}"),"protocol":{"type":"tls","default_target":{
                 "cert":cert,"key":key,"key_exchange_groups":groups,
                 "alpn_protocols":["h2","http/1.1"],"protocol":{"type":"http"}
             }}},
             {"address":format!("0.0.0.0:{destination_ready}"),"protocol":{"type":"socks"}}
-        ]))?)?;
+        ]))?;
+        // Keep ports reserved through config construction; callers may bind new
+        // destinations as soon as this constructor returns.
+        drop((destination_reservation, readiness_reservation));
+        let mut server = start_shoes_server(&config)?;
+        wait_shoes_ready(&mut server.0, destination_ready).await?;
         Ok(Self {
             post_bytes: POST_BYTES,
             post_interval_ms: 1,
@@ -483,7 +536,9 @@ impl Fixture {
         xray::wait_socks(([127, 0, 0, 1], self.destination_ready).into()).await?;
         assert!(peer != Peer::Mihomo || protocol == "vless");
         assert!(peer != Peer::Mihomo || !shoes_client || version != "h3");
-        let remote = port();
+        let remote_reservation = PortReservation::new()?;
+        let remote = remote_reservation.port();
+        let mut remote_reservation = Some(remote_reservation);
         assert!(
             version != "h3" || self.latency_ms == 0,
             "latency relay is TCP-only"
@@ -493,8 +548,11 @@ impl Fixture {
             "latency qualification requires a separate peer process"
         );
         let (client_remote, relay) = LatencyRelay::start(remote, self.latency_ms).await?;
-        let socks_port = port();
-        let readiness = port();
+        let socks_reservation = PortReservation::new()?;
+        let socks_port = socks_reservation.port();
+        let mut socks_reservation = Some(socks_reservation);
+        let readiness_reservation = PortReservation::new()?;
+        let readiness = readiness_reservation.port();
         let socks = ([127, 0, 0, 1], socks_port).into();
         let mut shoes_config = self.shoes_config(
             &case,
@@ -527,13 +585,18 @@ impl Fixture {
                 .unwrap()
                 .insert(0, json!({"global_limits":{"max_streams_per_connection":1}}));
         }
-        let shoes = start_shoes_server(&serde_yaml::to_string(&shoes_config)?)?;
-        xray::wait_socks(
-            (
-                [127, 0, 0, 1],
-                if shoes_client { socks_port } else { readiness },
-            )
-                .into(),
+        let shoes_config = serde_yaml::to_string(&shoes_config)?;
+        if !shoes_client || peer == Peer::Shoes {
+            drop(remote_reservation.take());
+        }
+        if shoes_client {
+            drop(socks_reservation.take());
+        }
+        drop(readiness_reservation);
+        let mut shoes = start_shoes_server(&shoes_config)?;
+        wait_shoes_ready(
+            &mut shoes.0,
+            if shoes_client { socks_port } else { readiness },
         )
         .await?;
         let mut pair = Pair {
@@ -544,6 +607,7 @@ impl Fixture {
             _reference: None,
             _relay: relay,
         };
+        drop((remote_reservation, socks_reservation));
         match peer {
             Peer::Shoes => {}
             Peer::Xray => pair._xray = Some(xray::start(peer_config).await?),
@@ -566,8 +630,10 @@ impl Fixture {
     }
 
     pub async fn start_xray_reference(&self) -> Result<Pair> {
-        let remote = port();
-        let socks_port = port();
+        let remote_reservation = PortReservation::new()?;
+        let remote = remote_reservation.port();
+        let socks_reservation = PortReservation::new()?;
+        let socks_port = socks_reservation.port();
         let (client_remote, relay) = LatencyRelay::start(remote, self.latency_ms).await?;
         let mut case = Case {
             peer: Peer::Xray,
@@ -576,9 +642,13 @@ impl Fixture {
             version: "h2",
             mode: "packet-up",
         };
-        let server = xray::start(self.xray_config(&case, remote, socks_port)).await?;
+        let server_config = self.xray_config(&case, remote, socks_port);
+        drop(remote_reservation);
+        let server = xray::start(server_config).await?;
         case.shoes_client = false;
-        let client = xray::start(self.xray_config(&case, client_remote, socks_port)).await?;
+        let client_config = self.xray_config(&case, client_remote, socks_port);
+        drop(socks_reservation);
+        let client = xray::start(client_config).await?;
         let socks = ([127, 0, 0, 1], socks_port).into();
         xray::wait_socks(socks).await?;
         Ok(Pair {
@@ -598,5 +668,69 @@ pub fn shoes_xhttp(endpoint: &mut Value) -> &mut Value {
         protocol
     } else {
         &mut protocol["protocol"]
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn reservation_holds_both_transports_until_handoff() -> Result {
+        let reserved = PortReservation::new()?;
+        let address = ("0.0.0.0", reserved.port());
+        assert_eq!(
+            TcpListener::bind(address).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert_eq!(
+            UdpSocket::bind(address).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        drop(reserved);
+        let _tcp = TcpListener::bind(address)?;
+        let _udp = UdpSocket::bind(address)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn constructor_returns_with_destination_listeners_ready() -> Result {
+        let fixture = Fixture::new(Peer::Shoes).await?;
+        let _destination =
+            tokio::net::TcpStream::connect(("127.0.0.1", fixture.destination)).await?;
+        let mut readiness =
+            tokio::net::TcpStream::connect(("127.0.0.1", fixture.destination_ready)).await?;
+        readiness.write_all(&[5, 1, 0]).await?;
+        let mut response = [0; 2];
+        tokio::time::timeout(Duration::from_secs(2), readiness.read_exact(&mut response)).await??;
+        assert_eq!(response, [5, 0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn occupied_port_reports_child_exit_before_readiness_timeout() -> Result {
+        let candidate = PortReservation::new()?;
+        let port = candidate.port();
+        drop(candidate);
+        // Deterministically take the released port before the child can bind it.
+        let _occupied = TcpListener::bind(("0.0.0.0", port))?;
+        let config = serde_yaml::to_string(&json!([
+            {"address":format!("0.0.0.0:{port}"),"protocol":{"type":"socks"}}
+        ]))?;
+        let (mut process, _config) = start_shoes_server(&config)?;
+        let error =
+            tokio::time::timeout(Duration::from_secs(2), wait_shoes_ready(&mut process, port))
+                .await?
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("exited before SOCKS readiness"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&format!("127.0.0.1:{port}")),
+            "{error}"
+        );
+        assert!(!process.try_wait()?.unwrap().success());
+        Ok(())
     }
 }

@@ -95,7 +95,8 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_init<'local>(
     let level = crate::logging::parse_log_level(&level_str).unwrap_or(log::LevelFilter::Info);
 
     // Initialize logger (only once)
-    if !LOGGER_INITIALIZED.swap(true, Ordering::SeqCst) {
+    let _setup = common::LOGGER_SETUP.lock();
+    if !LOGGER_INITIALIZED.load(Ordering::SeqCst) {
         LOG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
 
         let writers: Vec<Box<dyn LogWriter>> = vec![
@@ -103,7 +104,10 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_init<'local>(
             Box::new(DynamicFileLogWriter::new(&LOG_FILE)),
         ];
         let directives = vec![crate::logging::Directive { name: None, level }];
-        crate::logging::init_multi_logger(writers, directives);
+        if crate::logging::init_multi_logger(writers, directives).is_err() {
+            return -1;
+        }
+        LOGGER_INITIALIZED.store(true, Ordering::SeqCst);
     }
 
     info!("shoes initialized with log level: {}", level_str);

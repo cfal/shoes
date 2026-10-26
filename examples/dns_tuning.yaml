@@ -20,6 +20,18 @@
 # These defaults leave configured upstream resolvers, raw DNS exchange, and
 # bootstrap unchanged.
 
+# Native OS/NSS lookup memoization is separate from hickory tuning and DNS TTLs.
+# Omitted listener dns defaults to 60 seconds. Explicit system defaults to no cache.
+- dns_group: native-short-cache
+  dns_servers:
+    - url: system
+      native_cache_secs: 15
+
+- dns_group: native-no-cache
+  dns_servers:
+    - url: system
+      native_cache_secs: 0
+
 # Direct DNS group with fast-fail tuning.
 - dns_group: tuned-direct-dns
   dns_servers:

@@ -811,6 +811,7 @@ fn validate_dns_group_ref(
 /// Expands client chains (resolves group refs to configs) and validates:
 /// - Inline client configs (PEMs, etc.)
 /// - Protocol compatibility (system doesn't support chains, UDP/H3 only direct chains)
+/// - System-only use of native_cache_secs
 /// - Bootstrap URL validity (must be a known group or valid IP-only URL)
 fn expand_dns_specs(
     specs: &[DnsServerSpec],
@@ -828,6 +829,12 @@ fn expand_dns_specs(
         // Parse URL to validate and check protocol
         let parsed_url = ParsedDnsUrl::parse_with_server_name(url_str, server_name_override)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        if spec.native_cache_secs().is_some() && !matches!(parsed_url, ParsedDnsUrl::System) {
+            return Err(std::io::Error::other(
+                "native_cache_secs is only supported for system DNS resolver",
+            ));
+        }
 
         // Expand and validate client chains
         let client_chains_raw = spec.client_chains();
@@ -911,6 +918,7 @@ fn expand_dns_specs(
             timeout_secs: spec.timeout_secs(),
             connect_timeout_secs: spec.connect_timeout_secs(),
             attempts: spec.attempts(),
+            native_cache_secs: spec.native_cache_secs().unwrap_or(0),
         });
     }
 
@@ -3550,6 +3558,7 @@ mod tests {
                 timeout_secs: 10,
                 connect_timeout_secs: 5,
                 attempts: 1,
+                native_cache_secs: None,
             }),
         })];
 
@@ -3560,6 +3569,47 @@ mod tests {
             err.contains("client_chain is not supported for system DNS"),
             "Expected system DNS client_chain error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_dns_native_cache_only_accepts_system_specs() {
+        for url in [
+            "system",
+            "udp://192.0.2.1",
+            "tcp://192.0.2.1",
+            "tls://192.0.2.1",
+            "https://192.0.2.1/dns-query",
+            "h3://192.0.2.1/dns-query",
+        ] {
+            for seconds in [0, 7] {
+                let yaml = format!(
+                    "- dns_group: native\n  dns_servers: [{{url: '{url}', native_cache_secs: {seconds}}}]\n- dns_group: composed\n  dns_servers: native\n"
+                );
+                let result = create_server_configs(serde_yaml::from_str(&yaml).unwrap());
+                if url == "system" {
+                    let config = result.unwrap();
+                    assert_eq!(config.dns_groups.len(), 2);
+                    for group in config.dns_groups {
+                        assert_eq!(group.specs[0].native_cache_secs, seconds);
+                    }
+                } else {
+                    let error = result.err().expect("non-system cache option must fail");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("native_cache_secs is only supported for system")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dns_tuning_example_validates() {
+        create_server_configs(
+            serde_yaml::from_str(include_str!("../../examples/dns_tuning.yaml")).unwrap(),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3596,6 +3646,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3635,6 +3686,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3676,6 +3728,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3715,6 +3768,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3747,6 +3801,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3780,6 +3835,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3813,6 +3869,7 @@ mod tests {
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
+                    native_cache_secs: None,
                 }),
             }),
         ];
@@ -3958,6 +4015,7 @@ mod tests {
                         timeout_secs: 10,
                         connect_timeout_secs: 5,
                         attempts: 1,
+                        native_cache_secs: None,
                     },
                 ]),
             }),

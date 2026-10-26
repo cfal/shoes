@@ -33,9 +33,16 @@ mod rule_sets;
 #[path = "cases/process_contract/clash_api.rs"]
 mod clash_api;
 
+#[path = "cases/process_contract/config_tooling.rs"]
+mod config_tooling;
+
 #[cfg(unix)]
 #[path = "cases/process_contract/certificates.rs"]
 mod certificates;
+
+#[cfg(unix)]
+#[path = "cases/process_contract/file_logging.rs"]
+mod file_logging;
 
 #[cfg(unix)]
 #[tokio::test]
@@ -448,7 +455,7 @@ fn vless_wrong_side_credentials_fail_check_and_startup() {
     use serde_json::json;
     let directory = tempfile::Builder::new()
         .prefix("vless-wrong-side-")
-        .tempdir_in(std::env::var_os("HOME").unwrap())
+        .tempdir()
         .unwrap();
     for server in [false, true] {
         let address = available_address();
@@ -641,6 +648,13 @@ fn available_address() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+#[cfg(unix)]
+fn reserve_address() -> (std::net::TcpListener, SocketAddr) {
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let address = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+    (listener, address)
 }
 
 #[cfg(unix)]
@@ -1073,8 +1087,8 @@ async fn unsupported_quic_allowlists_fail_validation_and_start() {
 async fn initial_partial_bind_failure_exits_and_releases_addresses() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
-    let first = available_address();
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let first = available_address();
     for config in [
         format!(
             "- address: ['{first}', '{}']\n  protocol: {{type: http}}\n",
@@ -1532,14 +1546,15 @@ async fn shutdown_interrupts_dns_preparation_without_retiring_listeners() {
 async fn replacement_bind_failure_retains_service_and_allows_subsequent_reload() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
         .await
         .unwrap();
-    let address = available_address();
-    let candidate_address = available_address();
-    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let (address_reservation, address) = reserve_address();
+    let (candidate_reservation, candidate_address) = reserve_address();
     let config = forward(address, echo.local_addr());
     std::fs::write(&path, &config).unwrap();
+    drop(address_reservation);
     let mut child = Process::start(&path, &["--no-reload"]);
     child.wait_for("Servers ready").await;
     let mut retained = TcpStream::connect(address).await.unwrap();
@@ -1552,6 +1567,7 @@ async fn replacement_bind_failure_retains_service_and_allows_subsequent_reload()
         ),
     )
     .unwrap();
+    drop(candidate_reservation);
     child.signal(libc::SIGHUP);
     child
         .wait_for("Reload rejected; current servers retained")
