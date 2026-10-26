@@ -37,67 +37,67 @@ async fn load_candidate(
     retained_ranges: &[ipnetwork::IpNetwork],
 ) -> io::Result<(ValidatedConfigs, Vec<Config>)> {
     async {
-    let cache_dir = crate::rule_set::cache_directory(&configs)?;
-    let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
-    let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
-    dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
-    recovery_dependencies.retain(|path| !dependencies.contains(path));
-    discovered(
-        &dependencies,
-        &recovery_dependencies,
-        expected_cache_dir.unwrap_or(&cache_dir).as_deref(),
-    );
-    let config_files: Vec<_> = paths.iter().map(PathBuf::from).collect();
-    crate::rule_set::validate_remote_paths(&mut configs, &config_files)?;
-    if let Some(expected) = expected_cache_dir
-        && &cache_dir != expected
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "changing rule_cache_dir requires a restart",
-        ));
-    }
-    #[cfg(unix)]
-    if for_runtime
-        && cache_lease.is_none()
-        && let Some(directory) = cache_dir
-    {
-        *cache_lease = Some(std::sync::Arc::new(
-            tokio::task::spawn_blocking(move || {
-                crate::rule_updater::create_cache_directory(&directory)?;
-                crate::rule_updater::cache_lease(&directory)
-            })
-            .await
-            .map_err(io::Error::other)??,
-        ));
-    }
-    #[cfg(not(unix))]
-    let _ = (cache_lease, retained_ranges);
-    let (mut configs, _) = config::convert_cert_paths(configs).await?;
-    #[cfg(unix)]
-    if for_runtime {
-        configs = crate::rule_updater::bootstrap(configs, retained_ranges).await?;
-    }
-    let mut has_remote = false;
-    crate::rule_set::visit_sources(&mut configs, &mut |source| {
-        has_remote |= source.url.is_some();
-        Ok(())
-    })?;
-    let snapshot = if for_runtime && has_remote {
-        configs.clone()
-    } else {
-        Vec::new()
-    };
-    let mut validated = config::compile_configs(configs).await?;
-    validated.reload_files = dependencies;
-    tokio::task::spawn_blocking(move || {
-        if validated.catalog.is_some() {
-            crate::control::validation::validate_resources(&validated)?;
+        let cache_dir = crate::rule_set::cache_directory(&configs)?;
+        let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
+        let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
+        dependencies.extend(config::pem_reload_dependencies(&mut configs)?);
+        recovery_dependencies.retain(|path| !dependencies.contains(path));
+        discovered(
+            &dependencies,
+            &recovery_dependencies,
+            expected_cache_dir.unwrap_or(&cache_dir).as_deref(),
+        );
+        let config_files: Vec<_> = paths.iter().map(PathBuf::from).collect();
+        crate::rule_set::validate_remote_paths(&mut configs, &config_files)?;
+        if let Some(expected) = expected_cache_dir
+            && &cache_dir != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "changing rule_cache_dir requires a restart",
+            ));
         }
-        Ok((validated, snapshot))
-    })
-    .await
-    .map_err(io::Error::other)?
+        #[cfg(unix)]
+        if for_runtime
+            && cache_lease.is_none()
+            && let Some(directory) = cache_dir
+        {
+            *cache_lease = Some(std::sync::Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    crate::rule_updater::create_cache_directory(&directory)?;
+                    crate::rule_updater::cache_lease(&directory)
+                })
+                .await
+                .map_err(io::Error::other)??,
+            ));
+        }
+        #[cfg(not(unix))]
+        let _ = (cache_lease, retained_ranges);
+        let (mut configs, _) = config::convert_cert_paths(configs).await?;
+        #[cfg(unix)]
+        if for_runtime {
+            configs = crate::rule_updater::bootstrap(configs, retained_ranges).await?;
+        }
+        let mut has_remote = false;
+        crate::rule_set::visit_sources(&mut configs, &mut |source| {
+            has_remote |= source.url.is_some();
+            Ok(())
+        })?;
+        let snapshot = if for_runtime && has_remote {
+            configs.clone()
+        } else {
+            Vec::new()
+        };
+        let mut validated = config::compile_configs(configs).await?;
+        validated.reload_files = dependencies;
+        tokio::task::spawn_blocking(move || {
+            if validated.catalog.is_some() {
+                crate::control::validation::validate_resources(&validated)?;
+            }
+            Ok((validated, snapshot))
+        })
+        .await
+        .map_err(io::Error::other)?
     }
     .await
     .map_err(|error: io::Error| {
