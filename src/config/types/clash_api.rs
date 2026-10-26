@@ -13,6 +13,7 @@ pub struct ClashApiConfig {
     pub secret: String,
     pub cors_origins: Vec<String>,
     pub allow_private_network: bool,
+    pub connection_notes: bool,
 }
 
 impl fmt::Debug for ClashApiConfig {
@@ -22,6 +23,7 @@ impl fmt::Debug for ClashApiConfig {
             .field("secret", &"[redacted]")
             .field("cors_origins", &self.cors_origins)
             .field("allow_private_network", &self.allow_private_network)
+            .field("connection_notes", &self.connection_notes)
             .finish()
     }
 }
@@ -40,6 +42,8 @@ impl<'de> Deserialize<'de> for ClashApiConfig {
             cors_origins: Vec<String>,
             #[serde(default)]
             allow_private_network: bool,
+            #[serde(default)]
+            connection_notes: bool,
         }
 
         let value = serde_yaml::Value::deserialize(deserializer)?;
@@ -100,6 +104,7 @@ impl<'de> Deserialize<'de> for ClashApiConfig {
             secret: fields.secret,
             cors_origins: fields.cors_origins,
             allow_private_network: fields.allow_private_network,
+            connection_notes: fields.connection_notes,
         })
     }
 }
@@ -123,6 +128,9 @@ impl Serialize for ClashApiConfig {
         }
         if self.allow_private_network {
             map.serialize_entry("allow_private_network", &true)?;
+        }
+        if self.connection_notes {
+            map.serialize_entry("connection_notes", &true)?;
         }
         map.end()
     }
@@ -179,6 +187,27 @@ impl ControlConfig {
 mod tests {
     use super::*;
     use crate::config::{Config, create_server_configs};
+
+    #[test]
+    fn connection_notes_opt_in_roundtrips_and_defaults_off() {
+        let base = "clash_api_address: '127.0.0.1:9090'\nsecret: test";
+        let disabled: ClashApiConfig = serde_yaml::from_str(base).unwrap();
+        assert!(!disabled.connection_notes);
+        assert!(
+            !serde_yaml::to_string(&disabled)
+                .unwrap()
+                .contains("connection_notes")
+        );
+        let enabled: ClashApiConfig =
+            serde_yaml::from_str(&format!("{base}\nconnection_notes: true")).unwrap();
+        assert!(enabled.connection_notes);
+        assert_eq!(
+            serde_yaml::from_str::<ClashApiConfig>(&serde_yaml::to_string(&enabled).unwrap())
+                .unwrap(),
+            enabled
+        );
+        assert_ne!(disabled, enabled);
+    }
 
     #[test]
     fn flat_clash_api_entries_share_one_control_config() {

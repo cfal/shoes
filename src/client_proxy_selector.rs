@@ -14,6 +14,8 @@ use std::sync::Arc;
 use crate::address::NetLocationMask;
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::client_proxy_chain::ClientChainGroup;
+use crate::control::connection_notes::{ConnectionNotes, Phase};
+use crate::control::flows::FlowRegistry;
 use crate::dns::fake_ip::FakeDnsContext;
 use crate::resolver::{Resolver, resolve_location};
 #[cfg(test)]
@@ -229,6 +231,7 @@ pub struct ClientProxySelector {
     has_hostname_rules: bool,
     sniff_enabled: bool,
     tracks_flows: bool,
+    notes_registry: Option<Arc<FlowRegistry>>,
     fake_dns: Option<Arc<FakeDnsContext>>,
 }
 
@@ -319,6 +322,16 @@ impl ClientProxySelector {
             ConnectAction::Allow { chain_group, .. } => chain_group.tracks_flows(),
             ConnectAction::Block => false,
         });
+        let notes_registry = rules.iter().find_map(|rule| match &rule.action {
+            ConnectAction::Allow { chain_group, .. } => {
+                let (_, context) = chain_group.tracking()?;
+                context
+                    .registry
+                    .notes_enabled()
+                    .then(|| context.registry.clone())
+            }
+            ConnectAction::Block => None,
+        });
         let has_hostname_rules = rules
             .iter()
             .any(|rule| rule.predicate.dependencies.hostname);
@@ -329,6 +342,7 @@ impl ClientProxySelector {
             has_hostname_rules,
             sniff_enabled: false,
             tracks_flows,
+            notes_registry,
             fake_dns: None,
         }
     }
@@ -340,6 +354,10 @@ impl ClientProxySelector {
 
     pub(crate) fn tracks_flows(&self) -> bool {
         self.tracks_flows
+    }
+
+    pub(crate) fn start_notes(&self) -> Option<Arc<ConnectionNotes>> {
+        self.notes_registry.as_ref()?.start_notes()
     }
 
     pub(crate) fn inherit_inbound_policy(mut self, parent: &Self) -> std::io::Result<Self> {
@@ -461,6 +479,51 @@ impl ClientProxySelector {
             wire_destination: target.wire_destination,
             decision,
         })
+    }
+
+    pub(crate) async fn judge_prepared_with_notes<'a>(
+        &'a self,
+        target: PreparedDestination,
+        hostname: Option<&str>,
+        resolver: &Arc<dyn Resolver>,
+        notes: Option<&ConnectionNotes>,
+    ) -> std::io::Result<RoutedDestination<'a>> {
+        if let Some(notes) = notes {
+            notes.event(
+                Phase::Routing,
+                format_args!(
+                    "target {}; fake-ip {}",
+                    target.connection_target.location(),
+                    target.is_fake_dns()
+                ),
+            );
+            if let Some(hostname) = hostname {
+                notes.event(Phase::Routing, format_args!("sniff hint {hostname}"));
+            }
+        }
+        let routed = self.judge_prepared(target, hostname, resolver).await?;
+        if let Some(notes) = notes
+            && let ConnectDecision::Allow {
+                chain_group,
+                remote_location,
+            } = &routed.decision
+        {
+            if let Some((description, _)) = chain_group.tracking() {
+                notes.event(
+                    Phase::Routing,
+                    format_args!("selected rule: {}", description.payload),
+                );
+            }
+            notes.event(
+                Phase::Routing,
+                format_args!(
+                    "effective target {}; pinned {:?}",
+                    remote_location.location(),
+                    remote_location.resolved_addr()
+                ),
+            );
+        }
+        Ok(routed)
     }
 
     /// Judge a connection request, using the cache for faster repeated lookups.
