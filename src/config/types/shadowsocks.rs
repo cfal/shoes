@@ -54,8 +54,8 @@ impl ShadowsocksConfig {
                 "Shadowsocks 2022 identity keys require an AES-GCM cipher",
             ));
         }
-        let mut parts = password.rsplit(':');
-        let mut config = Self::from_fields(cipher, parts.next().unwrap())?;
+        let mut parts = password.split(':');
+        let mut config = Self::from_fields(cipher, parts.next_back().unwrap())?;
         let Self::Aead2022 { identity_keys, .. } = &mut config else {
             unreachable!()
         };
@@ -72,8 +72,7 @@ impl ShadowsocksConfig {
                     .into_boxed_slice(),
             );
         }
-        identity_keys.reverse();
-        config.validate_key_len()?;
+        config.validate_keys()?;
         Ok(config)
     }
 
@@ -97,7 +96,7 @@ impl ShadowsocksConfig {
                     key_bytes: key_bytes.into_boxed_slice(),
                     identity_keys: Vec::new(),
                 };
-                config.validate_key_len()?;
+                config.validate_keys()?;
                 Ok(config)
             }
             None => {
@@ -110,39 +109,33 @@ impl ShadowsocksConfig {
         }
     }
 
-    pub(crate) fn validate_key_len(&self) -> std::io::Result<()> {
-        if let Self::Aead2022 {
+    pub(crate) fn validate_keys(&self) -> std::io::Result<()> {
+        let Self::Aead2022 {
             cipher,
             key_bytes,
             identity_keys,
         } = self
-        {
-            if key_bytes.len() != cipher.key_len()
-                || identity_keys
-                    .iter()
-                    .any(|key| key.len() != cipher.key_len())
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "Shadowsocks 2022 keys must each decode to exactly {} bytes",
-                        cipher.key_len()
-                    ),
-                ));
-            }
-            if !identity_keys.is_empty() && !matches!(cipher.name(), "aes-128-gcm" | "aes-256-gcm")
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Shadowsocks 2022 identity keys require an AES-GCM cipher",
-                ));
-            }
+        else {
+            return Ok(());
+        };
+        let key_len = cipher.key_len();
+        if key_bytes.len() != key_len || identity_keys.iter().any(|key| key.len() != key_len) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Shadowsocks 2022 keys must each decode to exactly {key_len} bytes"),
+            ));
+        }
+        if !identity_keys.is_empty() && !matches!(cipher.name(), "aes-128-gcm" | "aes-256-gcm") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Shadowsocks 2022 identity keys require an AES-GCM cipher",
+            ));
         }
         Ok(())
     }
 
     pub(crate) fn validate_server_key(&self) -> std::io::Result<()> {
-        self.validate_key_len()?;
+        self.validate_keys()?;
         if matches!(self, Self::Aead2022 { identity_keys, .. } if !identity_keys.is_empty()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -248,16 +241,9 @@ mod tests {
                 assert_eq!(key_bytes, keys.last().unwrap());
                 assert_eq!(identity_keys, &keys[..keys.len() - 1]);
                 assert_eq!(serde_json::to_value(&client).unwrap(), input);
-                assert_eq!(
-                    serde_json::to_value(
-                        serde_yaml::from_str::<ClientProxyConfig>(
-                            &serde_yaml::to_string(&client).unwrap()
-                        )
-                        .unwrap()
-                    )
-                    .unwrap(),
-                    input
-                );
+                let yaml = serde_yaml::to_string(&client).unwrap();
+                let from_yaml: ClientProxyConfig = serde_yaml::from_str(&yaml).unwrap();
+                assert_eq!(serde_json::to_value(from_yaml).unwrap(), input);
                 assert_eq!(
                     serde_json::from_value::<ServerProxyConfig>(input).is_ok(),
                     count == 1
@@ -312,6 +298,45 @@ mod tests {
         });
         let client: ClientProxyConfig = serde_json::from_value(input.clone()).unwrap();
         assert_eq!(serde_json::to_value(client).unwrap(), input);
+    }
+
+    #[test]
+    fn client_identity_key_errors_preserve_precedence() {
+        for (cipher, len) in [
+            ("2022-blake3-aes-128-gcm", 16),
+            ("2022-blake3-aes-256-gcm", 32),
+        ] {
+            let valid = BASE64.encode(vec![0x42; len]);
+            let short = BASE64.encode(vec![0x42; len - 1]);
+            for user_key in ["not-base64!", "", short.as_str()] {
+                let expected = ShadowsocksConfig::from_fields(cipher, user_key).unwrap_err();
+                let password = format!("not-base64!:{user_key}");
+                let error = ShadowsocksConfig::from_client_fields(cipher, &password).unwrap_err();
+                assert_eq!(error.kind(), expected.kind());
+                assert_eq!(error.to_string(), expected.to_string());
+            }
+            for identities in [
+                format!("not-base64!:{short}"),
+                format!("{short}:not-base64!"),
+            ] {
+                let password = format!("{identities}:{valid}");
+                let error = ShadowsocksConfig::from_client_fields(cipher, &password).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(
+                    error.to_string(),
+                    "Invalid base64 Shadowsocks 2022 identity key"
+                );
+            }
+        }
+        for cipher in ["2022-blake3-chacha20-poly1305", "2022-blake3-unknown"] {
+            let error =
+                ShadowsocksConfig::from_client_fields(cipher, "invalid:invalid").unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "Shadowsocks 2022 identity keys require an AES-GCM cipher"
+            );
+        }
     }
 
     #[test]

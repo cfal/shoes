@@ -861,7 +861,7 @@ impl ShadowsocksStream {
                 Ok(handled_len)
             }
             ShadowsocksStreamType::AEAD2022Client => {
-                let mut request_header = allocate_vec(1 + 8 + 2);
+                let mut request_header = [0; 1 + 8 + 2];
                 let buf_len = buf.len();
                 let base_cache_len = self.stream_type.max_payload_len() + METADATA_SIZE;
                 // The complete address/padding header must fit before any handshake bytes are queued.
@@ -894,8 +894,7 @@ impl ShadowsocksStream {
                 // HeaderTypeClientStream = 0
                 request_header[0] = 0;
                 request_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
-                request_header[9] = (buf_len >> 8) as u8;
-                request_header[10] = (buf_len & 0xff) as u8;
+                request_header[9..11].copy_from_slice(&(buf_len as u16).to_be_bytes());
 
                 self.encrypt_single(&request_header, false)
                     .map_err(|_| std::io::Error::other("failed to encrypt response header"))?;

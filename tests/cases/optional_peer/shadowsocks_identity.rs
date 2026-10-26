@@ -29,7 +29,7 @@ fn keys(size: usize) -> [String; 3] {
     [0x11, 0x22, 0x33].map(|byte| BASE64_STANDARD.encode(vec![byte; size]))
 }
 
-fn client(port: u16, server: u16, method: &str, password: &str) -> Value {
+fn client_config(port: u16, server: u16, method: &str, password: &str) -> Value {
     support::relay_config(
         port,
         server,
@@ -120,7 +120,8 @@ async fn xray_single_key_multiuser_and_ordered_identity_relay() -> TestResult {
             ] {
                 eprintln!("{method}: {label}");
                 let (_, entry) = ports.get_localhost_listener_port();
-                let _shoes = start_shoes_server(&serde_yaml::to_string(&vec![client(entry, server, method, &password)])?)?;
+                let config = [client_config(entry, server, method, &password)];
+                let _shoes = start_shoes_server(&serde_yaml::to_string(&config)?)?;
                 ports.wait_for_all_ports().await?;
                 check_tcp(entry, Shutdown::BeforeReply).await?;
             }
@@ -137,7 +138,8 @@ async fn xray_single_key_multiuser_and_ordered_identity_relay() -> TestResult {
                 eprintln!("{method}: rejects {label}");
                 let target = TcpListener::bind("0.0.0.0:0").await?;
                 let (_, entry) = ports.get_localhost_listener_port();
-                let _shoes = start_shoes_server(&serde_yaml::to_string(&vec![client(entry, server, method, &password)])?)?;
+                let config = [client_config(entry, server, method, &password)];
+                let _shoes = start_shoes_server(&serde_yaml::to_string(&config)?)?;
                 ports.wait_for_all_ports().await?;
                 let attempt = async {
                     let mut stream = support::connect(entry, &format!("127.0.0.1:{}", target.local_addr()?.port())).await?;
@@ -172,14 +174,16 @@ async fn shadowsocks_rust_multiuser_both_aes_ciphers() -> TestResult {
                     {"name": "second-user", "password": second_user}], "mode": "tcp_only"
             }], "runtime": {"mode": "single_thread"}});
             let mut file = tempfile::NamedTempFile::new()?;
-            file.write_all(config.to_string().as_bytes())?;
+            serde_json::to_writer(&mut file, &config)?;
             file.flush()?;
             let binary = std::env::var_os("SHOES_TEST_SSSERVER_BIN").unwrap_or_else(|| "ssserver".into());
-            let _peer = ProcessGuard::new(Command::new(binary).arg("-c").arg(file.path()).spawn()?, "ssserver");
-            let _shoes = start_shoes_server(&serde_yaml::to_string(&vec![
-                client(entry, server, method, &format!("{server_key}:{user_key}")),
-                client(second_entry, server, method, &format!("{server_key}:{second_user}")),
-            ])?)?;
+            let process = Command::new(binary).arg("-c").arg(file.path()).spawn()?;
+            let _peer = ProcessGuard::new(process, "ssserver");
+            let configs = [
+                client_config(entry, server, method, &format!("{server_key}:{user_key}")),
+                client_config(second_entry, server, method, &format!("{server_key}:{second_user}")),
+            ];
+            let _shoes = start_shoes_server(&serde_yaml::to_string(&configs)?)?;
             ports.wait_for_all_ports().await?;
             tokio::try_join!(
                 check_tcp(entry, Shutdown::BeforeReply),
@@ -217,7 +221,8 @@ async fn check_singbox_tcp_and_udp(through_http: bool) -> TestResult {
                 })
                 .to_string(),
             )?;
-            let mut config = client(entry, server, method, &format!("{server_key}:{user_key}"));
+            let mut config =
+                client_config(entry, server, method, &format!("{server_key}:{user_key}"));
             config["protocol"] = json!({"type": "mixed", "udp_enabled": true});
             config["rules"][0]["client_chain"][0]["protocol"]["udp_enabled"] = true.into();
             let mut configs = Vec::new();
@@ -226,15 +231,13 @@ async fn check_singbox_tcp_and_udp(through_http: bool) -> TestResult {
                 configs.push(
                     json!({"address": format!("0.0.0.0:{hop}"), "protocol": {"type": "http"}}),
                 );
-                config["rules"][0]["client_chain"]
-                    .as_array_mut()
-                    .unwrap()
-                    .insert(
-                        0,
-                        json!({
-                            "address": format!("127.0.0.1:{hop}"), "protocol": {"type": "http"}
-                        }),
-                    );
+                let chain = config["rules"][0]["client_chain"].as_array_mut().unwrap();
+                chain.insert(
+                    0,
+                    json!({
+                        "address": format!("127.0.0.1:{hop}"), "protocol": {"type": "http"}
+                    }),
+                );
             }
             configs.push(config);
             let _shoes = start_shoes_server(&serde_yaml::to_string(&configs)?)?;

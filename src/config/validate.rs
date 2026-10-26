@@ -1434,7 +1434,7 @@ fn validate_client_proxy_config(
     default_sni: Option<&str>,
 ) -> std::io::Result<()> {
     match client_proxy_config {
-        ClientProxyConfig::Shadowsocks { config, .. } => config.validate_key_len()?,
+        ClientProxyConfig::Shadowsocks { config, .. } => config.validate_keys()?,
         ClientProxyConfig::Vmess {
             user_id, cipher, ..
         } => {
