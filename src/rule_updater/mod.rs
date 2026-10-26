@@ -45,14 +45,7 @@ pub(crate) async fn update_direct(paths: &[String]) -> io::Result<()> {
     let directory =
         crate::rule_set::cache_directory(&configs)?.expect("remote namespace validated");
     let _lease = tokio::task::spawn_blocking(move || {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
-            Ok(()) => {
-                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
+        install::create_cache_directory(&directory)?;
         cache_lease(&directory)
     })
     .await

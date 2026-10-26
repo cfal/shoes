@@ -6,7 +6,7 @@ use std::fs::{File, Metadata};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -19,6 +19,30 @@ pub(crate) fn cache_file(path: &Path) -> io::Result<File> {
     let file = open_at(&directory, &c_name(&name)?, libc::O_RDONLY)?;
     check_file(&file.metadata()?, false)?;
     Ok(file)
+}
+
+pub(super) fn create_cache_directory(directory: &Path) -> io::Result<()> {
+    (|| {
+        match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+            Ok(()) => {
+                let metadata = directory.symlink_metadata()?;
+                if !metadata.is_dir() || metadata.mode() & 0o700 != 0o700 {
+                    return Err(invalid(
+                        "new directory lacks owner access or was replaced; create it with install -d -m 700 before updating rules",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    })()
+    .map_err(|error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("rule_cache_dir {}: {error}", directory.display()),
+        )
+    })
 }
 
 pub(crate) fn cache_lease(directory: &Path) -> io::Result<File> {
@@ -468,6 +492,30 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn cache_directory_creation_preserves_existing_modes_and_contextualizes_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let missing = root.join("missing/cache");
+        let error = create_cache_directory(&missing).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("rule_cache_dir"), "{error}");
+        assert!(
+            error.to_string().contains(missing.to_str().unwrap()),
+            "{error}"
+        );
+
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o500)).unwrap();
+        create_cache_directory(&target).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        create_cache_directory(&alias).unwrap();
+        assert!(cache_lease(&alias).is_err());
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o500);
+    }
 
     #[test]
     fn cache_lease_errors_identify_the_root_and_owner_conflict() {

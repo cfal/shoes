@@ -2269,6 +2269,10 @@ does not validate the whole configuration or promise rollback. Run `shoes check`
 afterward before restarting. Neither `--dry-run` nor `--no-reload` can be combined
 with this command.
 
+Directory creation respects the process umask and never repairs permissions.
+If the umask removes owner access, create the directory explicitly with
+`install -d -m 700 cache` before running the update command.
+
 The process refreshes due sources serially, with 10% jitter and capped exponential
 failure backoff. Downloaded files pass Shoes' actual decoders, compilation budgets,
 and validation against the active configuration snapshot before atomic replacement.

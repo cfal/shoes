@@ -247,8 +247,27 @@ async fn explicit_update_overrides_routing_and_respects_root_ownership() {
 }
 
 #[tokio::test]
-async fn explicit_update_creates_private_root_under_restrictive_umasks() {
+async fn restrictive_umasks_require_explicit_cache_directory_setup() {
     use std::os::unix::process::CommandExt;
+
+    async fn masked_update(path: &Path, mask: libc::mode_t) -> std::process::Output {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_shoes"));
+            command
+                .args(["-t", "1", "update-rules", "--direct"])
+                .arg(path);
+            unsafe {
+                command.pre_exec(move || {
+                    libc::umask(mask);
+                    Ok(())
+                });
+            }
+            command.output().unwrap()
+        })
+        .await
+        .unwrap()
+    }
 
     for mask in [0o200, 0o400, 0o600, 0o777] {
         let dir = directory();
@@ -264,22 +283,26 @@ async fn explicit_update_creates_private_root_under_restrictive_umasks() {
             &format!("http://{}/rules.json", listener.local_addr().unwrap()),
             "7d",
         );
-        let update = tokio::task::spawn_blocking(move || {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_shoes"));
-            command
-                .args(["-t", "1", "update-rules", "--direct"])
-                .arg(path);
-            unsafe {
-                command.pre_exec(move || {
-                    libc::umask(mask);
-                    Ok(())
-                });
-            }
-            command.output().unwrap()
-        });
+        let output = masked_update(&path, mask).await;
+        let mode = std::fs::metadata(&root).unwrap().mode() & 0o777;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("rule_cache_dir") && error.contains("install -d -m 700"),
+            "{error}"
+        );
+        assert_eq!(u64::from(mode), 0o700 & !u64::from(mask));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+
+        let update = masked_update(&path, mask);
         let fixture = async { respond(request(&listener).await, MISS).await };
         let (output, ()) = tokio::join!(update, fixture);
-        let output = output.unwrap();
         assert!(
             output.status.success(),
             "umask {mask:o}: {}",
@@ -287,12 +310,7 @@ async fn explicit_update_creates_private_root_under_restrictive_umasks() {
         );
         assert_eq!(std::fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
         assert_eq!(std::fs::read(root.join("rules.json")).unwrap(), MISS);
-        assert!(
-            command(&dir.path().join("config.yaml"), &["--dry-run"])
-                .await
-                .status
-                .success()
-        );
+        assert!(command(&path, &["--dry-run"]).await.status.success());
     }
 }
 
