@@ -8,11 +8,17 @@ const MAX_INPUT: usize = 4096;
 const BUDGET: usize = 72 * 1024 * 1024;
 const SEED: u64 = 0x726c_7365_745f_3234;
 
-fn load(path: &Path, bytes: &[u8], format: Format) -> std::io::Result<Vec<Outcome>> {
-    load_with_budget(path, bytes, format, BUDGET)
+fn rule_source(path: &Path, format: Format) -> RuleSource {
+    RuleSource {
+        path: path.to_owned(),
+        format: Some(format),
+        behavior: (format == Format::MihomoText).then_some(Behavior::Domain),
+        code: None,
+        attributes: vec![],
+    }
 }
 
-fn load_with_budget(
+fn load_outcomes(
     path: &Path,
     bytes: &[u8],
     format: Format,
@@ -23,22 +29,12 @@ fn load_with_budget(
     let mut compiler = Compiler::default();
     // Use the public accounting API to cap decoding, inflation and compilation.
     compiler.charge(512 * 1024 * 1024 - budget, 0).unwrap();
-    let predicate = load_source(
-        &RuleSource {
-            path: path.to_owned(),
-            format: Some(format),
-            behavior: (format == Format::MihomoText).then_some(Behavior::Domain),
-            code: None,
-            attributes: vec![],
-        },
-        &mut compiler,
-    )?;
+    let predicate = load_source(&rule_source(path, format), &mut compiler)?;
+    let address = "192.0.2.1".parse().unwrap();
     Ok(["exact.example", "a.suffix.example", "miss.invalid"]
         .into_iter()
         .flat_map(|name| {
-            [80, 443, 8443].map(|port| {
-                predicate.evaluate(Some(name), Some("192.0.2.1".parse().unwrap()), port)
-            })
+            [80, 443, 8443].map(|port| predicate.evaluate(Some(name), Some(address), port))
         })
         .collect())
 }
@@ -68,11 +64,17 @@ fn bounded_rule_mutations_are_deterministic_and_do_not_panic() {
             include_bytes!("fixtures/rule_sets/mihomo-domain.txt").as_slice(),
         ),
     ];
+    let comparable = |result: std::io::Result<Vec<Outcome>>| {
+        result.map_err(|error| (error.kind(), error.to_string()))
+    };
     let mut state = SEED;
     let mut cases = 0;
     for (format, seed) in seeds {
         // Ensure the reserved budget still reaches successful parsing, not just rejection.
-        assert!(load(&path, seed, format).is_ok(), "seed {format:?}");
+        assert!(
+            load_outcomes(&path, seed, format, BUDGET).is_ok(),
+            "seed {format:?}"
+        );
         for case in 0..96 {
             let mut bytes = seed.to_vec();
             let index = random(&mut state) % bytes.len();
@@ -82,12 +84,9 @@ fn bounded_rule_mutations_are_deterministic_and_do_not_panic() {
                 2 => bytes.insert(index, random(&mut state) as u8),
                 _ => bytes.extend_from_slice(&[0xff, 0, b'{', b']']),
             }
-            let fingerprint = |result: std::io::Result<Vec<Outcome>>| {
-                result.map_err(|error| (error.kind(), error.to_string()))
-            };
             assert_eq!(
-                fingerprint(load(&path, &bytes, format)),
-                fingerprint(load(&path, &bytes, format)),
+                comparable(load_outcomes(&path, &bytes, format, BUDGET)),
+                comparable(load_outcomes(&path, &bytes, format, BUDGET)),
                 "seed={SEED:#x}, format={format:?}, case={case}, bytes={bytes:?}"
             );
             cases += 1;
@@ -107,7 +106,7 @@ fn bounded_compressed_expansion_rejects_before_full_inflation() {
         encoder.write_all(&[0; 4096]).unwrap();
     }
     let bytes = encoder.finish().unwrap();
-    let error = load_with_budget(&path, &bytes, Format::Srs, 4 * 1024 * 1024).unwrap_err();
+    let error = load_outcomes(&path, &bytes, Format::Srs, 4 * 1024 * 1024).unwrap_err();
     assert!(error.to_string().contains("budget"), "{error}");
 }
 
@@ -124,22 +123,12 @@ fn generated_domain_rules_agree_for_shared_normalized_subset() {
         let json = serde_json::json!({"version": 2, "rules": [{"domain": names}]});
         let parse = |bytes: &[u8], format| {
             std::fs::write(&path, bytes).unwrap();
-            load_source(
-                &RuleSource {
-                    path: path.clone(),
-                    format: Some(format),
-                    behavior: (format == Format::MihomoText).then_some(Behavior::Domain),
-                    code: None,
-                    attributes: vec![],
-                },
-                &mut Compiler::default(),
-            )
-            .unwrap()
+            load_source(&rule_source(&path, format), &mut Compiler::default()).unwrap()
         };
-        let a = parse(json.to_string().as_bytes(), Format::SingboxJson);
+        let json_rules = parse(json.to_string().as_bytes(), Format::SingboxJson);
         // Sing-box literals preserve upstream case semantics; only Mihomo folds
         // pattern case. Compare the intentionally shared normalized subset.
-        let b = parse(variants.join("\n").as_bytes(), Format::MihomoText);
+        let text_rules = parse(variants.join("\n").as_bytes(), Format::MihomoText);
         for i in 0..=count {
             let expected = if i < count {
                 Outcome::Match
@@ -148,8 +137,8 @@ fn generated_domain_rules_agree_for_shared_normalized_subset() {
             };
             for query in [format!("h{i}.example"), format!("H{i}.EXAMPLE.")] {
                 let name = shoes::rules::domain::normalize(&query).unwrap();
-                assert_eq!(a.evaluate(Some(&name), None, 443), expected);
-                assert_eq!(b.evaluate(Some(&name), None, 443), expected);
+                assert_eq!(json_rules.evaluate(Some(&name), None, 443), expected);
+                assert_eq!(text_rules.evaluate(Some(&name), None, 443), expected);
             }
         }
     }
