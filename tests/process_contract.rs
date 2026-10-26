@@ -33,6 +33,9 @@ mod rule_sets;
 #[path = "cases/process_contract/clash_api.rs"]
 mod clash_api;
 
+#[path = "cases/process_contract/config_tooling.rs"]
+mod config_tooling;
+
 #[cfg(unix)]
 #[path = "cases/process_contract/certificates.rs"]
 mod certificates;
@@ -452,7 +455,7 @@ fn vless_wrong_side_credentials_fail_check_and_startup() {
     use serde_json::json;
     let directory = tempfile::Builder::new()
         .prefix("vless-wrong-side-")
-        .tempdir_in(std::env::var_os("HOME").unwrap())
+        .tempdir()
         .unwrap();
     for server in [false, true] {
         let address = available_address();
