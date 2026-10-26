@@ -309,6 +309,17 @@ async fn rejected_candidate_and_recovery_watches_exclude_managed_caches() {
         std::slice::from_ref(&cache),
         Some(&root),
     );
+    // FSEvents can deliver fixture-creation events after watch registration.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        std::fs::write(&config, "ready").unwrap();
+        changes.recv().await.unwrap();
+        while tokio::time::timeout(Duration::from_millis(100), watches.changed(&mut changes))
+            .await
+            .is_ok()
+        {}
+    })
+    .await
+    .unwrap();
     std::fs::write(&cache, "new").unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(250), watches.changed(&mut changes))
