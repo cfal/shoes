@@ -2237,7 +2237,7 @@ regular, singly linked, not group- or world-writable, and have no setuid, setgid
 or sticky mode bits. Symlinks in any path component
 and `..` traversal are rejected. `owner.lock`, `.shoes-update.lock`, and
 `.shoes-update.tmp` sidecars are reserved. The daemon holds an exclusive directory
-lease; another daemon or update command cannot use the same directory concurrently.
+lease; another daemon cannot use the same directory concurrently.
 Identical declarations sharing a cache are deduplicated;
 conflicting declarations are rejected. Local-only file sources are unchanged.
 
@@ -2247,31 +2247,46 @@ are supported; DAT still needs explicit format/code, and Mihomo YAML/text needs
 behavior. Invalid decoding never retries a different format.
 
 `update_interval` defaults to `24h`; use a positive integer with `s`, `m`, `h`, or
-`d`, from `1s` through `365d`. Startup, reload, `check`, and `--dry-run` never fetch
-rules. Missing, invalid, or empty required caches fail validation; a rejected
-reload retains the running generation. Bootstrap or update caches explicitly,
-with the owning Shoes process stopped:
+`d`, from `1s` through `365d`. Daemon startup and reload fetch required **missing**
+caches using their configured download routes before preparing candidate listeners.
+Existing files are never replaced by bootstrap: invalid or empty caches fail
+validation. Repair them externally, or remove them and restart/reload to fetch
+again. Unsafe ownership, permissions, and symlinks are hard errors, not reasons
+to download. `check` and `--dry-run` stay strictly offline: no fetching, directory
+creation, leases, or installation. They fail for missing or invalid caches; run
+the daemon to populate missing files.
 
-```sh
-shoes update-rules --direct config.yaml
-shoes check config.yaml
-shoes config.yaml
-```
+Missing-cache bootstrap supports built-in `direct`, inline TCP proxy chains and
+pools, and normal outbound TLS settings with inline, named, or file-backed PEMs.
+Its `bootstrap_url` must be `system` or a literal-IP `udp://`, `tcp://`, `tls://`,
+or `https://` DNS URL. Target and proxy hostnames use that resolver. Every pool
+member must be supported. User-defined named client groups (including ordinary
+round-robin groups), selectors, URL-test groups, named DNS groups, WireGuard,
+QUIC proxy transports, and H3 DNS are unsupported for bootstrap. A DNS group
+named `system` is still a named group, not the built-in resolver. No failed or
+unsupported route falls back to direct TCP or system DNS. Literal bootstrap DNS
+URLs keep their existing direct routing semantics; OS VPN/TUN routing still applies.
 
-The required `--direct` flag overrides every declared download route with direct
-TCP and system DNS for this command only. It does not bypass OS VPN/TUN routing.
-Named groups, selectors, proxy PEMs, and listeners are not prepared. If direct
-access is unsuitable, populate the files externally instead. The command creates
-the final cache directory if missing, preflights namespace conflicts, then fetches,
-decoder-validates, and atomically installs one file at a time. It can replace valid
-caches. On failure it exits nonzero; earlier successful replacements remain. It
-does not validate the whole configuration or promise rollback. Run `shoes check`
-afterward before restarting. Neither `--dry-run` nor `--no-reload` can be combined
-with this command.
+These restrictions apply only when a cache is missing. With usable caches,
+startup accepts the normal refresh routes, including dynamic client and named DNS
+groups. Populate such caches externally, or bootstrap with a supported route
+before switching to a runtime-dependent route. Bootstrap must not depend on this
+instance's own listeners; indirect dependencies can fail at the download deadline.
+Candidate and retained Fake-IP ranges remain excluded from download destinations,
+proxy hops, and bootstrap DNS.
 
-Directory creation respects the process umask and never repairs permissions.
-If the umask removes owner access, create the directory explicitly with
-`install -d -m 700 cache` before running the update command.
+Startup creates the final cache directory if missing, then acquires its lease.
+The parent directory must already exist. Creation respects the process umask and
+never repairs permissions. If owner access is missing, create the directory with
+`install -d -m 700 cache` before starting. Reload reuses the lease and does not
+recreate a removed root.
+
+Declarations and all required bootstrap routes are preflighted before fetching.
+Files are downloaded, decoder-validated, and atomically installed serially, then
+the complete configuration is compiled normally. A failed startup exits before
+serving; a failed reload retains the active generation. Earlier completed installs
+remain if a later download, configuration check, or activation fails. This is a
+per-file repair, not a multi-file disk transaction or a promise of activation.
 
 The process refreshes due sources serially, with 10% jitter and capped exponential
 failure backoff. Downloaded files pass Shoes' actual decoders, compilation budgets,
@@ -2773,7 +2788,6 @@ OPTIONS:
 
 COMMANDS:
   check <config.yaml>                           Alias for --dry-run
-  update-rules --direct <config.yaml>           Update managed rule caches while Shoes is stopped
   version                                      Alias for --version
   generate-reality-keypair                       Generate Reality X25519 keypair
   generate-reality-mldsa65-keypair                Generate optional Reality ML-DSA-65 keys
