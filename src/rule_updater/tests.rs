@@ -1446,7 +1446,7 @@ async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
         "https://example.com/second.json",
         &dir.path().join("second.json"),
     );
-    write_rule(&first.path, b"invalid old cache");
+    write_rule(&first.path, b"SRS invalid old cache");
     write_rule(&second.path, OLD);
     let mut install = Install::open(&first.path).unwrap();
     install.file.write_all(VALID).unwrap();
@@ -1482,7 +1482,10 @@ async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
         .collect();
     assert!(Arc::ptr_eq(predicates[0], predicates[1]));
     assert!(!Arc::ptr_eq(predicates[0], predicates[2]));
-    assert_eq!(std::fs::read(&first.path).unwrap(), b"invalid old cache");
+    assert_eq!(
+        std::fs::read(&first.path).unwrap(),
+        b"SRS invalid old cache"
+    );
 
     std::fs::remove_file(&second.path).unwrap();
     let error = validate_staged(config, &first.path, &staged.install)
