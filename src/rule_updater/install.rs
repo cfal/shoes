@@ -6,8 +6,13 @@ use std::fs::{File, Metadata};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const DIRECTORY_SEARCH: i32 = libc::O_PATH;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const DIRECTORY_SEARCH: i32 = libc::O_RDONLY;
 
 pub(crate) fn cache_file(path: &Path) -> io::Result<File> {
     let (directory, name) = checked_path(path)?;
@@ -339,15 +344,31 @@ fn checked_path(path: &Path) -> io::Result<(File, std::ffi::OsString)> {
         return Err(invalid("updater sidecar suffixes are reserved"));
     }
     let parent = path.parent().unwrap();
-    let mut directory = File::open("/")?;
-    for component in parent.components() {
-        if let Component::Normal(name) = component {
-            directory = open_at(
-                &directory,
-                &c_name(name)?,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-            )?;
-        }
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            libc::O_DIRECTORY
+                | if parent == Path::new("/") {
+                    libc::O_RDONLY
+                } else {
+                    DIRECTORY_SEARCH
+                },
+        )
+        .open("/")?;
+    let mut components = parent
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .peekable();
+    while let Some(name) = components.next() {
+        let flags = if components.peek().is_some() {
+            DIRECTORY_SEARCH
+        } else {
+            libc::O_RDONLY
+        };
+        directory = open_at(&directory, &c_name(name)?, flags | libc::O_DIRECTORY)?;
     }
     check_directory(&directory.metadata()?)?;
     Ok((directory, path.file_name().unwrap().to_os_string()))
@@ -421,6 +442,40 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn execute_only_ancestors_allow_cache_reads_and_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ancestor = dir.path().join("search-only");
+        let parent = ancestor.join("private");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(
+                File::open(&ancestor).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        let path = parent.join("rules.json");
+        let result = (|| -> io::Result<()> {
+            for bytes in [b"first".as_slice(), b"second"] {
+                let mut install = Install::open(&path)?;
+                install.file.write_all(bytes)?;
+                assert_eq!(install.finish(blake3::hash(bytes))?, Outcome::Updated);
+                let mut contents = Vec::new();
+                cache_file(&path)?.read_to_end(&mut contents)?;
+                assert_eq!(contents, bytes);
+            }
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&ancestor, &alias)?;
+            assert!(cache_file(&alias.join("private/rules.json")).is_err());
+            Ok(())
+        })();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+    }
 
     #[test]
     fn new_sidecars_are_private_and_usable_under_restrictive_umasks() {
