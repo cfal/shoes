@@ -22,30 +22,35 @@ pub(crate) fn cache_file(path: &Path) -> io::Result<File> {
 }
 
 pub(crate) fn cache_lease(directory: &Path) -> io::Result<File> {
-    let (directory, name) = checked_path(&directory.join("owner.lock"))?;
-    let name = c_name(&name)?;
-    let file = match open_at(
-        &directory,
-        &name,
-        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-    ) {
-        Ok(file) => {
-            check_file(&file.metadata()?, true)?;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            file
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            open_at(&directory, &name, libc::O_RDWR)?
-        }
-        Err(error) => return Err(error),
-    };
-    check_file(&file.metadata()?, true)?;
-    file.try_lock().map_err(|_| {
-        invalid(
-            "rule_cache_dir is already owned; stop its Shoes process before running update-rules",
+    (|| {
+        let (directory, name) = checked_path(&directory.join("owner.lock"))?;
+        let name = c_name(&name)?;
+        let file = match open_at(
+            &directory,
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        ) {
+            Ok(file) => {
+                check_file(&file.metadata()?, true)?;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                file
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                open_at(&directory, &name, libc::O_RDWR)?
+            }
+            Err(error) => return Err(error),
+        };
+        check_file(&file.metadata()?, true)?;
+        file.try_lock()
+            .map_err(|_| invalid("already owned by another Shoes process or updater"))?;
+        Ok(file)
+    })()
+    .map_err(|error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("rule_cache_dir {}: {error}", directory.display()),
         )
-    })?;
-    Ok(file)
+    })
 }
 
 pub(super) struct Install {
@@ -463,6 +468,34 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn cache_lease_errors_identify_the_root_and_owner_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("cache");
+        let error = cache_lease(&root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("rule_cache_dir"), "{error}");
+        assert!(
+            error.to_string().contains(root.to_str().unwrap()),
+            "{error}"
+        );
+
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _lease = cache_lease(&root).unwrap();
+        let error = cache_lease(&root).unwrap_err();
+        assert!(
+            error.to_string().contains(root.to_str().unwrap()),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("already owned by another Shoes process or updater"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn sidecar_names_are_reserved_case_insensitively() {
