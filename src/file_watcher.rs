@@ -77,7 +77,9 @@ fn register_paths(
 ) -> io::Result<()> {
     for directory in directories {
         if let Err(error) = register(directory) {
-            let error = reject_stream_failure(error)?;
+            if is_stream_failure(&error) {
+                return Err(io::Error::other(error));
+            }
             if required_directories.contains(directory) {
                 if !matches!(&error.kind, notify::ErrorKind::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
                 {
@@ -97,7 +99,9 @@ fn register_paths(
     }
     for file in direct_files {
         if let Err(error) = register(file) {
-            let error = reject_stream_failure(error)?;
+            if is_stream_failure(&error) {
+                return Err(io::Error::other(error));
+            }
             let missing = match &error.kind {
                 notify::ErrorKind::PathNotFound => true,
                 notify::ErrorKind::Io(error) => error.kind() == io::ErrorKind::NotFound,
@@ -111,9 +115,12 @@ fn register_paths(
     Ok(())
 }
 
-fn reject_stream_failure(error: notify::Error) -> io::Result<notify::Error> {
+fn is_stream_failure(error: &notify::Error) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
     // FSEvents restarts the entire stream for each path; a failed restart loses all watches.
-    let stream_failure = match &error.kind {
+    match &error.kind {
         notify::ErrorKind::Generic(_) => true,
         notify::ErrorKind::Io(error) => !matches!(
             error.kind(),
@@ -122,11 +129,7 @@ fn reject_stream_failure(error: notify::Error) -> io::Result<notify::Error> {
                 | io::ErrorKind::NotADirectory
         ),
         _ => false,
-    };
-    if cfg!(target_os = "macos") && stream_failure {
-        return Err(io::Error::other(error));
     }
-    Ok(error)
 }
 
 fn watch_directory(path: &Path) -> PathBuf {
@@ -253,11 +256,12 @@ mod tests {
         let file = directory.join("config.yaml");
         register_paths(
             |path| {
-                Err(notify::Error::io(io::Error::from(if path == file {
+                let kind = if path == file {
                     io::ErrorKind::NotFound
                 } else {
                     io::ErrorKind::PermissionDenied
-                })))
+                };
+                Err(notify::Error::io(kind.into()))
             },
             &HashSet::from([directory.clone()]),
             &HashSet::from([directory]),

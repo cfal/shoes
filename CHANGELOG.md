@@ -4,7 +4,7 @@
 
 - Fixed REALITY connection failures with camouflage targets that use a minimal 28-byte EncryptedExtensions record, including VLESS with Vision. The rustls fork now omits the SNI acknowledgement only for REALITY; ordinary TLS and strict target-record capacity checks are unchanged.
 - Updated dependency security fixes, including ctutils 0.4.6 for constant-time mask/comparison code generation (RUSTSEC-2026-0385). Bundled Web PKI roots 1.0.11 additionally remove `emSign Root CA - C1` and `emSign ECC Root CA - C3`; affected servers need an unaffected certificate chain. ICU 2.4 updates Unicode-domain normalization data to Unicode 18/CLDR 49.
-- Updated notify to 8.2.1 and propagate macOS watcher stream-restart failures rather than installing a watcher with no active stream. Initial config-watch failure now fails startup; `--no-reload` disables automatic config watching but not live certificate rotation. Failed config watcher replacement retains the previous watcher; certificate sources retain their reconciliation/retry behavior.
+- Updated notify to 8.2.1 and propagate macOS watcher stream-restart failures rather than installing a watcher with no active stream. These failures abort initial config-watcher construction and startup; later failed replacements retain the previous watcher, including when discovering dependencies during startup. `--no-reload` disables automatic config watching but not live certificate rotation; certificate sources retain their reconciliation/retry behavior.
 
 ## v0.3.5
 
