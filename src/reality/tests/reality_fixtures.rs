@@ -123,7 +123,8 @@ pub(in crate::reality) fn separate_target_records(
 ) -> Vec<Bytes> {
     let mut records = target_records(group, cipher, session);
     records.truncate(2);
-    for payload_len in [32, 4096, 128, 96] {
+    // Empty EncryptedExtensions needs exactly 23 bytes including the content type and AEAD tag.
+    for payload_len in [23, 4096, 128, 96] {
         let mut record = write_record_header(23, payload_len);
         record.resize(5 + payload_len as usize, 0);
         records.push(record.into());

@@ -2465,7 +2465,7 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.46"
-source = "git+https://github.com/cfal/rustls?rev=d17d0fc304c03fe6e2c96ade6cd39c33b951c3af#d17d0fc304c03fe6e2c96ade6cd39c33b951c3af"
+source = "git+https://github.com/cfal/rustls?rev=f1a23c187330386e9e7f14a21dbae368034dc430#f1a23c187330386e9e7f14a21dbae368034dc430"
 dependencies = [
  "aws-lc-rs",
  "log",

@@ -241,6 +241,24 @@ fn mutate_record(
 }
 
 #[test]
+fn minimal_encrypted_extensions_are_empty_and_complete_handshake() {
+    let secrets = Arc::new(Secrets::default());
+    let (mut client, mut server, flight) = pending_pair(secrets.clone(), false);
+    client.feed(&flight[..2].concat()).unwrap();
+    assert_eq!(flight[2].len(), 28);
+    let secret = secrets.0.lock()["SERVER_HANDSHAKE_TRAFFIC_SECRET"].clone();
+    let unchanged = mutate_record(&flight[2], &secret, 0, |plaintext| {
+        assert_eq!(plaintext.as_slice(), &[8, 0, 0, 2, 0, 0, 22]);
+    });
+    assert_eq!(unchanged, flight[2]);
+    client.feed(&flight[2..].concat()).unwrap();
+    let mut finished = Vec::new();
+    client.write_tls(&mut finished).unwrap();
+    server.feed(&finished).unwrap();
+    assert!(!client.is_handshaking() && !server.is_handshaking());
+}
+
+#[test]
 fn authenticated_unadvertised_ed25519_and_key_updates() {
     let (mut client, mut server, flight) = pending_pair(Arc::default(), true);
     client.feed(&flight.concat()).unwrap();
@@ -492,6 +510,7 @@ fn rejected_templates_never_queue_synthetic_output() {
         "type",
         "length",
         "short",
+        "short-extensions",
         "extra",
         "session",
         "unknown-extension",
@@ -521,6 +540,12 @@ fn rejected_templates_never_queue_synthetic_output() {
                     23, 3, 3, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 ]);
                 Some((3, 5))
+            }
+            "short-extensions" => {
+                let mut record = write_record_header(23, 22);
+                record.resize(27, 0);
+                target[2] = record.into();
+                None
             }
             "extra" => {
                 target.extend([target[5].clone(), target[5].clone()]);

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed REALITY connection failures with camouflage targets that use a minimal 28-byte EncryptedExtensions record, including VLESS with Vision. The rustls fork now omits the SNI acknowledgement only for REALITY; ordinary TLS and strict target-record capacity checks are unchanged.
+
 ## v0.3.5
 
 - Breaking: named PEM entries, `tcp_settings`, and DNS server option objects (inline or in DNS groups, including non-system upstreams) now reject unknown fields instead of silently ignoring them. Named PEMs accept only `pem` and exactly one of `path` or `data`; `tcp_settings` accepts only `no_delay`. Remove unsupported or misspelled keys before upgrading, or configuration loading will fail.
