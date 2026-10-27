@@ -39,7 +39,7 @@ jobs:
         components: llvm-tools-preview
     - uses: actions/setup-node@v7
       with:
-        node-version: '24'
+        node-version: '26'
         package-manager-cache: false
     - name: Report parser and zero-test guard regressions
       run: node --test benches/*.test.mjs scripts/coverage-lines.test.mjs scripts/require-tests.test.mjs
@@ -76,7 +76,7 @@ jobs:
         node benches/run_advisory.mjs "$binary" "$CARGO_TARGET_DIR/release/shoes" performance-evidence
     - name: Retain raw runs, provenance, skipped scopes and reports
       if: always()
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: verification-${{ inputs.suite }}-${{ github.sha }}
         if-no-files-found: error
