@@ -66,7 +66,7 @@ For advanced access control (IP allowlist/blocklists), see [tobaru](https://gith
 
 ## Installation
 
-Building Shoes requires Rust 1.95 or newer. Unix WireGuard builds include
+Building Shoes requires Rust 1.99.1 or newer. Unix WireGuard builds include
 MPL-2.0-covered GotaTun code; binary and library distributors must retain
 [the dependency notices and corresponding source information](THIRD_PARTY_NOTICES.md).
 See [dependency maintenance](DEPENDENCIES.md) for protected forks, update

@@ -1,9 +1,10 @@
 # Dependency Maintenance
 
 Refresh registry dependencies and maintained build tools without changing peer
-fixtures or the supported Rust/platform floors. Use targeted Cargo updates and
-inspect source changes as well as versions. Existing wildcard requirements are
-intentional; narrower requirements must be reconsidered when upstream advances.
+fixtures. Change supported Rust/platform floors only when explicitly requested.
+Use targeted Cargo updates and inspect source changes as well as versions.
+Existing wildcard requirements are intentional; narrower requirements must be
+reconsidered when upstream advances.
 Regenerate [dependency notices](THIRD_PARTY_NOTICES.md) after lockfile changes.
 
 ## Protected Sources
@@ -68,7 +69,7 @@ pulls unmaintained unsafe-libyaml; replacing the configuration parser is a
 separate compatibility change, not an available version bump.
 
 Build tools use cargo-about 0.9.3, cargo-ndk 4.1.2, cross 0.2.5, Node 26 and
-the Rust 1.99.1 Docker builder. The Rust minimum remains 1.95, checked separately
+the Rust 1.99.1 Docker builder. The Rust minimum is now 1.99.1, checked separately
 in CI, and the Docker runtime remains Bookworm. Go 1.27.3, cbindgen 0.29.4 and
 cargo-llvm-cov 0.9.1 were already current. Keep peer hashes, frozen Shoes
 baselines, fixture-generation provenance and historical benchmark evidence
