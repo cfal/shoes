@@ -1,11 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.3.6
 
 - Fixed REALITY connection failures with camouflage targets that use a minimal 28-byte EncryptedExtensions record, including VLESS with Vision. The rustls fork now omits the SNI acknowledgement only for REALITY; ordinary TLS and strict target-record capacity checks are unchanged.
 - Building from source now requires Rust 1.99.1 or newer.
-- Updated dependency security fixes, including ctutils 0.4.6 for constant-time mask/comparison code generation (RUSTSEC-2026-0385). Bundled Web PKI roots 1.0.11 additionally remove `emSign Root CA - C1` and `emSign ECC Root CA - C3`; affected servers need an unaffected certificate chain. ICU 2.4 updates Unicode-domain normalization data to Unicode 18/CLDR 49.
-- Updated notify to 8.2.1 and propagate macOS watcher stream-restart failures rather than installing a watcher with no active stream. These failures abort initial config-watcher construction and startup; later failed replacements retain the previous watcher, including when discovering dependencies during startup. `--no-reload` disables automatic config watching but not live certificate rotation; certificate sources retain their reconciliation/retry behavior.
+- Updated dependencies with security fixes, including ctutils 0.4.6 for constant-time mask/comparison code generation (RUSTSEC-2026-0385). Bundled Web PKI roots 1.0.11 additionally remove `emSign Root CA - C1` and `emSign ECC Root CA - C3`; affected servers need an unaffected certificate chain. ICU 2.4 updates Unicode-domain normalization data to Unicode 18/CLDR 49.
+- Updated notify to 8.2.1 and propagated macOS watcher stream-restart failures rather than installing a watcher with no active stream. These failures abort initial config-watcher construction and startup; later failed replacements retain the previous watcher, including when discovering dependencies during startup. `--no-reload` disables automatic config watching but not live certificate rotation; certificate sources retain their reconciliation/retry behavior.
+
+This release is distributed through GitHub Releases and GHCR, not crates.io; `cargo install shoes` still installs the previously published crates.io version. Six Linux/macOS tarballs include `THIRD_PARTY_NOTICES.md` and `licenses/`, which distributors must retain along with the corresponding source information. Container images support `linux/amd64` and `linux/arm64`; native mobile interfaces remain source-built, with no AAR or XCFramework archives.
 
 ## v0.3.5
 
