@@ -7,10 +7,10 @@ The release tarballs include this bundle and the additional GotaTun and
 anytls-rs notices below. Applications embedding Shoes' native libraries must
 also distribute these notices and corresponding source information.
 
-Regenerate the bundle after changing Cargo.lock, using cargo-about 0.9.2:
+Regenerate the bundle after changing Cargo.lock, using cargo-about 0.9.3:
 
 ```sh
-cargo install --locked cargo-about@0.9.2
+cargo install --locked --features cli cargo-about@0.9.3
 python3 scripts/generate-release-notices.py
 cargo fetch --locked
 python3 scripts/test-release-notices.py

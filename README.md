@@ -66,9 +66,11 @@ For advanced access control (IP allowlist/blocklists), see [tobaru](https://gith
 
 ## Installation
 
-Building Shoes requires Rust 1.95 or newer. Unix WireGuard builds include
+Building Shoes requires Rust 1.99.1 or newer. Unix WireGuard builds include
 MPL-2.0-covered GotaTun code; binary and library distributors must retain
 [the dependency notices and corresponding source information](THIRD_PARTY_NOTICES.md).
+See [dependency maintenance](DEPENDENCIES.md) for protected forks, update
+constraints and required integration checks.
 
 Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
 
@@ -126,7 +128,7 @@ This repository does not ship Kotlin wrappers, AARs, or XCFrameworks. Applicatio
 own their platform glue and packaging, including Android `VpnService` or iOS
 Network Extension setup.
 
-For Android, install `cargo-ndk`, set `ANDROID_NDK_HOME` to an installed Android
+For Android, install `cargo-ndk` 4.1.2, set `ANDROID_NDK_HOME` to an installed Android
 NDK, and build the native libraries:
 
 ```sh

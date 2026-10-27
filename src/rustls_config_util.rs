@@ -384,6 +384,30 @@ mod material_tests {
     use super::*;
     use std::io::{Read, Write};
 
+    #[test]
+    fn bundled_roots_exclude_removed_emsign_anchors() {
+        use x509_parser::prelude::{FromDer, X509Name};
+
+        let subjects = get_root_cert_store().subjects();
+        assert!(!subjects.is_empty());
+        for subject in subjects {
+            let (remaining, name) = X509Name::from_der(subject.as_ref()).unwrap();
+            assert!(remaining.is_empty());
+            for common_name in name.iter_common_name() {
+                let common_name = common_name.as_str().unwrap();
+                assert!(
+                    ![
+                        "emSign Root CA - C1",
+                        "emSign ECC Root CA - C3",
+                        "emSign ECC Root CA - G3",
+                    ]
+                    .contains(&common_name),
+                    "removed trust anchor: {common_name}"
+                );
+            }
+        }
+    }
+
     fn resumption_configs() -> (Arc<rustls::ClientConfig>, rustls::ServerConfig) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let server = try_create_server_config(

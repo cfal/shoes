@@ -32,7 +32,7 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - uses: taiki-e/install-action@v2
       with:
-        tool: cargo-about@0.9.2
+        tool: cargo-about@0.9.3
     - name: Verify generated dependency licenses and artifact checks
       run: |
         python3 scripts/generate-release-notices.py
@@ -167,7 +167,7 @@ jobs:
     - uses: actions/checkout@v7
     - uses: actions/setup-node@v7
       with:
-        node-version: '24'
+        node-version: '26'
         package-manager-cache: false
     - name: Test benchmark harness and manifests
       run: node --test benches/*.test.mjs scripts/coverage-lines.test.mjs scripts/require-tests.test.mjs
@@ -210,6 +210,10 @@ jobs:
     - name: Run process filesystem watcher unit tests
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --lib process:: -- --test-threads=1
+
+    - name: Run native filesystem watcher regressions
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --lib file_watcher:: -- --test-threads=1
 
   integration-tests:
     name: Integration (${{ matrix.name }})

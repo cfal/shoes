@@ -60,9 +60,27 @@ pub(crate) fn watch<P: AsRef<Path>>(
             _ => {}
         })
         .map_err(io::Error::other)?;
+    register_paths(
+        |path| watcher.watch(path, RecursiveMode::NonRecursive),
+        &directories,
+        &required_directories,
+        &direct_files,
+    )?;
+    Ok(watcher)
+}
+
+fn register_paths(
+    mut register: impl FnMut(&Path) -> notify::Result<()>,
+    directories: &HashSet<PathBuf>,
+    required_directories: &HashSet<PathBuf>,
+    direct_files: &HashSet<PathBuf>,
+) -> io::Result<()> {
     for directory in directories {
-        if let Err(error) = watcher.watch(&directory, RecursiveMode::NonRecursive) {
-            if required_directories.contains(&directory) {
+        if let Err(error) = register(directory) {
+            if is_stream_failure(&error) {
+                return Err(io::Error::other(error));
+            }
+            if required_directories.contains(directory) {
                 if !matches!(&error.kind, notify::ErrorKind::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
                 {
                     return Err(io::Error::other(error));
@@ -80,7 +98,10 @@ pub(crate) fn watch<P: AsRef<Path>>(
         }
     }
     for file in direct_files {
-        if let Err(error) = watcher.watch(&file, RecursiveMode::NonRecursive) {
+        if let Err(error) = register(file) {
+            if is_stream_failure(&error) {
+                return Err(io::Error::other(error));
+            }
             let missing = match &error.kind {
                 notify::ErrorKind::PathNotFound => true,
                 notify::ErrorKind::Io(error) => error.kind() == io::ErrorKind::NotFound,
@@ -91,7 +112,24 @@ pub(crate) fn watch<P: AsRef<Path>>(
             }
         }
     }
-    Ok(watcher)
+    Ok(())
+}
+
+fn is_stream_failure(error: &notify::Error) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    // FSEvents restarts the entire stream for each path; a failed restart loses all watches.
+    match &error.kind {
+        notify::ErrorKind::Generic(_) => true,
+        notify::ErrorKind::Io(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::NotFound
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::NotADirectory
+        ),
+        _ => false,
+    }
 }
 
 fn watch_directory(path: &Path) -> PathBuf {
@@ -167,6 +205,70 @@ pub(crate) async fn debounce(changes: &mut mpsc::Receiver<()>, delay: Duration) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_failure_is_fatal_for_every_registration_kind() {
+        let directory = PathBuf::from("directory");
+        let file = directory.join("config.yaml");
+        let failures: [fn() -> notify::Error; 2] = [
+            || notify::Error::generic("unable to start FSEvent stream"),
+            || notify::Error::io(io::ErrorKind::WouldBlock.into()),
+        ];
+        for failure in failures {
+            for required in [false, true] {
+                let directories = HashSet::from([directory.clone()]);
+                let required_directories = if required {
+                    directories.clone()
+                } else {
+                    HashSet::new()
+                };
+                assert!(
+                    register_paths(
+                        |_| Err(failure()),
+                        &directories,
+                        &required_directories,
+                        &HashSet::new(),
+                    )
+                    .is_err()
+                );
+            }
+            let mut registered = Vec::new();
+            assert!(
+                register_paths(
+                    |path| {
+                        registered.push(path.to_path_buf());
+                        if path == file { Err(failure()) } else { Ok(()) }
+                    },
+                    &HashSet::from([directory.clone()]),
+                    &HashSet::from([directory.clone()]),
+                    &HashSet::from([file.clone()]),
+                )
+                .is_err()
+            );
+            assert_eq!(registered, [directory.clone(), file.clone()]);
+        }
+    }
+
+    #[test]
+    fn path_local_watch_failures_retain_recovery_fallbacks() {
+        let directory = PathBuf::from("directory");
+        let file = directory.join("config.yaml");
+        register_paths(
+            |path| {
+                let kind = if path == file {
+                    io::ErrorKind::NotFound
+                } else {
+                    io::ErrorKind::PermissionDenied
+                };
+                Err(notify::Error::io(kind.into()))
+            },
+            &HashSet::from([directory.clone()]),
+            &HashSet::from([directory]),
+            &HashSet::from([file.clone()]),
+        )
+        .unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn debounce_waits_for_quiet_after_the_last_event() {

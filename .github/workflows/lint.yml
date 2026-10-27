@@ -10,6 +10,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Rust 1.99.1 minimum
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@1.99.1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: msrv-1.99.1
+    - name: Check minimum supported Rust
+      run: cargo check --workspace --all-targets --all-features --locked
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -54,4 +68,4 @@ jobs:
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Run clippy
-      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

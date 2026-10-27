@@ -3,7 +3,7 @@ name = "shoes"
 version = "0.3.5"
 publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.99.1"
 autotests = false
 autobenches = false
 license = "MIT"
@@ -152,7 +152,8 @@ memchr = "*"
 mime_guess = "*"
 ml-kem = { version = "0.3.3", features = ["zeroize"] }
 notify = "*"
-parking_lot = "*"
+# 0.13's futex_time64 probe triggers SIGSYS on 32-bit Android API 26-29.
+parking_lot = "0.12.5"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 quinn-proto = { version = "0.11", default-features = false }

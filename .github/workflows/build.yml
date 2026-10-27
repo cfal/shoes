@@ -85,7 +85,7 @@ jobs:
       - name: Install cross-compilation tool
         if: matrix.use_cross == true
         run: |
-          cargo install cross
+          cargo install --locked cross@0.2.5
 
       - name: Setup cache
         uses: Swatinem/rust-cache@v2
@@ -94,11 +94,11 @@ jobs:
 
       - name: Build binary (using cross)
         if: matrix.use_cross == true
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --locked --release --target ${{ matrix.target }}
 
       - name: Build binary (native)
         if: matrix.use_cross == false
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Verify binary exists
         run: |

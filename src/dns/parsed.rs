@@ -364,6 +364,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn https_dns_unicode_hosts_preserve_idna_and_tls_identity() {
+        use hickory_resolver::proto::rr::Name;
+
+        for hostname in [
+            "b\u{fc}cher.example",
+            "bu\u{308}cher.example",
+            "xn--bcher-kva.example",
+        ] {
+            let url = ParsedDnsUrl::parse(&format!("https://{hostname}/dns-query")).unwrap();
+            assert_eq!(url.hostname(), Some("xn--bcher-kva.example"));
+            assert_eq!(
+                Name::from_utf8(hostname).unwrap().to_ascii(),
+                "xn--bcher-kva.example"
+            );
+            let server = url
+                .to_parsed_server(Some("192.0.2.53".parse().unwrap()))
+                .unwrap();
+            let ParsedDnsServer::Https {
+                server_name, path, ..
+            } = server
+            else {
+                panic!("expected HTTPS DNS");
+            };
+            assert_eq!(&*server_name, "xn--bcher-kva.example");
+            assert_eq!(&*path, "/dns-query");
+        }
+        for hostname in ["\u{200d}.example", "\u{fffd}.example"] {
+            assert!(ParsedDnsUrl::parse(&format!("https://{hostname}/dns-query")).is_err());
+            assert!(Name::from_utf8(hostname).is_err());
+        }
+    }
+
+    #[test]
     fn test_parse_system() {
         let url = ParsedDnsUrl::parse("system").unwrap();
         assert!(matches!(url, ParsedDnsUrl::System));

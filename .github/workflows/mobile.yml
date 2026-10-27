@@ -50,25 +50,15 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
 
-      - name: Install cbindgen
+      - name: Install native build tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cbindgen@0.29.4
+          tool: cbindgen@0.29.4,cargo-ndk@4.1.2
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
           key: android
-
-      - name: Cache cargo-ndk binary
-        uses: actions/cache@v6
-        with:
-          path: ~/.cargo/bin/cargo-ndk
-          key: cargo-ndk-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-ndk-${{ runner.os }}-
-
-      - name: Install cargo-ndk
-        run: command -v cargo-ndk || cargo install cargo-ndk
 
       - name: Set NDK path
         run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
