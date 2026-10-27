@@ -740,8 +740,8 @@ async fn serve_reality_tls_template(
         config.crypto_provider(),
     )
     .map_err(std::io::Error::other)?;
-    // Each record must hold its complete replacement message, including the REALITY certificate.
-    let plan = rustls::reality::FlightPlan::new(&[64, 4096, 128, 96], Some(64))
+    // Uses minimal empty EncryptedExtensions and enough space for the REALITY certificate.
+    let plan = rustls::reality::FlightPlan::new(&[28, 4096, 128, 96], Some(64))
         .map_err(std::io::Error::other)?;
     let mut target = rustls::ServerConnection::new_reality(config, prepared.with_flight_plan(plan))
         .map_err(std::io::Error::other)?;
