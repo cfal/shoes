@@ -10,17 +10,16 @@ pub(crate) struct NetworkSession {
 }
 
 impl NetworkSession {
-    pub(crate) async fn prepare(paths: &[String]) -> io::Result<Self> {
+    pub(crate) async fn prepare(configs: &[crate::config::Config]) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            let configs = crate::config::load_configs(&paths.to_vec()).await?;
-            if let Some(spec) = linux::Spec::from_configs(&configs)? {
+            if let Some(spec) = linux::Spec::from_configs(configs)? {
                 return Ok(Self {
                     session: Some(linux::Session::prepare(spec).await?),
                 });
             }
         }
-        let _ = paths;
+        let _ = configs;
         Ok(Self::default())
     }
 

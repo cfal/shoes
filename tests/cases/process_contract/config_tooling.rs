@@ -219,10 +219,33 @@ fn check_dry_run_does_not_dispatch_cleanup() {
 }
 
 #[cfg(unix)]
+async fn config_pipe_writer(path: &Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(writer) => break writer,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("open configuration pipe: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("configuration reader did not open the pipe")
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn check_dry_run_keeps_default_signal_actions() {
-    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::ExitStatusExt};
-    use std::time::Duration;
+    use std::os::unix::{ffi::OsStrExt, process::ExitStatusExt};
 
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("blocked.yaml");
@@ -240,26 +263,72 @@ async fn check_dry_run_keeps_default_signal_actions() {
             let mut process = super::Process::from_child(child);
             process.wait_for("Starting dry run.").await;
             // Opening the writer proves validation reached the blocking configuration read.
-            let writer = tokio::time::timeout(Duration::from_secs(8), async {
-                loop {
-                    match std::fs::OpenOptions::new()
-                        .write(true)
-                        .custom_flags(libc::O_NONBLOCK)
-                        .open(&path)
-                    {
-                        Ok(writer) => break writer,
-                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                        Err(error) => panic!("open configuration pipe: {error}"),
-                    }
-                }
-            })
-            .await
-            .expect("validation did not open the configuration pipe");
+            let writer = config_pipe_writer(&path).await;
             process.signal(signal);
             assert_eq!(process.exit().await.signal(), Some(signal), "{mode}");
             drop(writer);
         }
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_reads_configuration_once_and_remains_interruptible() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("startup.yaml");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    for signal in [Some(libc::SIGINT), Some(libc::SIGTERM), None] {
+        let mut process = super::Process::start(&path, &["--no-reload"]);
+        let mut writer = config_pipe_writer(&path).await;
+        if let Some(signal) = signal {
+            process.signal(signal);
+            assert!(process.exit().await.success());
+            drop(writer);
+        } else {
+            writer
+                .write_all(b"- address: '127.0.0.1:0'\n  protocol: {type: socks}\n")
+                .unwrap();
+            drop(writer);
+            process.wait_for("Servers ready").await;
+            process.signal(libc::SIGTERM);
+            assert!(process.exit().await.success());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_keeps_configuration_changes_queued_during_initial_read() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("server.yaml");
+    std::fs::write(
+        &config,
+        "- address: '127.0.0.1:0'\n  protocol: {type: socks}\n",
+    )
+    .unwrap();
+    let pipe = directory.path().join("blocked.yaml");
+    let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut process = super::Process::start(&pipe, &[config.to_str().unwrap()]);
+    let mut writer = config_pipe_writer(&pipe).await;
+
+    // The second read holds startup open after the first config has been loaded.
+    std::fs::write(&config, "invalid configuration").unwrap();
+    writer.write_all(b"[]\n").unwrap();
+    let replacement = directory.path().join("replacement.yaml");
+    std::fs::write(&replacement, "[]\n").unwrap();
+    std::fs::rename(&replacement, &pipe).unwrap();
+    drop(writer);
+
+    process.wait_for("Servers ready").await;
+    process.wait_for("Reload rejected").await;
+    process.signal(libc::SIGTERM);
+    assert!(process.exit().await.success());
 }

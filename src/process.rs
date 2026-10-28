@@ -16,11 +16,11 @@ use crate::tcp::tcp_server::TcpListeners;
 
 const RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
-async fn load_validated(
+async fn validate_configs(
     paths: &[String],
+    mut configs: Vec<Config>,
     discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
 ) -> io::Result<ValidatedConfigs> {
-    let mut configs = config::load_configs(&paths.to_vec()).await?;
     async {
         let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
         let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
@@ -66,6 +66,7 @@ struct PreparedServers {
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
     prepare_tracking(
         paths,
+        config::load_configs(&paths.to_vec()).await?,
         previous,
         None,
         &mut |_, _| {},
@@ -77,13 +78,14 @@ async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result
 
 async fn prepare_tracking(
     paths: &[String],
+    configs: Vec<Config>,
     previous: Option<&DnsRegistry>,
     previous_servers: Option<&PreparedServers>,
     discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
     control: &mut Option<crate::control::runtime::ControlService>,
     network: &crate::desktop::NetworkSession,
 ) -> io::Result<PreparedServers> {
-    let mut validated = load_validated(paths, discovered).await?;
+    let mut validated = validate_configs(paths, configs, discovered).await?;
     network.validate(&validated.configs)?;
     for config in &mut validated.configs {
         if let Config::TunServer(tun) = config
@@ -639,13 +641,14 @@ impl ReloadSignal {
 
 pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Result<()> {
     if dry_run {
-        load_validated(&paths, &mut |_, _| {}).await?;
+        let configs = config::load_configs(&paths).await?;
+        validate_configs(&paths, configs, &mut |_, _| {}).await?;
         println!("Configuration valid");
         return Ok(());
     }
     let mut shutdown = ShutdownSignals::new()?;
     let mut reload = ReloadSignal::new()?;
-    let mut network = crate::desktop::NetworkSession::prepare(&paths).await?;
+    let mut network = crate::desktop::NetworkSession::default();
     let mut control = None;
     let mut api = None;
     let result = run_inner(
@@ -686,12 +689,18 @@ async fn run_inner(
 ) -> io::Result<()> {
     let (change_tx, mut changes) = mpsc::channel(1);
     let mut watches = ConfigWatches::new(&paths, change_tx, no_reload)?;
+    let configs = tokio::select! {
+        biased;
+        _ = shutdown.recv() => return Ok(()),
+        result = config::load_configs(&paths) => result?,
+    };
+    *network = crate::desktop::NetworkSession::prepare(&configs).await?;
     let mut discovered =
         |paths: &[PathBuf], recovery: &[PathBuf]| watches.discovered(paths, recovery);
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = prepare_tracking(&paths, None, None, &mut discovered, control, network) => result?,
+        result = prepare_tracking(&paths, configs, None, None, &mut discovered, control, network) => result?,
     };
     network.prepare_network().await?;
     #[cfg(target_os = "linux")]
@@ -779,7 +788,10 @@ async fn run_inner(
                 let _ = running.shutdown_network(&[&prepared], network).await;
                 return Err(error);
             },
-            result = prepare_tracking(&paths, Some(&prepared.dns), Some(&prepared), &mut discovered, control, network) => result,
+            result = async {
+                let configs = config::load_configs(&paths).await?;
+                prepare_tracking(&paths, configs, Some(&prepared.dns), Some(&prepared), &mut discovered, control, network).await
+            } => result,
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
