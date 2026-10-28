@@ -130,7 +130,7 @@ impl Resolved {
         Ok(())
     }
 
-    async fn current(&self, index: u32, property: &str) -> io::Result<Value> {
+    async fn settings(&self, index: u32) -> io::Result<Value> {
         let link = self
             .call(&[
                 "call",
@@ -149,19 +149,37 @@ impl Resolved {
             .and_then(Value::as_str)
             .filter(|path| path.starts_with("/org/freedesktop/resolve1/link/"))
             .ok_or_else(|| io::Error::other("resolved returned an invalid link path"))?;
-        let property = self
+        let properties = self
             .call(&[
-                "get-property",
+                "call",
                 "org.freedesktop.resolve1",
                 path,
+                "org.freedesktop.DBus.Properties",
+                "GetAll",
+                "s",
                 "org.freedesktop.resolve1.Link",
-                property,
             ])
             .await?;
-        property
+        let properties = properties
             .get("data")
-            .cloned()
-            .ok_or_else(|| io::Error::other("resolved returned an invalid property"))
+            .and_then(Value::as_array)
+            .and_then(|data| data.first())
+            .and_then(Value::as_object)
+            .ok_or_else(|| io::Error::other("resolved returned invalid link properties"))?;
+        let mut values = serde_json::Map::new();
+        for property in ["DNS", "Domains", "DefaultRoute"]
+            .into_iter()
+            .chain(LINK_MODES.map(|(_, property)| property))
+        {
+            let value = properties
+                .get(property)
+                .and_then(|value| value.get("data"))
+                .ok_or_else(|| {
+                    io::Error::other(format!("resolved returned no {property} property"))
+                })?;
+            values.insert(property.to_owned(), value.clone());
+        }
+        Ok(Value::Object(values))
     }
 
     async fn owned(handle: &rtnetlink::Handle, record: &Record) -> io::Result<Option<u32>> {
@@ -191,17 +209,6 @@ impl Resolved {
                 })
                 .collect(),
         ))
-    }
-
-    async fn settings(&self, index: u32) -> io::Result<Value> {
-        let mut values = serde_json::Map::new();
-        for property in ["DNS", "Domains", "DefaultRoute"]
-            .into_iter()
-            .chain(LINK_MODES.map(|(_, property)| property))
-        {
-            values.insert(property.to_owned(), self.current(index, property).await?);
-        }
-        Ok(Value::Object(values))
     }
 
     fn expected(record: &Record) -> io::Result<Value> {
