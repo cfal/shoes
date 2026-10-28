@@ -1,0 +1,15 @@
+# cross 0.2.5 images, shared by compilation and packaged-binary smoke tests.
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99"
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:7f8308a8734d9fcd2ebbe9a3e4bdea74af293f0799d80c3cc341e340cda49a4c"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"
+
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf@sha256:4a08bebb60f08d52c1885b643a768f163c7318c05f91cf119f6c02855ea52699"
+
+[target.armv7-unknown-linux-musleabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf@sha256:b4f481f30ceca34730a5723f717396d762d94f6eddd7e1cf7c7862d1377ff98c"

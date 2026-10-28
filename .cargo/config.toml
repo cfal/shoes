@@ -1,3 +1,7 @@
 # Static linking for musl targets
 [target.'cfg(target_env = "musl")']
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.armv7-unknown-linux-musleabihf]
+# GCC-built jemalloc uses __ffsdi2, which Rust's compiler builtins do not supply.
+rustflags = ["-C", "link-arg=-lgcc"]
