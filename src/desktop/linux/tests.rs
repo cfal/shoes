@@ -479,6 +479,35 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
                 true,
             ));
     }
+    if std::env::var_os("SHOES_RESOLVED_FOREIGN").is_some() {
+        assert_ne!(namespace.as_os_str(), std::env::var_os(PARENT).unwrap());
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let mut spec = spec(true);
+                spec.auto_dns = true;
+                let mut session = Session::prepare(spec).await?;
+                assert!(session.resolved.is_none());
+                session.prepare_network().await?;
+                assert_eq!(session.record.ifindex, Some(3));
+                session.activate().await?;
+                assert!(!session.record.dns_pending);
+                session.deactivate().await?;
+                session.record.dns_pending = true;
+                session.journal.save(&session.record)?;
+                let retained = session.ingress().unwrap();
+                drop(session);
+                let error = cleanup().await.unwrap_err();
+                assert!(
+                    error.to_string().contains("different network namespace"),
+                    "{error}"
+                );
+                assert!(Journal::lock()?.load()?.is_some());
+                drop(retained);
+                cleanup().await
+            });
+    }
     if let Some(parent) = std::env::var_os(PARENT) {
         assert_ne!(
             namespace.as_os_str(),
@@ -568,6 +597,7 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
             "--propagation",
             "private",
             "--pid",
+            "--mount-proc",
             "--fork",
             "--kill-child",
             "--",
@@ -871,6 +901,7 @@ async fn kernel_capture() -> io::Result<()> {
                 resolved_integration(limit, redirect).await?;
             }
         }
+        resolved_foreign_namespace().await?;
     }
     drop((tcp_echo, udp_echo));
     Ok(())
@@ -976,6 +1007,85 @@ async fn resolved_fixture() -> io::Result<Vec<tokio::process::Child>> {
     })
     .await?;
     Ok(vec![resolver, bus])
+}
+
+async fn resolved_foreign_namespace() -> io::Result<()> {
+    let native: serde_json::Value =
+        serde_json::from_str(&run("ip", &["-j", "link", "show", "native0"])?)?;
+    assert_eq!(native[0]["ifindex"], 3);
+    for (family, gateway) in [("-4", "192.0.2.1"), ("-6", "fd00:1::1")] {
+        run(
+            "ip",
+            &[
+                "-n", "peer", family, "route", "add", "default", "via", gateway,
+            ],
+        )?;
+    }
+    let link = run(
+        "busctl",
+        &[
+            "--system",
+            "--json=short",
+            "call",
+            "org.freedesktop.resolve1",
+            "/org/freedesktop/resolve1",
+            "org.freedesktop.resolve1.Manager",
+            "GetLink",
+            "i",
+            "3",
+        ],
+    )?;
+    let link: serde_json::Value = serde_json::from_str(&link)?;
+    let path = link["data"][0].as_str().unwrap();
+    run(
+        "busctl",
+        &[
+            "--system",
+            "call",
+            "org.freedesktop.resolve1",
+            "/org/freedesktop/resolve1",
+            "org.freedesktop.resolve1.Manager",
+            "SetLinkLLMNR",
+            "is",
+            "3",
+            "no",
+        ],
+    )?;
+    let settings = || -> io::Result<serde_json::Value> {
+        Ok(serde_json::from_str(&run(
+            "busctl",
+            &[
+                "--system",
+                "--json=short",
+                "call",
+                "org.freedesktop.resolve1",
+                path,
+                "org.freedesktop.DBus.Properties",
+                "GetAll",
+                "s",
+                "org.freedesktop.resolve1.Link",
+            ],
+        )?)?)
+    };
+    let before = settings()?;
+    assert_eq!(before["data"][0]["DNS"]["data"], json!([]));
+    assert_eq!(before["data"][0]["Domains"]["data"], json!([]));
+    let output = tokio::process::Command::new("ip")
+        .args(["netns", "exec", "peer"])
+        .arg(std::env::current_exe()?)
+        .args(KERNEL_TEST_ARGS)
+        .env("SHOES_RESOLVED_FOREIGN", "1")
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(settings()?, before);
+    Ok(())
 }
 
 async fn resolved_integration(udp_limit: usize, redirect: bool) -> io::Result<()> {

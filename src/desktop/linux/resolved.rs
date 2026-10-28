@@ -1,5 +1,6 @@
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 
 use serde_json::{Value, json};
 
@@ -73,6 +74,7 @@ pub(super) async fn ready(record: &Record) -> io::Result<()> {
 pub(super) struct Resolved {
     busctl: String,
     lease: OwnedFd,
+    owner: String,
 }
 
 const LINK_MODES: [(&str, &str); 4] = [
@@ -84,14 +86,66 @@ const LINK_MODES: [(&str, &str); 4] = [
 
 impl Resolved {
     pub(super) async fn preflight(lease: BorrowedFd<'_>) -> io::Result<Self> {
-        let backend = Self {
+        single_pid_namespace("self")?;
+        let bus = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::UnixStream::connect("/run/dbus/system_bus_socket"),
+        )
+        .await??;
+        let pid = bus
+            .peer_cred()?
+            .pid()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| io::Error::other("system bus is outside this PID namespace"))?;
+        // Standard system buses run in their socket listener's PID namespace.
+        single_pid_namespace(&pid.to_string())?;
+        let mut backend = Self {
             busctl: command::executable("busctl")?,
             lease: lease.try_clone_to_owned()?,
+            owner: String::new(),
         };
+        let owner = backend
+            .call(&[
+                "call",
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "GetNameOwner",
+                "s",
+                "org.freedesktop.resolve1",
+            ])
+            .await?;
+        backend.owner = owner["data"][0]
+            .as_str()
+            .filter(|name| name.starts_with(':'))
+            .ok_or_else(|| io::Error::other("resolved returned an invalid bus owner"))?
+            .to_owned();
+        let credentials = backend
+            .call(&[
+                "call",
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "GetConnectionUnixProcessID",
+                "s",
+                &backend.owner,
+            ])
+            .await?;
+        let pid = credentials["data"][0]
+            .as_u64()
+            .filter(|pid| *pid > 0 && *pid <= u32::MAX as u64)
+            .ok_or_else(|| io::Error::other("resolved returned an invalid process ID"))?;
+        let local = std::fs::metadata("/proc/self/net/dev")?;
+        let remote = std::fs::metadata(format!("/proc/{pid}/net/dev"))?;
+        if (local.dev(), local.ino()) != (remote.dev(), remote.ino()) {
+            return Err(io::Error::other(
+                "resolved is in a different network namespace",
+            ));
+        }
         backend
             .call(&[
                 "get-property",
-                "org.freedesktop.resolve1",
+                &backend.owner,
                 "/org/freedesktop/resolve1",
                 "org.freedesktop.resolve1.Manager",
                 "DNS",
@@ -102,7 +156,7 @@ impl Resolved {
 
     async fn call(&self, arguments: &[&str]) -> io::Result<Value> {
         let mut args = vec![
-            "--system",
+            "--address=unix:path=/run/dbus/system_bus_socket",
             "--json=short",
             "--no-pager",
             "--allow-interactive-authorization=no",
@@ -124,7 +178,7 @@ impl Resolved {
     ) -> io::Result<Value> {
         let mut args = vec![
             "call",
-            "org.freedesktop.resolve1",
+            &self.owner,
             "/org/freedesktop/resolve1",
             "org.freedesktop.resolve1.Manager",
             method,
@@ -146,7 +200,7 @@ impl Resolved {
         let properties = self
             .call(&[
                 "call",
-                "org.freedesktop.resolve1",
+                &self.owner,
                 path,
                 "org.freedesktop.DBus.Properties",
                 "GetAll",
@@ -322,4 +376,15 @@ impl Resolved {
             .await?;
         Ok(())
     }
+}
+
+fn single_pid_namespace(pid: &str) -> io::Result<()> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    let ids = status.lines().find_map(|line| line.strip_prefix("NSpid:"));
+    if ids.is_none_or(|ids| ids.split_whitespace().count() != 1) {
+        return Err(io::Error::other(
+            "automatic DNS requires procfs and the system bus in the same PID namespace",
+        ));
+    }
+    Ok(())
 }

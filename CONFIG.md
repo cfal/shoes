@@ -986,7 +986,7 @@ replace its `rules` with the desired proxy policy before using it as a proxy.
 | `route_address` | Captured destination CIDRs; default `[0.0.0.0/0, '::/0']` |
 | `route_exclude_address` | Explicit destination exclusions, including DNS; default empty |
 | `bootstrap_dns` | Required literal real DNS socket addresses, never a loopback stub or TUN subnet |
-| `auto_dns` | Publishes transient systemd-resolved settings on the owned link; default `true` |
+| `auto_dns` | Attempts to publish transient systemd-resolved settings on the owned link; default `true` |
 | `dns_hijack` | Intercepts TCP/UDP port 53; defaults `true` when managed, otherwise follows fake-IP policy |
 | `linux.table` | Private route table; default `12000` |
 | `linux.rule_priority` | Policy rule priority; default `12000` |
@@ -997,7 +997,13 @@ replace its `rules` with the desired proxy policy before using it as a proxy.
 Requirements: Linux, `/dev/net/tun`, trusted system `nft` with JSON support, and
 network-administration privileges. Automatic DNS additionally requires a running
 systemd-resolved, `busctl` with JSON support, and authorization to
-configure the owned link. The supplied service runs as root with a bounded
+configure the owned link. Automatic DNS preparation is best-effort: if the service
+is unavailable or its namespace sanity checks fail, Shoes warns and leaves DNS
+externally managed. Namespace checks assume a standard local system bus whose
+listener and daemon share a PID namespace, with procfs mounted for that namespace;
+resolved must share Shoes' network namespace. Custom bus arrangements should use
+`auto_dns: false`. Restart Shoes after restarting the system bus. The supplied
+service runs as root with a bounded
 capability set. File capabilities on Shoes alone do not grant privileges to
 `nft` children or authorize resolved changes.
 

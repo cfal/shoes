@@ -64,7 +64,15 @@ impl Session {
         }
         routes::preflight(&handle, &spec).await?;
         let resolved = if spec.auto_dns {
-            Some(resolved::Resolved::preflight(journal.lease()).await?)
+            match resolved::Resolved::preflight(journal.lease()).await {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    log::warn!(
+                        "Automatic DNS unavailable; leaving DNS externally managed: {error}"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
