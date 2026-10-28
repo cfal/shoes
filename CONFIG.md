@@ -1021,7 +1021,9 @@ then remains native. This is not an IPv6 blocking policy.
 Loopback, local destinations, multicast, broadcast, link-local destinations,
 and connected networks remain native. DNS to connected networks is intercepted
 unless explicitly excluded. Replies to inbound services remain native. Existing
-tracked native flows remain native; captured flows retain their selection.
+tracked native flows remain native, including unreplied UDP; captured flows retain
+their selection. Traffic excluded from conntrack by foreign NOTRACK rules remains
+native.
 New TCP capture starts only with connection establishment. UDP flows created
 before conntrack was enabled cannot be identified reliably and may reset.
 Applications explicitly bound to a physical device remain native in both modes;

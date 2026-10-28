@@ -172,6 +172,14 @@ pub(super) fn install(
     );
     rule(
         "output",
+        "untracked",
+        vec![
+            matches(ct("state"), "==", json!("untracked")),
+            json!({"return": null}),
+        ],
+    );
+    rule(
+        "output",
         "local",
         vec![
             matches(
@@ -220,6 +228,14 @@ pub(super) fn install(
             matches(masked(ct("mark"), mask), "==", json!(capture)),
             mark(meta("mark"), mask, capture),
             json!({"counter": null}),
+            json!({"return": null}),
+        ],
+    );
+    rule(
+        "select",
+        "confirmed-native-flow",
+        vec![
+            matches(ct("status"), "in", json!("confirmed")),
             json!({"return": null}),
         ],
     );
@@ -283,7 +299,7 @@ pub(super) fn install(
         "capture",
         "untrackable",
         vec![
-            matches(ct("state"), "==", json!({"set": ["invalid", "untracked"]})),
+            matches(ct("state"), "==", json!("invalid")),
             json!({"drop": null}),
         ],
     );

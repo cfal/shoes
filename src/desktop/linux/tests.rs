@@ -683,6 +683,7 @@ async fn kernel_capture() -> io::Result<()> {
             )?;
         }
         native_dns.extend(native_dns_connections().await?);
+        let unreplied = native_unreplied_udp().await?;
         let mut config = serde_json::to_value(configuration(redirect))?;
         config["dns_hijack"] = json!(true);
         config["rules"] = json!([
@@ -734,6 +735,13 @@ async fn kernel_capture() -> io::Result<()> {
         native_services(&session)
             .await
             .map_err(|error| io::Error::other(format!("native services: {error}")))?;
+        for (client, peer) in &unreplied {
+            client.send(b"still-native").await?;
+            let mut bytes = [0; 128];
+            let length =
+                tokio::time::timeout(Duration::from_secs(3), peer.recv(&mut bytes)).await??;
+            assert_eq!(&bytes[..length], b"still-native");
+        }
         device_bound_connections(&session).await.map_err(|error| {
             io::Error::other(format!("device-bound TCP (redirect={redirect}): {error}"))
         })?;
@@ -1451,6 +1459,26 @@ fn in_peer<T: Send + 'static>(
     .unwrap()
 }
 
+async fn native_unreplied_udp() -> io::Result<Vec<(tokio::net::UdpSocket, tokio::net::UdpSocket)>> {
+    let mut connections = Vec::new();
+    for (local, remote) in [("192.0.2.1", "198.51.100.2"), ("fd00:1::1", "fd00:2::2")] {
+        let peer = in_peer(move || {
+            let peer = std::net::UdpSocket::bind((remote, 0))?;
+            peer.set_nonblocking(true)?;
+            Ok(peer)
+        })?;
+        let peer = tokio::net::UdpSocket::from_std(peer)?;
+        let client = tokio::net::UdpSocket::bind((local, 0)).await?;
+        client.connect(peer.local_addr()?).await?;
+        client.send(b"unreplied").await?;
+        let mut bytes = [0; 128];
+        let length = tokio::time::timeout(Duration::from_secs(3), peer.recv(&mut bytes)).await??;
+        assert_eq!(&bytes[..length], b"unreplied");
+        connections.push((client, peer));
+    }
+    Ok(connections)
+}
+
 async fn device_bound_connections(session: &Session) -> io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let before = redirect_counts(session).await?;
@@ -1557,14 +1585,50 @@ async fn native_services(session: &Session) -> io::Result<()> {
         let server = tokio::net::UdpSocket::bind((wildcard, 0)).await?;
         let destination = SocketAddr::new(local, server.local_addr()?.port());
         let mut bytes = [0; 128];
-        peer.send_to(b"inbound", destination).await?;
-        let (length, source) =
-            tokio::time::timeout(Duration::from_secs(3), server.recv_from(&mut bytes)).await??;
-        server.send_to(&bytes[..length], source).await?;
-        let (length, source) =
-            tokio::time::timeout(Duration::from_secs(3), peer.recv_from(&mut bytes)).await??;
-        assert_eq!(source, destination);
-        assert_eq!(&bytes[..length], b"inbound");
+        for untracked in [false, true] {
+            if untracked {
+                run("nft", &["add", "table", "inet", "native_notrack"])?;
+                for (chain, selector) in [("prerouting", "dport"), ("output", "sport")] {
+                    run(
+                        "nft",
+                        &[
+                            "add",
+                            "chain",
+                            "inet",
+                            "native_notrack",
+                            chain,
+                            &format!("{{ type filter hook {chain} priority -300; }}"),
+                        ],
+                    )?;
+                    run(
+                        "nft",
+                        &[
+                            "add",
+                            "rule",
+                            "inet",
+                            "native_notrack",
+                            chain,
+                            "udp",
+                            selector,
+                            &destination.port().to_string(),
+                            "notrack",
+                        ],
+                    )?;
+                }
+            }
+            peer.send_to(b"inbound", destination).await?;
+            let (length, source) =
+                tokio::time::timeout(Duration::from_secs(3), server.recv_from(&mut bytes))
+                    .await??;
+            server.send_to(&bytes[..length], source).await?;
+            let (length, source) =
+                tokio::time::timeout(Duration::from_secs(3), peer.recv_from(&mut bytes)).await??;
+            assert_eq!(source, destination);
+            assert_eq!(&bytes[..length], b"inbound");
+            if untracked {
+                run("nft", &["delete", "table", "inet", "native_notrack"])?;
+            }
+        }
 
         let protected = crate::socket_util::new_udp_socket(local.is_ipv6(), None)?;
         assert_eq!(
