@@ -118,7 +118,7 @@ impl State {
 pub struct FakeIpPool {
     state: Mutex<State>,
     store: Option<SnapshotStore>,
-    pub(super) persistence_admission: std::sync::Arc<tokio::sync::Semaphore>,
+    pub(in crate::dns) persistence_admission: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for FakeIpPool {

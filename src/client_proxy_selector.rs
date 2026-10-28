@@ -16,7 +16,7 @@ use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::control::connection_notes::{ConnectionNotes, Phase};
 use crate::control::flows::FlowRegistry;
-use crate::dns::fake_ip::FakeDnsContext;
+use crate::dns::DnsContext;
 use crate::resolver::{Resolver, resolve_location};
 #[cfg(test)]
 use crate::rules::Compiler;
@@ -232,14 +232,15 @@ pub struct ClientProxySelector {
     sniff_enabled: bool,
     tracks_flows: bool,
     notes_registry: Option<Arc<FlowRegistry>>,
-    fake_dns: Option<Arc<FakeDnsContext>>,
+    fake_dns: Option<Arc<DnsContext>>,
+    dns_interception: Option<Arc<DnsContext>>,
 }
 
 #[derive(Debug)]
 pub(crate) enum IngressTarget {
     LocalDns {
         wire_destination: NetLocation,
-        context: Arc<FakeDnsContext>,
+        context: Arc<DnsContext>,
     },
     Forward(PreparedDestination),
 }
@@ -344,6 +345,7 @@ impl ClientProxySelector {
             tracks_flows,
             notes_registry,
             fake_dns: None,
+            dns_interception: None,
         }
     }
 
@@ -362,13 +364,29 @@ impl ClientProxySelector {
 
     pub(crate) fn inherit_inbound_policy(mut self, parent: &Self) -> std::io::Result<Self> {
         self.sniff_enabled = parent.sniff_enabled;
-        self.with_fake_dns_context(parent.fake_dns.clone())
+        let mut selector = self.with_fake_dns_context(parent.fake_dns.clone())?;
+        selector.dns_interception = parent.dns_interception.clone();
+        Ok(selector)
+    }
+
+    pub(crate) fn with_dns_interception(
+        mut self,
+        resolver: Arc<dyn Resolver>,
+        enabled: bool,
+    ) -> Self {
+        self.dns_interception = enabled.then(|| {
+            self.fake_dns
+                .clone()
+                .unwrap_or_else(|| Arc::new(DnsContext::real(resolver)))
+        });
+        self
     }
 
     pub(crate) fn with_fake_dns_context(
         mut self,
-        context: Option<Arc<FakeDnsContext>>,
+        context: Option<Arc<DnsContext>>,
     ) -> std::io::Result<Self> {
+        self.dns_interception = context.clone();
         self.fake_dns = context;
         for rule in &self.rules {
             if let ConnectAction::Allow {
@@ -411,13 +429,15 @@ impl ClientProxySelector {
                 domain::normalize(hostname)?;
             }
         }
+        if wire_destination.port() == 53
+            && let Some(context) = &self.dns_interception
+        {
+            return Ok(IngressTarget::LocalDns {
+                wire_destination,
+                context: context.clone(),
+            });
+        }
         if let Some(context) = &self.fake_dns {
-            if wire_destination.port() == 53 {
-                return Ok(IngressTarget::LocalDns {
-                    wire_destination,
-                    context: context.clone(),
-                });
-            }
             if let Some(addr) = location.location().to_socket_addr_nonblocking()
                 && let Some(name) = context.restore(addr.ip())?
             {

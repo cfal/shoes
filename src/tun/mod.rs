@@ -442,9 +442,12 @@ async fn run_tun_from_config_inner(
     }
 
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let client_proxy_selector = Arc::new(
-        create_tcp_client_proxy_selector(rules, resolver.clone())?.with_sniff(config.sniff),
-    );
+    let mut selector =
+        create_tcp_client_proxy_selector(rules, resolver.clone())?.with_sniff(config.sniff);
+    if let Some(enabled) = config.dns_hijack {
+        selector = selector.with_dns_interception(resolver.clone(), enabled);
+    }
+    let client_proxy_selector = Arc::new(selector);
 
     run_tun_server_inner(
         tun_server_config,

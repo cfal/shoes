@@ -161,9 +161,8 @@ async fn connection_notes_tcp_udp_setup_and_failures_have_no_history() {
 async fn connection_notes_local_dns_releases_admission_before_routing() {
     use crate::control::connection_notes::MAX_FLOWS;
     let (selector, resolver, registry) = notes_fixture("success");
-    let context = Arc::new(
-        crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone()).unwrap(),
-    );
+    let context =
+        Arc::new(crate::dns::DnsContext::new(Default::default(), resolver.clone()).unwrap());
     let selector = selector.with_fake_dns_context(Some(context)).unwrap();
     let prepared = PreparedTcp::new(
         &selector,
@@ -380,9 +379,8 @@ impl FakeTcpCase {
                 Arc::new(crate::resolver::NativeResolver::new()) as Arc<dyn Resolver>,
             )
         };
-        let context = Arc::new(
-            crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone()).unwrap(),
-        );
+        let context =
+            Arc::new(crate::dns::DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let target = match self {
             Self::Dns => NetLocation::from_str("198.18.0.1:53", None).unwrap(),
             Self::Unknown => NetLocation::from_str("198.18.0.1:443", None).unwrap(),
@@ -425,9 +423,8 @@ impl FakeTcpCase {
 async fn http_host_routes_only_the_original_destination_and_port() {
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     for fake in [false, true] {
-        let context = Arc::new(
-            crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone()).unwrap(),
-        );
+        let context =
+            Arc::new(crate::dns::DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let target = if fake {
             NetLocation::from_ip_addr(context.allocate("restored.example", false).unwrap(), 443)
         } else {
@@ -584,10 +581,10 @@ async fn http_sniff_eligibility_and_misses_keep_ordinary_routing() {
 
 #[tokio::test]
 async fn local_dns_is_ready_without_a_query_and_fake_names_are_probed() {
-    use crate::dns::fake_ip::{FakeDnsContext, FakeIpOptions};
+    use crate::dns::DnsContext;
+    use crate::dns::fake_ip::FakeIpOptions;
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-    let context =
-        Arc::new(FakeDnsContext::new(FakeIpOptions::default(), resolver.clone()).unwrap());
+    let context = Arc::new(DnsContext::new(FakeIpOptions::default(), resolver.clone()).unwrap());
     let selector = ClientProxySelector::new(vec![crate::client_proxy_selector::ConnectRule::new(
         vec![crate::address::NetLocationMask::from("sniff.example").unwrap()],
         crate::client_proxy_selector::ConnectAction::Block,

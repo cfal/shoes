@@ -6,7 +6,8 @@ use std::time::Duration;
 use ipnetwork::IpNetwork;
 use rustc_hash::FxHashMap;
 
-use super::fake_ip::{FakeDnsContext, FakeDnsResolver, FakeIpOptions, FakeIpPool};
+use super::context::{DnsContext, FakeDnsResolver};
+use super::fake_ip::{FakeIpOptions, FakeIpPool};
 use super::real_only;
 use super::system::SystemResolver;
 use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
@@ -20,6 +21,34 @@ use crate::resolver::{
     ResolverFactory, TimeoutResolver,
 };
 use crate::tcp::chain_builder::{build_client_chain_group_with_limits, build_direct_chain_group};
+
+pub(crate) async fn check_interception(
+    configs: &[crate::config::Config],
+    groups: &[ExpandedDnsGroup],
+) -> std::io::Result<()> {
+    for config in configs {
+        let crate::config::Config::TunServer(tun) = config else {
+            continue;
+        };
+        if tun.dns_hijack != Some(true) {
+            continue;
+        }
+        let uses_system = match tun.dns.as_ref().and_then(DnsConfig::resolved_group) {
+            None => true,
+            Some(name) => groups
+                .iter()
+                .find(|group| group.name == name)
+                .is_some_and(|group| {
+                    group.use_default_resolver
+                        || group.specs.iter().any(|spec| spec.url == "system")
+                }),
+        };
+        if uses_system {
+            SystemResolver::check_configuration(Arc::from([])).await?;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct PoolState {
@@ -766,7 +795,7 @@ pub async fn build_dns_registry_for_runtime(
                     pool: pool.clone(),
                 },
             );
-            let context = Arc::new(FakeDnsContext::with_pool(options, real.clone(), pool)?);
+            let context = Arc::new(DnsContext::with_pool(options, real.clone(), pool)?);
             Arc::new(FakeDnsResolver::new(real, context))
         } else {
             if old.is_some() {

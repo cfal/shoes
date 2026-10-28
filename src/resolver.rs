@@ -69,7 +69,7 @@ pub trait Resolver: Send + Sync + Debug {
         Vec::new()
     }
 
-    fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
+    fn fake_dns_context(&self) -> Option<Arc<crate::dns::DnsContext>> {
         None
     }
 
@@ -130,7 +130,7 @@ impl<T: Resolver> Resolver for TimeoutResolver<T> {
         self.inner.manual_selector_paths()
     }
 
-    fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
+    fn fake_dns_context(&self) -> Option<Arc<crate::dns::DnsContext>> {
         self.inner.fake_dns_context()
     }
 

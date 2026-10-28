@@ -161,6 +161,10 @@ fn default_mtu() -> u16 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunConfig {
+    /// Intercepts captured TCP/UDP DNS independently of synthetic addressing.
+    /// Omitted follows the selected fake-IP policy for unmanaged TUNs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_hijack: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "super::common::is_false")]

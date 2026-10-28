@@ -600,9 +600,8 @@ async fn coalesced_connect_dns_pipeline_drains_replies_during_prefix_replay() {
 
     timeout(Duration::from_secs(5), async {
         let resolver: Arc<dyn Resolver> = Arc::new(PendingResolver);
-        let context = Arc::new(
-            crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone()).unwrap(),
-        );
+        let context =
+            Arc::new(crate::dns::DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let selector = Arc::new(
             ClientProxySelector::new(vec![])
                 .with_fake_dns_context(Some(context))

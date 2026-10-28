@@ -1,7 +1,8 @@
 use super::*;
 use crate::address::NetLocationMask;
 use crate::client_proxy_selector::{ConnectAction, ConnectRule};
-use crate::dns::fake_ip::{FakeDnsContext, FakeIpOptions};
+use crate::dns::DnsContext;
+use crate::dns::fake_ip::FakeIpOptions;
 use crate::resolver::{DnsExchangeFuture, ResolveFuture};
 use hickory_resolver::proto::op::{Message, Query, ResponseCode};
 use hickory_resolver::proto::rr::{Name, RecordType};
@@ -75,7 +76,7 @@ impl UdpFixture {
     pub(crate) async fn new(case: UdpCase, tasks: &mut tokio::task::JoinSet<()>) -> Self {
         let dns = case == UdpCase::Dns;
         let resolver: Arc<dyn Resolver> = Arc::new(RealDns);
-        let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+        let context = Arc::new(DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let payload = match case {
             UdpCase::Dns => query(RecordType::A),
             UdpCase::Tls => crate::sniff::tests::hello(&rustls::version::TLS13, true),
@@ -245,7 +246,7 @@ async fn exchange(stream: &mut Box<dyn AsyncMessageStream>, request: &[u8]) -> M
 #[tokio::test]
 async fn local_dns_precedes_blocks_restoration_and_hostname_resolution() {
     let real: Arc<dyn Resolver> = Arc::new(RealDns);
-    let context = Arc::new(FakeDnsContext::new(Default::default(), real.clone()).unwrap());
+    let context = Arc::new(DnsContext::new(Default::default(), real.clone()).unwrap());
     let selector = ClientProxySelector::new(Vec::new())
         .with_fake_dns_context(Some(context))
         .unwrap();
@@ -305,7 +306,7 @@ async fn snell_dns_hostname_replies_are_resolved_before_ip_only_framing() {
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let resolver: Arc<dyn Resolver> = Arc::new(DnsAddress);
-        let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+        let context = Arc::new(DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let selector = Arc::new(
             ClientProxySelector::new(vec![])
                 .with_fake_dns_context(Some(context))
@@ -354,7 +355,7 @@ async fn snell_dns_hostname_replies_are_resolved_before_ip_only_framing() {
 #[tokio::test]
 async fn legacy_replies_preserve_domain_encoded_fake_ips_without_resolution() {
     let real: Arc<dyn Resolver> = Arc::new(RealDns);
-    let context = Arc::new(FakeDnsContext::new(Default::default(), real.clone()).unwrap());
+    let context = Arc::new(DnsContext::new(Default::default(), real.clone()).unwrap());
     let selector = ClientProxySelector::new(vec![ConnectRule::new(
         vec![NetLocationMask::from("encoded.example").unwrap()],
         ConnectAction::new_allow(
@@ -401,7 +402,7 @@ async fn legacy_replies_preserve_domain_encoded_fake_ips_without_resolution() {
 async fn restored_target_is_frozen_and_override_to_53_does_not_reintercept() {
     let real: Arc<dyn Resolver> = Arc::new(RealDns);
     let context = Arc::new(
-        FakeDnsContext::new(
+        DnsContext::new(
             FakeIpOptions {
                 max_entries: 1,
                 ..Default::default()

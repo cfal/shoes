@@ -9,18 +9,25 @@ use hickory_resolver::proto::rr::RecordType;
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::resolver::Resolver;
 
-use super::responder::{UDP_PAYLOAD_LIMIT, response};
-use super::{DnsDecision, FakeDnsResponder, FakeIpOptions, FakeIpPool};
+use super::fake_ip::responder::{UDP_PAYLOAD_LIMIT, precheck, response};
+use super::fake_ip::{DnsDecision, FakeDnsResponder, FakeIpOptions, FakeIpPool};
 
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
-pub struct FakeDnsContext {
-    responder: Arc<FakeDnsResponder>,
+pub struct DnsContext {
+    responder: Option<Arc<FakeDnsResponder>>,
     real: Arc<dyn Resolver>,
 }
 
-impl FakeDnsContext {
+impl DnsContext {
+    pub fn real(real: Arc<dyn Resolver>) -> Self {
+        Self {
+            responder: None,
+            real,
+        }
+    }
+
     #[cfg(test)]
     pub fn new(options: FakeIpOptions, real: Arc<dyn Resolver>) -> io::Result<Self> {
         options.validate()?;
@@ -34,22 +41,26 @@ impl FakeDnsContext {
         pool: Arc<FakeIpPool>,
     ) -> io::Result<Self> {
         Ok(Self {
-            responder: Arc::new(FakeDnsResponder::new(options, pool)?),
+            responder: Some(Arc::new(FakeDnsResponder::new(options, pool)?)),
             real,
         })
     }
 
     pub fn restore(&self, address: IpAddr) -> io::Result<Option<String>> {
-        self.responder.pool.restore(address)
+        self.responder
+            .as_ref()
+            .map_or(Ok(None), |responder| responder.pool.restore(address))
     }
 
     pub fn contains(&self, address: IpAddr) -> bool {
-        self.responder.pool.contains(address)
+        self.responder
+            .as_ref()
+            .is_some_and(|responder| responder.pool.contains(address))
     }
 
     #[cfg(test)]
     pub fn allocate(&self, name: &str, ipv6: bool) -> io::Result<IpAddr> {
-        self.responder.pool.allocate(name, ipv6)
+        self.responder.as_ref().unwrap().pool.allocate(name, ipv6)
     }
 
     pub fn tcp_stream(self: &Arc<Self>) -> Box<dyn AsyncStream> {
@@ -73,8 +84,14 @@ impl FakeDnsContext {
                 request.queries[0].query_type,
                 RecordType::A | RecordType::AAAA
             );
-        let decision = if self.responder.pool.persistent() && may_allocate {
-            let responder = self.responder.clone();
+        let decision = if let Some(decision) = precheck(&request) {
+            decision
+        } else if let Some(responder) = self
+            .responder
+            .as_ref()
+            .filter(|r| r.pool.persistent() && may_allocate)
+        {
+            let responder = responder.clone();
             let request = request.clone();
             let failure = response(&request, ResponseCode::ServFail);
             let decision = async move {
@@ -97,7 +114,9 @@ impl FakeDnsContext {
                 _ => DnsDecision::Answer(failure),
             }
         } else {
-            self.responder.decide(&request)
+            self.responder
+                .as_ref()
+                .map_or(DnsDecision::Forward, |responder| responder.decide(&request))
         };
         let answer = match decision {
             DnsDecision::Drop => return Ok(None),
@@ -171,11 +190,11 @@ impl FakeDnsContext {
 #[derive(Debug)]
 pub struct FakeDnsResolver {
     real: Arc<dyn Resolver>,
-    context: Arc<FakeDnsContext>,
+    context: Arc<DnsContext>,
 }
 
 impl FakeDnsResolver {
-    pub fn new(real: Arc<dyn Resolver>, context: Arc<FakeDnsContext>) -> Self {
+    pub fn new(real: Arc<dyn Resolver>, context: Arc<DnsContext>) -> Self {
         Self { real, context }
     }
 }
@@ -204,7 +223,7 @@ impl Resolver for FakeDnsResolver {
         })
     }
 
-    fn fake_dns_context(&self) -> Option<Arc<FakeDnsContext>> {
+    fn fake_dns_context(&self) -> Option<Arc<DnsContext>> {
         Some(self.context.clone())
     }
 

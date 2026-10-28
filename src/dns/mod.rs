@@ -12,6 +12,7 @@
 
 mod builder;
 mod composite_resolver;
+mod context;
 mod exchange;
 pub mod fake_ip;
 mod guard;
@@ -19,7 +20,11 @@ mod hickory_resolver;
 mod message;
 mod parsed;
 mod proxy_runtime;
+mod stream;
 mod system;
+
+pub(crate) use builder::check_interception;
+pub use context::{DnsContext, FakeDnsResolver};
 
 pub(crate) use guard::{SyntheticDnsAnswer, real_only};
 

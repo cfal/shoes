@@ -1101,6 +1101,21 @@ async fn test_tun_config_parsing() {
     assert!(result.is_ok(), "TUN config validation failed: {:?}", result);
 }
 
+#[test]
+fn tun_dns_interception_override_roundtrips() {
+    for value in [None, Some(false), Some(true)] {
+        let mut yaml = serde_json::json!({"device_fd":42});
+        if let Some(value) = value {
+            yaml["dns_hijack"] = value.into();
+        }
+        let tun: TunConfig = serde_json::from_value(yaml).unwrap();
+        assert_eq!(tun.dns_hijack, value);
+        let restored: TunConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&tun).unwrap()).unwrap();
+        assert_eq!(restored.dns_hijack, value);
+    }
+}
+
 #[tokio::test]
 async fn test_tun_config_with_device_fd() {
     let yaml = r#"
@@ -1151,6 +1166,7 @@ async fn test_tun_config_defaults() {
 async fn test_tun_icmp_requires_tcp() {
     // ICMP requires TCP to be enabled
     let tun_config = TunConfig {
+        dns_hijack: None,
         name: None,
         sniff: false,
         segmentation_offload: None,
