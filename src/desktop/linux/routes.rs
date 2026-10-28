@@ -70,7 +70,7 @@ pub(super) fn owned_link(link: &LinkMessage, index: u32, name: &str, alias: &str
             .contains(&LinkAttribute::IfAlias(alias.to_owned()))
 }
 
-pub(super) fn table(route: &RouteMessage) -> u32 {
+fn table(route: &RouteMessage) -> u32 {
     route
         .attributes
         .iter()
@@ -81,7 +81,7 @@ pub(super) fn table(route: &RouteMessage) -> u32 {
         .unwrap_or(u32::from(route.header.table))
 }
 
-pub(super) async fn dump(handle: &Handle, ipv6: bool) -> io::Result<Vec<RouteMessage>> {
+async fn dump(handle: &Handle, ipv6: bool) -> io::Result<Vec<RouteMessage>> {
     let family = if ipv6 {
         AddressFamily::Inet6
     } else {
@@ -176,18 +176,12 @@ pub(super) async fn preflight(handle: &Handle, spec: &Spec) -> io::Result<()> {
             if route.header.destination_prefix_length == 0 {
                 continue;
             }
-            for attribute in &route.attributes {
-                let destination = match attribute {
-                    RouteAttribute::Destination(RouteAddress::Inet(ip)) => IpAddr::V4(*ip),
-                    RouteAttribute::Destination(RouteAddress::Inet6(ip)) => IpAddr::V6(*ip),
-                    _ => continue,
-                };
-                let existing = IpNetwork::new(destination, route.header.destination_prefix_length)
-                    .map_err(io::Error::other)?;
+            for existing in destinations(route) {
+                let existing = existing?;
                 if spec
                     .addresses
                     .iter()
-                    .any(|owned| owned.contains(destination) || existing.contains(owned.ip()))
+                    .any(|owned| owned.contains(existing.ip()) || existing.contains(owned.ip()))
                 {
                     return Err(invalid(format!(
                         "managed TUN subnet overlaps existing route {existing}"
@@ -256,8 +250,22 @@ fn references_reservation(rule: &RuleMessage, spec: &Spec) -> bool {
         || u32::from(rule.header.table) == spec.linux.table
 }
 
-fn next_hops(route: &RouteMessage) -> impl Iterator<Item = &RouteAttribute> {
-    route.attributes.iter().filter(|attribute| {
+fn destinations(route: &RouteMessage) -> impl Iterator<Item = io::Result<IpNetwork>> + '_ {
+    route.attributes.iter().filter_map(|attribute| {
+        let address = match attribute {
+            RouteAttribute::Destination(RouteAddress::Inet(ip)) => IpAddr::V4(*ip),
+            RouteAttribute::Destination(RouteAddress::Inet6(ip)) => IpAddr::V6(*ip),
+            _ => return None,
+        };
+        Some(
+            IpNetwork::new(address, route.header.destination_prefix_length)
+                .map_err(io::Error::other),
+        )
+    })
+}
+
+fn has_next_hop(route: &RouteMessage) -> bool {
+    route.attributes.iter().any(|attribute| {
         matches!(
             attribute,
             RouteAttribute::Gateway(_)
@@ -558,20 +566,12 @@ pub(super) async fn on_link(handle: &Handle, index: u32) -> io::Result<Vec<IpNet
                 || route.header.kind != RouteType::Unicast
                 || route.header.destination_prefix_length == 0
                 || route.attributes.contains(&RouteAttribute::Oif(index))
-                || next_hops(&route).next().is_some()
+                || has_next_hop(&route)
             {
                 continue;
             }
-            for attribute in &route.attributes {
-                let ip = match attribute {
-                    RouteAttribute::Destination(RouteAddress::Inet(ip)) => IpAddr::V4(*ip),
-                    RouteAttribute::Destination(RouteAddress::Inet6(ip)) => IpAddr::V6(*ip),
-                    _ => continue,
-                };
-                networks.push(
-                    IpNetwork::new(ip, route.header.destination_prefix_length)
-                        .map_err(io::Error::other)?,
-                );
+            for network in destinations(&route) {
+                networks.push(network?);
             }
         }
     }

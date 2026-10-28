@@ -139,8 +139,10 @@ impl Session {
         .await?;
         self.record.ifindex = Some(index);
         self.journal.save(&self.record)?;
-        self.ingress = Some(Arc::new(Ingress::new(&self.record.spec, device)?));
-        self.record.redirect_ports = self.ingress.as_ref().unwrap().ports()?;
+        let ingress = self
+            .ingress
+            .insert(Arc::new(Ingress::new(&self.record.spec, device)?));
+        self.record.redirect_ports = ingress.ports()?;
         self.record.on_link = routes::on_link(&self.handle, index).await?;
         self.journal.save(&self.record)?;
         routes::configure(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
@@ -283,17 +285,7 @@ impl Session {
         if let Err(error) = self.deactivate().await {
             errors.push(error.to_string());
         }
-        if let Err(error) =
-            routes::check_cleanup_routes(&self.handle, &self.record.spec, self.record.ifindex).await
-        {
-            errors.push(error.to_string());
-        }
-        if let Err(error) = routes::remove_rules(&self.handle, &self.record.spec).await {
-            errors.push(error.to_string());
-        }
-        if let Err(error) = remove_link(&self.handle, &self.record).await {
-            errors.push(error.to_string());
-        }
+        remove_routing(&self.handle, &self.record, &mut errors).await;
         self.ingress = None;
         if errors.is_empty() {
             self.journal.clear()?;
@@ -332,17 +324,18 @@ async fn firewall_listing(
         .get("nftables")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| io::Error::other("invalid nft table listing"))?;
+    let name = record.table();
     if !entries.iter().any(|entry| {
         entry
             .get("table")
-            .is_some_and(|table| table["family"] == "inet" && table["name"] == record.table())
+            .is_some_and(|table| table["family"] == "inet" && table["name"] == name)
     }) {
         return Ok(None);
     }
     let bytes = command::run(
         lease,
         executable,
-        &["-j", "list", "table", "inet", &record.table()],
+        &["-j", "list", "table", "inet", &name],
         &[],
     )
     .await?;
@@ -417,6 +410,18 @@ async fn remove_link(handle: &Handle, record: &Record) -> io::Result<()> {
     routes::request(handle.link().del(link.header.index).execute()).await
 }
 
+async fn remove_routing(handle: &Handle, record: &Record, errors: &mut Vec<String>) {
+    if let Err(error) = routes::check_cleanup_routes(handle, &record.spec, record.ifindex).await {
+        errors.push(error.to_string());
+    }
+    if let Err(error) = routes::remove_rules(handle, &record.spec).await {
+        errors.push(error.to_string());
+    }
+    if let Err(error) = remove_link(handle, record).await {
+        errors.push(error.to_string());
+    }
+}
+
 async fn recover(handle: &Handle, nft: &str, journal: &Journal, record: &Record) -> io::Result<()> {
     let mut errors = Vec::new();
     if record.firewall_pending
@@ -434,15 +439,7 @@ async fn recover(handle: &Handle, nft: &str, journal: &Journal, record: &Record)
             Err(error) => errors.push(error.to_string()),
         }
     }
-    if let Err(error) = routes::check_cleanup_routes(handle, &record.spec, record.ifindex).await {
-        errors.push(error.to_string());
-    }
-    if let Err(error) = routes::remove_rules(handle, &record.spec).await {
-        errors.push(error.to_string());
-    }
-    if let Err(error) = remove_link(handle, record).await {
-        errors.push(error.to_string());
-    }
+    remove_routing(handle, record, &mut errors).await;
     failures(errors)?;
     journal.clear()
 }

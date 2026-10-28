@@ -1945,15 +1945,49 @@ async fn route_ownership_failures() -> io::Result<()> {
             )
             .await?;
             assert!(session.reconcile().await.is_err());
+            let family = if ipv6 { "-6" } else { "-4" };
+            run(
+                "ip",
+                &[
+                    family,
+                    "rule",
+                    "add",
+                    "priority",
+                    "12001",
+                    "fwmark",
+                    "0x20000000/0x60000000",
+                    "table",
+                    "12000",
+                ],
+            )?;
+            run(
+                "ip",
+                &[family, "rule", "del", "priority", "12000", "table", "12000"],
+            )?;
+            let expected_errors = concat!(
+                "managed TUN routing table was changed externally; refusing to forget it; ",
+                "managed TUN rule was changed externally; refusing to remove it",
+            );
             if !orphan {
-                assert!(session.close().await.is_err());
+                let retained = session.ingress().unwrap();
+                assert_eq!(
+                    session.close().await.unwrap_err().to_string(),
+                    expected_errors
+                );
+                assert!(routes::link(&session.handle, "shoes0").await?.is_none());
+                assert!(session.ingress.is_none());
                 assert!(session.journal.load()?.is_some());
+                drop(retained);
             }
             drop(session);
-            assert!(cleanup().await.is_err());
+            assert_eq!(cleanup().await.unwrap_err().to_string(), expected_errors);
             assert!(Journal::lock()?.load()?.is_some());
-            let family = if ipv6 { "-6" } else { "-4" };
+            assert!(run("ip", &[family, "rule", "show"])?.contains("12001:"));
             assert!(run("ip", &[family, "route", "show", "table", "12000"])?.contains("native0"));
+            run(
+                "ip",
+                &[family, "rule", "del", "priority", "12001", "table", "12000"],
+            )?;
             run("ip", &[family, "route", "del", "table", "12000", "default"])?;
             cleanup().await?;
             assert!(Journal::lock()?.load()?.is_none());

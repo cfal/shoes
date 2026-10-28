@@ -78,8 +78,9 @@ impl Journal {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(root.join(format!("netns-{namespace}.lock")))?;
-        private(&lock.metadata()?)?;
-        if !lock.metadata()?.is_file() {
+        let metadata = lock.metadata()?;
+        private(&metadata)?;
+        if !metadata.is_file() {
             return Err(io::Error::other("invalid managed TUN lock file"));
         }
         lock.try_lock().map_err(|error| {
