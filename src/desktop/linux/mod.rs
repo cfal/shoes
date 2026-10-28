@@ -189,10 +189,7 @@ impl Session {
             expected_policy(&self.record, &self.record.on_link),
         )
         .await?;
-        let listing = firewall_listing(self.journal.lease(), &self.nft, &self.record)
-            .await?
-            .filter(nft::valid_policy)
-            .ok_or_else(|| io::Error::other("new nft policy could not be read back"))?;
+        let listing = verify_firewall(self.journal.lease(), &self.nft, &self.record).await?;
         self.record.firewall = Some(listing);
         self.journal.save(&self.record)?;
         if let Some(resolved) = &self.resolved {
@@ -286,6 +283,11 @@ impl Session {
         if let Err(error) = self.deactivate().await {
             errors.push(error.to_string());
         }
+        if let Err(error) =
+            routes::check_cleanup_routes(&self.handle, &self.record.spec, self.record.ifindex).await
+        {
+            errors.push(error.to_string());
+        }
         if let Err(error) = routes::remove_rules(&self.handle, &self.record.spec).await {
             errors.push(error.to_string());
         }
@@ -349,20 +351,28 @@ async fn firewall_listing(
     ))
 }
 
-fn matches_policy(listing: &serde_json::Value, record: &Record) -> bool {
-    if let Some(baseline) = &record.firewall {
-        return nft::same_policy(listing, baseline)
-            || record
-                .previous_firewall
-                .as_ref()
-                .is_some_and(|previous| nft::same_policy(listing, previous));
+fn matches_current_policy(listing: &serde_json::Value, record: &Record) -> bool {
+    match &record.firewall {
+        Some(baseline) => nft::same_policy(listing, baseline),
+        None => nft::same_policy(listing, &expected_policy(record, &record.on_link)),
+    }
+}
+
+fn matches_recovery_policy(listing: &serde_json::Value, record: &Record) -> bool {
+    if matches_current_policy(listing, record) {
+        return true;
+    }
+    if record.firewall.is_some() {
+        return record
+            .previous_firewall
+            .as_ref()
+            .is_some_and(|previous| nft::same_policy(listing, previous));
     }
     // A crash before the first readback leaves only the write-ahead policy for conservative recovery.
-    nft::same_policy(listing, &expected_policy(record, &record.on_link))
-        || record
-            .previous_on_link
-            .as_ref()
-            .is_some_and(|networks| nft::same_policy(listing, &expected_policy(record, networks)))
+    record
+        .previous_on_link
+        .as_ref()
+        .is_some_and(|networks| nft::same_policy(listing, &expected_policy(record, networks)))
 }
 
 async fn verify_firewall(
@@ -372,7 +382,7 @@ async fn verify_firewall(
 ) -> io::Result<serde_json::Value> {
     firewall_listing(lease, executable, record)
         .await?
-        .filter(|listing| matches_policy(listing, record))
+        .filter(|listing| matches_current_policy(listing, record))
         .ok_or_else(|| io::Error::other("managed nft policy disappeared or changed externally"))
 }
 
@@ -384,7 +394,7 @@ async fn remove_firewall(
     let Some(listing) = firewall_listing(lease, executable, record).await? else {
         return Ok(());
     };
-    if !matches_policy(&listing, record) {
+    if !matches_recovery_policy(&listing, record) {
         return Err(io::Error::other(
             "refusing to remove an externally changed nft table",
         ));
@@ -423,6 +433,9 @@ async fn recover(handle: &Handle, nft: &str, journal: &Journal, record: &Record)
             }
             Err(error) => errors.push(error.to_string()),
         }
+    }
+    if let Err(error) = routes::check_cleanup_routes(handle, &record.spec, record.ifindex).await {
+        errors.push(error.to_string());
     }
     if let Err(error) = routes::remove_rules(handle, &record.spec).await {
         errors.push(error.to_string());

@@ -7,7 +7,10 @@ use rtnetlink::packet_route::{
     AddressFamily,
     address::{AddressAttribute, AddressFlags, AddressHeaderFlags},
     link::{LinkAttribute, LinkFlags, LinkMessage},
-    route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType},
+    route::{
+        RouteAddress, RouteAttribute, RouteFlags, RouteMessage, RoutePreference, RouteProtocol,
+        RouteScope, RouteType, RouteVia,
+    },
     rule::{RuleAction, RuleAttribute, RuleMessage},
 };
 use rtnetlink::{Handle, IpVersion, LinkUnspec, RouteMessageBuilder};
@@ -79,13 +82,17 @@ pub(super) fn table(route: &RouteMessage) -> u32 {
 }
 
 pub(super) async fn dump(handle: &Handle, ipv6: bool) -> io::Result<Vec<RouteMessage>> {
-    let mut query = RouteMessage::default();
-    query.header.address_family = if ipv6 {
+    let family = if ipv6 {
         AddressFamily::Inet6
     } else {
         AddressFamily::Inet
     };
-    request(handle.route().get(query).execute().try_collect()).await
+    let mut query = RouteMessage::default();
+    query.header.address_family = family;
+    let mut routes = request(handle.route().get(query).execute().try_collect::<Vec<_>>()).await?;
+    // Unsupported families can fall back to an all-family kernel dump.
+    routes.retain(|route| route.header.address_family == family);
+    Ok(routes)
 }
 
 pub(super) async fn rules(handle: &Handle, ipv6: bool) -> io::Result<Vec<RuleMessage>> {
@@ -149,31 +156,22 @@ pub(super) async fn preflight(handle: &Handle, spec: &Spec) -> io::Result<()> {
         ));
     }
     for ipv6 in [false, true] {
+        let configured = families(spec).any(|family| family == ipv6);
         for rule in rules(handle, ipv6).await? {
-            check_precedence(&rule, spec)?;
-            if references_reservation(&rule, spec) {
-                return Err(invalid(
-                    "managed TUN rule priority or routing table is already referenced",
-                ));
+            if configured {
+                check_precedence(&rule, spec)?;
+                if references_reservation(&rule, spec) {
+                    return Err(invalid(
+                        "managed TUN rule priority or routing table is already referenced",
+                    ));
+                }
             }
-            let mask = rule
-                .attributes
-                .iter()
-                .find_map(|attribute| match attribute {
-                    RuleAttribute::FwMask(mask) => Some(*mask),
-                    _ => None,
-                })
-                .unwrap_or(u32::MAX);
-            if rule.attributes.iter().any(|attribute| {
-                matches!(attribute,
-                RuleAttribute::FwMark(mark) if mark & mask & spec.linux.mark_mask != 0)
-            }) {
-                return Err(invalid(
-                    "managed TUN mark reservation conflicts with an existing rule",
-                ));
-            }
+            check_mark_reservation(&rule, spec)?;
         }
         let routes = dump(handle, ipv6).await?;
+        if configured {
+            check_redirect_gateways(&routes, spec)?;
+        }
         for route in &routes {
             if route.header.destination_prefix_length == 0 {
                 continue;
@@ -197,20 +195,54 @@ pub(super) async fn preflight(handle: &Handle, spec: &Spec) -> io::Result<()> {
                 }
             }
         }
-        if routes.iter().any(|route| table(route) == spec.linux.table) {
+        if configured && routes.iter().any(|route| table(route) == spec.linux.table) {
             return Err(invalid("managed TUN routing table is not empty"));
         }
-        if families(spec).any(|family| family == ipv6)
-            && !routes.iter().any(|route| {
-                table(route) == 254
-                    && route.header.kind == RouteType::Unicast
-                    && route.header.destination_prefix_length == 0
-            })
-        {
+        if configured && !routes.iter().any(native_default) {
             return Err(invalid(
-                "managed TUN requires an underlying main-table default route for each configured IP family",
+                "managed TUN requires an underlying main-table default route without source or TOS constraints for each configured IP family",
             ));
         }
+    }
+    Ok(())
+}
+
+pub(super) fn native_default(route: &RouteMessage) -> bool {
+    table(route) == 254
+        && route.header.kind == RouteType::Unicast
+        && route.header.destination_prefix_length == 0
+        && route.header.source_prefix_length == 0
+        && route.header.tos == 0
+        && !route.attributes.iter().any(|attribute| {
+            matches!(
+                attribute,
+                RouteAttribute::Source(_) | RouteAttribute::Iif(_) | RouteAttribute::Mark(_)
+            )
+        })
+}
+
+pub(super) fn check_mark_reservation(rule: &RuleMessage, spec: &Spec) -> io::Result<()> {
+    let mark = rule
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RuleAttribute::FwMark(mark) => Some(*mark),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let mask = rule
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RuleAttribute::FwMask(mask) => Some(*mask),
+            _ => None,
+        })
+        .unwrap_or(if mark == 0 { 0 } else { u32::MAX });
+    // Dumps omit zero-valued marks, but their masks still select reserved bits, even when inverted.
+    if mask & spec.linux.mark_mask != 0 {
+        return Err(invalid(
+            "managed TUN mark reservation conflicts with an existing rule",
+        ));
     }
     Ok(())
 }
@@ -224,8 +256,8 @@ fn references_reservation(rule: &RuleMessage, spec: &Spec) -> bool {
         || u32::from(rule.header.table) == spec.linux.table
 }
 
-fn has_next_hop(route: &RouteMessage) -> bool {
-    route.attributes.iter().any(|attribute| {
+fn next_hops(route: &RouteMessage) -> impl Iterator<Item = &RouteAttribute> {
+    route.attributes.iter().filter(|attribute| {
         matches!(
             attribute,
             RouteAttribute::Gateway(_)
@@ -234,6 +266,36 @@ fn has_next_hop(route: &RouteMessage) -> bool {
                 | RouteAttribute::NhId(_)
         )
     })
+}
+
+pub(super) fn check_redirect_gateways(routes: &[RouteMessage], spec: &Spec) -> io::Result<()> {
+    fn conflicts(attributes: &[RouteAttribute], spec: &Spec) -> bool {
+        attributes.iter().any(|attribute| {
+            let gateway = match attribute {
+                RouteAttribute::Gateway(RouteAddress::Inet(ip))
+                | RouteAttribute::Via(RouteVia::Inet(ip)) => IpAddr::V4(*ip),
+                RouteAttribute::Gateway(RouteAddress::Inet6(ip))
+                | RouteAttribute::Via(RouteVia::Inet6(ip)) => IpAddr::V6(*ip),
+                RouteAttribute::MultiPath(hops) => {
+                    return hops.iter().any(|hop| conflicts(&hop.attributes, spec));
+                }
+                // Opaque nexthop objects cannot establish exclusive ownership of the route marker.
+                RouteAttribute::NhId(_) => return true,
+                _ => return false,
+            };
+            spec.redirect_gateway(gateway.is_ipv6()) == Some(gateway)
+        })
+    }
+    if spec.redirect
+        && routes
+            .iter()
+            .any(|route| table(route) != spec.linux.table && conflicts(&route.attributes, spec))
+    {
+        return Err(invalid(
+            "auto_redirect requires exclusive virtual peer gateways and does not support nexthop-object routes",
+        ));
+    }
+    Ok(())
 }
 
 fn check_precedence(rule: &RuleMessage, spec: &Spec) -> io::Result<()> {
@@ -270,11 +332,11 @@ fn check_precedence(rule: &RuleMessage, spec: &Spec) -> io::Result<()> {
 }
 
 pub(super) fn default_route(spec: &Spec, index: u32, ipv6: bool) -> RouteMessage {
-    if ipv6 {
+    let mut route = if ipv6 {
         RouteMessageBuilder::<Ipv6Addr>::new()
             .table_id(spec.linux.table)
             .output_interface(index)
-            .scope(RouteScope::Link)
+            .scope(RouteScope::Universe)
             .protocol(PROTOCOL)
             .build()
     } else {
@@ -284,7 +346,67 @@ pub(super) fn default_route(spec: &Spec, index: u32, ipv6: bool) -> RouteMessage
             .scope(RouteScope::Link)
             .protocol(PROTOCOL)
             .build()
+    };
+    if let Some(gateway) = spec.redirect_gateway(ipv6) {
+        route
+            .attributes
+            .push(RouteAttribute::Gateway(match gateway {
+                IpAddr::V4(ip) => RouteAddress::Inet(ip),
+                IpAddr::V6(ip) => RouteAddress::Inet6(ip),
+            }));
+        route.header.scope = RouteScope::Universe;
+        route.header.flags.insert(RouteFlags::Onlink);
     }
+    route
+}
+
+pub(super) fn same_route(actual: &RouteMessage, expected: &RouteMessage) -> bool {
+    if table(actual) != table(expected) {
+        return false;
+    }
+    let mut actual = actual.clone();
+    let mut expected = expected.clone();
+    for route in [&mut actual, &mut expected] {
+        route.header.table = 0;
+        let ipv6 = route.header.address_family == AddressFamily::Inet6;
+        // Dumps include table encoding, IPv6 defaults and dynamic cache statistics.
+        route.attributes.retain(|attribute| match attribute {
+            RouteAttribute::Table(_) => false,
+            RouteAttribute::Priority(1024)
+            | RouteAttribute::Preference(RoutePreference::Medium)
+                if ipv6 =>
+            {
+                false
+            }
+            RouteAttribute::CacheInfo(info) if info.expires == 0 && info.error == 0 => false,
+            _ => true,
+        });
+    }
+    actual.header == expected.header
+        && actual.attributes.len() == expected.attributes.len()
+        && expected
+            .attributes
+            .iter()
+            .all(|attribute| actual.attributes.contains(attribute))
+}
+
+pub(super) async fn check_cleanup_routes(
+    handle: &Handle,
+    spec: &Spec,
+    index: Option<u32>,
+) -> io::Result<()> {
+    for ipv6 in families(spec) {
+        for route in dump(handle, ipv6).await? {
+            if table(&route) == spec.linux.table
+                && !index.is_some_and(|index| same_route(&route, &default_route(spec, index, ipv6)))
+            {
+                return Err(io::Error::other(
+                    "managed TUN routing table was changed externally; refusing to forget it",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn configure(
@@ -346,10 +468,7 @@ pub(super) async fn remove_rules(handle: &Handle, spec: &Spec) -> io::Result<()>
         for actual in rules(handle, ipv6).await? {
             if same_rule(&actual, &expected) {
                 request(handle.rule().del(actual).execute()).await?;
-            } else if actual
-                .attributes
-                .contains(&RuleAttribute::Priority(spec.linux.rule_priority))
-            {
+            } else if references_reservation(&actual, spec) {
                 return Err(io::Error::other(
                     "managed TUN rule was changed externally; refusing to remove it",
                 ));
@@ -391,32 +510,38 @@ pub(super) async fn check(handle: &Handle, spec: &Spec, index: u32, alias: &str)
             return Err(io::Error::other("managed TUN address disappeared"));
         }
     }
-    for ipv6 in families(spec) {
+    for ipv6 in [false, true] {
+        let configured = families(spec).any(|family| family == ipv6);
         let rules = rules(handle, ipv6).await?;
-        for rule in &rules {
-            check_precedence(rule, spec)?;
+        let expected = rule(spec, ipv6);
+        for actual in &rules {
+            if configured {
+                check_precedence(actual, spec)?;
+            }
+            if !configured || !same_rule(actual, &expected) {
+                check_mark_reservation(actual, spec)?;
+            }
+        }
+        if !configured {
+            continue;
         }
         let reserved: Vec<_> = rules
             .iter()
             .filter(|rule| references_reservation(rule, spec))
             .collect();
-        if reserved.len() != 1 || !same_rule(reserved[0], &rule(spec, ipv6)) {
+        if reserved.len() != 1 || !same_rule(reserved[0], &expected) {
             return Err(io::Error::other(
                 "managed TUN policy rule disappeared or changed",
             ));
         }
         let routes = dump(handle, ipv6).await?;
+        check_redirect_gateways(&routes, spec)?;
         let owned: Vec<_> = routes
             .iter()
             .filter(|route| table(route) == spec.linux.table)
             .collect();
-        if owned.len() != 1
-            || owned[0].header.protocol != PROTOCOL
-            || owned[0].header.kind != RouteType::Unicast
-            || owned[0].header.destination_prefix_length != 0
-            || !owned[0].attributes.contains(&RouteAttribute::Oif(index))
-            || has_next_hop(owned[0])
-        {
+        let expected = default_route(spec, index, ipv6);
+        if owned.len() != 1 || !same_route(owned[0], &expected) {
             return Err(io::Error::other(
                 "managed TUN routing table disappeared or changed",
             ));
@@ -433,7 +558,7 @@ pub(super) async fn on_link(handle: &Handle, index: u32) -> io::Result<Vec<IpNet
                 || route.header.kind != RouteType::Unicast
                 || route.header.destination_prefix_length == 0
                 || route.attributes.contains(&RouteAttribute::Oif(index))
-                || has_next_hop(&route)
+                || next_hops(&route).next().is_some()
             {
                 continue;
             }

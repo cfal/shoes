@@ -1013,8 +1013,9 @@ Other links are not changed. The managed TUN subnet is reserved for ingress:
 forwarding a connection back to that subnet is rejected, except local DNS handling.
 
 The initial route must exist before OUTPUT capture, so every configured family
-requires an underlying main-table default route. For explicitly IPv4-only
-capture, configure only an IPv4 address and `route_address: [0.0.0.0/0]`; IPv6
+requires an underlying main-table default route without source or TOS constraints.
+For explicitly IPv4-only capture, configure only an IPv4 address and
+`route_address: [0.0.0.0/0]`; IPv6
 then remains native. This is not an IPv6 blocking policy.
 
 Loopback, local destinations, multicast, broadcast, link-local destinations,
@@ -1023,8 +1024,11 @@ unless explicitly excluded. Replies to inbound services remain native. Existing
 tracked native flows remain native; captured flows retain their selection.
 New TCP capture starts only with connection establishment. UDP flows created
 before conntrack was enabled cannot be identified reliably and may reset.
-Applications explicitly bound to a physical device are outside the capture
-guarantee; address-bound TCP/UDP clients are supported.
+Applications explicitly bound to a physical device remain native in both modes;
+address-bound TCP/UDP clients are supported. REDIRECT requires an unused adjacent
+virtual peer in each TUN subnet. Its private routes use that peer as their next
+hop, and only traffic routed through that peer is redirected. Traffic to the peer
+itself, including virtual DNS, stays on the TUN engine.
 Foreign-marked traffic is left to existing policy. Unsupported protocols remain
 native; ICMP handling is the existing synthetic echo behavior, not remote ICMP
 forwarding. This is host capture, not gateway or container forwarding.
@@ -1032,6 +1036,9 @@ forwarding. This is host capture, not gateway or container forwarding.
 Conflicting tables, priorities, mark reservations, or preceding nonlocal policy
 rules cause startup rejection. Other VPNs and firewall managers require explicit
 coexistence validation; Shoes does not override foreign firewall decisions.
+REDIRECT also rejects native routes using its virtual peer as a gateway and
+opaque nexthop-object routes. Captured replies carry the capture mark before
+mark-aware reverse-path filtering.
 No universal VPN, firewall, resolver-manager, or distribution compatibility is
 promised.
 
@@ -1053,10 +1060,10 @@ uninterrupted fail-open guarantee.
 Outstanding helper processes retain the namespace lock, so recovery fails rather
 than racing a helper that could still commit. The service terminates remaining
 helpers before `ExecStopPost`; standalone operators must let them finish or stop
-them before retrying cleanup. Firewall comparisons use the installed nft version's
-readback. A crash before the first readback uses conservative generated-policy
-comparison and may require manual inspection if that nft version renders it
-differently.
+them before retrying cleanup. The first firewall readback must match the generated
+policy before becoming the baseline for later comparisons. Unsupported nft JSON
+rendering differences cause activation or recovery to fail rather than trusting
+unverified rules, and may require manual inspection.
 The service retries without a start-rate limit, including while a configured
 family is waiting for its underlying default route. Read failures during
 reconciliation currently trigger cleanup and a supervised restart, not in-place

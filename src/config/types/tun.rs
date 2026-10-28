@@ -294,7 +294,7 @@ impl TunConfig {
     pub(crate) fn virtual_dns_addresses(&self) -> impl Iterator<Item = IpAddr> + '_ {
         self.addresses
             .iter()
-            .filter(|_| self.auto_route && self.auto_dns.unwrap_or(true))
+            .filter(|_| self.auto_route && (self.auto_dns.unwrap_or(true) || self.auto_redirect))
             .filter_map(|network| next_ip_address(network.ip()))
     }
 }

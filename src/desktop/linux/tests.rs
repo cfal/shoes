@@ -107,7 +107,6 @@ fn managed_firewall_schema_preserves_masks_reply_exemption_and_exact_ownership()
         command::encode_nft(policy.clone()).unwrap(),
         serde_json::to_vec(&serialized).unwrap(),
     );
-    assert!(nft::valid_policy(&serialized));
     assert!(nft::same_policy(&serialized, &policy), "{serialized}");
     let text = serialized.to_string();
     assert!(text.contains("reply"));
@@ -129,7 +128,7 @@ fn managed_firewall_schema_preserves_masks_reply_exemption_and_exact_ownership()
 }
 
 #[test]
-fn firewall_readback_validation_preserves_self_comparison_semantics() {
+fn firewall_comparison_rejects_malformed_documents() {
     for (listing, valid) in [
         (json!({}), false),
         (json!({"nftables": null}), false),
@@ -150,9 +149,98 @@ fn firewall_readback_validation_preserves_self_comparison_semantics() {
             true,
         ),
     ] {
-        assert_eq!(nft::valid_policy(&listing), valid, "{listing}");
         assert_eq!(nft::same_policy(&listing, &listing), valid, "{listing}");
     }
+}
+
+#[test]
+fn firewall_comparison_accepts_flag_renderings_from_newer_nft() {
+    fn singleton_flags(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(serde_json::Value::Array(flags)) = object.get("flags")
+                    && flags.len() == 1
+                {
+                    object.insert("flags".into(), flags[0].clone());
+                }
+                for value in object.values_mut() {
+                    singleton_flags(value);
+                }
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(singleton_flags),
+            _ => {}
+        }
+    }
+    let policy = nft::install(
+        &spec(true),
+        "shoes_test",
+        "token",
+        &[],
+        [Some(12345), Some(12346)],
+    );
+    let mut listing = policy.clone();
+    singleton_flags(&mut listing);
+    assert_ne!(listing, policy);
+    assert!(nft::same_policy(&listing, &policy));
+    let tcp_rule = listing["nftables"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find_map(|entry| {
+            let rule = entry.get_mut("add")?.get_mut("rule")?;
+            (rule["comment"] == "token:not-tcp-establishment").then_some(rule)
+        })
+        .unwrap();
+    tcp_rule["expr"][0]["match"]["left"]["&"][1] = json!({"|": ["syn", "ack"]});
+    assert!(nft::same_policy(&listing, &policy));
+    let set = listing["nftables"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find_map(|entry| entry.get_mut("add")?.get_mut("set"))
+        .unwrap();
+    set["flags"] = json!("constant");
+    assert!(!nft::same_policy(&listing, &policy));
+}
+
+#[test]
+fn firewall_comparison_accepts_prefix_ranges_from_older_nft() {
+    fn render_ranges(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(prefix) = object.get("prefix") {
+                    let network = ipnetwork::IpNetwork::new(
+                        prefix["addr"].as_str().unwrap().parse().unwrap(),
+                        prefix["len"].as_u64().unwrap().try_into().unwrap(),
+                    )
+                    .unwrap();
+                    if network.network() != network.broadcast() {
+                        *value = json!({"range": [network.network(), network.broadcast()]});
+                    }
+                } else {
+                    for value in object.values_mut() {
+                        render_ranges(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(render_ranges),
+            _ => {}
+        }
+    }
+    let policy = nft::install(&spec(false), "shoes_test", "token", &[], [None, None]);
+    let mut listing = policy.clone();
+    render_ranges(&mut listing);
+    assert_ne!(listing, policy);
+    assert!(nft::same_policy(&listing, &policy));
+    let set = listing["nftables"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find_map(|entry| entry.get_mut("add")?.get_mut("set"))
+        .unwrap();
+    assert_eq!(set["name"], "include4");
+    set["elem"][0]["range"][1] = json!("255.255.255.254");
+    assert!(!nft::same_policy(&listing, &policy));
 }
 
 #[test]
@@ -180,6 +268,171 @@ fn managed_routing_rule_matches_bypass_never_even_after_native_lookup_fails() {
             .push(RuleAttribute::Oifname("foreign".into()));
         assert!(!routes::same_rule(&actual, &expected));
     }
+}
+
+#[test]
+fn managed_native_default_requires_unconstrained_selectors() {
+    use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute};
+    for ipv6 in [false, true] {
+        let mut route = routes::default_route(&spec(false), 42, ipv6);
+        route
+            .attributes
+            .retain(|attribute| !matches!(attribute, RouteAttribute::Table(_)));
+        route.header.table = 254;
+        assert!(routes::native_default(&route));
+        let mut changed = route.clone();
+        changed.header.source_prefix_length = 64;
+        assert!(!routes::native_default(&changed));
+        let mut changed = route.clone();
+        changed.header.tos = 16;
+        assert!(!routes::native_default(&changed));
+        let address = if ipv6 {
+            RouteAddress::Inet6("fd00:1::1".parse().unwrap())
+        } else {
+            RouteAddress::Inet("192.0.2.1".parse().unwrap())
+        };
+        for attribute in [
+            RouteAttribute::Source(address.clone()),
+            RouteAttribute::Iif(7),
+            RouteAttribute::Mark(1),
+        ] {
+            let mut changed = route.clone();
+            changed.attributes.push(attribute);
+            assert!(!routes::native_default(&changed));
+        }
+        route.attributes.push(RouteAttribute::PrefSource(address));
+        assert!(routes::native_default(&route));
+    }
+}
+
+#[test]
+fn managed_mark_reservation_checks_masks_including_zero_and_inverted_values() {
+    use rtnetlink::packet_route::rule::{RuleAttribute, RuleFlags};
+    let spec = spec(false);
+    for ipv6 in [false, true] {
+        for flags in [RuleFlags::empty(), RuleFlags::Invert] {
+            for mark in [0, 1, spec.linux.capture_mark, spec.linux.bypass_mark] {
+                for (mask, conflicts) in [
+                    (None, mark != 0),
+                    (Some(0), false),
+                    (Some(0xff), false),
+                    (Some(spec.linux.capture_mark), true),
+                    (Some(spec.linux.bypass_mark), true),
+                    (Some(spec.linux.mark_mask), true),
+                ] {
+                    let mut rule = routes::rule(&spec, ipv6);
+                    rule.header.flags = flags;
+                    rule.attributes = vec![RuleAttribute::FwMark(mark)];
+                    if let Some(mask) = mask {
+                        rule.attributes.push(RuleAttribute::FwMask(mask));
+                    }
+                    assert_eq!(
+                        routes::check_mark_reservation(&rule, &spec).is_err(),
+                        conflicts
+                    );
+                    if mark == 0 {
+                        rule.attributes
+                            .retain(|attribute| !matches!(attribute, RuleAttribute::FwMark(_)));
+                        assert_eq!(
+                            routes::check_mark_reservation(&rule, &spec).is_err(),
+                            conflicts
+                        );
+                    }
+                }
+            }
+        }
+        let mut rule = routes::rule(&spec, ipv6);
+        rule.attributes.clear();
+        assert!(routes::check_mark_reservation(&rule, &spec).is_ok());
+    }
+}
+
+#[test]
+fn managed_default_route_comparison_preserves_selectors_and_attributes() {
+    use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RoutePreference};
+    for redirect in [false, true] {
+        for ipv6 in [false, true] {
+            let expected = routes::default_route(&spec(redirect), 42, ipv6);
+            let mut actual = expected.clone();
+            actual.header.table = 0;
+            actual.attributes.reverse();
+            if ipv6 {
+                actual.attributes.extend([
+                    RouteAttribute::Priority(1024),
+                    RouteAttribute::Preference(RoutePreference::Medium),
+                ]);
+            }
+            assert!(routes::same_route(&actual, &expected));
+            let mut changed = actual.clone();
+            changed.header.source_prefix_length = 64;
+            assert!(!routes::same_route(&changed, &expected));
+            let mut changed = actual.clone();
+            changed.header.tos = 16;
+            assert!(!routes::same_route(&changed, &expected));
+            let address = if ipv6 {
+                RouteAddress::Inet6("fd00:1::1".parse().unwrap())
+            } else {
+                RouteAddress::Inet("192.0.2.1".parse().unwrap())
+            };
+            for attribute in [
+                RouteAttribute::Source(address.clone()),
+                RouteAttribute::PrefSource(address),
+                RouteAttribute::Priority(99),
+                RouteAttribute::Iif(7),
+                RouteAttribute::Expires(1),
+            ] {
+                let mut changed = actual.clone();
+                changed.attributes.push(attribute);
+                assert!(!routes::same_route(&changed, &expected));
+            }
+        }
+    }
+}
+
+#[test]
+fn redirect_gateways_are_reserved_in_every_native_next_hop_form() {
+    use rtnetlink::packet_route::route::{
+        RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteVia,
+    };
+    let peer4 = "10.233.0.2".parse().unwrap();
+    let peer6 = "fd73::2".parse().unwrap();
+    let mut hop = RouteNextHop::default();
+    hop.attributes
+        .push(RouteAttribute::Gateway(RouteAddress::Inet(peer4)));
+    for attribute in [
+        RouteAttribute::Gateway(RouteAddress::Inet(peer4)),
+        RouteAttribute::Gateway(RouteAddress::Inet6(peer6)),
+        RouteAttribute::Via(RouteVia::Inet(peer4)),
+        RouteAttribute::Via(RouteVia::Inet6(peer6)),
+        RouteAttribute::MultiPath(vec![hop]),
+        RouteAttribute::NhId(42),
+    ] {
+        let mut route = RouteMessage::default();
+        route.header.table = 254;
+        route.attributes.push(attribute);
+        assert!(routes::check_redirect_gateways(&[route.clone()], &spec(true)).is_err());
+        assert!(routes::check_redirect_gateways(&[route], &spec(false)).is_ok());
+    }
+    let mut route = RouteMessage::default();
+    route.header.table = 254;
+    route
+        .attributes
+        .push(RouteAttribute::Gateway(RouteAddress::Inet(
+            "192.0.2.2".parse().unwrap(),
+        )));
+    assert!(routes::check_redirect_gateways(&[route], &spec(true)).is_ok());
+
+    let mut config = configuration(true);
+    config.addresses = vec![
+        "10.233.0.1/32".parse().unwrap(),
+        "fd73::1/128".parse().unwrap(),
+    ];
+    assert!(Spec::from_configs(&[crate::config::Config::TunServer(config)]).is_err());
+    let peers: Vec<_> = configuration(true).virtual_dns_addresses().collect();
+    assert_eq!(
+        peers,
+        vec![std::net::IpAddr::V4(peer4), std::net::IpAddr::V6(peer6)]
+    );
 }
 
 fn run(program: &str, arguments: &[&str]) -> io::Result<String> {
@@ -344,6 +597,41 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
 
 async fn kernel_capture() -> io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    run("nft", &["add", "table", "inet", "strict_rpf"])?;
+    run(
+        "nft",
+        &[
+            "add",
+            "chain",
+            "inet",
+            "strict_rpf",
+            "prerouting",
+            "{ type filter hook prerouting priority -150; }",
+        ],
+    )?;
+    run(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            "strict_rpf",
+            "prerouting",
+            "meta",
+            "nfproto",
+            "ipv6",
+            "fib",
+            "saddr",
+            ".",
+            "mark",
+            ".",
+            "iif",
+            "oif",
+            "missing",
+            "counter",
+            "drop",
+        ],
+    )?;
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = tcp.local_addr()?.port();
     let udp = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
@@ -413,6 +701,16 @@ async fn kernel_capture() -> io::Result<()> {
         let ingress = session.ingress().unwrap();
         let resolver: Arc<dyn crate::resolver::Resolver> =
             Arc::new(crate::resolver::NativeResolver::new());
+        if !redirect {
+            let unexpanded = serde_json::from_value(json!({
+                "device_name":"unused", "rules":"unexpanded-rule"
+            }))?;
+            assert!(
+                ingress
+                    .start_redirects(&unexpanded, resolver.clone())?
+                    .is_empty()
+            );
+        }
         let mut tasks = ingress.start_redirects(&config, resolver.clone())?;
         tasks.push(
             crate::tun::start_tun_server_retained(
@@ -434,6 +732,9 @@ async fn kernel_capture() -> io::Result<()> {
         native_services(&session)
             .await
             .map_err(|error| io::Error::other(format!("native services: {error}")))?;
+        device_bound_connections(&session).await.map_err(|error| {
+            io::Error::other(format!("device-bound TCP (redirect={redirect}): {error}"))
+        })?;
         for (client, server) in &mut native_dns {
             exchange_native_dns(client, server)
                 .await
@@ -548,11 +849,15 @@ async fn kernel_capture() -> io::Result<()> {
     }
     process_recovery(port).await?;
     orphan_helper_recovery().await?;
+    preflight_failures().await?;
     ownership_failures().await?;
+    route_ownership_failures().await?;
     interception_validation().await?;
     if std::env::var_os("SHOES_RESOLVED_ROOT").is_some() {
-        for limit in [1, 2] {
-            resolved_integration(limit).await?;
+        for redirect in [false, true] {
+            for limit in [1, 2] {
+                resolved_integration(limit, redirect).await?;
+            }
         }
     }
     drop((tcp_echo, udp_echo));
@@ -661,11 +966,12 @@ async fn resolved_fixture() -> io::Result<Vec<tokio::process::Child>> {
     Ok(vec![resolver, bus])
 }
 
-async fn resolved_integration(udp_limit: usize) -> io::Result<()> {
+async fn resolved_integration(udp_limit: usize, redirect: bool) -> io::Result<()> {
     use hickory_resolver::proto::{
         op::{Message, Query},
         rr::{Name, RData, Record, RecordType, rdata},
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[derive(Debug)]
     struct Answer;
     impl crate::resolver::Resolver for Answer {
@@ -680,16 +986,21 @@ async fn resolved_integration(udp_limit: usize) -> io::Result<()> {
                 let mut reply = Message::from_vec(&request)
                     .map_err(io::Error::other)?
                     .into_response();
+                let texts = if reply.queries[0].name().to_ascii().starts_with("tcp") {
+                    vec!["x".repeat(255); 8]
+                } else {
+                    vec!["real-answer".into()]
+                };
                 reply.add_answer(Record::from_rdata(
                     reply.queries[0].name().clone(),
                     60,
-                    RData::TXT(rdata::TXT::new(vec!["real-answer".into()])),
+                    RData::TXT(rdata::TXT::new(texts)),
                 ));
                 reply.to_vec().map_err(io::Error::other)
             })
         }
     }
-    let mut config = configuration(false);
+    let mut config = configuration(redirect);
     config.dns_hijack = Some(true);
     config.auto_dns = Some(true);
     config.resource_limits.max_udp_destinations = Some(udp_limit);
@@ -703,14 +1014,16 @@ async fn resolved_integration(udp_limit: usize) -> io::Result<()> {
     let mut session = Session::prepare(spec).await?;
     session.prepare_network().await?;
     let ingress = session.ingress().unwrap();
-    let task =
+    let mut tasks = ingress.start_redirects(&config, Arc::new(Answer))?;
+    tasks.push(
         crate::tun::start_tun_server_retained(config, Arc::new(Answer), ingress.device.clone())
-            .await?;
+            .await?,
+    );
     session.activate().await?;
     let mut query = Message::query();
     query.metadata.recursion_desired = true;
     query.add_query(Query::query(
-        Name::from_ascii(format!("managed{udp_limit}.example.")).unwrap(),
+        Name::from_ascii(format!("managed{udp_limit}-{redirect}.example.")).unwrap(),
         RecordType::TXT,
     ));
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
@@ -726,10 +1039,35 @@ async fn resolved_integration(udp_limit: usize) -> io::Result<()> {
         &reply.answers[0].data,
         &RData::TXT(rdata::TXT::new(vec!["real-answer".into()]))
     );
+    if udp_limit == 2 {
+        query.queries[0] = Query::query(
+            Name::from_ascii(format!("tcp{udp_limit}-{redirect}.example.")).unwrap(),
+            RecordType::TXT,
+        );
+        let query = query.to_vec().map_err(io::Error::other)?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut tcp = tokio::net::TcpStream::connect("127.0.0.53:53").await?;
+            tcp.write_u16(query.len() as u16).await?;
+            tcp.write_all(&query).await?;
+            let length = tcp.read_u16().await? as usize;
+            let mut bytes = vec![0; length];
+            tcp.read_exact(&mut bytes).await?;
+            let reply = Message::from_vec(&bytes).map_err(io::Error::other)?;
+            assert_eq!(reply.answers.len(), 1, "{reply:?}");
+            assert_eq!(
+                reply.answers[0].data,
+                RData::TXT(rdata::TXT::new(vec!["x".repeat(255); 8]))
+            );
+            Ok::<_, io::Error>(())
+        })
+        .await??;
+    }
     session.reconcile().await?;
     session.deactivate().await?;
-    task.abort();
-    let _ = task.await;
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
     session.close().await?;
     assert_no_owned_firewall()?;
     Ok(())
@@ -919,7 +1257,7 @@ async fn redirect_counts(session: &Session) -> io::Result<[u64; 2]> {
         let expressions = rule["expr"].as_array().unwrap();
         let ipv6 = expressions
             .iter()
-            .any(|expr| expr["match"]["right"] == "ipv6");
+            .any(|expr| expr["match"]["left"]["rt"]["family"] == "ip6");
         counts[usize::from(ipv6)] = expressions
             .iter()
             .find_map(|expr| expr["counter"]["packets"].as_u64())
@@ -1050,6 +1388,93 @@ fn in_peer<T: Send + 'static>(
     .unwrap()
 }
 
+async fn device_bound_connections(session: &Session) -> io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let before = redirect_counts(session).await?;
+    let link: serde_json::Value = serde_json::from_str(&run(
+        "ip",
+        &["-n", "peer", "-j", "link", "show", "remote0"],
+    )?)?;
+    let mac = link[0]["address"].as_str().unwrap();
+    for (remote, gateway, family) in [
+        ("198.51.100.2", "192.0.2.2", "-4"),
+        ("fd00:2::2", "fd00:1::2", "-6"),
+    ] {
+        for gatewayless in [false, true] {
+            if gatewayless {
+                run(
+                    "ip",
+                    &[
+                        family,
+                        "neigh",
+                        "replace",
+                        remote,
+                        "lladdr",
+                        mac,
+                        "nud",
+                        "permanent",
+                        "dev",
+                        "native0",
+                    ],
+                )?;
+                run(
+                    "ip",
+                    &[family, "route", "replace", "default", "dev", "native0"],
+                )?;
+            }
+            let remote: std::net::IpAddr = remote.parse().unwrap();
+            let listener = in_peer(move || {
+                let listener = std::net::TcpListener::bind((remote, 0))?;
+                listener.set_nonblocking(true)?;
+                Ok(listener)
+            })?;
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let socket = if remote.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
+            } else {
+                tokio::net::TcpSocket::new_v6()?
+            };
+            socket2::SockRef::from(&socket).bind_device(Some(b"native0"))?;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let mut client = socket.connect(listener.local_addr()?).await?;
+                let (mut server, _) = listener.accept().await?;
+                server.write_all(b"native").await?;
+                let mut bytes = [0; 6];
+                client.read_exact(&mut bytes).await?;
+                assert_eq!(&bytes, b"native");
+                Ok::<_, io::Error>(())
+            })
+            .await
+            .map_err(|error| io::Error::other(format!("{remote}: {error}")))??;
+            if gatewayless {
+                run(
+                    "ip",
+                    &[
+                        family, "route", "replace", "default", "via", gateway, "dev", "native0",
+                    ],
+                )?;
+                run(
+                    "ip",
+                    &[
+                        family,
+                        "neigh",
+                        "del",
+                        &remote.to_string(),
+                        "dev",
+                        "native0",
+                    ],
+                )?;
+            }
+        }
+    }
+    assert_eq!(
+        redirect_counts(session).await?,
+        before,
+        "device-bound TCP entered REDIRECT"
+    );
+    Ok(())
+}
+
 async fn native_services(session: &Session) -> io::Result<()> {
     use std::net::{IpAddr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1170,7 +1595,247 @@ async fn native_services(session: &Session) -> io::Result<()> {
     Ok(())
 }
 
+async fn preflight_failures() -> io::Result<()> {
+    for (family, gateway, selector) in [
+        ("-4", "192.0.2.2", ["tos", "0x10"]),
+        ("-6", "fd00:1::2", ["from", "fd00:99::/64"]),
+    ] {
+        run("ip", &[family, "route", "del", "default"])?;
+        let mut route = vec![family, "route", "add", "default"];
+        route.extend(selector);
+        route.extend(["via", gateway, "dev", "native0"]);
+        run("ip", &route)?;
+        let error = Session::prepare(spec(false)).await.err().unwrap();
+        assert!(
+            error.to_string().contains("underlying main-table default"),
+            "{error}"
+        );
+        route[2] = "del";
+        run("ip", &route)?;
+        run("ip", &[family, "route", "add", "default", "via", gateway])?;
+        drop(Session::prepare(spec(false)).await?);
+    }
+    let mut ipv4_only = spec(false);
+    ipv4_only.addresses.retain(ipnetwork::IpNetwork::is_ipv4);
+    ipv4_only.routes.retain(ipnetwork::IpNetwork::is_ipv4);
+    for family in ["-4", "-6"] {
+        for inverted in [false, true] {
+            for mark in ["0/0x40000000", "0x40000000/0x40000000"] {
+                let mut rule = vec![family, "rule", "add", "priority", "13000"];
+                if inverted {
+                    rule.push("not");
+                }
+                rule.extend(["fwmark", mark, "table", "13000"]);
+                run("ip", &rule)?;
+                for spec in [spec(false), ipv4_only.clone()] {
+                    let error = Session::prepare(spec)
+                        .await
+                        .err()
+                        .unwrap_or_else(|| panic!("accepted {rule:?}"));
+                    assert!(error.to_string().contains("mark reservation"), "{error}");
+                }
+                rule[2] = "del";
+                run("ip", &rule)?;
+            }
+        }
+        let mut session = Session::prepare(ipv4_only.clone()).await?;
+        session.prepare_network().await?;
+        session.activate().await?;
+        run(
+            "ip",
+            &[
+                family,
+                "rule",
+                "add",
+                "priority",
+                "13000",
+                "fwmark",
+                "0/0x40000000",
+                "table",
+                "13000",
+            ],
+        )?;
+        let error = session.reconcile().await.unwrap_err();
+        assert!(error.to_string().contains("mark reservation"), "{error}");
+        session.close().await?;
+        run(
+            "ip",
+            &[family, "rule", "del", "priority", "13000", "table", "13000"],
+        )?;
+    }
+    assert!(Journal::lock()?.load()?.is_none());
+    assert_no_owned_firewall()?;
+    Ok(())
+}
+
 async fn ownership_failures() -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    run(
+        "ip",
+        &[
+            "-6",
+            "nexthop",
+            "add",
+            "id",
+            "42",
+            "via",
+            "fd00:1::2",
+            "dev",
+            "native0",
+        ],
+    )?;
+    run("ip", &["-6", "route", "add", "fd00:3::/64", "nhid", "42"])?;
+    let mut config = configuration(true);
+    config.addresses.retain(ipnetwork::IpNetwork::is_ipv4);
+    config.route_address = vec!["0.0.0.0/0".parse().unwrap()];
+    let ipv4_only = Spec::from_configs(&[crate::config::Config::TunServer(config)])?.unwrap();
+    run(
+        "ip",
+        &["-6", "rule", "add", "priority", "100", "table", "12000"],
+    )?;
+    run(
+        "ip",
+        &[
+            "-6",
+            "route",
+            "add",
+            "table",
+            "12000",
+            "default",
+            "via",
+            "fd00:1::2",
+            "dev",
+            "native0",
+        ],
+    )?;
+    let mut session = Session::prepare(ipv4_only.clone()).await?;
+    session.prepare_network().await?;
+    session.activate().await?;
+    session.reconcile().await?;
+    session.close().await?;
+    drop(session);
+    assert!(run("ip", &["-6", "rule", "show"])?.contains("100:"));
+    assert!(run("ip", &["-6", "route", "show", "table", "12000"])?.contains("default"));
+    assert!(Session::prepare(spec(true)).await.is_err());
+    run(
+        "ip",
+        &["-6", "rule", "del", "priority", "100", "table", "12000"],
+    )?;
+    run("ip", &["-6", "route", "del", "table", "12000", "default"])?;
+    assert!(Session::prepare(spec(true)).await.is_err());
+    run(
+        "ip",
+        &[
+            "-6",
+            "rule",
+            "add",
+            "priority",
+            "13000",
+            "fwmark",
+            "0x40000000/0x60000000",
+            "table",
+            "main",
+        ],
+    )?;
+    assert!(Session::prepare(ipv4_only).await.is_err());
+    run(
+        "ip",
+        &["-6", "rule", "del", "priority", "13000", "table", "main"],
+    )?;
+    run("ip", &["-6", "route", "del", "fd00:3::/64"])?;
+    run("ip", &["nexthop", "del", "id", "42"])?;
+
+    let mut session = Session::prepare(spec(false)).await?;
+    session.prepare_network().await?;
+    let executable = session.nft.clone();
+    let table = session.record.table();
+    let helper = "/run/nft-change-before-readback";
+    std::fs::write(
+        helper,
+        format!(
+            "#!/bin/sh\n{executable} \"$@\" || exit $?\nif [ \"$*\" = '-j -f -' ]; then\n{executable} flush chain inet {table} output\nfi\n"
+        ),
+    )?;
+    std::fs::set_permissions(helper, std::fs::Permissions::from_mode(0o700))?;
+    session.nft = helper.into();
+    assert!(session.activate().await.is_err());
+    assert!(session.record.firewall.is_none());
+    assert!(session.journal.load()?.unwrap().firewall.is_none());
+    session.nft = executable;
+    command::nft(session.journal.lease(), &session.nft, nft::remove(&table)).await?;
+    session.close().await?;
+    drop(session);
+
+    let mut session = Session::prepare(spec(false)).await?;
+    session.prepare_network().await?;
+    session.activate().await?;
+    let old_policy = session.record.firewall.clone().unwrap();
+    let executable = session.nft.clone();
+    std::fs::write(
+        "/run/old-onlink.json",
+        command::encode_nft(nft::update_onlink(
+            &session.record.table(),
+            &session.record.on_link,
+        ))?,
+    )?;
+    std::fs::write(
+        helper,
+        format!(
+            "#!/bin/sh\n{executable} \"$@\" || exit $?\nif [ \"$*\" = '-j -f -' ]; then\n{executable} -j -f /run/old-onlink.json\nfi\n"
+        ),
+    )?;
+    session.nft = helper.into();
+    run("ip", &["addr", "add", "192.0.3.1/24", "dev", "native0"])?;
+    assert!(session.reconcile().await.is_err());
+    let record = session.journal.load()?.unwrap();
+    assert_eq!(record.previous_firewall, Some(old_policy.clone()));
+    assert!(!matches_current_policy(&old_policy, &record));
+    assert!(matches_recovery_policy(&old_policy, &record));
+    session.nft = executable;
+    session.close().await?;
+    drop(session);
+    assert!(Journal::lock()?.load()?.is_none());
+    assert_no_owned_firewall()?;
+    run("ip", &["addr", "del", "192.0.3.1/24", "dev", "native0"])?;
+
+    for family in ["-4", "-6"] {
+        let mut session = Session::prepare(spec(false)).await?;
+        session.prepare_network().await?;
+        session.activate().await?;
+        run(
+            "ip",
+            &[
+                family,
+                "rule",
+                "add",
+                "priority",
+                "12001",
+                "fwmark",
+                "0x20000000/0x60000000",
+                "table",
+                "12000",
+            ],
+        )?;
+        run(
+            "ip",
+            &[family, "rule", "del", "priority", "12000", "table", "12000"],
+        )?;
+        assert!(session.close().await.is_err());
+        assert!(session.journal.load()?.is_some());
+        drop(session);
+        assert!(cleanup().await.is_err());
+        assert!(Journal::lock()?.load()?.is_some());
+        assert!(run("ip", &[family, "rule", "show"])?.contains("12001:"));
+        run(
+            "ip",
+            &[family, "rule", "del", "priority", "12001", "table", "12000"],
+        )?;
+        cleanup().await?;
+        assert!(Journal::lock()?.load()?.is_none());
+        assert_no_owned_firewall()?;
+    }
+
     let mut session = Session::prepare(spec(false)).await?;
     session.record.firewall = Some(json!({"large_snapshot": "x".repeat(128 * 1024)}));
     session.record.previous_firewall = session.record.firewall.clone();
@@ -1226,6 +1891,75 @@ async fn ownership_failures() -> io::Result<()> {
     session.close().await?;
     run("nft", &["list", "table", "inet", "foreign_preserved"])?;
     assert_no_owned_firewall()?;
+    Ok(())
+}
+
+async fn route_ownership_failures() -> io::Result<()> {
+    use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute};
+
+    for redirect in [false, true] {
+        for ipv6 in [false, true] {
+            let mut session = Session::prepare(spec(redirect)).await?;
+            session.prepare_network().await?;
+            session.activate().await?;
+            let expected =
+                routes::default_route(&session.record.spec, session.record.ifindex.unwrap(), ipv6);
+            routes::request(session.handle.route().del(expected.clone()).execute()).await?;
+            let mut changed = expected;
+            if ipv6 {
+                changed.header.source_prefix_length = 64;
+                changed
+                    .attributes
+                    .push(RouteAttribute::Source(RouteAddress::Inet6(
+                        "fd00:99::".parse().unwrap(),
+                    )));
+            } else {
+                changed.header.tos = 16;
+            }
+            routes::request(session.handle.route().add(changed).execute()).await?;
+            assert!(session.reconcile().await.is_err());
+            assert!(session.close().await.is_err());
+            assert!(session.journal.load()?.is_some());
+            drop(session);
+            cleanup().await?;
+            assert!(Journal::lock()?.load()?.is_none());
+        }
+    }
+    for ipv6 in [false, true] {
+        for orphan in [false, true] {
+            let mut session = Session::prepare(spec(false)).await?;
+            session.prepare_network().await?;
+            session.activate().await?;
+            let native = routes::link(&session.handle, "native0")
+                .await?
+                .unwrap()
+                .header
+                .index;
+            routes::request(
+                session
+                    .handle
+                    .route()
+                    .add(routes::default_route(&session.record.spec, native, ipv6))
+                    .replace()
+                    .execute(),
+            )
+            .await?;
+            assert!(session.reconcile().await.is_err());
+            if !orphan {
+                assert!(session.close().await.is_err());
+                assert!(session.journal.load()?.is_some());
+            }
+            drop(session);
+            assert!(cleanup().await.is_err());
+            assert!(Journal::lock()?.load()?.is_some());
+            let family = if ipv6 { "-6" } else { "-4" };
+            assert!(run("ip", &[family, "route", "show", "table", "12000"])?.contains("native0"));
+            run("ip", &[family, "route", "del", "table", "12000", "default"])?;
+            cleanup().await?;
+            assert!(Journal::lock()?.load()?.is_none());
+            assert_no_owned_firewall()?;
+        }
+    }
     Ok(())
 }
 

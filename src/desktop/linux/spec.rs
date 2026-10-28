@@ -174,13 +174,20 @@ impl Spec {
             icmp: tun.icmp_enabled,
             linux,
         };
-        if spec.auto_dns {
-            if !spec.dns_hijack {
-                return Err(invalid("auto_dns requires dns_hijack"));
-            }
+        if spec.auto_dns && !spec.dns_hijack {
+            return Err(invalid("auto_dns requires dns_hijack"));
+        }
+        if spec.auto_dns || spec.redirect {
             spec.dns_addresses()?;
         }
         Ok(spec)
+    }
+
+    pub(super) fn redirect_gateway(&self, ipv6: bool) -> Option<IpAddr> {
+        self.addresses
+            .iter()
+            .find(|network| self.redirect && network.is_ipv6() == ipv6)
+            .and_then(|network| next_ip_address(network.ip()))
     }
 
     pub(super) fn dns_addresses(&self) -> io::Result<Vec<IpAddr>> {
@@ -193,7 +200,7 @@ impl Spec {
                     || matches!(network, IpNetwork::V4(v4) if IpAddr::V4(v4.broadcast()) == ip)
                 {
                     return Err(invalid(
-                        "auto_dns requires space after each TUN address for a virtual DNS endpoint",
+                        "auto_dns/auto_redirect requires space after each TUN address for a virtual peer",
                     ));
                 }
                 Ok(ip)

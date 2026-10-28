@@ -68,6 +68,7 @@ pub(super) fn install(
         ("capture", None),
         ("redirect", Some(("nat", "output", -100))),
         ("guard", Some(("filter", "input", -10))),
+        ("prerouting", Some(("filter", "prerouting", -175))),
     ] {
         let mut chain = json!({"family": "inet", "table": table, "name": name});
         if let Some((kind, hook, priority)) = hook {
@@ -104,6 +105,16 @@ pub(super) fn install(
     let mask = spec.linux.mark_mask;
     let capture = spec.linux.capture_mark;
     let bypass = spec.linux.bypass_mark;
+    // Mark-aware reverse-path filters must find the private route for replies injected by the TUN.
+    rule(
+        "prerouting",
+        "captured-reply",
+        vec![
+            matches(meta("iifname"), "==", json!(spec.name)),
+            matches(masked(ct("mark"), mask), "==", json!(capture)),
+            mark(meta("mark"), mask, capture),
+        ],
+    );
     if spec.dns_hijack {
         for address in spec.dns_addresses().unwrap_or_default() {
             for protocol in ["tcp", "udp"] {
@@ -301,14 +312,23 @@ pub(super) fn install(
         let Some(port) = port else {
             continue;
         };
-        // OUTPUT interface metadata describes the initial route, not the mark-driven reroute.
+        let gateway = spec
+            .redirect_gateway(family == "ipv6")
+            .expect("validated redirect gateway");
+        let protocol = if family == "ipv4" { "ip" } else { "ip6" };
+        // Route nexthop, unlike OUTPUT interface metadata, reflects bound-device rerouting.
         rule(
             "redirect",
             "tcp",
             vec![
-                matches(meta("nfproto"), "==", json!(family)),
                 matches(meta("l4proto"), "==", json!("tcp")),
                 matches(masked(meta("mark"), mask), "==", json!(capture)),
+                matches(payload(protocol, "daddr"), "!=", json!(gateway)),
+                matches(
+                    json!({"rt": {"key": "nexthop", "family": protocol}}),
+                    "==",
+                    json!(gateway),
+                ),
                 json!({"counter": null}),
                 json!({"redirect": {"port": port}}),
             ],
@@ -379,8 +399,16 @@ pub(super) fn with_onlink(listing: &Value, networks: &[IpNetwork]) -> Value {
 
 fn canonical_policy(document: &Value) -> Option<std::collections::BTreeMap<String, Vec<Value>>> {
     fn normalize(value: &mut Value) {
+        // Newer nft versions render the TCP flag mask as an explicit bitwise OR.
+        if *value == json!({"|": ["syn", "ack"]}) {
+            *value = json!(["syn", "ack"]);
+            return;
+        }
         match value {
             Value::Object(object) => {
+                if let Some(flags @ Value::String(_)) = object.get_mut("flags") {
+                    *flags = json!([flags.as_str().unwrap()]);
+                }
                 if object.get("match").is_some_and(|value| {
                     value["left"] == ct("status") && value["op"] == "!" && value["right"] == "dnat"
                 }) {
@@ -396,11 +424,16 @@ fn canonical_policy(document: &Value) -> Option<std::collections::BTreeMap<Strin
                 if let Some(prefix) = object.get("prefix")
                     && let (Some(address), Some(len)) =
                         (prefix["addr"].as_str(), prefix["len"].as_u64())
-                    && address
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| len == if ip.is_ipv4() { 32 } else { 128 })
+                    && let Ok(address) = address.parse()
+                    && let Ok(len) = u8::try_from(len)
+                    && let Ok(network) = IpNetwork::new(address, len)
                 {
-                    *value = json!(address);
+                    // Older nft versions render intervals ending at the maximum address as ranges.
+                    *value = if network.network() == network.broadcast() {
+                        json!(network.network())
+                    } else {
+                        json!({"range": [network.network(), network.broadcast()]})
+                    };
                 }
             }
             Value::Array(values) => values.iter_mut().for_each(normalize),
@@ -451,10 +484,6 @@ fn canonical_policy(document: &Value) -> Option<std::collections::BTreeMap<Strin
             .push(value);
     }
     Some(objects)
-}
-
-pub(super) fn valid_policy(listing: &Value) -> bool {
-    canonical_policy(listing).is_some()
 }
 
 pub(super) fn same_policy(listing: &Value, expected: &Value) -> bool {
