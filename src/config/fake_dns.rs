@@ -205,7 +205,12 @@ impl ValidatedConfigs {
                     rules(ranges, &server.rules)?;
                     protocol(ranges, &server.protocol)?;
                 }
-                Config::TunServer(tun) => rules(ranges, &tun.rules)?,
+                Config::TunServer(tun) => {
+                    rules(ranges, &tun.rules)?;
+                    for endpoint in &tun.bootstrap_dns {
+                        reject(ranges, endpoint.ip(), "managed bootstrap endpoint")?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -249,6 +254,39 @@ mod tests {
 
     fn validate_yaml(yaml: &str) -> io::Result<ValidatedConfigs> {
         super::super::create_server_configs(serde_yaml::from_str(yaml).map_err(io::Error::other)?)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_bootstrap_rejects_active_and_retained_fake_ranges() {
+        use serde_json::json;
+
+        let ranges = [
+            "198.18.0.0/15".parse().unwrap(),
+            "2001:2::/48".parse().unwrap(),
+        ];
+        for endpoint in ["198.18.0.1:53", "198.18.0.5:53", "[2001:2::5]:53"] {
+            let mut configs = json!([
+                {"dns_group":"fake", "dns_servers":"system", "fake_ip":{"ipv6_range":"2001:2::/48"}},
+                {"device_name":"shoes0", "auto_route":true, "auto_dns":false,
+                 "addresses":["10.233.0.1/30", "fd73::1/126"], "bootstrap_dns":[endpoint]}
+            ]);
+            let error = validate_yaml(&configs.to_string()).err().unwrap();
+            assert!(
+                error.to_string().contains("managed bootstrap endpoint"),
+                "{error}"
+            );
+            configs[0]["fake_ip"] = false.into();
+            let mut validated = validate_yaml(&configs.to_string()).unwrap();
+            let error = validated.validate_network_endpoints(&ranges).unwrap_err();
+            assert!(
+                error.to_string().contains("managed bootstrap endpoint"),
+                "{error}"
+            );
+            validated
+                .validate_network_endpoints(&["192.0.2.0/24".parse().unwrap()])
+                .unwrap();
+        }
     }
 
     #[test]
