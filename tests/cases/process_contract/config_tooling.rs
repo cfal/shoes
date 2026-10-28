@@ -180,3 +180,86 @@ fn check_dry_run_validates_all_files_without_forwarding_or_state_writes() {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires sudo and util-linux; isolates cleanup dispatch from host networking"]
+fn check_dry_run_does_not_dispatch_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cleanup-tun");
+    for mode in ["check", "--dry-run"] {
+        for (config, expected) in [
+            (
+                "- address: '127.0.0.1:12345'\n  protocol: {type: socks}\n",
+                0,
+            ),
+            ("invalid configuration", 1),
+        ] {
+            std::fs::write(&path, config).unwrap();
+            let output = Command::new("sudo")
+                .current_dir(directory.path())
+                .args([
+                    "-n", "--", "unshare", "--net", "--mount", "--propagation", "private",
+                    "--", "/bin/sh", "-ec",
+                    "mount -t tmpfs -o size=1m,mode=755 tmpfs /run\nstatus=0\n\"$@\" || status=$?\ntest ! -e /run/shoes || exit 99\nexit \"$status\"",
+                    "sh",
+                    env!("CARGO_BIN_EXE_shoes"), mode, "-t", "1", "cleanup-tun",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn check_dry_run_keeps_default_signal_actions() {
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::ExitStatusExt};
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("blocked.yaml");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    for mode in ["check", "--dry-run"] {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut process = super::Process::from_child(child);
+            process.wait_for("Starting dry run.").await;
+            // Opening the writer proves validation reached the blocking configuration read.
+            let writer = tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&path)
+                    {
+                        Ok(writer) => break writer,
+                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("open configuration pipe: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("validation did not open the configuration pipe");
+            process.signal(signal);
+            assert_eq!(process.exit().await.signal(), Some(signal), "{mode}");
+            drop(writer);
+        }
+    }
+}

@@ -638,14 +638,18 @@ impl ReloadSignal {
 }
 
 pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Result<()> {
+    if dry_run {
+        load_validated(&paths, &mut |_, _| {}).await?;
+        println!("Configuration valid");
+        return Ok(());
+    }
     let mut shutdown = ShutdownSignals::new()?;
     let mut reload = ReloadSignal::new()?;
-    let mut network = crate::desktop::NetworkSession::prepare(&paths, dry_run).await?;
+    let mut network = crate::desktop::NetworkSession::prepare(&paths).await?;
     let mut control = None;
     let mut api = None;
     let result = run_inner(
         paths,
-        dry_run,
         no_reload,
         &mut control,
         &mut api,
@@ -671,10 +675,8 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     paths: Vec<String>,
-    dry_run: bool,
     no_reload: bool,
     control: &mut Option<crate::control::runtime::ControlService>,
     api: &mut Option<crate::clash_api::ApiService>,
@@ -682,11 +684,6 @@ async fn run_inner(
     shutdown: &mut ShutdownSignals,
     reload: &mut ReloadSignal,
 ) -> io::Result<()> {
-    if dry_run {
-        load_validated(&paths, &mut |_, _| {}).await?;
-        println!("Configuration valid");
-        return Ok(());
-    }
     let (change_tx, mut changes) = mpsc::channel(1);
     let mut watches = ConfigWatches::new(&paths, change_tx, no_reload)?;
     let mut discovered =

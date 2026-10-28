@@ -312,7 +312,7 @@ fn run() -> i32 {
 
     let result = runtime.block_on(async {
         #[cfg(target_os = "linux")]
-        if args.len() == 1 && args[0] == "cleanup-tun" {
+        if !dry_run && args.len() == 1 && args[0] == "cleanup-tun" {
             return crate::desktop::cleanup().await;
         }
         process::run(args, dry_run, no_reload).await
