@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added Linux ARMv7 hard-float GNU and static musl release builds, with QEMU smoke checks for the packaged binaries.
+- Hardened binary releases with pinned build tooling and cross images, native macOS smoke checks, tag/version validation, SHA-256 checksums, and GitHub build-provenance attestations. macOS binaries are not yet Developer ID signed or notarized.
+
 ## v0.3.6
 
 - Fixed REALITY connection failures with camouflage targets that use a minimal 28-byte EncryptedExtensions record, including VLESS with Vision. The rustls fork now omits the SNI acknowledgement only for REALITY; ordinary TLS and strict target-record capacity checks are unchanged.
