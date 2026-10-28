@@ -42,6 +42,7 @@ impl ProxyRuntimeProvider {
         let quic_binder = ProxyQuicBinder {
             chain_group: chain_group.clone(),
             memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
+            socket_buffer: crate::resources::limits().quic_socket_buffer,
         };
         Self {
             chain_group,
@@ -53,6 +54,11 @@ impl ProxyRuntimeProvider {
 
     pub fn with_quic_memory(mut self, bytes: usize) -> Self {
         self.quic_binder.memory_bytes = bytes;
+        self
+    }
+
+    pub fn with_quic_socket_buffer(mut self, bytes: usize) -> Self {
+        self.quic_binder.socket_buffer = bytes;
         self
     }
 }
@@ -171,6 +177,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
 struct ProxyQuicBinder {
     chain_group: Arc<ClientChainGroup>,
     memory_bytes: usize,
+    socket_buffer: usize,
 }
 
 impl QuicSocketBinder for ProxyQuicBinder {
@@ -186,6 +193,10 @@ impl QuicSocketBinder for ProxyQuicBinder {
             self.chain_group.select_bind_interface()?.map(str::to_owned),
             Some(local_addr),
         )?;
+        crate::socket_util::set_udp_socket_buffers(
+            socket2::SockRef::from(&socket),
+            self.socket_buffer,
+        );
         crate::quic_endpoint::socket_with_memory(socket.into(), memory)
     }
 }

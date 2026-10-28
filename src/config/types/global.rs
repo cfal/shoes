@@ -32,7 +32,7 @@ impl Default for GlobalLimits {
             quic_send_window: 2 << 20,
             quic_stream_window: 256 << 10,
             quic_dns_memory_bytes: 16 << 20,
-            quic_socket_buffer: 1 << 20,
+            quic_socket_buffer: 8 << 20,
             reload_grace_secs: 300,
         }
     }
@@ -129,6 +129,7 @@ mod tests {
             assert!(result.global_limits.max_streams_per_connection.is_none());
             assert!(result.global_limits.max_udp_destinations.is_none());
             assert!(result.global_limits.quic_memory_bytes.is_none());
+            assert_eq!(result.global_limits.quic_socket_buffer, 8 << 20);
         }
     }
 
@@ -149,6 +150,13 @@ mod tests {
         assert_eq!(result.global_limits.max_connections, Some(1024));
         assert_eq!(result.global_limits.reload_grace_secs, 0);
         assert_eq!(result.configs.len(), 1);
+    }
+
+    #[test]
+    fn quic_socket_buffer_override_is_preserved() {
+        let configs = serde_yaml::from_str("- global_limits: {quic_socket_buffer: 65536}").unwrap();
+        let result = create_server_configs(configs).unwrap();
+        assert_eq!(result.global_limits.quic_socket_buffer, 65536);
     }
 
     #[test]
@@ -176,6 +184,8 @@ mod tests {
             "quic_receive_window: 1",
             "quic_send_window: 67108865",
             "quic_dns_memory_bytes: 0",
+            "quic_socket_buffer: 0",
+            "quic_socket_buffer: 16777217",
             "reload_grace_secs: 86401",
         ] {
             let configs = serde_yaml::from_str(&format!("- global_limits: {{{fields}}}")).unwrap();

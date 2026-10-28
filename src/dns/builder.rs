@@ -533,6 +533,7 @@ fn build_resolver_with_limits(
             connect_timeout: Duration::from_secs(entry.connect_timeout_secs as u64),
             attempts: entry.attempts,
             quic_memory_bytes: limits.quic_dns_memory_bytes,
+            quic_socket_buffer: limits.quic_socket_buffer,
         };
 
         let resolver: Arc<dyn Resolver> = match entry.server {
@@ -615,6 +616,7 @@ fn try_build_hickory_pool(
         connect_timeout: Duration::from_secs(first.connect_timeout_secs as u64),
         attempts: first.attempts,
         quic_memory_bytes: limits.quic_dns_memory_bytes,
+        quic_socket_buffer: limits.quic_socket_buffer,
     };
 
     let descriptions: Vec<String> = entries.iter().map(|e| format!("{:?}", e.server)).collect();
@@ -996,6 +998,7 @@ async fn build_entry_and_plan(
         connect_timeout: Duration::from_secs(spec.connect_timeout_secs as u64),
         attempts: spec.attempts,
         quic_memory_bytes: registry.limits.quic_dns_memory_bytes,
+        quic_socket_buffer: registry.limits.quic_socket_buffer,
     };
 
     // Build plan for hickory-backed resolvers (not system)

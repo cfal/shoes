@@ -23,6 +23,7 @@ use crate::resolver::Resolver as ShoesResolver;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HickoryResolverOptions {
     pub quic_memory_bytes: usize,
+    pub quic_socket_buffer: usize,
     pub ip_strategy: IpStrategy,
     /// Per-request timeout passed to hickory's ResolverOpts.timeout.
     /// None means use hickory's default.
@@ -37,6 +38,7 @@ impl Default for HickoryResolverOptions {
     fn default() -> Self {
         Self {
             quic_memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
+            quic_socket_buffer: crate::resources::limits().quic_socket_buffer,
             ip_strategy: IpStrategy::default(),
             request_timeout: Some(Duration::from_secs(5)),
             connect_timeout: Duration::from_secs(5),
@@ -216,7 +218,8 @@ impl HickoryResolver {
         let config = ResolverConfig::from_parts(None, vec![], ns_configs.clone());
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, bootstrap, options.connect_timeout)
-                .with_quic_memory(options.quic_memory_bytes);
+                .with_quic_memory(options.quic_memory_bytes)
+                .with_quic_socket_buffer(options.quic_socket_buffer);
 
         let mut builder = Resolver::builder_with_config(config, provider.clone());
         let resolver_opts = builder.options_mut();
