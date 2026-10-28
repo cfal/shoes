@@ -24,6 +24,62 @@ Check every resolved consumer, especially Quinn, tokio-rustls, hyper-rustls,
 rustls-platform-verifier, Hickory and Shoes; absence of unused-patch warnings is
 not sufficient. Keep `publish = false` while workspace patches remain.
 
+### smoltcp
+
+The October 2026 refresh rebases the two TCP recovery commits from published
+`cfal/smoltcp` main (`a80fa50dce926117669ef061f55f4d6bdad0904a`) onto upstream
+[`24bda3b4f982625d8453d4360172557d24921c76`](https://github.com/smoltcp-rs/smoltcp/commit/24bda3b4f982625d8453d4360172557d24921c76).
+Their previous upstream base was `72a0d7892d696620541b1147c7cac471d421e554`,
+not the older release-based `fix/tcp-ack-sequence` branch. The new series lives
+on `shoes/tcp-recovery-20261028-GsfiI8`, pinned at
+[`042e568bfa39d0f111a23a4718ec257e474fd1e7`](https://github.com/cfal/smoltcp/commit/042e568bfa39d0f111a23a4718ec257e474fd1e7);
+existing branches and old pins remain intact.
+
+The package version and latest registry release are still **0.14.0**. The new
+upstream change is unreleased [smoltcp #1223](https://github.com/smoltcp-rs/smoltcp/pull/1223):
+defensively clamp the remaining advertised receive window after FIN consumes
+sequence space at a full window. Earlier post-release RTO bounds, zero-window
+timer recovery, failed-fast-retransmission retry and no-std CUBIC fixes were
+already in our pin and remain included. This refresh changes no public API, features, dependencies,
+Rust minimum or platform support.
+
+Preserve the complete recovery patch, not only its persistent send frontier:
+
+- Pure ACKs use the non-rewound frontier; a zero peer window with queued stream
+  data uses SND.UNA, while FIN-only flight retains the frontier.
+- RSTs retain the baseline retransmission cursor. Fast retransmit cannot extend
+  the frontier with unsent data. Keepalive probes use SND.UNA minus one.
+- Probes and empty emissions do not advance the retransmission cursor; failed
+  emission does not advance the send frontier. Socket reuse resets it.
+- Relaxed receive acceptance applies only to empty None/PSH segments, bounded
+  by scaling slack, physical receive capacity and the one-byte lost-FIN allowance.
+
+The exact lost-FIN allowance, FIN-only ACK frontier and RST cursor are retained
+fork policies, not universal RFC or OS behavior. Keepalive sequence placement
+does not establish timer reachability with outstanding data.
+
+Shoes retains explicit CUBIC, IPv4/IPv6, medium-IP and 32-segment assembly.
+Linux TUN transmit offload remains IPv4-only: the interface still does not
+forward IPv6 segmentation metadata. TUN supplies partial TCP checksums when
+offload is enabled; WireGuard's queue device uses software checksums and MTU-sized
+packets without segmentation capabilities. Do not enable new offload paths
+without checking `Device`, tokens, `PacketMeta`, ownership and poll wakeups.
+
+For future refreshes, discover and compare published fork branches before
+rebasing, inspect the complete upstream delta and `range-diff`, and pin the
+tested full SHA in both manifest and lockfile. Run the fork's `ci.sh` matrix,
+`socket::tcp::test::` with Reno/CUBIC, and library tests with the exact Shoes
+feature set. Use separate target directories for baseline comparisons.
+The oversized-frame offload fixture selects no congestion control; a separate
+CUBIC regression checks its real flight limit. This avoids mistaking the old
+fixture's 65 KB expectation under a 2,048-byte CUBIC window for a runtime bug.
+Require deterministic loss/window/FIN/reset regressions as well as Shoes'
+rootless TUN, shared IP-stack, WireGuard, kernel and macOS rootless-TUN checks.
+Neither those tests nor the original [Shoes #197](https://github.com/cfal/shoes/pull/197)
+establish the historical macOS stall's cause or comprehensive Linux/BSD/XNU interoperability.
+
+### nix
+
 The `nix-rust/nix` patch is upstream, not a maintained fork. Published 0.31.3
 still lacks [#2821](https://github.com/nix-rust/nix/pull/2821), despite sharing
 the pinned commit's package version. With libc 0.2.191 and Shoes' iOS features

@@ -2865,7 +2865,7 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 [[package]]
 name = "smoltcp"
 version = "0.14.0"
-source = "git+https://github.com/cfal/smoltcp?rev=a80fa50dce926117669ef061f55f4d6bdad0904a#a80fa50dce926117669ef061f55f4d6bdad0904a"
+source = "git+https://github.com/cfal/smoltcp?rev=042e568bfa39d0f111a23a4718ec257e474fd1e7#042e568bfa39d0f111a23a4718ec257e474fd1e7"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
