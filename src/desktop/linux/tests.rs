@@ -707,16 +707,18 @@ async fn kernel_capture() -> io::Result<()> {
             }))?;
             assert!(
                 ingress
-                    .start_redirects(&unexpanded, resolver.clone())?
+                    .start_redirects(&unexpanded, resolver.clone(), None)?
                     .is_empty()
             );
         }
-        let mut tasks = ingress.start_redirects(&config, resolver.clone())?;
+        let admission = Ingress::tcp_admission(&config);
+        let mut tasks = ingress.start_redirects(&config, resolver.clone(), admission.clone())?;
         tasks.push(
             crate::tun::start_tun_server_retained(
                 config.clone(),
                 resolver.clone(),
                 ingress.device.clone(),
+                admission,
             )
             .await?,
         );
@@ -811,19 +813,21 @@ async fn kernel_capture() -> io::Result<()> {
             let _ = task.await;
         }
         assert_eq!(session.record.ifindex, index);
+        let mut limited = config.clone();
+        limited.resource_limits.max_tcp_connections = Some(1);
+        let admission = Ingress::tcp_admission(&limited);
         tasks.push(
             crate::tun::start_tun_server_retained(
-                config.clone(),
+                limited.clone(),
                 resolver.clone(),
                 ingress.device.clone(),
+                admission.clone(),
             )
             .await?,
         );
-        let mut limited = config.clone();
-        limited.resource_limits.max_tcp_connections = Some(1);
-        tasks.extend(ingress.start_redirects(&limited, resolver)?);
+        tasks.extend(ingress.start_redirects(&limited, resolver, admission.clone())?);
         if redirect {
-            redirect_dual_stack_limit(port, &session).await?;
+            redirect_dual_stack_limit(port, &session, admission.as_ref().unwrap()).await?;
         }
         session.reconcile().await?;
         session.deactivate().await?;
@@ -1014,10 +1018,16 @@ async fn resolved_integration(udp_limit: usize, redirect: bool) -> io::Result<()
     let mut session = Session::prepare(spec).await?;
     session.prepare_network().await?;
     let ingress = session.ingress().unwrap();
-    let mut tasks = ingress.start_redirects(&config, Arc::new(Answer))?;
+    let admission = Ingress::tcp_admission(&config);
+    let mut tasks = ingress.start_redirects(&config, Arc::new(Answer), admission.clone())?;
     tasks.push(
-        crate::tun::start_tun_server_retained(config, Arc::new(Answer), ingress.device.clone())
-            .await?,
+        crate::tun::start_tun_server_retained(
+            config,
+            Arc::new(Answer),
+            ingress.device.clone(),
+            admission,
+        )
+        .await?,
     );
     session.activate().await?;
     let mut query = Message::query();
@@ -1212,7 +1222,11 @@ async fn tun_subnet_rejected(session: &Session, active: bool) -> io::Result<()> 
     Ok(())
 }
 
-async fn redirect_dual_stack_limit(port: u16, session: &Session) -> io::Result<()> {
+async fn redirect_dual_stack_limit(
+    port: u16,
+    session: &Session,
+    admission: &tokio::sync::Semaphore,
+) -> io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let before = redirect_counts(session).await?;
     let mut first = tokio::net::TcpStream::connect(("198.51.100.2", port)).await?;
@@ -1220,6 +1234,15 @@ async fn redirect_dual_stack_limit(port: u16, session: &Session) -> io::Result<(
     let mut bytes = [0; 3];
     tokio::time::timeout(Duration::from_secs(3), first.read_exact(&mut bytes)).await??;
     assert_eq!(&bytes, b"one");
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(("10.233.0.2", 53)),
+        )
+        .await
+        .is_err(),
+        "TUN admitted TCP while REDIRECT held the only permit",
+    );
     let mut second = tokio::net::TcpStream::connect(("fd00:2::2", port)).await?;
     let _ = second.write_all(b"two").await;
     assert!(
@@ -1236,6 +1259,46 @@ async fn redirect_dual_stack_limit(port: u16, session: &Session) -> io::Result<(
     assert!(
         after[0] > before[0] && after[1] > before[1],
         "both flows must traverse REDIRECT: {before:?} -> {after:?}"
+    );
+    socket2::SockRef::from(&first).set_linger(Some(Duration::ZERO))?;
+    drop(first);
+    drop(
+        tokio::time::timeout(Duration::from_secs(3), admission.acquire())
+            .await?
+            .unwrap(),
+    );
+    let mut dns = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(("fd73::2", 53)),
+    )
+    .await??;
+    let query = hickory_resolver::proto::op::Message::query()
+        .to_vec()
+        .unwrap();
+    dns.write_u16(query.len() as u16).await?;
+    dns.write_all(&query).await?;
+    let length = tokio::time::timeout(Duration::from_secs(3), dns.read_u16()).await??;
+    let mut answer = vec![0; length as usize];
+    dns.read_exact(&mut answer).await?;
+    assert_eq!(
+        hickory_resolver::proto::op::Message::from_vec(&answer)
+            .unwrap()
+            .response_code,
+        hickory_resolver::proto::op::ResponseCode::FormErr,
+    );
+    assert_eq!(admission.available_permits(), 0);
+    let mut redirected = tokio::net::TcpStream::connect(("198.51.100.2", port)).await?;
+    let _ = redirected.write_all(b"two").await;
+    assert!(
+        !matches!(tokio::time::timeout(Duration::from_secs(2), redirected.read(&mut bytes)).await?, Ok(n) if n > 0),
+        "REDIRECT admitted TCP while TUN held the only permit",
+    );
+    socket2::SockRef::from(&dns).set_linger(Some(Duration::ZERO))?;
+    drop(dns);
+    drop(
+        tokio::time::timeout(Duration::from_secs(3), admission.acquire())
+            .await?
+            .unwrap(),
     );
     Ok(())
 }

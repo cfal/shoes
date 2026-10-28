@@ -162,7 +162,8 @@ fn stack_at_wait(tun: OwnedFd) -> (TcpStackDirect, GateControl) {
     let (gate, control) = TestGate::new();
     receiver.before_wait = Some(gate);
     set_nonblocking(tun.as_raw_fd()).unwrap();
-    let stack = TcpStackDirect::start(tun, TunServerConfig::new(), wake, receiver, false).unwrap();
+    let stack =
+        TcpStackDirect::start(tun, TunServerConfig::new(), wake, receiver, false, None).unwrap();
     control.wait();
     (stack, control)
 }
@@ -328,7 +329,10 @@ async fn reset_half_open_releases_admission_before_the_next_packet() {
         }
         let mut config = TunServerConfig::new();
         config.resource_limits.max_tcp_connections = Some(1);
-        let mut stack = TcpStackDirect::with_config(tun.into(), config).unwrap();
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut stack =
+            TcpStackDirect::with_offload(tun.into(), config, false, Some(admission.clone()))
+                .unwrap();
         let mut rx = stack.take_tcp_rx().unwrap();
         let mut reply = [0; 1500];
         let n = peer.recv(&mut reply).unwrap();
@@ -348,10 +352,13 @@ async fn reset_half_open_releases_admission_before_the_next_packet() {
         let mut received = [0; 11];
         second.connection.read_exact(&mut received).await.unwrap();
         assert_eq!(&received, b"second peer");
+        assert_eq!(admission.available_permits(), 0);
         assert!(matches!(
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+        drop(stack);
+        assert_eq!(admission.available_permits(), 1);
     })
     .await
     .unwrap();
@@ -395,7 +402,9 @@ async fn malformed_syns_never_publish_connections() {
     }
     let mut config = TunServerConfig::new();
     config.resource_limits.max_tcp_connections = Some(1);
-    let mut stack = TcpStackDirect::with_config(tun.into(), config).unwrap();
+    let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut stack =
+        TcpStackDirect::with_offload(tun.into(), config, false, Some(admission.clone())).unwrap();
     let mut buffer = [0; 1500];
     let n = peer.recv(&mut buffer).unwrap();
     let ip = Ipv4Packet::new_checked(&buffer[..n]).unwrap();
@@ -414,10 +423,13 @@ async fn malformed_syns_never_publish_connections() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(admission.available_permits(), 0);
     assert!(matches!(
         rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
+    drop(stack);
+    assert_eq!(admission.available_permits(), 1);
 }
 
 #[test]
@@ -440,6 +452,7 @@ fn handshake_timeout_is_lifted_only_when_the_connection_is_published() {
             create_tcp_connection(src, dst, &mut sockets, &Wake::new().unwrap().0, 4096).unwrap();
         let handle = incoming.handle;
         let mut entry = SocketInfo {
+            _permit: None,
             control: incoming.control,
             src_addr: src,
             dst_addr: dst,
@@ -611,6 +624,7 @@ fn time_wait_cleanup_does_not_depend_on_egress_progress() {
     let mut sockets = HashMap::from([(
         handle,
         SocketInfo {
+            _permit: None,
             control: control.clone(),
             src_addr,
             dst_addr,
@@ -749,6 +763,7 @@ fn closed_socket_keeps_its_pending_reset_until_a_complete_egress_sweep() {
         sockets.insert(
             handle,
             SocketInfo {
+                _permit: None,
                 control: Arc::new(TcpConnectionControl::new(1024, 1024)),
                 src_addr,
                 dst_addr,
@@ -1121,6 +1136,7 @@ fn socket_owner_drop_wakes_readers_and_writers() {
     let control = Arc::new(TcpConnectionControl::new(1, 1));
     let mut conn = TcpConnection::new(control.clone(), Wake::new().unwrap().0);
     let info = SocketInfo {
+        _permit: None,
         control: control.clone(),
         src_addr: "127.0.0.1:1".parse().unwrap(),
         dst_addr: "127.0.0.1:2".parse().unwrap(),
@@ -1171,8 +1187,15 @@ fn idle_stack_delivers_udp_output_without_inbound_traffic() {
     receiver.before_wait = Some(wait_gate);
     wake.notify();
     tun.set_nonblocking(true).unwrap();
-    let mut stack =
-        TcpStackDirect::start(tun.into(), TunServerConfig::new(), wake, receiver, false).unwrap();
+    let mut stack = TcpStackDirect::start(
+        tun.into(),
+        TunServerConfig::new(),
+        wake,
+        receiver,
+        false,
+        None,
+    )
+    .unwrap();
     setup.wait();
     let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
     stack.set_udp_response_tx(rx);

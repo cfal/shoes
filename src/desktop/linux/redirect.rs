@@ -50,19 +50,23 @@ impl Ingress {
         Ok(ports)
     }
 
+    pub(crate) fn tcp_admission(config: &TunConfig) -> Option<Arc<Semaphore>> {
+        config
+            .resource_limits
+            .tcp_connection_limit()
+            .map(|limit| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))))
+    }
+
     pub(crate) fn start_redirects(
         &self,
         config: &TunConfig,
         resolver: Arc<dyn Resolver>,
+        admission: Option<Arc<Semaphore>>,
     ) -> io::Result<Vec<JoinHandle<io::Result<()>>>> {
         if self.listeners.is_empty() {
             return Ok(Vec::new());
         }
         let selector = crate::tun::proxy_selector(config, resolver.clone())?;
-        let admission = config
-            .resource_limits
-            .tcp_connection_limit()
-            .map(|limit| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))));
         Ok(self
             .listeners
             .iter()
