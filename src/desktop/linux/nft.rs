@@ -11,6 +11,10 @@ fn ct(key: &str) -> Value {
     json!({"ct": {"key": key}})
 }
 
+fn payload(protocol: &str, field: &str) -> Value {
+    json!({"payload": {"protocol": protocol, "field": field}})
+}
+
 fn masked(value: Value, mask: u32) -> Value {
     json!({"&": [value, mask]})
 }
@@ -39,7 +43,15 @@ fn prefixes(networks: &[IpNetwork], ipv6: bool) -> Vec<Value> {
             unique.push(network);
         }
     }
-    unique.into_iter().map(|network| json!({"prefix": {"addr": network.network().to_string(), "len": network.prefix()}})).collect()
+    unique
+        .into_iter()
+        .map(|network| {
+            json!({"prefix": {
+                "addr": network.network().to_string(),
+                "len": network.prefix()
+            }})
+        })
+        .collect()
 }
 
 pub(super) fn install(
@@ -50,15 +62,15 @@ pub(super) fn install(
     redirect: [Option<u16>; 2],
 ) -> Value {
     let mut commands = vec![json!({"create": {"table": {"family": "inet", "name": table}}})];
-    for (name, kind, hook, priority) in [
-        ("output", Some("route"), Some("output"), Some(-150)),
-        ("select", None, None, None),
-        ("capture", None, None, None),
-        ("redirect", Some("nat"), Some("output"), Some(-100)),
-        ("guard", Some("filter"), Some("input"), Some(-10)),
+    for (name, hook) in [
+        ("output", Some(("route", "output", -150))),
+        ("select", None),
+        ("capture", None),
+        ("redirect", Some(("nat", "output", -100))),
+        ("guard", Some(("filter", "input", -10))),
     ] {
         let mut chain = json!({"family": "inet", "table": table, "name": name});
-        if let (Some(kind), Some(hook), Some(priority)) = (kind, hook, priority) {
+        if let Some((kind, hook, priority)) = hook {
             chain["type"] = json!(kind);
             chain["hook"] = json!(hook);
             chain["prio"] = json!(priority);
@@ -102,15 +114,11 @@ pub(super) fn install(
                         matches(masked(meta("mark"), mask), "==", json!(bypass)),
                         matches(meta("oifname"), "==", json!(spec.name)),
                         matches(
-                            json!({"payload": {"protocol": if address.is_ipv4() { "ip" } else { "ip6" }, "field": "daddr"}}),
+                            payload(if address.is_ipv4() { "ip" } else { "ip6" }, "daddr"),
                             "==",
                             json!(address),
                         ),
-                        matches(
-                            json!({"payload": {"protocol": protocol, "field": "dport"}}),
-                            "==",
-                            json!(53),
-                        ),
+                        matches(payload(protocol, "dport"), "==", json!(53)),
                         json!({"return": null}),
                     ],
                 );
@@ -176,7 +184,7 @@ pub(super) fn install(
             "reserved",
             vec![
                 matches(
-                    json!({"payload": {"protocol": family, "field": "daddr"}}),
+                    payload(family, "daddr"),
                     "==",
                     json!({"set": prefixes(&networks, family == "ip6")}),
                 ),
@@ -184,20 +192,12 @@ pub(super) fn install(
             ],
         );
     }
-    for family in ["ip", "ip6"] {
+    for (family, set) in [("ip", "@include4"), ("ip6", "@include6")] {
         rule(
             "output",
             "selected-address",
             vec![
-                matches(
-                    json!({"payload": {"protocol": family, "field": "daddr"}}),
-                    "==",
-                    json!(if family == "ip" {
-                        "@include4"
-                    } else {
-                        "@include6"
-                    }),
-                ),
+                matches(payload(family, "daddr"), "==", json!(set)),
                 json!({"goto": {"target": "select"}}),
             ],
         );
@@ -229,27 +229,19 @@ pub(super) fn install(
         "not-tcp-establishment",
         vec![
             matches(
-                json!({"&": [{"payload": {"protocol": "tcp", "field": "flags"}}, ["syn", "ack"]]}),
+                json!({"&": [payload("tcp", "flags"), ["syn", "ack"]]}),
                 "!=",
                 json!("syn"),
             ),
             json!({"return": null}),
         ],
     );
-    for family in ["ip", "ip6"] {
+    for (family, set) in [("ip", "@exclude4"), ("ip6", "@exclude6")] {
         rule(
             "select",
             "excluded-address",
             vec![
-                matches(
-                    json!({"payload": {"protocol": family, "field": "daddr"}}),
-                    "==",
-                    json!(if family == "ip" {
-                        "@exclude4"
-                    } else {
-                        "@exclude6"
-                    }),
-                ),
+                matches(payload(family, "daddr"), "==", json!(set)),
                 json!({"return": null}),
             ],
         );
@@ -260,30 +252,18 @@ pub(super) fn install(
                 "select",
                 "dns",
                 vec![
-                    matches(
-                        json!({"payload": {"protocol": protocol, "field": "dport"}}),
-                        "==",
-                        json!(53),
-                    ),
+                    matches(payload(protocol, "dport"), "==", json!(53)),
                     json!({"goto": {"target": "capture"}}),
                 ],
             );
         }
     }
-    for family in ["ip", "ip6"] {
+    for (family, set) in [("ip", "@onlink4"), ("ip6", "@onlink6")] {
         rule(
             "select",
             "onlink",
             vec![
-                matches(
-                    json!({"payload": {"protocol": family, "field": "daddr"}}),
-                    "==",
-                    json!(if family == "ip" {
-                        "@onlink4"
-                    } else {
-                        "@onlink6"
-                    }),
-                ),
+                matches(payload(family, "daddr"), "==", json!(set)),
                 json!({"return": null}),
             ],
         );
@@ -333,11 +313,7 @@ pub(super) fn install(
                 json!({"redirect": {"port": port}}),
             ],
         );
-        let destination = matches(
-            json!({"payload": {"protocol": "tcp", "field": "dport"}}),
-            "==",
-            json!(port),
-        );
+        let destination = matches(payload("tcp", "dport"), "==", json!(port));
         for (label, condition) in [
             (
                 "not-dnat",
@@ -353,7 +329,7 @@ pub(super) fn install(
                 label,
                 vec![
                     matches(
-                        json!({"payload": {"protocol": if family == "ipv4" { "ip" } else { "ip6" }, "field": "daddr"}}),
+                        payload(if family == "ipv4" { "ip" } else { "ip6" }, "daddr"),
                         "==",
                         json!(if family == "ipv4" { "127.0.0.1" } else { "::1" }),
                     ),
@@ -401,7 +377,7 @@ pub(super) fn with_onlink(listing: &Value, networks: &[IpNetwork]) -> Value {
     listing
 }
 
-pub(super) fn same_policy(listing: &Value, expected: &Value) -> bool {
+fn canonical_policy(document: &Value) -> Option<std::collections::BTreeMap<String, Vec<Value>>> {
     fn normalize(value: &mut Value) {
         match value {
             Value::Object(object) => {
@@ -431,53 +407,58 @@ pub(super) fn same_policy(listing: &Value, expected: &Value) -> bool {
             _ => {}
         }
     }
-    fn canonical(document: &Value) -> Option<std::collections::BTreeMap<String, Vec<Value>>> {
-        let entries = document.get("nftables")?.as_array()?;
-        let mut objects = std::collections::BTreeMap::<String, Vec<Value>>::new();
-        for entry in entries {
-            let entry = entry
-                .get("add")
-                .or_else(|| entry.get("create"))
-                .unwrap_or(entry);
-            if entry.get("metainfo").is_some() {
-                continue;
-            }
-            let entry = entry.as_object()?;
-            if entry.len() != 1 {
-                return None;
-            }
-            let (kind, value) = entry.iter().next()?;
-            if !["table", "chain", "set", "rule"].contains(&kind.as_str()) {
-                return None;
-            }
-            let mut value = value.clone();
-            normalize(&mut value);
-            let object = value.as_object_mut()?;
-            object.remove("handle");
-            if kind == "set" {
-                let elements = object.entry("elem").or_insert(json!([])).as_array_mut()?;
-                elements.sort_by_key(Value::to_string);
-            }
-            if kind == "rule" {
-                for expression in object.get_mut("expr")?.as_array_mut()? {
-                    if expression.get("counter").is_some() {
-                        *expression = json!({"counter": null});
-                    }
+    let entries = document.get("nftables")?.as_array()?;
+    let mut objects = std::collections::BTreeMap::<String, Vec<Value>>::new();
+    for entry in entries {
+        let entry = entry
+            .get("add")
+            .or_else(|| entry.get("create"))
+            .unwrap_or(entry);
+        if entry.get("metainfo").is_some() {
+            continue;
+        }
+        let entry = entry.as_object()?;
+        if entry.len() != 1 {
+            return None;
+        }
+        let (kind, value) = entry.iter().next()?;
+        if !["table", "chain", "set", "rule"].contains(&kind.as_str()) {
+            return None;
+        }
+        let mut value = value.clone();
+        normalize(&mut value);
+        let object = value.as_object_mut()?;
+        object.remove("handle");
+        if kind == "set" {
+            let elements = object.entry("elem").or_insert(json!([])).as_array_mut()?;
+            elements.sort_by_key(Value::to_string);
+        }
+        if kind == "rule" {
+            for expression in object.get_mut("expr")?.as_array_mut()? {
+                if expression.get("counter").is_some() {
+                    *expression = json!({"counter": null});
                 }
             }
-            let identity = if kind == "rule" {
-                object.get("chain")?.as_str()?
-            } else {
-                object.get("name")?.as_str()?
-            };
-            objects
-                .entry(format!("{kind}:{identity}"))
-                .or_default()
-                .push(value);
         }
-        Some(objects)
+        let identity = if kind == "rule" {
+            object.get("chain")?.as_str()?
+        } else {
+            object.get("name")?.as_str()?
+        };
+        objects
+            .entry(format!("{kind}:{identity}"))
+            .or_default()
+            .push(value);
     }
-    match (canonical(listing), canonical(expected)) {
+    Some(objects)
+}
+
+pub(super) fn valid_policy(listing: &Value) -> bool {
+    canonical_policy(listing).is_some()
+}
+
+pub(super) fn same_policy(listing: &Value, expected: &Value) -> bool {
+    match (canonical_policy(listing), canonical_policy(expected)) {
         (Some(actual), Some(expected)) => actual == expected,
         _ => false,
     }

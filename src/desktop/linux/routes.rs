@@ -151,14 +151,7 @@ pub(super) async fn preflight(handle: &Handle, spec: &Spec) -> io::Result<()> {
     for ipv6 in [false, true] {
         for rule in rules(handle, ipv6).await? {
             check_precedence(&rule, spec)?;
-            if rule.attributes.iter().any(|attribute| {
-                matches!(attribute,
-                RuleAttribute::Priority(priority) if *priority == spec.linux.rule_priority)
-            }) || rule.attributes.iter().any(|attribute| {
-                matches!(attribute,
-                    RuleAttribute::Table(table) if *table == spec.linux.table)
-            }) || u32::from(rule.header.table) == spec.linux.table
-            {
+            if references_reservation(&rule, spec) {
                 return Err(invalid(
                     "managed TUN rule priority or routing table is already referenced",
                 ));
@@ -220,6 +213,27 @@ pub(super) async fn preflight(handle: &Handle, spec: &Spec) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn references_reservation(rule: &RuleMessage, spec: &Spec) -> bool {
+    rule.attributes
+        .contains(&RuleAttribute::Priority(spec.linux.rule_priority))
+        || rule
+            .attributes
+            .contains(&RuleAttribute::Table(spec.linux.table))
+        || u32::from(rule.header.table) == spec.linux.table
+}
+
+fn has_next_hop(route: &RouteMessage) -> bool {
+    route.attributes.iter().any(|attribute| {
+        matches!(
+            attribute,
+            RouteAttribute::Gateway(_)
+                | RouteAttribute::Via(_)
+                | RouteAttribute::MultiPath(_)
+                | RouteAttribute::NhId(_)
+        )
+    })
 }
 
 fn check_precedence(rule: &RuleMessage, spec: &Spec) -> io::Result<()> {
@@ -384,14 +398,7 @@ pub(super) async fn check(handle: &Handle, spec: &Spec, index: u32, alias: &str)
         }
         let reserved: Vec<_> = rules
             .iter()
-            .filter(|rule| {
-                rule.attributes
-                    .contains(&RuleAttribute::Priority(spec.linux.rule_priority))
-                    || rule
-                        .attributes
-                        .contains(&RuleAttribute::Table(spec.linux.table))
-                    || u32::from(rule.header.table) == spec.linux.table
-            })
+            .filter(|rule| references_reservation(rule, spec))
             .collect();
         if reserved.len() != 1 || !same_rule(reserved[0], &rule(spec, ipv6)) {
             return Err(io::Error::other(
@@ -408,15 +415,7 @@ pub(super) async fn check(handle: &Handle, spec: &Spec, index: u32, alias: &str)
             || owned[0].header.kind != RouteType::Unicast
             || owned[0].header.destination_prefix_length != 0
             || !owned[0].attributes.contains(&RouteAttribute::Oif(index))
-            || owned[0].attributes.iter().any(|attribute| {
-                matches!(
-                    attribute,
-                    RouteAttribute::Gateway(_)
-                        | RouteAttribute::Via(_)
-                        | RouteAttribute::MultiPath(_)
-                        | RouteAttribute::NhId(_)
-                )
-            })
+            || has_next_hop(owned[0])
         {
             return Err(io::Error::other(
                 "managed TUN routing table disappeared or changed",
@@ -434,15 +433,7 @@ pub(super) async fn on_link(handle: &Handle, index: u32) -> io::Result<Vec<IpNet
                 || route.header.kind != RouteType::Unicast
                 || route.header.destination_prefix_length == 0
                 || route.attributes.contains(&RouteAttribute::Oif(index))
-                || route.attributes.iter().any(|attribute| {
-                    matches!(
-                        attribute,
-                        RouteAttribute::Gateway(_)
-                            | RouteAttribute::Via(_)
-                            | RouteAttribute::MultiPath(_)
-                            | RouteAttribute::NhId(_)
-                    )
-                })
+                || has_next_hop(&route)
             {
                 continue;
             }

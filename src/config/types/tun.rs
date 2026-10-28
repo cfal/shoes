@@ -280,15 +280,30 @@ pub struct TunConfig {
 }
 
 impl TunConfig {
+    pub(crate) fn has_managed_options(&self) -> bool {
+        self.auto_route
+            || self.auto_redirect
+            || self.auto_dns.is_some()
+            || self.linux.is_some()
+            || !self.addresses.is_empty()
+            || !self.bootstrap_dns.is_empty()
+            || !self.route_address.is_empty()
+            || !self.route_exclude_address.is_empty()
+    }
+
     pub(crate) fn virtual_dns_addresses(&self) -> impl Iterator<Item = IpAddr> + '_ {
         self.addresses
             .iter()
             .filter(|_| self.auto_route && self.auto_dns.unwrap_or(true))
-            .filter_map(|network| match network.ip() {
-                IpAddr::V4(ip) => u32::from(ip).checked_add(1).map(|ip| IpAddr::V4(ip.into())),
-                IpAddr::V6(ip) => u128::from(ip)
-                    .checked_add(1)
-                    .map(|ip| IpAddr::V6(ip.into())),
-            })
+            .filter_map(|network| next_ip_address(network.ip()))
+    }
+}
+
+pub(crate) fn next_ip_address(address: IpAddr) -> Option<IpAddr> {
+    match address {
+        IpAddr::V4(ip) => u32::from(ip).checked_add(1).map(|ip| IpAddr::V4(ip.into())),
+        IpAddr::V6(ip) => u128::from(ip)
+            .checked_add(1)
+            .map(|ip| IpAddr::V6(ip.into())),
     }
 }

@@ -1,6 +1,14 @@
 use super::*;
 use serde_json::json;
 
+const KERNEL_TEST_ARGS: [&str; 5] = [
+    "--exact",
+    "desktop::linux::tests::managed_kernel_capture_and_cleanup",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1",
+];
+
 fn configuration(redirect: bool) -> crate::config::TunConfig {
     serde_json::from_value(json!({
         "device_name":"shoes0", "auto_route":true, "auto_redirect":redirect,
@@ -95,6 +103,11 @@ fn managed_firewall_schema_preserves_masks_reply_exemption_and_exact_ownership()
     );
     let typed: nftables::schema::Nftables<'_> = serde_json::from_value(policy.clone()).unwrap();
     let serialized = serde_json::to_value(typed).unwrap();
+    assert_eq!(
+        command::encode_nft(policy.clone()).unwrap(),
+        serde_json::to_vec(&serialized).unwrap(),
+    );
+    assert!(nft::valid_policy(&serialized));
     assert!(nft::same_policy(&serialized, &policy), "{serialized}");
     let text = serialized.to_string();
     assert!(text.contains("reply"));
@@ -112,6 +125,33 @@ fn managed_firewall_schema_preserves_masks_reply_exemption_and_exact_ownership()
         nft::remove("shoes_test"),
     ] {
         serde_json::from_value::<nftables::schema::Nftables<'_>>(batch).unwrap();
+    }
+}
+
+#[test]
+fn firewall_readback_validation_preserves_self_comparison_semantics() {
+    for (listing, valid) in [
+        (json!({}), false),
+        (json!({"nftables": null}), false),
+        (json!({"nftables": []}), true),
+        (json!({"nftables": [{"metainfo": {}}]}), true),
+        (json!({"nftables": [{"unknown": {}}]}), false),
+        (json!({"nftables": [{"table": {}, "chain": {}}]}), false),
+        (json!({"nftables": [{"table": null}]}), false),
+        (json!({"nftables": [{"table": {}}]}), false),
+        (json!({"nftables": [{"table": {"name": "owned"}}]}), true),
+        (
+            json!({"nftables": [{"set": {"name": "onlink4", "elem": null}}]}),
+            false,
+        ),
+        (json!({"nftables": [{"rule": {"chain": "output"}}]}), false),
+        (
+            json!({"nftables": [{"rule": {"chain": "output", "expr": []}}]}),
+            true,
+        ),
+    ] {
+        assert_eq!(nft::valid_policy(&listing), valid, "{listing}");
+        assert_eq!(nft::same_policy(&listing, &listing), valid, "{listing}");
     }
 }
 
@@ -291,13 +331,7 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
                 .map(|root| format!("SHOES_RESOLVED_ROOT={root}")),
         )
         .arg(std::env::current_exe()?)
-        .args([
-            "--exact",
-            "desktop::linux::tests::managed_kernel_capture_and_cleanup",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(KERNEL_TEST_ARGS)
         .output()?;
     assert!(
         output.status.success(),
@@ -704,13 +738,7 @@ async fn resolved_integration(udp_limit: usize) -> io::Result<()> {
 async fn orphan_helper_recovery() -> io::Result<()> {
     let mut child = tokio::process::Command::new(std::env::current_exe()?)
         .env("SHOES_ORPHAN_HELPER", "1")
-        .args([
-            "--exact",
-            "desktop::linux::tests::managed_kernel_capture_and_cleanup",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(KERNEL_TEST_ARGS)
         .kill_on_drop(true)
         .spawn()?;
     let pid: i32 = tokio::time::timeout(Duration::from_secs(10), async {
@@ -953,13 +981,7 @@ async fn process_recovery(port: u16) -> io::Result<()> {
         write(&config)?;
         let mut child = tokio::process::Command::new(std::env::current_exe()?)
             .env("SHOES_MANAGED_PROCESS_CONFIG", path)
-            .args([
-                "--exact",
-                "desktop::linux::tests::managed_kernel_capture_and_cleanup",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(KERNEL_TEST_ARGS)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)

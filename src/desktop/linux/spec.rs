@@ -4,7 +4,10 @@ use std::net::{IpAddr, SocketAddr};
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, TunConfig, tun::LinuxTunOptions};
+use crate::config::{
+    Config, TunConfig,
+    tun::{LinuxTunOptions, next_ip_address},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,25 +34,19 @@ impl Spec {
     pub(crate) fn from_configs(configs: &[Config]) -> io::Result<Option<Self>> {
         let mut selected = None;
         for config in configs {
-            if let Config::TunServer(tun) = config {
-                if !tun.auto_route {
-                    if tun.auto_redirect
-                        || tun.auto_dns.is_some()
-                        || tun.linux.is_some()
-                        || !tun.bootstrap_dns.is_empty()
-                        || !tun.addresses.is_empty()
-                        || !tun.route_address.is_empty()
-                        || !tun.route_exclude_address.is_empty()
-                    {
-                        return Err(invalid("TUN network automation options require auto_route"));
-                    }
-                    continue;
+            let Config::TunServer(tun) = config else {
+                continue;
+            };
+            if !tun.auto_route {
+                if tun.has_managed_options() {
+                    return Err(invalid("TUN network automation options require auto_route"));
                 }
-                if selected.is_some() {
-                    return Err(invalid("only one auto_route TUN is supported per process"));
-                }
-                selected = Some(Self::new(tun)?);
+                continue;
             }
+            if selected.is_some() {
+                return Err(invalid("only one auto_route TUN is supported per process"));
+            }
+            selected = Some(Self::new(tun)?);
         }
         Ok(selected)
     }
@@ -190,15 +187,8 @@ impl Spec {
         self.addresses
             .iter()
             .map(|network| {
-                let ip = match network.ip() {
-                    IpAddr::V4(address) => u32::from(address)
-                        .checked_add(1)
-                        .map(|ip| IpAddr::V4(ip.into())),
-                    IpAddr::V6(address) => u128::from(address)
-                        .checked_add(1)
-                        .map(|ip| IpAddr::V6(ip.into())),
-                }
-                .ok_or_else(|| invalid("TUN address has no adjacent DNS address"))?;
+                let ip = next_ip_address(network.ip())
+                    .ok_or_else(|| invalid("TUN address has no adjacent DNS address"))?;
                 if !network.contains(ip)
                     || matches!(network, IpNetwork::V4(v4) if IpAddr::V4(v4.broadcast()) == ip)
                 {

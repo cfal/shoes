@@ -154,6 +154,25 @@ async fn real_interception_rejects_unsupported_operations_before_forwarding() {
 }
 
 #[tokio::test]
+async fn interception_drops_responses_before_synthesis_or_forwarding() {
+    let real = Arc::new(RecordingResolver::default());
+    for context in [
+        DnsContext::real(real.clone()),
+        DnsContext::new(Default::default(), real.clone()).unwrap(),
+    ] {
+        for tcp in [false, true] {
+            let response = Message::from_vec(&query(RecordType::A))
+                .unwrap()
+                .into_response()
+                .to_vec()
+                .unwrap();
+            assert!(context.exchange(response, tcp).await.unwrap().is_none());
+        }
+    }
+    assert_eq!(real.exchanges.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn signed_requests_are_refused_without_forwarding() {
     use hickory_resolver::proto::rr::{RData, Record, rdata::TSIG, rdata::tsig::TsigAlgorithm};
 

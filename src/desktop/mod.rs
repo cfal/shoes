@@ -104,21 +104,13 @@ pub(crate) fn validate_config(configs: &[crate::config::Config]) -> io::Result<(
     }
     #[cfg(not(target_os = "linux"))]
     for config in configs {
-        if let crate::config::Config::TunServer(tun) = config {
-            if tun.auto_route
-                || tun.auto_redirect
-                || tun.auto_dns.is_some()
-                || tun.linux.is_some()
-                || !tun.addresses.is_empty()
-                || !tun.bootstrap_dns.is_empty()
-                || !tun.route_address.is_empty()
-                || !tun.route_exclude_address.is_empty()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "managed TUN is currently supported only on Linux",
-                ));
-            }
+        if let crate::config::Config::TunServer(tun) = config
+            && tun.has_managed_options()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "managed TUN is currently supported only on Linux",
+            ));
         }
     }
     Ok(())

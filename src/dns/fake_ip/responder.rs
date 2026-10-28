@@ -7,7 +7,7 @@ use hickory_resolver::proto::rr::{DNSClass, RData, Record, RecordType, rdata};
 
 use super::pool::canonical_hostname;
 use super::{FakeIpOptions, FakeIpPool, HttpsRecords, MissingFamily};
-pub(in crate::dns) use crate::dns::message::UDP_PAYLOAD_LIMIT;
+use crate::dns::message::UDP_PAYLOAD_LIMIT;
 
 pub const SYNTHETIC_TTL: u32 = 60;
 

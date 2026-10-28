@@ -75,19 +75,19 @@ pub(super) async fn run(
         )?;
         child.wait().await
     })
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{executable} timed out; completion requires reconciliation"),
+        ))
+    });
     let status = match result {
-        Ok(Ok(status)) => status,
-        failure => {
+        Ok(status) => status,
+        Err(error) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(match failure {
-                Ok(Err(error)) => error,
-                _ => io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("{executable} timed out; completion requires reconciliation"),
-                ),
-            });
+            return Err(error);
         }
     };
     if output.len() as u64 > OUTPUT_LIMIT || error.len() as u64 > OUTPUT_LIMIT {
@@ -109,9 +109,13 @@ pub(super) async fn nft(
     executable: &str,
     batch: serde_json::Value,
 ) -> io::Result<()> {
-    let typed: nftables::schema::Nftables<'_> =
-        serde_json::from_value(batch).map_err(io::Error::other)?;
-    let input = serde_json::to_vec(&typed).map_err(io::Error::other)?;
+    let input = encode_nft(batch)?;
     run(lease, executable, &["-j", "-f", "-"], &input).await?;
     Ok(())
+}
+
+pub(super) fn encode_nft(batch: serde_json::Value) -> io::Result<Vec<u8>> {
+    let typed: nftables::schema::Nftables<'_> =
+        serde_json::from_value(batch).map_err(io::Error::other)?;
+    serde_json::to_vec(&typed).map_err(io::Error::other)
 }

@@ -1116,6 +1116,48 @@ fn tun_dns_interception_override_roundtrips() {
     }
 }
 
+#[test]
+fn tun_managed_options_distinguish_absent_and_disabled_settings() {
+    let manual = serde_json::json!({
+        "device_fd": 42,
+        "auto_route": false,
+        "auto_redirect": false,
+        "dns_hijack": true,
+    });
+    let tun: TunConfig = serde_json::from_value(manual.clone()).unwrap();
+    assert!(!tun.has_managed_options());
+    for (field, value) in [
+        ("auto_route", serde_json::json!(true)),
+        ("auto_redirect", serde_json::json!(true)),
+        ("auto_dns", serde_json::json!(false)),
+        ("linux", serde_json::json!({})),
+        ("addresses", serde_json::json!(["10.233.0.1/30"])),
+        ("bootstrap_dns", serde_json::json!(["192.0.2.53:53"])),
+        ("route_address", serde_json::json!(["0.0.0.0/0"])),
+        ("route_exclude_address", serde_json::json!(["192.0.2.0/24"])),
+    ] {
+        let mut config = manual.clone();
+        config[field] = value;
+        let tun: TunConfig = serde_json::from_value(config).unwrap();
+        assert!(tun.has_managed_options(), "{field}");
+    }
+}
+
+#[test]
+fn tun_adjacent_dns_addresses_preserve_family_and_check_overflow() {
+    for (address, next) in [
+        ("10.233.0.1", Some("10.233.0.2")),
+        ("fd73::1", Some("fd73::2")),
+        ("255.255.255.255", None),
+        ("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", None),
+    ] {
+        assert_eq!(
+            crate::config::tun::next_ip_address(address.parse().unwrap()),
+            next.map(|address| address.parse().unwrap()),
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_tun_config_with_device_fd() {
     let yaml = r#"

@@ -30,8 +30,7 @@
 
 mod offload;
 mod retained;
-use crate::ip_stack::tcp_conn;
-use crate::ip_stack::{packet, wake};
+use crate::ip_stack::{packet, tcp_conn, wake};
 pub(crate) use retained::RetainedDevice;
 mod tcp_stack_direct;
 #[cfg(test)]
@@ -454,7 +453,7 @@ async fn run_tun_from_config_inner(
     ready: &mut Option<oneshot::Sender<std::io::Result<()>>>,
     retained: Option<Arc<RetainedDevice>>,
 ) -> std::io::Result<()> {
-    let client_proxy_selector = proxy_selector(config.clone(), resolver.clone())?;
+    let client_proxy_selector = proxy_selector(&config, resolver.clone())?;
     if config.auto_route && retained.is_none() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -507,14 +506,18 @@ async fn run_tun_from_config_inner(
 }
 
 pub(crate) fn proxy_selector(
-    config: TunConfig,
+    config: &TunConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Arc<ClientProxySelector>> {
-    let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
+    let rules = config
+        .rules
+        .clone()
+        .map(ConfigSelection::unwrap_config)
+        .into_vec();
     let mut selector =
         create_tcp_client_proxy_selector(rules, resolver.clone())?.with_sniff(config.sniff);
     if let Some(enabled) = config.dns_hijack.or(config.auto_route.then_some(true)) {
-        selector = selector.with_dns_interception(resolver.clone(), enabled);
+        selector = selector.with_dns_interception(resolver, enabled);
     }
     Ok(Arc::new(selector))
 }

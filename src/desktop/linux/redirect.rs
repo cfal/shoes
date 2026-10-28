@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::TunConfig;
 use crate::resolver::Resolver;
 
@@ -54,7 +55,7 @@ impl Ingress {
         config: &TunConfig,
         resolver: Arc<dyn Resolver>,
     ) -> io::Result<Vec<JoinHandle<io::Result<()>>>> {
-        let selector = crate::tun::proxy_selector(config.clone(), resolver.clone())?;
+        let selector = crate::tun::proxy_selector(config, resolver.clone())?;
         let admission = config
             .resource_limits
             .tcp_connection_limit()
@@ -63,51 +64,56 @@ impl Ingress {
             .listeners
             .iter()
             .map(|listener| {
-                let listener = listener.clone();
-                let selector = selector.clone();
-                let resolver = resolver.clone();
-                let admission = admission.clone();
-                tokio::spawn(async move {
-                    let mut connections = JoinSet::new();
-                    loop {
-                        let (stream, source) = tokio::select! {
-                            result = accept(&listener) => result,
-                            _ = connections.join_next(), if !connections.is_empty() => continue,
-                        };
-                        let permit = match &admission {
-                            Some(admission) => match admission.clone().try_acquire_owned() {
-                                Ok(permit) => Some(permit),
-                                Err(_) => continue,
-                            },
-                            None => None,
-                        };
-                        let target = match original_destination(&stream) {
-                            Ok(target) => target,
-                            Err(error) => {
-                                log::debug!("Rejected redirect connection: {error}");
-                                continue;
-                            }
-                        };
-                        let selector = selector.clone();
-                        let resolver = resolver.clone();
-                        connections.spawn(async move {
-                            let _permit = permit;
-                            let _ = crate::tun::handle_tcp_connection(
-                                stream,
-                                crate::address::NetLocation::from_ip_addr(
-                                    target.ip(),
-                                    target.port(),
-                                ),
-                                selector,
-                                resolver,
-                                Some(source),
-                            )
-                            .await;
-                        });
-                    }
-                })
+                tokio::spawn(serve(
+                    listener.clone(),
+                    selector.clone(),
+                    resolver.clone(),
+                    admission.clone(),
+                ))
             })
             .collect())
+    }
+}
+
+async fn serve(
+    listener: Arc<TcpListener>,
+    selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    admission: Option<Arc<Semaphore>>,
+) -> io::Result<()> {
+    let mut connections = JoinSet::new();
+    loop {
+        let (stream, source) = tokio::select! {
+            result = accept(&listener) => result,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let permit = match &admission {
+            Some(admission) => match admission.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => continue,
+            },
+            None => None,
+        };
+        let target = match original_destination(&stream) {
+            Ok(target) => target,
+            Err(error) => {
+                log::debug!("Rejected redirect connection: {error}");
+                continue;
+            }
+        };
+        let selector = selector.clone();
+        let resolver = resolver.clone();
+        connections.spawn(async move {
+            let _permit = permit;
+            let _ = crate::tun::handle_tcp_connection(
+                stream,
+                crate::address::NetLocation::from_ip_addr(target.ip(), target.port()),
+                selector,
+                resolver,
+                Some(source),
+            )
+            .await;
+        });
     }
 }
 

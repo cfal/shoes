@@ -145,9 +145,7 @@ impl Session {
         self.journal.save(&self.record)?;
         routes::configure(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
         let batch = expected_policy(&self.record, &self.record.on_link);
-        let typed: nftables::schema::Nftables<'_> =
-            serde_json::from_value(batch).map_err(io::Error::other)?;
-        let bytes = serde_json::to_vec(&typed).map_err(io::Error::other)?;
+        let bytes = command::encode_nft(batch)?;
         command::run(
             self.journal.lease(),
             &self.nft,
@@ -193,7 +191,7 @@ impl Session {
         .await?;
         let listing = firewall_listing(self.journal.lease(), &self.nft, &self.record)
             .await?
-            .filter(|listing| nft::same_policy(listing, listing))
+            .filter(nft::valid_policy)
             .ok_or_else(|| io::Error::other("new nft policy could not be read back"))?;
         self.record.firewall = Some(listing);
         self.journal.save(&self.record)?;

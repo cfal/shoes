@@ -9,8 +9,9 @@ use hickory_resolver::proto::rr::RecordType;
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::resolver::Resolver;
 
-use super::fake_ip::responder::{UDP_PAYLOAD_LIMIT, precheck, response};
+use super::fake_ip::responder::{precheck, response};
 use super::fake_ip::{DnsDecision, FakeDnsResponder, FakeIpOptions, FakeIpPool};
+use super::message::UDP_PAYLOAD_LIMIT;
 
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -76,9 +77,6 @@ impl DnsContext {
             Ok(request) => request,
             Err(_) => return Ok(None),
         };
-        if request.metadata.message_type != MessageType::Query {
-            return Ok(None);
-        }
         let may_allocate = request.queries.len() == 1
             && matches!(
                 request.queries[0].query_type,
