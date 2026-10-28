@@ -116,7 +116,12 @@ impl Resolved {
         serde_json::from_slice(&output).map_err(io::Error::other)
     }
 
-    async fn mutate(&self, method: &str, signature: &str, arguments: &[String]) -> io::Result<()> {
+    async fn manager(
+        &self,
+        method: &str,
+        signature: &str,
+        arguments: &[String],
+    ) -> io::Result<Value> {
         let mut args = vec![
             "call",
             "org.freedesktop.resolve1",
@@ -126,22 +131,11 @@ impl Resolved {
             signature,
         ];
         args.extend(arguments.iter().map(String::as_str));
-        self.call(&args).await?;
-        Ok(())
+        self.call(&args).await
     }
 
     async fn settings(&self, index: u32) -> io::Result<Value> {
-        let link = self
-            .call(&[
-                "call",
-                "org.freedesktop.resolve1",
-                "/org/freedesktop/resolve1",
-                "org.freedesktop.resolve1.Manager",
-                "GetLink",
-                "i",
-                &index.to_string(),
-            ])
-            .await?;
+        let link = self.manager("GetLink", "i", &[index.to_string()]).await?;
         let path = link
             .get("data")
             .and_then(Value::as_array)
@@ -263,14 +257,14 @@ impl Resolved {
             Self::owned(handle, record)
                 .await?
                 .ok_or_else(|| io::Error::other("TUN disappeared during DNS activation"))?;
-            self.mutate(method, "is", &[index.clone(), "no".into()])
+            self.manager(method, "is", &[index.clone(), "no".into()])
                 .await?;
         }
-        self.mutate("SetLinkDNS", "ia(iay)", &args).await?;
+        self.manager("SetLinkDNS", "ia(iay)", &args).await?;
         Self::owned(handle, record)
             .await?
             .ok_or_else(|| io::Error::other("TUN disappeared during DNS activation"))?;
-        self.mutate(
+        self.manager(
             "SetLinkDomains",
             "ia(sb)",
             &[index.clone(), "1".into(), ".".into(), "true".into()],
@@ -279,7 +273,7 @@ impl Resolved {
         Self::owned(handle, record)
             .await?
             .ok_or_else(|| io::Error::other("TUN disappeared during DNS activation"))?;
-        self.mutate("SetLinkDefaultRoute", "ib", &[index, "true".into()])
+        self.manager("SetLinkDefaultRoute", "ib", &[index, "true".into()])
             .await?;
         self.check(handle, record).await
     }
@@ -324,7 +318,8 @@ impl Resolved {
                 "refusing to revert externally changed resolved settings",
             ));
         }
-        self.mutate("RevertLink", "i", &[index.to_string()]).await?;
+        self.manager("RevertLink", "i", &[index.to_string()])
+            .await?;
         Ok(())
     }
 }
