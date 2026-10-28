@@ -55,6 +55,9 @@ impl Ingress {
         config: &TunConfig,
         resolver: Arc<dyn Resolver>,
     ) -> io::Result<Vec<JoinHandle<io::Result<()>>>> {
+        if self.listeners.is_empty() {
+            return Ok(Vec::new());
+        }
         let selector = crate::tun::proxy_selector(config, resolver.clone())?;
         let admission = config
             .resource_limits
