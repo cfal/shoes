@@ -470,7 +470,13 @@ impl NetLocationPortRange {
             Address::Hostname(hostname) => {
                 let mut result = Vec::new();
                 for &port in &self.ports {
-                    let addr_iter = format!("{hostname}:{port}").to_socket_addrs()?;
+                    let address = format!("{hostname}:{port}");
+                    if let Ok(address) = address.parse::<SocketAddr>() {
+                        result.push(address);
+                        continue;
+                    }
+                    crate::socket_policy::check_native_hostname()?;
+                    let addr_iter = address.to_socket_addrs()?;
                     for addr in addr_iter {
                         result.push(addr);
                     }

@@ -44,7 +44,7 @@ pub(super) async fn bind(configs: &[ClashApiConfig]) -> io::Result<Vec<Bound>> {
                         );
                     }
                     bound.push(Bound::Tcp(
-                        tokio::net::TcpListener::bind(socket).await?,
+                        crate::socket_util::new_tcp_listener(socket, 1024, None)?,
                         config.clone(),
                     ));
                 }

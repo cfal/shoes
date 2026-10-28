@@ -1242,6 +1242,16 @@ impl ClientChainGroup {
         self.chains.iter().all(|chain| chain.is_direct_only())
     }
 
+    pub(crate) fn may_connect_directly(&self) -> bool {
+        self.chains.iter().any(|chain| {
+            chain.subsequent_hops.is_empty()
+                && chain
+                    .initial_hop
+                    .iter()
+                    .any(|entry| matches!(entry.as_ref(), InitialHopEntry::Direct(_)))
+        })
+    }
+
     /// Selects the interface for a new direct UDP/QUIC DNS socket.
     pub fn select_bind_interface(&self) -> std::io::Result<Option<&str>> {
         if !self.is_direct_only() {

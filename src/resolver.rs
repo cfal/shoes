@@ -414,6 +414,9 @@ impl NativeResolver {
 
 impl Resolver for NativeResolver {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
+        if let Some(bootstrap) = crate::socket_policy::bootstrap() {
+            return bootstrap.resolve_location(location);
+        }
         let address = location.address().clone();
         let port = location.port();
         Box::pin(

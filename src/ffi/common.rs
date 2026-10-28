@@ -231,6 +231,7 @@ pub async fn start_from_config(
 
     let mut validated = crate::config::compile_configs(configs).await?;
     validated.validate_ffi_support()?;
+    crate::dns::check_interception(&validated.configs, &validated.dns_groups).await?;
     let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;

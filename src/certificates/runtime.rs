@@ -139,15 +139,18 @@ impl Registry {
                                     }
                                     listeners.push(listener);
                                 }
-                                None => match TcpListener::bind(address).await {
-                                    Ok(listener) => listeners.push(Arc::new(listener)),
-                                    Err(error)
-                                        if error.kind() == io::ErrorKind::AddrInUse
-                                            && retiring_proxy_covers(retiring, *address) => {}
-                                    Err(error) => {
-                                        return Err(http_bind_error(source, *address, error));
+                                None => {
+                                    match crate::socket_util::new_tcp_listener(*address, 1024, None)
+                                    {
+                                        Ok(listener) => listeners.push(Arc::new(listener)),
+                                        Err(error)
+                                            if error.kind() == io::ErrorKind::AddrInUse
+                                                && retiring_proxy_covers(retiring, *address) => {}
+                                        Err(error) => {
+                                            return Err(http_bind_error(source, *address, error));
+                                        }
                                     }
-                                },
+                                }
                             }
                         }
                     }
@@ -203,8 +206,7 @@ impl Registry {
                     .iter()
                     .any(|listener| listener.local_addr().ok().as_ref() == Some(address));
                 if !bound {
-                    let listener = TcpListener::bind(address)
-                        .await
+                    let listener = crate::socket_util::new_tcp_listener(*address, 1024, None)
                         .map_err(|error| http_bind_error(&worker.source, *address, error))?;
                     worker.listeners.lock().push(Arc::new(listener));
                 }
