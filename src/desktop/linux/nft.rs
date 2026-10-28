@@ -308,14 +308,13 @@ pub(super) fn install(
             json!({"counter": null}),
         ],
     );
-    for (family, port) in ["ipv4", "ipv6"].into_iter().zip(redirect) {
+    for (protocol, port) in ["ip", "ip6"].into_iter().zip(redirect) {
         let Some(port) = port else {
             continue;
         };
         let gateway = spec
-            .redirect_gateway(family == "ipv6")
+            .redirect_gateway(protocol == "ip6")
             .expect("validated redirect gateway");
-        let protocol = if family == "ipv4" { "ip" } else { "ip6" };
         // Route nexthop, unlike OUTPUT interface metadata, reflects bound-device rerouting.
         rule(
             "redirect",
@@ -349,9 +348,9 @@ pub(super) fn install(
                 label,
                 vec![
                     matches(
-                        payload(if family == "ipv4" { "ip" } else { "ip6" }, "daddr"),
+                        payload(protocol, "daddr"),
                         "==",
-                        json!(if family == "ipv4" { "127.0.0.1" } else { "::1" }),
+                        json!(if protocol == "ip" { "127.0.0.1" } else { "::1" }),
                     ),
                     destination.clone(),
                     condition,
