@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
@@ -120,12 +121,8 @@ pub fn new_socket2_udp_socket_with_buffer_size(
 
     socket.set_nonblocking(true)?;
 
-    // Set socket buffer sizes if specified.
-    // This helps prevent packet drops during bursts for high-throughput connections.
     if let Some(size) = buffer_size {
-        // Ignore errors - kernel may cap the value
-        let _ = socket.set_recv_buffer_size(size);
-        let _ = socket.set_send_buffer_size(size);
+        set_udp_socket_buffers(socket2::SockRef::from(&socket), size);
     }
 
     if reuse_port {
@@ -146,6 +143,35 @@ pub fn new_socket2_udp_socket_with_buffer_size(
     }
 
     Ok(socket)
+}
+
+pub(crate) fn set_udp_socket_buffers(socket: socket2::SockRef<'_>, size: usize) {
+    static RECEIVE_WARNING: AtomicBool = AtomicBool::new(false);
+    static SEND_WARNING: AtomicBool = AtomicBool::new(false);
+
+    let receive_result = socket.set_recv_buffer_size(size);
+    let receive_actual = socket.recv_buffer_size();
+    let send_result = socket.set_send_buffer_size(size);
+    let send_actual = socket.send_buffer_size();
+
+    for (direction, result, actual, warned) in [
+        ("receive", receive_result, receive_actual, &RECEIVE_WARNING),
+        ("send", send_result, send_actual, &SEND_WARNING),
+    ] {
+        // Linux reports twice the requested capacity for kernel accounting.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let actual = actual.map(|bytes| bytes / 2);
+        if result.is_ok() && actual.as_ref().is_ok_and(|bytes| *bytes >= size) {
+            continue;
+        }
+        if !warned.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "UDP {direction} buffer request of {size} bytes was not satisfied \
+                 (set: {result:?}, effective bytes: {actual:?}); \
+                 continuing with OS buffers (further {direction} buffer warnings suppressed)"
+            );
+        }
+    }
 }
 
 fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net::UdpSocket> {
@@ -271,6 +297,76 @@ pub fn new_unix_listener<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_buffer_requests_match_os_supported_sizes() {
+        for size in [65536, 8 << 20] {
+            let reference = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            let _ = reference.set_recv_buffer_size(size);
+            let _ = reference.set_send_buffer_size(size);
+            let socket = new_socket2_udp_socket_with_buffer_size(
+                false,
+                None,
+                Some("0.0.0.0:0".parse().unwrap()),
+                false,
+                Some(size),
+            )
+            .unwrap();
+            assert_eq!(
+                socket.recv_buffer_size().unwrap(),
+                reference.recv_buffer_size().unwrap()
+            );
+            assert_eq!(
+                socket.send_buffer_size().unwrap(),
+                reference.send_buffer_size().unwrap()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capped_udp_buffers_do_not_prevent_socket_use() {
+        let receive_max: usize = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let send_max: usize = std::fs::read_to_string("/proc/sys/net/core/wmem_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let cap = receive_max.max(send_max);
+        if cap >= 16 << 20 {
+            // No allowed QUIC buffer request exceeds both of this host's ceilings.
+            return;
+        }
+        let request = (cap + 1).max(8 << 20);
+        let socket = new_socket2_udp_socket_with_buffer_size(
+            false,
+            None,
+            Some("0.0.0.0:0".parse().unwrap()),
+            false,
+            Some(request),
+        )
+        .unwrap();
+        assert_eq!(socket.recv_buffer_size().unwrap(), receive_max * 2);
+        assert_eq!(socket.send_buffer_size().unwrap(), send_max * 2);
+        socket.set_nonblocking(false).unwrap();
+        let server: std::net::UdpSocket = socket.into();
+        let client = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let timeout = Some(std::time::Duration::from_secs(2));
+        server.set_read_timeout(timeout).unwrap();
+        client.set_read_timeout(timeout).unwrap();
+        let address = SocketAddr::from(([127, 0, 0, 1], server.local_addr().unwrap().port()));
+        client.send_to(b"ping", address).unwrap();
+        let mut buffer = [0; 16];
+        let (len, peer) = server.recv_from(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"ping");
+        server.send_to(b"pong", peer).unwrap();
+        let (len, _) = client.recv_from(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"pong");
+    }
 
     #[test]
     fn hostname_socket_fallback_is_limited_to_family_errors() {
