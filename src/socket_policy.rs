@@ -123,6 +123,23 @@ pub(crate) fn check_dns_endpoint(address: std::net::IpAddr) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn check_outbound_address(address: std::net::IpAddr) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if POLICY.read().as_ref().is_some_and(|policy| {
+        policy
+            .addresses
+            .iter()
+            .any(|range| range.contains(address.to_canonical()))
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed TUN subnet cannot be an outbound target",
+        ));
+    }
+    let _ = address;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn local_address(address: std::net::IpAddr) -> io::Result<bool> {
     struct Addresses(*mut libc::ifaddrs);

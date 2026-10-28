@@ -40,6 +40,16 @@ pub struct ValidatedConfigs {
 impl ValidatedConfigs {
     #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi", test))]
     pub(crate) fn validate_ffi_support(&self) -> std::io::Result<()> {
+        if self
+            .configs
+            .iter()
+            .any(|config| matches!(config, Config::TunServer(tun) if tun.auto_route))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "managed TUN requires the CLI process lifecycle; FFI hosts must manage their own network",
+            ));
+        }
         self.control.reject_ffi()?;
         if self
             .catalog
@@ -369,6 +379,7 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     // Combine into Config list (only Server and TunServer variants)
     let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
     result.extend(tun_configs.into_iter().map(Config::TunServer));
+    crate::desktop::validate_config(&result)?;
 
     let mut validated = ValidatedConfigs {
         catalog,
@@ -2136,7 +2147,9 @@ fn validate_tun_config(
     // Validate that we have either Linux config (device_name/address) or mobile config (device_fd)
     #[cfg(target_os = "linux")]
     {
-        if config.device_fd.is_none() && (config.device_name.is_none() || config.address.is_none())
+        if !config.auto_route
+            && config.device_fd.is_none()
+            && (config.device_name.is_none() || config.address.is_none())
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

@@ -49,6 +49,7 @@ mod control;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
+mod desktop;
 pub mod dns;
 mod file_watcher;
 mod h2mux;

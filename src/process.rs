@@ -49,6 +49,8 @@ async fn load_validated(
 }
 
 struct PreparedServers {
+    #[cfg(target_os = "linux")]
+    managed: Option<std::sync::Arc<crate::desktop::Ingress>>,
     generation: Option<std::sync::Arc<crate::control::runtime::Generation>>,
     certificates: crate::certificates::Registry,
     validated: ValidatedConfigs,
@@ -62,7 +64,15 @@ struct PreparedServers {
 
 #[cfg(test)]
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
-    prepare_tracking(paths, previous, None, &mut |_, _| {}, &mut None).await
+    prepare_tracking(
+        paths,
+        previous,
+        None,
+        &mut |_, _| {},
+        &mut None,
+        &crate::desktop::NetworkSession::default(),
+    )
+    .await
 }
 
 async fn prepare_tracking(
@@ -71,8 +81,18 @@ async fn prepare_tracking(
     previous_servers: Option<&PreparedServers>,
     discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
     control: &mut Option<crate::control::runtime::ControlService>,
+    network: &crate::desktop::NetworkSession,
 ) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths, discovered).await?;
+    network.validate(&validated.configs)?;
+    for config in &mut validated.configs {
+        if let Config::TunServer(tun) = config
+            && tun.auto_route
+            && tun.dns_hijack.is_none()
+        {
+            tun.dns_hijack = Some(true);
+        }
+    }
     if control.is_none() && validated.catalog.is_some() {
         if previous.is_some()
             && (!validated.control.listeners.is_empty()
@@ -153,6 +173,7 @@ async fn prepare_tracking(
         validated.global_limits,
         previous,
         &synthetic_endpoints,
+        validated.configs.iter().any(|config| matches!(config, Config::TunServer(tun) if tun.auto_route || tun.dns_hijack == Some(true))),
     )
     .await
     .map_err(|error| {
@@ -209,6 +230,8 @@ async fn prepare_tracking(
         })
         .collect();
     Ok(PreparedServers {
+        #[cfg(target_os = "linux")]
+        managed: network.ingress(),
         generation,
         certificates,
         validated,
@@ -234,6 +257,20 @@ struct RunningServers {
 }
 
 impl RunningServers {
+    async fn shutdown_network(
+        &mut self,
+        registries: &[&PreparedServers],
+        network: &mut crate::desktop::NetworkSession,
+    ) -> io::Result<()> {
+        let network_result = network.deactivate().await;
+        let worker_result = self.shutdown(registries).await;
+        match (network_result, worker_result) {
+            (Ok(()), result) => result,
+            (Err(error), result) => Err(io::Error::other(format!(
+                "network cleanup failed: {error}; worker cleanup: {result:?}"
+            ))),
+        }
+    }
     async fn tun_failure(&mut self) -> io::Error {
         #[cfg(unix)]
         if !self.tun.is_empty() {
@@ -308,6 +345,22 @@ impl RunningServers {
             let resolver = prepared.dns.get_for_server(dns_ref);
             #[cfg(unix)]
             if let Config::TunServer(config) = config {
+                #[cfg(target_os = "linux")]
+                if config.auto_route {
+                    let ingress = prepared
+                        .managed
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("managed TUN ingress is missing"))?;
+                    let task = crate::tun::start_tun_server_retained(
+                        config.clone(),
+                        resolver.clone(),
+                        ingress.device.clone(),
+                    )
+                    .await?;
+                    self.tun.push(task);
+                    self.tun.extend(ingress.start_redirects(config, resolver)?);
+                    continue;
+                }
                 if let Some(fd) = config.device_fd {
                     use std::os::fd::FromRawFd;
                     if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -582,9 +635,23 @@ impl ReloadSignal {
 }
 
 pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Result<()> {
+    let mut shutdown = ShutdownSignals::new()?;
+    let mut reload = ReloadSignal::new()?;
+    let mut network = crate::desktop::NetworkSession::prepare(&paths, dry_run).await?;
     let mut control = None;
     let mut api = None;
-    let result = run_inner(paths, dry_run, no_reload, &mut control, &mut api).await;
+    let result = run_inner(
+        paths,
+        dry_run,
+        no_reload,
+        &mut control,
+        &mut api,
+        &mut network,
+        &mut shutdown,
+        &mut reload,
+    )
+    .await;
+    let cleanup = network.close().await;
     if let Some(api) = &mut api {
         api.shutdown().await;
     }
@@ -593,23 +660,30 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         control.shutdown().await;
     }
     drop(control);
-    result
+    match (result, cleanup) {
+        (result, Ok(())) => result,
+        (result, Err(error)) => Err(io::Error::other(format!(
+            "managed TUN cleanup failed: {error}; process: {result:?}"
+        ))),
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     paths: Vec<String>,
     dry_run: bool,
     no_reload: bool,
     control: &mut Option<crate::control::runtime::ControlService>,
     api: &mut Option<crate::clash_api::ApiService>,
+    network: &mut crate::desktop::NetworkSession,
+    shutdown: &mut ShutdownSignals,
+    reload: &mut ReloadSignal,
 ) -> io::Result<()> {
     if dry_run {
         load_validated(&paths, &mut |_, _| {}).await?;
         println!("Configuration valid");
         return Ok(());
     }
-    let mut shutdown = ShutdownSignals::new()?;
-    let mut reload = ReloadSignal::new()?;
     let (change_tx, mut changes) = mpsc::channel(1);
     let mut watches = ConfigWatches::new(&paths, change_tx, no_reload)?;
     let mut discovered =
@@ -617,8 +691,13 @@ async fn run_inner(
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = prepare_tracking(&paths, None, None, &mut discovered, control) => result?,
+        result = prepare_tracking(&paths, None, None, &mut discovered, control, network) => result?,
     };
+    network.prepare_network().await?;
+    #[cfg(target_os = "linux")]
+    {
+        prepared.managed = network.ingress();
+    }
     prepared.tcp =
         TcpListeners::prepare(&prepared.validated.configs, &TcpListeners::default(), &[])?;
     watches.activated(&prepared.validated.reload_files);
@@ -632,35 +711,53 @@ async fn run_inner(
     }
     tokio::select! {
         biased;
-        _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
+        _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
         result = running.start(&mut prepared) => if let Err(error) = result {
-            let _ = running.shutdown(&[&prepared]).await;
+            let _ = running.shutdown_network(&[&prepared], network).await;
             return Err(error);
         },
     }
-    if let Some(control) = control.as_ref() {
-        control.runtime.resume().await?;
+    if let Some(control) = control.as_ref()
+        && let Err(error) = control.runtime.resume().await
+    {
+        let cleanup = running.shutdown_network(&[&prepared], network).await;
+        return Err(io::Error::other(format!(
+            "controller activation failed: {error}; shutdown: {cleanup:?}"
+        )));
     }
     prepared.certificates.start().await;
     prepared.tcp.activate();
+    if let Err(error) = network.activate().await {
+        let cleanup = running.shutdown_network(&[&prepared], network).await;
+        return Err(io::Error::other(format!(
+            "managed network activation failed: {error}; shutdown: {cleanup:?}"
+        )));
+    }
     println!("Servers ready");
     loop {
         let debounce = tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
+            _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
             error = running.tun_failure() => {
-                let _ = running.shutdown(&[&prepared]).await;
+                let _ = running.shutdown_network(&[&prepared], network).await;
                 return Err(error);
             },
             _ = reload.recv() => false,
+            _ = network.changed() => {
+                if let Err(error) = network.reconcile().await {
+                    let cleanup = running.shutdown_network(&[&prepared], network).await;
+                    return Err(io::Error::other(format!("managed network changed: {error}; shutdown: {cleanup:?}")));
+                }
+                continue;
+            },
             _ = watches.changed(&mut changes) => true,
         };
         if debounce {
             tokio::select! {
                 biased;
-                _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
+                _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
                 error = running.tun_failure() => {
-                    let _ = running.shutdown(&[&prepared]).await;
+                    let _ = running.shutdown_network(&[&prepared], network).await;
                     return Err(error);
                 },
                 _ = reload.recv() => {}
@@ -677,12 +774,12 @@ async fn run_inner(
             |paths: &[PathBuf], recovery: &[PathBuf]| watches.discovered(paths, recovery);
         let candidate = tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared]).await,
+            _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
             error = running.tun_failure() => {
-                let _ = running.shutdown(&[&prepared]).await;
+                let _ = running.shutdown_network(&[&prepared], network).await;
                 return Err(error);
             },
-            result = prepare_tracking(&paths, Some(&prepared.dns), Some(&prepared), &mut discovered, control) => result,
+            result = prepare_tracking(&paths, Some(&prepared.dns), Some(&prepared), &mut discovered, control, network) => result,
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
@@ -722,25 +819,27 @@ async fn run_inner(
         };
         tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
+            _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
             result = retirement => if let Err(error) = result {
-                let _ = running.shutdown(&[&prepared, &candidate]).await;
+                let _ = running.shutdown_network(&[&prepared, &candidate], network).await;
                 return Err(error);
             },
         }
         let result = tokio::select! {
             biased;
-            _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
+            _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
             result = running.activate(&mut candidate, control.as_ref()) => result,
         };
         if let Err(error) = result {
             let rollback = tokio::select! {
                 biased;
-                _ = shutdown.recv() => return running.shutdown(&[&prepared, &candidate]).await,
+                _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
                 result = running.rollback(&mut prepared, &mut candidate, control.as_ref()) => result,
             };
             if let Err(rollback) = rollback {
-                let cleanup = running.shutdown(&[&prepared, &candidate]).await;
+                let cleanup = running
+                    .shutdown_network(&[&prepared, &candidate], network)
+                    .await;
                 return Err(io::Error::other(format!(
                     "Reload activation failed: {error}; rollback failed: {rollback}; shutdown: {cleanup:?}"
                 )));

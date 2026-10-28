@@ -1166,6 +1166,14 @@ async fn test_tun_config_defaults() {
 async fn test_tun_icmp_requires_tcp() {
     // ICMP requires TCP to be enabled
     let tun_config = TunConfig {
+        auto_route: false,
+        auto_redirect: false,
+        auto_dns: None,
+        addresses: Vec::new(),
+        route_address: Vec::new(),
+        route_exclude_address: Vec::new(),
+        bootstrap_dns: Vec::new(),
+        linux: None,
         dns_hijack: None,
         name: None,
         sniff: false,

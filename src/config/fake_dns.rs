@@ -14,11 +14,16 @@ pub(crate) fn tun_endpoint_ips(configs: &[Config]) -> impl Iterator<Item = IpAdd
     configs
         .iter()
         .filter_map(|config| match config {
-            Config::TunServer(tun) => Some([tun.address, tun.destination]),
+            Config::TunServer(tun) => Some(tun),
             _ => None,
         })
-        .flatten()
-        .flatten()
+        .flat_map(|tun| {
+            [tun.address, tun.destination]
+                .into_iter()
+                .flatten()
+                .chain(tun.addresses.iter().map(IpNetwork::ip))
+                .chain(tun.virtual_dns_addresses())
+        })
 }
 
 pub(crate) fn validate_tun_endpoints(

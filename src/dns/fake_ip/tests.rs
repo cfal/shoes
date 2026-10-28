@@ -440,6 +440,33 @@ async fn context_separates_synthesis_real_exchange_and_malformed_input() {
 }
 
 #[tokio::test]
+async fn empty_question_udp_probe_releases_its_stream_after_reply() {
+    let (context, real) = context();
+    let mut stream = context.udp_stream();
+    let request = Message::query().to_vec().unwrap();
+    std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &request))
+        .await
+        .unwrap();
+    let mut bytes = [0; 512];
+    let mut buffer = tokio::io::ReadBuf::new(&mut bytes);
+    std::future::poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buffer))
+        .await
+        .unwrap();
+    assert_eq!(
+        Message::from_vec(buffer.filled())
+            .unwrap()
+            .metadata
+            .response_code,
+        ResponseCode::FormErr
+    );
+    assert_eq!(real.exchanges.load(Ordering::SeqCst), 0);
+    let error = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buffer))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[tokio::test]
 async fn udp_has_backpressure_and_keeps_synthesizing_after_forwarding() {
     let (context, real) = context();
     let mut stream = context.udp_stream();

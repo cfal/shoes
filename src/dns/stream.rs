@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use hickory_resolver::proto::op::{Header, ResponseCode};
+use hickory_resolver::proto::serialize::binary::{BinDecodable, BinDecoder};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::task::JoinHandle;
 
@@ -71,6 +73,12 @@ impl AsyncReadMessage for UdpDnsStream {
                         io::ErrorKind::InvalidInput,
                         "DNS reply buffer too small",
                     )));
+                }
+                // Empty-question probes must release UDP admission after their local error reply.
+                if Header::read(&mut BinDecoder::new(&bytes)).is_ok_and(|header| {
+                    header.counts.queries == 0 && header.response_code == ResponseCode::FormErr
+                }) {
+                    self.closed = true;
                 }
                 buf.put_slice(&bytes);
                 Poll::Ready(Ok(()))

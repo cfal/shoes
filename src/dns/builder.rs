@@ -26,6 +26,16 @@ pub(crate) async fn check_interception(
     configs: &[crate::config::Config],
     groups: &[ExpandedDnsGroup],
 ) -> std::io::Result<()> {
+    let mut forbidden: Vec<IpNetwork> = groups
+        .iter()
+        .filter_map(|group| group.fake_ip.as_ref())
+        .flat_map(|options| options.ipv4_range.iter().chain(options.ipv6_range.iter()))
+        .map(|range| range.parse().map_err(std::io::Error::other))
+        .collect::<std::io::Result<_>>()?;
+    forbidden.extend(
+        crate::config::tun_endpoint_ips(configs).map(|ip| IpNetwork::from(ip.to_canonical())),
+    );
+    let forbidden: Arc<[IpNetwork]> = forbidden.into();
     for config in configs {
         let crate::config::Config::TunServer(tun) = config else {
             continue;
@@ -44,7 +54,7 @@ pub(crate) async fn check_interception(
                 }),
         };
         if uses_system {
-            SystemResolver::check_configuration(Arc::from([])).await?;
+            SystemResolver::check_configuration(forbidden.clone()).await?;
         }
     }
     Ok(())
@@ -684,7 +694,7 @@ pub async fn build_dns_registry_reusing(
     limits: GlobalLimits,
     previous: Option<&DnsRegistry>,
 ) -> std::io::Result<DnsRegistry> {
-    build_dns_registry_for_runtime(groups, limits, previous, &[]).await
+    build_dns_registry_for_runtime(groups, limits, previous, &[], false).await
 }
 
 pub async fn build_dns_registry_for_runtime(
@@ -692,6 +702,7 @@ pub async fn build_dns_registry_for_runtime(
     limits: GlobalLimits,
     previous: Option<&DnsRegistry>,
     synthetic_endpoints: &[std::net::IpAddr],
+    protect_tun_endpoints: bool,
 ) -> std::io::Result<DnsRegistry> {
     let active_options = groups.iter().filter_map(|group| group.fake_ip.as_ref());
     let retained_options = previous
@@ -713,7 +724,7 @@ pub async fn build_dns_registry_for_runtime(
             }
         }
     }
-    if !forbidden.is_empty() {
+    if !forbidden.is_empty() || protect_tun_endpoints {
         for endpoint in synthetic_endpoints {
             let range = IpNetwork::from(endpoint.to_canonical());
             if !forbidden.contains(&range) {

@@ -29,7 +29,10 @@
 //!   directly, or `false` if using the readPackets/writePackets API.
 
 mod offload;
-use crate::ip_stack::{packet, tcp_conn, wake};
+mod retained;
+use crate::ip_stack::tcp_conn;
+use crate::ip_stack::{packet, wake};
+pub(crate) use retained::RetainedDevice;
 mod tcp_stack_direct;
 #[cfg(test)]
 mod tcp_tests;
@@ -99,7 +102,15 @@ pub async fn run_tun_server(
     resolver: Arc<dyn Resolver>,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
-    run_tun_server_inner(config, proxy_selector, resolver, shutdown_rx, &mut None).await
+    run_tun_server_inner(
+        config,
+        proxy_selector,
+        resolver,
+        shutdown_rx,
+        &mut None,
+        None,
+    )
+    .await
 }
 
 async fn run_tun_server_inner(
@@ -108,6 +119,7 @@ async fn run_tun_server_inner(
     resolver: Arc<dyn Resolver>,
     mut shutdown_rx: oneshot::Receiver<()>,
     ready: &mut Option<oneshot::Sender<std::io::Result<()>>>,
+    retained: Option<Arc<RetainedDevice>>,
 ) -> std::io::Result<()> {
     config.resource_limits.validate()?;
     let offload = config.offload_enabled()?;
@@ -116,7 +128,9 @@ async fn run_tun_server_inner(
         config.mtu, config.tcp_enabled, config.udp_enabled, config.icmp_enabled
     );
 
-    let (fd, offload) = if let Some(fd) = config.raw_fd {
+    let (fd, offload) = if let Some(device) = retained {
+        (device.duplicate()?, device.offload)
+    } else if let Some(fd) = config.raw_fd {
         info!("Using provided raw FD: {}", fd);
         // Raw descriptors must be validated before constructing an IO-safety wrapper.
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
@@ -260,8 +274,8 @@ fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
 }
 
 /// Handle a TCP connection by forwarding it through the proxy chain.
-pub(crate) async fn handle_tcp_connection(
-    mut connection: tcp_conn::TcpConnection,
+pub(crate) async fn handle_tcp_connection<T: crate::async_stream::AsyncStream>(
+    mut connection: T,
     target: NetLocation,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -366,15 +380,39 @@ pub(crate) async fn start_tun_server_with_fd_ownership(
     resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
     close_fd_on_drop: bool,
 ) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
+    start_tun(config, resolver, close_fd_on_drop, None).await
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn start_tun_server_retained(
+    config: TunConfig,
+    resolver: Arc<dyn Resolver>,
+    retained: Arc<RetainedDevice>,
+) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
+    start_tun(config, resolver, false, Some(retained)).await
+}
+
+async fn start_tun(
+    config: TunConfig,
+    resolver: Arc<dyn Resolver>,
+    close_fd_on_drop: bool,
+    retained: Option<Arc<RetainedDevice>>,
+) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {
         let _keep_alive = shutdown_tx;
         let mut ready = Some(ready_tx);
-        let result =
-            run_tun_from_config_inner(config, shutdown_rx, close_fd_on_drop, resolver, &mut ready)
-                .await;
+        let result = run_tun_from_config_inner(
+            config,
+            shutdown_rx,
+            close_fd_on_drop,
+            resolver,
+            &mut ready,
+            retained,
+        )
+        .await;
         if let Some(ready) = ready.take() {
             let _ = ready.send(result);
             Ok(())
@@ -397,7 +435,15 @@ pub async fn run_tun_from_config(
     close_fd_on_drop: bool,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    run_tun_from_config_inner(config, shutdown_rx, close_fd_on_drop, resolver, &mut None).await
+    run_tun_from_config_inner(
+        config,
+        shutdown_rx,
+        close_fd_on_drop,
+        resolver,
+        &mut None,
+        None,
+    )
+    .await
 }
 
 async fn run_tun_from_config_inner(
@@ -406,7 +452,15 @@ async fn run_tun_from_config_inner(
     close_fd_on_drop: bool,
     resolver: Arc<dyn Resolver>,
     ready: &mut Option<oneshot::Sender<std::io::Result<()>>>,
+    retained: Option<Arc<RetainedDevice>>,
 ) -> std::io::Result<()> {
+    let client_proxy_selector = proxy_selector(config.clone(), resolver.clone())?;
+    if config.auto_route && retained.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed TUN requires the process network session",
+        ));
+    }
     let mut tun_server_config = TunServerConfig::new()
         .mtu(config.mtu)
         .tcp_enabled(config.tcp_enabled)
@@ -441,22 +495,28 @@ async fn run_tun_from_config_inner(
         tun_server_config.packet_information = packet_information;
     }
 
-    let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let mut selector =
-        create_tcp_client_proxy_selector(rules, resolver.clone())?.with_sniff(config.sniff);
-    if let Some(enabled) = config.dns_hijack {
-        selector = selector.with_dns_interception(resolver.clone(), enabled);
-    }
-    let client_proxy_selector = Arc::new(selector);
-
     run_tun_server_inner(
         tun_server_config,
         client_proxy_selector,
         resolver,
         shutdown_rx,
         ready,
+        retained,
     )
     .await
+}
+
+pub(crate) fn proxy_selector(
+    config: TunConfig,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<Arc<ClientProxySelector>> {
+    let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
+    let mut selector =
+        create_tcp_client_proxy_selector(rules, resolver.clone())?.with_sniff(config.sniff);
+    if let Some(enabled) = config.dns_hijack.or(config.auto_route.then_some(true)) {
+        selector = selector.with_dns_interception(resolver.clone(), enabled);
+    }
+    Ok(Arc::new(selector))
 }
 
 #[cfg(test)]
@@ -560,8 +620,15 @@ mod tests {
                 let (_shutdown, stopped) = oneshot::channel();
                 let (ready, started) = oneshot::channel();
                 let task = tokio::spawn(async move {
-                    run_tun_from_config_inner(config, stopped, true, resolver, &mut Some(ready))
-                        .await
+                    run_tun_from_config_inner(
+                        config,
+                        stopped,
+                        true,
+                        resolver,
+                        &mut Some(ready),
+                        None,
+                    )
+                    .await
                 });
                 started.await.unwrap().unwrap();
                 peer.take();

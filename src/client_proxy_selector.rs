@@ -401,20 +401,23 @@ impl ClientProxySelector {
     }
 
     fn validate_real_target(&self, target: &ResolvedLocation) -> std::io::Result<()> {
-        if let Some(context) = &self.fake_dns {
-            for addr in [
-                target.location().to_socket_addr_nonblocking(),
-                target.resolved_addr(),
-            ]
-            .into_iter()
-            .flatten()
+        for addr in [
+            target.location().to_socket_addr_nonblocking(),
+            target.resolved_addr(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            crate::socket_policy::check_outbound_address(addr.ip())?;
+            if self
+                .fake_dns
+                .as_ref()
+                .is_some_and(|context| context.contains(addr.ip()))
             {
-                if context.contains(addr.ip()) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "synthetic address cannot be an outbound target",
-                    ));
-                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "synthetic address cannot be an outbound target",
+                ));
             }
         }
         Ok(())
@@ -437,19 +440,17 @@ impl ClientProxySelector {
                 context: context.clone(),
             });
         }
-        if let Some(context) = &self.fake_dns {
-            if let Some(addr) = location.location().to_socket_addr_nonblocking()
-                && let Some(name) = context.restore(addr.ip())?
-            {
-                return Ok(IngressTarget::Forward(PreparedDestination {
-                    wire_destination,
-                    connection_target: NetLocation::new(Address::Hostname(name), addr.port())
-                        .into(),
-                    source: DestinationSource::FakeDns,
-                }));
-            }
-            self.validate_real_target(&location)?;
+        if let Some(context) = &self.fake_dns
+            && let Some(addr) = location.location().to_socket_addr_nonblocking()
+            && let Some(name) = context.restore(addr.ip())?
+        {
+            return Ok(IngressTarget::Forward(PreparedDestination {
+                wire_destination,
+                connection_target: NetLocation::new(Address::Hostname(name), addr.port()).into(),
+                source: DestinationSource::FakeDns,
+            }));
         }
+        self.validate_real_target(&location)?;
         let source = if location.address().hostname().is_some() {
             DestinationSource::SuppliedHostname
         } else {
