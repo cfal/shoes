@@ -921,6 +921,7 @@ mtu: 1500                      # Default: 1500 (Linux), 9000 (Android), 4064 (iO
 tcp_enabled: true              # Default: true
 udp_enabled: true              # Default: true
 icmp_enabled: true             # Default: true
+dns_hijack: true               # Optional: intercept TCP/UDP port 53 independently of fake-IP
 
 # Routing rules
 rules: [RuleConfig]
@@ -950,6 +951,118 @@ rules: [RuleConfig]
             type: vless
             user_id: "uuid"
 ```
+
+### Managed Linux Desktop Capture
+
+`auto_route: true` gives the Shoes process ownership of one nonpersistent TUN,
+private routing table, policy rules, nftables table, and optional per-link DNS
+configuration. It captures host-originated TCP/UDP using conntrack-aware output
+marking. Both protocols use the existing TUN engine unless `auto_redirect: true`
+selects kernel TCP REDIRECT. The system `nft` executable runs only for control-plane
+changes and reconciliation, not per packet or connection.
+
+See [the desktop example](examples/tun_desktop.yaml) and
+[the systemd unit](dist/shoes-desktop.service). The example forwards DIRECT;
+replace its `rules` with the desired proxy policy before using it as a proxy.
+
+```yaml
+- device_name: shoes0
+  auto_route: true
+  auto_redirect: true
+  addresses: [10.233.0.1/30, 'fd73:686f:6573::1/126']
+  bootstrap_dns: ['1.1.1.1:53', '9.9.9.9:53']
+  auto_dns: true
+  dns_hijack: true
+  dns:
+    servers: ['udp://1.1.1.1', 'tcp://1.1.1.1']
+  rules: allow-all-direct
+```
+
+| Field | Managed Behavior |
+|---|---|
+| `auto_route` | Enables process-owned Linux capture; default `false` |
+| `auto_redirect` | Uses kernel TCP REDIRECT; requires `auto_route`; default `false` |
+| `addresses` | One local CIDR per family; cannot combine with manual `address`, `netmask`, `destination`, or supplied FDs |
+| `route_address` | Captured destination CIDRs; default `[0.0.0.0/0, '::/0']` |
+| `route_exclude_address` | Explicit destination exclusions, including DNS; default empty |
+| `bootstrap_dns` | Required literal real DNS socket addresses, never a loopback stub or TUN subnet |
+| `auto_dns` | Publishes transient systemd-resolved settings on the owned link; default `true` |
+| `dns_hijack` | Intercepts TCP/UDP port 53; defaults `true` when managed, otherwise follows fake-IP policy |
+| `linux.table` | Private route table; default `12000` |
+| `linux.rule_priority` | Policy rule priority; default `12000` |
+| `linux.capture_mark` | Capture bit; default `536870912` (`0x20000000`) |
+| `linux.bypass_mark` | Shoes socket bypass bit; default `1073741824` (`0x40000000`) |
+| `linux.mark_mask` | Combined reserved bits; default `1610612736` (`0x60000000`) |
+
+Requirements: Linux, `/dev/net/tun`, trusted system `nft` with JSON support, and
+network-administration privileges. Automatic DNS additionally requires a running
+systemd-resolved, `busctl` with JSON support, and authorization to
+configure the owned link. The supplied service runs as root with a bounded
+capability set. File capabilities on Shoes alone do not grant privileges to
+`nft` children or authorize resolved changes.
+
+Use `auto_dns: false` for externally managed DNS. Shoes never rewrites
+`/etc/resolv.conf`. Bootstrap and native resolution use protected Shoes sockets
+while managed mode is active; listener bind addresses must be literal IPs.
+Real DNS does not require fake-IP. Automatic DNS requires interception and room
+after each interface address for its adjacent virtual DNS endpoint. Both UDP and
+TCP readiness are checked before publishing it.
+The owned link disables DNS-over-TLS, DNSSEC validation, LLMNR, and mDNS;
+upstream encryption and DNS policy belong in Shoes' `dns` configuration.
+Other links are not changed. The managed TUN subnet is reserved for ingress:
+forwarding a connection back to that subnet is rejected, except local DNS handling.
+
+The initial route must exist before OUTPUT capture, so every configured family
+requires an underlying main-table default route. For explicitly IPv4-only
+capture, configure only an IPv4 address and `route_address: [0.0.0.0/0]`; IPv6
+then remains native. This is not an IPv6 blocking policy.
+
+Loopback, local destinations, multicast, broadcast, link-local destinations,
+and connected networks remain native. DNS to connected networks is intercepted
+unless explicitly excluded. Replies to inbound services remain native. Existing
+tracked native flows remain native; captured flows retain their selection.
+New TCP capture starts only with connection establishment. UDP flows created
+before conntrack was enabled cannot be identified reliably and may reset.
+Applications explicitly bound to a physical device are outside the capture
+guarantee; address-bound TCP/UDP clients are supported.
+Foreign-marked traffic is left to existing policy. Unsupported protocols remain
+native; ICMP handling is the existing synthetic echo behavior, not remote ICMP
+forwarding. This is host capture, not gateway or container forwarding.
+
+Conflicting tables, priorities, mark reservations, or preceding nonlocal policy
+rules cause startup rejection. Other VPNs and firewall managers require explicit
+coexistence validation; Shoes does not override foreign firewall decisions.
+No universal VPN, firewall, resolver-manager, or distribution compatibility is
+promised.
+
+Reload retains the interface, capture, and redirect listener identities. Network
+topology changes require restart and are rejected before retiring live workers.
+Ordinary worker reloads can reset existing connections and briefly interrupt
+traffic, but do not disable capture. Failed candidates roll back on the same
+network lease. Unexpected owned-state changes cause orderly shutdown rather
+than silently overwriting external changes.
+
+Shutdown removes capture and owned DNS settings before retiring ingress.
+SIGKILL cannot run cleanup: the service's `ExecStopPost` invokes
+`shoes cleanup-tun`, and the next managed startup also reconciles stale state.
+Recovery uses a private namespace-scoped journal under `/run/shoes`; externally
+modified objects are refused, with errors reported. Temporary outages and lost
+connections are possible. Cached fake addresses may outlive shutdown. There is
+no kill switch, no automatic DIRECT fallback on upstream failure, and no
+uninterrupted fail-open guarantee.
+Outstanding helper processes retain the namespace lock, so recovery fails rather
+than racing a helper that could still commit. The service terminates remaining
+helpers before `ExecStopPost`; standalone operators must let them finish or stop
+them before retrying cleanup. Firewall comparisons use the installed nft version's
+readback. A crash before the first readback uses conservative generated-policy
+comparison and may require manual inspection if that nft version renders it
+differently.
+The service retries without a start-rate limit, including while a configured
+family is waiting for its underlying default route. Read failures during
+reconciliation currently trigger cleanup and a supervised restart, not in-place
+repair. If an owned table has changed externally, automatic cleanup refuses to
+delete it; inspect the journal's token-named table before removing it manually.
+Until it is removed, stale TCP REDIRECT rules can continue to reject connections.
 
 ## Client Config
 

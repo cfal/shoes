@@ -1,0 +1,30 @@
+[Unit]
+Description=Shoes managed desktop proxy
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/shoes /etc/shoes/desktop.yaml
+ExecStopPost=/usr/local/bin/shoes cleanup-tun
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=60
+KillMode=mixed
+RuntimeDirectory=shoes
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/run/shoes /var/lib/shoes
+StateDirectory=shoes
+StateDirectoryMode=0700
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
