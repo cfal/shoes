@@ -217,6 +217,74 @@ fn tls_reads_leave_output_and_writer_readiness_untouched() {
 }
 
 #[test]
+fn masked_tls_reads_preserve_underlying_writer_readiness() {
+    for reality in [false, true] {
+        for synchronous_progress in [false, true] {
+            for operation in [
+                WriteOperation::Write,
+                WriteOperation::WriteVectored,
+                WriteOperation::Flush,
+                WriteOperation::Shutdown,
+                WriteOperation::DrainTls,
+            ] {
+                let state = Arc::new(Mutex::new(WriteReadiness::default()));
+                let config: crate::sudoku_mask::SudokuMaskConfig<()> =
+                    serde_json::from_value(serde_json::json!({"protocol":null})).unwrap();
+                let io = crate::sudoku_mask::SudokuStream::new(
+                    Box::new(SingleWriteWaiter(state.clone())),
+                    config.prepare().unwrap(),
+                    crate::sudoku_mask::Role::Client,
+                );
+                let session = if reality {
+                    completed_reality_connection()
+                } else {
+                    completed_ordinary_connections().0
+                };
+                let mut stream = CryptoTlsStream::new(io, session, None);
+                let writer = Arc::new(WakeCount::default());
+                let reader = Arc::new(WakeCount::default());
+                let (write_waker, read_waker) = (writer.clone().into(), reader.clone().into());
+                let mut write_cx = Context::from_waker(&write_waker);
+                let mut read_cx = Context::from_waker(&read_waker);
+                saturate_tls_output(&mut stream, &mut write_cx);
+                assert!(
+                    operation
+                        .poll(&mut stream, &mut write_cx, &BACKPRESSURE_PAYLOAD)
+                        .is_pending(),
+                    "expected {operation:?} to block"
+                );
+                assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+                if synchronous_progress {
+                    state.lock().unwrap().allowance = usize::MAX;
+                }
+                // TLS reads no longer drain TLS output, but the mask still drains accepted wire.
+                assert!(
+                    Pin::new(&mut stream)
+                        .poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0]))
+                        .is_pending()
+                );
+                if !synchronous_progress {
+                    assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+                    // Cancel the reader: only the transport readiness notification remains.
+                    let readiness = state.lock().unwrap().waker.take().unwrap();
+                    readiness.wake();
+                    assert!(reader.0.load(Ordering::Relaxed) > 0);
+                }
+                assert!(
+                    writer.0.load(Ordering::Relaxed) > 0,
+                    "lost writer: reality={reality}, synchronous={synchronous_progress}, operation={operation:?}"
+                );
+                state.lock().unwrap().allowance = usize::MAX;
+                assert!(matches!(
+                    Pin::new(&mut stream).poll_flush(&mut write_cx),
+                    Poll::Ready(Ok(()))
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn split_tls_tasks_keep_raw_and_ping_write_readiness() {
     for raw_read in [false, true] {
         for operation in [

@@ -123,8 +123,8 @@ pub struct Client {
     version: XhttpVersion,
     mode: XhttpMode,
     security: Security,
-    outer_masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
-    inner_masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
+    before_security_masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
+    after_security_masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
     memory: Arc<Budget>,
     admission: Arc<Budget>,
     tasks: Tasks,
@@ -173,8 +173,8 @@ impl Client {
             version,
             mode,
             security,
-            outer_masks: Vec::new(),
-            inner_masks: Vec::new(),
+            before_security_masks: Vec::new(),
+            after_security_masks: Vec::new(),
             slots: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -200,11 +200,11 @@ impl Client {
 
     pub(super) fn with_masks(
         mut self,
-        outer: Vec<Arc<crate::sudoku_mask::Prepared>>,
-        inner: Vec<Arc<crate::sudoku_mask::Prepared>>,
+        before_security: Vec<Arc<crate::sudoku_mask::Prepared>>,
+        after_security: Vec<Arc<crate::sudoku_mask::Prepared>>,
     ) -> Self {
-        self.outer_masks = outer;
-        self.inner_masks = inner;
+        self.before_security_masks = before_security;
+        self.after_security_masks = after_security;
         self
     }
 
@@ -230,12 +230,15 @@ impl Client {
                 if self.version == XhttpVersion::H3 {
                     Carrier::quic(dialer.open_quic().await?, header_limit).await
                 } else {
-                    let stream = Self::mask_carrier(dialer.open_stream().await?, &self.outer_masks);
+                    let stream = Self::mask_carrier(
+                        dialer.open_stream().await?,
+                        &self.before_security_masks,
+                    );
                     let stream = self
                         .security
                         .wrap(stream, &self.endpoint, self.version)
                         .await?;
-                    let stream = Self::mask_carrier(stream, &self.inner_masks);
+                    let stream = Self::mask_carrier(stream, &self.after_security_masks);
                     Carrier::tcp_with_windows(
                         stream,
                         self.version,
@@ -850,8 +853,8 @@ mod tests {
             let (client, _) = super::super::connector::build(&config, resolver.clone())
                 .unwrap()
                 .unwrap();
-            assert_eq!(client.outer_masks.len(), before);
-            assert_eq!(client.inner_masks.len(), after);
+            assert_eq!(client.before_security_masks.len(), before);
+            assert_eq!(client.after_security_masks.len(), after);
             let request = client.request("session", None, false, Body::Empty).unwrap();
             assert_eq!(
                 request.uri().scheme_str(),

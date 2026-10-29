@@ -107,6 +107,7 @@ pub(super) struct Mapping {
 
 impl Mapping {
     pub fn new(password: &str) -> Self {
+        // Build shared tables during config preparation, not on the first connection.
         core();
         let hash = digest(&SHA256, password.as_bytes());
         let seed = i64::from_be_bytes(hash.as_ref()[..8].try_into().unwrap());

@@ -10,12 +10,28 @@ use std::{fmt, io, sync::Arc};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+use crate::config::{ClientProxyConfig, ServerProxyConfig, Transport};
+
 use layout::Layout;
 use table::Mapping;
 
 pub(crate) use stream::SudokuStream;
 
-pub(crate) fn contains_client(protocol: &crate::config::ClientProxyConfig) -> bool {
+pub(crate) fn check_client_transport(
+    protocol: &ClientProxyConfig,
+    transport: &Transport,
+) -> io::Result<()> {
+    check_transport(contains_client(protocol), transport)
+}
+
+pub(crate) fn check_server_transport(
+    protocol: &ServerProxyConfig,
+    transport: &Transport,
+) -> io::Result<()> {
+    check_transport(contains_server(protocol), transport)
+}
+
+fn contains_client(protocol: &ClientProxyConfig) -> bool {
     use crate::config::ClientProxyConfig as P;
     match protocol {
         P::SudokuMask(_) => true,
@@ -27,7 +43,7 @@ pub(crate) fn contains_client(protocol: &crate::config::ClientProxyConfig) -> bo
     }
 }
 
-pub(crate) fn contains_server(protocol: &crate::config::ServerProxyConfig) -> bool {
+fn contains_server(protocol: &ServerProxyConfig) -> bool {
     use crate::config::ServerProxyConfig as P;
     match protocol {
         P::SudokuMask(_) => true,
@@ -55,11 +71,8 @@ pub(crate) fn contains_server(protocol: &crate::config::ServerProxyConfig) -> bo
     }
 }
 
-pub(crate) fn check_transport(
-    present: bool,
-    transport: &crate::config::Transport,
-) -> io::Result<()> {
-    if present && *transport != crate::config::Transport::Tcp {
+fn check_transport(present: bool, transport: &Transport) -> io::Result<()> {
+    if present && *transport != Transport::Tcp {
         return Err(invalid(
             "sudoku_mask requires TCP transport; native UDP/QUIC masking is not supported",
         ));
@@ -67,10 +80,8 @@ pub(crate) fn check_transport(
     Ok(())
 }
 
-pub(crate) fn without_server_masks(
-    mut protocol: &crate::config::ServerProxyConfig,
-) -> &crate::config::ServerProxyConfig {
-    while let crate::config::ServerProxyConfig::SudokuMask(config) = protocol {
+pub(crate) fn without_server_masks(mut protocol: &ServerProxyConfig) -> &ServerProxyConfig {
+    while let ServerProxyConfig::SudokuMask(config) = protocol {
         protocol = &config.protocol;
     }
     protocol

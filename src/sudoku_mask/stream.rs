@@ -218,10 +218,7 @@ impl AsyncWrite for SudokuStream {
         ready!(this.poll_drain(cx))?;
         match ready!(Pin::new(&mut this.inner).poll_flush(cx)) {
             Ok(()) => Poll::Ready(Ok(())),
-            Err(error) => {
-                this.write_error = Some(Failure::new(error));
-                Poll::Ready(Err(this.write_error.as_ref().unwrap().error()))
-            }
+            Err(error) => Poll::Ready(Err(this.write_error.insert(Failure::new(error)).error())),
         }
     }
 
@@ -392,21 +389,33 @@ mod tests {
 
     #[test]
     fn split_tasks_keep_write_readiness_after_read_drains_or_is_cancelled() {
+        #[derive(Clone, Copy, Debug)]
+        enum Operation {
+            Write,
+            Flush,
+            Shutdown,
+            Ping,
+        }
         fn write_side(
             stream: &mut SudokuStream,
             cx: &mut Context<'_>,
-            operation: usize,
+            operation: Operation,
         ) -> Poll<io::Result<()>> {
             match operation {
-                0 => Pin::new(stream)
+                Operation::Write => Pin::new(stream)
                     .poll_write(cx, b"next")
                     .map(|r| r.map(|_| ())),
-                1 => Pin::new(stream).poll_flush(cx),
-                2 => Pin::new(stream).poll_shutdown(cx),
-                _ => Pin::new(stream).poll_write_ping(cx).map(|r| r.map(|_| ())),
+                Operation::Flush => Pin::new(stream).poll_flush(cx),
+                Operation::Shutdown => Pin::new(stream).poll_shutdown(cx),
+                Operation::Ping => Pin::new(stream).poll_write_ping(cx).map(|r| r.map(|_| ())),
             }
         }
-        for operation in 0..4 {
+        for operation in [
+            Operation::Write,
+            Operation::Flush,
+            Operation::Shutdown,
+            Operation::Ping,
+        ] {
             for (drain_immediately, cancel_reader) in [(false, false), (false, true), (true, false)]
             {
                 let (mut stream, state) = scripted(Role::Client);
@@ -442,7 +451,7 @@ mod tests {
                 }
                 assert!(
                     writer.0.load(Ordering::Relaxed) > 0,
-                    "writer lost readiness; operation {operation}"
+                    "writer lost readiness; operation {operation:?}"
                 );
                 if !cancel_reader && !drain_immediately {
                     assert!(
@@ -467,7 +476,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     decoded,
-                    if operation == 0 {
+                    if matches!(operation, Operation::Write) {
                         b"onenext".as_slice()
                     } else {
                         b"one"

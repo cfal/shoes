@@ -396,6 +396,22 @@ pub fn protocol_type(protocol: &ClientProxyConfig) -> &str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sudoku_masks_preserve_inner_protocol_type() {
+        let protocol = serde_json::from_value(serde_json::json!({
+            "type": "sudoku_mask",
+            "protocol": {
+                "type": "tls",
+                "protocol": {
+                    "type": "sudoku_mask",
+                    "protocol": {"type": "socks"}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(protocol_type(&protocol), "Socks5");
+    }
+
     #[cfg(unix)]
     #[test]
     fn unused_catalog_leaves_are_normalized_without_activating_wireguard() {

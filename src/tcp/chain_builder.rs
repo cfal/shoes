@@ -94,10 +94,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
 
     for (index, configs) in hops.iter().enumerate() {
         for config in configs {
-            crate::sudoku_mask::check_transport(
-                crate::sudoku_mask::contains_client(&config.protocol),
-                &config.transport,
-            )?;
+            crate::sudoku_mask::check_client_transport(&config.protocol, &config.transport)?;
             config.validate_quic_key_exchange(index == 0)?;
         }
     }

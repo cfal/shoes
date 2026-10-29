@@ -518,7 +518,7 @@ pub(crate) fn validate_server_transport(
     protocol: &ServerProxyConfig,
     transport: &super::Transport,
 ) -> io::Result<()> {
-    crate::sudoku_mask::check_transport(crate::sudoku_mask::contains_server(protocol), transport)?;
+    crate::sudoku_mask::check_server_transport(protocol, transport)?;
     match protocol {
         ServerProxyConfig::SudokuMask(config) => {
             validate_server_transport(&config.protocol, transport)?
@@ -543,15 +543,10 @@ pub(crate) fn validate_server_transport(
             if *transport == super::Transport::Quic && contains_server(protocol) {
                 return Err(invalid("QUIC XHTTP must be a top-level protocol"));
             }
-            for target in tls_targets.values() {
-                if let ServerProxyConfig::Xhttp(config) =
-                    crate::sudoku_mask::without_server_masks(&target.protocol)
-                {
-                    config.tls_alpn(&target.alpn_protocols)?;
-                }
-                validate_server_transport(&target.protocol, transport)?;
-            }
-            if let Some(target) = default_tls_target {
+            for target in tls_targets
+                .values()
+                .chain(default_tls_target.iter().map(|target| target.as_ref()))
+            {
                 if let ServerProxyConfig::Xhttp(config) =
                     crate::sudoku_mask::without_server_masks(&target.protocol)
                 {

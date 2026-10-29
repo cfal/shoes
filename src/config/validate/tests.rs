@@ -198,8 +198,18 @@ fn sudoku_mask_preserves_sni_and_existing_immediate_child_constraints() {
     .unwrap_err();
     assert!(error.to_string().contains("NaiveProxy must be used inside"));
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let configs=serde_json::from_value(json!([{"address":"0.0.0.0:1234","protocol":mask(json!({"type":"tls",
-        "default_target":{"cert":cert.cert.pem(),"key":cert.signing_key.serialize_pem(),"protocol":naive}}))}])).unwrap();
+    let configs = serde_json::from_value(json!([{
+        "address": "0.0.0.0:1234",
+        "protocol": mask(json!({
+            "type": "tls",
+            "default_target": {
+                "cert": cert.cert.pem(),
+                "key": cert.signing_key.serialize_pem(),
+                "protocol": naive
+            }
+        }))
+    }]))
+    .unwrap();
     assert!(create_server_configs(configs).is_ok());
 }
 
