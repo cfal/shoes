@@ -355,7 +355,7 @@ async fn send_message(
     Ok(answer.into_message())
 }
 
-fn net_error(error: NetError) -> io::Error {
+pub(super) fn net_error(error: NetError) -> io::Error {
     let kind = match &error {
         NetError::Timeout => io::ErrorKind::TimedOut,
         NetError::Io(error) => error.kind(),
