@@ -351,11 +351,15 @@ mod tests {
             NxDomain,
         }
 
+        let location = NetLocation::from_str("recovery.example.:443", None).unwrap();
+        let expected_addresses: [SocketAddr; 1] = ["198.51.100.7:443".parse().unwrap()];
+
         for failure in [Failure::Timeout, Failure::NoConnections, Failure::NxDomain] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-                let _silent = if matches!(failure, Failure::Timeout) {
+                // Keeps the unanswered connection open so the lookup fails by timeout, not EOF.
+                let _unanswered_connection = if matches!(failure, Failure::Timeout) {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let length = stream.read_u16().await.unwrap();
                     let mut bytes = vec![0; length as usize];
@@ -364,10 +368,10 @@ mod tests {
                 } else {
                     None
                 };
-                let (mut healthy, _) = listener.accept().await.unwrap();
-                let length = healthy.read_u16().await.unwrap();
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let length = stream.read_u16().await.unwrap();
                 let mut bytes = vec![0; length as usize];
-                healthy.read_exact(&mut bytes).await.unwrap();
+                stream.read_exact(&mut bytes).await.unwrap();
                 let mut reply = Message::from_vec(&bytes).unwrap().into_response();
                 if matches!(failure, Failure::NxDomain) {
                     reply.metadata.response_code = ResponseCode::NXDomain;
@@ -379,41 +383,38 @@ mod tests {
                     ));
                 }
                 let bytes = reply.to_vec().unwrap();
-                healthy.write_u16(bytes.len() as u16).await.unwrap();
-                healthy.write_all(&bytes).await.unwrap();
+                stream.write_u16(bytes.len() as u16).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
             }));
             let builds = Arc::new(AtomicUsize::new(0));
-            let factory: ResolverFactory = Arc::new({
-                let builds = builds.clone();
-                move || {
-                    let generation = builds.fetch_add(1, Ordering::Relaxed);
-                    Box::pin(async move {
-                        let bootstrap: Arc<dyn ShoesResolver> =
-                            Arc::new(crate::resolver::NativeResolver::new());
-                        let chain = Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
-                            bootstrap.clone(),
-                        ));
-                        let options = HickoryResolverOptions {
-                            ip_strategy: IpStrategy::Ipv4Only,
-                            request_timeout: Some(Duration::from_millis(250)),
-                            attempts: 0,
-                            ..Default::default()
-                        };
-                        let resolver =
-                            if matches!(failure, Failure::NoConnections) && generation == 0 {
-                                HickoryResolver::build_pooled(
-                                    vec![],
-                                    chain,
-                                    bootstrap,
-                                    options,
-                                    "empty test pool".into(),
-                                )?
-                            } else {
-                                HickoryResolver::tcp(address, chain, bootstrap, options)?
-                            };
-                        Ok(Arc::new(resolver) as Arc<dyn ShoesResolver>)
-                    })
-                }
+            let factory_builds = builds.clone();
+            let factory: ResolverFactory = Arc::new(move || {
+                let generation = factory_builds.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    let bootstrap: Arc<dyn ShoesResolver> =
+                        Arc::new(crate::resolver::NativeResolver::new());
+                    let chain = Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
+                        bootstrap.clone(),
+                    ));
+                    let options = HickoryResolverOptions {
+                        ip_strategy: IpStrategy::Ipv4Only,
+                        request_timeout: Some(Duration::from_millis(250)),
+                        attempts: 0,
+                        ..Default::default()
+                    };
+                    let resolver = if matches!(failure, Failure::NoConnections) && generation == 0 {
+                        HickoryResolver::build_pooled(
+                            vec![],
+                            chain,
+                            bootstrap,
+                            options,
+                            "empty test pool".into(),
+                        )?
+                    } else {
+                        HickoryResolver::tcp(address, chain, bootstrap, options)?
+                    };
+                    Ok(Arc::new(resolver) as Arc<dyn ShoesResolver>)
+                })
             });
             let resolver = RefreshingResolver::new(
                 factory,
@@ -425,39 +426,32 @@ mod tests {
             )
             .await
             .unwrap();
-            let result = tokio::time::timeout(
-                Duration::from_secs(3),
-                resolver.resolve_location(
-                    &NetLocation::from_str("recovery.example.:443", None).unwrap(),
-                ),
-            )
-            .await
-            .unwrap();
-            if matches!(failure, Failure::NxDomain) {
-                let error = result.unwrap_err();
-                assert_eq!(error.kind(), std::io::ErrorKind::Other);
-                assert!(
-                    error
-                        .get_ref()
-                        .unwrap()
-                        .is::<hickory_resolver::net::NetError>()
-                );
-                assert_eq!(builds.load(Ordering::Relaxed), 1);
-                server.await.unwrap();
-                continue;
-            }
-            assert_eq!(result.unwrap(), ["198.51.100.7:443".parse().unwrap()]);
-            assert_eq!(builds.load(Ordering::Relaxed), 2);
-            assert_eq!(
-                resolver
-                    .resolve_location(
-                        &NetLocation::from_str("recovery.example.:443", None).unwrap()
-                    )
+            let result =
+                tokio::time::timeout(Duration::from_secs(3), resolver.resolve_location(&location))
                     .await
-                    .unwrap(),
-                ["198.51.100.7:443".parse().unwrap()]
-            );
-            assert_eq!(builds.load(Ordering::Relaxed), 2);
+                    .unwrap();
+            match failure {
+                Failure::NxDomain => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                    assert!(
+                        error
+                            .get_ref()
+                            .unwrap()
+                            .is::<hickory_resolver::net::NetError>()
+                    );
+                    assert_eq!(builds.load(Ordering::Relaxed), 1);
+                }
+                Failure::Timeout | Failure::NoConnections => {
+                    assert_eq!(result.unwrap(), expected_addresses);
+                    assert_eq!(builds.load(Ordering::Relaxed), 2);
+                    assert_eq!(
+                        resolver.resolve_location(&location).await.unwrap(),
+                        expected_addresses
+                    );
+                    assert_eq!(builds.load(Ordering::Relaxed), 2);
+                }
+            }
             server.await.unwrap();
         }
     }
