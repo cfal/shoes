@@ -100,7 +100,6 @@ impl Session {
             ifindex: None,
             redirect_ports: [None, None],
             dns_pending: false,
-            dns_before: None,
             firewall_pending: false,
             on_link: Vec::new(),
             previous_on_link: None,
@@ -187,10 +186,6 @@ impl Session {
             &self.record.alias(),
         )
         .await?;
-        // The virtual DNS endpoint is reachable through its connected TUN route without capture.
-        if self.resolved.is_some() {
-            resolved::ready(&self.record).await?;
-        }
         self.record.firewall_pending = true;
         self.journal.save(&self.record)?;
         command::nft(
@@ -203,10 +198,13 @@ impl Session {
         self.record.firewall = Some(listing);
         self.journal.save(&self.record)?;
         if let Some(resolved) = &self.resolved {
-            self.record.dns_before = Some(resolved.snapshot(&self.handle, &self.record).await?);
             self.record.dns_pending = true;
             self.journal.save(&self.record)?;
-            resolved.activate(&self.handle, &self.record).await?;
+            if let Err(error) = resolved.activate(&self.handle, &self.record).await {
+                log::warn!(
+                    "Automatic DNS setup failed; continuing without guaranteed system DNS routing: {error}"
+                );
+            }
         }
         self.active = true;
         Ok(())
@@ -231,9 +229,6 @@ impl Session {
         }
         routes::check(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
         verify_firewall(self.journal.lease(), &self.nft, &self.record).await?;
-        if let Some(resolved) = &self.resolved {
-            resolved.check(&self.handle, &self.record).await?;
-        }
         let networks = routes::on_link(&self.handle, index).await?;
         if networks != self.record.on_link {
             self.record.previous_on_link =
@@ -277,7 +272,7 @@ impl Session {
         {
             match resolved.revert(&self.handle, &self.record).await {
                 Ok(()) => self.record.dns_pending = false,
-                Err(error) => errors.push(error.to_string()),
+                Err(error) => log::warn!("Automatic DNS cleanup failed: {error}"),
             }
         }
         self.active = false;
@@ -437,14 +432,14 @@ async fn recover(handle: &Handle, nft: &str, journal: &Journal, record: &Record)
     {
         errors.push(error.to_string());
     }
-    if record.dns_pending && routes::link(handle, &record.spec.name).await?.is_some() {
+    if record.dns_pending {
         match resolved::Resolved::preflight(journal.lease()).await {
             Ok(resolved) => {
                 if let Err(error) = resolved.revert(handle, record).await {
-                    errors.push(error.to_string());
+                    log::warn!("Automatic DNS recovery failed: {error}");
                 }
             }
-            Err(error) => errors.push(error.to_string()),
+            Err(error) => log::warn!("Automatic DNS recovery unavailable: {error}"),
         }
     }
     remove_routing(handle, record, &mut errors).await;

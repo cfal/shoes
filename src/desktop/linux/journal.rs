@@ -18,7 +18,6 @@ pub(super) struct Record {
     pub ifindex: Option<u32>,
     pub redirect_ports: [Option<u16>; 2],
     pub dns_pending: bool,
-    pub dns_before: Option<serde_json::Value>,
     pub firewall_pending: bool,
     pub on_link: Vec<ipnetwork::IpNetwork>,
     pub previous_on_link: Option<Vec<ipnetwork::IpNetwork>>,

@@ -498,14 +498,19 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
                 session.journal.save(&session.record)?;
                 let retained = session.ingress().unwrap();
                 drop(session);
-                let error = cleanup().await.unwrap_err();
+                cleanup().await?;
+                assert!(Journal::lock()?.load()?.is_none());
+                let links: serde_json::Value =
+                    serde_json::from_str(&run("ip", &["-j", "link", "show"])?)?;
                 assert!(
-                    error.to_string().contains("different network namespace"),
-                    "{error}"
+                    !links
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|link| link["ifname"] == "shoes0")
                 );
-                assert!(Journal::lock()?.load()?.is_some());
                 drop(retained);
-                cleanup().await
+                Ok(())
             });
     }
     if let Some(parent) = std::env::var_os(PARENT) {
@@ -753,7 +758,7 @@ async fn kernel_capture() -> io::Result<()> {
             )
             .await?,
         );
-        resolved::ready(&session.record).await?;
+        dns_ready(&session.record).await?;
         tun_subnet_rejected(&session, false)
             .await
             .map_err(|error| io::Error::other(format!("pre-capture subnet guard: {error}")))?;
@@ -902,6 +907,8 @@ async fn kernel_capture() -> io::Result<()> {
             }
         }
         resolved_foreign_namespace().await?;
+        resolved_failures().await?;
+        resolved_service_loss().await?;
     }
     drop((tcp_echo, udp_echo));
     Ok(())
@@ -943,6 +950,71 @@ async fn interception_validation() -> io::Result<()> {
     Ok(())
 }
 
+async fn dns_ready(record: &journal::Record) -> io::Result<()> {
+    use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // An empty question is rejected locally, without publishing fake answers or querying upstreams.
+    let query = Message::query();
+    let id = query.id;
+    let query = query.to_vec().map_err(io::Error::other)?;
+    for address in record.spec.dns_addresses()? {
+        let endpoint = std::net::SocketAddr::new(address, 53);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let udp = crate::socket_util::new_udp_socket(address.is_ipv6(), None)?;
+            udp.connect(endpoint).await?;
+            let mut bytes = vec![0; 4096];
+            let length = loop {
+                udp.send(&query).await?;
+                if let Ok(result) = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    udp.recv(&mut bytes),
+                )
+                .await
+                {
+                    break result?;
+                }
+            };
+            let check = |bytes: &[u8]| -> io::Result<()> {
+                let response = Message::from_vec(bytes).map_err(io::Error::other)?;
+                if response.message_type != MessageType::Response
+                    || response.response_code != ResponseCode::FormErr
+                    || response.id != id
+                {
+                    return Err(io::Error::other(
+                        "unexpected managed DNS readiness response",
+                    ));
+                }
+                Ok(())
+            };
+            check(&bytes[..length])?;
+            let mut tcp = crate::socket_util::new_tcp_socket(None, address.is_ipv6())?
+                .connect(endpoint)
+                .await?;
+            tcp.write_u16(query.len() as u16).await?;
+            tcp.write_all(&query).await?;
+            let length = tcp.read_u16().await? as usize;
+            bytes.resize(length, 0);
+            tcp.read_exact(&mut bytes).await?;
+            check(&bytes)?;
+            tcp.shutdown().await?;
+            if tcp.read(&mut [0]).await? != 0 {
+                return Err(io::Error::other(
+                    "unexpected trailing DNS readiness response",
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("managed DNS endpoint {endpoint} is not ready"),
+            )
+        })??;
+    }
+    Ok(())
+}
+
 async fn resolved_fixture() -> io::Result<Vec<tokio::process::Child>> {
     let Some(root) = std::env::var_os("SHOES_RESOLVED_ROOT") else {
         return Ok(Vec::new());
@@ -976,10 +1048,7 @@ async fn resolved_fixture() -> io::Result<Vec<tokio::process::Child>> {
         "/run/systemd/resolved.conf.d/zz-test.conf",
         "[Resolve]\nDNS=\nFallbackDNS=\nDNSOverTLS=yes\nDNSSEC=yes\nLLMNR=yes\nMulticastDNS=yes\n",
     )?;
-    std::fs::write(
-        "/run/managed-bus.conf",
-        "<busconfig><type>system</type><listen>unix:path=/run/dbus/system_bus_socket</listen><policy context=\"default\"><allow user=\"*\"/><allow own=\"*\"/><allow send_destination=\"*\"/><allow receive_sender=\"*\"/></policy></busconfig>",
-    )?;
+    resolved_bus_policy(None)?;
     let bus = tokio::process::Command::new("dbus-daemon")
         .args(["--config-file=/run/managed-bus.conf", "--nofork"])
         .kill_on_drop(true)
@@ -1009,6 +1078,158 @@ async fn resolved_fixture() -> io::Result<Vec<tokio::process::Child>> {
     Ok(vec![resolver, bus])
 }
 
+fn resolved_bus_policy(denied: Option<&str>) -> io::Result<()> {
+    let deny = denied
+        .map(|method| format!("<deny send_interface=\"org.freedesktop.resolve1.Manager\" send_member=\"{method}\"/>"))
+        .unwrap_or_default();
+    std::fs::write(
+        "/run/managed-bus.conf",
+        format!(
+            "<busconfig><type>system</type><listen>unix:path=/run/dbus/system_bus_socket</listen><policy context=\"default\"><allow user=\"*\"/><allow own=\"*\"/><allow send_destination=\"*\"/><allow receive_sender=\"*\"/>{deny}</policy></busconfig>"
+        ),
+    )
+}
+
+fn reload_resolved_bus_policy(denied: Option<&str>) -> io::Result<()> {
+    resolved_bus_policy(denied)?;
+    run(
+        "busctl",
+        &[
+            "--system",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ReloadConfig",
+        ],
+    )?;
+    Ok(())
+}
+
+async fn resolved_failures() -> io::Result<()> {
+    for (denied, orphan) in [
+        ("SetLinkDomains", false),
+        ("RevertLink", false),
+        ("RevertLink", true),
+    ] {
+        reload_resolved_bus_policy(Some(denied))?;
+        let mut spec = spec(true);
+        spec.auto_dns = true;
+        let mut session = Session::prepare(spec).await?;
+        assert!(session.resolved.is_some());
+        session.prepare_network().await?;
+        session.activate().await?;
+        assert!(session.active);
+        assert!(session.record.dns_pending);
+        let index = session.record.ifindex.unwrap();
+        let settings = resolved_link_settings(index)?;
+        assert!(!settings["DNS"]["data"].as_array().unwrap().is_empty());
+        if denied == "SetLinkDomains" {
+            assert_eq!(settings["Domains"]["data"], json!([]));
+        }
+        session.reconcile().await?;
+        let retained = session.ingress().unwrap();
+        if orphan {
+            drop(session);
+            cleanup().await?;
+        } else {
+            session.close().await?;
+            assert!(routes::link(&session.handle, "shoes0").await?.is_none());
+            assert!(session.journal.load()?.is_none());
+            drop(session);
+        }
+        assert!(Journal::lock()?.load()?.is_none());
+        assert_no_owned_firewall()?;
+        let links: serde_json::Value = serde_json::from_str(&run("ip", &["-j", "link", "show"])?)?;
+        assert!(
+            !links
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|link| link["ifname"] == "shoes0")
+        );
+        drop(retained);
+    }
+    reload_resolved_bus_policy(None)
+}
+
+fn resolved_link_settings(index: u32) -> io::Result<serde_json::Value> {
+    let link = run(
+        "busctl",
+        &[
+            "--system",
+            "--json=short",
+            "call",
+            "org.freedesktop.resolve1",
+            "/org/freedesktop/resolve1",
+            "org.freedesktop.resolve1.Manager",
+            "GetLink",
+            "i",
+            &index.to_string(),
+        ],
+    )?;
+    let link: serde_json::Value = serde_json::from_str(&link)?;
+    let settings = run(
+        "busctl",
+        &[
+            "--system",
+            "--json=short",
+            "call",
+            "org.freedesktop.resolve1",
+            link["data"][0].as_str().unwrap(),
+            "org.freedesktop.DBus.Properties",
+            "GetAll",
+            "s",
+            "org.freedesktop.resolve1.Link",
+        ],
+    )?;
+    let mut settings: serde_json::Value = serde_json::from_str(&settings)?;
+    Ok(settings["data"][0].take())
+}
+
+async fn resolved_service_loss() -> io::Result<()> {
+    let mut spec = spec(true);
+    spec.auto_dns = true;
+    let mut session = Session::prepare(spec.clone()).await?;
+    assert!(session.resolved.is_some());
+    session.prepare_network().await?;
+    session.activate().await?;
+    let credentials: serde_json::Value = serde_json::from_str(&run(
+        "busctl",
+        &[
+            "--system",
+            "--json=short",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetConnectionUnixProcessID",
+            "s",
+            "org.freedesktop.resolve1",
+        ],
+    )?)?;
+    let pid = credentials["data"][0].as_u64().unwrap() as i32;
+    assert!(pid > 1);
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while resolved_link_settings(session.record.ifindex.unwrap()).is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    session.reconcile().await?;
+    session.close().await?;
+    assert!(session.journal.load()?.is_none());
+    drop(session);
+    let mut session = Session::prepare(spec).await?;
+    assert!(session.resolved.is_none());
+    session.prepare_network().await?;
+    session.activate().await?;
+    session.close().await?;
+    assert!(session.journal.load()?.is_none());
+    Ok(())
+}
+
 async fn resolved_foreign_namespace() -> io::Result<()> {
     let native: serde_json::Value =
         serde_json::from_str(&run("ip", &["-j", "link", "show", "native0"])?)?;
@@ -1021,22 +1242,6 @@ async fn resolved_foreign_namespace() -> io::Result<()> {
             ],
         )?;
     }
-    let link = run(
-        "busctl",
-        &[
-            "--system",
-            "--json=short",
-            "call",
-            "org.freedesktop.resolve1",
-            "/org/freedesktop/resolve1",
-            "org.freedesktop.resolve1.Manager",
-            "GetLink",
-            "i",
-            "3",
-        ],
-    )?;
-    let link: serde_json::Value = serde_json::from_str(&link)?;
-    let path = link["data"][0].as_str().unwrap();
     run(
         "busctl",
         &[
@@ -1051,25 +1256,9 @@ async fn resolved_foreign_namespace() -> io::Result<()> {
             "no",
         ],
     )?;
-    let settings = || -> io::Result<serde_json::Value> {
-        Ok(serde_json::from_str(&run(
-            "busctl",
-            &[
-                "--system",
-                "--json=short",
-                "call",
-                "org.freedesktop.resolve1",
-                path,
-                "org.freedesktop.DBus.Properties",
-                "GetAll",
-                "s",
-                "org.freedesktop.resolve1.Link",
-            ],
-        )?)?)
-    };
-    let before = settings()?;
-    assert_eq!(before["data"][0]["DNS"]["data"], json!([]));
-    assert_eq!(before["data"][0]["Domains"]["data"], json!([]));
+    let before = resolved_link_settings(3)?;
+    assert_eq!(before["DNS"]["data"], json!([]));
+    assert_eq!(before["Domains"]["data"], json!([]));
     let output = tokio::process::Command::new("ip")
         .args(["netns", "exec", "peer"])
         .arg(std::env::current_exe()?)
@@ -1084,7 +1273,7 @@ async fn resolved_foreign_namespace() -> io::Result<()> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(settings()?, before);
+    assert_eq!(resolved_link_settings(3)?, before);
     Ok(())
 }
 
@@ -1190,7 +1379,30 @@ async fn resolved_integration(udp_limit: usize, redirect: bool) -> io::Result<()
         })
         .await??;
     }
+    let index = session.record.ifindex.unwrap();
+    run(
+        "busctl",
+        &[
+            "--system",
+            "call",
+            "org.freedesktop.resolve1",
+            "/org/freedesktop/resolve1",
+            "org.freedesktop.resolve1.Manager",
+            "SetLinkDomains",
+            "ia(sb)",
+            &index.to_string(),
+            "1",
+            "external.example",
+            "true",
+        ],
+    )?;
+    let changed = resolved_link_settings(index)?;
+    assert_eq!(
+        changed["Domains"]["data"],
+        json!([["external.example", true]])
+    );
     session.reconcile().await?;
+    assert_eq!(resolved_link_settings(index)?, changed);
     session.deactivate().await?;
     for task in tasks {
         task.abort();

@@ -997,12 +997,17 @@ replace its `rules` with the desired proxy policy before using it as a proxy.
 Requirements: Linux, `/dev/net/tun`, trusted system `nft` with JSON support, and
 network-administration privileges. Automatic DNS additionally requires a running
 systemd-resolved, `busctl` with JSON support, and authorization to
-configure the owned link. Automatic DNS preparation is best-effort: if the service
-is unavailable or its namespace sanity checks fail, Shoes warns and leaves DNS
-externally managed. Namespace checks assume a standard local system bus whose
+configure the owned link. Automatic DNS setup and cleanup are best-effort, with
+bounded helper calls. Missing services, failed namespace checks, and configuration
+errors produce warnings rather than stopping capture. Failed setup may leave
+partial per-link settings until cleanup; system DNS routing through Shoes is not
+guaranteed in that case. Resolver settings are not continuously monitored or
+restored after external changes, and resolver restarts do not stop the proxy.
+Namespace checks assume a standard local system bus whose
 listener and daemon share a PID namespace, with procfs mounted for that namespace;
 resolved must share Shoes' network namespace. Custom bus arrangements should use
-`auto_dns: false`. Restart Shoes after restarting the system bus. The supplied
+`auto_dns: false`. Restart Shoes to reapply automatic DNS after restarting the
+resolver or system bus. The supplied
 service runs as root with a bounded
 capability set. File capabilities on Shoes alone do not grant privileges to
 `nft` children or authorize resolved changes.
@@ -1011,11 +1016,14 @@ Use `auto_dns: false` for externally managed DNS. Shoes never rewrites
 `/etc/resolv.conf`. Bootstrap and native resolution use protected Shoes sockets
 while managed mode is active; listener bind addresses must be literal IPs.
 Real DNS does not require fake-IP. Automatic DNS requires interception and room
-after each interface address for its adjacent virtual DNS endpoint. Both UDP and
-TCP readiness are checked before publishing it.
+after each interface address for its adjacent virtual DNS endpoint. Settings are
+published after ingress workers start, without a separate DNS readiness probe.
 The owned link disables DNS-over-TLS, DNSSEC validation, LLMNR, and mDNS;
 upstream encryption and DNS policy belong in Shoes' `dns` configuration.
-Other links are not changed. The managed TUN subnet is reserved for ingress:
+Cleanup attempts to revert per-link settings on the owned interface, even if
+another manager changed them while Shoes was running. Removing the owned TUN also
+discards its transient resolver settings. Other links are not changed.
+The managed TUN subnet is reserved for ingress:
 forwarding a connection back to that subnet is rejected, except local DNS handling.
 
 The initial route must exist before OUTPUT capture, so every configured family
@@ -1054,10 +1062,10 @@ Reload retains the interface, capture, and redirect listener identities. Network
 topology changes require restart and are rejected before retiring live workers.
 Ordinary worker reloads can reset existing connections and briefly interrupt
 traffic, but do not disable capture. Failed candidates roll back on the same
-network lease. Unexpected owned-state changes cause orderly shutdown rather
-than silently overwriting external changes.
+network lease. Unexpected owned routing or firewall changes cause orderly shutdown
+rather than silently overwriting external changes. Resolver-setting changes do not.
 
-Shutdown removes capture and owned DNS settings before retiring ingress.
+Shutdown removes capture and attempts DNS cleanup before retiring ingress.
 SIGKILL cannot run cleanup: the service's `ExecStopPost` invokes
 `shoes cleanup-tun`, and the next managed startup also reconciles stale state.
 Recovery uses a private namespace-scoped journal under `/run/shoes`; externally
