@@ -357,16 +357,9 @@ impl RunningServers {
                         .as_ref()
                         .ok_or_else(|| io::Error::other("managed TUN ingress is missing"))?;
                     let admission = crate::desktop::Ingress::tcp_admission(config);
-                    let task = crate::tun::start_tun_server_retained(
-                        config.clone(),
-                        resolver.clone(),
-                        ingress.device.clone(),
-                        admission.clone(),
-                    )
-                    .await?;
-                    self.tun.push(task);
-                    self.tun
-                        .extend(ingress.start_redirects(config, resolver, admission)?);
+                    ingress
+                        .start(config, resolver, admission, &mut self.tun)
+                        .await?;
                     continue;
                 }
                 if let Some(fd) = config.device_fd {

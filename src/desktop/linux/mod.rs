@@ -1,7 +1,7 @@
 mod command;
+mod ingress;
 mod journal;
 mod nft;
-mod redirect;
 mod resolved;
 mod routes;
 pub(crate) mod spec;
@@ -18,8 +18,8 @@ use futures::StreamExt;
 use rtnetlink::{Handle, LinkUnspec, MulticastGroup};
 use tokio_util::task::AbortOnDropHandle;
 
+pub(crate) use ingress::Ingress;
 use journal::{Journal, Record};
-pub(crate) use redirect::Ingress;
 pub(crate) use spec::Spec;
 
 pub(crate) struct Session {

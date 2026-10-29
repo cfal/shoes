@@ -13,7 +13,7 @@ use crate::resolver::Resolver;
 use super::spec::Spec;
 
 pub(crate) struct Ingress {
-    pub device: Arc<crate::tun::RetainedDevice>,
+    device: Arc<crate::tun::RetainedDevice>,
     listeners: Vec<Arc<TcpListener>>,
 }
 
@@ -57,7 +57,27 @@ impl Ingress {
             .map(|limit| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS))))
     }
 
-    pub(crate) fn start_redirects(
+    pub(crate) async fn start(
+        &self,
+        config: &TunConfig,
+        resolver: Arc<dyn Resolver>,
+        admission: Option<Arc<Semaphore>>,
+        tasks: &mut Vec<JoinHandle<io::Result<()>>>,
+    ) -> io::Result<()> {
+        let task = crate::tun::start_tun_server_retained(
+            config.clone(),
+            resolver.clone(),
+            self.device.clone(),
+            admission.clone(),
+        )
+        .await?;
+        // Registers the TUN task for caller cleanup before fallible REDIRECT setup.
+        tasks.push(task);
+        tasks.extend(self.start_redirects(config, resolver, admission)?);
+        Ok(())
+    }
+
+    pub(super) fn start_redirects(
         &self,
         config: &TunConfig,
         resolver: Arc<dyn Resolver>,
@@ -170,10 +190,16 @@ mod tests {
     async fn redirect_accept_recovers_after_descriptor_exhaustion() -> io::Result<()> {
         const CHILD: &str = "SHOES_REDIRECT_EXHAUSTION";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe()?)
-                .args(["--exact", "desktop::linux::redirect::tests::redirect_accept_recovers_after_descriptor_exhaustion", "--nocapture"])
-                .env(CHILD, "1").status()?;
-            assert!(status.success());
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "desktop::linux::ingress::tests::redirect_accept_recovers_after_descriptor_exhaustion", "--nocapture"])
+                .env(CHILD, "1").output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "redirect exhaustion test failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
             return Ok(());
         }
         let listener = TcpListener::bind("127.0.0.1:0").await?;

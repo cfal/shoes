@@ -657,16 +657,10 @@ async fn kernel_capture() -> io::Result<()> {
             );
         }
         let admission = Ingress::tcp_admission(&config);
-        let mut tasks = ingress.start_redirects(&config, resolver.clone(), admission.clone())?;
-        tasks.push(
-            crate::tun::start_tun_server_retained(
-                config.clone(),
-                resolver.clone(),
-                ingress.device.clone(),
-                admission,
-            )
-            .await?,
-        );
+        let mut tasks = Vec::new();
+        ingress
+            .start(&config, resolver.clone(), admission, &mut tasks)
+            .await?;
         dns_ready(&session.record).await?;
         tun_subnet_rejected(&session, false)
             .await
@@ -769,16 +763,9 @@ async fn kernel_capture() -> io::Result<()> {
         let mut limited = config.clone();
         limited.resource_limits.max_tcp_connections = Some(1);
         let admission = Ingress::tcp_admission(&limited);
-        tasks.push(
-            crate::tun::start_tun_server_retained(
-                limited.clone(),
-                resolver.clone(),
-                ingress.device.clone(),
-                admission.clone(),
-            )
-            .await?,
-        );
-        tasks.extend(ingress.start_redirects(&limited, resolver, admission.clone())?);
+        ingress
+            .start(&limited, resolver, admission.clone(), &mut tasks)
+            .await?;
         if redirect {
             redirect_dual_stack_limit(port, &session, admission.as_ref().unwrap()).await?;
         }
@@ -1236,16 +1223,10 @@ async fn resolved_integration(udp_limit: usize, redirect: bool) -> io::Result<()
     session.prepare_network().await?;
     let ingress = session.ingress().unwrap();
     let admission = Ingress::tcp_admission(&config);
-    let mut tasks = ingress.start_redirects(&config, Arc::new(Answer), admission.clone())?;
-    tasks.push(
-        crate::tun::start_tun_server_retained(
-            config,
-            Arc::new(Answer),
-            ingress.device.clone(),
-            admission,
-        )
-        .await?,
-    );
+    let mut tasks = Vec::new();
+    ingress
+        .start(&config, Arc::new(Answer), admission, &mut tasks)
+        .await?;
     session.activate().await?;
     let mut query = Message::query();
     query.metadata.recursion_desired = true;
