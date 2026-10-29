@@ -16,13 +16,8 @@ pub(super) struct Record {
     pub token: String,
     pub spec: Spec,
     pub ifindex: Option<u32>,
-    pub redirect_ports: [Option<u16>; 2],
     pub dns_pending: bool,
     pub firewall_pending: bool,
-    pub on_link: Vec<ipnetwork::IpNetwork>,
-    pub previous_on_link: Option<Vec<ipnetwork::IpNetwork>>,
-    pub firewall: Option<serde_json::Value>,
-    pub previous_firewall: Option<serde_json::Value>,
 }
 
 impl Record {
@@ -110,7 +105,6 @@ impl Journal {
         if !metadata.is_file() {
             return Err(io::Error::other("invalid managed TUN journal"));
         }
-        // This private, owner-written record grows with configuration and firewall readbacks.
         let record: Record =
             serde_json::from_reader(BufReader::new(file)).map_err(io::Error::other)?;
         if record.version != 1

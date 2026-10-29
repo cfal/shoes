@@ -89,7 +89,7 @@ fn managed_configuration_is_explicit_dual_stack_and_restart_identifiable() {
 }
 
 #[test]
-fn managed_firewall_schema_preserves_masks_reply_exemption_and_exact_ownership() {
+fn managed_firewall_schema_preserves_masks_and_reply_exemption() {
     let spec = spec(true);
     let policy = nft::install(
         &spec,
@@ -107,140 +107,16 @@ fn managed_firewall_schema_preserves_masks_reply_exemption_and_exact_ownership()
         command::encode_nft(policy.clone()).unwrap(),
         serde_json::to_vec(&serialized).unwrap(),
     );
-    assert!(nft::same_policy(&serialized, &policy), "{serialized}");
     let text = serialized.to_string();
     assert!(text.contains("reply"));
     assert!(text.contains(&(!spec.linux.mark_mask).to_string()));
     assert!(!text.contains("192.0.2.64"));
-    let mut changed = policy.clone();
-    let entries = changed["nftables"].as_array_mut().unwrap();
-    entries.pop();
-    assert!(!nft::same_policy(&changed, &policy));
-    let mut changed = policy.clone();
-    changed["nftables"][1]["add"]["chain"]["prio"] = json!(-149);
-    assert!(!nft::same_policy(&changed, &policy));
     for batch in [
         nft::update_onlink("shoes_test", &[]),
         nft::remove("shoes_test"),
     ] {
         serde_json::from_value::<nftables::schema::Nftables<'_>>(batch).unwrap();
     }
-}
-
-#[test]
-fn firewall_comparison_rejects_malformed_documents() {
-    for (listing, valid) in [
-        (json!({}), false),
-        (json!({"nftables": null}), false),
-        (json!({"nftables": []}), true),
-        (json!({"nftables": [{"metainfo": {}}]}), true),
-        (json!({"nftables": [{"unknown": {}}]}), false),
-        (json!({"nftables": [{"table": {}, "chain": {}}]}), false),
-        (json!({"nftables": [{"table": null}]}), false),
-        (json!({"nftables": [{"table": {}}]}), false),
-        (json!({"nftables": [{"table": {"name": "owned"}}]}), true),
-        (
-            json!({"nftables": [{"set": {"name": "onlink4", "elem": null}}]}),
-            false,
-        ),
-        (json!({"nftables": [{"rule": {"chain": "output"}}]}), false),
-        (
-            json!({"nftables": [{"rule": {"chain": "output", "expr": []}}]}),
-            true,
-        ),
-    ] {
-        assert_eq!(nft::same_policy(&listing, &listing), valid, "{listing}");
-    }
-}
-
-#[test]
-fn firewall_comparison_accepts_flag_renderings_from_newer_nft() {
-    fn singleton_flags(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(object) => {
-                if let Some(serde_json::Value::Array(flags)) = object.get("flags")
-                    && flags.len() == 1
-                {
-                    object.insert("flags".into(), flags[0].clone());
-                }
-                for value in object.values_mut() {
-                    singleton_flags(value);
-                }
-            }
-            serde_json::Value::Array(values) => values.iter_mut().for_each(singleton_flags),
-            _ => {}
-        }
-    }
-    let policy = nft::install(
-        &spec(true),
-        "shoes_test",
-        "token",
-        &[],
-        [Some(12345), Some(12346)],
-    );
-    let mut listing = policy.clone();
-    singleton_flags(&mut listing);
-    assert_ne!(listing, policy);
-    assert!(nft::same_policy(&listing, &policy));
-    let tcp_rule = listing["nftables"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find_map(|entry| {
-            let rule = entry.get_mut("add")?.get_mut("rule")?;
-            (rule["comment"] == "token:not-tcp-establishment").then_some(rule)
-        })
-        .unwrap();
-    tcp_rule["expr"][0]["match"]["left"]["&"][1] = json!({"|": ["syn", "ack"]});
-    assert!(nft::same_policy(&listing, &policy));
-    let set = listing["nftables"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find_map(|entry| entry.get_mut("add")?.get_mut("set"))
-        .unwrap();
-    set["flags"] = json!("constant");
-    assert!(!nft::same_policy(&listing, &policy));
-}
-
-#[test]
-fn firewall_comparison_accepts_prefix_ranges_from_older_nft() {
-    fn render_ranges(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(object) => {
-                if let Some(prefix) = object.get("prefix") {
-                    let network = ipnetwork::IpNetwork::new(
-                        prefix["addr"].as_str().unwrap().parse().unwrap(),
-                        prefix["len"].as_u64().unwrap().try_into().unwrap(),
-                    )
-                    .unwrap();
-                    if network.network() != network.broadcast() {
-                        *value = json!({"range": [network.network(), network.broadcast()]});
-                    }
-                } else {
-                    for value in object.values_mut() {
-                        render_ranges(value);
-                    }
-                }
-            }
-            serde_json::Value::Array(values) => values.iter_mut().for_each(render_ranges),
-            _ => {}
-        }
-    }
-    let policy = nft::install(&spec(false), "shoes_test", "token", &[], [None, None]);
-    let mut listing = policy.clone();
-    render_ranges(&mut listing);
-    assert_ne!(listing, policy);
-    assert!(nft::same_policy(&listing, &policy));
-    let set = listing["nftables"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find_map(|entry| entry.get_mut("add")?.get_mut("set"))
-        .unwrap();
-    assert_eq!(set["name"], "include4");
-    set["elem"][0]["range"][1] = json!("255.255.255.254");
-    assert!(!nft::same_policy(&listing, &policy));
 }
 
 #[test]
@@ -462,7 +338,7 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
                 session.prepare_network().await?;
                 session.record.firewall_pending = true;
                 session.journal.save(&session.record)?;
-                let batch = serde_json::to_vec(&expected_policy(&session.record, &session.record.on_link))?;
+                let batch = serde_json::to_vec(&session.firewall_policy())?;
                 command::run(session.journal.lease(), "/bin/sh", &["-c",
                     "cat > /run/helper.batch; echo $$ > /run/helper.pid; kill -STOP $$; exec nft -j -f /run/helper.batch"], &batch).await?;
                 Ok(())
@@ -786,7 +662,7 @@ async fn kernel_capture() -> io::Result<()> {
                 .map_err(|error| io::Error::other(format!("established DNS: {error}")))?;
         }
         tun_subnet_rejected(&session, true).await?;
-        for (ipv6, port) in session.record.redirect_ports.iter().enumerate() {
+        for (ipv6, port) in session.redirect_ports.iter().enumerate() {
             if let Some(port) = port {
                 let address = std::net::SocketAddr::new(
                     if ipv6 == 0 { "127.0.0.1" } else { "::1" }.parse().unwrap(),
@@ -1527,9 +1403,7 @@ async fn tun_subnet_rejected(session: &Session, active: bool) -> io::Result<()> 
         "TUN subnet traffic leaked descriptors"
     );
     if active {
-        let listing = firewall_listing(session.journal.lease(), &session.nft, &session.record)
-            .await?
-            .unwrap();
+        let listing = firewall_listing(session).await?;
         let guard = listing["nftables"]
             .as_array()
             .unwrap()
@@ -1633,10 +1507,19 @@ async fn redirect_dual_stack_limit(
     Ok(())
 }
 
+async fn firewall_listing(session: &Session) -> io::Result<serde_json::Value> {
+    let bytes = command::run(
+        session.journal.lease(),
+        &session.nft,
+        &["-j", "list", "table", "inet", &session.record.table()],
+        &[],
+    )
+    .await?;
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
 async fn redirect_counts(session: &Session) -> io::Result<[u64; 2]> {
-    let listing = firewall_listing(session.journal.lease(), &session.nft, &session.record)
-        .await?
-        .unwrap();
+    let listing = firewall_listing(session).await?;
     let mut counts = [0; 2];
     for rule in listing["nftables"]
         .as_array()
@@ -2199,54 +2082,81 @@ async fn ownership_failures() -> io::Result<()> {
     session.prepare_network().await?;
     let executable = session.nft.clone();
     let table = session.record.table();
-    let helper = "/run/nft-change-before-readback";
+    let helper = "/run/nft-delete-after-install";
     std::fs::write(
         helper,
         format!(
-            "#!/bin/sh\n{executable} \"$@\" || exit $?\nif [ \"$*\" = '-j -f -' ]; then\n{executable} flush chain inet {table} output\nfi\n"
+            "#!/bin/sh\n{executable} \"$@\" || exit $?\nif [ \"$*\" = '-j -f -' ]; then\n{executable} delete table inet {table}\nfi\n"
         ),
     )?;
     std::fs::set_permissions(helper, std::fs::Permissions::from_mode(0o700))?;
     session.nft = helper.into();
-    assert!(session.activate().await.is_err());
-    assert!(session.record.firewall.is_none());
-    assert!(session.journal.load()?.unwrap().firewall.is_none());
+    assert_eq!(
+        session.activate().await.unwrap_err().to_string(),
+        "managed nft table disappeared"
+    );
+    assert!(session.journal.load()?.unwrap().firewall_pending);
     session.nft = executable;
-    command::nft(session.journal.lease(), &session.nft, nft::remove(&table)).await?;
     session.close().await?;
     drop(session);
 
-    let mut session = Session::prepare(spec(false)).await?;
-    session.prepare_network().await?;
-    session.activate().await?;
-    let old_policy = session.record.firewall.clone().unwrap();
-    let executable = session.nft.clone();
-    std::fs::write(
-        "/run/old-onlink.json",
-        command::encode_nft(nft::update_onlink(
-            &session.record.table(),
-            &session.record.on_link,
-        ))?,
-    )?;
-    std::fs::write(
-        helper,
-        format!(
-            "#!/bin/sh\n{executable} \"$@\" || exit $?\nif [ \"$*\" = '-j -f -' ]; then\n{executable} -j -f /run/old-onlink.json\nfi\n"
-        ),
-    )?;
-    session.nft = helper.into();
-    run("ip", &["addr", "add", "192.0.3.1/24", "dev", "native0"])?;
-    assert!(session.reconcile().await.is_err());
-    let record = session.journal.load()?.unwrap();
-    assert_eq!(record.previous_firewall, Some(old_policy.clone()));
-    assert!(!matches_current_policy(&old_policy, &record));
-    assert!(matches_recovery_policy(&old_policy, &record));
-    session.nft = executable;
-    session.close().await?;
-    drop(session);
-    assert!(Journal::lock()?.load()?.is_none());
-    assert_no_owned_firewall()?;
-    run("ip", &["addr", "del", "192.0.3.1/24", "dev", "native0"])?;
+    for applied in [false, true] {
+        let mut session = Session::prepare(spec(false)).await?;
+        session.prepare_network().await?;
+        session.activate().await?;
+        let record = serde_json::to_value(session.journal.load()?.unwrap())?;
+        let executable = session.nft.clone();
+        let helper = "/run/nft-fail-update";
+        let apply = if applied { "\"$@\"" } else { "--check \"$@\"" };
+        std::fs::write(
+            helper,
+            format!(
+                "#!/bin/sh\nif [ \"$*\" = '-j -f -' ]; then\n{executable} {apply} || exit $?\nexit 1\nfi\nexec {executable} \"$@\"\n"
+            ),
+        )?;
+        std::fs::set_permissions(helper, std::fs::Permissions::from_mode(0o700))?;
+        session.nft = helper.into();
+        run("ip", &["addr", "add", "192.0.3.1/24", "dev", "native0"])?;
+        assert!(session.reconcile().await.is_err());
+        assert_eq!(
+            serde_json::to_value(session.journal.load()?.unwrap())?,
+            record
+        );
+        assert!(!session.on_link.contains(&"192.0.3.0/24".parse().unwrap()));
+        assert_eq!(
+            run(
+                "nft",
+                &["list", "set", "inet", &session.record.table(), "onlink4"]
+            )?
+            .contains("192.0.3.0/24"),
+            applied
+        );
+        drop(session);
+        cleanup().await?;
+        assert!(Journal::lock()?.load()?.is_none());
+        assert_no_owned_firewall()?;
+        run("ip", &["addr", "del", "192.0.3.1/24", "dev", "native0"])?;
+    }
+
+    for failure in ["exit 1", "printf invalid", "printf '{}'"] {
+        let mut session = Session::prepare(spec(false)).await?;
+        session.prepare_network().await?;
+        session.activate().await?;
+        let executable = session.nft.clone();
+        let helper = "/run/nft-unreadable-tables";
+        std::fs::write(helper, format!("#!/bin/sh\n{failure}\n"))?;
+        std::fs::set_permissions(helper, std::fs::Permissions::from_mode(0o700))?;
+        session.nft = helper.into();
+        assert!(session.reconcile().await.is_err());
+        assert!(session.close().await.is_err());
+        assert!(session.journal.load()?.unwrap().firewall_pending);
+        run("nft", &["list", "table", "inet", &session.record.table()])?;
+        session.nft = executable;
+        session.close().await?;
+        drop(session);
+        assert!(Journal::lock()?.load()?.is_none());
+        assert_no_owned_firewall()?;
+    }
 
     for family in ["-4", "-6"] {
         let mut session = Session::prepare(spec(false)).await?;
@@ -2285,18 +2195,6 @@ async fn ownership_failures() -> io::Result<()> {
         assert_no_owned_firewall()?;
     }
 
-    let mut session = Session::prepare(spec(false)).await?;
-    session.record.firewall = Some(json!({"large_snapshot": "x".repeat(128 * 1024)}));
-    session.record.previous_firewall = session.record.firewall.clone();
-    session.journal.save(&session.record)?;
-    let recovered = session.journal.load()?.unwrap();
-    assert_eq!(recovered.firewall, session.record.firewall);
-    assert_eq!(
-        recovered.previous_firewall,
-        session.record.previous_firewall
-    );
-    session.journal.clear()?;
-    drop(session);
     run("nft", &["add", "table", "inet", "foreign_preserved"])?;
     run("ip", &["rule", "add", "priority", "12000", "table", "main"])?;
     assert!(Session::prepare(spec(false)).await.is_err());
@@ -2312,34 +2210,54 @@ async fn ownership_failures() -> io::Result<()> {
     drop(session);
     assert!(Journal::lock()?.load()?.is_none());
 
-    let mut session = Session::prepare(spec(false)).await?;
-    session.prepare_network().await?;
-    session.activate().await?;
-    run("ip", &["addr", "add", "192.0.3.1/24", "dev", "native0"])?;
-    session.reconcile().await?;
-    assert!(
-        session
-            .record
-            .on_link
-            .contains(&"192.0.3.0/24".parse().unwrap())
-    );
-    run("ip", &["addr", "del", "192.0.3.1/24", "dev", "native0"])?;
-    session.reconcile().await?;
-    let table = session.record.table();
-    run("nft", &["add", "rule", "inet", &table, "output", "counter"])?;
-    assert!(session.reconcile().await.is_err());
-    assert!(session.deactivate().await.is_err());
-    assert!(run("nft", &["list", "table", "inet", &table])?.contains("counter"));
-    command::nft(session.journal.lease(), &session.nft, nft::remove(&table)).await?;
-    command::nft(
-        session.journal.lease(),
-        &session.nft,
-        expected_policy(&session.record, &session.record.on_link),
-    )
-    .await?;
-    session.close().await?;
-    run("nft", &["list", "table", "inet", "foreign_preserved"])?;
-    assert_no_owned_firewall()?;
+    for orphan in [false, true] {
+        for missing in [false, true] {
+            let mut session = Session::prepare(spec(false)).await?;
+            session.prepare_network().await?;
+            session.activate().await?;
+            let record = serde_json::to_value(session.journal.load()?.unwrap())?;
+            let table = session.record.table();
+            let network = "192.0.3.0/24".parse().unwrap();
+            run("ip", &["addr", "add", "192.0.3.1/24", "dev", "native0"])?;
+            session.reconcile().await?;
+            assert!(session.on_link.contains(&network));
+            assert!(
+                run("nft", &["list", "set", "inet", &table, "onlink4"])?.contains("192.0.3.0/24")
+            );
+            run("ip", &["addr", "del", "192.0.3.1/24", "dev", "native0"])?;
+            session.reconcile().await?;
+            assert!(!session.on_link.contains(&network));
+            assert!(
+                !run("nft", &["list", "set", "inet", &table, "onlink4"])?.contains("192.0.3.0/24")
+            );
+            assert_eq!(
+                serde_json::to_value(session.journal.load()?.unwrap())?,
+                record
+            );
+            run("nft", &["add", "table", "ip", &table])?;
+            if missing {
+                run("nft", &["delete", "table", "inet", &table])?;
+                assert_eq!(
+                    session.reconcile().await.unwrap_err().to_string(),
+                    "managed nft table disappeared"
+                );
+            } else {
+                run("nft", &["flush", "chain", "inet", &table, "output"])?;
+                run("nft", &["add", "rule", "inet", &table, "output", "counter"])?;
+                session.reconcile().await?;
+            }
+            if !orphan {
+                session.close().await?;
+            }
+            drop(session);
+            cleanup().await?;
+            assert!(Journal::lock()?.load()?.is_none());
+            run("nft", &["list", "table", "inet", "foreign_preserved"])?;
+            run("nft", &["list", "table", "ip", &table])?;
+            run("nft", &["delete", "table", "ip", &table])?;
+            assert_no_owned_firewall()?;
+        }
+    }
     Ok(())
 }
 

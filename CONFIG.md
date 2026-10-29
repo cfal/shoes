@@ -1062,30 +1062,35 @@ Reload retains the interface, capture, and redirect listener identities. Network
 topology changes require restart and are rejected before retiring live workers.
 Ordinary worker reloads can reset existing connections and briefly interrupt
 traffic, but do not disable capture. Failed candidates roll back on the same
-network lease. Unexpected owned routing or firewall changes cause orderly shutdown
-rather than silently overwriting external changes. Resolver-setting changes do not.
+network lease. Unexpected owned routing changes or a missing private firewall
+table cause orderly shutdown. Resolver-setting changes do not.
+
+Shoes exclusively owns its token-named `inet` nftables table, including all of its
+contents. Do not add rules, chains, or sets to that table: external changes inside
+it are neither audited nor preserved. Cleanup removes the exact owned table even
+if its contents have changed; other tables are left untouched. Connected-network
+sets are updated atomically through nftables and cached in memory, not journaled
+as firewall snapshots.
 
 Shutdown removes capture and attempts DNS cleanup before retiring ingress.
 SIGKILL cannot run cleanup: the service's `ExecStopPost` invokes
 `shoes cleanup-tun`, and the next managed startup also reconciles stale state.
-Recovery uses a private namespace-scoped journal under `/run/shoes`; externally
-modified objects are refused, with errors reported. Temporary outages and lost
-connections are possible. Cached fake addresses may outlive shutdown. There is
+Recovery uses a private namespace-scoped journal under `/run/shoes` to track
+cleanup identity and pending operations, not firewall policies. Interface and
+routing ownership checks remain strict; conflicting changes are refused, with
+errors reported. Temporary outages and lost connections are possible. Cached fake
+addresses may outlive shutdown. There is
 no kill switch, no automatic DIRECT fallback on upstream failure, and no
 uninterrupted fail-open guarantee.
 Outstanding helper processes retain the namespace lock, so recovery fails rather
 than racing a helper that could still commit. The service terminates remaining
 helpers before `ExecStopPost`; standalone operators must let them finish or stop
-them before retrying cleanup. The first firewall readback must match the generated
-policy before becoming the baseline for later comparisons. Unsupported nft JSON
-rendering differences cause activation or recovery to fail rather than trusting
-unverified rules, and may require manual inspection.
+them before retrying cleanup.
 The service retries without a start-rate limit, including while a configured
 family is waiting for its underlying default route. Read failures during
 reconciliation currently trigger cleanup and a supervised restart, not in-place
-repair. If an owned table has changed externally, automatic cleanup refuses to
-delete it; inspect the journal's token-named table before removing it manually.
-Until it is removed, stale TCP REDIRECT rules can continue to reject connections.
+repair. Cleanup errors retain the journal for retry. Until the owned table is
+removed, stale TCP REDIRECT rules can continue to reject connections.
 
 ## Client Config
 

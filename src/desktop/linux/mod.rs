@@ -29,6 +29,8 @@ pub(crate) struct Session {
     nft: String,
     resolved: Option<resolved::Resolved>,
     ingress: Option<Arc<Ingress>>,
+    redirect_ports: [Option<u16>; 2],
+    on_link: Vec<ipnetwork::IpNetwork>,
     active: bool,
     started: bool,
     _policy: crate::socket_policy::SocketPolicy,
@@ -98,13 +100,8 @@ impl Session {
             token,
             spec,
             ifindex: None,
-            redirect_ports: [None, None],
             dns_pending: false,
             firewall_pending: false,
-            on_link: Vec::new(),
-            previous_on_link: None,
-            firewall: None,
-            previous_firewall: None,
         };
         Ok(Self {
             journal,
@@ -113,6 +110,8 @@ impl Session {
             nft,
             resolved,
             ingress: None,
+            redirect_ports: [None, None],
+            on_link: Vec::new(),
             active: false,
             started: false,
             _policy: policy,
@@ -149,12 +148,10 @@ impl Session {
         let ingress = self
             .ingress
             .insert(Arc::new(Ingress::new(&self.record.spec, device)?));
-        self.record.redirect_ports = ingress.ports()?;
-        self.record.on_link = routes::on_link(&self.handle, index).await?;
-        self.journal.save(&self.record)?;
+        self.redirect_ports = ingress.ports()?;
+        self.on_link = routes::on_link(&self.handle, index).await?;
         routes::configure(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
-        let batch = expected_policy(&self.record, &self.record.on_link);
-        let bytes = command::encode_nft(batch)?;
+        let bytes = command::encode_nft(self.firewall_policy())?;
         command::run(
             self.journal.lease(),
             &self.nft,
@@ -167,6 +164,16 @@ impl Session {
 
     pub(crate) fn ingress(&self) -> Option<Arc<Ingress>> {
         self.ingress.clone()
+    }
+
+    fn firewall_policy(&self) -> serde_json::Value {
+        nft::install(
+            &self.record.spec,
+            &self.record.table(),
+            &self.record.token,
+            &self.on_link,
+            self.redirect_ports,
+        )
     }
 
     pub(crate) fn validate(&self, configs: &[crate::config::Config]) -> io::Result<()> {
@@ -188,15 +195,8 @@ impl Session {
         .await?;
         self.record.firewall_pending = true;
         self.journal.save(&self.record)?;
-        command::nft(
-            self.journal.lease(),
-            &self.nft,
-            expected_policy(&self.record, &self.record.on_link),
-        )
-        .await?;
-        let listing = verify_firewall(self.journal.lease(), &self.nft, &self.record).await?;
-        self.record.firewall = Some(listing);
-        self.journal.save(&self.record)?;
+        command::nft(self.journal.lease(), &self.nft, self.firewall_policy()).await?;
+        check_firewall(self.journal.lease(), &self.nft, &self.record).await?;
         if let Some(resolved) = &self.resolved {
             self.record.dns_pending = true;
             self.journal.save(&self.record)?;
@@ -228,29 +228,16 @@ impl Session {
             crate::socket_policy::check_dns_endpoint(endpoint.ip())?;
         }
         routes::check(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
-        verify_firewall(self.journal.lease(), &self.nft, &self.record).await?;
+        check_firewall(self.journal.lease(), &self.nft, &self.record).await?;
         let networks = routes::on_link(&self.handle, index).await?;
-        if networks != self.record.on_link {
-            self.record.previous_on_link =
-                Some(std::mem::replace(&mut self.record.on_link, networks));
-            self.record.previous_firewall = self.record.firewall.take();
-            self.record.firewall = self
-                .record
-                .previous_firewall
-                .as_ref()
-                .map(|listing| nft::with_onlink(listing, &self.record.on_link));
-            self.journal.save(&self.record)?;
+        if networks != self.on_link {
             command::nft(
                 self.journal.lease(),
                 &self.nft,
-                nft::update_onlink(&self.record.table(), &self.record.on_link),
+                nft::update_onlink(&self.record.table(), &networks),
             )
             .await?;
-            self.record.firewall =
-                Some(verify_firewall(self.journal.lease(), &self.nft, &self.record).await?);
-            self.record.previous_on_link = None;
-            self.record.previous_firewall = None;
-            self.journal.save(&self.record)?;
+            self.on_link = networks;
         }
         self.reconcile_after = tokio::time::Instant::now() + Duration::from_secs(1);
         Ok(())
@@ -306,21 +293,11 @@ fn failures(errors: Vec<String>) -> io::Result<()> {
     }
 }
 
-fn expected_policy(record: &Record, on_link: &[ipnetwork::IpNetwork]) -> serde_json::Value {
-    nft::install(
-        &record.spec,
-        &record.table(),
-        &record.token,
-        on_link,
-        record.redirect_ports,
-    )
-}
-
-async fn firewall_listing(
+async fn firewall_exists(
     lease: BorrowedFd<'_>,
     executable: &str,
     record: &Record,
-) -> io::Result<Option<serde_json::Value>> {
+) -> io::Result<bool> {
     let tables = command::run(lease, executable, &["-j", "list", "tables"], &[]).await?;
     let tables: serde_json::Value = serde_json::from_slice(&tables).map_err(io::Error::other)?;
     let entries = tables
@@ -328,58 +305,23 @@ async fn firewall_listing(
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| io::Error::other("invalid nft table listing"))?;
     let name = record.table();
-    if !entries.iter().any(|entry| {
+    Ok(entries.iter().any(|entry| {
         entry
             .get("table")
             .is_some_and(|table| table["family"] == "inet" && table["name"] == name)
-    }) {
-        return Ok(None);
-    }
-    let bytes = command::run(
-        lease,
-        executable,
-        &["-j", "list", "table", "inet", &name],
-        &[],
-    )
-    .await?;
-    Ok(Some(
-        serde_json::from_slice(&bytes).map_err(io::Error::other)?,
-    ))
+    }))
 }
 
-fn matches_current_policy(listing: &serde_json::Value, record: &Record) -> bool {
-    match &record.firewall {
-        Some(baseline) => nft::same_policy(listing, baseline),
-        None => nft::same_policy(listing, &expected_policy(record, &record.on_link)),
-    }
-}
-
-fn matches_recovery_policy(listing: &serde_json::Value, record: &Record) -> bool {
-    if matches_current_policy(listing, record) {
-        return true;
-    }
-    if record.firewall.is_some() {
-        return record
-            .previous_firewall
-            .as_ref()
-            .is_some_and(|previous| nft::same_policy(listing, previous));
-    }
-    // A crash before the first readback leaves only the write-ahead policy for conservative recovery.
-    record
-        .previous_on_link
-        .as_ref()
-        .is_some_and(|networks| nft::same_policy(listing, &expected_policy(record, networks)))
-}
-
-async fn verify_firewall(
+async fn check_firewall(
     lease: BorrowedFd<'_>,
     executable: &str,
     record: &Record,
-) -> io::Result<serde_json::Value> {
-    firewall_listing(lease, executable, record)
-        .await?
-        .filter(|listing| matches_current_policy(listing, record))
-        .ok_or_else(|| io::Error::other("managed nft policy disappeared or changed externally"))
+) -> io::Result<()> {
+    if firewall_exists(lease, executable, record).await? {
+        Ok(())
+    } else {
+        Err(io::Error::other("managed nft table disappeared"))
+    }
 }
 
 async fn remove_firewall(
@@ -387,15 +329,10 @@ async fn remove_firewall(
     executable: &str,
     record: &Record,
 ) -> io::Result<()> {
-    let Some(listing) = firewall_listing(lease, executable, record).await? else {
-        return Ok(());
-    };
-    if !matches_recovery_policy(&listing, record) {
-        return Err(io::Error::other(
-            "refusing to remove an externally changed nft table",
-        ));
+    if firewall_exists(lease, executable, record).await? {
+        command::nft(lease, executable, nft::remove(&record.table())).await?;
     }
-    command::nft(lease, executable, nft::remove(&record.table())).await
+    Ok(())
 }
 
 async fn remove_link(handle: &Handle, record: &Record) -> io::Result<()> {
