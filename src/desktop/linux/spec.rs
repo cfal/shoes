@@ -83,18 +83,12 @@ impl Spec {
                 "managed TUN requires one address per configured IP family",
             ));
         }
-        for ipv6 in [false, true] {
-            if tun
-                .addresses
-                .iter()
-                .filter(|network| network.is_ipv6() == ipv6)
-                .count()
-                > 1
-            {
-                return Err(invalid(
-                    "managed TUN permits at most one address per IP family",
-                ));
-            }
+        if let [first, second] = tun.addresses.as_slice()
+            && first.is_ipv6() == second.is_ipv6()
+        {
+            return Err(invalid(
+                "managed TUN permits at most one address per IP family",
+            ));
         }
         for network in &tun.addresses {
             let ip = network.ip();

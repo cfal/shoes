@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
@@ -128,7 +128,6 @@ impl Journal {
             .open(&path)?;
         private(&file.metadata()?)?;
         serde_json::to_writer(&mut file, record).map_err(io::Error::other)?;
-        file.flush()?;
         file.sync_all()?;
         std::fs::rename(path, &self.path)?;
         self.directory.sync_all()

@@ -105,12 +105,7 @@ impl Resolved {
         serde_json::from_slice(&output).map_err(io::Error::other)
     }
 
-    async fn manager(
-        &self,
-        method: &str,
-        signature: &str,
-        arguments: &[String],
-    ) -> io::Result<Value> {
+    async fn manager(&self, method: &str, signature: &str, arguments: &[String]) -> io::Result<()> {
         let mut args = vec![
             "call",
             &self.owner,
@@ -120,7 +115,8 @@ impl Resolved {
             signature,
         ];
         args.extend(arguments.iter().map(String::as_str));
-        self.call(&args).await
+        self.call(&args).await?;
+        Ok(())
     }
 
     async fn owned(handle: &rtnetlink::Handle, record: &Record) -> io::Result<Option<u32>> {
@@ -178,8 +174,7 @@ impl Resolved {
             .await?
             .ok_or_else(|| io::Error::other("TUN disappeared during DNS activation"))?;
         self.manager("SetLinkDefaultRoute", "ib", &[index, "true".into()])
-            .await?;
-        Ok(())
+            .await
     }
 
     pub(super) async fn revert(
@@ -190,9 +185,7 @@ impl Resolved {
         let Some(index) = Self::owned(handle, record).await? else {
             return Ok(());
         };
-        self.manager("RevertLink", "i", &[index.to_string()])
-            .await?;
-        Ok(())
+        self.manager("RevertLink", "i", &[index.to_string()]).await
     }
 }
 

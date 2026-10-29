@@ -89,6 +89,39 @@ fn managed_configuration_is_explicit_dual_stack_and_restart_identifiable() {
 }
 
 #[test]
+fn managed_configuration_accepts_at_most_one_address_per_family() {
+    let length_error = "managed TUN requires one address per configured IP family";
+    let family_error = "managed TUN permits at most one address per IP family";
+    for (addresses, expected_error) in [
+        (vec![], Some(length_error)),
+        (vec!["10.233.0.1/30"], None),
+        (vec!["fd73::1/126"], None),
+        (vec!["10.233.0.1/30", "10.234.0.1/30"], Some(family_error)),
+        (vec!["fd73::1/126", "fd74::1/126"], Some(family_error)),
+        (vec!["10.233.0.1/30", "fd73::1/126"], None),
+        (vec!["fd73::1/126", "10.233.0.1/30"], None),
+        (
+            vec!["10.233.0.1/30", "10.234.0.1/30", "fd73::1/126"],
+            Some(length_error),
+        ),
+        (vec!["127.0.0.1/8", "10.233.0.1/30"], Some(family_error)),
+    ] {
+        let mut config = configuration(false);
+        config.addresses = addresses
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        config.route_address = config.addresses.clone();
+        let result = Spec::from_configs(&[crate::config::Config::TunServer(config)]);
+        assert_eq!(
+            result.err().map(|error| (error.kind(), error.to_string())),
+            expected_error.map(|message| (io::ErrorKind::InvalidInput, message.to_owned())),
+            "{addresses:?}",
+        );
+    }
+}
+
+#[test]
 fn managed_firewall_schema_preserves_masks_and_reply_exemption() {
     let spec = spec(true);
     let policy = nft::install(
