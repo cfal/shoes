@@ -380,6 +380,28 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
     let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
     result.extend(tun_configs.into_iter().map(Config::TunServer));
     crate::desktop::validate_config(&result)?;
+    if result
+        .iter()
+        .any(|config| matches!(config, Config::TunServer(tun) if tun.auto_route))
+    {
+        let binds = result
+            .iter()
+            .filter_map(|config| match config {
+                Config::Server(server) => Some(&server.bind_location),
+                _ => None,
+            })
+            .chain(control.listeners.iter().map(|listener| &listener.bind));
+        for bind in binds {
+            if let BindLocation::Address(addresses) = bind
+                && addresses.iter().any(|address| !address.is_literal())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "managed TUN requires literal listener addresses; native hostname lookup is disabled",
+                ));
+            }
+        }
+    }
 
     let mut validated = ValidatedConfigs {
         catalog,

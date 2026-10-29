@@ -183,6 +183,78 @@ fn check_dry_run_validates_all_files_without_forwarding_or_state_writes() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn managed_check_requires_literal_listener_addresses() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("managed.yaml");
+    let example = include_str!("../../../examples/tun_desktop.yaml");
+    let unix = serde_yaml::to_string(&serde_json::json!([{
+        "clash_api_path": directory.path().join("api.sock"),
+        "secret": "test",
+    }]))
+    .unwrap();
+    for mode in ["check", "--dry-run"] {
+        for (listener, valid) in [
+            ("", true),
+            (
+                "- address: 'localhost:1080'\n  protocol: {type: socks}\n",
+                false,
+            ),
+            (
+                "- addresses: ['127.0.0.1:1080', 'localhost:1081']\n  protocol: {type: socks}\n",
+                false,
+            ),
+            (
+                "- clash_api_address: 'localhost:9090'\n  secret: test\n",
+                false,
+            ),
+            (
+                "- addresses: ['127.0.0.1:1080-1081', '[::1]:1080', '[fe80::1%2]:1080']\n  protocol: {type: socks}\n",
+                true,
+            ),
+            (
+                "- clash_api_address: '127.0.0.1:9090'\n  secret: test\n",
+                true,
+            ),
+            (unix.as_str(), true),
+        ] {
+            std::fs::write(&path, format!("{example}\n{listener}")).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(if valid { 0 } else { 1 }),
+                "{listener}: {diagnostic}"
+            );
+            if !valid {
+                assert!(
+                    diagnostic.contains("managed TUN requires literal listener addresses"),
+                    "{diagnostic}"
+                );
+                std::fs::write(&path, listener).unwrap();
+                let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                    .args([mode, "-t", "1"])
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "manual listeners must still accept hostnames"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 #[ignore = "requires sudo and util-linux; isolates cleanup dispatch from host networking"]
 fn check_dry_run_does_not_dispatch_cleanup() {
     let directory = tempfile::tempdir().unwrap();

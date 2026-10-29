@@ -369,6 +369,13 @@ impl NetLocationPortRange {
         }
     }
 
+    pub(crate) fn is_literal(&self) -> bool {
+        match &self.address {
+            Address::Ipv4(_) | Address::Ipv6(_) => true,
+            Address::Hostname(host) => format!("{host}:0").parse::<SocketAddr>().is_ok(),
+        }
+    }
+
     pub fn new(address: Address, mut ports: Vec<u16>) -> std::io::Result<Self> {
         ports.sort_unstable();
         ports.dedup();
