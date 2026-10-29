@@ -115,27 +115,6 @@ pub(super) fn install(
             mark(meta("mark"), mask, capture),
         ],
     );
-    if spec.dns_hijack {
-        for address in spec.dns_addresses().unwrap_or_default() {
-            for protocol in ["tcp", "udp"] {
-                rule(
-                    "output",
-                    "dns-readiness",
-                    vec![
-                        matches(masked(meta("mark"), mask), "==", json!(bypass)),
-                        matches(meta("oifname"), "==", json!(spec.name)),
-                        matches(
-                            payload(if address.is_ipv4() { "ip" } else { "ip6" }, "daddr"),
-                            "==",
-                            json!(address),
-                        ),
-                        matches(payload(protocol, "dport"), "==", json!(53)),
-                        json!({"return": null}),
-                    ],
-                );
-            }
-        }
-    }
     rule(
         "output",
         "recursive-egress",
@@ -251,18 +230,6 @@ pub(super) fn install(
             json!({"return": null}),
         ],
     );
-    rule(
-        "select",
-        "not-tcp-establishment",
-        vec![
-            matches(
-                json!({"&": [payload("tcp", "flags"), ["syn", "ack"]]}),
-                "!=",
-                json!("syn"),
-            ),
-            json!({"return": null}),
-        ],
-    );
     for (family, set) in [("ip", "@exclude4"), ("ip6", "@exclude6")] {
         rule(
             "select",
@@ -301,6 +268,18 @@ pub(super) fn install(
         vec![
             matches(ct("state"), "==", json!("invalid")),
             json!({"drop": null}),
+        ],
+    );
+    rule(
+        "capture",
+        "not-tcp-establishment",
+        vec![
+            matches(
+                json!({"&": [payload("tcp", "flags"), ["syn", "ack"]]}),
+                "!=",
+                json!("syn"),
+            ),
+            json!({"return": null}),
         ],
     );
     let mut protocols = vec!["tcp", "udp"];

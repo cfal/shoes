@@ -1038,7 +1038,8 @@ unless explicitly excluded. Replies to inbound services remain native. Existing
 tracked native flows remain native, including unreplied UDP; captured flows retain
 their selection. Traffic excluded from conntrack by foreign NOTRACK rules remains
 native.
-New TCP capture starts only with connection establishment. UDP flows created
+New TCP capture starts only with connection establishment. Invalid conntrack
+packets selected for capture are dropped. UDP flows created
 before conntrack was enabled cannot be identified reliably and may reset.
 Applications explicitly bound to a physical device remain native in both modes;
 address-bound TCP/UDP clients are supported. REDIRECT requires an unused adjacent

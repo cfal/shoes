@@ -676,6 +676,7 @@ async fn kernel_capture() -> io::Result<()> {
             eprintln!("firewall: {}", run("nft", &["-j", "list", "ruleset"])?);
             return Err(error);
         }
+        invalid_tcp_rejected()?;
         native_services(&session)
             .await
             .map_err(|error| io::Error::other(format!("native services: {error}")))?;
@@ -1428,7 +1429,21 @@ async fn tun_subnet_rejected(session: &Session, active: bool) -> io::Result<()> 
         }
         if active {
             let protected = crate::socket_util::new_udp_socket(ip.is_ipv6(), None)?;
-            let _ = protected.send_to(b"guard", (ip, 9)).await;
+            for port in [9, 53] {
+                let _ = protected.send_to(b"guard", (ip, port)).await;
+            }
+            let protected = crate::socket_util::new_tcp_socket(None, ip.is_ipv6())?;
+            assert!(
+                !matches!(
+                    tokio::time::timeout(
+                        Duration::from_millis(100),
+                        protected.connect((ip, 53).into()),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                ),
+                "bypass-marked TCP reached the virtual DNS peer",
+            );
         }
     }
     assert!(
@@ -1453,9 +1468,102 @@ async fn tun_subnet_rejected(session: &Session, active: bool) -> io::Result<()> 
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|expr| expr["counter"]["packets"].as_u64().is_some_and(|n| n >= 2))
+                .any(|expr| expr["counter"]["packets"].as_u64().is_some_and(|n| n >= 6))
         );
     }
+    Ok(())
+}
+
+fn invalid_tcp_rejected() -> io::Result<()> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    run("nft", &["add", "table", "inet", "invalid_probe"])?;
+    for (name, hook, priority, selectors) in [
+        ("invalid", "output", "-151", vec!["ct", "state", "invalid"]),
+        ("native", "postrouting", "0", vec!["oifname", "native0"]),
+    ] {
+        run("nft", &["add", "counter", "inet", "invalid_probe", name])?;
+        run(
+            "nft",
+            &[
+                "add",
+                "chain",
+                "inet",
+                "invalid_probe",
+                name,
+                &format!("{{ type filter hook {hook} priority {priority}; }}"),
+            ],
+        )?;
+        let mut args = vec![
+            "add",
+            "rule",
+            "inet",
+            "invalid_probe",
+            name,
+            "tcp",
+            "sport",
+            "30001",
+            "tcp",
+            "dport",
+            "30002",
+        ];
+        args.extend(selectors);
+        args.extend(["counter", "name", name]);
+        run("nft", &args)?;
+    }
+    for (index, (remote, builder)) in [
+        (
+            "198.51.100.2:0",
+            etherparse::PacketBuilder::ipv4([192, 0, 2, 1], [198, 51, 100, 2], 64),
+        ),
+        (
+            "[fd00:2::2]:0",
+            etherparse::PacketBuilder::ipv6(
+                "fd00:1::1".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+                "fd00:2::2".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+                64,
+            ),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let remote: std::net::SocketAddr = remote.parse().unwrap();
+        let raw = Socket::new(Domain::for_address(remote), Type::RAW, Some(Protocol::TCP))?;
+        if remote.is_ipv4() {
+            raw.set_header_included_v4(true)?;
+        } else {
+            raw.set_header_included_v6(true)?;
+        }
+        let mut packet = Vec::new();
+        builder
+            .tcp(30001, 30002, 1, 65535)
+            .syn()
+            .ack(1)
+            .write(&mut packet, &[])
+            .map_err(io::Error::other)?;
+        // The foreign-marked control proves the invalid packet can leave over the native route.
+        raw.set_mark(7)?;
+        raw.send_to(&packet, &remote.into())?;
+        raw.set_mark(0)?;
+        if let Err(error) = raw.send_to(&packet, &remote.into()) {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+        let listing: serde_json::Value = serde_json::from_str(&run(
+            "nft",
+            &["-j", "list", "table", "inet", "invalid_probe"],
+        )?)?;
+        for (name, expected) in [("invalid", 2 * (index + 1)), ("native", index + 1)] {
+            let counter = listing["nftables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry.get("counter"))
+                .find(|counter| counter["name"] == name)
+                .unwrap();
+            assert_eq!(counter["packets"], json!(expected), "{remote}: {name}");
+        }
+    }
+    run("nft", &["delete", "table", "inet", "invalid_probe"])?;
     Ok(())
 }
 
