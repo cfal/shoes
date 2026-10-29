@@ -290,7 +290,7 @@ impl ShoesResolver for HickoryResolver {
                     elapsed,
                     e
                 );
-                std::io::Error::other(format!("DNS lookup failed: {e}"))
+                super::exchange::net_error(e)
             })?;
 
             let addrs: Vec<SocketAddr> = response
@@ -333,6 +333,134 @@ impl ShoesResolver for HickoryResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hostname_lookup_refreshes_only_transport_failures() {
+        use crate::resolver::{RefreshPolicy, RefreshingResolver, ResolverFactory};
+        use hickory_resolver::proto::{
+            op::{Message, ResponseCode},
+            rr::{RData, Record, rdata},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Timeout,
+            NoConnections,
+            NxDomain,
+        }
+
+        for failure in [Failure::Timeout, Failure::NoConnections, Failure::NxDomain] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let _silent = if matches!(failure, Failure::Timeout) {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let length = stream.read_u16().await.unwrap();
+                    let mut bytes = vec![0; length as usize];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    Some(stream)
+                } else {
+                    None
+                };
+                let (mut healthy, _) = listener.accept().await.unwrap();
+                let length = healthy.read_u16().await.unwrap();
+                let mut bytes = vec![0; length as usize];
+                healthy.read_exact(&mut bytes).await.unwrap();
+                let mut reply = Message::from_vec(&bytes).unwrap().into_response();
+                if matches!(failure, Failure::NxDomain) {
+                    reply.metadata.response_code = ResponseCode::NXDomain;
+                } else {
+                    reply.add_answer(Record::from_rdata(
+                        reply.queries[0].name.clone(),
+                        60,
+                        RData::A(rdata::A("198.51.100.7".parse().unwrap())),
+                    ));
+                }
+                let bytes = reply.to_vec().unwrap();
+                healthy.write_u16(bytes.len() as u16).await.unwrap();
+                healthy.write_all(&bytes).await.unwrap();
+            }));
+            let builds = Arc::new(AtomicUsize::new(0));
+            let factory: ResolverFactory = Arc::new({
+                let builds = builds.clone();
+                move || {
+                    let generation = builds.fetch_add(1, Ordering::Relaxed);
+                    Box::pin(async move {
+                        let bootstrap: Arc<dyn ShoesResolver> =
+                            Arc::new(crate::resolver::NativeResolver::new());
+                        let chain = Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
+                            bootstrap.clone(),
+                        ));
+                        let options = HickoryResolverOptions {
+                            ip_strategy: IpStrategy::Ipv4Only,
+                            request_timeout: Some(Duration::from_millis(250)),
+                            attempts: 0,
+                            ..Default::default()
+                        };
+                        let resolver =
+                            if matches!(failure, Failure::NoConnections) && generation == 0 {
+                                HickoryResolver::build_pooled(
+                                    vec![],
+                                    chain,
+                                    bootstrap,
+                                    options,
+                                    "empty test pool".into(),
+                                )?
+                            } else {
+                                HickoryResolver::tcp(address, chain, bootstrap, options)?
+                            };
+                        Ok(Arc::new(resolver) as Arc<dyn ShoesResolver>)
+                    })
+                }
+            });
+            let resolver = RefreshingResolver::new(
+                factory,
+                RefreshPolicy {
+                    max_idle: Duration::from_secs(3600),
+                    retry_once_after_refresh: true,
+                },
+                "hostname refresh regression".into(),
+            )
+            .await
+            .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                resolver.resolve_location(
+                    &NetLocation::from_str("recovery.example.:443", None).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            if matches!(failure, Failure::NxDomain) {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                assert!(
+                    error
+                        .get_ref()
+                        .unwrap()
+                        .is::<hickory_resolver::net::NetError>()
+                );
+                assert_eq!(builds.load(Ordering::Relaxed), 1);
+                server.await.unwrap();
+                continue;
+            }
+            assert_eq!(result.unwrap(), ["198.51.100.7:443".parse().unwrap()]);
+            assert_eq!(builds.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                resolver
+                    .resolve_location(
+                        &NetLocation::from_str("recovery.example.:443", None).unwrap()
+                    )
+                    .await
+                    .unwrap(),
+                ["198.51.100.7:443".parse().unwrap()]
+            );
+            assert_eq!(builds.load(Ordering::Relaxed), 2);
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn test_hickory_resolver_options_default() {
