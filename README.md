@@ -29,6 +29,7 @@ All server protocols plus:
 - **XTLS Reality**
   - Hybrid-first X25519MLKEM768 key exchange and optional ML-DSA-65 server authentication
 - **XTLS Vision** (for VLESS)
+- **Sudoku TCP mask** (Xray FinalMask-compatible, composable client/server wrapper; [configuration](CONFIG.md#sudoku-tcp-mask))
 
 ### TUN/VPN Mode
 - **WireGuard** - Userspace TCP/UDP server and client protocols using GotaTun, without root, an OS TUN, or host route changes (Unix only). See [WireGuard configuration](CONFIG.md#wireguard).

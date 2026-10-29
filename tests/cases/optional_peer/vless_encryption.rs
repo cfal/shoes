@@ -32,6 +32,8 @@ mod composition;
 mod legacy;
 #[path = "vless_encryption/lifecycle.rs"]
 mod lifecycle;
+#[path = "vless_encryption/sudoku_mask.rs"]
+mod sudoku_mask;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -400,10 +402,17 @@ fn client_config(kind: Kind, port: u16, server_port: u16, encryption: &str, visi
 type Captures = Arc<Mutex<Vec<Vec<u8>>>>;
 
 async fn tap(upstream: u16) -> (u16, Captures, Task) {
+    let (port, uplink, _, task) = tap_both(upstream).await;
+    (port, uplink, task)
+}
+
+async fn tap_both(upstream: u16) -> (u16, Captures, Captures, Task) {
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let captures: Captures = Arc::default();
     let output = captures.clone();
+    let downlink: Captures = Arc::default();
+    let downlink_output = downlink.clone();
     let task = tokio::spawn(async move {
         let mut children = JoinSet::new();
         loop {
@@ -411,11 +420,14 @@ async fn tap(upstream: u16) -> (u16, Captures, Task) {
                 result = listener.accept() => {
                     let Ok((client, _)) = result else { break };
                     let captures = captures.clone();
+                    let downlink = downlink.clone();
                     children.spawn(async move {
                         let index = {
                             let mut guard = captures.lock().unwrap();
+                            let mut downlink = downlink.lock().unwrap();
                             let index = guard.len();
                             guard.push(Vec::new());
+                            downlink.push(Vec::new());
                             index
                         };
                         let server = TcpStream::connect(("127.0.0.1", upstream)).await?;
@@ -434,7 +446,20 @@ async fn tap(upstream: u16) -> (u16, Captures, Task) {
                                 sw.write_all(&bytes[..n]).await?;
                             }
                             sw.shutdown().await
-                        }, async { tokio::io::copy(&mut sr, &mut cw).await?; cw.shutdown().await })?;
+                        }, async {
+                            let mut bytes = [0; 8192];
+                            loop {
+                                let n = sr.read(&mut bytes).await?;
+                                if n == 0 { break; }
+                                {
+                                    let mut captures = downlink.lock().unwrap();
+                                    let recorded = n.min(262144usize.saturating_sub(captures[index].len()));
+                                    captures[index].extend_from_slice(&bytes[..recorded]);
+                                }
+                                cw.write_all(&bytes[..n]).await?;
+                            }
+                            cw.shutdown().await
+                        })?;
                         Ok::<_, io::Error>(())
                     });
                 }
@@ -442,7 +467,7 @@ async fn tap(upstream: u16) -> (u16, Captures, Task) {
             }
         }
     });
-    (port, output, Task(task))
+    (port, output, downlink_output, Task(task))
 }
 
 async fn echo() -> (u16, Arc<AtomicUsize>, Task) {
