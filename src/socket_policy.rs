@@ -201,10 +201,16 @@ mod tests {
     async fn managed_resolution_never_falls_back_to_native_and_policy_is_process_scoped() {
         const CHILD: &str = "SHOES_SOCKET_POLICY_TEST";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "socket_policy::tests::managed_resolution_never_falls_back_to_native_and_policy_is_process_scoped", "--nocapture"])
-                .env(CHILD, "1").status().unwrap();
-            assert!(status.success());
+                .env(CHILD, "1").output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "socket policy test failed: {}\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         let install = || {

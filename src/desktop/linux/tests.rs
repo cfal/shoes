@@ -530,10 +530,11 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
         .arg(std::env::current_exe()?)
         .args(KERNEL_TEST_ARGS)
         .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+        "managed kernel test failed: {}\n{stdout}\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
