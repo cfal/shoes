@@ -46,6 +46,13 @@ pub fn create_tcp_client_handler(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Box<dyn TcpClientHandler>> {
     Ok(match client_proxy_config {
+        ClientProxyConfig::SudokuMask(config) => {
+            let prepared = config.prepare()?;
+            Box::new(crate::sudoku_mask::handler::ClientHandler {
+                config: prepared,
+                inner: create_tcp_client_handler(*config.protocol, default_sni_hostname, resolver)?,
+            })
+        }
         ClientProxyConfig::Xhttp(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

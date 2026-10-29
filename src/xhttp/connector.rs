@@ -72,6 +72,7 @@ impl Security {
 
 pub fn contains(config: &ClientProxyConfig) -> bool {
     match config {
+        ClientProxyConfig::SudokuMask(config) => contains(&config.protocol),
         ClientProxyConfig::Xhttp(_) => true,
         ClientProxyConfig::Tls(tls) => contains(&tls.protocol),
         ClientProxyConfig::Reality { protocol, .. }
@@ -82,6 +83,17 @@ pub fn contains(config: &ClientProxyConfig) -> bool {
 }
 
 type ClientTransport = (Arc<Client>, Box<dyn TcpClientHandler>);
+
+fn peel_masks(
+    mut protocol: ClientProxyConfig,
+) -> io::Result<(Vec<Arc<crate::sudoku_mask::Prepared>>, ClientProxyConfig)> {
+    let mut masks = Vec::new();
+    while let ClientProxyConfig::SudokuMask(config) = protocol {
+        masks.push(config.prepare()?);
+        protocol = *config.protocol;
+    }
+    Ok((masks, protocol))
+}
 
 pub fn build(
     config: &ClientConfig,
@@ -100,10 +112,15 @@ pub(crate) fn build_with_limits(
     if !contains(&config.protocol) {
         return Ok(None);
     }
+    crate::sudoku_mask::check_transport(
+        crate::sudoku_mask::contains_client(&config.protocol),
+        &config.transport,
+    )?;
     if config.transport == Transport::Udp {
         return Err(invalid("XHTTP requires TCP or QUIC transport"));
     }
-    let mut outer = config.protocol.clone();
+    let (outer_masks, mut outer) = peel_masks(config.protocol.clone())?;
+    let mut inner_masks = Vec::new();
     let default_sni = config.address.address().hostname().map(str::to_owned);
     let (xhttp, effective_sni, security, tls_alpn, reality) = match &mut outer {
         ClientProxyConfig::Xhttp(xhttp) => (
@@ -117,13 +134,14 @@ pub(crate) fn build_with_limits(
             false,
         ),
         ClientProxyConfig::Tls(tls) => {
-            let ClientProxyConfig::Xhttp(xhttp) = tls.protocol.as_ref() else {
+            let (masks, protocol) = peel_masks(*tls.protocol.clone())?;
+            inner_masks = masks;
+            let ClientProxyConfig::Xhttp(xhttp) = protocol else {
                 return Err(invalid("XHTTP must be directly inside TLS"));
             };
             if tls.vision {
                 return Err(invalid("Vision cannot wrap XHTTP"));
             }
-            let xhttp = xhttp.clone();
             let sni = if tls.sni_hostname.is_unspecified() {
                 default_sni
             } else {
@@ -179,13 +197,14 @@ pub(crate) fn build_with_limits(
             vision,
             ..
         } => {
-            let ClientProxyConfig::Xhttp(xhttp) = protocol.as_ref() else {
+            let (masks, inner) = peel_masks(*protocol.clone())?;
+            inner_masks = masks;
+            let ClientProxyConfig::Xhttp(xhttp) = inner else {
                 return Err(invalid("XHTTP must be directly inside REALITY"));
             };
             if *vision {
                 return Err(invalid("Vision cannot wrap XHTTP"));
             }
-            let xhttp = xhttp.clone();
             let sni = sni_hostname.clone().or(default_sni.clone());
             **protocol = ClientProxyConfig::PortForward;
             let handler = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
@@ -262,14 +281,17 @@ pub(crate) fn build_with_limits(
         resolver,
     )?;
     Ok(Some((
-        Arc::new(Client::new(
-            xhttp,
-            config.address.clone(),
-            authority,
-            version,
-            mode,
-            security,
-        )?),
+        Arc::new(
+            Client::new(
+                xhttp,
+                config.address.clone(),
+                authority,
+                version,
+                mode,
+                security,
+            )?
+            .with_masks(outer_masks, inner_masks),
+        ),
         inner,
     )))
 }

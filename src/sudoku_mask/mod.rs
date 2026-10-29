@@ -1,5 +1,6 @@
 mod codec;
 mod go_rng;
+pub(crate) mod handler;
 mod layout;
 mod stream;
 mod table;
@@ -11,6 +12,69 @@ use zeroize::Zeroize;
 
 use layout::Layout;
 use table::Mapping;
+
+pub(crate) use stream::SudokuStream;
+
+pub(crate) fn contains_client(protocol: &crate::config::ClientProxyConfig) -> bool {
+    use crate::config::ClientProxyConfig as P;
+    match protocol {
+        P::SudokuMask(_) => true,
+        P::Tls(c) => contains_client(&c.protocol),
+        P::Reality { protocol, .. } | P::ShadowTls { protocol, .. } => contains_client(protocol),
+        P::Websocket(c) => contains_client(&c.protocol),
+        P::Xhttp(c) => contains_client(&c.protocol),
+        _ => false,
+    }
+}
+
+pub(crate) fn contains_server(protocol: &crate::config::ServerProxyConfig) -> bool {
+    use crate::config::ServerProxyConfig as P;
+    match protocol {
+        P::SudokuMask(_) => true,
+        P::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            ..
+        } => {
+            tls_targets.values().any(|c| contains_server(&c.protocol))
+                || default_tls_target
+                    .as_ref()
+                    .is_some_and(|c| contains_server(&c.protocol))
+                || shadowtls_targets
+                    .values()
+                    .any(|c| contains_server(&c.protocol))
+                || reality_targets
+                    .values()
+                    .any(|c| contains_server(&c.protocol))
+        }
+        P::Websocket { targets } => targets.iter().any(|c| contains_server(&c.protocol)),
+        P::Xhttp(c) => contains_server(&c.protocol),
+        _ => false,
+    }
+}
+
+pub(crate) fn check_transport(
+    present: bool,
+    transport: &crate::config::Transport,
+) -> io::Result<()> {
+    if present && *transport != crate::config::Transport::Tcp {
+        return Err(invalid(
+            "sudoku_mask requires TCP transport; native UDP/QUIC masking is not supported",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn without_server_masks(
+    mut protocol: &crate::config::ServerProxyConfig,
+) -> &crate::config::ServerProxyConfig {
+    while let crate::config::ServerProxyConfig::SudokuMask(config) = protocol {
+        protocol = &config.protocol;
+    }
+    protocol
+}
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(transparent)]

@@ -704,6 +704,8 @@ impl WebsocketPingType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
+    #[serde(rename = "sudoku_mask")]
+    SudokuMask(crate::sudoku_mask::SudokuMaskConfig<ServerProxyConfig>),
     Wireguard(Box<super::wireguard::WireguardServerConfig>),
     #[serde(alias = "splithttp")]
     Xhttp(super::xhttp::XhttpServerConfig),
@@ -870,6 +872,7 @@ pub enum ServerProxyConfig {
 impl std::fmt::Display for ServerProxyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SudokuMask(config) => write!(f, "Sudoku mask ({})", config.protocol),
             Self::Wireguard(_) => write!(f, "WireGuard"),
             Self::Http { .. } => write!(f, "HTTP"),
             Self::Socks { .. } => write!(f, "SOCKS"),

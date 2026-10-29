@@ -137,6 +137,19 @@ fn create_handler(
     scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<Box<dyn TcpServerHandler>> {
     Ok(match server_proxy_config {
+        ServerProxyConfig::SudokuMask(config) => {
+            let prepared = config.prepare()?;
+            Box::new(crate::sudoku_mask::handler::ServerHandler {
+                config: prepared,
+                inner: create_handler(
+                    *config.protocol,
+                    client_proxy_selector,
+                    resolver,
+                    bind_ip,
+                    &mut scope.child("sudoku_mask".into()),
+                )?,
+            })
+        }
         ServerProxyConfig::Xhttp(config) => {
             let service = match scope.services.xhttp.entry(scope.path.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -487,7 +500,9 @@ fn create_tls_server_target(
             );
         }
         naive_alpn
-    } else if let ServerProxyConfig::Xhttp(config) = &protocol {
+    } else if let ServerProxyConfig::Xhttp(config) =
+        crate::sudoku_mask::without_server_masks(&protocol)
+    {
         config.tls_alpn(&alpn_protocols)?
     } else {
         alpn_protocols.into_vec()
@@ -839,12 +854,23 @@ mod tests {
 
     #[test]
     fn native_vless_services_share_only_within_one_generation_and_protocol_path() {
+        for mask_depth in 0..=2 {
+            check_native_service_scope(mask_depth);
+        }
+    }
+
+    fn check_native_service_scope(mask_depth: usize) {
         let selector = Arc::new(ClientProxySelector::new(vec![]));
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-        let config: ServerProxyConfig = serde_json::from_value(json!({
+        let mut value = json!({
             "type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000",
             "decryption": "mlkem768x25519plus.native.600s.CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        })).unwrap();
+        });
+        for _ in 0..mask_depth {
+            value = json!({"type":"sudoku_mask","protocol":value});
+        }
+        let config: ServerProxyConfig = serde_json::from_value(value).unwrap();
+        let path = vec!["sudoku_mask".to_owned(); mask_depth];
         let mut services = HandlerServices::default();
         let first = create_tcp_server_handler_shared(
             config.clone(),
@@ -854,7 +880,7 @@ mod tests {
             &mut services,
         )
         .unwrap();
-        let session = services.vless[&Vec::new()].clone();
+        let session = services.vless[&path].clone();
         let second = create_tcp_server_handler_shared(
             config.clone(),
             &selector,
@@ -864,7 +890,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(services.vless.len(), 1);
-        assert!(Arc::ptr_eq(&session, &services.vless[&Vec::new()]));
+        assert!(Arc::ptr_eq(&session, &services.vless[&path]));
         assert_eq!(Arc::strong_count(&session), 4);
         let scoped = create_handler(
             config.clone(),
@@ -877,10 +903,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!Arc::ptr_eq(
-            &session,
-            &services.vless[&vec!["other-target".into()]]
-        ));
+        let mut other_path = vec!["other-target".into()];
+        other_path.extend(path.clone());
+        assert!(!Arc::ptr_eq(&session, &services.vless[&other_path]));
         let mut next_generation = HandlerServices::default();
         let next = create_tcp_server_handler_shared(
             config,
@@ -890,7 +915,7 @@ mod tests {
             &mut next_generation,
         )
         .unwrap();
-        assert!(!Arc::ptr_eq(&session, &next_generation.vless[&Vec::new()]));
+        assert!(!Arc::ptr_eq(&session, &next_generation.vless[&path]));
         drop((first, second, scoped, next, services, next_generation));
         assert_eq!(Arc::strong_count(&session), 1);
     }

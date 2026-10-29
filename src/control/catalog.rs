@@ -383,6 +383,7 @@ pub fn protocol_type(protocol: &ClientProxyConfig) -> &str {
         ClientProxyConfig::Reality { protocol, .. }
         | ClientProxyConfig::ShadowTls { protocol, .. } => protocol_type(protocol),
         ClientProxyConfig::Websocket(config) => protocol_type(&config.protocol),
+        ClientProxyConfig::SudokuMask(config) => protocol_type(&config.protocol),
         ClientProxyConfig::Xhttp(config) => protocol_type(&config.protocol),
         ClientProxyConfig::Socks { .. } => "Socks5",
         ClientProxyConfig::Vless { .. } => "VLESS",

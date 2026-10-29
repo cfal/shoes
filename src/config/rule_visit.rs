@@ -53,6 +53,9 @@ fn protocol(
                 self::protocol(&mut target.protocol, visitor, group)?;
             }
         }
+        ServerProxyConfig::SudokuMask(config) => {
+            self::protocol(&mut config.protocol, visitor, group)?
+        }
         ServerProxyConfig::Xhttp(config) => self::protocol(&mut config.protocol, visitor, group)?,
         _ => {}
     }

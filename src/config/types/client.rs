@@ -410,6 +410,8 @@ pub enum HttpVersion {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientProxyConfig {
+    #[serde(rename = "sudoku_mask")]
+    SudokuMask(crate::sudoku_mask::SudokuMaskConfig<ClientProxyConfig>),
     Direct,
     Wireguard(Box<super::wireguard::WireguardClientConfig>),
     Http {
@@ -574,6 +576,7 @@ impl ClientProxyConfig {
     /// Returns the protocol name for display/error messages
     pub fn protocol_name(&self) -> &str {
         match self {
+            ClientProxyConfig::SudokuMask(_) => "Sudoku mask",
             ClientProxyConfig::Direct => "Direct",
             ClientProxyConfig::Wireguard(_) => "WireGuard",
             ClientProxyConfig::Http { .. } => "HTTP",

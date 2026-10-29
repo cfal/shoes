@@ -391,6 +391,9 @@ fn gather_pem_file_paths_from_server_proxy(
                 }
             }
         }
+        ServerProxyConfig::SudokuMask(config) => {
+            gather_pem_file_paths_from_server_proxy(&mut config.protocol, visitor)?;
+        }
         ServerProxyConfig::Xhttp(config) => {
             gather_pem_file_paths_from_server_proxy(&mut config.protocol, visitor)?;
         }
@@ -495,6 +498,9 @@ fn gather_pem_file_paths_from_client_proxy(
         }
         ClientProxyConfig::Websocket(ws_config) => {
             gather_pem_file_paths_from_client_proxy(&mut ws_config.protocol, visitor);
+        }
+        ClientProxyConfig::SudokuMask(config) => {
+            gather_pem_file_paths_from_client_proxy(&mut config.protocol, visitor);
         }
         ClientProxyConfig::Xhttp(config) => {
             gather_pem_file_paths_from_client_proxy(&mut config.protocol, visitor);

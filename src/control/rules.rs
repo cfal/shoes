@@ -152,6 +152,12 @@ impl Builder {
                     );
                 }
             }
+            ServerProxyConfig::SudokuMask(config) => self.project_protocol(
+                &mut config.protocol,
+                inbound,
+                &format!("{scope}/sudoku_mask"),
+                inherited,
+            ),
             ServerProxyConfig::Xhttp(config) => self.project_target(
                 &mut NoneOrSome::None,
                 &mut config.protocol,
@@ -177,6 +183,7 @@ pub fn inbound_type(protocol: &ServerProxyConfig) -> &'static str {
         ServerProxyConfig::Wireguard(_) => "WireGuard",
         ServerProxyConfig::Tls { .. } => "TLS",
         ServerProxyConfig::Websocket { .. } => "WebSocket",
+        ServerProxyConfig::SudokuMask(config) => inbound_type(&config.protocol),
         ServerProxyConfig::Xhttp(_) => "XHTTP",
         _ => "Shoes",
     }

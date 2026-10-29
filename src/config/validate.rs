@@ -1032,6 +1032,10 @@ fn validate_server_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
+    crate::sudoku_mask::check_transport(
+        crate::sudoku_mask::contains_server(&server_config.protocol),
+        &server_config.transport,
+    )?;
     if let ServerProxyConfig::Wireguard(config) = &server_config.protocol {
         if server_config.transport != Transport::Udp
             || server_config.tcp_settings.is_some()
@@ -1338,6 +1342,7 @@ pub(crate) fn validate_client_vision_protocol(
 /// Recursive validation of client proxy config structure (Vision rules, etc.)
 fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
     let inner = match config {
+        ClientProxyConfig::SudokuMask(config) => Some(config.protocol.as_ref()),
         ClientProxyConfig::Tls(tls_config) => {
             tls_config
                 .key_exchange_groups
@@ -1382,6 +1387,10 @@ fn validate_client_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
+    crate::sudoku_mask::check_transport(
+        crate::sudoku_mask::contains_client(&client_config.protocol),
+        &client_config.transport,
+    )?;
     client_config.validate_quic_key_exchange(true)?;
     if let ClientProxyConfig::Wireguard(config) = &mut client_config.protocol {
         if client_config.transport != Transport::Udp
@@ -1497,6 +1506,10 @@ fn validate_client_proxy_config(
     default_sni: Option<&str>,
 ) -> std::io::Result<()> {
     match client_proxy_config {
+        ClientProxyConfig::SudokuMask(config) => {
+            config.prepare()?;
+            validate_client_proxy_config(&mut config.protocol, named_pems, default_sni)?;
+        }
         ClientProxyConfig::Shadowsocks { config, .. } => config.validate_keys()?,
         ClientProxyConfig::Vmess {
             user_id, cipher, ..
@@ -1780,6 +1793,17 @@ fn validate_server_proxy_config(
 ) -> std::io::Result<()> {
     validate_server_auth(server_proxy_config)?;
     match server_proxy_config {
+        ServerProxyConfig::SudokuMask(config) => {
+            config.prepare()?;
+            validate_server_proxy_config(
+                &mut config.protocol,
+                client_groups,
+                rule_groups,
+                named_pems,
+                ServerProtocolContext::Stream,
+                global_limits,
+            )?;
+        }
         ServerProxyConfig::Wireguard(_) => {
             return Err(super::types::wireguard::invalid(
                 "WireGuard requires a top-level server protocol",
