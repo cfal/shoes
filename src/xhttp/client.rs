@@ -15,7 +15,6 @@ use super::{
 };
 use crate::{
     address::NetLocation,
-    async_stream::AsyncStream,
     config::xhttp::{MAX_PADDING_BYTES, XhttpClientConfig, XhttpMode, XhttpVersion},
     resources::Budget,
     tcp::carrier_dialer::{CarrierDialer, RouteKey},
@@ -201,20 +200,6 @@ impl Client {
         self
     }
 
-    fn mask_carrier(
-        mut stream: Box<dyn AsyncStream>,
-        masks: &[Arc<crate::sudoku_mask::Prepared>],
-    ) -> Box<dyn AsyncStream> {
-        for config in masks {
-            stream = Box::new(crate::sudoku_mask::SudokuStream::new(
-                stream,
-                config.clone(),
-                crate::sudoku_mask::Role::Client,
-            ));
-        }
-        stream
-    }
-
     async fn dial(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Arc<Carrier>> {
         let header_limit = 8192 + MAX_PADDING_BYTES as usize;
         tokio::time::timeout(
@@ -223,7 +208,14 @@ impl Client {
                 if self.version == XhttpVersion::H3 {
                     Carrier::quic(dialer.open_quic().await?, header_limit).await
                 } else {
-                    let stream = Self::mask_carrier(dialer.open_stream().await?, &self.masks);
+                    let mut stream = dialer.open_stream().await?;
+                    for config in &self.masks {
+                        stream = Box::new(crate::sudoku_mask::SudokuStream::new(
+                            stream,
+                            config.clone(),
+                            crate::sudoku_mask::Role::Client,
+                        ));
+                    }
                     let stream = self
                         .security
                         .wrap(stream, &self.endpoint, self.version)

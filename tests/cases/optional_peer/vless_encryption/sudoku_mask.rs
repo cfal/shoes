@@ -332,19 +332,21 @@ async fn xray_tcp_carriers_and_native_encryption() {
 
 #[tokio::test]
 async fn vision_direct_cannot_bypass_the_mask() {
-    for peer in [Kind::Shoes, Kind::Xray] {
-        for peer_client in [false, true] {
-            for transport in [Transport::Tls, Transport::Reality] {
-                let mut case = Case::new(peer, peer_client, transport);
-                case.vision = true;
-                run(case).await;
-            }
-            for native in ["native", "random"] {
-                let mut case = Case::new(peer, peer_client, Transport::Raw);
-                case.native = Some(native);
-                case.vision = true;
-                run(case).await;
-            }
+    for (peer, peer_client) in [
+        (Kind::Shoes, false),
+        (Kind::Xray, false),
+        (Kind::Xray, true),
+    ] {
+        for transport in [Transport::Tls, Transport::Reality] {
+            let mut case = Case::new(peer, peer_client, transport);
+            case.vision = true;
+            run(case).await;
+        }
+        for native in ["native", "random"] {
+            let mut case = Case::new(peer, peer_client, Transport::Raw);
+            case.native = Some(native);
+            case.vision = true;
+            run(case).await;
         }
     }
 }

@@ -543,10 +543,7 @@ pub(crate) fn validate_server_transport(
             if *transport == super::Transport::Quic && contains_server(protocol) {
                 return Err(invalid("QUIC XHTTP must be a top-level protocol"));
             }
-            for target in tls_targets
-                .values()
-                .chain(default_tls_target.iter().map(|target| target.as_ref()))
-            {
+            for target in tls_targets.values().chain(default_tls_target.as_deref()) {
                 if let ServerProxyConfig::Xhttp(config) = &target.protocol {
                     config.tls_alpn(&target.alpn_protocols)?;
                 }
