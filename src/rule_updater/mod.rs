@@ -18,7 +18,6 @@ const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Limits {
-    bytes: u64,
     connect: Duration,
     idle: Duration,
     overall: Duration,
@@ -27,7 +26,6 @@ struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            bytes: MAX_BYTES,
             connect: Duration::from_secs(10),
             idle: Duration::from_secs(10),
             overall: Duration::from_secs(120),
@@ -99,12 +97,12 @@ async fn download_memory(
         return Ok(None);
     }
     let source = source.clone();
-    crate::config::blocking_compile(move || {
-        crate::rule_set::load_memory(source, bytes, digest)
-            .map(|loaded| Some(std::sync::Arc::new(loaded)))
+    let loaded = crate::config::blocking_compile(move || {
+        crate::rule_set::load_memory(&source, bytes, digest)
             .map_err(|_| invalid("download failed Shoes rule validation"))
     })
-    .await
+    .await?;
+    Ok(Some(std::sync::Arc::new(loaded)))
 }
 
 async fn validate_staged(
@@ -186,16 +184,16 @@ async fn refresh_memory(
         return Ok(false);
     };
     let mut candidate = memory.clone();
-    candidate.insert(source.path.clone(), loaded);
+    candidate.insert(source.path.clone(), loaded.clone());
     validate_inputs(
         configs.to_vec(),
         RuleInputs {
-            file: None,
-            memory: candidate.clone(),
+            memory: candidate,
+            ..Default::default()
         },
     )
     .await?;
-    *memory = candidate;
+    memory.insert(source.path.clone(), loaded);
     Ok(true)
 }
 

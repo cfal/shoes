@@ -430,6 +430,22 @@ fn memory_configs(source: &RuleSource) -> Vec<Config> {
     .unwrap()
 }
 
+fn predicates(validated: &ValidatedConfigs) -> Vec<Arc<crate::rules::Predicate>> {
+    let Config::Server(server) = &validated.configs[0] else {
+        panic!("expected server")
+    };
+    server
+        .rules
+        .iter()
+        .map(|rule| {
+            let crate::config::ConfigSelection::Config(rule) = rule else {
+                panic!("unexpanded rule")
+            };
+            rule.criteria.compiled.as_ref().unwrap().clone()
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn memory_bootstrap_reuses_compiled_sources_and_invalidates_changed_urls() {
     let (url, fixture) = serve(response(200, "", OLD)).await;
@@ -445,8 +461,8 @@ async fn memory_bootstrap_reuses_compiled_sources_and_invalidates_changed_urls()
     let validated = validate_inputs(
         config.clone(),
         RuleInputs {
-            file: None,
             memory: reused.clone(),
+            ..Default::default()
         },
     )
     .await
@@ -472,25 +488,24 @@ async fn memory_bootstrap_reuses_compiled_sources_and_invalidates_changed_urls()
 
 #[tokio::test]
 async fn memory_refresh_validates_changed_candidates_without_replacing_on_failure() {
-    for body in [OLD, VALID] {
+    for (body, valid_config) in [(OLD, false), (VALID, false), (VALID, true)] {
         let (url, fixture) = serve(response(200, "", body)).await;
         let mut config = memory_configs(&source(&url, Path::new("")));
         let source = crate::rule_set::remote_sources(&mut config)
             .unwrap()
             .remove(0);
         let original = Arc::new(
-            crate::rule_set::load_memory(source.clone(), OLD.to_vec(), blake3::hash(OLD)).unwrap(),
+            crate::rule_set::load_memory(&source, OLD.to_vec(), blake3::hash(OLD)).unwrap(),
         );
         let mut memory = MemorySources::from([(source.path.clone(), original.clone())]);
-        let Config::Server(server) = &mut config[0] else {
-            panic!("expected server")
-        };
-        let extra = serde_json::from_value(
-            serde_json::json!({"masks": {"ip_cidr": ["invalid"]}, "action": "block"}),
-        )
-        .unwrap();
-        let first = server.rules.iter().next().unwrap().clone();
-        server.rules = crate::option_util::NoneOrSome::Some(vec![first, extra]);
+        if !valid_config {
+            config.push(
+                serde_json::from_value(serde_json::json!({
+                    "rule_group": "invalid", "rules": [{"masks": {"ip_cidr": ["invalid"]}}]
+                }))
+                .unwrap(),
+            );
+        }
         let result = refresh_memory(
             &source,
             &config,
@@ -503,6 +518,12 @@ async fn memory_refresh_validates_changed_candidates_without_replacing_on_failur
         fixture.await.unwrap();
         if body == OLD {
             assert!(!result.unwrap());
+        } else if valid_config {
+            assert!(result.unwrap());
+            assert_eq!(
+                memory.get(&source.path).unwrap().digest,
+                blake3::hash(VALID)
+            );
         } else {
             assert!(
                 result
@@ -511,8 +532,48 @@ async fn memory_refresh_validates_changed_candidates_without_replacing_on_failur
                     .contains("whole configuration validation")
             );
         }
-        assert!(Arc::ptr_eq(&original, memory.get(&source.path).unwrap()));
+        assert_eq!(
+            Arc::ptr_eq(&original, memory.get(&source.path).unwrap()),
+            body == OLD || !valid_config
+        );
     }
+}
+
+#[tokio::test]
+async fn memory_refresh_validates_new_source_and_preserves_other_sources() {
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let first = source("https://unused.invalid/a.json", Path::new(""));
+    let second = source(&url, Path::new(""));
+    let mut config = memory_configs(&first);
+    config.extend(memory_configs(&second));
+    let sources = crate::rule_set::remote_sources(&mut config).unwrap();
+    let first = sources
+        .iter()
+        .find(|source| source.url == first.url)
+        .unwrap();
+    let second = sources
+        .iter()
+        .find(|source| source.url == second.url)
+        .unwrap();
+    let original =
+        Arc::new(crate::rule_set::load_memory(first, OLD.to_vec(), blake3::hash(OLD)).unwrap());
+    let mut memory = MemorySources::from([(first.path.clone(), original.clone())]);
+    assert!(
+        refresh_memory(
+            second,
+            &config,
+            &mut memory,
+            &DnsRegistry::new(),
+            GlobalLimits::default(),
+            &mut http::DownloadState::default()
+        )
+        .await
+        .unwrap()
+    );
+    fixture.await.unwrap();
+    assert_eq!(memory.len(), 2);
+    assert!(Arc::ptr_eq(&original, &memory[&first.path]));
+    assert_eq!(memory[&second.path].digest, blake3::hash(VALID));
 }
 
 #[tokio::test]
@@ -542,21 +603,6 @@ async fn pathless_cached_sources_get_stable_names_and_restart_offline() {
 #[tokio::test]
 async fn memory_inputs_share_predicates_across_references_and_reloads_without_replacing_local_files()
  {
-    fn predicates(validated: &ValidatedConfigs) -> Vec<Arc<crate::rules::Predicate>> {
-        let Config::Server(server) = &validated.configs[0] else {
-            panic!("expected server")
-        };
-        server
-            .rules
-            .iter()
-            .map(|rule| {
-                let crate::config::ConfigSelection::Config(rule) = rule else {
-                    panic!("unexpanded rule")
-                };
-                rule.criteria.compiled.as_ref().unwrap().clone()
-            })
-            .collect()
-    }
     let dir = directory();
     let local = dir.path().join("local.json");
     write_rule(&local, OLD);
@@ -564,9 +610,8 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
     let remote = crate::rule_set::remote_sources(&mut config)
         .unwrap()
         .remove(0);
-    let loaded = Arc::new(
-        crate::rule_set::load_memory(remote.clone(), OLD.to_vec(), blake3::hash(OLD)).unwrap(),
-    );
+    let loaded =
+        Arc::new(crate::rule_set::load_memory(&remote, OLD.to_vec(), blake3::hash(OLD)).unwrap());
     let memory = MemorySources::from([(remote.path, loaded)]);
     let Config::Server(server) = &mut config[0] else {
         panic!("expected server")
@@ -579,8 +624,8 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
         &validate_inputs(
             config.clone(),
             RuleInputs {
-                file: None,
                 memory: memory.clone(),
+                ..Default::default()
             },
         )
         .await
@@ -590,8 +635,8 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
         &validate_inputs(
             config.clone(),
             RuleInputs {
-                file: None,
                 memory: memory.clone(),
+                ..Default::default()
             },
         )
         .await
@@ -602,9 +647,15 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
     assert!(!Arc::ptr_eq(&first[0], &first[2]));
     std::fs::remove_file(local).unwrap();
     assert!(
-        validate_inputs(config, RuleInputs { file: None, memory })
-            .await
-            .is_err()
+        validate_inputs(
+            config,
+            RuleInputs {
+                memory,
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
     );
 }
 
@@ -956,7 +1007,6 @@ async fn idle_header_body_connect_and_overall_trickle_deadlines() {
             }
         });
         let limits = Limits {
-            bytes: MAX_BYTES,
             connect: Duration::from_millis(150),
             idle: Duration::from_millis(150),
             overall: Duration::from_millis(250),
@@ -1257,7 +1307,7 @@ async fn every_existing_decoder_validates_downloads() {
         source.format = Some(format);
         source.behavior = behavior;
         source.code = code.map(str::to_owned);
-        crate::rule_set::load_memory(source.clone(), bytes.clone(), blake3::hash(&bytes)).unwrap();
+        crate::rule_set::load_memory(&source, bytes.clone(), blake3::hash(&bytes)).unwrap();
         assert_eq!(
             update(&source, Limits::default()).await.unwrap(),
             "updated",
@@ -1744,10 +1794,6 @@ async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
     write_rule(&second.path, OLD);
     let mut install = Install::open(&first.path).unwrap();
     install.file.write_all(VALID).unwrap();
-    let staged = Staged {
-        install,
-        digest: blake3::hash(VALID),
-    };
     let config: Vec<Config> = serde_json::from_value(serde_json::json!([
         {"rule_cache_dir": dir.path()},
         {"rule_source_group": "shared", "rules": [first]},
@@ -1758,31 +1804,19 @@ async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
         ]}
     ]))
     .unwrap();
-    let validated = validate_staged(config.clone(), &first.path, &staged.install)
+    let validated = validate_staged(config.clone(), &first.path, &install)
         .await
         .unwrap();
-    let Config::Server(server) = &validated.configs[0] else {
-        panic!("expected server");
-    };
-    let predicates: Vec<_> = server
-        .rules
-        .iter()
-        .map(|rule| {
-            let crate::config::ConfigSelection::Config(rule) = rule else {
-                panic!("unexpanded rule");
-            };
-            rule.criteria.compiled.as_ref().unwrap()
-        })
-        .collect();
-    assert!(Arc::ptr_eq(predicates[0], predicates[1]));
-    assert!(!Arc::ptr_eq(predicates[0], predicates[2]));
+    let predicates = predicates(&validated);
+    assert!(Arc::ptr_eq(&predicates[0], &predicates[1]));
+    assert!(!Arc::ptr_eq(&predicates[0], &predicates[2]));
     assert_eq!(
         std::fs::read(&first.path).unwrap(),
         b"SRS invalid old cache"
     );
 
     std::fs::remove_file(&second.path).unwrap();
-    let error = validate_staged(config, &first.path, &staged.install)
+    let error = validate_staged(config, &first.path, &install)
         .await
         .err()
         .unwrap();
@@ -1969,6 +2003,54 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
             ]
         );
     }
+}
+
+#[tokio::test]
+async fn streaming_body_limit_preserves_last_good_cache() {
+    timeout(Duration::from_secs(30), async {
+        for chunked in [false, true] {
+            let dir = directory();
+            let path = dir.path().join("rules.json");
+            write_rule(&path, OLD);
+            let original = std::fs::metadata(&path).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+            let fixture = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                request(&mut stream).await;
+                let header = if chunked {
+                    "Transfer-Encoding: chunked\r\n"
+                } else {
+                    ""
+                };
+                stream
+                    .write_all(format!("HTTP/1.1 200 OK\r\n{header}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let block = [b' '; 16 * 1024];
+                for _ in 0..(MAX_BYTES / block.len() as u64 + 1) {
+                    if chunked {
+                        stream.write_all(b"4000\r\n").await.unwrap();
+                    }
+                    stream.write_all(&block).await.unwrap();
+                    if chunked {
+                        stream.write_all(b"\r\n").await.unwrap();
+                    }
+                }
+                if chunked {
+                    let _ = stream.write_all(b"0\r\n\r\n").await;
+                }
+            });
+            let error = update(&source(&url, &path), Limits::default())
+                .await
+                .unwrap_err();
+            fixture.await.unwrap();
+            assert_eq!(error.to_string(), "download exceeds byte limit");
+            assert_preserved(&path, &original);
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

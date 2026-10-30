@@ -1,4 +1,4 @@
-use super::Limits;
+use super::{Limits, MAX_BYTES};
 use crate::async_stream::AsyncStream;
 use crate::config::{ConfigSelection, GlobalLimits};
 use crate::crypto::{CryptoTlsStream, TlsConnection, TlsReadMode};
@@ -155,7 +155,7 @@ pub(super) async fn download(
     source: &RuleSource,
     dns: &DnsRegistry,
     global: GlobalLimits,
-    file: &mut (impl AsyncWrite + Unpin),
+    output: &mut (impl AsyncWrite + Unpin),
     limits: Limits,
     state: &mut DownloadState,
 ) -> io::Result<blake3::Hash> {
@@ -217,7 +217,7 @@ pub(super) async fn download(
             .get(header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
-        if length.is_some_and(|length| length == 0 || length > limits.bytes) {
+        if length.is_some_and(|length| length == 0 || length > MAX_BYTES) {
             return Err(invalid("download size outside permitted range"));
         }
         let mut body = response.into_body();
@@ -234,16 +234,16 @@ pub(super) async fn download(
             bytes = bytes
                 .checked_add(data.len() as u64)
                 .ok_or_else(|| invalid("body size overflow"))?;
-            if bytes > limits.bytes || length.is_some_and(|length| bytes > length) {
+            if bytes > MAX_BYTES || length.is_some_and(|length| bytes > length) {
                 return Err(invalid("download exceeds byte limit"));
             }
-            file.write_all(&data).await?;
+            output.write_all(&data).await?;
             digest.update(&data);
         }
         if bytes == 0 || length.is_some_and(|length| bytes != length) {
             return Err(invalid("truncated HTTP body"));
         }
-        file.flush().await?;
+        output.flush().await?;
         Ok(digest.finalize())
     };
     // Drive HTTP in this future, so timeout/cancellation drops the socket too.

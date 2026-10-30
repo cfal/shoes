@@ -286,26 +286,27 @@ pub(crate) fn remote_sources(configs: &mut [Config]) -> io::Result<Vec<RuleSourc
         if source.parsed_url()?.is_none() {
             return Ok(());
         }
-        if directory.is_none() || source.path.as_os_str().is_empty() {
-            let name = format!("{}.rules", source.content_identity()?);
-            let path = directory.as_ref().map_or_else(
-                || PathBuf::from(format!("remote:{name}")),
-                |dir| dir.join(&name),
-            );
-            if directory.is_none() && !source.path.as_os_str().is_empty() && source.path != path {
-                return Err(invalid(
-                    "remote path requires rule_cache_dir; omit path for memory-only sources",
-                ));
+        match &directory {
+            None => {
+                let path = PathBuf::from(format!("remote:{}.rules", source.content_identity()?));
+                if !source.path.as_os_str().is_empty() && source.path != path {
+                    return Err(invalid(
+                        "remote path requires rule_cache_dir; omit path for memory-only sources",
+                    ));
+                }
+                source.path = path;
             }
-            source.path = path;
-        }
-        if directory.is_some() && !source.path.is_absolute() {
-            return Err(invalid(
-                "remote cache paths must be absolute for string configs",
-            ));
-        }
-        if source.path.is_absolute() {
-            source.path = std::path::absolute(&source.path)?;
+            Some(directory) => {
+                if source.path.as_os_str().is_empty() {
+                    source.path = directory.join(format!("{}.rules", source.content_identity()?));
+                }
+                if !source.path.is_absolute() {
+                    return Err(invalid(
+                        "remote cache paths must be absolute for string configs",
+                    ));
+                }
+                source.path = std::path::absolute(&source.path)?;
+            }
         }
         if let Some(previous) = sources.get(&source.path) {
             if serde_json::to_value(previous)? != serde_json::to_value(&source)? {
@@ -638,7 +639,14 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
     if let Some((path, file)) = &compiler.inputs.file
         && path == &source.path
     {
-        return read_staged(source, file.try_clone()?, source.path.clone(), compiler);
+        return read_file(source, file.try_clone()?, source.path.clone(), compiler).map_err(
+            |error| {
+                io::Error::new(
+                    error.kind(),
+                    "staged rule data failed validation (details redacted)",
+                )
+            },
+        );
     }
     #[cfg(unix)]
     if source.url.is_some() || compiler.remote_files.contains_key(&source.path) {
@@ -675,20 +683,6 @@ pub(crate) fn validate_file(source: &RuleSource, file: std::fs::File) -> io::Res
     read_file(source, file, source.path.clone(), &mut Compiler::default()).map(|_| ())
 }
 
-fn read_staged(
-    source: &RuleSource,
-    file: std::fs::File,
-    path: PathBuf,
-    compiler: &mut Compiler,
-) -> io::Result<Arc<Predicate>> {
-    read_file(source, file, path, compiler).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            "staged rule data failed validation (details redacted)",
-        )
-    })
-}
-
 fn read_file(
     source: &RuleSource,
     file: std::fs::File,
@@ -699,12 +693,12 @@ fn read_file(
 }
 
 pub(crate) fn load_memory(
-    source: RuleSource,
+    source: &RuleSource,
     bytes: Vec<u8>,
     digest: blake3::Hash,
 ) -> io::Result<MemorySource> {
     let (format, predicate) = read_data(
-        &source,
+        source,
         source.path.clone(),
         SourceInput::Memory(bytes),
         &mut Compiler::default(),
@@ -729,7 +723,7 @@ fn read_data(
     mut input: SourceInput,
     compiler: &mut Compiler,
 ) -> io::Result<(Format, Arc<Predicate>)> {
-    let url = source.parsed_url()?;
+    let url_hint = source.url_format()?;
     let start = std::time::Instant::now();
     let size = match &mut input {
         SourceInput::File(file) => {
@@ -756,7 +750,6 @@ fn read_data(
         SourceInput::Memory(bytes) => prefix.copy_from_slice(&bytes[..prefix.len()]),
     }
     let remote_hint = compiler.remote_files.get(&path).copied().flatten();
-    let url_hint = url.and_then(|url| extension(Path::new(url.path())));
     let format = source.format_with_hint(prefix, url_hint.or(remote_hint))?;
     if !matches!(
         format,
@@ -879,16 +872,7 @@ mod tests {
             ("list", b"{}", None),
             ("list", b"SR", None),
         ] {
-            let mut source = RuleSource {
-                url: None,
-                download: None,
-                update_interval: None,
-                path: path.into(),
-                format: None,
-                behavior: None,
-                code: None,
-                attributes: vec![],
-            };
+            let mut source = RuleSource::from_path(path.into());
             assert_eq!(source.format(prefix).ok(), expected, "{path}");
             source.format = Some(Format::MihomoText);
             assert_eq!(source.format(prefix).unwrap(), Format::MihomoText);
@@ -903,16 +887,7 @@ mod tests {
             include_bytes!("../../tests/fixtures/rule_sets/mihomo-domain.mrs").as_slice(),
         ] {
             let path = dir.path().join("source.json");
-            let source = RuleSource {
-                url: None,
-                download: None,
-                update_interval: None,
-                path: path.clone(),
-                format: None,
-                behavior: None,
-                code: None,
-                attributes: vec![],
-            };
+            let source = RuleSource::from_path(path.clone());
             std::fs::write(&path, bytes).unwrap();
             load_source(&source, &mut Compiler::default()).unwrap();
             std::fs::write(&path, &bytes[..4]).unwrap();
@@ -926,14 +901,8 @@ mod tests {
         let path = dir.path().join("escaped.json");
         std::fs::write(&path, format!(r#"{{"{}\n":0}}"#, "a".repeat(1024 * 1024))).unwrap();
         let source = RuleSource {
-            url: None,
-            download: None,
-            update_interval: None,
-            path,
             format: Some(Format::SingboxJson),
-            behavior: None,
-            code: None,
-            attributes: vec![],
+            ..RuleSource::from_path(path)
         };
         let mut compiler = Compiler::default();
         compiler.charge(509 * 1024 * 1024, 0).unwrap();
@@ -956,14 +925,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("domains.json");
         let source = RuleSource {
-            url: None,
-            download: None,
-            update_interval: None,
-            path: path.clone(),
             format: Some(Format::SingboxJson),
-            behavior: None,
-            code: None,
-            attributes: Vec::new(),
+            ..RuleSource::from_path(path.clone())
         };
         let context = format!("rule source {}: ", path.display());
         let mut compiler = Compiler::default();
