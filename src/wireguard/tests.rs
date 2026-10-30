@@ -310,7 +310,7 @@ async fn wireguard_config_sniffs_literal_and_restored_targets_without_rewriting(
         documents[0]["sniff"] = json!(true);
         documents[0]["dns"] = json!({"servers":"udp://127.0.0.1:9", "fake_ip":true});
         documents[0]["rules"] = json!([{"mask":"sniff.example", "client_chain":"exit"}]);
-        documents.push(json!({"client_group":"exit", "client_proxies":[{
+        documents.push(json!({"client_group":"exit", "client_chains":[{
             "address":format!("127.0.0.1:{}", exit.local_addr().unwrap().port()), "protocol":{"type":"socks"}
         }]}));
         let mut configs = validate(&serde_yaml::to_string(&documents).unwrap()).unwrap();
@@ -531,7 +531,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
     for tun_address in [None, Some("127.0.0.1"), Some("::ffff:127.0.0.1")] {
         let tun_endpoint = tun_address.is_some();
         let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
-        raw[1]["client_proxies"][0]["address"] = json!("localhost:51820");
+        raw[1]["client_chains"][0]["address"] = json!("localhost:51820");
         raw.as_array_mut().unwrap().push(json!({
             "dns_group":"fake", "dns_servers":"system",
             "fake_ip":{"ipv4_range":if tun_endpoint { "198.18.0.0/15" } else { "127.0.0.0/8" }}
@@ -547,11 +547,11 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
             stdio::ErrorKind::InvalidData
         );
 
-        raw[1]["client_proxies"][0]["address"] = json!("127.0.0.1:51820");
+        raw[1]["client_chains"][0]["address"] = json!("127.0.0.1:51820");
         assert!(validate(&raw.to_string()).is_err());
 
-        raw[1]["client_proxies"][0]["address"] = json!("192.0.2.1:51820");
-        raw[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{
+        raw[1]["client_chains"][0]["address"] = json!("192.0.2.1:51820");
+        raw[1]["client_chains"][0]["protocol"]["peer_client_chain"] = json!([{
             "address":"localhost:443", "protocol":{"type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"}
         }]);
         let mut configs = validate(&raw.to_string()).unwrap();
@@ -571,7 +571,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
         assert!(error.to_string().contains("synthetic address"), "{error}");
 
         raw[3]["fake_ip"] = false.into();
-        raw[1]["client_proxies"][0]["address"] = json!("localhost:51820");
+        raw[1]["client_chains"][0]["address"] = json!("localhost:51820");
         let mut configs = validate(&raw.to_string()).unwrap();
         Prepared::new(&mut configs).await.unwrap();
 
@@ -596,7 +596,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
                     .kind(),
                 stdio::ErrorKind::InvalidData
             );
-            candidate[1]["client_proxies"][0]["address"] = json!("127.0.0.1:51820");
+            candidate[1]["client_chains"][0]["address"] = json!("127.0.0.1:51820");
             let mut configs = validate(&candidate.to_string()).unwrap();
             assert_eq!(
                 Prepared::with_forbidden(&mut configs, &inherited)
@@ -606,7 +606,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
                     .kind(),
                 stdio::ErrorKind::InvalidInput
             );
-            candidate[1]["client_proxies"][0]["address"] = json!("192.0.2.1:51820");
+            candidate[1]["client_chains"][0]["address"] = json!("192.0.2.1:51820");
             let mut configs = validate(&candidate.to_string()).unwrap();
             let prepared = Prepared::with_forbidden(&mut configs, &inherited)
                 .await
@@ -618,7 +618,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
                     .await
                     .is_err()
             );
-            candidate[1]["client_proxies"][0]["protocol"]["peer_client_chain"][0]["address"] =
+            candidate[1]["client_chains"][0]["protocol"]["peer_client_chain"][0]["address"] =
                 json!("127.0.0.1:443");
             let mut configs = validate(&candidate.to_string()).unwrap();
             assert_eq!(
@@ -638,7 +638,7 @@ fn fake_dns_rejects_unbracketed_wireguard_literals() {
     use serde_json::json;
     for endpoint in ["::ffff:198.18.0.5:51820", "2001:2::5:51820"] {
         let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
-        raw[1]["client_proxies"][0]["address"] = json!(endpoint);
+        raw[1]["client_chains"][0]["address"] = json!(endpoint);
         raw.as_array_mut().unwrap().push(json!({
             "dns_group":"fake", "dns_servers":"system",
             "fake_ip":{"ipv6_range":"2001:2::/48"}
@@ -721,7 +721,7 @@ async fn wireguard_copied_clients_share_a_connector_only_within_their_generation
     let mut duplicate = raw[1].clone();
     duplicate["client_group"] = json!("copy");
     raw[2]["rules"][0]["client_chain"] = json!([{"pool": [
-        "client", "copy", raw[1]["client_proxies"][0],
+        "client", "copy", raw[1]["client_chains"][0],
     ]}]);
     raw.as_array_mut().unwrap().push(duplicate);
     let mut configs = validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
@@ -770,9 +770,9 @@ fn wireguard_validation_rejects_unsafe_or_ambiguous_configs() {
         ("/0/protocol/peers/0/public_key", json!(public(41))),
         ("/0/rules", json!([])),
         ("/0/rules", Value::Null),
-        ("/1/client_proxies/0/address", json!("127.0.0.1:0")),
-        ("/1/client_proxies/0/protocol/addresses", json!([])),
-        ("/1/client_proxies/0/protocol/allowed_ips", json!([])),
+        ("/1/client_chains/0/address", json!("127.0.0.1:0")),
+        ("/1/client_chains/0/protocol/addresses", json!([])),
+        ("/1/client_chains/0/protocol/allowed_ips", json!([])),
     ] {
         let mut invalid: Value = serde_yaml::from_str(&base).unwrap();
         if pointer.ends_with("/mtu") {
@@ -854,7 +854,7 @@ fn wireguard_dns_and_chain_constraints() {
         .err()
         .unwrap();
     assert!(error.to_string().contains("hop 0"));
-    let client_protocol = raw[1]["client_proxies"][0]["protocol"].clone();
+    let client_protocol = raw[1]["client_chains"][0]["protocol"].clone();
     raw[2]["rules"][0]["client_chain"] = json!([{
         "address": "127.0.0.1:443", "protocol": {"type": "tls", "protocol": client_protocol},
     }]);
@@ -891,7 +891,7 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
     let direct = json!({"protocol": {"type": "direct"}});
     let check = |value: &serde_json::Value| validate(&serde_yaml::to_string(value).unwrap());
     let mut valid = base.clone();
-    valid[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([direct]);
+    valid[1]["client_chains"][0]["protocol"]["peer_client_chain"] = json!([direct]);
     check(&valid).unwrap();
     let raw: Vec<crate::config::Config> =
         serde_yaml::from_str(&serde_yaml::to_string(&valid).unwrap()).unwrap();
@@ -906,14 +906,14 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
         ),
     ] {
         let mut invalid = valid.clone();
-        invalid[1]["client_proxies"][0]["protocol"][field] = value;
+        invalid[1]["client_chains"][0]["protocol"][field] = value;
         assert!(check(&invalid).is_err(), "accepted {field}");
     }
     let mut bound = valid.clone();
-    bound[1]["client_proxies"][0]["bind_interface"] = json!("lo");
+    bound[1]["client_chains"][0]["bind_interface"] = json!("lo");
     assert!(check(&bound).is_err());
     let mut missing_peer = valid.clone();
-    missing_peer[1]["client_proxies"][0]
+    missing_peer[1]["client_chains"][0]
         .as_object_mut()
         .unwrap()
         .remove("address");
@@ -922,10 +922,10 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
     let mut nested = base.clone();
     let mut carrier = base[1].clone();
     carrier["client_group"] = json!("carrier");
-    carrier["client_proxies"][0]["address"] = json!("127.0.0.1:51821");
+    carrier["client_chains"][0]["address"] = json!("127.0.0.1:51821");
     nested.as_array_mut().unwrap().push(carrier);
-    nested[1]["client_proxies"][0]["protocol"]["mtu"] = json!(1280);
-    nested[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("carrier");
+    nested[1]["client_chains"][0]["protocol"]["mtu"] = json!(1280);
+    nested[1]["client_chains"][0]["protocol"]["peer_client_chain"] = json!("carrier");
     nested.as_array_mut().unwrap().reverse();
     let sorted = check(&nested).unwrap();
     assert_eq!(
@@ -936,7 +936,7 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
         sorted.wireguard_endpoints[1].peers[0].endpoint.as_deref(),
         Some("127.0.0.1:51820")
     );
-    nested[2]["client_proxies"][0]["protocol"]["mtu"] = json!(1408);
+    nested[2]["client_chains"][0]["protocol"]["mtu"] = json!(1408);
     assert!(check(&nested).err().unwrap().to_string().contains("MTU"));
 
     let cycle_chain = |group| {
@@ -946,7 +946,7 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
         ])
     };
     let mut cyclic = valid.clone();
-    cyclic[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = cycle_chain("client");
+    cyclic[1]["client_chains"][0]["protocol"]["peer_client_chain"] = cycle_chain("client");
     assert!(
         check(&cyclic)
             .err()
@@ -956,9 +956,9 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
     );
     let mut carrier = base[1].clone();
     carrier["client_group"] = json!("carrier");
-    carrier["client_proxies"][0]["protocol"]["peer_client_chain"] = cycle_chain("client");
+    carrier["client_chains"][0]["protocol"]["peer_client_chain"] = cycle_chain("client");
     cyclic.as_array_mut().unwrap().push(carrier);
-    cyclic[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = cycle_chain("carrier");
+    cyclic[1]["client_chains"][0]["protocol"]["peer_client_chain"] = cycle_chain("carrier");
     assert!(
         check(&cyclic)
             .err()
@@ -966,7 +966,7 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
             .to_string()
             .contains("Circular dependency")
     );
-    cyclic[1]["client_proxies"][0]["protocol"]["peer_client_chain"][0] =
+    cyclic[1]["client_chains"][0]["protocol"]["peer_client_chain"][0] =
         json!({"pool": [direct, "carrier"]});
     assert!(
         check(&cyclic)
@@ -976,11 +976,11 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
             .contains("Circular dependency")
     );
 
-    valid[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("outer");
+    valid[1]["client_chains"][0]["protocol"]["peer_client_chain"] = json!("outer");
     valid
         .as_array_mut()
         .unwrap()
-        .push(json!({"client_group": "outer", "client_proxies": [direct]}));
+        .push(json!({"client_group": "outer", "client_chains": [direct]}));
     check(&valid).unwrap();
 }
 
@@ -992,7 +992,7 @@ async fn wireguard_outer_chain_requires_udp_before_starting() {
         "{type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0, udp_enabled: false}",
     ] {
         let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
-        raw[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = serde_yaml::from_str(
+        raw[1]["client_chains"][0]["protocol"]["peer_client_chain"] = serde_yaml::from_str(
             &format!("[{{address: 'unresolvable.invalid:9', protocol: {protocol}}}]"),
         )
         .unwrap();
@@ -1054,8 +1054,8 @@ async fn wireguard_nested_outer_chain_and_reload() {
         carrier[2]["rules"][0]["client_chain"] = json!("carrier-client");
         let mut inner: Vec<Value> =
             serde_yaml::from_str(&pair_config(inner_port.local_addr().unwrap().port())).unwrap();
-        inner[1]["client_proxies"][0]["protocol"]["mtu"] = json!(1280);
-        inner[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("carrier-client");
+        inner[1]["client_chains"][0]["protocol"]["mtu"] = json!(1280);
+        inner[1]["client_chains"][0]["protocol"]["peer_client_chain"] = json!("carrier-client");
         inner.extend(carrier);
         let mut configs = validate(&serde_yaml::to_string(&inner).unwrap()).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
@@ -1155,7 +1155,7 @@ async fn wireguard_chains_load_client_certificate_paths_before_validation() {
     }]);
     for outer in [false, true] {
         if outer {
-            config[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = chain.clone();
+            config[1]["client_chains"][0]["protocol"]["peer_client_chain"] = chain.clone();
         } else {
             config[0]["rules"][0]["client_chain"] = chain.clone();
         }
@@ -1165,10 +1165,10 @@ async fn wireguard_chains_load_client_certificate_paths_before_validation() {
         crate::config::create_server_configs(configs).unwrap();
         config = serde_yaml::from_str(&pair_config(10001)).unwrap();
     }
-    let mut carrier = config[1]["client_proxies"][0].clone();
+    let mut carrier = config[1]["client_chains"][0].clone();
     carrier["address"] = json!("127.0.0.1:10002");
     carrier["protocol"]["peer_client_chain"] = chain;
-    let mut nested = config[1]["client_proxies"][0].clone();
+    let mut nested = config[1]["client_chains"][0].clone();
     nested["protocol"]["mtu"] = json!(1280);
     nested["protocol"]["peer_client_chain"] = json!([carrier]);
     let rule = json!({"masks": "0.0.0.0/0", "action": "allow", "client_chain": [nested]});
@@ -1453,7 +1453,7 @@ async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
         let port = reservation.local_addr().unwrap().port();
         let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(port)).unwrap();
         raw[0]["address"] = serde_json::json!(format!("[::]:{port}"));
-        raw[1]["client_proxies"][0]["address"] = serde_json::json!(format!("[::1]:{port}"));
+        raw[1]["client_chains"][0]["address"] = serde_json::json!(format!("[::1]:{port}"));
         let mut configs = validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
@@ -1587,7 +1587,7 @@ async fn wireguard_unused_dns_groups_do_not_contact_peers() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut client = config::client(peer.local_addr().unwrap().port());
-        client["client_proxies"][0]["protocol"]["persistent_keepalive"] = json!(1);
+        client["client_chains"][0]["protocol"]["persistent_keepalive"] = json!(1);
         let mut raw = json!([
             client,
             {"dns_group": "tunnel", "dns_servers": [{"url": "tcp://192.0.2.53", "client_chain": "wg"}]},

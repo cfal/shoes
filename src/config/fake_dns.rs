@@ -324,7 +324,7 @@ mod tests {
         ] {
             let mut configs = json!([
                 {"dns_group":"fake", "dns_servers":"system", "fake_ip":{"ipv4_range":"100.64.0.0/10", "ipv6_range":"fd00::/64"}},
-                {"client_group":"auto", "type":"url-test", "url":url, "client_proxies":["direct"]}
+                {"client_group":"auto", "type":"url-test", "url":url, "client_chains":["direct"]}
             ]);
             let error = validate_yaml(&configs.to_string())
                 .err()

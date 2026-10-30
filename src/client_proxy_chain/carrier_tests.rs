@@ -14,7 +14,7 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
 - client_group: inner
   type: url-test
   url: http://inner.invalid/
-  client_proxies:
+  client_chains:
     - name: http
       address: 127.0.0.1:8000
       protocol: {{type: http}}
@@ -23,11 +23,11 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
       protocol: {{type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}}
 - client_group: manual
   type: selector
-  client_proxies: [inner, direct]
+  client_chains: [inner, direct]
 - client_group: outer
   type: url-test
   url: http://outer.invalid/
-  client_proxies: [manual, direct]
+  client_chains: [manual, direct]
 - address: 127.0.0.1:1080
   protocol: {{type: socks}}
   rules: [{{mask: 0.0.0.0/0, action: allow, client_chain: {route}}}]
@@ -84,13 +84,13 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
             };
             json!({
                 "client_group": format!("deep-{index}"),
-                "client_proxies": [member]
+                "client_chains": [member]
             })
         })
         .collect();
     configs.push(json!({
         "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
-        "client_proxies":["deep-0", {"name":"other", "protocol":{"type":"direct"}}]
+        "client_chains":["deep-0", {"name":"other", "protocol":{"type":"direct"}}]
     }));
     configs.push(json!({
         "address":"127.0.0.1:1080", "protocol":{"type":"socks"},
@@ -147,7 +147,7 @@ fn unselected_large_pools_keep_constant_time_round_robin() {
 fn selectors_filter_all_hops_without_changing_flattened_weights() {
     let yaml = "
 - client_group: leaves
-  client_proxies:
+  client_chains:
     - name: http
       address: 127.0.0.1:8000
       protocol: {type: http}
@@ -155,10 +155,10 @@ fn selectors_filter_all_hops_without_changing_flattened_weights() {
       address: 127.0.0.1:8001
       protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
 - client_group: weighted
-  client_proxies: [leaves, leaves, direct]
+  client_chains: [leaves, leaves, direct]
 - client_group: choose
   type: selector
-  client_proxies: [weighted, direct]
+  client_chains: [weighted, direct]
 - address: 127.0.0.1:1080
   protocol: {type: socks}
   rules: [{mask: 0.0.0.0/0, action: allow, client_chain: choose}]
@@ -198,7 +198,7 @@ fn udp_selection_rejects_ineligible_member_without_falling_back() {
 - client_group: leaves
   type: selector
   default: http
-  client_proxies:
+  client_chains:
     - name: http
       address: 127.0.0.1:8000
       protocol: {type: http}

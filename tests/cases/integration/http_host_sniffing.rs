@@ -63,7 +63,7 @@ async fn wire_ingress_sniffs_http(protocol: &str) -> io::Result<()> {
         let (_server, _server_config) = start_shoes_server(&json!([server]).to_string())?;
         let (_client, _client_config) = if protocol == "naiveproxy" {
             start_shoes_server(&json!([
-                {"client_group": "upstream", "client_proxies": [{
+                {"client_group": "upstream", "client_chains": [{
                     "address": format!("127.0.0.1:{server_port}"),
                     "protocol": {"type": "tls", "verify": false, "sni_hostname": "test.local", "alpn_protocols": ["h2"],
                         "protocol": {"type": "naiveproxy", "username": "user", "password": "pass"}},

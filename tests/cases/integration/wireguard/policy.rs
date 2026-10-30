@@ -28,9 +28,9 @@ async fn denied_routes_families_and_unavailable_peers_never_reach_local_targets(
                     "rule" => server["rules"].as_array_mut().unwrap().insert(0, json!({
                         "masks": [tcp.to_string(), udp.to_string()], "action": "block",
                     })),
-                    "route" => client["client_proxies"][0]["protocol"]["allowed_ips"] = json!(["10.77.0.1/32", "fd77::1/128"]),
-                    "family" => client["client_proxies"][0]["protocol"]["addresses"] = if ipv6 { json!(["10.77.0.2/32"]) } else { json!(["fd77::2/128"]) },
-                    "peer" => client["client_proxies"][0]["address"] = json!(blackhole.local_addr().unwrap().to_string()),
+                    "route" => client["client_chains"][0]["protocol"]["allowed_ips"] = json!(["10.77.0.1/32", "fd77::1/128"]),
+                    "family" => client["client_chains"][0]["protocol"]["addresses"] = if ipv6 { json!(["10.77.0.2/32"]) } else { json!(["fd77::2/128"]) },
+                    "peer" => client["client_chains"][0]["address"] = json!(blackhole.local_addr().unwrap().to_string()),
                     "inbound" => server["rules"] = json!("block-all"),
                     _ => unreachable!(),
                 }).await?;

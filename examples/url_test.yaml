@@ -6,7 +6,7 @@
   timeout: 5000
   tolerance: 50
   lazy: true
-  client_proxies:
+  client_chains:
     - name: east
       address: "east.example.com:443"
       protocol:

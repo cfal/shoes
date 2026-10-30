@@ -78,7 +78,7 @@ fn automatic_generation(id: u64, count: usize, resolver: Arc<dyn Resolver>) -> A
         .collect();
     let configs = serde_json::from_value(json!([
         {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "interval":10,
-            "timeout":1000, "lazy":false, "client_proxies":members}
+            "timeout":1000, "lazy":false, "client_chains":members}
     ]))
     .unwrap();
     let validated = crate::config::create_server_configs(configs).unwrap();
@@ -134,7 +134,7 @@ fn scheduled_generation(
             json!({
                 "client_group": name, "type": "url-test", "url": "http://probe.invalid/",
                 "interval": interval, "timeout": timeout, "lazy": false,
-                "client_proxies": members
+                "client_chains": members
             })
         })
         .collect();
@@ -246,13 +246,13 @@ async fn url_test_expansion_limits_preserve_health_without_dialing() {
                 };
                 json!({
                     "client_group": format!("deep-{index}"),
-                    "client_proxies": [member]
+                    "client_chains": [member]
                 })
             })
             .collect();
         configs.push(json!({
             "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
-            "interval":10, "timeout":1000, "lazy":false, "client_proxies":["deep-0"]
+            "interval":10, "timeout":1000, "lazy":false, "client_chains":["deep-0"]
         }));
         let validated =
             crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
@@ -679,7 +679,7 @@ fn url_test_quic_budget_rejection_preserves_health_in_a_fresh_process() {
             })
             .unwrap();
             let configs = serde_json::from_value(json!([
-                {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":[
+                {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":[
                     {"name":"quic", "address":"127.0.0.1:443", "transport":"quic", "quic_settings":{"verify":false}, "protocol":{"type":"socks"}}
                 ]}
             ])).unwrap();
@@ -902,7 +902,7 @@ async fn probe_wrapped_errors(h2_proxy: bool) {
 #[tokio::test]
 async fn url_test_xhttp_session_budget_rejection_preserves_health() {
     let configs = serde_json::from_value(json!([
-        {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":[
+        {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":[
             {"name":"xhttp", "address":"proxy.invalid:80", "protocol":{
                 "type":"xhttp", "limits":{"max_sessions":1}, "protocol":{"type":"socks"}
             }}
@@ -1212,7 +1212,7 @@ async fn url_test_automatic_real_proxy_probes_select_fast_sticky_recovered_membe
                 "type": "url-test",
                 "url": "http://probe.invalid/",
                 "tolerance": 100,
-                "client_proxies": [
+                "client_chains": [
                     {"name": "a", "address": a, "protocol": {"type": "http"}},
                     {"name": "b", "address": b, "protocol": {"type": "http"}}
                 ]
@@ -1682,7 +1682,7 @@ async fn inactive_wireguard_member_only_fails_when_selected() {
         let peer = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
         let config = json!([
             crate::wireguard::test_support::client(peer.local_addr().unwrap().port()),
-            {"client_group":"outbound","type":"selector","default":"http","client_proxies":[
+            {"client_group":"outbound","type":"selector","default":"http","client_chains":[
                 "wg", {"name":"http","address":proxy,"protocol":{"type":"http"}}
             ]},
             {"address":"127.0.0.1:0","protocol":{"type":"socks"},"rules":"allow-all-direct"}
@@ -2026,7 +2026,7 @@ async fn carrier_probe_checks_http_hostname_before_connecting() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let local = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
     let config = json!([
-        {"client_group":"outbound","type":"selector","default":"http","client_proxies":[
+        {"client_group":"outbound","type":"selector","default":"http","client_chains":[
             {"name":"http","address":local.to_string(),"protocol":{"type":"http","resolve_hostname":true}},
             {"name":"xhttp","address":local.to_string(),"protocol":{"type":"xhttp","protocol":{"type":"socks"}}}
         ]}

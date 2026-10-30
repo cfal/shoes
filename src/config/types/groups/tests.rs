@@ -53,7 +53,7 @@ fn test_client_config_group() {
         group_type: Default::default(),
         default: None,
         client_group: "test-client-group".to_string(),
-        client_proxies: OneOrSome::Some(vec![
+        client_chains: OneOrSome::Some(vec![
             ConfigSelection::Config(create_test_client_config()),
             ConfigSelection::Config(ClientConfig {
                 name: None,
@@ -81,7 +81,7 @@ fn test_client_config_group() {
         panic!("Expected client config group");
     };
     assert_eq!(group.client_group, "test-client-group");
-    match &group.client_proxies {
+    match &group.client_chains {
         OneOrSome::Some(vec) => assert_eq!(vec.len(), 2),
         OneOrSome::One(_) => panic!("Expected Some(vec), got One"),
     }
@@ -91,13 +91,13 @@ fn test_client_config_group() {
 fn test_client_config_group_with_group_refs() {
     let yaml = r#"
 client_group: all-proxies
-client_proxies:
+client_chains:
   - us-proxies
   - eu-proxies
 "#;
     let group: ClientConfigGroup = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(group.client_group, "all-proxies");
-    let proxies: Vec<_> = group.client_proxies.into_vec();
+    let proxies: Vec<_> = group.client_chains.into_vec();
     assert_eq!(proxies.len(), 2);
     assert!(matches!(&proxies[0], ConfigSelection::GroupName(n) if n == "us-proxies"));
     assert!(matches!(&proxies[1], ConfigSelection::GroupName(n) if n == "eu-proxies"));
@@ -107,14 +107,14 @@ client_proxies:
 fn test_client_config_group_mixed() {
     let yaml = r#"
 client_group: mixed-group
-client_proxies:
+client_chains:
   - other-group
   - address: "127.0.0.1:1080"
     protocol:
       type: direct
 "#;
     let group: ClientConfigGroup = serde_yaml::from_str(yaml).unwrap();
-    let proxies: Vec<_> = group.client_proxies.into_vec();
+    let proxies: Vec<_> = group.client_chains.into_vec();
     assert_eq!(proxies.len(), 2);
     assert!(matches!(&proxies[0], ConfigSelection::GroupName(_)));
     assert!(matches!(&proxies[1], ConfigSelection::Config(_)));
@@ -412,7 +412,7 @@ fn test_server_config_with_addresses_alias() {
 fn test_rejects_unknown_field_in_client_config_group() {
     let yaml = r#"
 - client_group: my-proxies
-  client_proxies:
+  client_chains:
     - address: "127.0.0.1:9090"
       protocol:
         type: socks

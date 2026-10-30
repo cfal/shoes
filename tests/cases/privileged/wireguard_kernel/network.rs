@@ -121,7 +121,7 @@ fn native_ipv6_outer_transport_interoperates_with_kernel_in_both_roles() -> io::
                 if shoes_server {
                     endpoint["address"] = json!(format!("[::1]:{port}"));
                 } else {
-                    endpoint["client_proxies"][0]["address"] =
+                    endpoint["client_chains"][0]["address"] =
                         json!(format!("[::1]:{}", kernel.port()?));
                 }
                 let mut ports = PortHelper::new();

@@ -436,7 +436,7 @@ mod tests {
 - client_group: automatic
   type: url-test
   url: http://probe.invalid/
-  client_proxies: [direct]
+  client_chains: [direct]
 "#;
         let (_shutdown, shutdown) = oneshot::channel();
         let error = start_from_config(config, shutdown).await.unwrap_err();

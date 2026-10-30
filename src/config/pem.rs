@@ -275,7 +275,7 @@ fn gather_pem_file_paths_from_client_config_group(
     client_group_config: &mut ClientConfigGroup,
     visitor: &mut PemVisitor<'_>,
 ) {
-    for selection in client_group_config.client_proxies.iter_mut() {
+    for selection in client_group_config.client_chains.iter_mut() {
         if let ConfigSelection::Config(client_config) = selection {
             gather_pem_file_paths_from_client_config(client_config, visitor);
         }
@@ -662,7 +662,7 @@ mod tests {
             serde_yaml::to_value(json!([
                 {"pem": "first", "path": path},
                 {"pem": "second", "path": path},
-                {"client_group": "outbound", "client_proxy": {
+                {"client_group": "outbound", "client_chains": {
                     "address": "127.0.0.1:443", "protocol": {
                         "type": "tls", "cert": path, "key": path, "protocol": {"type": "socks"}
                     }
@@ -684,7 +684,7 @@ mod tests {
         let Config::ClientConfigGroup(group) = &configs[2] else {
             panic!()
         };
-        let ConfigSelection::Config(client) = group.client_proxies.iter().next().unwrap() else {
+        let ConfigSelection::Config(client) = group.client_chains.iter().next().unwrap() else {
             panic!()
         };
         let ClientProxyConfig::Tls(tls) = &client.protocol else {
@@ -784,7 +784,7 @@ mod tests {
                     "override_rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": [client("override")]}]
                 }}},
                 "rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": [client("rule")]}]},
-            {"client_group": "outbound", "client_proxy": {
+            {"client_group": "outbound", "client_chains": {
                 "address": "127.0.0.1:443", "transport": "quic",
                 "quic_settings": {"cert": "client-quic.crt", "key": "client-quic.key"},
                 "protocol": {"type": "tls", "cert": "live.crt", "key": "outbound.key", "protocol": {"type": "socks"}}

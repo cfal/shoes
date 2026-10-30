@@ -24,7 +24,7 @@ pub struct ClientConfigGroup {
     pub group_type: GroupType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
-    pub client_proxies: OneOrSome<ConfigSelection<ClientConfig>>,
+    pub client_chains: OneOrSome<ConfigSelection<ClientConfig>>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -52,8 +52,7 @@ struct RawClientGroup {
     #[serde(rename = "type", default = "default_group_type")]
     kind: String,
     default: Option<String>,
-    #[serde(alias = "client_proxy")]
-    client_proxies: OneOrSome<ConfigSelection<ClientConfig>>,
+    client_chains: OneOrSome<ConfigSelection<ClientConfig>>,
     url: Option<String>,
     interval: Option<u64>,
     timeout: Option<u64>,
@@ -102,7 +101,7 @@ impl TryFrom<RawClientGroup> for ClientConfigGroup {
             client_group: raw.client_group,
             group_type,
             default: raw.default,
-            client_proxies: raw.client_proxies,
+            client_chains: raw.client_chains,
         })
     }
 }
@@ -196,7 +195,7 @@ mod group_type_tests {
 
     #[test]
     fn url_test_defaults_and_serialization_use_only_type() {
-        let raw = json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":["direct"]});
+        let raw = json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":["direct"]});
         let group: ClientConfigGroup = serde_json::from_value(raw).unwrap();
         assert_eq!(
             group.group_type,
@@ -218,16 +217,24 @@ mod group_type_tests {
             group.group_type
         );
         let group: ClientConfigGroup =
-            serde_json::from_value(json!({"client_group":"rr", "client_proxies":["direct"]}))
+            serde_json::from_value(json!({"client_group":"rr", "client_chains":["direct"]}))
                 .unwrap();
         assert_eq!(group.group_type, GroupType::RoundRobin);
     }
 
     #[test]
-    fn client_proxy_alias_preserves_canonical_serialization() {
+    fn client_chains_rejects_legacy_group_fields() {
+        for field in ["client_proxy", "client_proxies"] {
+            assert!(
+                serde_json::from_value::<ClientConfigGroup>(json!({
+                    "client_group": "rr", field: ["direct"]
+                }))
+                .is_err()
+            );
+        }
         let group: ClientConfigGroup = serde_json::from_value(json!({
             "client_group": "rr",
-            "client_proxy": ["direct"]
+            "client_chains": ["direct"]
         }))
         .unwrap();
         assert_eq!(group.group_type, GroupType::RoundRobin);
@@ -237,14 +244,14 @@ mod group_type_tests {
             json!({
                 "client_group": "rr",
                 "type": "round-robin",
-                "client_proxies": ["direct"]
+                "client_chains": ["direct"]
             })
         );
     }
 
     #[test]
     fn url_test_rejects_removed_unknown_and_incompatible_group_settings() {
-        let base = json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":["direct"]});
+        let base = json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":["direct"]});
         for (field, value) in [
             ("strategy", json!("url-test")),
             ("type", json!("urltest")),
@@ -286,7 +293,7 @@ mod group_type_tests {
                 ("strategy", json!(kind)),
             ] {
                 let mut raw =
-                    json!({"client_group":"test", "type":kind, "client_proxies":["direct"]});
+                    json!({"client_group":"test", "type":kind, "client_chains":["direct"]});
                 raw[field] = value;
                 assert!(
                     serde_json::from_value::<ClientConfigGroup>(raw.clone()).is_err(),
@@ -296,7 +303,7 @@ mod group_type_tests {
         }
         for members in [json!([]), json!(["direct", "direct"])] {
             let mut raw = base.clone();
-            raw["client_proxies"] = members;
+            raw["client_chains"] = members;
             let configs = serde_json::from_value(json!([raw]));
             assert!(
                 configs.is_err() || crate::config::create_server_configs(configs.unwrap()).is_err()

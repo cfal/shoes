@@ -157,7 +157,7 @@ pub(super) fn create_server_configs_with_memory(
             }
             Config::ClientConfigGroup(group) => {
                 if raw_client_groups
-                    .insert(group.client_group.clone(), group.client_proxies)
+                    .insert(group.client_group.clone(), group.client_chains)
                     .is_some()
                 {
                     return Err(std::io::Error::new(

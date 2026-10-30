@@ -61,7 +61,7 @@ async fn test_dns_through_vless_tcp() -> Result<(), Box<dyn std::error::Error>> 
 
 # Client proxy group for DNS routing
 - client_group: vless-dns-tunnel
-  client_proxies:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls
@@ -181,7 +181,7 @@ async fn test_dns_through_vless_dot() -> Result<(), Box<dyn std::error::Error>> 
 
 # Client proxy group for DNS routing
 - client_group: vless-dns-tunnel
-  client_proxies:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls
@@ -448,7 +448,7 @@ async fn test_dns_through_vless_doh() -> Result<(), Box<dyn std::error::Error>> 
 
 # Client proxy group for DNS routing
 - client_group: vless-dns-tunnel
-  client_proxies:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls
@@ -560,7 +560,7 @@ async fn test_dns_through_vless_multiple_servers() -> Result<(), Box<dyn std::er
 
 # Client proxy group
 - client_group: vless-dns-tunnel
-  client_proxies:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls
@@ -1162,14 +1162,14 @@ async fn test_dns_two_hop_chain() -> Result<(), Box<dyn std::error::Error>> {
 
 # Client group for first hop (SOCKS5)
 - client_group: socks-hop
-  client_proxies:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: socks
 
 # Client group for second hop (VLESS+TLS)
 - client_group: vless-hop
-  client_proxies:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls

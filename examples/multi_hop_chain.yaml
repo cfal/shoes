@@ -9,7 +9,7 @@
 
 # Define reusable proxy groups (each group round-robins between its members)
 - client_group: us-proxies
-  client_proxies:
+  client_chains:
     - address: "us1.example.com:1080"
       protocol:
         type: socks
@@ -18,13 +18,13 @@
         type: socks
 
 - client_group: eu-proxies
-  client_proxies:
+  client_chains:
     - address: "eu1.example.com:1080"
       protocol:
         type: socks
 
 - client_group: exit-proxy
-  client_proxies:
+  client_chains:
     - address: "exit.example.com:443"
       protocol:
         type: tls

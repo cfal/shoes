@@ -253,10 +253,10 @@ impl Catalog {
         let mut automatic = super::url_test::AutomaticGroups::default();
         for config in configs.iter() {
             if let Config::ClientConfigGroup(group) = config {
-                let members: Vec<_> = group.client_proxies.iter().map(member_name).collect();
+                let members: Vec<_> = group.client_chains.iter().map(member_name).collect();
                 match &group.group_type {
                     GroupType::Selector => {
-                        let has_unnamed_member = group.client_proxies.iter().any(|member| {
+                        let has_unnamed_member = group.client_chains.iter().any(|member| {
                             matches!(member, ConfigSelection::Config(client) if client.name.is_none())
                         });
                         if has_unnamed_member {
@@ -398,7 +398,7 @@ mod tests {
                     client["protocol"]["key"] = json!("client-key");
                 }
                 let definition = if nested {
-                    json!({"client_group":"unused", "client_proxies":{
+                    json!({"client_group":"unused", "client_chains":{
                         "name":"unused-wireguard", "address":"192.0.2.1:51820",
                         "protocol":{"type":"wireguard",
                             "private_key":base64::engine::general_purpose::STANDARD.encode([42;32]),
@@ -443,7 +443,7 @@ mod tests {
 
     const CONFIG: &str = "
 - client_group: child
-  client_proxies:
+  client_chains:
     - name: east
       address: east.example:1080
       protocol: {type: socks}
@@ -453,7 +453,7 @@ mod tests {
 - client_group: outbound
   type: selector
   default: child
-  client_proxies: [child, direct]
+  client_chains: [child, direct]
 - address: 127.0.0.1:1080
   name: inbound
   protocol: {type: socks}

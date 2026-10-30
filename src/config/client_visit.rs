@@ -96,7 +96,7 @@ pub(crate) fn visit_configs(configs: &mut [Config], visitor: &mut Visitor<'_>) -
     for config in configs.iter_mut() {
         match config {
             Config::ClientConfigGroup(group) => {
-                for member in group.client_proxies.iter_mut() {
+                for member in group.client_chains.iter_mut() {
                     visit_selection(member, visitor)?;
                 }
             }

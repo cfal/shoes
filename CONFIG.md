@@ -73,7 +73,7 @@ A client has one remote peer. Its ordinary `address` identifies that peer;
 
 ```yaml
 - client_group: vpn
-  client_proxies:
+  client_chains:
     - address: "vpn.example:51820"
       protocol:
         type: wireguard
@@ -358,7 +358,7 @@ Opt into manual selection explicitly:
 - client_group: outbound
   type: selector
   default: east
-  client_proxies:
+  client_chains:
     - name: east
       address: "east.example.com:1080"
       protocol: {type: socks}
@@ -388,7 +388,7 @@ Automatic selection does not require a controller listener or a cache file:
   timeout: 5000       # milliseconds, 1..60000, no longer than interval
   tolerance: 50       # milliseconds, 0..65535
   lazy: true
-  client_proxies:
+  client_chains:
     - name: east
       address: "east.example.com:1080"
       protocol: {type: socks}
@@ -2119,7 +2119,7 @@ rules:
 ### Client Proxy Group
 ```yaml
 - client_group: my-upstream
-  client_proxies:              # Define proxies in this group
+  client_chains:              # Define proxies in this group
     - address: "proxy1.example.com:1080"
       protocol:
         type: socks

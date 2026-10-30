@@ -421,7 +421,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let cache = directory.path().join("cache.db");
             let mut configs = serde_json::json!([
-                {"client_group":"outbound", "type":if mode == "selector" { "selector" } else { "round-robin" }, "client_proxies":[
+                {"client_group":"outbound", "type":if mode == "selector" { "selector" } else { "round-robin" }, "client_chains":[
                     {"name":"proxy", "address":"proxy.invalid:8080", "protocol":{"type":"http"}}
                 ]},
                 {"name":"entry", "address":"127.0.0.1:0", "protocol":{"type":"socks"}, "rules":[

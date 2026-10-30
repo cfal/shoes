@@ -31,8 +31,8 @@ async fn named_outer_chains_carry_wireguard_over_each_supported_stream_protocol(
                 }}}), json!({"type": "tls", "sni_hostname": "localhost", "verify": false, "protocol": protocol}))
             } else { (protocol.clone(), protocol) };
             let mut client = config::client(port);
-            client["client_proxies"][0]["address"] = json!(format!("192.0.2.200:{port}"));
-            client["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("outer");
+            client["client_chains"][0]["address"] = json!(format!("192.0.2.200:{port}"));
+            client["client_chains"][0]["protocol"]["peer_client_chain"] = json!("outer");
             let server = json!([
                 config::server(port),
                 {"address": format!("0.0.0.0:{outer}"), "protocol": server_protocol,
@@ -41,7 +41,7 @@ async fn named_outer_chains_carry_wireguard_over_each_supported_stream_protocol(
             drop(reservation);
             let _server = start(&server)?;
             let _client = start(&json!([
-                {"client_group": "outer", "client_proxies": [{"address": format!("127.0.0.1:{outer}"), "protocol": client_protocol}]},
+                {"client_group": "outer", "client_chains": [{"address": format!("127.0.0.1:{outer}"), "protocol": client_protocol}]},
                 client, config::socks(entry),
             ]))?;
             ports.wait_for_all_ports().await?;
@@ -65,9 +65,9 @@ async fn nested_endpoints_start_in_dependency_order_in_a_real_process() -> io::R
         let mut carrier = config::client(carrier_port);
         carrier["client_group"] = json!("carrier");
         let mut inner = config::client(inner_port);
-        inner["client_proxies"][0]["protocol"]["mtu"] = json!(1280);
-        inner["client_proxies"][0]["address"] = json!(format!("198.18.0.1:{inner_port}"));
-        inner["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("carrier");
+        inner["client_chains"][0]["protocol"]["mtu"] = json!(1280);
+        inner["client_chains"][0]["address"] = json!(format!("198.18.0.1:{inner_port}"));
+        inner["client_chains"][0]["protocol"]["peer_client_chain"] = json!("carrier");
         drop((carrier_socket, inner_socket));
         let _carrier = start(&json!([config::server(carrier_port)]))?;
         let _inner = start(&json!([config::server(inner_port)]))?;
@@ -103,9 +103,9 @@ async fn outer_pool_reconnects_through_an_alternate_member_without_restarting_fl
             "rules": [{"masks": "192.0.2.200/32", "action": "allow", "override_address": "127.0.0.1:0"}],
         }]);
         let mut client = config::client(port);
-        client["client_proxies"][0]["address"] = json!(format!("192.0.2.200:{port}"));
-        client["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{"pool": ["primary", "backup"]}]);
-        let group = |name, port| json!({"client_group": name, "client_proxies": [{
+        client["client_chains"][0]["address"] = json!(format!("192.0.2.200:{port}"));
+        client["client_chains"][0]["protocol"]["peer_client_chain"] = json!([{"pool": ["primary", "backup"]}]);
+        let group = |name, port| json!({"client_group": name, "client_chains": [{
             "address": format!("127.0.0.1:{port}"), "protocol": config::vless_protocol(),
         }]});
         drop(reservation);

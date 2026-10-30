@@ -164,7 +164,7 @@ fn tcp_settings_reject_unknown_fields_for_servers_and_clients() {
   protocol: {type: socks}
   tcp_settings: {unsupported_policy: true}"#,
         r#"- client_group: proxy
-  client_proxies:
+  client_chains:
     address: '127.0.0.1:1080'
     protocol: {type: socks}
     tcp_settings: {unsupported_policy: true}"#,
