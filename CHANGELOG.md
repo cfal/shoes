@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Raised the default `global_limits.quic_socket_buffer` request to 8 MiB and extended the setting from QUIC listeners to outbound QUIC proxies and DNS-over-HTTP/3. Buffer tuning remains best-effort; unsatisfied or unverifiable requests now warn at most once per receive/send direction per process, including SOCKS5 UDP's existing 2 MiB request.
+- Added Linux ARMv7 hard-float GNU and static musl release builds, with QEMU smoke checks for the packaged binaries.
+- Hardened binary releases with pinned build tooling and cross images, native macOS smoke checks, tag/version validation, SHA-256 checksums, and GitHub build-provenance attestations. macOS binaries are not yet Developer ID signed or notarized.
+
 ## v0.3.6
 
 - Fixed REALITY connection failures with camouflage targets that use a minimal 28-byte EncryptedExtensions record, including VLESS with Vision. The rustls fork now omits the SNI acknowledgement only for REALITY; ordinary TLS and strict target-record capacity checks are unchanged.

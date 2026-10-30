@@ -207,8 +207,11 @@ async fn quic_binder_keeps_candidate_reservation_without_publishing_limits() {
         resolver,
         TEST_CONNECT_TIMEOUT,
     )
-    .with_quic_memory(1 << 20);
+    .with_quic_memory(1 << 20)
+    .with_quic_socket_buffer(65536);
     assert_eq!(crate::resources::limits().quic_dns_memory_bytes, 16 << 20);
+    assert_eq!(crate::resources::limits().quic_socket_buffer, 8 << 20);
+    assert_eq!(provider.quic_binder.socket_buffer, 65536);
     let binder = provider.quic_binder().unwrap();
     let bind = || {
         binder.bind_quic(
@@ -264,6 +267,7 @@ async fn quic_binder_reserves_shared_memory_until_last_socket_drop() {
     let binder = ProxyQuicBinder {
         chain_group: Arc::new(build_direct_chain_group(Arc::new(NativeResolver::new()))),
         memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
+        socket_buffer: crate::resources::limits().quic_socket_buffer,
     };
     let local_addr = "0.0.0.0:0".parse().unwrap();
     let server_addr = "127.0.0.1:443".parse().unwrap();

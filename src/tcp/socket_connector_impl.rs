@@ -274,6 +274,10 @@ impl SocketConnectorImpl {
                         new_udp_socket(target_address.address().is_ipv6(), bind_interface.clone())?
                     };
                     let udp_socket = udp_socket.into_std()?;
+                    crate::socket_util::set_udp_socket_buffers(
+                        socket2::SockRef::from(&udp_socket),
+                        limits.quic_socket_buffer,
+                    );
 
                     let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes)?;
                     endpoint.set_default_client_config(quinn_client_config.clone());

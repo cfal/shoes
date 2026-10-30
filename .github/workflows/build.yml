@@ -8,210 +8,216 @@ on:
     branches: [ master ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: binaries-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CROSS_VERSION: 0.2.5
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
+  version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check manifest, lockfile, and tag
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(Path("Cargo.toml").read_text())["package"]
+          packages = tomllib.loads(Path("Cargo.lock").read_text())["package"]
+          locked = [p["version"] for p in packages if p["name"] == manifest["name"] and "source" not in p]
+          assert locked == [manifest["version"]], "Manifest and lockfile versions differ"
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              assert os.environ["GITHUB_REF_NAME"] == f'v{manifest["version"]}', "Tag does not match package version"
+          PY
+
+      - name: Test release smoke checks
+        run: python3 scripts/test-smoke-release.py
+
   build:
     name: Build ${{ matrix.target }}
+    needs: version
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux builds (using cross for cross-compilation)
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             use_cross: false
-            binary_name: shoes
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             use_cross: true
-            binary_name: shoes
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             use_cross: true
-            binary_name: shoes
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             use_cross: true
-            binary_name: shoes
-
-          # macOS builds (native compilation)
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-24.04
+            use_cross: true
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-24.04
+            use_cross: true
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
             use_cross: false
-            binary_name: shoes
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
             use_cross: false
-            binary_name: shoes
-
-          # Windows builds
-          # TODO: enable when working
-          # - target: x86_64-pc-windows-msvc
-          #   os: windows-latest
-          #   use_cross: false
-          #   binary_name: shoes.exe
-          # - target: aarch64-pc-windows-msvc
-          #   os: windows-latest
-          #   use_cross: false
-          #   binary_name: shoes.exe
+    env:
+      TARGET: ${{ matrix.target }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
 
-      - name: Install system dependencies
-        if: matrix.use_cross == true
+      - name: Install pinned cross binary
+        if: matrix.use_cross
         run: |
-          sudo apt-get update
-          case "${{ matrix.target }}" in
-            "aarch64-unknown-linux-gnu")
-              sudo apt-get install -y gcc-aarch64-linux-gnu
-              ;;
-            "aarch64-unknown-linux-musl")
-              sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
-              ;;
-            "x86_64-unknown-linux-musl")
-              sudo apt-get install -y musl-tools
-              ;;
-          esac
-
-      - name: Install cross-compilation tool
-        if: matrix.use_cross == true
-        run: |
-          cargo install --locked cross@0.2.5
+          curl --fail --location --retry 3 \
+            "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz" \
+            --output "$RUNNER_TEMP/cross.tar.gz"
+          echo "642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad  $RUNNER_TEMP/cross.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/cross.tar.gz" -C "$HOME/.cargo/bin" cross
 
       - name: Setup cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ matrix.target }}
+          key: release-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      - name: Build binary (using cross)
-        if: matrix.use_cross == true
-        run: cross build --locked --release --target ${{ matrix.target }}
+      - name: Build binary (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target "$TARGET" --bin shoes
 
       - name: Build binary (native)
-        if: matrix.use_cross == false
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked --target "$TARGET" --bin shoes
 
-      - name: Verify binary exists
+      - name: Verify lockfile unchanged
+        run: git diff --exit-code -- Cargo.lock
+
+      # Cargo's release profile strips with the target toolchain before packaging.
+      - name: Package binary and notices
         run: |
-          if [ -f "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" ]; then
-            echo "Binary found: target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
-            ls -la "target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
-            
-            # Show file type and architecture
-            file "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" || true
-            
-            # Test the binary can be executed (for native builds only)
-            if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
-              echo "Testing binary execution..."
-              "./target/${{ matrix.target }}/release/${{ matrix.binary_name }}" --help || echo "Binary test failed, but file exists"
-            fi
-          else
-            echo "Binary not found!"
-            echo "Contents of release directory:"
-            ls -la "target/${{ matrix.target }}/release/" || echo "Release directory doesn't exist"
-            exit 1
-          fi
+          test -x "target/$TARGET/release/shoes"
+          file "target/$TARGET/release/shoes"
+          case "$TARGET" in
+            *musl*) file "target/$TARGET/release/shoes" | grep -E 'static.*linked' ;;
+          esac
+          mkdir -p package artifacts smoke
+          cp "target/$TARGET/release/shoes" THIRD_PARTY_NOTICES.md package/
+          cp -R licenses package/
+          tar -czf "artifacts/shoes-$TARGET.tar.gz" -C package shoes THIRD_PARTY_NOTICES.md licenses
+          python3 scripts/check-release-notices.py "artifacts/shoes-$TARGET.tar.gz"
+          tar -xzf "artifacts/shoes-$TARGET.tar.gz" -C smoke
 
-      - name: Prepare binary (Unix)
-        if: "!contains(matrix.os, 'windows')"
+      - name: Smoke-test packaged binary (cross/QEMU)
+        if: matrix.use_cross
+        timeout-minutes: 5
         run: |
-          mkdir -p artifacts
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "artifacts/${{ matrix.binary_name }}"
-          
-          # Strip the binary to reduce size
-          if command -v strip &> /dev/null; then
-            strip "artifacts/${{ matrix.binary_name }}" || echo "Strip failed, continuing..."
-          fi
-          
-          # Create tarball
-          cp THIRD_PARTY_NOTICES.md artifacts/
-          cp -R licenses artifacts/
-          cd artifacts
-          tar -czf ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz "${{ matrix.binary_name }}" THIRD_PARTY_NOTICES.md licenses
-          python3 ../scripts/check-release-notices.py ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz
-          
-          # Debug: show what files were created
-          echo "Contents of artifacts directory:"
-          ls -la
-          
-          # Verify the tarball was created
-          if [ -f "${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz" ]; then
-            echo "Tarball created successfully: ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz"
-          else
-            echo "ERROR: Tarball was not created!"
-            exit 1
-          fi
-          
-          rm "${{ matrix.binary_name }}"
+          image="$(python3 -c 'import sys, tomllib; print(tomllib.load(open("Cross.toml", "rb"))["target"][sys.argv[1]]["image"])' "$TARGET")"
+          runner=/linux-runner
+          case "$TARGET" in
+            *musl*) runner=/qemu-runner ;;
+          esac
+          python3 scripts/smoke-release.py docker run --rm \
+            --volume "$PWD:/work:ro" --workdir /work \
+            "$image" "$runner" "${TARGET%%-*}" ./smoke/shoes
 
-      - name: Prepare binary (Windows)
-        if: contains(matrix.os, 'windows')
-        shell: bash
-        run: |
-          mkdir -p artifacts
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "artifacts/${{ matrix.binary_name }}"
-          cd artifacts
-          7z a ${{ github.event.repository.name }}-${{ matrix.target }}.zip "${{ matrix.binary_name }}"
+      - name: Smoke-test packaged binary (native)
+        if: ${{ !matrix.use_cross }}
+        timeout-minutes: 5
+        run: python3 scripts/smoke-release.py ./smoke/shoes
 
-      - name: Verify artifacts before upload
-        run: |
-          echo "Checking for artifacts to upload..."
-          ls -la artifacts/ || echo "artifacts directory not found"
-          
-          # Check for expected file patterns
-          if ls artifacts/*.tar.gz 1> /dev/null 2>&1; then
-            echo "Found .tar.gz files:"
-            ls -la artifacts/*.tar.gz
-          fi
-          
-          if ls artifacts/*.zip 1> /dev/null 2>&1; then
-            echo "Found .zip files:"
-            ls -la artifacts/*.zip
-          fi
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+      - name: Upload verified archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: ${{ github.event.repository.name }}-${{ matrix.target }}
-          path: |
-            artifacts/*.tar.gz
-            artifacts/*.zip
+          name: shoes-${{ matrix.target }}
+          path: artifacts/shoes-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
   release:
-    name: Create Release
+    name: Create Draft Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: artifacts
+          persist-credentials: false
 
-      - name: List artifacts
+      - name: Verify tag still targets this commit and release is unpublished
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Downloaded artifacts:"
-          find artifacts -type f -name "*.tar.gz" -o -name "*.zip" | sort
+          git fetch --no-tags origin "refs/tags/$GITHUB_REF_NAME"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | {tag_name, draft}' > "$RUNNER_TEMP/releases.jsonl"
+          jq --slurp --exit-status --arg tag "$GITHUB_REF_NAME" \
+            '[.[] | select(.tag_name == $tag)] | all(.draft)' "$RUNNER_TEMP/releases.jsonl"
 
-      - name: Flatten artifacts
+      - name: Download verified archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: shoes-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Verify notices and checksum final archives
         run: |
-          mkdir -p release-artifacts
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-artifacts/ \;
-          ls -la release-artifacts/
+          archives=(release-artifacts/shoes-*.tar.gz)
+          test "${#archives[@]}" -eq 8
+          for archive in "${archives[@]}"; do
+            python3 scripts/check-release-notices.py "$archive"
+          done
+          cd release-artifacts
+          sha256sum shoes-*.tar.gz > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v3
+      - name: Attest final release artifacts
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: release-artifacts/*
+
+      - name: Create Draft Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: release-artifacts/*
+          fail_on_unmatched_files: true
           draft: true
           generate_release_notes: true
