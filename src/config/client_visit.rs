@@ -17,7 +17,7 @@ pub(crate) fn sorted_targets<T>(targets: &mut HashMap<String, T>) -> Vec<(&Strin
     targets
 }
 
-pub(crate) fn visit_chain(chain: &mut ClientChain, visitor: &mut Visitor<'_>) -> io::Result<()> {
+fn visit_chain(chain: &mut ClientChain, visitor: &mut Visitor<'_>) -> io::Result<()> {
     for hop in chain.hops.iter_mut() {
         visit_hop(hop, visitor)?;
     }

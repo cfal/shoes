@@ -1,12 +1,13 @@
 use super::*;
-use crate::config::{ClientChainHop, ClientConfig, ConfigSelection, GlobalLimits, GroupType};
+use crate::config::{ClientChainHop, ConfigSelection, GlobalLimits, GroupType};
 use crate::control::selection::{Choices, SelectionView};
 use crate::option_util::OneOrSome;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
 use std::io;
 
 struct Leaf {
-    config: ClientConfig,
+    origin: Option<MemberOrigin>,
+    direct: bool,
     initial: Option<Arc<InitialHopEntry>>,
     proxy: Option<Arc<dyn ProxyConnector>>,
     udp: bool,
@@ -189,14 +190,13 @@ fn node(
         ClientChainHop::Single(ConfigSelection::GroupName(name)) => Err(
             crate::config::composition::invalid(format!("unresolved client group: {name}")),
         ),
-        ClientChainHop::Single(ConfigSelection::Config(config)) => {
+        ClientChainHop::Single(ConfigSelection::Config(mut config)) => {
+            let origin = config.control.clone();
+            let direct = config.protocol.is_direct();
             let (initial, proxy, udp) = if first {
-                let mut initial_config = config.clone();
-                initial_config.control = None;
+                config.control = None;
                 let chain = crate::tcp::chain_builder::build_client_proxy_chain_with_limits(
-                    OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                        initial_config,
-                    ))),
+                    OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(config))),
                     resolver.clone(),
                     limits,
                 )?;
@@ -205,14 +205,15 @@ fn node(
                 (Some(entry), None, udp)
             } else {
                 let proxy: Arc<dyn ProxyConnector> = Arc::new(
-                    ProxyConnectorImpl::from_config(config.clone(), resolver.clone())?
+                    ProxyConnectorImpl::from_config(config, resolver.clone())?
                         .ok_or_else(unsupported)?,
                 );
                 let udp = proxy.supports_udp_over_tcp();
                 (None, Some(proxy), udp)
             };
             Ok(Node::Client(Arc::new(Leaf {
-                config,
+                origin,
+                direct,
                 initial,
                 proxy,
                 udp,
@@ -263,7 +264,7 @@ fn node(
 fn pinned(leaves: &[Arc<Leaf>]) -> ClientProxyChain {
     let origins = leaves
         .iter()
-        .map(|leaf| vec![leaf.config.control.clone()])
+        .map(|leaf| vec![leaf.origin.clone()])
         .collect();
     let udp = leaves.last().unwrap().udp;
     let subsequent_hops: Vec<_> = leaves
@@ -274,12 +275,9 @@ fn pinned(leaves: &[Arc<Leaf>]) -> ClientProxyChain {
     ClientProxyChain {
         composition: None,
         origins,
-        selection: leaves.iter().find_map(|leaf| {
-            leaf.config
-                .control
-                .as_ref()
-                .map(|origin| origin.selection.clone())
-        }),
+        selection: leaves
+            .iter()
+            .find_map(|leaf| leaf.origin.as_ref().map(|origin| origin.selection.clone())),
         selector_hops: vec![false; leaves.len()],
         initial_hop: vec![leaves[0].initial.as_ref().unwrap().clone()],
         initial_hop_next_index: AtomicU32::new(0),
@@ -318,14 +316,14 @@ impl Node {
     }
     fn direct_only(&self) -> bool {
         match self {
-            Self::Client(leaf) => leaf.config.protocol.is_direct(),
+            Self::Client(leaf) => leaf.direct,
             Self::Sequence(_) => false,
             Self::Choice { members, .. } => members.iter().all(Self::direct_only),
         }
     }
     fn may_connect_directly(&self) -> bool {
         match self {
-            Self::Client(leaf) => leaf.config.protocol.is_direct(),
+            Self::Client(leaf) => leaf.direct,
             Self::Sequence(_) => false,
             Self::Choice { members, .. } => members.iter().any(Self::may_connect_directly),
         }
@@ -523,9 +521,17 @@ mod tests {
         let two = tree.select(true).unwrap();
         assert_eq!(two.num_hops(), 2);
         assert!(two.supports_udp());
+        assert_eq!(two.origin(0, 0).unwrap().name.as_ref(), "entrance");
+        assert_eq!(two.origin(1, 0).unwrap().name.as_ref(), "exit-leaf");
+        for hop in 0..2 {
+            let origin = two.origin(hop, 0).unwrap();
+            assert_eq!(origin.path[0], ("out".into(), "via-exit".into()));
+            assert!(Arc::ptr_eq(&origin.selection, &catalog.selection));
+        }
         owner.select("out", "DIRECT").unwrap();
         let direct = tree.select(true).unwrap();
         assert!(direct.is_direct_only());
+        assert_eq!(direct.origin(0, 0).unwrap().name.as_ref(), "DIRECT");
         assert_eq!(two.num_hops(), 2);
         assert!(!single.is_direct_only());
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());

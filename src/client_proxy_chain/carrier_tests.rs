@@ -51,10 +51,11 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
             crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver)
                 .unwrap();
         let chain = &group.chains[0];
-        chain.test_record_automatic("http", "http://inner.invalid/", Some(10));
-        chain.test_record_automatic("udp", "http://inner.invalid/", Some(100));
-        chain.test_record_automatic("manual", "http://outer.invalid/", Some(10));
-        chain.test_record_automatic("DIRECT", "http://outer.invalid/", Some(200));
+        let auto = &catalog.selection.automatic;
+        auto.record("http", "http://inner.invalid/", Some(10));
+        auto.record("udp", "http://inner.invalid/", Some(100));
+        auto.record("manual", "http://outer.invalid/", Some(10));
+        auto.record("DIRECT", "http://outer.invalid/", Some(200));
         if route == "outer" {
             assert_eq!(chain.select_indices(false).unwrap(), [0]);
             assert_eq!(chain.select_indices(true).unwrap(), [1]);

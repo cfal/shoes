@@ -544,7 +544,7 @@ pub(crate) async fn run_automatic(
         .filter_map(|name| generation.catalog.selection.automatic.0.get(name))
         .collect();
     let mut rounds = futures::stream::FuturesUnordered::new();
-    let mut checking = std::collections::HashSet::new();
+    let mut checking = vec![false; groups.len()];
     loop {
         let Some(runtime) = runtime.upgrade() else {
             return;
@@ -554,7 +554,7 @@ pub(crate) async fn run_automatic(
             _ = runtime.shutdown.cancelled() => return,
             _ = epoch.cancelled() => return,
             Some(index) = rounds.next(), if !rounds.is_empty() => {
-                checking.remove(&index);
+                checking[index] = false;
                 continue;
             }
             _ = ticker.tick() => {}
@@ -566,13 +566,13 @@ pub(crate) async fn run_automatic(
         let mut due: Vec<_> = groups
             .iter()
             .enumerate()
-            .filter(|(index, _)| !checking.contains(index))
+            .filter(|(index, _)| !checking[*index])
             .filter_map(|(index, group)| group.due_members(now).map(|members| (index, members)))
             .collect();
         // A busy, short-interval group must not reset a waiting group's priority.
         due.sort_by_key(|(index, _)| groups[*index].last_unqueued_admission());
         for (index, members) in due {
-            checking.insert(index);
+            checking[index] = true;
             let runtime = runtime.clone();
             let generation = &generation;
             let epoch = &epoch;

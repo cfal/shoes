@@ -36,11 +36,9 @@ impl SelectionView {
     fn publish_choices(&self, choices: Arc<Choices>) {
         let mut previous = self.choices.write();
         // Preserves the snapshot identity when effective choices have not changed.
-        let choices = if **previous == *choices {
-            previous.clone()
-        } else {
-            choices
-        };
+        if **previous == *choices {
+            return;
+        }
         self.automatic.choices_changed(&previous, &choices);
         *previous = choices;
     }

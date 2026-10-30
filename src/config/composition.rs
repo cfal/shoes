@@ -104,8 +104,8 @@ pub(crate) fn expand(hops: &mut OneOrSome<ClientChainHop>, groups: &Groups) -> i
     validate(hops)
 }
 
-// Returns expanded node count, maximum physical hop count, and concrete path count.
-pub(crate) fn measure(hop: &ClientChainHop, depth: usize) -> io::Result<(usize, usize, usize)> {
+// Returns expanded node count and maximum physical hop count.
+pub(crate) fn measure(hop: &ClientChainHop, depth: usize) -> io::Result<(usize, usize)> {
     if depth > MAX_DEPTH {
         return Err(invalid("client composition exceeds 64 levels"));
     }
@@ -114,7 +114,7 @@ pub(crate) fn measure(hop: &ClientChainHop, depth: usize) -> io::Result<(usize, 
             Err(invalid(format!("unresolved client group: {name}")))
         }
         ClientChainHop::Single(ConfigSelection::Config(client)) => {
-            Ok((client_nodes(client, depth)?, 1, 1))
+            Ok((client_nodes(client, depth)?, 1))
         }
         ClientChainHop::Pool(pool) => {
             if pool.iter().count() == 0 {
@@ -127,7 +127,7 @@ pub(crate) fn measure(hop: &ClientChainHop, depth: usize) -> io::Result<(usize, 
                 };
                 nodes = nodes.saturating_add(client_nodes(client, depth)?);
             }
-            Ok((nodes, 1, pool.iter().count()))
+            Ok((nodes, 1))
         }
         ClientChainHop::Choice(choice) => {
             if choice.members.is_empty() || choice.members.len() != choice.labels.len() {
@@ -135,26 +135,22 @@ pub(crate) fn measure(hop: &ClientChainHop, depth: usize) -> io::Result<(usize, 
             }
             let mut nodes = 1usize;
             let mut longest = 0usize;
-            let mut paths = 0usize;
             for member in &choice.members {
                 if member.hops.iter().count() == 0 {
                     return Err(invalid("chain cannot be empty"));
                 }
                 let mut length = 0usize;
-                let mut product = 1usize;
                 for hop in member.hops.iter() {
-                    let (count, hops, branches) = measure(hop, depth + 1)?;
+                    let (count, hops) = measure(hop, depth + 1)?;
                     nodes = nodes.saturating_add(count);
                     length = length.saturating_add(hops);
-                    product = product.saturating_mul(branches);
                 }
                 longest = longest.max(length);
-                paths = paths.saturating_add(product);
             }
             if nodes > MAX_NODES || longest > MAX_HOPS {
                 return Err(invalid("client composition exceeds 16384 nodes or 64 hops"));
             }
-            Ok((nodes, longest, paths))
+            Ok((nodes, longest))
         }
     }
 }
@@ -215,7 +211,7 @@ pub(crate) fn validate(hops: &OneOrSome<ClientChainHop>) -> io::Result<()> {
     let mut nodes = 0usize;
     let mut longest = 0usize;
     for hop in hops.iter() {
-        let (count, length, _) = measure(hop, 0)?;
+        let (count, length) = measure(hop, 0)?;
         nodes = nodes.saturating_add(count);
         longest = longest.saturating_add(length);
     }
@@ -290,13 +286,28 @@ mod tests {
              "rules":[{"mask":"0.0.0.0/0","action":"allow","client_chain":"out"}]}
         ]);
         let choices = validate(base.clone()).unwrap();
-        let (_, hops, paths) = measure(route(&choices).hops.iter().next().unwrap(), 0).unwrap();
-        assert_eq!((hops, paths), (1, 2));
+        let hop = route(&choices).hops.iter().next().unwrap();
+        let ClientChainHop::Choice(group) = hop else {
+            panic!("group alternatives must remain a choice")
+        };
+        assert_eq!(group.members.len(), 2);
+        assert!(
+            group
+                .members
+                .iter()
+                .all(|member| member.hops.iter().count() == 1)
+        );
+        assert_eq!(measure(hop, 0).unwrap().1, 1);
         let mut sequential = base;
         sequential[2]["client_chains"] = json!([{"chain":["a","b"]}]);
         let sequential = validate(sequential).unwrap();
-        let (_, hops, paths) = measure(route(&sequential).hops.iter().next().unwrap(), 0).unwrap();
-        assert_eq!((hops, paths), (2, 1));
+        let hop = route(&sequential).hops.iter().next().unwrap();
+        let ClientChainHop::Choice(group) = hop else {
+            panic!("multi-hop members must retain their choice boundary")
+        };
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(group.members[0].hops.iter().count(), 2);
+        assert_eq!(measure(hop, 0).unwrap().1, 2);
     }
 
     #[test]
