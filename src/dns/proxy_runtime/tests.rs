@@ -33,11 +33,8 @@ async fn synthetic_intermediate_proxy_is_rejected_before_socks_connect() {
         Default::default(),
     )
     .unwrap();
-    let provider = ProxyRuntimeProvider::with_bootstrap(
-        Arc::new(chains),
-        resolver,
-        Duration::from_secs(1),
-    );
+    let provider =
+        ProxyRuntimeProvider::with_bootstrap(Arc::new(chains), resolver, Duration::from_secs(1));
     for _ in 0..2 {
         let error = provider
             .connect_tcp("127.0.0.1:53".parse().unwrap(), None, None)

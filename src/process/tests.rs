@@ -233,7 +233,11 @@ async fn activation_discards_candidate_identity_events_but_preserves_reload_even
         );
 
         for changed in [&config, &trust] {
-            watches.discovered(std::slice::from_ref(&trust), &[cert.clone(), key.clone()], None);
+            watches.discovered(
+                std::slice::from_ref(&trust),
+                &[cert.clone(), key.clone()],
+                None,
+            );
             let contents = std::fs::read(changed).unwrap();
             std::fs::write(changed, contents).unwrap();
             while changes.is_empty() {
@@ -302,8 +306,7 @@ async fn rejected_candidate_and_recovery_watches_exclude_managed_caches() {
     let config = directory.path().join("config.yaml");
     std::fs::write(&config, "config").unwrap();
     let (tx, mut changes) = mpsc::channel(1);
-    let mut watches =
-        ConfigWatches::new(&[config.to_str().unwrap().into()], tx, false).unwrap();
+    let mut watches = ConfigWatches::new(&[config.to_str().unwrap().into()], tx, false).unwrap();
     watches.discovered(
         std::slice::from_ref(&alias),
         std::slice::from_ref(&cache),
