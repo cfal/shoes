@@ -78,7 +78,7 @@ The dedicated VLESS/REALITY fixtures additionally use `XRAY_BINARY` and
 `MIHOMO_BINARY`; their fixture guide and workflow specify the exact pins.
 Requested but unavailable peers should fail, not silently skip.
 
-The SS2022 identity tests use Xray 26.10.21, shadowsocks-rust `ssserver` 1.25.0,
+The SS2022 identity tests use Xray 26.10.29, shadowsocks-rust `ssserver` 1.25.0,
 and sing-box 1.14.1 with multi-user Shadowsocks and SagerNet UoT. They cover
 both AES key sizes, concurrent users, ordered relays, wrong/missing/reordered
 identity rejection, large bidirectional transfers, half-close, server-first data,

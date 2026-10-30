@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: XTLS/Xray-core
-          ref: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
+          ref: 0afec66085a85191e9dd2a4a6646c7c9a94688d1
           path: peers/xray
       - uses: actions/checkout@v7
         with:

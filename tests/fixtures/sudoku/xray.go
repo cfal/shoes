@@ -1,8 +1,7 @@
 //go:build ignore
 
-// Run from Xray 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74 (v26.10.21):
+// Run from Xray 0afec66085a85191e9dd2a4a6646c7c9a94688d1 (v26.10.29):
 // GOMAXPROCS=1 go run -p 1 /path/to/shoes/tests/fixtures/sudoku/xray.go
-// The Sudoku source is identical at 0afec660 (v26.10.29).
 // -verify FILE cross-decodes the Rust export instead of generating samples.
 package main
 

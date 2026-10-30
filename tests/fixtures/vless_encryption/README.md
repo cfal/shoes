@@ -38,8 +38,8 @@ GOMAXPROCS=1 go run -p 1 /path/to/shoes/tests/fixtures/vless_encryption/generate
 ```
 
 The peer suite uses `XRAY_BINARY`, `MIHOMO_BINARY`, `SHOES_TEST_SING_BOX_BIN`, and
-optionally `SHOES_TEST_SHOES_BIN`. CI pins Xray 26.10.21
-(`1b1647cd9ddf0abc34b981d4611fc03bcac1ca74`), including its Vision TLS-buffer
+optionally `SHOES_TEST_SHOES_BIN`. CI pins Xray 26.10.29
+(`0afec66085a85191e9dd2a4a6646c7c9a94688d1`), including its Vision TLS-buffer
 compatibility fix. The committed vectors retain their original provenance above.
 Missing requested peers fail rather than skip. The wire tap distinguishes fresh
 from resumed handshakes and checks raw DIRECT lengths. Successful transfers plus

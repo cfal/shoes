@@ -12,9 +12,10 @@ connection APIs, with separate writes of 1, 2, 3, 13, 14 and 256 bytes. Samples
 cover entropy, ASCII, custom layout rotation, mixed entropy/custom rotation,
 passwords including whitespace, zero/100% padding and a 5-15% range.
 
-Reference: XTLS/Xray-core `1b1647cd9ddf0abc34b981d4611fc03bcac1ca74`,
-v26.10.21. The Sudoku source tree is byte-identical at `0afec660`, v26.10.29,
-which was used to capture these samples. From that Xray checkout:
+Reference: XTLS/Xray-core `0afec66085a85191e9dd2a4a6646c7c9a94688d1`,
+v26.10.29, which was used to capture these samples. Its Sudoku source tree is
+byte-identical to the previously pinned `1b1647cd`, v26.10.21.
+From that Xray checkout:
 
 ```sh
 GOMAXPROCS=1 go run -p 1 /path/to/shoes/tests/fixtures/sudoku/xray.go
