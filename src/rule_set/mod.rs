@@ -73,6 +73,7 @@ pub(crate) struct MemorySource {
     identity: blake3::Hash,
     format: Format,
     predicate: Arc<Predicate>,
+    retained_bytes: usize,
     pub(crate) digest: blake3::Hash,
     pub(crate) updated: std::time::Instant,
 }
@@ -83,7 +84,7 @@ impl MemorySource {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.predicate.retained_bytes()
+        self.retained_bytes
     }
 }
 
@@ -326,6 +327,14 @@ pub(crate) fn normalize_sources(
         compiler
             .remote_files
             .insert(source.path.clone(), source.url_format()?);
+        // Retained remote indexes are resident before any local source decodes.
+        if compiler
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.contains_key(&source.path))
+        {
+            load_source(source, compiler)?;
+        }
     }
     visit_sources(configs, &mut |source| {
         source.url = None;
@@ -689,16 +698,20 @@ pub(crate) fn load_memory(
     source: &RuleSource,
     bytes: &[u8],
     digest: blake3::Hash,
+    retained_bytes: usize,
 ) -> io::Result<MemorySource> {
+    let mut compiler = Compiler::default();
+    compiler.charge(retained_bytes, 0)?;
     let (format, predicate) = read_data(
         source,
         source.path.clone(),
         SourceInput::Memory(bytes),
-        &mut Compiler::default(),
+        &mut compiler,
     )?;
     Ok(MemorySource {
         identity: source.content_identity()?,
         format,
+        retained_bytes: predicate.retained_bytes(),
         predicate,
         digest,
         updated: std::time::Instant::now(),

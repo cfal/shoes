@@ -48,6 +48,7 @@ async fn download_source(
     global: GlobalLimits,
     limits: Limits,
     state: &mut http::DownloadState,
+    retained_bytes: usize,
 ) -> io::Result<Downloaded> {
     let mut bytes = Vec::new();
     let digest = crate::control::url_test::BACKGROUND
@@ -71,7 +72,7 @@ async fn download_source(
     }
     let source = source.clone();
     crate::config::blocking_compile(move || {
-        let loaded = crate::rule_set::load_memory(&source, &bytes, digest)
+        let loaded = crate::rule_set::load_memory(&source, &bytes, digest, retained_bytes)
             .map_err(|_| invalid("download failed Shoes rule validation"))?;
         Ok(Downloaded {
             bytes,
@@ -81,7 +82,11 @@ async fn download_source(
     .await
 }
 
-fn load_cached(source: &RuleSource, lease: Option<&CacheLease>) -> io::Result<Arc<MemorySource>> {
+fn load_cached(
+    source: &RuleSource,
+    lease: Option<&CacheLease>,
+    retained_bytes: usize,
+) -> io::Result<Arc<MemorySource>> {
     let file = cache_file(&source.path, lease)?;
     let metadata = file.metadata()?;
     if metadata.len() > MAX_BYTES {
@@ -98,7 +103,8 @@ fn load_cached(source: &RuleSource, lease: Option<&CacheLease>) -> io::Result<Ar
     if bytes.len() as u64 != metadata.len() {
         return Err(invalid("rule cache changed while reading"));
     }
-    let mut loaded = crate::rule_set::load_memory(source, &bytes, blake3::hash(&bytes))?;
+    let mut loaded =
+        crate::rule_set::load_memory(source, &bytes, blake3::hash(&bytes), retained_bytes)?;
     let now = std::time::Instant::now();
     loaded.updated = now.checked_sub(age).unwrap_or(now - interval);
     Ok(Arc::new(loaded))
@@ -156,9 +162,23 @@ async fn refresh_source(
     state: &mut http::DownloadState,
     lease: Option<Arc<CacheLease>>,
 ) -> io::Result<bool> {
+    let mut budget = crate::rules::Compiler::default();
+    for (path, loaded) in memory.iter() {
+        if path != &source.path {
+            budget.charge(loaded.retained_bytes(), 0)?;
+        }
+    }
     let previous = memory.get(&source.path);
-    let Downloaded { bytes, loaded } =
-        download_source(source, previous, dns, global, Limits::default(), state).await?;
+    let Downloaded { bytes, loaded } = download_source(
+        source,
+        previous,
+        dns,
+        global,
+        Limits::default(),
+        state,
+        budget.charged_bytes(),
+    )
+    .await?;
     let changed = previous.is_none_or(|previous| !Arc::ptr_eq(previous, &loaded));
     if changed {
         let mut candidate = memory.clone();

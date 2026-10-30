@@ -30,6 +30,10 @@ pub struct Compiler {
 }
 
 impl Compiler {
+    pub(crate) fn charged_bytes(&self) -> usize {
+        self.bytes
+    }
+
     // Temporary decode/build costs overlap only within one source. Other sources
     // retain their immutable indexes, not their parser buffers or entry counts.
     pub fn source(

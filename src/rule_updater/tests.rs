@@ -165,7 +165,9 @@ async fn bootstrap_budget_counts_retained_cached_and_downloaded_sources_before_s
     let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
     let cached = source(&url, &dir.path().join("cached.json"));
     let first = source(&url, &dir.path().join("first.json"));
-    let second = source(&url, &dir.path().join("second.json"));
+    let mut second = source(&url, &dir.path().join("second.yaml"));
+    second.format = Some(crate::rule_set::Format::MihomoYaml);
+    second.behavior = Some(crate::rule_set::Behavior::Domain);
     let domains: Vec<_> = (0..10_000)
         .map(|index| format!("{index:05}.{}.example", "x".repeat(48)))
         .collect();
@@ -174,10 +176,13 @@ async fn bootstrap_budget_counts_retained_cached_and_downloaded_sources_before_s
     }))
     .unwrap();
     let loaded =
-        Arc::new(crate::rule_set::load_memory(&cached, &body, blake3::hash(&body)).unwrap());
+        Arc::new(crate::rule_set::load_memory(&cached, &body, blake3::hash(&body), 0).unwrap());
     let retained_bytes = loaded.retained_bytes();
     assert!(retained_bytes > 0);
     let mut budget = crate::rules::Compiler::default();
+    budget
+        .charge(crate::rule_set::YAML_PARSER_SCRATCH_BYTES, 0)
+        .unwrap();
     let mut capacity = 0;
     while budget.charge(retained_bytes, 0).is_ok() {
         capacity += 1;
@@ -188,7 +193,7 @@ async fn bootstrap_budget_counts_retained_cached_and_downloaded_sources_before_s
     let mut sources = vec![cached.clone(), first.clone(), second.clone()];
     let mut previous = MemorySources::new();
     // Shared predicates exercise the aggregate limit without allocating 512 MiB.
-    for index in 0..capacity - 2 {
+    for index in 0..capacity - 1 {
         let retained = source(&url, &dir.path().join(format!("retained-{index:04}.json")));
         previous.insert(retained.path.clone(), loaded.clone());
         sources.push(retained);
@@ -204,13 +209,13 @@ async fn bootstrap_budget_counts_retained_cached_and_downloaded_sources_before_s
         }),
     ];
     let fixture = tokio::spawn(async move {
-        for _ in 0..2 {
+        for body in [body.as_slice(), b"payload: [new.example]\n"] {
             let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
                 .await
                 .unwrap()
                 .unwrap();
             request(&mut stream).await;
-            stream.write_all(&response(200, "", &body)).await.unwrap();
+            stream.write_all(&response(200, "", body)).await.unwrap();
         }
     });
     let error = super::bootstrap(config, &[], previous, None)
@@ -218,7 +223,12 @@ async fn bootstrap_budget_counts_retained_cached_and_downloaded_sources_before_s
         .err()
         .unwrap();
     fixture.await.unwrap();
-    assert_eq!(error.to_string(), "rule compilation budget exceeded");
+    assert!(
+        error
+            .to_string()
+            .contains("download failed Shoes rule validation"),
+        "{error}"
+    );
     assert_eq!(
         blake3::hash(&std::fs::read(&first.path).unwrap()),
         loaded.digest
@@ -229,7 +239,226 @@ async fn bootstrap_budget_counts_retained_cached_and_downloaded_sources_before_s
     );
     assert!(!second.path.exists());
     assert!(!stage_path(&second.path).exists());
-    assert!(!dir.path().join("second.json.shoes-update.lock").exists());
+    assert!(!dir.path().join("second.yaml.shoes-update.lock").exists());
+}
+
+fn retained_budget_source() -> (RuleSource, Arc<MemorySource>, usize) {
+    let domains: Vec<_> = (0..10_000)
+        .map(|index| format!("{index:05}.{}.example", "x".repeat(48)))
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "rules": [{"domain": domains}]
+    }))
+    .unwrap();
+    let retained = source(
+        "https://retained.invalid/rules.json",
+        Path::new("/unused.json"),
+    );
+    let loaded =
+        Arc::new(crate::rule_set::load_memory(&retained, &body, blake3::hash(&body), 0).unwrap());
+    let bytes = loaded.retained_bytes();
+    assert!((1..crate::rule_set::YAML_PARSER_SCRATCH_BYTES).contains(&bytes));
+    let mut budget = crate::rules::Compiler::default();
+    budget
+        .charge(crate::rule_set::YAML_PARSER_SCRATCH_BYTES, 0)
+        .unwrap();
+    let count = (1..1024)
+        .find(|_| budget.charge(bytes, 0).is_err())
+        .unwrap();
+    (retained, loaded, count)
+}
+
+#[tokio::test]
+async fn remote_decode_scratch_counts_retained_sources_before_cache_or_memory_changes() {
+    let (retained, loaded, count) = retained_budget_source();
+    for mode in ["download", "cache", "refresh"] {
+        let dir = directory();
+        let (url, fixture) = serve(response(200, "", b"payload: [new.example]\n")).await;
+        let mut remote = source(&url, &dir.path().join("a.yaml"));
+        remote.format = Some(crate::rule_set::Format::MihomoYaml);
+        remote.behavior = Some(crate::rule_set::Behavior::Domain);
+        let mut sources = vec![remote.clone()];
+        let mut memory = MemorySources::new();
+        for index in 0..count {
+            let mut source = retained.clone();
+            source.path = dir.path().join(format!("z-{index:04}.json"));
+            memory.insert(source.path.clone(), loaded.clone());
+            sources.push(source);
+        }
+        let configs = vec![
+            Config::RuleCacheDirectory(dir.path().into()),
+            Config::RuleSourceGroup(crate::config::RuleSourceGroup {
+                rule_source_group: "remote".into(),
+                rules: sources
+                    .into_iter()
+                    .map(crate::rules::Expression::Source)
+                    .collect(),
+            }),
+        ];
+        if mode != "download" {
+            write_rule(&remote.path, b"payload: [old.example]\n");
+        }
+        let before = std::fs::metadata(&remote.path).ok().map(|m| stamp(&m));
+        let error = if mode == "refresh" {
+            let previous = load_cached(&remote, None, 0).unwrap();
+            memory.insert(remote.path.clone(), previous.clone());
+            let result = refresh_source(
+                &remote,
+                &configs,
+                &mut memory,
+                &DnsRegistry::new(),
+                Default::default(),
+                &mut http::DownloadState::default(),
+                None,
+            )
+            .await;
+            assert!(Arc::ptr_eq(&previous, &memory[&remote.path]));
+            result.unwrap_err()
+        } else {
+            super::bootstrap(configs, &[], memory, None)
+                .await
+                .err()
+                .unwrap()
+        };
+        fixture.await.unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("download failed Shoes rule validation"),
+            "{mode}: {error}"
+        );
+        assert_eq!(
+            std::fs::metadata(&remote.path).ok().map(|m| stamp(&m)),
+            before
+        );
+        if mode != "download" {
+            assert_eq!(
+                std::fs::read(&remote.path).unwrap(),
+                b"payload: [old.example]\n"
+            );
+        }
+        assert!(!stage_path(&remote.path).exists());
+        assert!(!dir.path().join("a.yaml.shoes-update.lock").exists());
+    }
+}
+
+#[tokio::test]
+async fn local_decode_counts_remote_indexes_before_their_first_reference() {
+    let (retained, loaded, count) = retained_budget_source();
+    let dir = directory();
+    let local_dir = directory();
+    let local_path = local_dir.path().join("local.yaml");
+    write_rule(&local_path, b"payload: [local.example]\n");
+    let mut local = RuleSource::from_path(local_path);
+    local.behavior = Some(crate::rule_set::Behavior::Domain);
+
+    for retained_count in [count - 1, count] {
+        let mut memory = MemorySources::new();
+        let mut rules = vec![crate::rules::Expression::Source(local.clone())];
+        for index in 0..retained_count {
+            let mut source = retained.clone();
+            source.path = dir.path().join(format!("remote-{index:04}.json"));
+            memory.insert(source.path.clone(), loaded.clone());
+            // Repeated references must not charge the same source twice.
+            rules.push(crate::rules::Expression::Source(source.clone()));
+            rules.push(crate::rules::Expression::Source(source));
+        }
+        let config = vec![
+            Config::RuleCacheDirectory(dir.path().into()),
+            Config::RuleSourceGroup(crate::config::RuleSourceGroup {
+                rule_source_group: "mixed".into(),
+                rules,
+            }),
+        ];
+        let result = crate::config::compile_configs_with_memory(config, Some(memory)).await;
+        if retained_count == count {
+            let error = result.err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("rule compilation budget exceeded"),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn refresh_decode_excludes_replaced_indexes_and_reuses_identical_bytes_near_budget() {
+    let (retained, loaded, count) = retained_budget_source();
+    let body = b"payload: [new.example]\n";
+    for identical in [false, true] {
+        let dir = directory();
+        let (url, fixture) = serve(response(200, "", body)).await;
+        let mut remote = source(&url, &dir.path().join("rules.yaml"));
+        remote.format = Some(crate::rule_set::Format::MihomoYaml);
+        remote.behavior = Some(crate::rule_set::Behavior::Domain);
+        let old_body = if identical {
+            body.to_vec()
+        } else {
+            let domains: Vec<_> = (0..30_000)
+                .map(|index| format!("{index:05}.{}.example", "x".repeat(48)))
+                .collect();
+            serde_yaml::to_string(&serde_json::json!({"payload": domains}))
+                .unwrap()
+                .into_bytes()
+        };
+        let previous = Arc::new(
+            crate::rule_set::load_memory(&remote, &old_body, blake3::hash(&old_body), 0).unwrap(),
+        );
+        let retained_count = if identical { count } else { count - 1 };
+        let seed = retained_count * loaded.retained_bytes();
+        if !identical {
+            assert!(previous.retained_bytes() > loaded.retained_bytes());
+            assert!(crate::rule_set::load_memory(&remote, body, blake3::hash(body), seed).is_ok());
+        }
+        assert!(
+            crate::rule_set::load_memory(
+                &remote,
+                body,
+                blake3::hash(body),
+                seed + previous.retained_bytes()
+            )
+            .is_err()
+        );
+        let mut memory = MemorySources::from([(remote.path.clone(), previous.clone())]);
+        let mut rules = vec![crate::rules::Expression::Source(remote.clone())];
+        for index in 0..retained_count {
+            let mut source = retained.clone();
+            source.path = dir.path().join(format!("retained-{index:04}.json"));
+            memory.insert(source.path.clone(), loaded.clone());
+            rules.push(crate::rules::Expression::Source(source));
+        }
+        let config = vec![
+            Config::RuleCacheDirectory(dir.path().into()),
+            Config::RuleSourceGroup(crate::config::RuleSourceGroup {
+                rule_source_group: "remote".into(),
+                rules,
+            }),
+        ];
+        assert_eq!(
+            refresh_source(
+                &remote,
+                &config,
+                &mut memory,
+                &DnsRegistry::new(),
+                Default::default(),
+                &mut http::DownloadState::default(),
+                None,
+            )
+            .await
+            .unwrap(),
+            !identical,
+        );
+        fixture.await.unwrap();
+        assert_eq!(Arc::ptr_eq(&previous, &memory[&remote.path]), identical);
+        assert_eq!(memory[&remote.path].digest, blake3::hash(body));
+        // Persistence is retried even when the predicate was reused without decoding.
+        assert_eq!(std::fs::read(&remote.path).unwrap(), body);
+        assert!(!stage_path(&remote.path).exists());
+    }
 }
 
 #[tokio::test]
@@ -491,7 +720,7 @@ fn write_rule(path: &Path, bytes: &[u8]) {
 fn cached_sources(sources: &[RuleSource]) -> MemorySources {
     sources
         .iter()
-        .map(|source| (source.path.clone(), load_cached(source, None).unwrap()))
+        .map(|source| (source.path.clone(), load_cached(source, None, 0).unwrap()))
         .collect()
 }
 
@@ -584,7 +813,7 @@ async fn memory_refresh_validates_changed_candidates_without_replacing_on_failur
             .unwrap()
             .remove(0);
         let original =
-            Arc::new(crate::rule_set::load_memory(&source, OLD, blake3::hash(OLD)).unwrap());
+            Arc::new(crate::rule_set::load_memory(&source, OLD, blake3::hash(OLD), 0).unwrap());
         let mut memory = MemorySources::from([(source.path.clone(), original.clone())]);
         if !valid_config {
             config.push(
@@ -641,11 +870,11 @@ async fn retained_sources_do_not_read_a_replaced_cache_namespace() {
     let memory = MemorySources::from([
         (
             first.path.clone(),
-            load_cached(&first, Some(&lease)).unwrap(),
+            load_cached(&first, Some(&lease), 0).unwrap(),
         ),
         (
             second.path.clone(),
-            load_cached(&second, Some(&lease)).unwrap(),
+            load_cached(&second, Some(&lease), 0).unwrap(),
         ),
     ]);
     let mut config = configs(&first);
@@ -705,7 +934,8 @@ async fn memory_refresh_validates_new_source_and_preserves_other_sources() {
         .iter()
         .find(|source| source.url == second.url)
         .unwrap();
-    let original = Arc::new(crate::rule_set::load_memory(first, OLD, blake3::hash(OLD)).unwrap());
+    let original =
+        Arc::new(crate::rule_set::load_memory(first, OLD, blake3::hash(OLD), 0).unwrap());
     let mut memory = MemorySources::from([(first.path.clone(), original.clone())]);
     assert!(
         refresh_source(
@@ -923,7 +1153,8 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
     let remote = crate::rule_set::remote_sources(&mut config)
         .unwrap()
         .remove(0);
-    let loaded = Arc::new(crate::rule_set::load_memory(&remote, OLD, blake3::hash(OLD)).unwrap());
+    let loaded =
+        Arc::new(crate::rule_set::load_memory(&remote, OLD, blake3::hash(OLD), 0).unwrap());
     let memory = MemorySources::from([(remote.path, loaded)]);
     let Config::Server(server) = &mut config[0] else {
         panic!("expected server")
@@ -957,6 +1188,7 @@ async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str>
         GlobalLimits::default(),
         limits,
         &mut http::DownloadState::default(),
+        0,
     )
     .await?;
     validate_memory(
@@ -1610,7 +1842,7 @@ async fn every_existing_decoder_validates_downloads() {
         source.format = Some(format);
         source.behavior = behavior;
         source.code = code.map(str::to_owned);
-        crate::rule_set::load_memory(&source, &bytes, blake3::hash(&bytes)).unwrap();
+        crate::rule_set::load_memory(&source, &bytes, blake3::hash(&bytes), 0).unwrap();
         assert_eq!(
             update(&source, Limits::default()).await.unwrap(),
             "updated",
@@ -1684,6 +1916,7 @@ async fn stalled_url_address_does_not_block_another_guarded_candidate() {
                 GlobalLimits::default(),
                 Limits::default(),
                 &mut http::DownloadState::default(),
+                0,
             ),
         )
         .await
@@ -2142,9 +2375,9 @@ async fn runtime_validation_uses_retained_sources_and_never_falls_back_to_disk()
     let memory = MemorySources::from([
         (
             first.path.clone(),
-            Arc::new(crate::rule_set::load_memory(&first, VALID, blake3::hash(VALID)).unwrap()),
+            Arc::new(crate::rule_set::load_memory(&first, VALID, blake3::hash(VALID), 0).unwrap()),
         ),
-        (second.path.clone(), load_cached(&second, None).unwrap()),
+        (second.path.clone(), load_cached(&second, None, 0).unwrap()),
     ]);
     let config: Vec<Config> = serde_json::from_value(serde_json::json!([
         {"rule_cache_dir": dir.path()},
@@ -2227,6 +2460,7 @@ async fn explicit_bootstrap_resolves_target_without_system_dns() {
         GlobalLimits::default(),
         Limits::default(),
         &mut http::DownloadState::default(),
+        0,
     )
     .await
     .unwrap();
@@ -2349,6 +2583,7 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
             GlobalLimits::default(),
             Limits::default(),
             &mut http::DownloadState::default(),
+            0,
         )
         .await
         .unwrap();
@@ -2504,6 +2739,7 @@ async fn first_download_proxy_retains_bootstrap_address_fallback() {
                 GlobalLimits::default(),
                 Limits::default(),
                 &mut http::DownloadState::default(),
+                0,
             )
             .await
             .unwrap(),

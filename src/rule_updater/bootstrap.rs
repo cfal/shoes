@@ -18,18 +18,22 @@ pub(crate) async fn prepare(
             let persistent = crate::rule_set::cache_directory(&configs)?.is_some();
             let mut memory = MemorySources::new();
             let mut budget = crate::rules::Compiler::default();
-            for source in crate::rule_set::remote_sources(&mut configs)? {
-                if let Some(loaded) = previous.get(&source.path) {
-                    if loaded.matches(&source)? {
-                        budget.charge(loaded.retained_bytes(), 0)?;
-                        memory.insert(source.path.clone(), loaded.clone());
-                    } else {
-                        missing.push(source);
-                    }
+            let sources = crate::rule_set::remote_sources(&mut configs)?;
+            // All retained indexes constrain cache decoding, regardless of path order.
+            for source in &sources {
+                if let Some(loaded) = previous.get(&source.path)
+                    && loaded.matches(source)?
+                {
+                    budget.charge(loaded.retained_bytes(), 0)?;
+                    memory.insert(source.path.clone(), loaded.clone());
+                }
+            }
+            for source in sources {
+                if memory.contains_key(&source.path) {
                     continue;
                 }
-                if persistent {
-                    match load_cached(&source, cache_lease.as_deref()) {
+                if persistent && !previous.contains_key(&source.path) {
+                    match load_cached(&source, cache_lease.as_deref(), budget.charged_bytes()) {
                         Ok(loaded) => {
                             budget.charge(loaded.retained_bytes(), 0)?;
                             memory.insert(source.path.clone(), loaded);
@@ -79,6 +83,7 @@ pub(crate) async fn prepare(
             global,
             Limits::default(),
             &mut http::DownloadState::default(),
+            budget.charged_bytes(),
         )
         .await
         .map_err(|error| {

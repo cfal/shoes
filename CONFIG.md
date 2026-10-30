@@ -2098,8 +2098,11 @@ retain their own case flags; only the bounded ASCII Rust regex subset is accepte
 Files are limited to 64 MiB, inflated payloads to 256 MiB, and compilation has a
 512 MiB conservative allocation budget. Each source is limited to 2 million
 entries. Temporary decode/build charges are released between sources; retained
-indexes count toward the generation budget. Reference-expanded predicate visits
-also have a conservative 2 million compilation budget, counting repeated group
+indexes count toward the generation budget, including remote indexes retained
+before cache, download, or local-source decoding. Refresh candidates exclude the
+replaced source's old index. The budget excludes old/new generation overlap and
+does not cap process RSS. Reference-expanded predicate visits also have a
+conservative 2 million compilation budget, counting repeated group
 references and caller compositions. These are safety ceilings, not a mobile
 memory guarantee. Runtime regex caches are separate per worker and generation;
 capture tracking is disabled and each lazy-DFA cache is capped at 256 KiB.
