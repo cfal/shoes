@@ -792,7 +792,20 @@ async fn kernel_capture() -> io::Result<()> {
             }));
         }
     }
-    process_recovery(port).await?;
+    for redirect in [false, true] {
+        for ipv6 in [false, true] {
+            managed_dns_egress(redirect, ipv6).await.map_err(|error| {
+                io::Error::other(format!(
+                    "managed DNS (redirect={redirect}, ipv6={ipv6}): {error}"
+                ))
+            })?;
+        }
+        process_recovery(port, redirect).await.map_err(|error| {
+            io::Error::other(format!(
+                "managed process recovery (redirect={redirect}): {error}"
+            ))
+        })?;
+    }
     orphan_helper_recovery().await?;
     preflight_failures().await?;
     ownership_failures().await?;
@@ -1172,6 +1185,227 @@ async fn resolved_foreign_namespace() -> io::Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(resolved_link_settings(3)?, before);
+    Ok(())
+}
+
+async fn managed_dns_egress(redirect: bool, ipv6: bool) -> io::Result<()> {
+    use hickory_resolver::proto::{
+        op::{Message, Query},
+        rr::{Name, RData, Record, RecordType, rdata},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let remote: std::net::IpAddr = if ipv6 { "fd00:2::2" } else { "198.51.100.2" }
+        .parse()
+        .unwrap();
+    let target: std::net::IpAddr = if ipv6 { "fd00:2::3" } else { "198.51.100.3" }
+        .parse()
+        .unwrap();
+    let dns_target: std::net::IpAddr = if ipv6 { "fd00:2::53" } else { "198.51.100.53" }
+        .parse()
+        .unwrap();
+    let (udp, tcp, echo) = in_peer(move || {
+        let udp = std::net::UdpSocket::bind((remote, 53))?;
+        let tcp = std::net::TcpListener::bind((remote, 53))?;
+        let echo = std::net::TcpListener::bind((remote, 0))?;
+        udp.set_nonblocking(true)?;
+        tcp.set_nonblocking(true)?;
+        echo.set_nonblocking(true)?;
+        Ok((udp, tcp, echo))
+    })?;
+    let udp = tokio::net::UdpSocket::from_std(udp)?;
+    let tcp = tokio::net::TcpListener::from_std(tcp)?;
+    let echo = tokio::net::TcpListener::from_std(echo)?;
+    let port = echo.local_addr()?.port();
+    let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let transcript = observed.clone();
+    let answer = Arc::new(move |bytes: &[u8], tcp: bool| -> io::Result<Vec<u8>> {
+        let mut reply = Message::from_vec(bytes)
+            .map_err(io::Error::other)?
+            .into_response();
+        let query = reply.queries[0].clone();
+        let name = query.name().to_ascii();
+        transcript.lock().push((name.clone(), tcp));
+        if !tcp && !name.starts_with("udp-only-") {
+            reply.metadata.truncation = true;
+        } else {
+            let data = match (query.query_type(), remote) {
+                (RecordType::A, std::net::IpAddr::V4(address)) => Some(RData::A(rdata::A(address))),
+                (RecordType::AAAA, std::net::IpAddr::V6(address)) => {
+                    Some(RData::AAAA(rdata::AAAA(address)))
+                }
+                (RecordType::TXT, _) => Some(RData::TXT(rdata::TXT::new(vec![
+                    if tcp { "tcp-only" } else { "udp-only" }.into(),
+                ]))),
+                _ => None,
+            };
+            if let Some(data) = data {
+                reply.add_answer(Record::from_rdata(query.name().clone(), 0, data));
+            }
+        }
+        reply.to_vec().map_err(io::Error::other)
+    });
+    let _dns = AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        let mut bytes = [0; 4096];
+        loop {
+            tokio::select! {
+                packet = udp.recv_from(&mut bytes) => {
+                    let (length, peer) = packet.unwrap();
+                    udp.send_to(&answer(&bytes[..length], false).unwrap(), peer).await.unwrap();
+                }
+                connection = tcp.accept() => {
+                    let (mut stream, _) = connection.unwrap();
+                    let answer = answer.clone();
+                    connections.spawn(async move {
+                        while let Ok(length) = stream.read_u16().await {
+                            let mut request = vec![0; usize::from(length)];
+                            stream.read_exact(&mut request).await.unwrap();
+                            let response = answer(&request, true).unwrap();
+                            stream.write_u16(response.len() as u16).await.unwrap();
+                            stream.write_all(&response).await.unwrap();
+                        }
+                    });
+                }
+                result = connections.join_next(), if !connections.is_empty() => {
+                    result.unwrap().unwrap();
+                }
+            }
+        }
+    }));
+    let _echo = AbortOnDropHandle::new(tokio::spawn(async move {
+        let (mut stream, _) = echo.accept().await.unwrap();
+        let mut bytes = [0; 9];
+        stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"bootstrap");
+        stream.write_all(&bytes).await.unwrap();
+    }));
+    let hostname = format!("bootstrap-{redirect}-{ipv6}.test");
+    let mut config = serde_json::to_value(configuration(redirect))?;
+    config["dns_hijack"] = json!(true);
+    config["bootstrap_dns"] = json!([std::net::SocketAddr::new(remote, 53).to_string()]);
+    config["rules"] = json!([
+        {"masks": [format!("{target}/{}", if ipv6 { 128 } else { 32 })], "action": "allow",
+         "override_address": format!("{hostname}:{port}")},
+        {"masks": ["0.0.0.0/0", "::/0"], "action": "allow"}
+    ]);
+    let mut validated =
+        crate::config::create_server_configs(vec![crate::config::Config::TunServer(
+            serde_json::from_value(config)?,
+        )])?;
+    let spec = Spec::from_configs(&validated.configs)?.unwrap();
+    let crate::config::Config::TunServer(config) = validated.configs.remove(0) else {
+        unreachable!()
+    };
+    let mut session = Session::prepare(spec).await?;
+    session.prepare_network().await?;
+    let mut registry = crate::dns::DnsRegistry::new();
+    let mut tasks = Vec::new();
+    session
+        .ingress()
+        .unwrap()
+        .start(
+            &config,
+            registry.get_or_create_default(),
+            Ingress::tcp_admission(&config),
+            &mut tasks,
+        )
+        .await?;
+    session.activate().await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = tokio::net::TcpStream::connect((target, port)).await?;
+        stream.write_all(b"bootstrap").await?;
+        let mut bytes = [0; 9];
+        stream.read_exact(&mut bytes).await?;
+        assert_eq!(&bytes, b"bootstrap");
+        Ok::<(), io::Error>(())
+    })
+    .await??;
+    for tcp in [false, true] {
+        let observed = observed.lock();
+        assert!(
+            observed.contains(&(format!("{hostname}."), tcp)),
+            "{:?}",
+            observed
+        );
+    }
+    for (label, tcp_client) in [
+        ("udp-only", false),
+        ("fallback-udp", false),
+        ("fallback-tcp", true),
+    ] {
+        let name = format!("{label}-{redirect}-{ipv6}.test.");
+        let mut query = Message::query();
+        query.metadata.id = 123;
+        query.metadata.recursion_desired = true;
+        query.add_query(Query::query(
+            Name::from_ascii(&name).unwrap(),
+            RecordType::TXT,
+        ));
+        let request = query.to_vec().map_err(io::Error::other)?;
+        let counts = redirect_counts(&session).await?;
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            if tcp_client {
+                let mut stream = tokio::net::TcpStream::connect((dns_target, 53)).await?;
+                stream.write_u16(request.len() as u16).await?;
+                stream.write_all(&request).await?;
+                let length = stream.read_u16().await?;
+                let mut response = vec![0; usize::from(length)];
+                stream.read_exact(&mut response).await?;
+                Ok::<_, io::Error>(response)
+            } else {
+                let socket =
+                    tokio::net::UdpSocket::bind(if ipv6 { "[::]:0" } else { "0.0.0.0:0" }).await?;
+                socket.send_to(&request, (dns_target, 53)).await?;
+                let mut bytes = [0; 4096];
+                let (length, source) = socket.recv_from(&mut bytes).await?;
+                assert_eq!(source, std::net::SocketAddr::new(dns_target, 53));
+                Ok(bytes[..length].to_vec())
+            }
+        })
+        .await??;
+        let reply = Message::from_vec(&response).map_err(io::Error::other)?;
+        assert_eq!(reply.metadata.id, query.metadata.id);
+        assert_eq!(reply.queries, query.queries);
+        assert!(!reply.metadata.truncation);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(
+            reply.answers[0].data,
+            RData::TXT(rdata::TXT::new(vec![
+                if label == "udp-only" {
+                    "udp-only"
+                } else {
+                    "tcp-only"
+                }
+                .into(),
+            ]))
+        );
+        let transports: Vec<_> = observed
+            .lock()
+            .iter()
+            .filter(|(question, _)| question == &name)
+            .map(|(_, tcp)| *tcp)
+            .collect();
+        assert_eq!(
+            transports,
+            if label == "udp-only" {
+                vec![false]
+            } else {
+                vec![false, true]
+            }
+        );
+        if redirect && tcp_client {
+            assert!(
+                redirect_counts(&session).await?[usize::from(ipv6)] > counts[usize::from(ipv6)]
+            );
+        }
+    }
+    session.deactivate().await?;
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    session.close().await?;
     Ok(())
 }
 
@@ -1665,9 +1899,9 @@ async fn redirect_counts(session: &Session) -> io::Result<[u64; 2]> {
     Ok(counts)
 }
 
-async fn process_recovery(port: u16) -> io::Result<()> {
+async fn process_recovery(port: u16, redirect: bool) -> io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-    let mut config = serde_json::to_value(configuration(true))?;
+    let mut config = serde_json::to_value(configuration(redirect))?;
     if std::env::var_os("SHOES_RESOLVED_ROOT").is_some() {
         config["auto_dns"] = json!(true);
         config["dns_hijack"] = json!(true);
@@ -1700,18 +1934,82 @@ async fn process_recovery(port: u16) -> io::Result<()> {
         })
         .await?
     }
-    async fn captured(port: u16) -> io::Result<()> {
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::net::TcpStream::connect(("198.51.100.2", port)),
-        )
-        .await??;
-        stream.write_all(b"process").await?;
-        let mut bytes = [0; 7];
-        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut bytes)).await??;
-        assert_eq!(&bytes, b"process");
+    async fn captured(port: u16, expected: &[u8; 7]) -> io::Result<()> {
+        for destination in ["198.51.100.2", "fd00:2::2"] {
+            for _ in 0..4 {
+                let target = (destination.parse::<std::net::IpAddr>().unwrap(), port);
+                let mut stream = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    tokio::net::TcpStream::connect(target),
+                )
+                .await??;
+                stream.write_all(b"process").await?;
+                let mut bytes = [0; 7];
+                tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut bytes))
+                    .await??;
+                assert_eq!(&bytes, expected);
+                let bind = if target.0.is_ipv6() {
+                    "[::]:0"
+                } else {
+                    "0.0.0.0:0"
+                };
+                let socket = tokio::net::UdpSocket::bind(bind).await?;
+                socket.send_to(b"process", target).await?;
+                let (length, peer) =
+                    tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut bytes))
+                        .await??;
+                assert_eq!(peer, std::net::SocketAddr::from(target));
+                assert_eq!(&bytes[..length], expected);
+            }
+        }
         Ok(())
     }
+    fn identity() -> io::Result<serde_json::Value> {
+        let links: serde_json::Value =
+            serde_json::from_str(&run("ip", &["-j", "link", "show", "shoes0"])?)?;
+        let tables: serde_json::Value =
+            serde_json::from_str(&run("nft", &["-j", "list", "tables"])?)?;
+        let tables: Vec<_> = tables["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["table"]["name"].as_str())
+            .filter(|name| name.starts_with("shoes_"))
+            .collect();
+        assert_eq!(tables.len(), 1);
+        let firewall: serde_json::Value =
+            serde_json::from_str(&run("nft", &["-j", "list", "table", "inet", tables[0]])?)?;
+        let ports: Vec<_> = firewall["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["rule"]["expr"].as_array())
+            .flatten()
+            .filter_map(|expr| expr["redirect"]["port"].as_u64())
+            .collect();
+        Ok(
+            json!({"ifindex": links[0]["ifindex"], "alias": links[0]["ifalias"],
+            "table": tables[0], "ports": ports}),
+        )
+    }
+    let marker = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let marker_address = marker.local_addr()?;
+    let marker_udp = tokio::net::UdpSocket::bind(marker_address).await?;
+    let _marker_tcp = AbortOnDropHandle::new(tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = marker.accept().await.unwrap();
+            let mut bytes = [0; 7];
+            stream.read_exact(&mut bytes).await.unwrap();
+            stream.write_all(b"changed").await.unwrap();
+        }
+    }));
+    let _marker_udp = AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut bytes = [0; 128];
+        loop {
+            let (_, peer) = marker_udp.recv_from(&mut bytes).await.unwrap();
+            marker_udp.send_to(b"changed", peer).await.unwrap();
+        }
+    }));
     let (connection, handle, _) = rtnetlink::new_connection().map_err(io::Error::other)?;
     let _connection = AbortOnDropHandle::new(tokio::spawn(connection));
     for signal in [libc::SIGTERM, libc::SIGKILL] {
@@ -1735,7 +2033,8 @@ async fn process_recovery(port: u16) -> io::Result<()> {
             return Err(io::Error::other(format!("{error}: {diagnostic}")));
         }
         let index = routes::link(&handle, "shoes0").await?.unwrap().header.index;
-        captured(port).await?;
+        let original_identity = identity()?;
+        captured(port, b"process").await?;
         let mut changed = config.clone();
         changed["mtu"] = json!(1400);
         write(&changed)?;
@@ -1744,7 +2043,38 @@ async fn process_recovery(port: u16) -> io::Result<()> {
             0
         );
         line(&mut stderr, "Reload rejected; current servers retained").await?;
-        captured(port).await?;
+        captured(port, b"process").await?;
+        let mut candidate = config.clone();
+        candidate["rules"][0]["override_address"] = json!(marker_address.to_string());
+        // The invalid descriptor fails only after the managed candidate has started.
+        std::fs::write(
+            path,
+            serde_yaml::to_string(&[
+                candidate.clone(),
+                json!({"device_fd": -1, "rules": "allow-all-direct"}),
+            ])
+            .map_err(io::Error::other)?,
+        )?;
+        assert_eq!(
+            unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGHUP) },
+            0
+        );
+        line(&mut stderr, "Reload rejected; previous servers restored").await?;
+        // Both the failed candidate and rollback must start the retained TUN.
+        for _ in 0..2 {
+            line(&mut stdout, "Starting TUN server on device shoes0").await?;
+        }
+        assert!(child.try_wait()?.is_none());
+        assert_eq!(identity()?, original_identity);
+        captured(port, b"process").await?;
+        write(&candidate)?;
+        assert_eq!(
+            unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGHUP) },
+            0
+        );
+        line(&mut stdout, "Servers ready").await?;
+        assert_eq!(identity()?, original_identity);
+        captured(port, b"changed").await?;
         write(&config)?;
         assert_eq!(
             unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGHUP) },
@@ -1755,7 +2085,8 @@ async fn process_recovery(port: u16) -> io::Result<()> {
             routes::link(&handle, "shoes0").await?.unwrap().header.index,
             index
         );
-        captured(port).await?;
+        assert_eq!(identity()?, original_identity);
+        captured(port, b"process").await?;
         assert_eq!(unsafe { libc::kill(child.id().unwrap() as i32, signal) }, 0);
         let status = tokio::time::timeout(Duration::from_secs(15), child.wait()).await??;
         assert_eq!(status.success(), signal == libc::SIGTERM);
