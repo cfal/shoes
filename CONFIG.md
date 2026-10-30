@@ -2253,6 +2253,8 @@ the URL and decoding options. Explicit remote paths require `rule_cache_dir` and
 must be direct children of that directory. Configuration, local
 rule sources (including aliases), PEMs, sockets, and other state must be outside
 it. ACME state directories cannot contain or be contained by the cache directory.
+On Linux, `/run/shoes` is reserved for managed-TUN ownership and recovery files;
+use a separate cache directory, such as `/run/shoes/rule-cache`, instead.
 The directory must be owned by the running user and not group- or world-writable
 (for example, create it with `install -d -m 700 cache`). Cache files must be owned,
 regular, singly linked, not group- or world-writable, and have no setuid, setgid,

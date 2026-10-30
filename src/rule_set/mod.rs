@@ -386,6 +386,12 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
         ));
     }
     let directory_identity = identity(&directory)?;
+    #[cfg(target_os = "linux")]
+    if directory_identity == identity(Path::new(crate::desktop::MANAGED_STATE_DIRECTORY))? {
+        return Err(invalid(
+            "rule_cache_dir overlaps the managed TUN state directory",
+        ));
+    }
     for source in &remotes {
         if std::path::absolute(&source.path)?.parent() != Some(directory.as_path()) {
             return Err(invalid(

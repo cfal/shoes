@@ -54,7 +54,7 @@ impl Journal {
     pub(super) fn lock() -> io::Result<Self> {
         let metadata = std::fs::metadata("/proc/self/ns/net")?;
         let namespace = format!("{}-{}", metadata.dev(), metadata.ino());
-        let root = PathBuf::from("/run/shoes");
+        let root = PathBuf::from(crate::desktop::MANAGED_STATE_DIRECTORY);
         match std::fs::DirBuilder::new().mode(0o700).create(&root) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}

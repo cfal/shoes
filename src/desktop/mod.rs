@@ -1,6 +1,9 @@
 #[cfg(target_os = "linux")]
 mod linux;
 
+#[cfg(target_os = "linux")]
+pub(crate) const MANAGED_STATE_DIRECTORY: &str = "/run/shoes";
+
 use std::io;
 
 #[derive(Default)]

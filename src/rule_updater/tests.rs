@@ -2780,6 +2780,37 @@ async fn namespace_preflight_rejects_unresolved_parent_traversal_before_creating
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn managed_tun_state_cannot_be_used_as_a_rule_cache() {
+    let dir = directory();
+    let root = Path::new("/run/shoes");
+    let alias = dir.path().join("managed-state");
+    symlink(root, &alias).unwrap();
+    let namespace = std::fs::metadata("/proc/self/ns/net").unwrap();
+    for extension in ["lock", "json", "pending"] {
+        let name = format!("netns-{}-{}.{extension}", namespace.dev(), namespace.ino());
+        let path = root.join(&name);
+        let before = std::fs::symlink_metadata(&path).ok().map(|m| stamp(&m));
+        let contents = std::fs::read(&path).ok();
+        for directory in [root, alias.as_path()] {
+            let remote = source("https://example.invalid/rules.json", &directory.join(&name));
+            let error =
+                crate::rule_set::validate_remote_paths(&mut configs(&remote), &[]).unwrap_err();
+            assert!(error.to_string().contains("managed TUN state"), "{error}");
+        }
+        assert_eq!(
+            std::fs::symlink_metadata(&path).ok().map(|m| stamp(&m)),
+            before
+        );
+        assert_eq!(std::fs::read(&path).ok(), contents);
+    }
+    let mut empty = vec![Config::RuleCacheDirectory(root.into())];
+    assert!(crate::rule_set::validate_remote_paths(&mut empty, &[]).is_err());
+    let mut separate = vec![Config::RuleCacheDirectory(root.join("rule-cache"))];
+    crate::rule_set::validate_remote_paths(&mut separate, &[]).unwrap();
+}
+
+#[test]
 fn cache_namespace_is_reserved_even_without_remote_sources() {
     let dir = directory();
     let cache = dir.path().join("cache");
