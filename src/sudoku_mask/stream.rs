@@ -141,17 +141,19 @@ impl AsyncRead for SudokuStream {
         let mut work = 0;
         loop {
             while this.read_start < this.read_end && output.remaining() != 0 && work < READ_BUDGET {
-                let byte = this.read_wire[this.read_start];
-                this.read_start += 1;
-                work += 1;
-                match this.decoder.decode(byte) {
-                    Ok(Some(byte)) => output.put_slice(&[byte]),
-                    Ok(None) => {}
-                    Err(error) => {
-                        this.read_error = Some(Failure::new(error));
-                        this.read_start = this.read_end;
-                        break;
-                    }
+                let end = this.read_end.min(this.read_start + READ_BUDGET - work);
+                let input = &this.read_wire[this.read_start..end];
+                let capacity = output.remaining().min(input.len());
+                let decoded = this
+                    .decoder
+                    .decode(input, output.initialize_unfilled_to(capacity));
+                this.read_start += decoded.consumed;
+                work += decoded.consumed;
+                output.advance(decoded.written);
+                if let Some(error) = decoded.error {
+                    this.read_error = Some(Failure::new(error));
+                    this.read_start = this.read_end;
+                    break;
                 }
             }
             if output.filled().len() != initial {
@@ -471,7 +473,7 @@ mod tests {
                     .unwrap()
                     .sent
                     .iter()
-                    .filter_map(|b| decoder.decode(*b).transpose())
+                    .filter_map(|b| decoder.decode_byte(*b).transpose())
                     .collect::<io::Result<_>>()
                     .unwrap();
                 assert_eq!(
@@ -583,7 +585,7 @@ mod tests {
         let bytes: Vec<_> = state
             .sent
             .iter()
-            .filter_map(|b| decoder.decode(*b).transpose())
+            .filter_map(|b| decoder.decode_byte(*b).transpose())
             .collect::<io::Result<_>>()
             .unwrap();
         assert_eq!(bytes, b"onetwothreefour");
