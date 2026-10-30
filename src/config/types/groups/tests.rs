@@ -153,7 +153,10 @@ fn policy_and_source_groups_are_explicit_and_roundtrip() {
         ),
         ("[{path: a.srs, action: block}]", "unknown field `action`"),
         ("[{path: a.srs, fromat: srs}]", "unknown field `fromat`"),
-        ("[{rule_group: other}]", "unknown masks field"),
+        (
+            "[{rule_group: other}]",
+            "use masks: {rule_source_group: name}",
+        ),
     ] {
         let result = serde_yaml::from_str::<RuleSourceGroup>(&format!(
             "rule_source_group: x\nrules: {rules}"

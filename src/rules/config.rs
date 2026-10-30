@@ -104,6 +104,9 @@ impl Expression {
                     "destination_port" => decode(value).map(Self::DestinationPort),
                     "destination_port_range" => decode(value).map(Self::DestinationPortRange),
                     "rule_source_group" => decode(value).map(Self::RuleSourceGroup),
+                    "rule_group" => Err(invalid(
+                        "masks rule_group was renamed; use masks: {rule_source_group: name} and declare the group with rule_source_group",
+                    )),
                     "all" => Self::parse_children(decode(value)?, depth).map(Self::All),
                     "any" => Self::parse_children(decode(value)?, depth).map(Self::Any),
                     "not" => Self::parse_config(value, depth + 1).map(|p| Self::Not(Box::new(p))),
