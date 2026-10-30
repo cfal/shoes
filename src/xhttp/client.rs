@@ -123,8 +123,7 @@ pub struct Client {
     version: XhttpVersion,
     mode: XhttpMode,
     security: Security,
-    before_security_masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
-    after_security_masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
+    masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
     memory: Arc<Budget>,
     admission: Arc<Budget>,
     tasks: Tasks,
@@ -173,8 +172,7 @@ impl Client {
             version,
             mode,
             security,
-            before_security_masks: Vec::new(),
-            after_security_masks: Vec::new(),
+            masks: Vec::new(),
             slots: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -198,13 +196,8 @@ impl Client {
         });
     }
 
-    pub(super) fn with_masks(
-        mut self,
-        before_security: Vec<Arc<crate::sudoku_mask::Prepared>>,
-        after_security: Vec<Arc<crate::sudoku_mask::Prepared>>,
-    ) -> Self {
-        self.before_security_masks = before_security;
-        self.after_security_masks = after_security;
+    pub(super) fn with_masks(mut self, masks: Vec<Arc<crate::sudoku_mask::Prepared>>) -> Self {
+        self.masks = masks;
         self
     }
 
@@ -230,15 +223,11 @@ impl Client {
                 if self.version == XhttpVersion::H3 {
                     Carrier::quic(dialer.open_quic().await?, header_limit).await
                 } else {
-                    let stream = Self::mask_carrier(
-                        dialer.open_stream().await?,
-                        &self.before_security_masks,
-                    );
+                    let stream = Self::mask_carrier(dialer.open_stream().await?, &self.masks);
                     let stream = self
                         .security
                         .wrap(stream, &self.endpoint, self.version)
                         .await?;
-                    let stream = Self::mask_carrier(stream, &self.after_security_masks);
                     Carrier::tcp_with_windows(
                         stream,
                         self.version,
@@ -830,22 +819,11 @@ mod tests {
             Arc::new(crate::resolver::NativeResolver::new());
         let xhttp = json!({"type":"xhttp","protocol":{"type":"socks"}});
         let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
-        for (protocol, secure, before, after) in [
-            (mask(xhttp.clone()), false, 1, 0),
-            (mask(mask(xhttp.clone())), false, 2, 0),
-            (mask(json!({"type":"tls","protocol":xhttp})), true, 1, 0),
-            (
-                json!({"type":"tls","protocol":mask(xhttp.clone())}),
-                true,
-                0,
-                1,
-            ),
-            (
-                mask(json!({"type":"tls","protocol":mask(xhttp.clone())})),
-                true,
-                1,
-                1,
-            ),
+        for (protocol, secure, count) in [
+            (mask(xhttp.clone()), false, 1),
+            (mask(mask(xhttp.clone())), false, 2),
+            (mask(json!({"type":"tls","protocol":xhttp})), true, 1),
+            (mask(mask(json!({"type":"tls","protocol":xhttp}))), true, 2),
         ] {
             let config =
                 serde_json::from_value(json!({"address":"origin.example:443","protocol":protocol}))
@@ -853,8 +831,7 @@ mod tests {
             let (client, _) = super::super::connector::build(&config, resolver.clone())
                 .unwrap()
                 .unwrap();
-            assert_eq!(client.before_security_masks.len(), before);
-            assert_eq!(client.after_security_masks.len(), after);
+            assert_eq!(client.masks.len(), count);
             let request = client.request("session", None, false, Body::Empty).unwrap();
             assert_eq!(
                 request.uri().scheme_str(),

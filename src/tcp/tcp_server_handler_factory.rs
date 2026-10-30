@@ -500,9 +500,7 @@ fn create_tls_server_target(
             );
         }
         naive_alpn
-    } else if let ServerProxyConfig::Xhttp(config) =
-        crate::sudoku_mask::without_server_masks(&protocol)
-    {
+    } else if let ServerProxyConfig::Xhttp(config) = &protocol {
         config.tls_alpn(&alpn_protocols)?
     } else {
         alpn_protocols.into_vec()

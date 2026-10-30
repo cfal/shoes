@@ -84,17 +84,6 @@ pub fn contains(config: &ClientProxyConfig) -> bool {
 
 type ClientTransport = (Arc<Client>, Box<dyn TcpClientHandler>);
 
-fn peel_masks(
-    mut protocol: ClientProxyConfig,
-) -> io::Result<(Vec<Arc<crate::sudoku_mask::Prepared>>, ClientProxyConfig)> {
-    let mut masks = Vec::new();
-    while let ClientProxyConfig::SudokuMask(config) = protocol {
-        masks.push(config.prepare()?);
-        protocol = *config.protocol;
-    }
-    Ok((masks, protocol))
-}
-
 pub fn build(
     config: &ClientConfig,
     resolver: Arc<dyn Resolver>,
@@ -112,12 +101,16 @@ pub(crate) fn build_with_limits(
     if !contains(&config.protocol) {
         return Ok(None);
     }
-    crate::sudoku_mask::check_client_transport(&config.protocol, &config.transport)?;
+    crate::sudoku_mask::validate_client(&config.protocol, &config.transport)?;
     if config.transport == Transport::Udp {
         return Err(invalid("XHTTP requires TCP or QUIC transport"));
     }
-    let (before_security_masks, mut outer) = peel_masks(config.protocol.clone())?;
-    let mut after_security_masks = Vec::new();
+    let mut outer = config.protocol.clone();
+    let mut masks = Vec::new();
+    while let ClientProxyConfig::SudokuMask(config) = outer {
+        masks.push(config.prepare()?);
+        outer = *config.protocol;
+    }
     let default_sni = config.address.address().hostname().map(str::to_owned);
     let (xhttp, effective_sni, security, tls_alpn, reality) = match &mut outer {
         ClientProxyConfig::Xhttp(xhttp) => (
@@ -131,14 +124,13 @@ pub(crate) fn build_with_limits(
             false,
         ),
         ClientProxyConfig::Tls(tls) => {
-            let (masks, unmasked) = peel_masks(*tls.protocol.clone())?;
-            after_security_masks = masks;
-            let ClientProxyConfig::Xhttp(xhttp) = unmasked else {
+            let ClientProxyConfig::Xhttp(xhttp) = tls.protocol.as_ref() else {
                 return Err(invalid("XHTTP must be directly inside TLS"));
             };
             if tls.vision {
                 return Err(invalid("Vision cannot wrap XHTTP"));
             }
+            let xhttp = xhttp.clone();
             let sni = if tls.sni_hostname.is_unspecified() {
                 default_sni
             } else {
@@ -194,12 +186,9 @@ pub(crate) fn build_with_limits(
             vision,
             ..
         } => {
-            let (masks, unmasked) = peel_masks(std::mem::replace(
-                protocol.as_mut(),
-                ClientProxyConfig::PortForward,
-            ))?;
-            after_security_masks = masks;
-            let ClientProxyConfig::Xhttp(xhttp) = unmasked else {
+            let ClientProxyConfig::Xhttp(xhttp) =
+                std::mem::replace(protocol.as_mut(), ClientProxyConfig::PortForward)
+            else {
                 return Err(invalid("XHTTP must be directly inside REALITY"));
             };
             if *vision {
@@ -289,7 +278,7 @@ pub(crate) fn build_with_limits(
                 mode,
                 security,
             )?
-            .with_masks(before_security_masks, after_security_masks),
+            .with_masks(masks),
         ),
         inner,
     )))
@@ -299,6 +288,30 @@ pub(crate) fn build_with_limits(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn xhttp_rejects_masks_inside_security_and_logical_sessions() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
+        let xhttp = json!({"type":"xhttp","protocol":{"type":"socks"}});
+        for protocol in [
+            json!({"type":"tls","protocol":mask(xhttp.clone())}),
+            json!({"type":"reality","public_key":"unused","protocol":mask(xhttp)}),
+            json!({"type":"xhttp","protocol":mask(json!({"type":"socks"}))}),
+        ] {
+            for protocol in [protocol.clone(), mask(protocol)] {
+                let config = serde_json::from_value(json!({
+                    "address":"localhost:443","protocol":protocol
+                }))
+                .unwrap();
+                let error = build(&config, resolver.clone()).unwrap_err();
+                assert!(
+                    error.to_string().contains("outermost protocol layer"),
+                    "{error}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn ipv6_literal_endpoints_do_not_require_a_host_override() {

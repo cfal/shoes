@@ -17,18 +17,32 @@ use table::Mapping;
 
 pub(crate) use stream::SudokuStream;
 
-pub(crate) fn check_client_transport(
-    protocol: &ClientProxyConfig,
+pub(crate) fn validate_client(
+    mut protocol: &ClientProxyConfig,
     transport: &Transport,
 ) -> io::Result<()> {
-    check_transport(contains_client(protocol), transport)
+    check_transport(contains_client(protocol), transport)?;
+    while let ClientProxyConfig::SudokuMask(config) = protocol {
+        protocol = &config.protocol;
+    }
+    if contains_client(protocol) {
+        return Err(invalid("sudoku_mask must be an outermost protocol layer"));
+    }
+    Ok(())
 }
 
-pub(crate) fn check_server_transport(
-    protocol: &ServerProxyConfig,
+pub(crate) fn validate_server(
+    mut protocol: &ServerProxyConfig,
     transport: &Transport,
 ) -> io::Result<()> {
-    check_transport(contains_server(protocol), transport)
+    check_transport(contains_server(protocol), transport)?;
+    while let ServerProxyConfig::SudokuMask(config) = protocol {
+        protocol = &config.protocol;
+    }
+    if contains_server(protocol) {
+        return Err(invalid("sudoku_mask must be an outermost protocol layer"));
+    }
+    Ok(())
 }
 
 fn contains_client(protocol: &ClientProxyConfig) -> bool {
@@ -78,13 +92,6 @@ fn check_transport(present: bool, transport: &Transport) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-pub(crate) fn without_server_masks(mut protocol: &ServerProxyConfig) -> &ServerProxyConfig {
-    while let ServerProxyConfig::SudokuMask(config) = protocol {
-        protocol = &config.protocol;
-    }
-    protocol
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]

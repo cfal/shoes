@@ -672,10 +672,12 @@ rules: string | [RuleConfig]
 
 ## Sudoku TCP Mask
 
-`sudoku_mask` is a nested protocol wrapper for both TCP clients and servers. It
+`sudoku_mask` is an outer protocol wrapper for both TCP clients and servers. It
 implements Xray FinalMask Sudoku, not the standalone Sudoku tunnel protocol.
-It transforms bytes at its configured nesting position without changing the
-inner proxy protocol. Native UDP and QUIC hops reject masks anywhere in their
+It transforms the TCP carrier bytes without changing the inner proxy protocol.
+Masks must form a consecutive outermost prefix of each client hop or server
+listener. Masks beneath any non-mask protocol are rejected during configuration
+validation. Native UDP and QUIC hops reject masks anywhere in their
 protocol tree, including inside XHTTP. UDP/XUDP forwarded inside a supported
 TCP proxy stream remains supported.
 
@@ -717,21 +719,22 @@ entry in `custom_tables` selects entropy. Camel-case aliases `customTable`,
 `customTables`, `paddingMin`, and `paddingMax` are accepted. Unknown fields fail
 validation.
 
-Placement is literal, with the root closest to the wire:
+Placement matches Xray, with the root closest to the wire:
 
 - `mask -> TLS/REALITY -> VLESS`, `mask -> WebSocket -> VLESS`, and
   `mask -> TLS/REALITY -> XHTTP -> VLESS` match Xray's wire-outside placement.
-- `TLS -> mask -> VLESS` and `TLS -> mask -> XHTTP` are Shoes-to-Shoes
-  compositions. The latter masks HTTP framing inside TLS.
-- `XHTTP -> mask -> VLESS` masks each logical session, not HTTP headers.
-  Carrier masks instead persist once per pooled carrier, including new dials.
-- Stacked masks compose in nesting order, including at later chain hops and
-  in pools. Xray's public mask list `[A, B]` corresponds to Shoes root `B`
+- `TLS -> mask -> VLESS`, `TLS -> mask -> XHTTP`, and
+  `XHTTP -> mask -> VLESS` are rejected. Masks cannot be inserted inside TLS,
+  WebSocket, or an XHTTP logical session.
+- XHTTP masks wrap each TCP carrier before TLS/REALITY, if configured. Mask state
+  persists for the carrier's lifetime across pooled requests; new carriers start
+  with fresh state.
+- Consecutive outer masks compose in nesting order, including at later chain
+  hops and in pools. Xray's public mask list `[A, B]` corresponds to Shoes root `B`
   containing `A`. Use distinct matching options for each stage.
 
-Existing placement constraints still apply: do not insert a mask between legacy
-Vision's TLS/REALITY layer and its immediate VLESS child, or between TLS and
-NaiveProxy's immediate-child dispatch. An outer mask remains active during Vision
+Existing Vision and NaiveProxy immediate-child constraints still apply inside
+the outer masks. A mask remains active during Vision
 DIRECT and disables raw TCP splice. A mask outside REALITY also prevents
 unmasked probes from reaching its usual camouflage fallback. Masked TLS listeners
 cannot serve unmasked ACME TLS-ALPN-01 challenges.

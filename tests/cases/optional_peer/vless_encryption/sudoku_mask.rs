@@ -3,20 +3,11 @@ use shoes_test_support::{
     socks5::Socks5UdpAssociation, test_servers::start_udp_echo_server_with_suffix,
 };
 
-#[derive(Clone, Copy, Debug)]
-enum Position {
-    Outer,
-    InsideSecurity,
-    InsideXhttp,
-    AroundSecurity,
-}
-
 struct Case {
     peer: Kind,
     peer_client: bool,
     transport: Transport,
     masks: Vec<Value>,
-    position: Position,
     native: Option<&'static str>,
     vision: bool,
 }
@@ -28,7 +19,6 @@ impl Case {
             peer_client,
             transport,
             masks: vec![json!({"password":"outer","ascii":"ascii"})],
-            position: Position::Outer,
             native: None,
             vision: false,
         }
@@ -44,42 +34,12 @@ fn mask_protocol(protocol: &mut Value, masks: &[Value]) {
     }
 }
 
-fn inside_security(protocol: &mut Value, server: bool) -> &mut Value {
-    match protocol["type"].as_str().unwrap() {
-        "tls" if server => {
-            if protocol.get("default_target").is_some() {
-                &mut protocol["default_target"]["protocol"]
-            } else {
-                &mut protocol["reality_targets"]["localhost"]["protocol"]
-            }
-        }
-        "tls" | "reality" => &mut protocol["protocol"],
-        _ => protocol,
-    }
-}
-
 fn masked(kind: Kind, mut config: Value, server: bool, case: &Case) -> Value {
     match kind {
         Kind::Shoes => {
-            let mut protocol = shoes_protocol_mut(&mut config, server);
-            match case.position {
-                Position::Outer => {}
-                Position::InsideSecurity => protocol = inside_security(protocol, server),
-                Position::InsideXhttp => {
-                    protocol = inside_security(protocol, server);
-                    assert_eq!(protocol["type"], "xhttp");
-                    protocol = &mut protocol["protocol"];
-                }
-                Position::AroundSecurity => {
-                    mask_protocol(inside_security(protocol, server), &case.masks[1..]);
-                    mask_protocol(protocol, &case.masks[..1]);
-                    return config;
-                }
-            }
-            mask_protocol(protocol, &case.masks);
+            mask_protocol(shoes_protocol_mut(&mut config, server), &case.masks);
         }
         Kind::Xray => {
-            assert!(matches!(case.position, Position::Outer));
             let stream = &mut xray_endpoint_mut(&mut config, server)["streamSettings"];
             if stream.is_null() {
                 *stream = json!({"network":"tcp","security":"none"});
@@ -152,8 +112,8 @@ async fn transfer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 
 async fn run(case: Case) {
     eprintln!(
-        "Sudoku {:?} client={} {:?} {:?} native={:?} vision={}",
-        case.peer, case.peer_client, case.transport, case.position, case.native, case.vision
+        "Sudoku {:?} client={} {:?} native={:?} vision={}",
+        case.peer, case.peer_client, case.transport, case.native, case.vision
     );
     let (server_kind, client_kind) = peer_roles(case.peer, case.peer_client);
     let (encryption, decryption) = case
@@ -267,9 +227,7 @@ async fn run(case: Case) {
     {
         let all = captures.lock().unwrap();
         assert!(all.iter().any(|c| !c.is_empty()));
-        if matches!(case.position, Position::Outer | Position::AroundSecurity)
-            && case.masks[0]["ascii"] == "ascii"
-        {
+        if case.masks[0]["ascii"] == "ascii" {
             let downlink = downlink.lock().unwrap();
             assert!(downlink.iter().any(|bytes| !bytes.is_empty()));
             for bytes in all.iter().chain(downlink.iter()) {
@@ -279,10 +237,6 @@ async fn run(case: Case) {
                         .all(|b| *b == b'\n' || (0x20..=0x7e).contains(b)),
                     "unmasked wire bytes"
                 );
-            }
-        } else if matches!(case.position, Position::InsideSecurity) {
-            for bytes in all.iter().filter(|c| !c.is_empty()) {
-                assert_eq!(bytes[0], 0x16, "TLS must remain outside the mask");
             }
         }
     }
@@ -305,7 +259,7 @@ async fn run(case: Case) {
 }
 
 #[tokio::test]
-async fn shoes_tcp_stacking_and_inner_placements() {
+async fn shoes_tcp_outer_stacking() {
     for transport in [
         Transport::Raw,
         Transport::Tls,
@@ -316,56 +270,17 @@ async fn shoes_tcp_stacking_and_inner_placements() {
         case.masks.push(json!({"password":"distinct inner mapping","custom_tables":["xpxvvpvv","vxpvxvvp"],"padding_min":100}));
         run(case).await;
     }
-    let mut case = Case::new(Kind::Shoes, false, Transport::Tls);
-    case.position = Position::InsideSecurity;
-    run(case).await;
 }
 
 #[tokio::test]
-async fn shoes_xhttp_carriers_and_logical_sessions() {
+async fn shoes_xhttp_masked_carriers() {
     for version in ["plain", "h1", "h2c", "h2", "reality"] {
         for mode in ["packet-up", "stream-up", "stream-one"] {
-            run(Case::new(
-                Kind::Shoes,
-                false,
-                Transport::XhttpMode { version, mode },
-            ))
-            .await;
-        }
-    }
-    for position in [
-        Position::InsideSecurity,
-        Position::InsideXhttp,
-        Position::AroundSecurity,
-    ] {
-        for mode in ["packet-up", "stream-up", "stream-one"] {
-            let mut case = Case::new(
-                Kind::Shoes,
-                false,
-                Transport::XhttpMode {
-                    version: "h2",
-                    mode,
-                },
-            );
-            case.position = position;
-            if matches!(position, Position::AroundSecurity) {
-                case.masks.push(json!({"password":"inside TLS","custom_tables":["","vxpvxvvp"],"padding_min":100}));
-            }
+            let mut case = Case::new(Kind::Shoes, false, Transport::XhttpMode { version, mode });
+            case.masks.push(json!({"password":"distinct carrier mapping","custom_tables":["","vxpvxvvp"],"padding_min":100}));
             run(case).await;
         }
     }
-    let mut case = Case::new(
-        Kind::Shoes,
-        false,
-        Transport::XhttpMode {
-            version: "reality",
-            mode: "stream-one",
-        },
-    );
-    case.position = Position::AroundSecurity;
-    case.masks
-        .push(json!({"password":"inside REALITY","custom_table":"xpxvvpvv"}));
-    run(case).await;
 }
 
 #[tokio::test]

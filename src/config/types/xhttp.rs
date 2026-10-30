@@ -518,7 +518,7 @@ pub(crate) fn validate_server_transport(
     protocol: &ServerProxyConfig,
     transport: &super::Transport,
 ) -> io::Result<()> {
-    crate::sudoku_mask::check_server_transport(protocol, transport)?;
+    crate::sudoku_mask::validate_server(protocol, transport)?;
     match protocol {
         ServerProxyConfig::SudokuMask(config) => {
             validate_server_transport(&config.protocol, transport)?
@@ -547,9 +547,7 @@ pub(crate) fn validate_server_transport(
                 .values()
                 .chain(default_tls_target.iter().map(|target| target.as_ref()))
             {
-                if let ServerProxyConfig::Xhttp(config) =
-                    crate::sudoku_mask::without_server_masks(&target.protocol)
-                {
+                if let ServerProxyConfig::Xhttp(config) = &target.protocol {
                     config.tls_alpn(&target.alpn_protocols)?;
                 }
                 validate_server_transport(&target.protocol, transport)?;
@@ -561,8 +559,7 @@ pub(crate) fn validate_server_transport(
                 validate_server_transport(&target.protocol, transport)?;
             }
             for target in reality_targets.values() {
-                if let ServerProxyConfig::Xhttp(config) =
-                    crate::sudoku_mask::without_server_masks(&target.protocol)
+                if let ServerProxyConfig::Xhttp(config) = &target.protocol
                     && !matches!(config.http_version, XhttpVersion::Auto | XhttpVersion::H2)
                 {
                     return Err(invalid("REALITY XHTTP requires H2"));

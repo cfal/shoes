@@ -1032,7 +1032,7 @@ fn validate_server_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
-    crate::sudoku_mask::check_server_transport(&server_config.protocol, &server_config.transport)?;
+    crate::sudoku_mask::validate_server(&server_config.protocol, &server_config.transport)?;
     if let ServerProxyConfig::Wireguard(config) = &server_config.protocol {
         if server_config.transport != Transport::Udp
             || server_config.tcp_settings.is_some()
@@ -1384,7 +1384,7 @@ fn validate_client_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
-    crate::sudoku_mask::check_client_transport(&client_config.protocol, &client_config.transport)?;
+    crate::sudoku_mask::validate_client(&client_config.protocol, &client_config.transport)?;
     client_config.validate_quic_key_exchange(true)?;
     if let ClientProxyConfig::Wireguard(config) = &mut client_config.protocol {
         if client_config.transport != Transport::Udp

@@ -401,9 +401,9 @@ mod tests {
         let protocol = serde_json::from_value(serde_json::json!({
             "type": "sudoku_mask",
             "protocol": {
-                "type": "tls",
+                "type": "sudoku_mask",
                 "protocol": {
-                    "type": "sudoku_mask",
+                    "type": "tls",
                     "protocol": {"type": "socks"}
                 }
             }
