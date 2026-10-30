@@ -24,6 +24,18 @@ fn spec(redirect: bool) -> Spec {
         .unwrap()
 }
 
+fn validated_configuration(
+    config: crate::config::TunConfig,
+) -> io::Result<(crate::config::TunConfig, Spec)> {
+    let mut validated =
+        crate::config::create_server_configs(vec![crate::config::Config::TunServer(config)])?;
+    let spec = Spec::from_configs(&validated.configs)?.unwrap();
+    let crate::config::Config::TunServer(config) = validated.configs.remove(0) else {
+        unreachable!()
+    };
+    Ok((config, spec))
+}
+
 #[test]
 fn managed_configuration_is_explicit_dual_stack_and_restart_identifiable() {
     let base = configuration(false);
@@ -635,13 +647,7 @@ async fn kernel_capture() -> io::Result<()> {
             {"masks":["10.233.0.0/30", "fd73::/126"], "action":"allow"},
             {"masks":["0.0.0.0/0", "::/0"], "action":"allow", "override_address":format!("127.0.0.1:{port}")}
         ]);
-        let config: crate::config::TunConfig = serde_json::from_value(config)?;
-        let mut validated =
-            crate::config::create_server_configs(vec![crate::config::Config::TunServer(config)])?;
-        let spec = Spec::from_configs(&validated.configs)?.unwrap();
-        let crate::config::Config::TunServer(config) = validated.configs.remove(0) else {
-            unreachable!()
-        };
+        let (config, spec) = validated_configuration(serde_json::from_value(config)?)?;
         let mut session = Session::prepare(spec).await?;
         session.prepare_network().await?;
         let ingress = session.ingress().unwrap();
@@ -1289,14 +1295,7 @@ async fn managed_dns_egress(redirect: bool, ipv6: bool) -> io::Result<()> {
          "override_address": format!("{hostname}:{port}")},
         {"masks": ["0.0.0.0/0", "::/0"], "action": "allow"}
     ]);
-    let mut validated =
-        crate::config::create_server_configs(vec![crate::config::Config::TunServer(
-            serde_json::from_value(config)?,
-        )])?;
-    let spec = Spec::from_configs(&validated.configs)?.unwrap();
-    let crate::config::Config::TunServer(config) = validated.configs.remove(0) else {
-        unreachable!()
-    };
+    let (config, spec) = validated_configuration(serde_json::from_value(config)?)?;
     let mut session = Session::prepare(spec).await?;
     session.prepare_network().await?;
     let mut registry = crate::dns::DnsRegistry::new();
@@ -1329,10 +1328,10 @@ async fn managed_dns_egress(redirect: bool, ipv6: bool) -> io::Result<()> {
             observed
         );
     }
-    for (label, tcp_client) in [
-        ("udp-only", false),
-        ("fallback-udp", false),
-        ("fallback-tcp", true),
+    for (label, tcp_client, answer, transports) in [
+        ("udp-only", false, "udp-only", vec![false]),
+        ("fallback-udp", false, "tcp-only", vec![false, true]),
+        ("fallback-tcp", true, "tcp-only", vec![false, true]),
     ] {
         let name = format!("{label}-{redirect}-{ipv6}.test.");
         let mut query = Message::query();
@@ -1371,29 +1370,15 @@ async fn managed_dns_egress(redirect: bool, ipv6: bool) -> io::Result<()> {
         assert_eq!(reply.answers.len(), 1);
         assert_eq!(
             reply.answers[0].data,
-            RData::TXT(rdata::TXT::new(vec![
-                if label == "udp-only" {
-                    "udp-only"
-                } else {
-                    "tcp-only"
-                }
-                .into(),
-            ]))
+            RData::TXT(rdata::TXT::new(vec![answer.into()]))
         );
-        let transports: Vec<_> = observed
+        let seen: Vec<_> = observed
             .lock()
             .iter()
             .filter(|(question, _)| question == &name)
             .map(|(_, tcp)| *tcp)
             .collect();
-        assert_eq!(
-            transports,
-            if label == "udp-only" {
-                vec![false]
-            } else {
-                vec![false, true]
-            }
-        );
+        assert_eq!(seen, transports);
         if redirect && tcp_client {
             assert!(
                 redirect_counts(&session).await?[usize::from(ipv6)] > counts[usize::from(ipv6)]
@@ -1448,12 +1433,7 @@ async fn resolved_integration(udp_limit: usize, redirect: bool) -> io::Result<()
     config.auto_dns = Some(true);
     config.resource_limits.max_udp_destinations = Some(udp_limit);
     config.resource_limits.max_tcp_connections = Some(1);
-    let mut validated =
-        crate::config::create_server_configs(vec![crate::config::Config::TunServer(config)])?;
-    let spec = Spec::from_configs(&validated.configs)?.unwrap();
-    let crate::config::Config::TunServer(config) = validated.configs.remove(0) else {
-        unreachable!()
-    };
+    let (config, spec) = validated_configuration(config)?;
     let mut session = Session::prepare(spec).await?;
     session.prepare_network().await?;
     let ingress = session.ingress().unwrap();
@@ -1901,6 +1881,10 @@ async fn redirect_counts(session: &Session) -> io::Result<[u64; 2]> {
 
 async fn process_recovery(port: u16, redirect: bool) -> io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    fn signal(child: &tokio::process::Child, signal: libc::c_int) {
+        assert_eq!(unsafe { libc::kill(child.id().unwrap() as i32, signal) }, 0);
+    }
+
     let mut config = serde_json::to_value(configuration(redirect))?;
     if std::env::var_os("SHOES_RESOLVED_ROOT").is_some() {
         config["auto_dns"] = json!(true);
@@ -2012,7 +1996,7 @@ async fn process_recovery(port: u16, redirect: bool) -> io::Result<()> {
     }));
     let (connection, handle, _) = rtnetlink::new_connection().map_err(io::Error::other)?;
     let _connection = AbortOnDropHandle::new(tokio::spawn(connection));
-    for signal in [libc::SIGTERM, libc::SIGKILL] {
+    for shutdown_signal in [libc::SIGTERM, libc::SIGKILL] {
         write(&config)?;
         let mut child = tokio::process::Command::new(std::env::current_exe()?)
             .env("SHOES_MANAGED_PROCESS_CONFIG", path)
@@ -2038,10 +2022,7 @@ async fn process_recovery(port: u16, redirect: bool) -> io::Result<()> {
         let mut changed = config.clone();
         changed["mtu"] = json!(1400);
         write(&changed)?;
-        assert_eq!(
-            unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGHUP) },
-            0
-        );
+        signal(&child, libc::SIGHUP);
         line(&mut stderr, "Reload rejected; current servers retained").await?;
         captured(port, b"process").await?;
         let mut candidate = config.clone();
@@ -2055,10 +2036,7 @@ async fn process_recovery(port: u16, redirect: bool) -> io::Result<()> {
             ])
             .map_err(io::Error::other)?,
         )?;
-        assert_eq!(
-            unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGHUP) },
-            0
-        );
+        signal(&child, libc::SIGHUP);
         line(&mut stderr, "Reload rejected; previous servers restored").await?;
         // Both the failed candidate and rollback must start the retained TUN.
         for _ in 0..2 {
@@ -2068,18 +2046,12 @@ async fn process_recovery(port: u16, redirect: bool) -> io::Result<()> {
         assert_eq!(identity()?, original_identity);
         captured(port, b"process").await?;
         write(&candidate)?;
-        assert_eq!(
-            unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGHUP) },
-            0
-        );
+        signal(&child, libc::SIGHUP);
         line(&mut stdout, "Servers ready").await?;
         assert_eq!(identity()?, original_identity);
         captured(port, b"changed").await?;
         write(&config)?;
-        assert_eq!(
-            unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGHUP) },
-            0
-        );
+        signal(&child, libc::SIGHUP);
         line(&mut stdout, "Servers ready").await?;
         assert_eq!(
             routes::link(&handle, "shoes0").await?.unwrap().header.index,
@@ -2087,11 +2059,11 @@ async fn process_recovery(port: u16, redirect: bool) -> io::Result<()> {
         );
         assert_eq!(identity()?, original_identity);
         captured(port, b"process").await?;
-        assert_eq!(unsafe { libc::kill(child.id().unwrap() as i32, signal) }, 0);
+        signal(&child, shutdown_signal);
         let status = tokio::time::timeout(Duration::from_secs(15), child.wait()).await??;
-        assert_eq!(status.success(), signal == libc::SIGTERM);
+        assert_eq!(status.success(), shutdown_signal == libc::SIGTERM);
         assert!(routes::link(&handle, "shoes0").await?.is_none());
-        if signal == libc::SIGTERM {
+        if shutdown_signal == libc::SIGTERM {
             assert!(Journal::lock()?.load()?.is_none());
             assert_no_owned_firewall()?;
         }
