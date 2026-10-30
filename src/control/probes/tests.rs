@@ -87,7 +87,6 @@ async fn automatic_probes_use_declared_chains_not_callers_and_keep_group_setting
                 &service.runtime,
                 &generation,
                 members,
-                now,
                 &epoch,
             )
         );
@@ -342,7 +341,7 @@ async fn url_test_other_url_eviction_does_not_change_admission() {
         advance_rounds(2).await;
         assert_eq!(
             *resolver.calls.lock(),
-            ["auto-1.invalid"],
+            ["auto-0.invalid", "auto-1.invalid"],
             "filtered={filtered}"
         );
         let automatic = &generation.catalog.selection.automatic.0["auto"];
@@ -457,7 +456,7 @@ async fn url_test_different_intervals_do_not_starve_a_due_group() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn url_test_unadmitted_round_does_not_skip_members_on_the_next_round() {
+async fn url_test_concurrent_rounds_eventually_check_all_members() {
     let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
     let resolver = Arc::new(ScheduledAnswers::default());
     let generation =
@@ -493,7 +492,7 @@ async fn url_test_slow_group_does_not_block_short_intervals() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn url_test_queued_group_gets_a_full_budget_on_a_later_round() {
+async fn url_test_queued_group_gets_a_full_timeout_in_the_same_round() {
     let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
     let resolver = Arc::new(ScheduledAnswers {
         delays: (0..16)
@@ -509,12 +508,12 @@ async fn url_test_queued_group_gets_a_full_budget_on_a_later_round() {
         .record("b-0", "http://probe.invalid/", Some(5));
     service.runtime.publish(generation.clone()).await.unwrap();
     service.runtime.resume().await.unwrap();
-    advance_rounds(2).await;
+    advance_rounds(1).await;
     assert_eq!(
         generation.catalog.selection.automatic.0["b"].health("b-0"),
         "healthy"
     );
-    advance_rounds(10).await;
+    advance_rounds(1).await;
     assert_eq!(
         generation.catalog.selection.automatic.0["b"].health("b-0"),
         "dead"
@@ -573,7 +572,7 @@ async fn url_test_unchecked_groups_use_catalog_order_for_admission_ties() {
     );
     service.runtime.publish(generation).await.unwrap();
     service.runtime.resume().await.unwrap();
-    advance_rounds(1).await;
+    tokio::task::yield_now().await;
     assert!(
         resolver
             .calls
@@ -686,7 +685,7 @@ async fn url_test_canceled_api_group_cannot_adopt_a_resumed_epoch() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn url_test_canceled_round_cannot_finish_or_advance_admission() {
+async fn url_test_canceled_round_stops_waiting_for_admission_and_can_restart() {
     let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
     let generation = automatic_generation(1, 16, Arc::new(PendingAnswers::default()));
     publish_for_api_probes(&service.runtime, &generation).await;
@@ -703,20 +702,90 @@ async fn url_test_canceled_round_cannot_finish_or_advance_admission() {
         &service.runtime,
         &generation,
         members,
-        now,
         &epoch,
     ));
     assert!(futures::poll!(&mut round).is_pending());
     service.runtime.begin_activation(&generation).await.unwrap();
-    drop(occupied);
     round.await;
-    assert!(group.last_unqueued_admission().is_none());
+    assert!(generation.probes.history.lock().is_empty());
+    assert!(group.due_members(tokio::time::Instant::now()).is_some());
+    drop(occupied);
+    service.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn url_test_waiting_checks_use_current_choices_and_fence_inflight_results() {
+    use crate::control::selection::SelectionOwner;
+
+    let catalog = crate::config::create_server_configs(
+        serde_json::from_value(json!([
+            {"client_group":"manual","type":"selector","client_chains":[
+                {"name":"a","address":"a.invalid:80","protocol":{"type":"http"}},
+                {"name":"b","address":"b.invalid:80","protocol":{"type":"http"}}
+            ]},
+            {"client_group":"auto","type":"url-test","url":"http://probe.invalid/",
+             "timeout":1000,"client_chains":["manual"]}
+        ]))
+        .unwrap(),
+    )
+    .unwrap()
+    .catalog
+    .unwrap();
+    let resolver = Arc::new(ScheduledAnswers::default());
+    let generation = Arc::new(generation(catalog, resolver.clone()));
+    let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+    publish_for_api_probes(&service.runtime, &generation).await;
+    let mut owner = SelectionOwner::new(None).unwrap();
+    owner
+        .activate(generation.catalog.selection.clone())
+        .unwrap();
+    let group = &generation.catalog.selection.automatic.0["auto"];
+    let epoch = service.runtime.probe_epoch();
+    let held = service.runtime.probes.acquire_many(16).await.unwrap();
+    let mut round = Box::pin(run_automatic_round(
+        AutomaticRound {
+            group,
+            completed: false,
+        },
+        &service.runtime,
+        &generation,
+        group.due_members(tokio::time::Instant::now()).unwrap(),
+        &epoch,
+    ));
+    assert!(futures::poll!(&mut round).is_pending());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(futures::poll!(&mut round).is_pending());
+    assert!(resolver.calls.lock().is_empty());
+    owner.select("manual", "b").unwrap();
+    drop(held);
+    assert!(futures::poll!(&mut round).is_pending());
+    assert_eq!(*resolver.calls.lock(), ["b.invalid"]);
+    tokio::time::advance(Duration::from_millis(900)).await;
+    assert!(futures::poll!(&mut round).is_pending());
+    round.await;
+    assert_eq!(group.health("manual"), "dead");
+
+    let mut round = Box::pin(run_automatic_round(
+        AutomaticRound {
+            group,
+            completed: false,
+        },
+        &service.runtime,
+        &generation,
+        group.due_members(tokio::time::Instant::now()).unwrap(),
+        &epoch,
+    ));
+    assert!(futures::poll!(&mut round).is_pending());
+    owner.select("manual", "a").unwrap();
+    owner.select("manual", "b").unwrap();
+    round.await;
+    assert_eq!(group.health("manual"), "unprobed");
     assert!(group.due_members(tokio::time::Instant::now()).is_some());
     service.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn url_test_late_admission_timeout_does_not_overwrite_health() {
+async fn url_test_late_admission_has_a_full_automatic_timeout_but_a_shared_api_deadline() {
     for automatic in [false, true] {
         let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
         let resolver = Arc::new(ScheduledAnswers {
@@ -757,9 +826,12 @@ async fn url_test_late_admission_timeout_does_not_overwrite_health() {
         );
         assert_eq!(
             generation.catalog.selection.automatic.0["auto"].health("auto-16"),
-            "healthy"
+            if automatic { "dead" } else { "healthy" }
         );
-        assert!(!generation.probes.history.lock().contains_key("auto-16"));
+        assert_eq!(
+            generation.probes.history.lock().contains_key("auto-16"),
+            automatic
+        );
         service.shutdown().await;
     }
 }
@@ -1106,7 +1178,7 @@ impl Resolver for TrackedAnswers {
 }
 
 #[tokio::test(start_paused = true)]
-async fn url_test_automatic_deadline_bounds_concurrency_and_does_not_poison_queued_members() {
+async fn url_test_automatic_round_gives_every_batch_a_full_timeout_with_bounded_concurrency() {
     let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
     let resolver = Arc::new(TrackedAnswers::default());
     let generation = automatic_generation(1, 32, resolver.clone());
@@ -1114,17 +1186,74 @@ async fn url_test_automatic_deadline_bounds_concurrency_and_does_not_poison_queu
     service.runtime.resume().await.unwrap();
     resolver.wait(16, 16).await;
     tokio::time::advance(Duration::from_secs(1)).await;
-    resolver.wait(16, 0).await;
+    resolver.wait(32, 16).await;
     assert_eq!(generation.probes.history.lock().len(), 16);
     let group = &generation.catalog.selection.automatic.0["auto"];
     assert_eq!(group.health("member-0"), "dead");
     assert_eq!(group.health("member-31"), "unprobed");
-    assert_eq!(service.runtime.probes.available_permits(), 16);
-    tokio::time::advance(Duration::from_secs(9)).await;
-    resolver.wait(32, 16).await;
-    service.shutdown().await;
-    resolver.wait(32, 0).await;
+    assert_eq!(service.runtime.probes.available_permits(), 0);
+    tokio::time::advance(Duration::from_millis(900)).await;
     assert_eq!(group.health("member-31"), "unprobed");
+    tokio::time::advance(Duration::from_millis(100)).await;
+    resolver.wait(32, 0).await;
+    assert_eq!(group.health("member-31"), "dead");
+    assert_eq!(generation.probes.history.lock().len(), 32);
+    assert!(generation.probes.full_budget_attempts.lock().is_empty());
+    assert_eq!(service.runtime.probes.available_permits(), 16);
+    service.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn url_test_midround_invalidation_rechecks_only_after_the_active_round_finishes() {
+    let catalog = crate::config::create_server_configs(
+        serde_json::from_value(json!([
+            {"client_group":"auto","type":"url-test","url":"http://probe.invalid/",
+             "interval":10,"timeout":1000,"client_chains":[
+                {"name":"a","protocol":{"type":"direct"}},
+                {"name":"b","protocol":{"type":"direct"}}
+             ]},
+        {"client_group":"manual","type":"selector","client_chains":["direct","auto"]}
+        ]))
+        .unwrap(),
+    )
+    .unwrap()
+    .catalog
+    .unwrap();
+    let resolver = Arc::new(TrackedAnswers::default());
+    let generation = Arc::new(generation(catalog, resolver.clone()));
+    let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+    let held = service
+        .runtime
+        .probes
+        .clone()
+        .acquire_many_owned(15)
+        .await
+        .unwrap();
+    service.runtime.publish(generation.clone()).await.unwrap();
+    service.runtime.resume().await.unwrap();
+    resolver.wait(1, 1).await;
+    service
+        .runtime
+        .select(1, "manual".into(), "auto".into())
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    resolver.wait(2, 1).await;
+    let group = &generation.catalog.selection.automatic.0["auto"];
+    assert_eq!(group.health("a"), "unprobed");
+    assert_eq!(group.health("b"), "unprobed");
+    tokio::time::advance(Duration::from_millis(900)).await;
+    assert_eq!(
+        resolver.started.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    resolver.wait(3, 1).await;
+    assert_eq!(group.health("a"), "unprobed");
+    assert_eq!(group.health("b"), "dead");
+    service.shutdown().await;
+    resolver.wait(3, 0).await;
+    drop(held);
     assert_eq!(service.runtime.probes.available_permits(), 16);
 }
 
@@ -1152,8 +1281,9 @@ async fn url_test_automatic_capacity_exhaustion_is_not_remote_failure() {
         resolver.started.load(std::sync::atomic::Ordering::Relaxed),
         0
     );
-    drop(permits);
     service.shutdown().await;
+    drop(permits);
+    assert_eq!(service.runtime.probes.available_permits(), 16);
 }
 
 #[tokio::test]
