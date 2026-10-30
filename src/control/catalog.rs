@@ -321,13 +321,6 @@ impl Catalog {
                     .collect();
                 match &group.group_type {
                     GroupType::Selector => {
-                        let has_unnamed_member = group
-                            .client_chains
-                            .iter()
-                            .any(|member| member.explicit_name().is_none());
-                        if has_unnamed_member {
-                            return Err(invalid("inline selector members require explicit names"));
-                        }
                         definitions.insert(
                             group.client_group.clone(),
                             SelectorDefinition {
