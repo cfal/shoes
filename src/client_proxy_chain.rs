@@ -92,7 +92,6 @@ impl InitialHopEntry {
 /// - `subsequent_hops`: Protocol connectors for hops 1+ (no socket creation needed)
 pub struct ClientProxyChain {
     composition: Option<Arc<composition::Composition>>,
-    automatic_contexts: Vec<Arc<crate::control::url_test::context::Context>>,
     origins: Vec<Vec<Option<MemberOrigin>>>,
     selection: Option<Arc<crate::control::selection::SelectionView>>,
     selector_hops: Vec<bool>,
@@ -162,13 +161,11 @@ impl ClientProxyChain {
         hops: crate::option_util::OneOrSome<crate::config::ClientChainHop>,
         resolver: Arc<dyn Resolver>,
         limits: crate::config::GlobalLimits,
-        standalone: bool,
     ) -> std::io::Result<Self> {
-        let composition = composition::Composition::build(hops, resolver, limits, standalone)?;
+        let composition = composition::Composition::build(hops, resolver, limits)?;
         Ok(Self {
             selection: composition.selection().cloned(),
             composition: Some(composition),
-            automatic_contexts: Vec::new(),
             origins: Vec::new(),
             selector_hops: Vec::new(),
             initial_hop: Vec::new(),
@@ -297,22 +294,12 @@ impl ClientProxyChain {
     }
 
     #[cfg(test)]
-    fn test_health_paths(&self) -> Vec<HealthPath> {
-        self.composition.as_ref().map_or_else(
-            || self.health_paths.clone(),
-            |composition| composition.test_health_paths(),
-        )
-    }
-
-    #[cfg(test)]
     fn test_record_automatic(&self, member: &str, url: &str, delay: Option<u16>) {
-        for context in self.composition.as_ref().unwrap().test_contexts() {
-            if context.group.config.url == url
-                && let Some(index) = context.group.members.iter().position(|name| name == member)
-            {
-                context.record(index, context.revision(), delay);
-            }
-        }
+        self.selection
+            .as_ref()
+            .unwrap()
+            .automatic
+            .record(member, url, delay);
     }
 
     fn origin(&self, hop: usize, index: usize) -> Option<&MemberOrigin> {
@@ -320,9 +307,6 @@ impl ClientProxyChain {
     }
 
     fn touch_automatic(&self, indices: &[usize], failed: bool) {
-        for context in &self.automatic_contexts {
-            context.touch(failed);
-        }
         if self
             .selection
             .as_ref()
@@ -436,7 +420,6 @@ impl ClientProxyChain {
 
         Self {
             composition: None,
-            automatic_contexts: Vec::new(),
             origins: Vec::new(),
             selection: None,
             selector_hops: Vec::new(),

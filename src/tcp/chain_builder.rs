@@ -54,7 +54,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
         .iter()
         .any(|hop| matches!(hop, ClientChainHop::Choice(_)))
     {
-        return ClientProxyChain::composed(client_chain, resolver, limits, false);
+        return ClientProxyChain::composed(client_chain, resolver, limits);
     }
     let hops: Vec<Vec<ClientConfig>> = client_chain
         .into_vec()
