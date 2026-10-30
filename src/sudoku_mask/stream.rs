@@ -5,7 +5,6 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use futures::task::{ArcWake, AtomicWaker, waker_ref};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream};
@@ -17,19 +16,6 @@ use super::{
 
 const WIRE_CAPACITY: usize = 32 * 1024;
 const READ_BUDGET: usize = 64 * 1024;
-
-#[derive(Default)]
-struct StreamWake {
-    reader: AtomicWaker,
-    writer: AtomicWaker,
-}
-
-impl ArcWake for StreamWake {
-    fn wake_by_ref(this: &Arc<Self>) {
-        this.reader.wake();
-        this.writer.wake();
-    }
-}
 
 struct Failure {
     kind: io::ErrorKind,
@@ -48,9 +34,10 @@ impl Failure {
     }
 }
 
+/// Writes may buffer output; callers must flush before waiting for a response.
+/// Reads only drive input.
 pub(crate) struct SudokuStream {
     inner: Box<dyn AsyncStream>,
-    wake: Arc<StreamWake>,
     encoder: Encoder,
     decoder: Decoder,
     read_wire: Box<[u8]>,
@@ -69,7 +56,6 @@ impl SudokuStream {
     pub fn new(inner: Box<dyn AsyncStream>, config: Arc<Prepared>, role: Role) -> Self {
         Self {
             inner,
-            wake: Arc::default(),
             encoder: Encoder::new(config.clone(), role),
             decoder: Decoder::new(config, role),
             read_wire: vec![0; WIRE_CAPACITY].into_boxed_slice(),
@@ -123,19 +109,6 @@ impl AsyncRead for SudokuStream {
         let this = self.get_mut();
         if output.remaining() == 0 {
             return Poll::Ready(Ok(()));
-        }
-        // Reads also drive writes; a single transport waker must notify both split tasks.
-        let wake = this.wake.clone();
-        wake.reader.register(cx.waker());
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
-        // Handshakes can switch to reading after write_all without an explicit flush.
-        // Drive accepted wire bytes, but never block reading on a stalled writer.
-        let pending = this.write_start < this.write_end;
-        let start = this.write_start;
-        let drained = this.poll_drain(cx);
-        if pending && (drained.is_ready() || start != this.write_start) {
-            wake.writer.wake();
         }
         let initial = output.filled().len();
         let mut work = 0;
@@ -191,10 +164,6 @@ impl AsyncWrite for SudokuStream {
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let wake = this.wake.clone();
-        wake.writer.register(cx.waker());
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
         if this.shutdown {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
@@ -213,10 +182,6 @@ impl AsyncWrite for SudokuStream {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let wake = this.wake.clone();
-        wake.writer.register(cx.waker());
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
         ready!(this.poll_drain(cx))?;
         match ready!(Pin::new(&mut this.inner).poll_flush(cx)) {
             Ok(()) => Poll::Ready(Ok(())),
@@ -229,9 +194,6 @@ impl AsyncWrite for SudokuStream {
             return Poll::Ready(Ok(()));
         }
         ready!(self.as_mut().poll_flush(cx))?;
-        let wake = self.wake.clone();
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
         ready!(Pin::new(&mut self.inner).poll_shutdown(cx))?;
         self.shutdown = true;
         Poll::Ready(Ok(()))
@@ -244,10 +206,6 @@ impl AsyncPing for SudokuStream {
     }
     fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         let this = self.get_mut();
-        let wake = this.wake.clone();
-        wake.writer.register(cx.waker());
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
         ready!(this.poll_drain(cx))?;
         Pin::new(&mut this.inner).poll_write_ping(cx)
     }
@@ -303,7 +261,13 @@ mod tests {
     struct State {
         reads: VecDeque<Read>,
         writes: VecDeque<Write>,
+        read_waker: Option<std::task::Waker>,
         write_waker: Option<std::task::Waker>,
+        read_polls: usize,
+        write_polls: usize,
+        flush_blocked: bool,
+        shutdown_blocked: bool,
+        ping_blocked: bool,
         sent: Vec<u8>,
         events: Vec<&'static str>,
     }
@@ -311,10 +275,11 @@ mod tests {
     impl AsyncRead for Script {
         fn poll_read(
             self: Pin<&mut Self>,
-            _: &mut Context<'_>,
+            cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             let mut state = self.0.lock().unwrap();
+            state.read_polls += 1;
             match state.reads.pop_front().unwrap_or(Read::Pending) {
                 Read::Bytes(bytes) => {
                     let n = bytes.len().min(buf.remaining());
@@ -324,7 +289,10 @@ mod tests {
                     }
                     Poll::Ready(Ok(()))
                 }
-                Read::Pending => Poll::Pending,
+                Read::Pending => {
+                    state.read_waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
                 Read::Error => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
                 Read::Eof => Poll::Ready(Ok(())),
             }
@@ -337,6 +305,7 @@ mod tests {
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
             let mut state = self.0.lock().unwrap();
+            state.write_polls += 1;
             match state.writes.pop_front().unwrap_or(Write::Count(usize::MAX)) {
                 Write::Count(n) => {
                     let n = n.min(buf.len());
@@ -350,12 +319,22 @@ mod tests {
                 Write::Error => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
             }
         }
-        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.0.lock().unwrap().events.push("flush");
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("flush");
+            if state.flush_blocked {
+                state.write_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
             Poll::Ready(Ok(()))
         }
-        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.0.lock().unwrap().events.push("shutdown");
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("shutdown");
+            if state.shutdown_blocked {
+                state.write_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
             Poll::Ready(Ok(()))
         }
     }
@@ -363,8 +342,13 @@ mod tests {
         fn supports_ping(&self) -> bool {
             true
         }
-        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
-            self.0.lock().unwrap().events.push("ping");
+        fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("ping");
+            if state.ping_blocked {
+                state.write_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
             Poll::Ready(Ok(true))
         }
     }
@@ -389,145 +373,180 @@ mod tests {
         out
     }
 
-    #[test]
-    fn split_tasks_keep_write_readiness_after_read_drains_or_is_cancelled() {
-        #[derive(Clone, Copy, Debug)]
-        enum Operation {
-            Write,
-            Flush,
-            Shutdown,
-            Ping,
-        }
-        fn write_side(
-            stream: &mut SudokuStream,
-            cx: &mut Context<'_>,
-            operation: Operation,
-        ) -> Poll<io::Result<()>> {
-            match operation {
-                Operation::Write => Pin::new(stream)
+    #[derive(Clone, Copy, Debug)]
+    enum Operation {
+        Write,
+        WriteVectored,
+        Flush,
+        Shutdown,
+        Ping,
+    }
+
+    impl Operation {
+        fn poll(self, stream: &mut SudokuStream, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match self {
+                Self::Write => Pin::new(stream)
                     .poll_write(cx, b"next")
                     .map(|r| r.map(|_| ())),
-                Operation::Flush => Pin::new(stream).poll_flush(cx),
-                Operation::Shutdown => Pin::new(stream).poll_shutdown(cx),
-                Operation::Ping => Pin::new(stream).poll_write_ping(cx).map(|r| r.map(|_| ())),
-            }
-        }
-        for operation in [
-            Operation::Write,
-            Operation::Flush,
-            Operation::Shutdown,
-            Operation::Ping,
-        ] {
-            for (drain_immediately, cancel_reader) in [(false, false), (false, true), (true, false)]
-            {
-                let (mut stream, state) = scripted(Role::Client);
-                state
-                    .lock()
-                    .unwrap()
-                    .writes
-                    .extend([Write::Pending, Write::Pending]);
-                if !drain_immediately {
-                    state.lock().unwrap().writes.push_back(Write::Pending);
-                }
-                let writer = Arc::new(WakeCounter(AtomicUsize::new(0)));
-                let reader = Arc::new(WakeCounter(AtomicUsize::new(0)));
-                let (write_waker, read_waker) = (writer.clone().into(), reader.clone().into());
-                let mut write_cx = Context::from_waker(&write_waker);
-                let mut read_cx = Context::from_waker(&read_waker);
-                assert!(matches!(
-                    Pin::new(&mut stream).poll_write(&mut write_cx, b"one"),
-                    Poll::Ready(Ok(3))
-                ));
-                assert!(write_side(&mut stream, &mut write_cx, operation).is_pending());
-                assert_eq!(writer.0.load(Ordering::Relaxed), 0);
-                assert!(
-                    Pin::new(&mut stream)
-                        .poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0]))
-                        .is_pending()
-                );
-                if !drain_immediately {
-                    assert_eq!(writer.0.load(Ordering::Relaxed), 0);
-                    let readiness = state.lock().unwrap().write_waker.take().unwrap();
-                    readiness.wake();
-                    assert!(reader.0.load(Ordering::Relaxed) > 0);
-                }
-                assert!(
-                    writer.0.load(Ordering::Relaxed) > 0,
-                    "writer lost readiness; operation {operation:?}"
-                );
-                if !cancel_reader && !drain_immediately {
-                    assert!(
-                        Pin::new(&mut stream)
-                            .poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0]))
-                            .is_pending()
-                    );
-                }
-                assert!(matches!(
-                    write_side(&mut stream, &mut write_cx, operation),
-                    Poll::Ready(Ok(()))
-                ));
-                let mut decoder =
-                    Decoder::new(super::super::tests::config(json!({})), Role::Server);
-                let decoded: Vec<_> = state
-                    .lock()
-                    .unwrap()
-                    .sent
-                    .iter()
-                    .filter_map(|b| decoder.decode_byte(*b).transpose())
-                    .collect::<io::Result<_>>()
-                    .unwrap();
-                assert_eq!(
-                    decoded,
-                    if matches!(operation, Operation::Write) {
-                        b"onenext".as_slice()
-                    } else {
-                        b"one"
-                    }
-                );
+                Self::WriteVectored => Pin::new(stream)
+                    .poll_write_vectored(cx, &[io::IoSlice::new(b""), io::IoSlice::new(b"next")])
+                    .map(|r| r.map(|_| ())),
+                Self::Flush => Pin::new(stream).poll_flush(cx),
+                Self::Shutdown => Pin::new(stream).poll_shutdown(cx),
+                Self::Ping => Pin::new(stream).poll_write_ping(cx).map(|r| r.map(|_| ())),
             }
         }
     }
 
     #[test]
-    fn read_drain_progress_and_errors_wake_a_blocked_writer() {
-        for fail in [false, true] {
-            let (mut stream, state) = scripted(Role::Client);
-            state
-                .lock()
-                .unwrap()
-                .writes
-                .extend([Write::Pending, Write::Pending]);
-            let writer = Arc::new(WakeCounter(AtomicUsize::new(0)));
-            let waker = writer.clone().into();
-            let mut write_cx = Context::from_waker(&waker);
-            let mut read_cx = Context::from_waker(std::task::Waker::noop());
-            assert!(matches!(
-                Pin::new(&mut stream).poll_write(&mut write_cx, b"one"),
-                Poll::Ready(Ok(3))
-            ));
-            assert!(Pin::new(&mut stream).poll_flush(&mut write_cx).is_pending());
-            if fail {
-                state.lock().unwrap().writes.push_back(Write::Error);
-            } else {
-                state
-                    .lock()
-                    .unwrap()
-                    .writes
-                    .extend([Write::Count(1), Write::Pending]);
+    fn reads_leave_buffered_output_and_writer_readiness_untouched() {
+        for operation in [
+            Operation::Write,
+            Operation::WriteVectored,
+            Operation::Flush,
+            Operation::Shutdown,
+            Operation::Ping,
+        ] {
+            for (role, peer_role) in [(Role::Client, Role::Server), (Role::Server, Role::Client)] {
+                for output_ready in [false, true] {
+                    let (mut stream, state) = scripted(role);
+                    state.lock().unwrap().writes.extend([
+                        Write::Count(1),
+                        Write::Pending,
+                        Write::Pending,
+                    ]);
+                    let writer = Arc::new(WakeCounter(AtomicUsize::new(0)));
+                    let reader = Arc::new(WakeCounter(AtomicUsize::new(0)));
+                    let (write_waker, read_waker) = (writer.clone().into(), reader.clone().into());
+                    let mut write_cx = Context::from_waker(&write_waker);
+                    let mut read_cx = Context::from_waker(&read_waker);
+                    assert!(matches!(
+                        Pin::new(&mut stream).poll_write(&mut write_cx, b"one"),
+                        Poll::Ready(Ok(3))
+                    ));
+                    assert!(operation.poll(&mut stream, &mut write_cx).is_pending());
+                    assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+                    let (sent, polls, events, read_polls) = {
+                        let mut state = state.lock().unwrap();
+                        if !output_ready {
+                            state.writes.push_back(Write::Pending);
+                        }
+                        state
+                            .reads
+                            .push_back(Read::Bytes(wire(b"incoming", peer_role)));
+                        (
+                            state.sent.clone(),
+                            state.write_polls,
+                            state.events.clone(),
+                            state.read_polls,
+                        )
+                    };
+                    assert!(matches!(
+                        Pin::new(&mut stream).poll_read(&mut read_cx, &mut ReadBuf::new(&mut [])),
+                        Poll::Ready(Ok(()))
+                    ));
+                    assert_eq!(state.lock().unwrap().read_polls, read_polls);
+                    let mut bytes = [0; 8];
+                    let mut buf = ReadBuf::new(&mut bytes);
+                    assert!(matches!(
+                        Pin::new(&mut stream).poll_read(&mut read_cx, &mut buf),
+                        Poll::Ready(Ok(()))
+                    ));
+                    assert_eq!(buf.filled(), b"incoming");
+                    assert!(
+                        Pin::new(&mut stream)
+                            .poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0]))
+                            .is_pending()
+                    );
+                    let readiness = {
+                        let mut state = state.lock().unwrap();
+                        assert_eq!(
+                            (&state.sent, state.write_polls, &state.events),
+                            (&sent, polls, &events)
+                        );
+                        state.writes.clear();
+                        state.write_waker.take().unwrap()
+                    };
+                    assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+                    assert!(readiness.will_wake(&write_waker));
+                    // Abandon the reader; write readiness must reach only the writer.
+                    readiness.wake();
+                    assert_eq!(writer.0.load(Ordering::Relaxed), 1);
+                    assert_eq!(reader.0.load(Ordering::Relaxed), 0);
+                    assert!(matches!(
+                        operation.poll(&mut stream, &mut write_cx),
+                        Poll::Ready(Ok(()))
+                    ));
+                    assert_eq!(writer.0.load(Ordering::Relaxed), 1);
+                    let readiness = state.lock().unwrap().read_waker.take().unwrap();
+                    assert!(readiness.will_wake(&read_waker));
+                    readiness.wake();
+                    assert_eq!(reader.0.load(Ordering::Relaxed), 1);
+                    assert_eq!(writer.0.load(Ordering::Relaxed), 1);
+                    let mut decoder =
+                        Decoder::new(super::super::tests::config(json!({})), peer_role);
+                    let decoded: Vec<_> = state
+                        .lock()
+                        .unwrap()
+                        .sent
+                        .iter()
+                        .filter_map(|b| decoder.decode_byte(*b).transpose())
+                        .collect::<io::Result<_>>()
+                        .unwrap();
+                    assert_eq!(
+                        decoded,
+                        if matches!(operation, Operation::Write | Operation::WriteVectored) {
+                            b"onenext".as_slice()
+                        } else {
+                            b"one"
+                        }
+                    );
+                }
             }
+        }
+    }
+
+    #[test]
+    fn reads_leave_transport_control_readiness_untouched() {
+        for operation in [Operation::Flush, Operation::Shutdown, Operation::Ping] {
+            let (mut stream, state) = scripted(Role::Client);
+            {
+                let mut state = state.lock().unwrap();
+                state.flush_blocked = matches!(operation, Operation::Flush);
+                state.shutdown_blocked = matches!(operation, Operation::Shutdown);
+                state.ping_blocked = matches!(operation, Operation::Ping);
+            }
+            let writer = Arc::new(WakeCounter(AtomicUsize::new(0)));
+            let reader = Arc::new(WakeCounter(AtomicUsize::new(0)));
+            let waker = writer.clone().into();
+            let read_waker = reader.clone().into();
+            let mut write_cx = Context::from_waker(&waker);
+            let mut read_cx = Context::from_waker(&read_waker);
+            assert!(operation.poll(&mut stream, &mut write_cx).is_pending());
+            let events = state.lock().unwrap().events.clone();
             assert!(
                 Pin::new(&mut stream)
                     .poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0]))
                     .is_pending()
             );
-            assert!(writer.0.load(Ordering::Relaxed) > 0);
-            match Pin::new(&mut stream).poll_flush(&mut write_cx) {
-                Poll::Ready(Err(error)) if fail => {
-                    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset)
-                }
-                Poll::Ready(Ok(())) if !fail => {}
-                result => panic!("unexpected flush result: {result:?}"),
-            }
+            let readiness = {
+                let mut state = state.lock().unwrap();
+                assert_eq!(state.events, events);
+                assert_eq!(state.write_polls, 0);
+                state.flush_blocked = false;
+                state.shutdown_blocked = false;
+                state.ping_blocked = false;
+                state.write_waker.take().unwrap()
+            };
+            assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+            assert!(readiness.will_wake(&waker));
+            readiness.wake();
+            assert_eq!(writer.0.load(Ordering::Relaxed), 1);
+            assert_eq!(reader.0.load(Ordering::Relaxed), 0);
+            assert!(matches!(
+                operation.poll(&mut stream, &mut write_cx),
+                Poll::Ready(Ok(()))
+            ));
         }
     }
 
@@ -619,6 +638,78 @@ mod tests {
     }
 
     #[test]
+    fn read_and_write_failures_remain_independent() {
+        for failure in [Write::Count(0), Write::Error] {
+            let (mut stream, state) = scripted(Role::Client);
+            state
+                .lock()
+                .unwrap()
+                .writes
+                .extend([Write::Pending, failure]);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                Pin::new(&mut stream).poll_write(&mut cx, b"one"),
+                Poll::Ready(Ok(3))
+            ));
+            // Neither a pending write error nor a recorded one may prevent input progress.
+            for failed in [false, true] {
+                state
+                    .lock()
+                    .unwrap()
+                    .reads
+                    .push_back(Read::Bytes(wire(b"ok", Role::Server)));
+                let mut bytes = [0; 2];
+                let mut buf = ReadBuf::new(&mut bytes);
+                assert!(matches!(
+                    Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+                    Poll::Ready(Ok(()))
+                ));
+                assert_eq!(buf.filled(), b"ok");
+                assert_eq!(stream.write_error.is_some(), failed);
+                assert!(matches!(
+                    Pin::new(&mut stream).poll_flush(&mut cx),
+                    Poll::Ready(Err(_))
+                ));
+            }
+            assert_eq!(state.lock().unwrap().write_polls, 2);
+        }
+
+        for input in [Read::Error, Read::Bytes(vec![0; 4]), Read::Eof] {
+            let eof = matches!(input, Read::Eof);
+            let (mut stream, state) = scripted(Role::Server);
+            state.lock().unwrap().writes.push_back(Write::Pending);
+            state.lock().unwrap().reads.push_back(input);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                Pin::new(&mut stream).poll_write(&mut cx, b"one"),
+                Poll::Ready(Ok(3))
+            ));
+            for _ in 0..2 {
+                let result = Pin::new(&mut stream).poll_read(&mut cx, &mut ReadBuf::new(&mut [0]));
+                assert!(if eof {
+                    matches!(result, Poll::Ready(Ok(())))
+                } else {
+                    matches!(result, Poll::Ready(Err(_)))
+                });
+                assert_eq!(state.lock().unwrap().write_polls, 1);
+            }
+            assert!(matches!(
+                Pin::new(&mut stream).poll_flush(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            let state = state.lock().unwrap();
+            let mut decoder = Decoder::new(super::super::tests::config(json!({})), Role::Client);
+            let decoded: Vec<_> = state
+                .sent
+                .iter()
+                .filter_map(|b| decoder.decode_byte(*b).transpose())
+                .collect::<io::Result<_>>()
+                .unwrap();
+            assert_eq!(decoded, b"one");
+        }
+    }
+
+    #[test]
     fn decoded_prefix_precedes_errors_and_pending_with_prefilled_output() {
         for tail in [Read::Pending, Read::Error, Read::Eof] {
             let (mut stream, state) = scripted(Role::Server);
@@ -660,6 +751,13 @@ mod tests {
     #[test]
     fn padding_only_yields_without_false_eof_and_truncated_tail_is_discarded() {
         let (mut stream, state) = scripted(Role::Server);
+        state.lock().unwrap().writes.push_back(Write::Pending);
+        let writer = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let write_waker = writer.clone().into();
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut Context::from_waker(&write_waker), b"pending"),
+            Poll::Ready(Ok(7))
+        ));
         state.lock().unwrap().reads.extend([
             Read::Bytes(vec![0xff; READ_BUDGET + 1]),
             Read::Bytes(vec![0; 3]),
@@ -675,12 +773,15 @@ mod tests {
                 .is_pending()
         );
         assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+        assert_eq!(state.lock().unwrap().write_polls, 1);
         let mut buf = ReadBuf::new(&mut bytes);
         assert!(matches!(
             Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
             Poll::Ready(Ok(()))
         ));
         assert!(buf.filled().is_empty());
+        assert_eq!(state.lock().unwrap().write_polls, 1);
     }
 
     #[tokio::test]
@@ -724,30 +825,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_drives_accepted_write_without_an_explicit_flush() {
-        let config = super::super::tests::config(json!({"ascii":"ascii"}));
-        let (a, b) = tokio::io::duplex(1);
-        let mut client = SudokuStream::new(Box::new(a), config.clone(), Role::Client);
-        let mut server = SudokuStream::new(Box::new(b), config, Role::Server);
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(
-                async {
-                    client.write_all(b"question").await.unwrap();
-                    let mut reply = [0; 6];
-                    client.read_exact(&mut reply).await.unwrap();
-                    assert_eq!(&reply, b"answer");
-                },
-                async {
-                    let mut request = [0; 8];
-                    server.read_exact(&mut request).await.unwrap();
-                    assert_eq!(&request, b"question");
-                    server.write_all(b"answer").await.unwrap();
-                    server.flush().await.unwrap();
+    async fn explicit_flush_before_read_drains_stacked_masks_and_buffered_transports() {
+        for layers in [1, 2] {
+            for buffered in [false, true] {
+                let (a, b) = tokio::io::duplex(1);
+                let (mut client, mut server): (Box<dyn AsyncStream>, Box<dyn AsyncStream>) =
+                    if buffered {
+                        use crate::async_stream::test_streams::FlushGatedStream;
+                        (
+                            Box::new(FlushGatedStream::new(a)),
+                            Box::new(FlushGatedStream::new(b)),
+                        )
+                    } else {
+                        (Box::new(a), Box::new(b))
+                    };
+                for layer in 0..layers {
+                    let config = super::super::tests::config(
+                        json!({"ascii":"ascii", "password":format!("layer-{layer}")}),
+                    );
+                    client = Box::new(SudokuStream::new(client, config.clone(), Role::Client));
+                    server = Box::new(SudokuStream::new(server, config, Role::Server));
                 }
-            );
-        })
-        .await
-        .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(
+                        async {
+                            client.write_all(b"question").await.unwrap();
+                            client.flush().await.unwrap();
+                            let mut reply = [0; 6];
+                            client.read_exact(&mut reply).await.unwrap();
+                            assert_eq!(&reply, b"answer");
+                        },
+                        async {
+                            let mut request = [0; 8];
+                            server.read_exact(&mut request).await.unwrap();
+                            assert_eq!(&request, b"question");
+                            server.write_all(b"answer").await.unwrap();
+                            server.flush().await.unwrap();
+                        }
+                    );
+                })
+                .await
+                .unwrap();
+            }
+        }
     }
 
     #[test]
