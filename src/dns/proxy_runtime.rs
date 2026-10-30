@@ -106,7 +106,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
             let target = NetLocation::new(address, server_addr.port());
 
             let started = std::time::Instant::now();
-            let connect_future = chain_group.connect_tcp_pinned(target.into(), &resolver);
+            let connect_future = chain_group.connect_tcp(target.into(), &resolver);
             match tokio::time::timeout(timeout, connect_future).await {
                 Ok(Ok(result)) => {
                     log::debug!(

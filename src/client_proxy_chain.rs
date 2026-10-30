@@ -1240,17 +1240,6 @@ impl ClientChainGroup {
             .await
     }
 
-    pub(crate) async fn connect_tcp_pinned(
-        &self,
-        remote_location: ResolvedLocation,
-        resolver: &Arc<dyn Resolver>,
-    ) -> std::io::Result<TcpClientSetupResult> {
-        let index = self.next_tcp_index.fetch_add(1, Ordering::Relaxed) as usize;
-        self.chains[index % self.chains.len()]
-            .connect_tcp_pinned(remote_location, resolver)
-            .await
-    }
-
     pub(crate) async fn connect_tcp_with_info(
         &self,
         remote_location: ResolvedLocation,

@@ -335,7 +335,10 @@ existing samples: DNS caches and retained connections are not concrete-path
 identity. Relevant selector changes fence in-flight probe results, including
 A-to-B-to-A changes; unrelated selectors and inactive nested branches do not.
 Fixed outer path choices do not erase samples. DNS-chain checks use the same
-configured bootstrap resolver as forwarding.
+configured bootstrap resolver as forwarding. Downstream proxy hostnames remain
+unresolved when passed through a proxy that supports remote name resolution;
+Shoes cannot inspect addresses resolved by that remote proxy. Rule downloads
+instead pre-resolve downstream proxies through their guarded bootstrap resolver.
 A fallback-checked chain cannot contain WireGuard whose `peer_client_chain` has
 more than one member at any hop, including recursively nested WireGuard carriers.
 All configured alternatives count, even branches that cannot carry UDP. It also

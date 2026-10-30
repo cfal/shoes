@@ -7,47 +7,112 @@ use crate::tcp::socket_connector::SocketConnector;
 use async_trait::async_trait;
 
 #[tokio::test]
-async fn synthetic_intermediate_proxy_is_rejected_before_socks_connect() {
+async fn downstream_dns_proxy_names_remain_remote_for_forwarding_and_health_probes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     #[derive(Debug)]
-    struct Bootstrap;
-    impl Resolver for Bootstrap {
+    struct RemoteOnly;
+    impl Resolver for RemoteOnly {
         fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
             assert_eq!(location.address().to_string(), "second.invalid");
-            let address = SocketAddr::new("198.18.0.53".parse().unwrap(), location.port());
-            Box::pin(async move { Ok(vec![address]) })
+            Box::pin(async { Err(io::Error::other("proxy name is only resolvable remotely")) })
         }
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let resolver = crate::dns::real_only(
-        Arc::new(Bootstrap),
-        Arc::from(["198.18.0.0/15".parse().unwrap()]),
-    );
+    let first = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for probe in [false, true] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                for downstream in [true, false] {
+                    let mut greeting = [0; 3];
+                    stream.read_exact(&mut greeting).await.unwrap();
+                    assert_eq!(greeting, [5, 1, 0]);
+                    stream.write_all(&[5, 0]).await.unwrap();
+                    let mut header = [0; 4];
+                    stream.read_exact(&mut header).await.unwrap();
+                    assert_eq!(header, [5, 1, 0, if downstream { 3 } else { 1 }]);
+                    if downstream {
+                        let length = stream.read_u8().await.unwrap();
+                        let mut name = vec![0; length as usize];
+                        stream.read_exact(&mut name).await.unwrap();
+                        assert_eq!(name, b"second.invalid");
+                        assert_eq!(stream.read_u16().await.unwrap(), 1080);
+                    } else {
+                        let mut address = [0; 4];
+                        stream.read_exact(&mut address).await.unwrap();
+                        assert_eq!(address, [192, 0, 2, 53]);
+                        assert_eq!(stream.read_u16().await.unwrap(), 80);
+                    }
+                    stream
+                        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                        .await
+                        .unwrap();
+                }
+                if probe {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(stream.read_u8().await.unwrap());
+                        assert!(request.len() < 4096);
+                    }
+                    assert!(request.starts_with(b"HEAD / HTTP/1.1\r\n"));
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(stream.read_u8().await.is_err());
+                }
+            }
+        })
+        .await
+        .unwrap();
+    });
+    let resolver: Arc<dyn Resolver> = Arc::new(RemoteOnly);
     let chain: crate::config::ClientChain = serde_json::from_value(serde_json::json!([
-        {"address": listener.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+        {"address": first.to_string(), "protocol": {"type": "socks"}},
         {"address": "second.invalid:1080", "protocol": {"type": "socks"}}
     ]))
     .unwrap();
-    let chains = crate::tcp::chain_builder::build_client_chain_group_with_limits(
-        crate::option_util::NoneOrSome::One(chain),
+    let chains = Arc::new(
+        crate::tcp::chain_builder::build_client_chain_group_with_limits(
+            crate::option_util::NoneOrSome::One(chain),
+            resolver.clone(),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let provider = ProxyRuntimeProvider::with_bootstrap(
+        chains.clone(),
         resolver.clone(),
-        Default::default(),
+        Duration::from_secs(2),
+    );
+    drop(
+        provider
+            .connect_tcp("192.0.2.53:80".parse().unwrap(), None, None)
+            .await
+            .unwrap(),
+    );
+    let query = crate::control::probes::ProbeQuery::parse(
+        &std::collections::HashMap::from([
+            ("url".into(), "http://192.0.2.53/".into()),
+            ("timeout".into(), "2000".into()),
+            ("expected".into(), "204".into()),
+        ]),
+        false,
     )
     .unwrap();
-    let provider =
-        ProxyRuntimeProvider::with_bootstrap(Arc::new(chains), resolver, Duration::from_secs(1));
-    for _ in 0..2 {
-        let error = provider
-            .connect_tcp("127.0.0.1:53".parse().unwrap(), None, None)
-            .await
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("synthetic"), "{error}");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), listener.accept())
-                .await
-                .is_err()
-        );
-    }
+    let (_, matched) = crate::control::probes::request_via(
+        &chains,
+        resolver,
+        &[],
+        &query,
+        crate::rustls_config_util::create_dns_client_config,
+    )
+    .await
+    .unwrap();
+    assert!(matched);
+    fixture.await.unwrap();
 }
 
 #[derive(Debug)]
