@@ -195,8 +195,15 @@ impl AutomaticGroups {
 }
 
 impl AutomaticGroup {
-    pub(crate) fn set_dependencies(&self, paths: Vec<super::selection::ManualSelectorPath>) {
-        *self.dependencies.lock() = paths;
+    pub(crate) fn set_dependencies(
+        &self,
+        paths: impl IntoIterator<Item = super::selection::ManualSelectorPath>,
+    ) {
+        *self.dependencies.lock() = paths
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
     }
 
     pub(crate) fn record_if_current(&self, member: &str, revision: u64, delay: Option<u16>) {

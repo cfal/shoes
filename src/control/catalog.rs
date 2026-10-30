@@ -1,10 +1,12 @@
+use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 
 use super::selection::{
-    Choices, SelectionOwner, SelectionView, SelectorDefinition, SelectorDefinitions,
+    Choices, ManualSelectorPath, SelectionOwner, SelectionView, SelectorDefinition,
+    SelectorDefinitions,
 };
 use super::store::valid_name;
 use crate::config::{
@@ -70,27 +72,42 @@ pub fn chain_selection_key(
     Ok(key)
 }
 
-pub(crate) fn client_selector_paths(
-    client: &ClientConfig,
-) -> Vec<super::selection::ManualSelectorPath> {
+pub(crate) fn client_selector_paths(client: &ClientConfig) -> Vec<ManualSelectorPath> {
+    fn carriers(
+        client: &ClientConfig,
+        prefix: &ManualSelectorPath,
+        paths: &mut BTreeSet<ManualSelectorPath>,
+    ) {
+        if let ClientProxyConfig::Wireguard(config) = &client.protocol
+            && let Some(chain) = &config.peer_client_chain
+        {
+            for nested in chain
+                .hops
+                .iter()
+                .flat_map(crate::config::composition::clients)
+            {
+                carriers(nested, prefix, paths);
+                let mut path = prefix.clone();
+                if let Some(origin) = &nested.control {
+                    path.extend(origin.manual_selector_path());
+                }
+                if !path.is_empty() {
+                    paths.insert(path);
+                }
+            }
+        }
+    }
     let prefix = client
         .control
         .as_ref()
         .map(MemberOrigin::manual_selector_path)
         .unwrap_or_default();
-    let mut paths = Vec::new();
-    crate::config::client_visit::visit_client(&mut client.clone(), &mut |nested| {
-        let mut path = prefix.clone();
-        if let Some(origin) = &nested.control {
-            path.extend(origin.manual_selector_path());
-        }
-        if !path.is_empty() {
-            paths.push(path);
-        }
-        Ok(())
-    })
-    .unwrap();
-    paths
+    let mut paths = BTreeSet::new();
+    carriers(client, &prefix, &mut paths);
+    if !prefix.is_empty() {
+        paths.insert(prefix);
+    }
+    paths.into_iter().collect()
 }
 
 #[derive(Debug, Clone)]

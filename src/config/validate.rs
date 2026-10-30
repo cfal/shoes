@@ -598,8 +598,7 @@ pub(super) fn refresh_catalog_clients(
         for (name, group) in &catalog.selection.automatic.0 {
             group.set_dependencies(
                 super::composition::clients(&groups[name])
-                    .flat_map(crate::control::catalog::client_selector_paths)
-                    .collect(),
+                    .flat_map(crate::control::catalog::client_selector_paths),
             );
         }
     }
