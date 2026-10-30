@@ -291,7 +291,7 @@ impl Fixture {
             {"clash_api_address":format!("0.0.0.0:{}", api.port()), "secret":SECRET, "cors_origins":["https://dashboard.example"]},
             {"clash_api_path":directory.path().join("api.sock"), "secret":SECRET},
             {"cache_file_path":directory.path().join("cache.db")},
-            {"client_group":"outbound", "type":"selector", "default":"east", "client_proxies":[
+            {"client_group":"outbound", "type":"selector", "default":"east", "client_chains":[
                 {"name":"east", "address":east.to_string(), "protocol":{"type":"socks"}},
                 {"name":"west", "address":west.to_string(), "protocol":{"type":"socks"}}
             ]},
@@ -379,7 +379,7 @@ async fn url_test_routes_without_controller_and_can_be_removed_on_reload() {
     group["url"] = json!("http://probe.invalid/");
     group["interval"] = json!(1);
     group["timeout"] = json!(500);
-    group["client_proxies"][0]["address"] = json!(available_address().to_string());
+    group["client_chains"][0]["address"] = json!(available_address().to_string());
     let mut process = fixture.start().await;
     timeout(Duration::from_secs(5), async {
         loop {
@@ -398,9 +398,9 @@ async fn url_test_routes_without_controller_and_can_be_removed_on_reload() {
     .await
     .unwrap();
     assert!(!fixture.directory.path().join("cache.db").exists());
-    let west = fixture.outbound_mut()["client_proxies"][1].clone();
+    let west = fixture.outbound_mut()["client_chains"][1].clone();
     *fixture.outbound_mut() = json!({
-        "client_group":"outbound", "type":"round-robin", "client_proxies":[west]
+        "client_group":"outbound", "type":"round-robin", "client_chains":[west]
     });
     fixture.write();
     process.signal(libc::SIGHUP);
@@ -606,8 +606,8 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
 async fn auth_errors_rules_providers_and_outbound_probes() {
     let mut fixture = Fixture::new().await;
     let mut unused = super::wireguard_support::client(51820);
-    unused["client_proxies"][0]["name"] = json!("inactive-wireguard");
-    unused["client_proxies"][0]["address"] = json!("unresolvable.invalid:51820");
+    unused["client_chains"][0]["name"] = json!("inactive-wireguard");
+    unused["client_chains"][0]["address"] = json!("unresolvable.invalid:51820");
     fixture.config.as_array_mut().unwrap().push(unused);
     let mut process = fixture.start().await;
     assert_eq!(
@@ -976,7 +976,7 @@ async fn udp_payload_totals_and_destination_cancellation_are_isolated() {
         socks5::Socks5UdpAssociation, test_servers::start_udp_echo_server_with_suffix,
     };
     let mut fixture = Fixture::new().await;
-    fixture.outbound_mut()["client_proxies"] = json!([
+    fixture.outbound_mut()["client_chains"] = json!([
         {"name":"east", "protocol":{"type":"direct"}},
         {"name":"west", "protocol":{"type":"direct"}}
     ]);

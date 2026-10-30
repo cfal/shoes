@@ -495,8 +495,8 @@ fn validate(values: Value) -> io::Result<ValidatedConfigs> {
 
 fn copies(second: Value) -> Value {
     json!([
-        {"client_group": "one", "client_proxies": [client()]},
-        {"client_group": "two", "client_proxies": [second]},
+        {"client_group": "one", "client_chains": [client()]},
+        {"client_group": "two", "client_chains": [second]},
         {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
          "rules": [{"masks": "0.0.0.0/0", "action": "allow",
                     "client_chain": [{"pool": ["one", "two", client()]}]}]},
@@ -589,8 +589,8 @@ fn copied_clients_share_with_equivalent_carrier_socket_defaults() {
         let mut second = client();
         second["protocol"]["peer_client_chain"] = chain.clone();
         let configs = json!([
-            {"client_group": "one", "client_proxies": [first]},
-            {"client_group": "relay", "client_proxies": [{"protocol": {"type": "direct"}}]},
+            {"client_group": "one", "client_chains": [first]},
+            {"client_group": "relay", "client_chains": [{"protocol": {"type": "direct"}}]},
             {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
              "rules": [{"masks": "0.0.0.0/0", "action": "allow",
                         "client_chain": [{"pool": ["one", second]}]}]},
@@ -670,7 +670,7 @@ fn scoped_endpoints_share_by_address_and_numeric_scope() {
 
 #[test]
 fn unused_groups_validate_without_starting_devices() {
-    let configs = json!([{"client_group": "unused", "client_proxies": [client()]}]);
+    let configs = json!([{"client_group": "unused", "client_chains": [client()]}]);
     assert!(
         validate(configs.clone())
             .unwrap()
@@ -678,7 +678,7 @@ fn unused_groups_validate_without_starting_devices() {
             .is_empty()
     );
     let mut invalid = configs;
-    invalid[0]["client_proxies"][0]["protocol"]["mtu"] = json!(9000);
+    invalid[0]["client_chains"][0]["protocol"]["mtu"] = json!(9000);
     assert!(validate(invalid).is_err());
 }
 
@@ -686,9 +686,9 @@ fn unused_groups_validate_without_starting_devices() {
 fn selectors_share_wireguard_devices_without_activating_unused_nodes() {
     let mut configs = json!([
         {"clash_api_address":"127.0.0.1:9090","secret":"test"},
-        {"client_group":"vpn","client_proxies":[client()]},
-        {"client_group":"outbound","type":"selector","client_proxies":["vpn","direct"]},
-        {"client_group":"another","type":"selector","client_proxies":["outbound","vpn"]}
+        {"client_group":"vpn","client_chains":[client()]},
+        {"client_group":"outbound","type":"selector","client_chains":["vpn","direct"]},
+        {"client_group":"another","type":"selector","client_chains":["outbound","vpn"]}
     ]);
     assert!(
         validate(configs.clone())
@@ -767,7 +767,7 @@ fn unused_wireguard_dns_groups_validate_without_starting_devices() {
 fn old_endpoint_forms_and_client_peer_lists_are_rejected() {
     for value in [
         json!([{"wireguard": "old", "private_key": key(42), "addresses": ["10.77.0.2/32"], "peers": []}]),
-        json!([{"client_group": "old", "client_proxies": [{"protocol": {"type": "wireguard", "endpoint": "old"}}]}]),
+        json!([{"client_group": "old", "client_chains": [{"protocol": {"type": "wireguard", "endpoint": "old"}}]}]),
     ] {
         assert!(validate(value).is_err());
     }

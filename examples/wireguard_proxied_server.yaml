@@ -1,6 +1,6 @@
 # Demonstration keys and credentials only. Replace them and both remote addresses.
 - client_group: relay
-  client_proxies:
+  client_chains:
     - address: "relay.example:443"
       protocol:
         type: tls

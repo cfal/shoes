@@ -3287,7 +3287,7 @@ impl ProxyTestFixture {
                     let (cert, key) = generate_test_cert()?;
                     let cfg = format!(
                         r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls
@@ -3322,7 +3322,7 @@ impl ProxyTestFixture {
                     upstream_port,
                 } => Some(format!(
                     r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: vless
@@ -3364,7 +3364,7 @@ impl ProxyTestFixture {
                     upstream_port,
                 } => Some(format!(
                     r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls
@@ -3388,7 +3388,7 @@ impl ProxyTestFixture {
                     upstream_port,
                 } => Some(format!(
                     r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls
@@ -3451,7 +3451,7 @@ impl ProxyTestFixture {
                     cipher,
                 } => Some(format!(
                     r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: vmess
@@ -3478,7 +3478,7 @@ impl ProxyTestFixture {
                     cipher,
                 } => Some(format!(
                     r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls
@@ -3514,7 +3514,7 @@ impl ProxyTestFixture {
                     upstream_port,
                 } => Some(format!(
                     r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: socks
@@ -3605,7 +3605,7 @@ impl ProxyTestFixture {
 
                     Some(format!(
                         r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: reality
@@ -3667,7 +3667,7 @@ impl ProxyTestFixture {
                     // REALITY Vision client - always uses VlessVision
                     Some(format!(
                         r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: reality
@@ -3748,7 +3748,7 @@ impl ProxyTestFixture {
                     sni,
                 } => Some(format!(
                     r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: shadowtls
@@ -3785,7 +3785,7 @@ impl ProxyTestFixture {
                     password,
                 } => Some(format!(
                     r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: shadowsocks
@@ -3824,7 +3824,7 @@ impl ProxyTestFixture {
                     password,
                 } => Some(format!(
                     r#"- client_group: default
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: snell
@@ -3877,7 +3877,7 @@ impl ProxyTestFixture {
                     sni,
                 } => Some(format!(
                     r#"- client_group: anytls-client
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls
@@ -3949,7 +3949,7 @@ impl ProxyTestFixture {
                     sni,
                 } => Some(format!(
                     r#"- client_group: naiveproxy-client
-  client_proxy:
+  client_chains:
     - address: "{}:{}"
       protocol:
         type: tls

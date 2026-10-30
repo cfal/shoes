@@ -8,7 +8,7 @@
 - client_group: outbound
   type: selector
   default: us-east
-  client_proxies:
+  client_chains:
     - name: us-east
       address: "us.example.com:1080"
       protocol:

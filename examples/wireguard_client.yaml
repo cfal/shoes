@@ -1,6 +1,6 @@
 # Demonstration keys only. Replace both keys and the peer endpoint before deployment.
 - client_group: vpn
-  client_proxies:
+  client_chains:
     - address: "127.0.0.1:51820"
       protocol:
         type: wireguard

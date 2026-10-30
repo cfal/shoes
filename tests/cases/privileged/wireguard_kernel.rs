@@ -344,9 +344,9 @@ async fn run_case(
                 .remove("pre_shared_key");
         }
     } else {
-        endpoint["client_proxies"][0]["protocol"]["mtu"] = json!(mtu);
+        endpoint["client_chains"][0]["protocol"]["mtu"] = json!(mtu);
         if !psk {
-            endpoint["client_proxies"][0]["protocol"]
+            endpoint["client_chains"][0]["protocol"]
                 .as_object_mut()
                 .unwrap()
                 .remove("pre_shared_key");
@@ -410,9 +410,9 @@ async fn run_case(
             endpoint["protocol"]["peers"][0]["persistent_keepalive"] = json!(1);
             &mut endpoint["protocol"]
         } else {
-            endpoint["client_proxies"][0]["address"] = json!(peer_address);
-            endpoint["client_proxies"][0]["protocol"]["persistent_keepalive"] = json!(1);
-            &mut endpoint["client_proxies"][0]["protocol"]
+            endpoint["client_chains"][0]["address"] = json!(peer_address);
+            endpoint["client_chains"][0]["protocol"]["persistent_keepalive"] = json!(1);
+            &mut endpoint["client_chains"][0]["protocol"]
         };
         protocol["peer_client_chain"] = json!([
             {"address": format!("127.0.0.1:{outer_socks_port}"), "protocol": {"type": "socks"}},
@@ -616,10 +616,10 @@ fn detoured_client_configs(
     }])).unwrap();
     let kernel_port = kernel.port()?;
     let mut client = config::client(kernel_port);
-    client["client_proxies"][0]["protocol"]["mtu"] = json!(1280);
-    client["client_proxies"][0]["address"] = json!(format!("{peer_host}:{kernel_port}"));
-    client["client_proxies"][0]["protocol"]["persistent_keepalive"] = json!(1);
-    client["client_proxies"][0]["protocol"]["peer_client_chain"] =
+    client["client_chains"][0]["protocol"]["mtu"] = json!(1280);
+    client["client_chains"][0]["address"] = json!(format!("{peer_host}:{kernel_port}"));
+    client["client_chains"][0]["protocol"]["persistent_keepalive"] = json!(1);
+    client["client_chains"][0]["protocol"]["peer_client_chain"] =
         json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
     let client_config = serde_yaml::to_string(&json!([client, config::socks(socks_port)])).unwrap();
     Ok((client_config, outer_config))

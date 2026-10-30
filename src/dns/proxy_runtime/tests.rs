@@ -152,7 +152,7 @@ async fn new_dns_sockets_follow_direct_selector_changes() {
 - client_group: dns-route
   type: selector
   default: usable
-  client_proxies:
+  client_chains:
     - name: unavailable
       bind_interface: shoes-missing
       protocol: {type: direct}

@@ -62,7 +62,7 @@ async fn dns_client_chain_resolves_proxy_through_configured_bootstrap() {
     let configs = serde_json::from_value(serde_json::json!([
         {
             "client_group": "out",
-            "client_proxies": [{
+            "client_chains": [{
                 "address": "private-proxy.invalid:80",
                 "protocol": {"type": "http"}
             }]
@@ -1134,17 +1134,17 @@ async fn selector_identity_prevents_dns_pooling_of_identical_members() {
     let configs = serde_yaml::from_str(
         r#"
 - client_group: east
-  client_proxies: [{name: east-direct, protocol: {type: direct}, bind_interface: east}]
+  client_chains: [{name: east-direct, protocol: {type: direct}, bind_interface: east}]
 - client_group: west
-  client_proxies: [{name: west-direct, protocol: {type: direct}, bind_interface: west}]
+  client_chains: [{name: west-direct, protocol: {type: direct}, bind_interface: west}]
 - client_group: first
   type: selector
   default: east
-  client_proxies: [east, west]
+  client_chains: [east, west]
 - client_group: second
   type: selector
   default: west
-  client_proxies: [east, west]
+  client_chains: [east, west]
 - dns_group: selected
   dns_servers:
     - {url: 'udp://192.0.2.1', client_chain: first}

@@ -150,10 +150,10 @@ mod tests {
     #[test]
     fn url_test_dto_reports_transport_eligible_members_and_url_health() {
         let configs = serde_json::from_value(json!([
-            {"client_group":"manual", "type":"selector", "default":"tcp", "client_proxies":[
+            {"client_group":"manual", "type":"selector", "default":"tcp", "client_chains":[
                 "direct", {"name":"tcp", "address":"proxy.invalid:80", "protocol":{"type":"http"}}
             ]},
-            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":[
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":[
                 "manual", {"name":"udp", "protocol":{"type":"direct"}}
             ]}
         ])).unwrap();
@@ -196,11 +196,11 @@ mod tests {
     #[test]
     fn catalog_dtos_preserve_group_types_members_and_selected_udp_support() {
         let configs = serde_json::from_value(json!([
-            {"client_group":"child", "client_proxies":[
+            {"client_group":"child", "client_chains":[
                 {"name":"east", "address":"east.invalid:1080", "protocol":{"type":"socks"}},
                 "direct"
             ]},
-            {"client_group":"outbound", "type":"selector", "default":"child", "client_proxies":[
+            {"client_group":"outbound", "type":"selector", "default":"child", "client_chains":[
                 "child",
                 {"name":"west", "address":"west.invalid:1080", "protocol":{"type":"socks"}}
             ]}

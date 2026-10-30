@@ -200,7 +200,7 @@ fn check_dry_run_validates_all_files_without_forwarding_or_state_writes() {
                 "client_group": "outbound",
                 "type": "selector",
                 "default": "upstream",
-                "client_proxies": [{
+                "client_chains": [{
                     "name": "upstream",
                     "address": upstream.local_addr().unwrap().to_string(),
                     "protocol": {"type": "socks"}
