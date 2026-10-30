@@ -7,6 +7,11 @@ use std::io;
 pub(crate) struct NetworkSession {
     #[cfg(target_os = "linux")]
     session: Option<linux::Session>,
+    #[cfg(test)]
+    test_events: Option<(
+        tokio::sync::mpsc::Receiver<()>,
+        tokio::sync::mpsc::Sender<()>,
+    )>,
 }
 
 impl NetworkSession {
@@ -16,6 +21,8 @@ impl NetworkSession {
             if let Some(spec) = linux::Spec::from_configs(configs)? {
                 return Ok(Self {
                     session: Some(linux::Session::prepare(spec).await?),
+                    #[cfg(test)]
+                    test_events: None,
                 });
             }
         }
@@ -61,6 +68,11 @@ impl NetworkSession {
     }
 
     pub(crate) async fn changed(&mut self) {
+        #[cfg(test)]
+        if let Some((changes, _)) = &mut self.test_events {
+            changes.recv().await.unwrap();
+            return;
+        }
         #[cfg(target_os = "linux")]
         if let Some(session) = &mut self.session {
             return session.changed().await;
@@ -69,11 +81,27 @@ impl NetworkSession {
     }
 
     pub(crate) async fn reconcile(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some((_, reconciled)) = &self.test_events {
+            reconciled.send(()).await.unwrap();
+            return Ok(());
+        }
         #[cfg(target_os = "linux")]
         if let Some(session) = &mut self.session {
             session.reconcile().await?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_events(
+        changes: tokio::sync::mpsc::Receiver<()>,
+        reconciled: tokio::sync::mpsc::Sender<()>,
+    ) -> Self {
+        Self {
+            test_events: Some((changes, reconciled)),
+            ..Self::default()
+        }
     }
 
     pub(crate) async fn deactivate(&mut self) -> io::Result<()> {

@@ -852,23 +852,38 @@ async fn run_inner(
     }
     println!("Servers ready");
     loop {
-        let debounce = tokio::select! {
-            biased;
-            _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
-            error = running.tun_failure() => {
+        enum Change {
+            Shutdown,
+            TunFailure(io::Error),
+            Reload { debounce: bool },
+        }
+        let change = wait_with_reconciliation(
+            async {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => Change::Shutdown,
+                    error = running.tun_failure() => Change::TunFailure(error),
+                    _ = reload.recv() => Change::Reload { debounce: false },
+                    _ = remote_rule_change(&mut prepared) => Change::Reload { debounce: false },
+                    _ = watches.changed(&mut changes) => Change::Reload { debounce: true },
+                }
+            },
+            network,
+        )
+        .await;
+        let debounce = match change {
+            Ok(Change::Shutdown) => return running.shutdown_network(&[&prepared], network).await,
+            Ok(Change::TunFailure(error)) => {
                 let _ = running.shutdown_network(&[&prepared], network).await;
                 return Err(error);
-            },
-            _ = reload.recv() => false,
-            _ = network.changed() => {
-                if let Err(error) = network.reconcile().await {
-                    let cleanup = running.shutdown_network(&[&prepared], network).await;
-                    return Err(io::Error::other(format!("managed network changed: {error}; shutdown: {cleanup:?}")));
-                }
-                continue;
-            },
-            _ = remote_rule_change(&mut prepared) => false,
-            _ = watches.changed(&mut changes) => true,
+            }
+            Ok(Change::Reload { debounce }) => debounce,
+            Err(error) => {
+                let cleanup = running.shutdown_network(&[&prepared], network).await;
+                return Err(io::Error::other(format!(
+                    "managed network changed: {error}; shutdown: {cleanup:?}"
+                )));
+            }
         };
         if debounce {
             tokio::select! {
@@ -973,6 +988,23 @@ async fn run_inner(
         let mut retired = std::mem::replace(&mut prepared, candidate);
         retired.certificates.shutdown().await;
         println!("Servers ready");
+    }
+}
+
+async fn wait_with_reconciliation<T>(
+    change: impl std::future::Future<Output = T>,
+    network: &mut crate::desktop::NetworkSession,
+) -> io::Result<T> {
+    tokio::pin!(change);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut change => return Ok(result),
+            _ = network.changed() => {
+                // Retain in-flight refreshes and finish network mutations before handling reload/shutdown.
+                network.reconcile().await?;
+            }
+        }
     }
 }
 

@@ -1,5 +1,60 @@
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn network_reconciliation_does_not_cancel_inflight_refresh() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cache = root.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = cache.join("rules.json");
+        std::fs::write(&path, br#"{"version":1,"rules":[{"domain":["old.example"]}]}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_times(
+            std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH)
+        ).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = root.join("config.yaml");
+        std::fs::write(&config, serde_json::json!([
+            {"rule_cache_dir": cache},
+            {"address":"127.0.0.1:0", "protocol":{"type":"socks"}, "rules":[{
+                "masks":{"path":path, "url":format!("http://{}/rules.json", listener.local_addr().unwrap()),
+                    "download":{"client_chain":"direct", "bootstrap_url":"system"}, "update_interval":"7d"},
+                "action":"block"
+            }]}
+        ]).to_string()).unwrap();
+        let mut prepared = prepare(&[config.to_str().unwrap().into()], None).await.unwrap();
+        let (events, receiver) = mpsc::channel(1);
+        let (ack, mut reconciled) = mpsc::channel(1);
+        let mut network = crate::desktop::NetworkSession::with_test_events(receiver, ack);
+        let body = br#"{"version":1,"rules":[{"domain":["new.example"]}]}"#;
+        let fixture = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            for _ in 0..3 {
+                events.send(()).await.unwrap();
+                reconciled.recv().await.unwrap();
+            }
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            result = wait_with_reconciliation(remote_rule_change(&mut prepared), &mut network) => result.unwrap(),
+            _ = fixture => unreachable!(),
+        }
+        assert_eq!(std::fs::read(path).unwrap(), body);
+    }).await.unwrap();
+}
+
 async fn load_validated(
     paths: &[String],
     discovered: &mut DiscoverDependencies<'_>,
