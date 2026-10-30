@@ -658,8 +658,15 @@ fn resolve_client_groups_topologically(
     for (name, (_, members)) in &raw_groups {
         let mut deps = Vec::new();
         for member in members.iter() {
-            for hop in member.chain().hops.iter() {
-                collect_hop_dependencies(hop, &mut deps);
+            match member {
+                super::ClientGroupMember::Client(client) => {
+                    collect_client_dependencies(client, &mut deps);
+                }
+                super::ClientGroupMember::Chain { chain, .. } => {
+                    for hop in chain.hops.iter() {
+                        collect_hop_dependencies(hop, &mut deps);
+                    }
+                }
             }
         }
         for dep in &deps {
@@ -778,17 +785,7 @@ fn collect_client_dependencies(
                 && let Some(chain) = &config.peer_client_chain
             {
                 for hop in chain.hops.iter() {
-                    match hop {
-                        ClientChainHop::Choice(_) => collect_hop_dependencies(hop, dependencies),
-                        ClientChainHop::Single(selection) => {
-                            collect_client_dependencies(selection, dependencies)
-                        }
-                        ClientChainHop::Pool(selections) => {
-                            for selection in selections.iter() {
-                                collect_client_dependencies(selection, dependencies);
-                            }
-                        }
-                    }
+                    collect_hop_dependencies(hop, dependencies);
                 }
             }
         }
@@ -802,7 +799,7 @@ fn expand_peer_chains(
     if let ClientProxyConfig::Wireguard(config) = &mut client.protocol
         && let Some(chain) = &mut config.peer_client_chain
     {
-        expand_client_chain(&mut chain.hops, groups)?;
+        super::composition::expand(&mut chain.hops, groups)?;
     }
     Ok(())
 }
@@ -1105,7 +1102,7 @@ fn expand_dns_specs(
                     ))),
                 },
             };
-            validate_client_chain(&mut chain.hops, 0, client_groups, named_pems, global_limits)?;
+            validate_client_chain(&mut chain.hops, client_groups, named_pems, global_limits)?;
             expanded_chains.push(chain);
         }
 
@@ -1119,7 +1116,9 @@ fn expand_dns_specs(
             }
 
             // Check if all chains are direct-only (for UDP/H3 validation)
-            let all_direct = expanded_chains.iter().all(is_chain_direct_only);
+            let all_direct = expanded_chains
+                .iter()
+                .all(|chain| super::composition::direct_only(&chain.hops));
 
             if !all_direct {
                 match &parsed_url {
@@ -1197,11 +1196,6 @@ pub(super) fn chain_uses_wireguard(chain: &ClientChain) -> bool {
     chain.hops.iter().any(hop_uses_wireguard)
 }
 
-/// Checks if a client chain is direct-only (single hop with all direct protocol configs).
-fn is_chain_direct_only(chain: &ClientChain) -> bool {
-    super::composition::direct_only(&chain.hops)
-}
-
 fn validate_server_config(
     server_config: &mut ServerConfig,
     client_groups: &super::composition::Groups,
@@ -1223,7 +1217,7 @@ fn validate_server_config(
         if let ServerProxyConfig::Wireguard(config) = &mut server_config.protocol
             && let Some(chain) = &mut config.peer_client_chain
         {
-            validate_client_chain(&mut chain.hops, 0, client_groups, named_pems, global_limits)?;
+            validate_client_chain(&mut chain.hops, client_groups, named_pems, global_limits)?;
             if !crate::tcp::chain_builder::supports_udp_offline(chain)? {
                 return Err(super::types::wireguard::invalid(
                     "WireGuard peer_client_chain does not support UDP",
@@ -1586,13 +1580,7 @@ fn validate_client_config(
             )
             .validate()?;
         if let Some(chain) = &mut config.peer_client_chain {
-            validate_client_chain(
-                &mut chain.hops,
-                0,
-                &HashMap::new(),
-                named_pems,
-                global_limits,
-            )?;
+            validate_client_chain(&mut chain.hops, &HashMap::new(), named_pems, global_limits)?;
             if !crate::tcp::chain_builder::supports_udp_offline(chain)? {
                 return Err(super::types::wireguard::invalid(
                     "WireGuard peer_client_chain does not support UDP",
@@ -2201,7 +2189,6 @@ fn validate_server_proxy_config(
                 } else if let ShadowTlsServerHandshakeConfig::Remote(remote_handshake) = handshake {
                     validate_client_chain(
                         &mut remote_handshake.client_chain,
-                        0,
                         client_groups,
                         named_pems,
                         global_limits,
@@ -2258,7 +2245,7 @@ fn validate_server_proxy_config(
                     let mut hops = OneOrSome::Some(
                         std::mem::take(&mut reality_config.dest_client_chain).into_vec(),
                     );
-                    validate_client_chain(&mut hops, 0, client_groups, named_pems, global_limits)?;
+                    validate_client_chain(&mut hops, client_groups, named_pems, global_limits)?;
                     reality_config.dest_client_chain = NoneOrSome::Some(hops.into_vec());
                 }
 
@@ -2452,14 +2439,8 @@ fn validate_rule_config(
             ));
         }
 
-        for (chain_index, chain) in client_chains.iter_mut().enumerate() {
-            validate_client_chain(
-                &mut chain.hops,
-                chain_index,
-                client_groups,
-                named_pems,
-                global_limits,
-            )?;
+        for chain in client_chains.iter_mut() {
+            validate_client_chain(&mut chain.hops, client_groups, named_pems, global_limits)?;
         }
     }
 
@@ -2468,7 +2449,6 @@ fn validate_rule_config(
 
 fn validate_client_chain(
     hops: &mut OneOrSome<ClientChainHop>,
-    chain_index: usize,
     client_groups: &super::composition::Groups,
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
@@ -2479,22 +2459,7 @@ fn validate_client_chain(
             validate_client_config(client, named_pems, global_limits)
         })?;
     }
-    expand_client_chain(hops, client_groups)?;
-    validate_connector_positions(hops, chain_index)
-}
-
-fn validate_connector_positions(
-    hops: &OneOrSome<ClientChainHop>,
-    _chain_index: usize,
-) -> std::io::Result<()> {
-    super::composition::validate(hops)
-}
-
-fn expand_client_chain(
-    hops: &mut OneOrSome<ClientChainHop>,
-    groups: &super::composition::Groups,
-) -> std::io::Result<()> {
-    super::composition::expand(hops, groups)
+    super::composition::expand(hops, client_groups)
 }
 
 #[cfg(test)]

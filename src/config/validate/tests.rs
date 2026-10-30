@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::composition;
 use crate::config::pem::convert_cert_paths;
 use crate::dns::IpStrategy;
 
@@ -1035,7 +1036,6 @@ fn quic_allowlists_cannot_be_ignored_by_direct_or_later_hops() {
                     serde_json::from_value(chain.clone()).unwrap();
                 let result = validate_client_chain(
                     &mut parsed.hops,
-                    0,
                     &group_configs,
                     &HashMap::new(),
                     GlobalLimits::default(),
@@ -1396,7 +1396,7 @@ fn test_direct_connector_at_hop_0_allowed() {
         ClientConfig::default(), // default is direct
     )));
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(composition::validate(&hops).is_ok());
 }
 
 fn http_proxy_config() -> ClientProxyConfig {
@@ -1426,7 +1426,7 @@ fn test_direct_then_proxy_allowed() {
         })),
     ]);
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(composition::validate(&hops).is_ok());
 }
 
 #[test]
@@ -1443,7 +1443,7 @@ fn test_proxy_then_proxy_allowed() {
         })),
     ]);
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(composition::validate(&hops).is_ok());
 }
 
 #[test]
@@ -1457,7 +1457,7 @@ fn test_direct_at_hop_1_rejected() {
         ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())), // direct
     ]);
 
-    let result = validate_connector_positions(&hops, 0);
+    let result = composition::validate(&hops);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("hop 1"));
@@ -1478,7 +1478,7 @@ fn test_direct_in_middle_of_chain_rejected() {
         })),
     ]);
 
-    let result = validate_connector_positions(&hops, 0);
+    let result = composition::validate(&hops);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("hop 1"));
@@ -1495,7 +1495,7 @@ fn test_direct_in_pool_at_hop_0_allowed() {
         }),
     ])));
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(composition::validate(&hops).is_ok());
 }
 
 #[test]
@@ -1515,7 +1515,7 @@ fn test_direct_in_pool_at_hop_1_rejected() {
         ])),
     ]);
 
-    let result = validate_connector_positions(&hops, 0);
+    let result = composition::validate(&hops);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("hop 1"));
@@ -1536,7 +1536,7 @@ fn test_three_hop_direct_first_then_proxies_allowed() {
         })),
     ]);
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(composition::validate(&hops).is_ok());
 }
 
 #[tokio::test]
