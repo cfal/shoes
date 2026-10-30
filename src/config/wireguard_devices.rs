@@ -136,16 +136,33 @@ fn normalize_client(client: &mut ClientConfig) -> io::Result<()> {
     normalize_cidrs(&mut config.allowed_ips, true)?;
     config.resource_limits = config.device(&client.address, None).limits();
     if let Some(chain) = &mut config.peer_client_chain {
-        for hop in chain.hops.iter_mut() {
-            if let ClientChainHop::Pool(pool) = hop
-                && pool.iter().count() == 1
-            {
-                let selection = pool.iter().next().unwrap().clone();
-                *hop = ClientChainHop::Single(selection);
-            }
-        }
+        normalize_fixed_chain(chain);
     }
     Ok(())
+}
+
+fn normalize_fixed_chain(chain: &mut super::ClientChain) {
+    let mut hops = Vec::new();
+    for mut hop in chain.hops.clone().into_vec() {
+        match &mut hop {
+            ClientChainHop::Pool(pool) if pool.iter().count() == 1 => {
+                hops.push(ClientChainHop::Single(pool.iter().next().unwrap().clone()));
+            }
+            ClientChainHop::Choice(choice) => {
+                for member in &mut choice.members {
+                    normalize_fixed_chain(member);
+                }
+                // A fixed alias carries no scheduling policy; leaf origins retain selectors.
+                if choice.group_type == super::GroupType::RoundRobin && choice.members.len() == 1 {
+                    hops.extend(choice.members.remove(0).hops.into_vec());
+                } else {
+                    hops.push(hop);
+                }
+            }
+            _ => hops.push(hop),
+        }
+    }
+    chain.hops = crate::option_util::OneOrSome::Some(hops);
 }
 
 fn normalize_cidrs(prefixes: &mut Vec<String>, routes: bool) -> io::Result<()> {
@@ -189,6 +206,14 @@ fn validate_carrier_mtu(device: &WireguardDeviceConfig) -> io::Result<()> {
         Ok(())
     };
     match chain.hops.iter().next().unwrap() {
+        ClientChainHop::Choice(choice) => {
+            for member in &choice.members {
+                let mut device = device.clone();
+                device.peer_client_chain = Some(member.clone());
+                validate_carrier_mtu(&device)?;
+            }
+            Ok(())
+        }
         ClientChainHop::Single(selection) => check(selection),
         ClientChainHop::Pool(selections) => {
             for selection in selections.iter() {
@@ -201,16 +226,14 @@ fn validate_carrier_mtu(device: &WireguardDeviceConfig) -> io::Result<()> {
 
 pub(super) fn collect_devices(
     validated: &mut ValidatedConfigs,
-    groups: &mut HashMap<String, Vec<ClientConfig>>,
+    groups: &mut super::composition::Groups,
 ) -> io::Result<()> {
     let mut clients = ClientRegistry::default();
     // Unused groups are validated for conflicts but do not start devices.
     let mut sorted_groups: Vec<_> = groups.iter_mut().collect();
     sorted_groups.sort_by_key(|(name, _)| *name);
     for (_, group) in sorted_groups {
-        for client in group {
-            visit_client(client, &mut |client| clients.register(client))?;
-        }
+        super::client_visit::visit_hop(group, &mut |client| clients.register(client))?;
     }
     validated.visit_clients(&mut |client| clients.register(client))?;
     if !validated.control.listeners.is_empty() {

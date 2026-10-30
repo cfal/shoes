@@ -1019,7 +1019,9 @@ fn quic_allowlists_cannot_be_ignored_by_direct_or_later_hops() {
         let proxy = json!({"address": "127.0.0.1:443", "protocol": {"type": "socks"}, "transport": "quic", "quic_settings": settings});
         let group_configs = HashMap::from([(
             "proxy".into(),
-            vec![serde_json::from_value::<ClientConfig>(proxy.clone()).unwrap()],
+            ClientChainHop::Single(ConfigSelection::Config(
+                serde_json::from_value::<ClientConfig>(proxy.clone()).unwrap(),
+            )),
         )]);
         for hop in [
             proxy.clone(),
@@ -1082,7 +1084,7 @@ async fn test_validate_config_success() {
             group_type: Default::default(),
             default: None,
             client_group: "test-group".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
     ];
 
@@ -1099,13 +1101,13 @@ async fn test_topological_sort_simple() {
             group_type: Default::default(),
             default: None,
             client_group: "group-a".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-b".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
     ];
 
@@ -1121,13 +1123,13 @@ async fn test_topological_sort_cycle_detected() {
             group_type: Default::default(),
             default: None,
             client_group: "group-a".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-b".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-a".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-a".to_string()).into()),
         }),
     ];
 
@@ -1148,7 +1150,7 @@ async fn test_topological_sort_unknown_group() {
         group_type: Default::default(),
         default: None,
         client_group: "group-a".to_string(),
-        client_chains: OneOrSome::One(ConfigSelection::GroupName("nonexistent".to_string())),
+        client_chains: OneOrSome::One(ConfigSelection::GroupName("nonexistent".to_string()).into()),
     })];
 
     let result = validate_configs_test(configs).await;
@@ -1170,27 +1172,27 @@ async fn test_topological_sort_diamond() {
             group_type: Default::default(),
             default: None,
             client_group: "group-d".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-c".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-b".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-a".to_string(),
             client_chains: OneOrSome::Some(vec![
-                ConfigSelection::GroupName("group-b".to_string()),
-                ConfigSelection::GroupName("group-c".to_string()),
+                ConfigSelection::GroupName("group-b".to_string()).into(),
+                ConfigSelection::GroupName("group-c".to_string()).into(),
             ]),
         }),
     ];
@@ -1207,21 +1209,21 @@ async fn test_nested_groups_resolve() {
             group_type: Default::default(),
             default: None,
             client_group: "us-proxies".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "eu-proxies".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "all-proxies".to_string(),
             client_chains: OneOrSome::Some(vec![
-                ConfigSelection::GroupName("us-proxies".to_string()),
-                ConfigSelection::GroupName("eu-proxies".to_string()),
+                ConfigSelection::GroupName("us-proxies".to_string()).into(),
+                ConfigSelection::GroupName("eu-proxies".to_string()).into(),
             ]),
         }),
     ];
@@ -1805,7 +1807,7 @@ async fn test_dns_udp_with_proxy_chain_rejected() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(socks_config)),
+            client_chains: OneOrSome::One(ConfigSelection::Config(socks_config).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
@@ -1843,7 +1845,7 @@ async fn test_dns_udp_with_direct_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "direct-chain".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
@@ -1885,7 +1887,7 @@ async fn test_dns_h3_with_proxy_chain_rejected() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(socks_config)),
+            client_chains: OneOrSome::One(ConfigSelection::Config(socks_config).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
@@ -1923,7 +1925,7 @@ async fn test_dns_h3_with_direct_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "direct-chain".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
@@ -1956,7 +1958,7 @@ async fn test_dns_tcp_with_client_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
@@ -1988,7 +1990,7 @@ async fn test_dns_tls_with_client_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
@@ -2020,7 +2022,7 @@ async fn test_dns_https_with_client_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,

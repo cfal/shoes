@@ -443,6 +443,9 @@ pub enum ClientChainHop {
     /// Can mix inline configs and group references.
     /// Group references are expanded, and all configs are combined into one pool.
     Pool(OneOrSome<ConfigSelection<ClientConfig>>),
+
+    /// Resolved alternatives retain their policy boundary and complete paths.
+    Choice(Box<super::groups::ClientChoice>),
 }
 
 impl ClientChainHop {
@@ -547,6 +550,7 @@ impl serde::ser::Serialize for ClientChainHop {
         use serde::ser::SerializeMap;
 
         match self {
+            ClientChainHop::Choice(choice) => choice.serialize(serializer),
             ClientChainHop::Single(ConfigSelection::GroupName(name)) => {
                 serializer.serialize_str(name)
             }

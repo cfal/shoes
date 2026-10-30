@@ -54,7 +54,7 @@ fn test_client_config_group() {
         default: None,
         client_group: "test-client-group".to_string(),
         client_chains: OneOrSome::Some(vec![
-            ConfigSelection::Config(create_test_client_config()),
+            ConfigSelection::Config(create_test_client_config()).into(),
             ConfigSelection::Config(ClientConfig {
                 name: None,
                 control: None,
@@ -69,7 +69,8 @@ fn test_client_config_group() {
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
-            }),
+            })
+            .into(),
         ]),
     })];
 
@@ -99,8 +100,12 @@ client_chains:
     assert_eq!(group.client_group, "all-proxies");
     let proxies: Vec<_> = group.client_chains.into_vec();
     assert_eq!(proxies.len(), 2);
-    assert!(matches!(&proxies[0], ConfigSelection::GroupName(n) if n == "us-proxies"));
-    assert!(matches!(&proxies[1], ConfigSelection::GroupName(n) if n == "eu-proxies"));
+    assert!(
+        matches!(&proxies[0], super::ClientGroupMember::Client(ConfigSelection::GroupName(n)) if n == "us-proxies")
+    );
+    assert!(
+        matches!(&proxies[1], super::ClientGroupMember::Client(ConfigSelection::GroupName(n)) if n == "eu-proxies")
+    );
 }
 
 #[test]
@@ -116,8 +121,14 @@ client_chains:
     let group: ClientConfigGroup = serde_yaml::from_str(yaml).unwrap();
     let proxies: Vec<_> = group.client_chains.into_vec();
     assert_eq!(proxies.len(), 2);
-    assert!(matches!(&proxies[0], ConfigSelection::GroupName(_)));
-    assert!(matches!(&proxies[1], ConfigSelection::Config(_)));
+    assert!(matches!(
+        &proxies[0],
+        super::ClientGroupMember::Client(ConfigSelection::GroupName(_))
+    ));
+    assert!(matches!(
+        &proxies[1],
+        super::ClientGroupMember::Client(ConfigSelection::Config(_))
+    ));
 }
 
 #[test]

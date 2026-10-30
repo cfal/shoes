@@ -98,11 +98,18 @@ pub(super) fn create_server_configs_with_memory(
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
     // First pass: collect raw groups with unresolved references
-    let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
-        HashMap::new();
+    let mut raw_client_groups: HashMap<
+        String,
+        (super::GroupType, OneOrSome<super::ClientGroupMember>),
+    > = HashMap::new();
     raw_client_groups.insert(
         String::from("direct"),
-        OneOrSome::One(ConfigSelection::Config(direct_client(catalog.as_ref()))),
+        (
+            super::GroupType::RoundRobin,
+            OneOrSome::One(super::ClientGroupMember::Client(ConfigSelection::Config(
+                direct_client(catalog.as_ref()),
+            ))),
+        ),
     );
 
     let mut rule_groups: HashMap<String, Vec<RuleConfig>> = HashMap::new();
@@ -157,7 +164,10 @@ pub(super) fn create_server_configs_with_memory(
             }
             Config::ClientConfigGroup(group) => {
                 if raw_client_groups
-                    .insert(group.client_group.clone(), group.client_chains)
+                    .insert(
+                        group.client_group.clone(),
+                        (group.group_type, group.client_chains),
+                    )
                     .is_some()
                 {
                     return Err(std::io::Error::new(
@@ -216,10 +226,11 @@ pub(super) fn create_server_configs_with_memory(
     let mut client_groups = resolve_client_groups_topologically(raw_client_groups)?;
 
     // Embed PEMs into all client configs in groups before they're used
-    for configs in client_groups.values_mut() {
-        for config in configs.iter_mut() {
-            validate_client_config(config, &named_pems, global_limits)?;
-        }
+    for group in client_groups.values_mut() {
+        super::client_visit::visit_hop(group, &mut |client| {
+            validate_client_config(client, &named_pems, global_limits)
+        })?;
+        super::composition::validate(&OneOrSome::One(group.clone()))?;
     }
 
     // Extract inline DNS configs from server/tun configs into dns_groups.
@@ -442,7 +453,9 @@ pub(super) fn create_server_configs_with_memory(
         // Unused definitions are still probeable, but must not activate WireGuard devices.
         for node in catalog.nodes.values_mut() {
             if let crate::control::catalog::CatalogNode::Leaf(client) = node {
-                expand_peer_chains(client, &client_groups)?;
+                super::client_visit::visit_client(client, &mut |nested| {
+                    expand_peer_chains(nested, &client_groups)
+                })?;
                 validate_client_config(client, &named_pems, global_limits)?;
             }
         }
@@ -452,7 +465,7 @@ pub(super) fn create_server_configs_with_memory(
 
 fn validate_rule_downloads(
     sources: &mut [crate::rule_set::RuleSource],
-    clients: &HashMap<String, Vec<ClientConfig>>,
+    clients: &super::composition::Groups,
     pems: &HashMap<String, String>,
     dns_names: &HashSet<&str>,
     limits: GlobalLimits,
@@ -516,7 +529,7 @@ pub(crate) fn validate_rule_bootstrap(
         }
     }
     let limits = limits.unwrap_or_default();
-    let clients = HashMap::from([("direct".into(), vec![direct_client(None)])]);
+    let clients = HashMap::from([("direct".into(), ClientChainHop::Single(ConfigSelection::Config(direct_client(None))))]);
     for source in sources {
         let result = (|| {
             let download = source.download.as_mut().expect("remote source checked");
@@ -574,11 +587,20 @@ fn direct_client(catalog: Option<&crate::control::catalog::Catalog>) -> ClientCo
 
 pub(super) fn refresh_catalog_clients(
     validated: &mut ValidatedConfigs,
-    groups: &HashMap<String, Vec<ClientConfig>>,
+    groups: &super::composition::Groups,
 ) -> std::io::Result<()> {
     if let Some(catalog) = &mut validated.catalog {
-        for client in groups.values().flatten() {
-            catalog.update_client(client);
+        for group in groups.values() {
+            for client in super::composition::clients(group) {
+                catalog.update_client(client);
+            }
+        }
+        for (name, group) in &catalog.selection.automatic.0 {
+            group.set_dependencies(
+                super::composition::clients(&groups[name])
+                    .flat_map(crate::control::catalog::client_selector_paths)
+                    .collect(),
+            );
         }
     }
     validated.refresh_catalog()
@@ -630,89 +652,119 @@ fn validate_wireguard_dns(validated: &ValidatedConfigs) -> std::io::Result<()> {
 /// 2. Detects cycles
 /// 3. Resolves groups in topological order
 fn resolve_client_groups_topologically(
-    raw_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>>,
-) -> std::io::Result<HashMap<String, Vec<ClientConfig>>> {
-    // Build dependency graph: for each group, collect which groups it references
-    let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
-    for (group_name, selections) in &raw_groups {
-        let mut deps = vec![];
-        for selection in selections.iter() {
-            collect_client_dependencies(selection, &mut deps);
-        }
-        dependencies.insert(group_name.clone(), deps);
-    }
-
-    // Check for unknown group references
-    for (group_name, deps) in &dependencies {
-        for dep in deps {
-            if !raw_groups.contains_key(dep) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "Client group '{}' references unknown group '{}'",
-                        group_name, dep
-                    ),
-                ));
+    raw_groups: HashMap<String, (super::GroupType, OneOrSome<super::ClientGroupMember>)>,
+) -> std::io::Result<super::composition::Groups> {
+    let mut dependencies = HashMap::new();
+    for (name, (_, members)) in &raw_groups {
+        let mut deps = Vec::new();
+        for member in members.iter() {
+            for hop in member.chain().hops.iter() {
+                collect_hop_dependencies(hop, &mut deps);
             }
         }
+        for dep in &deps {
+            if !raw_groups.contains_key(dep) {
+                return Err(super::composition::invalid(format!(
+                    "Client group '{name}' references unknown group '{dep}'"
+                )));
+            }
+        }
+        dependencies.insert(name.clone(), deps);
     }
-
-    // Topological sort using Kahn's algorithm with cycle detection
-    let sorted_groups = topological_sort(&dependencies)?;
-
-    // Resolve groups in topological order
-    let mut resolved: HashMap<String, Vec<ClientConfig>> = HashMap::new();
-    for group_name in sorted_groups {
-        let selections = raw_groups.get(&group_name).unwrap();
-        let mut expanded_configs = vec![];
-
-        for selection in selections.iter() {
-            match selection {
-                ConfigSelection::Config(config) => {
-                    let mut config = config.clone();
-                    expand_peer_chains(&mut config, &resolved)?;
-                    if group_name != "direct"
-                        && let Some(origin) = &mut config.control
-                    {
-                        origin
-                            .path
-                            .insert(0, (group_name.clone(), origin.name.to_string()));
-                    }
-                    expanded_configs.push(config);
-                }
-                ConfigSelection::GroupName(ref_name) => {
-                    // This group should already be resolved (due to topological order)
-                    let referenced_configs = resolved.get(ref_name).ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!(
-                                "Internal error: group '{}' not resolved before '{}'",
-                                ref_name, group_name
-                            ),
-                        )
-                    })?;
-                    expanded_configs.extend(referenced_configs.iter().cloned().map(
-                        |mut config| {
-                            if let Some(origin) = &mut config.control {
-                                origin.path.insert(
-                                    0,
-                                    (
-                                        group_name.clone(),
-                                        crate::control::catalog::api_group(ref_name).to_owned(),
-                                    ),
-                                );
-                            }
-                            config
-                        },
+    let mut resolved = super::composition::Groups::new();
+    for name in topological_sort(&dependencies)? {
+        let (kind, raw_members) = &raw_groups[&name];
+        let mut labels = Vec::new();
+        let mut members = Vec::new();
+        let mut nodes = 0usize;
+        for (index, member) in raw_members.iter().enumerate() {
+            let label = crate::control::catalog::group_member_name(member)
+                .unwrap_or_else(|| format!("{name}-chain-{}", index + 1));
+            let mut chain = member.chain();
+            for hop in chain.hops.iter_mut() {
+                super::client_visit::visit_hop(hop, &mut |client| {
+                    expand_peer_chains(client, &resolved)
+                })?;
+            }
+            super::composition::expand(&mut chain.hops, &resolved)?;
+            for hop in chain.hops.iter_mut() {
+                prepend_origin(hop, &name, &label);
+                nodes = nodes.saturating_add(super::composition::measure(hop, 0)?.0);
+                if nodes > super::composition::MAX_NODES {
+                    return Err(super::composition::invalid(
+                        "client composition exceeds 16384 nodes",
                     ));
                 }
             }
+            labels.push(label);
+            members.push(chain);
         }
-
-        resolved.insert(group_name, expanded_configs);
+        let hop = if *kind == super::GroupType::RoundRobin
+            && members.len() == 1
+            && members[0].hops.iter().count() == 1
+        {
+            members.remove(0).hops.into_vec().remove(0)
+        } else {
+            ClientChainHop::Choice(Box::new(super::ClientChoice {
+                name: name.clone(),
+                group_type: kind.clone(),
+                labels,
+                members,
+            }))
+        };
+        super::composition::measure(&hop, 0)?;
+        resolved.insert(name, hop);
     }
-
     Ok(resolved)
+}
+
+fn prepend_origin(hop: &mut ClientChainHop, group: &str, member: &str) {
+    if group == "direct" {
+        return;
+    }
+    match hop {
+        ClientChainHop::Choice(choice) => {
+            for chain in &mut choice.members {
+                for hop in chain.hops.iter_mut() {
+                    prepend_origin(hop, group, member);
+                }
+            }
+        }
+        ClientChainHop::Single(selection) => {
+            if let ConfigSelection::Config(client) = selection
+                && let Some(origin) = &mut client.control
+            {
+                origin.path.insert(0, (group.to_owned(), member.to_owned()));
+            }
+        }
+        ClientChainHop::Pool(pool) => {
+            for selection in pool.iter_mut() {
+                if let ConfigSelection::Config(client) = selection
+                    && let Some(origin) = &mut client.control
+                {
+                    origin.path.insert(0, (group.to_owned(), member.to_owned()));
+                }
+            }
+        }
+    }
+}
+
+fn collect_hop_dependencies(hop: &ClientChainHop, dependencies: &mut Vec<String>) {
+    match hop {
+        ClientChainHop::Single(selection) => collect_client_dependencies(selection, dependencies),
+        ClientChainHop::Pool(pool) => {
+            for selection in pool.iter() {
+                collect_client_dependencies(selection, dependencies);
+            }
+        }
+        ClientChainHop::Choice(choice) => {
+            for chain in &choice.members {
+                for hop in chain.hops.iter() {
+                    collect_hop_dependencies(hop, dependencies);
+                }
+            }
+        }
+    }
 }
 
 fn collect_client_dependencies(
@@ -727,6 +779,7 @@ fn collect_client_dependencies(
             {
                 for hop in chain.hops.iter() {
                     match hop {
+                        ClientChainHop::Choice(_) => collect_hop_dependencies(hop, dependencies),
                         ClientChainHop::Single(selection) => {
                             collect_client_dependencies(selection, dependencies)
                         }
@@ -744,24 +797,12 @@ fn collect_client_dependencies(
 
 fn expand_peer_chains(
     client: &mut ClientConfig,
-    groups: &HashMap<String, Vec<ClientConfig>>,
+    groups: &super::composition::Groups,
 ) -> std::io::Result<()> {
     if let ClientProxyConfig::Wireguard(config) = &mut client.protocol
         && let Some(chain) = &mut config.peer_client_chain
     {
         expand_client_chain(&mut chain.hops, groups)?;
-        for hop in chain.hops.iter_mut() {
-            match hop {
-                ClientChainHop::Single(selection) => {
-                    expand_peer_chains(selection.unwrap_config_mut(), groups)?
-                }
-                ClientChainHop::Pool(selections) => {
-                    for selection in selections.iter_mut() {
-                        expand_peer_chains(selection.unwrap_config_mut(), groups)?;
-                    }
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -1030,7 +1071,7 @@ fn validate_dns_group_ref(
 /// - Bootstrap URL validity (must be a known group or valid IP-only URL)
 fn expand_dns_specs(
     specs: &[DnsServerSpec],
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &super::composition::Groups,
     named_pems: &HashMap<String, String>,
     dns_group_names: &HashSet<&str>,
     global_limits: GlobalLimits,
@@ -1146,6 +1187,7 @@ fn hop_uses_wireguard(hop: &ClientChainHop) -> bool {
         ConfigSelection::GroupName(_) => false,
     };
     match hop {
+        ClientChainHop::Choice(choice) => choice.members.iter().any(chain_uses_wireguard),
         ClientChainHop::Single(selection) => uses_wireguard(selection),
         ClientChainHop::Pool(selections) => selections.iter().any(uses_wireguard),
     }
@@ -1157,29 +1199,12 @@ pub(super) fn chain_uses_wireguard(chain: &ClientChain) -> bool {
 
 /// Checks if a client chain is direct-only (single hop with all direct protocol configs).
 fn is_chain_direct_only(chain: &ClientChain) -> bool {
-    // Must have exactly one hop (OneOrSome::One variant)
-    let hop = match &chain.hops {
-        OneOrSome::One(hop) => hop,
-        OneOrSome::Some(_) => return false, // Multiple hops
-    };
-
-    // The single hop must be all direct configs
-    match hop {
-        ClientChainHop::Single(ConfigSelection::Config(config)) => config.protocol.is_direct(),
-        ClientChainHop::Single(ConfigSelection::GroupName(_)) => {
-            // Should not happen after expansion
-            false
-        }
-        ClientChainHop::Pool(selections) => selections.iter().all(|sel| match sel {
-            ConfigSelection::Config(config) => config.protocol.is_direct(),
-            ConfigSelection::GroupName(_) => false,
-        }),
-    }
+    super::composition::direct_only(&chain.hops)
 }
 
 fn validate_server_config(
     server_config: &mut ServerConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &super::composition::Groups,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
@@ -1945,7 +1970,7 @@ fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
 
 fn validate_server_proxy_config(
     server_proxy_config: &mut ServerProxyConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &super::composition::Groups,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
     context: ServerProtocolContext,
@@ -2333,7 +2358,7 @@ fn validate_server_proxy_config(
 /// Validates a TUN configuration.
 fn validate_tun_config(
     config: &mut TunConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &super::composition::Groups,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
@@ -2403,7 +2428,7 @@ fn validate_tun_config(
 
 fn validate_rule_config(
     rule_config: &mut RuleConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &super::composition::Groups,
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
@@ -2444,218 +2469,32 @@ fn validate_rule_config(
 fn validate_client_chain(
     hops: &mut OneOrSome<ClientChainHop>,
     chain_index: usize,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &super::composition::Groups,
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     for hop in hops.iter_mut() {
-        validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
+        super::client_visit::visit_hop(hop, &mut |client| {
+            expand_peer_chains(client, client_groups)?;
+            validate_client_config(client, named_pems, global_limits)
+        })?;
     }
     expand_client_chain(hops, client_groups)?;
     validate_connector_positions(hops, chain_index)
 }
 
-/// Rejects connector protocols that cannot wrap an existing stream at later hops.
 fn validate_connector_positions(
     hops: &OneOrSome<ClientChainHop>,
-    chain_index: usize,
+    _chain_index: usize,
 ) -> std::io::Result<()> {
-    for (hop_index, hop) in hops.iter().enumerate() {
-        if hop_index == 0 {
-            // Direct connectors are allowed at hop 0
-            continue;
-        }
-
-        if hop_uses_wireguard(hop) {
-            return Err(super::types::wireguard::invalid(
-                "WireGuard is only supported at hop 0; configure peer_client_chain in the protocol for preceding proxies",
-            ));
-        }
-
-        for selection in hop.selections() {
-            let ConfigSelection::Config(client) = selection else {
-                unreachable!("groups have been expanded");
-            };
-            crate::quic_client::validate(client, false)?;
-        }
-        let unsupported_h3 = |selection: &ConfigSelection<ClientConfig>| {
-            matches!(selection, ConfigSelection::Config(config)
-                if config.transport == Transport::Quic && crate::xhttp::connector::contains(&config.protocol))
-        };
-        if match hop {
-            ClientChainHop::Single(selection) => unsupported_h3(selection),
-            ClientChainHop::Pool(selections) => selections.iter().any(unsupported_h3),
-        } {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "XHTTP H3 is only supported at hop 0",
-            ));
-        }
-
-        // For hop 1+, check if any connector is direct
-        let has_direct = match hop {
-            ClientChainHop::Single(ConfigSelection::Config(config)) => config.protocol.is_direct(),
-            ClientChainHop::Single(ConfigSelection::GroupName(_)) => {
-                // Groups should already be expanded at this point
-                unreachable!("Group references should be expanded before validation")
-            }
-            ClientChainHop::Pool(selections) => {
-                selections.iter().any(|selection| match selection {
-                    ConfigSelection::Config(config) => config.protocol.is_direct(),
-                    ConfigSelection::GroupName(_) => {
-                        unreachable!("Group references should be expanded before validation")
-                    }
-                })
-            }
-        };
-
-        if has_direct {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Direct connector at chain {} hop {} is invalid. \
-                     Direct connectors can only be used at hop 0 (the first hop) \
-                     because they create the TCP connection. At hop 1+, the connection \
-                     already exists through the previous hop.",
-                    chain_index, hop_index
-                ),
-            ));
-        }
-    }
-
-    Ok(())
+    super::composition::validate(hops)
 }
 
-fn validate_client_chain_hop(
-    hop: &mut ClientChainHop,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-    named_pems: &HashMap<String, String>,
-    global_limits: GlobalLimits,
-) -> std::io::Result<()> {
-    match hop {
-        ClientChainHop::Single(selection) => {
-            validate_and_expand_selection(selection, client_groups, named_pems, global_limits)?;
-        }
-        ClientChainHop::Pool(selections) => {
-            for selection in selections.iter_mut() {
-                validate_and_expand_selection(selection, client_groups, named_pems, global_limits)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Validates a ConfigSelection and expands group references to inline configs.
-fn validate_and_expand_selection(
-    selection: &mut ConfigSelection<ClientConfig>,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-    named_pems: &HashMap<String, String>,
-    global_limits: GlobalLimits,
-) -> std::io::Result<()> {
-    match selection {
-        ConfigSelection::Config(client_config) => {
-            expand_peer_chains(client_config, client_groups)?;
-            validate_client_config(client_config, named_pems, global_limits)?;
-        }
-        ConfigSelection::GroupName(group_name) => {
-            let group_configs = client_groups.get(group_name).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Unknown client_group in chain: {group_name}"),
-                )
-            })?;
-            // Validate all configs in the group; expansion happens in expand_client_chain
-            for mut config in group_configs.clone() {
-                validate_client_config(&mut config, named_pems, global_limits)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Expands all group references in a client chain to their resolved configs.
-/// This should be called after validate_client_chain_hop to replace GroupName
-/// selections with their actual configs.
 fn expand_client_chain(
-    client_chain: &mut OneOrSome<ClientChainHop>,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    hops: &mut OneOrSome<ClientChainHop>,
+    groups: &super::composition::Groups,
 ) -> std::io::Result<()> {
-    let expanded_hops: Vec<ClientChainHop> = client_chain
-        .iter()
-        .map(|hop| expand_chain_hop(hop, client_groups))
-        .collect::<std::io::Result<Vec<_>>>()?;
-
-    for (index, hop) in expanded_hops.iter().enumerate() {
-        let validate = |selection: &ConfigSelection<ClientConfig>| match selection {
-            ConfigSelection::Config(config) => config.validate_quic_key_exchange(index == 0),
-            ConfigSelection::GroupName(_) => unreachable!("groups have been expanded"),
-        };
-        match hop {
-            ClientChainHop::Single(selection) => validate(selection)?,
-            ClientChainHop::Pool(selections) => {
-                for selection in selections.iter() {
-                    validate(selection)?;
-                }
-            }
-        }
-    }
-
-    *client_chain = if expanded_hops.len() == 1 {
-        OneOrSome::One(expanded_hops.into_iter().next().unwrap())
-    } else {
-        OneOrSome::Some(expanded_hops)
-    };
-    Ok(())
-}
-
-/// Expands a single chain hop by resolving all group references.
-fn expand_chain_hop(
-    hop: &ClientChainHop,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-) -> std::io::Result<ClientChainHop> {
-    match hop {
-        ClientChainHop::Single(selection) => {
-            let configs = expand_selection(selection, client_groups)?;
-            // Single becomes a Pool if the group has multiple configs
-            if configs.len() == 1 {
-                Ok(ClientChainHop::Single(ConfigSelection::Config(
-                    configs.into_iter().next().unwrap(),
-                )))
-            } else {
-                Ok(ClientChainHop::Pool(OneOrSome::Some(
-                    configs.into_iter().map(ConfigSelection::Config).collect(),
-                )))
-            }
-        }
-        ClientChainHop::Pool(selections) => {
-            let mut all_configs = vec![];
-            for selection in selections.iter() {
-                all_configs.extend(expand_selection(selection, client_groups)?);
-            }
-            Ok(ClientChainHop::Pool(OneOrSome::Some(
-                all_configs
-                    .into_iter()
-                    .map(ConfigSelection::Config)
-                    .collect(),
-            )))
-        }
-    }
-}
-
-/// Expands a single selection to its constituent configs.
-fn expand_selection(
-    selection: &ConfigSelection<ClientConfig>,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-) -> std::io::Result<Vec<ClientConfig>> {
-    match selection {
-        ConfigSelection::Config(config) => Ok(vec![config.clone()]),
-        ConfigSelection::GroupName(name) => client_groups.get(name).cloned().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Unknown client group: {name}"),
-            )
-        }),
-    }
+    super::composition::expand(hops, groups)
 }
 
 #[cfg(test)]

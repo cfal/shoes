@@ -13,28 +13,16 @@ use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 
 /// Checks the final hop without creating sockets or resolving addresses.
 pub(crate) fn supports_udp_offline(chain: &crate::config::ClientChain) -> std::io::Result<bool> {
-    let Some(hop) = chain.hops.iter().last() else {
-        return Ok(false);
-    };
-    let selections: Box<dyn Iterator<Item = &ConfigSelection<ClientConfig>>> = match hop {
-        ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
-        ClientChainHop::Pool(selections) => selections.iter(),
-    };
+    crate::config::composition::validate(&chain.hops)?;
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-    let mut supports_udp = false;
-    for selection in selections {
-        let ConfigSelection::Config(config) = selection else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Client chain groups must be expanded before checking UDP capability",
-            ));
-        };
-        supports_udp |= config.protocol.is_direct()
+    let mut supported = false;
+    for config in crate::config::composition::final_clients(&chain.hops) {
+        supported |= config.protocol.is_direct()
             || config.protocol.is_wireguard()
             || create_proxy_connector(config.clone(), resolver.clone())?
                 .is_some_and(|proxy| proxy.supports_udp());
     }
-    Ok(supports_udp)
+    Ok(supported)
 }
 
 /// Build a ClientProxyChain from a client_chain configuration.
@@ -62,11 +50,18 @@ pub(crate) fn build_client_proxy_chain_with_limits(
     resolver: Arc<dyn Resolver>,
     limits: crate::config::GlobalLimits,
 ) -> std::io::Result<ClientProxyChain> {
+    if client_chain
+        .iter()
+        .any(|hop| matches!(hop, ClientChainHop::Choice(_)))
+    {
+        return ClientProxyChain::composed(client_chain, resolver, limits, false);
+    }
     let hops: Vec<Vec<ClientConfig>> = client_chain
         .into_vec()
         .into_iter()
         .map(|hop| {
             let selections = match hop {
+                ClientChainHop::Choice(_) => unreachable!("composition handled above"),
                 ClientChainHop::Single(selection) => vec![selection],
                 ClientChainHop::Pool(selections) => selections.into_vec(),
             };

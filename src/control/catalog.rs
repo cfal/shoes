@@ -8,8 +8,8 @@ use super::selection::{
 };
 use super::store::valid_name;
 use crate::config::{
-    ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection, GroupType,
-    RuleActionConfig,
+    ClientChain, ClientChainHop, ClientConfig, ClientGroupMember, ClientProxyConfig, Config,
+    ConfigSelection, GroupType, RuleActionConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -70,6 +70,29 @@ pub fn chain_selection_key(
     Ok(key)
 }
 
+pub(crate) fn client_selector_paths(
+    client: &ClientConfig,
+) -> Vec<super::selection::ManualSelectorPath> {
+    let prefix = client
+        .control
+        .as_ref()
+        .map(MemberOrigin::manual_selector_path)
+        .unwrap_or_default();
+    let mut paths = Vec::new();
+    crate::config::client_visit::visit_client(&mut client.clone(), &mut |nested| {
+        let mut path = prefix.clone();
+        if let Some(origin) = &nested.control {
+            path.extend(origin.manual_selector_path());
+        }
+        if !path.is_empty() {
+            paths.push(path);
+        }
+        Ok(())
+    })
+    .unwrap();
+    paths
+}
+
 #[derive(Debug, Clone)]
 pub struct RuleDescription {
     pub payload: String,
@@ -84,6 +107,7 @@ pub enum CatalogNode {
         group_type: GroupType,
     },
     Leaf(Box<ClientConfig>),
+    Chain(Box<ClientChain>),
     Reject,
 }
 
@@ -112,6 +136,20 @@ fn member_name(member: &ConfigSelection<ClientConfig>) -> String {
     }
 }
 
+pub(crate) fn group_member_name(member: &ClientGroupMember) -> Option<String> {
+    match member {
+        ClientGroupMember::Client(ConfigSelection::GroupName(name)) => {
+            Some(api_group(name).to_owned())
+        }
+        ClientGroupMember::Client(ConfigSelection::Config(client)) => client
+            .control
+            .as_ref()
+            .map(|origin| origin.name.to_string())
+            .or_else(|| client.name.clone()),
+        ClientGroupMember::Chain { name, .. } => name.clone(),
+    }
+}
+
 pub fn bounded(mut value: String) -> String {
     if value.len() > 4096 {
         value.truncate(value.floor_char_boundary(4093));
@@ -134,6 +172,7 @@ fn rule_target(action: &RuleActionConfig) -> String {
                 .hops
                 .iter()
                 .map(|hop| match hop {
+                    ClientChainHop::Choice(choice) => choice.name.clone(),
                     ClientChainHop::Single(member) => member_name(member),
                     ClientChainHop::Pool(members) => format!(
                         "pool[{}]",
@@ -198,6 +237,19 @@ impl Catalog {
             match config {
                 Config::ClientConfigGroup(group) => {
                     claim(&group.client_group)?;
+                    for (ordinal, member) in group.client_chains.iter_mut().enumerate() {
+                        if group.group_type == GroupType::Selector
+                            && member.explicit_name().is_none()
+                        {
+                            return Err(invalid("inline selector members require explicit names"));
+                        }
+                        if let ClientGroupMember::Chain { name, .. } = member {
+                            let name = name.get_or_insert_with(|| {
+                                format!("chain-{}-{}", index + 1, ordinal + 1)
+                            });
+                            claim(name)?;
+                        }
+                    }
                     // Reserve source order before populating members in the second pass.
                     nodes.insert(
                         group.client_group.clone(),
@@ -253,12 +305,26 @@ impl Catalog {
         let mut automatic = super::url_test::AutomaticGroups::default();
         for config in configs.iter() {
             if let Config::ClientConfigGroup(group) = config {
-                let members: Vec<_> = group.client_chains.iter().map(member_name).collect();
+                for member in group.client_chains.iter() {
+                    if let ClientGroupMember::Chain {
+                        name: Some(name),
+                        chain,
+                    } = member
+                    {
+                        nodes.insert(name.clone(), CatalogNode::Chain(Box::new(chain.clone())));
+                    }
+                }
+                let members: Vec<_> = group
+                    .client_chains
+                    .iter()
+                    .map(|member| group_member_name(member).expect("catalog names assigned"))
+                    .collect();
                 match &group.group_type {
                     GroupType::Selector => {
-                        let has_unnamed_member = group.client_chains.iter().any(|member| {
-                            matches!(member, ConfigSelection::Config(client) if client.name.is_none())
-                        });
+                        let has_unnamed_member = group
+                            .client_chains
+                            .iter()
+                            .any(|member| member.explicit_name().is_none());
                         if has_unnamed_member {
                             return Err(invalid("inline selector members require explicit names"));
                         }
@@ -328,6 +394,102 @@ impl Catalog {
             return Err(invalid("control catalog exceeds 16384 nodes"));
         }
         Ok(Some(Self { nodes, selection }))
+    }
+
+    pub(crate) fn route(&self, name: &str) -> io::Result<ClientChain> {
+        self.expand_route(name, &[], 0, &mut 0)
+    }
+
+    fn expand_route(
+        &self,
+        name: &str,
+        path: &[(String, String)],
+        depth: usize,
+        count: &mut usize,
+    ) -> io::Result<ClientChain> {
+        use crate::option_util::OneOrSome;
+        *count += 1;
+        if depth >= 128 || *count > crate::config::composition::MAX_NODES {
+            return Err(super::health::capacity_error(
+                "probe route exceeds composition limits".into(),
+            ));
+        }
+        let hop = match self.nodes.get(name) {
+            Some(CatalogNode::Leaf(client)) => {
+                let mut client = (**client).clone();
+                client.control = Some(MemberOrigin {
+                    name: Arc::from(name),
+                    path: path.to_vec(),
+                    selection: self.selection.clone(),
+                });
+                ClientChainHop::Single(ConfigSelection::Config(client))
+            }
+            Some(CatalogNode::Group {
+                members,
+                group_type,
+            }) => {
+                let mut branches = Vec::new();
+                for member in members {
+                    let mut path = path.to_vec();
+                    path.push((name.to_owned(), member.clone()));
+                    branches.push(self.expand_route(member, &path, depth + 1, count)?);
+                }
+                if *group_type == GroupType::RoundRobin
+                    && branches.len() == 1
+                    && branches[0].hops.iter().count() == 1
+                {
+                    return Ok(branches.remove(0));
+                }
+                ClientChainHop::Choice(Box::new(crate::config::ClientChoice {
+                    name: name.into(),
+                    group_type: group_type.clone(),
+                    labels: members.clone(),
+                    members: branches,
+                }))
+            }
+            Some(CatalogNode::Chain(chain)) => {
+                let mut hops = Vec::new();
+                for hop in chain.hops.iter() {
+                    let mut expand = |selection: &ConfigSelection<ClientConfig>| {
+                        self.expand_route(&member_name(selection), path, depth + 1, count)
+                    };
+                    match hop {
+                        ClientChainHop::Single(selection) => {
+                            hops.extend(expand(selection)?.hops.into_vec());
+                        }
+                        ClientChainHop::Pool(pool) => {
+                            let members = pool
+                                .iter()
+                                .map(&mut expand)
+                                .collect::<io::Result<Vec<_>>>()?;
+                            hops.push(ClientChainHop::Choice(Box::new(
+                                crate::config::ClientChoice {
+                                    name: String::new(),
+                                    group_type: GroupType::RoundRobin,
+                                    labels: pool.iter().map(member_name).collect(),
+                                    members,
+                                },
+                            )));
+                        }
+                        ClientChainHop::Choice(_) => {
+                            unreachable!("catalog chains retain source references")
+                        }
+                    }
+                }
+                return Ok(ClientChain {
+                    hops: OneOrSome::Some(hops),
+                });
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "proxy does not exist or cannot carry a probe",
+                ));
+            }
+        };
+        Ok(ClientChain {
+            hops: OneOrSome::One(hop),
+        })
     }
 
     pub fn update_client(&mut self, client: &ClientConfig) {
@@ -461,7 +623,7 @@ mod tests {
 ";
 
     #[test]
-    fn flattening_retains_definition_identity_and_every_group_branch() {
+    fn composition_retains_definition_identity_and_every_group_branch() {
         let validated =
             crate::config::create_server_configs(serde_yaml::from_str(CONFIG).unwrap()).unwrap();
         let catalog = validated.catalog.as_ref().unwrap();
@@ -478,25 +640,16 @@ mod tests {
         let RuleActionConfig::Allow { client_chains, .. } = &rule.action else {
             panic!()
         };
-        let ClientChainHop::Pool(pool) = client_chains
+        let hop = client_chains
             .iter()
             .next()
             .unwrap()
             .hops
             .iter()
             .next()
-            .unwrap()
-        else {
-            panic!()
-        };
-        let origins: Vec<_> = pool
-            .iter()
-            .map(|member| {
-                let ConfigSelection::Config(client) = member else {
-                    panic!()
-                };
-                client.control.as_ref().unwrap()
-            })
+            .unwrap();
+        let origins: Vec<_> = crate::config::composition::clients(hop)
+            .map(|client| client.control.as_ref().unwrap())
             .collect();
         assert_eq!(
             origins.iter().map(|o| o.name.as_ref()).collect::<Vec<_>>(),

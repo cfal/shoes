@@ -7,6 +7,8 @@ use tokio::time::Instant;
 
 use crate::config::UrlTestConfig;
 
+pub(crate) mod context;
+
 tokio::task_local! {
     pub static BACKGROUND: ();
 }
@@ -43,6 +45,7 @@ struct Sample {
 
 #[derive(Debug, Default)]
 struct State {
+    revision: u64,
     samples: HashMap<String, Sample>,
     incumbent: [Option<String>; 2],
     last_touch: Option<Instant>,
@@ -57,6 +60,7 @@ pub struct AutomaticGroup {
     pub config: UrlTestConfig,
     pub members: Vec<String>,
     state: Mutex<State>,
+    dependencies: Mutex<Vec<super::selection::ManualSelectorPath>>,
 }
 
 #[derive(Debug, Default)]
@@ -128,11 +132,13 @@ impl AutomaticGroups {
                 config,
                 members,
                 state: Mutex::default(),
+                dependencies: Mutex::default(),
             },
         );
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn record(&self, member: &str, url: &str, delay: Option<u16>) {
         for group in self.0.values() {
             if group.config.url == url && group.members.iter().any(|name| name == member) {
@@ -143,6 +149,36 @@ impl AutomaticGroups {
                         delay,
                     },
                 );
+            }
+        }
+    }
+
+    pub(crate) fn tickets(&self, member: &str, url: &str) -> Vec<(&AutomaticGroup, u64)> {
+        self.0
+            .values()
+            .filter(|group| {
+                group.config.url == url && group.members.iter().any(|name| name == member)
+            })
+            .map(|group| (group, group.state.lock().revision))
+            .collect()
+    }
+
+    pub(crate) fn choices_changed(
+        &self,
+        previous: &super::selection::Choices,
+        current: &super::selection::Choices,
+    ) {
+        for group in self.0.values() {
+            if super::selection::manual_choices_changed(
+                &group.dependencies.lock(),
+                previous,
+                current,
+            ) {
+                let mut state = group.state.lock();
+                state.revision = state.revision.wrapping_add(1);
+                state.samples.clear();
+                state.incumbent = [None, None];
+                state.last_check = None;
             }
         }
     }
@@ -159,6 +195,22 @@ impl AutomaticGroups {
 }
 
 impl AutomaticGroup {
+    pub(crate) fn set_dependencies(&self, paths: Vec<super::selection::ManualSelectorPath>) {
+        *self.dependencies.lock() = paths;
+    }
+
+    pub(crate) fn record_if_current(&self, member: &str, revision: u64, delay: Option<u16>) {
+        let mut state = self.state.lock();
+        if state.revision == revision {
+            state.samples.insert(
+                member.into(),
+                Sample {
+                    at: Instant::now(),
+                    delay,
+                },
+            );
+        }
+    }
     fn fresh(&self, sample: &Sample, now: Instant) -> bool {
         now.duration_since(sample.at)
             <= Duration::from_secs(self.config.interval * 2)
@@ -166,8 +218,11 @@ impl AutomaticGroup {
     }
 
     pub fn choose(&self, eligible: &HashSet<&str>, udp: bool) -> Option<String> {
+        self.choose_at(eligible, udp, Instant::now())
+    }
+
+    fn choose_at(&self, eligible: &HashSet<&str>, udp: bool, now: Instant) -> Option<String> {
         let mut state = self.state.lock();
-        let now = Instant::now();
         let delay = |name: &str| {
             state
                 .samples
@@ -284,6 +339,30 @@ mod tests {
                 .unwrap();
         }
         groups
+    }
+
+    #[test]
+    fn standalone_tickets_reject_selector_aba_but_preserve_unrelated_changes() {
+        use crate::control::selection::Choices;
+        let groups = groups();
+        let group = &groups.0["one"];
+        group.set_dependencies(vec![vec![("manual".into(), "a".into())]]);
+        let previous = Choices::from([("manual".into(), "a".into())]);
+        let mut current = previous.clone();
+        current.insert("other".into(), "b".into());
+        let (_, revision) = groups.tickets("a", &group.config.url)[0];
+        groups.choices_changed(&previous, &current);
+        group.record_if_current("a", revision, Some(5));
+        assert_eq!(group.health("a"), "healthy");
+        current.insert("manual".into(), "b".into());
+        groups.choices_changed(&previous, &current);
+        groups.choices_changed(&current, &previous);
+        group.record_if_current("a", revision, Some(1));
+        assert_eq!(group.health("a"), "unprobed");
+        let (_, revision) = groups.tickets("a", &group.config.url)[0];
+        group.record_if_current("a", revision, Some(3));
+        assert_eq!(group.health("a"), "healthy");
+        assert_eq!(groups.0["two"].health("a"), "unprobed");
     }
 
     #[tokio::test(start_paused = true)]
