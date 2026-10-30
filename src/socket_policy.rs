@@ -14,10 +14,10 @@ struct Policy {
 }
 
 #[cfg(target_os = "linux")]
-static POLICY: parking_lot::RwLock<Option<Arc<Policy>>> = parking_lot::RwLock::new(None);
+static POLICY: parking_lot::RwLock<Option<Policy>> = parking_lot::RwLock::new(None);
 
 #[cfg(target_os = "linux")]
-pub(crate) struct SocketPolicy(Arc<Policy>);
+pub(crate) struct SocketPolicy(());
 
 #[cfg(target_os = "linux")]
 impl SocketPolicy {
@@ -41,28 +41,23 @@ impl SocketPolicy {
                 "invalid managed bypass mark",
             ));
         }
-        let policy = Arc::new(Policy {
+        *current = Some(Policy {
             interface,
             bypass_mark,
             mark_mask,
             addresses,
             bootstrap,
         });
-        *current = Some(policy.clone());
-        Ok(Self(policy))
+        Ok(Self(()))
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for SocketPolicy {
     fn drop(&mut self) {
-        let mut current = POLICY.write();
-        if current
-            .as_ref()
-            .is_some_and(|policy| Arc::ptr_eq(policy, &self.0))
-        {
-            *current = None;
-        }
+        // Resolver destruction must not hold the global policy lock.
+        let policy = POLICY.write().take();
+        drop(policy);
     }
 }
 
@@ -188,6 +183,12 @@ mod tests {
 
     #[derive(Debug)]
     struct Unavailable;
+    impl Drop for Unavailable {
+        fn drop(&mut self) {
+            assert!(POLICY.try_write().is_some());
+        }
+    }
+
     impl Resolver for Unavailable {
         fn resolve_location(
             &self,
@@ -272,5 +273,9 @@ mod tests {
         drop(policy);
         assert!(bootstrap().is_none());
         check_native_hostname().unwrap();
+        let policy = install().unwrap();
+        assert!(bootstrap().is_some());
+        drop(policy);
+        assert!(bootstrap().is_none());
     }
 }
