@@ -474,10 +474,13 @@ async fn pinned_later_endpoint_does_not_replace_the_same_directly_dialed_hostnam
     );
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let mut route = chain.selected_route(&resolver, &[0, 0]);
-    route.pinned_proxies = Some(Arc::new(std::collections::HashMap::from([(
-        NetLocation::from_str("same.test:443", None).unwrap(),
-        NetLocation::from_str("127.0.0.2:443", None).unwrap(),
-    )])));
+    route.pinned_proxies = Some(Arc::new(PinnedProxies {
+        endpoints: std::collections::HashMap::from([(
+            NetLocation::from_str("same.test:443", None).unwrap(),
+            vec!["127.0.0.2:443".parse().unwrap()],
+        )]),
+        extra_attempts: tokio::sync::Semaphore::new(1),
+    }));
     route
         .connect(NetLocation::from_str("192.0.2.1:80", None).unwrap().into())
         .await
@@ -522,4 +525,163 @@ fn pooled_prefix_does_not_retain_its_own_proxy() {
     drop(chain);
     assert!(initial.upgrade().is_none());
     assert_eq!(prefix.route_key().0.len(), 1);
+}
+
+mod pinned_fallback {
+    use super::*;
+    use std::collections::HashSet;
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    #[derive(Debug, Default)]
+    struct Handshakes {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    struct ActiveHandshake(Arc<Handshakes>);
+
+    impl Drop for ActiveHandshake {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug)]
+    struct Hop {
+        location: NetLocation,
+        stalled: Arc<HashSet<SocketAddr>>,
+        handshakes: Arc<Handshakes>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyConnector for Hop {
+        fn proxy_location(&self) -> &NetLocation {
+            &self.location
+        }
+
+        fn supports_udp_over_tcp(&self) -> bool {
+            false
+        }
+
+        async fn setup_tcp_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+            target: &ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            let active = self.handshakes.active.fetch_add(1, Ordering::Relaxed) + 1;
+            self.handshakes.peak.fetch_max(active, Ordering::Relaxed);
+            let _guard = ActiveHandshake(self.handshakes.clone());
+            if target
+                .location()
+                .to_socket_addr_nonblocking()
+                .is_some_and(|address| self.stalled.contains(&address))
+            {
+                std::future::pending::<()>().await;
+            }
+            Ok(TcpClientSetupResult {
+                client_stream: stream,
+                early_data: None,
+            })
+        }
+
+        async fn setup_udp_bidirectional(
+            &self,
+            _: Box<dyn AsyncStream>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+    }
+
+    fn addresses(port: u16) -> [SocketAddr; 2] {
+        [
+            SocketAddr::from(([192, 0, 2, 1], port)),
+            SocketAddr::from(([198, 51, 100, 1], port)),
+        ]
+    }
+
+    #[derive(Debug)]
+    struct Answers;
+
+    impl Resolver for Answers {
+        fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
+            assert!(
+                location.port() > 1,
+                "directly dialed proxy must not be pinned"
+            );
+            let addresses = addresses(location.port()).to_vec();
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+
+    fn chain(
+        levels: u16,
+        stalled: impl IntoIterator<Item = SocketAddr>,
+        handshakes: &Arc<Handshakes>,
+    ) -> ClientProxyChain {
+        let stalled = Arc::new(stalled.into_iter().collect());
+        let proxy = |port| {
+            Box::new(Hop {
+                location: NetLocation::from_str(&format!("hop{port}.test:{port}"), None).unwrap(),
+                stalled: Arc::clone(&stalled),
+                handshakes: handshakes.clone(),
+            }) as Box<dyn ProxyConnector>
+        };
+        ClientProxyChain::new(
+            vec![InitialHopEntry::Proxy {
+                socket: Arc::new(Socket(0, Arc::new(Mutex::new(Vec::new())))),
+                proxy: proxy(1),
+            }],
+            (2..=levels + 1).map(|port| vec![proxy(port)]).collect(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_first_handshake_bounds_nested_races_and_cancellation() {
+        for levels in [1, 4] {
+            let handshakes = Arc::new(Handshakes::default());
+            let chain = chain(levels, addresses(2), &handshakes);
+            let resolver: Arc<dyn Resolver> = Arc::new(Answers);
+            let target = NetLocation::from_str("203.0.113.1:80", None).unwrap();
+            let mut connect = Box::pin(chain.connect_tcp_pinned(target.into(), &resolver));
+            assert!(futures::poll!(&mut connect).is_pending());
+            for _ in 0..8 {
+                tokio::time::advance(Duration::from_millis(250)).await;
+                assert!(futures::poll!(&mut connect).is_pending());
+            }
+            let active = handshakes.active.load(Ordering::Relaxed);
+            let peak = handshakes.peak.load(Ordering::Relaxed);
+            drop(connect);
+            assert_eq!(handshakes.active.load(Ordering::Relaxed), 0);
+            assert!(active > 1, "fallback must remain concurrent");
+            assert!(
+                peak <= usize::from(levels) + 1,
+                "{levels} levels: peak {peak}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nested_stalled_addresses_reach_viable_alternatives() {
+        for stalled in [
+            vec![addresses(2)[0]],
+            vec![addresses(3)[0]],
+            vec![addresses(2)[0], addresses(3)[0]],
+        ] {
+            let handshakes = Arc::new(Handshakes::default());
+            let chain = chain(2, stalled, &handshakes);
+            let resolver: Arc<dyn Resolver> = Arc::new(Answers);
+            let target = NetLocation::from_str("203.0.113.1:80", None).unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                chain.connect_tcp_pinned(target.into(), &resolver),
+            )
+            .await
+            .expect("nested fallback must complete before the connection deadline")
+            .unwrap();
+            assert_eq!(handshakes.active.load(Ordering::Relaxed), 0);
+        }
+    }
 }

@@ -731,23 +731,15 @@ impl ClientProxyChain {
                 if pinned.contains_key(location) {
                     continue;
                 }
-                let address = crate::resolver::resolve_addresses(resolver, location)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "proxy resolved to no addresses",
-                        )
-                    })?;
-                pinned.insert(
-                    location.clone(),
-                    NetLocation::from_ip_addr(address.ip(), address.port()),
-                );
+                let addresses = crate::resolver::resolve_addresses(resolver, location).await?;
+                pinned.insert(location.clone(), addresses);
             }
             // Pin wire endpoints, not connector configurations: TLS still verifies the original name.
-            route.pinned_proxies = Some(Arc::new(pinned));
+            route.pinned_proxies = Some(Arc::new(PinnedProxies {
+                endpoints: pinned,
+                // Shared forks bound nested address races linearly in the selected route depth.
+                extra_attempts: tokio::sync::Semaphore::new(route.subsequent.len()),
+            }));
             route.connect(target).await
         })
         .await
@@ -1045,13 +1037,19 @@ impl ClientProxyChain {
     }
 }
 
+#[derive(Debug)]
+struct PinnedProxies {
+    endpoints: std::collections::HashMap<NetLocation, Vec<std::net::SocketAddr>>,
+    extra_attempts: tokio::sync::Semaphore,
+}
+
 #[derive(Clone, Debug)]
 struct SelectedRoute {
     socket: Arc<dyn SocketConnector>,
     initial: Option<Arc<InitialHopEntry>>,
     subsequent: Vec<Arc<dyn ProxyConnector>>,
     resolver: Arc<dyn Resolver>,
-    pinned_proxies: Option<Arc<std::collections::HashMap<NetLocation, NetLocation>>>,
+    pinned_proxies: Option<Arc<PinnedProxies>>,
 }
 
 impl SelectedRoute {
@@ -1075,14 +1073,6 @@ impl SelectedRoute {
             // A pooled prefix must not retain the connector that owns its pool.
             route.initial = None;
         }
-        let target = if route.last_proxy().is_some() {
-            self.pinned_proxies
-                .as_ref()
-                .and_then(|pinned| pinned.get(target.location()))
-                .map_or(target.clone(), |location| location.clone().into())
-        } else {
-            target
-        };
         let mut identities = vec![Arc::as_ptr(&route.socket) as *const () as usize];
         if let Some(initial) = &route.initial {
             identities.push(Arc::as_ptr(initial) as usize);
@@ -1139,7 +1129,27 @@ impl CarrierDialer for PrefixDialer {
     }
 
     async fn open_stream(&self) -> std::io::Result<Box<dyn crate::async_stream::AsyncStream>> {
-        let result = self.route.connect(self.target.clone()).await?;
+        let pinned = self
+            .route
+            .pinned_proxies
+            .as_ref()
+            .filter(|_| self.route.last_proxy().is_some());
+        let result = if let Some(pinned) = pinned
+            && let Some(addresses) = pinned.endpoints.get(self.target.location())
+        {
+            crate::tcp::socket_connector_impl::connect_tcp_candidates_bounded(
+                addresses.clone(),
+                Some(&pinned.extra_attempts),
+                |address| {
+                    Ok(self
+                        .route
+                        .connect(NetLocation::from_ip_addr(address.ip(), address.port()).into()))
+                },
+            )
+            .await?
+        } else {
+            self.route.connect(self.target.clone()).await?
+        };
         if result
             .early_data
             .as_ref()

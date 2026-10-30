@@ -1787,14 +1787,17 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
             location: &crate::address::NetLocation,
         ) -> crate::resolver::ResolveFuture {
             let name = location.address().to_string();
-            let address = match name.as_str() {
-                "first.invalid" => self.first,
-                "second.invalid" => "127.0.0.2:1080".parse().unwrap(),
-                "remote.invalid" => "192.0.2.10:8080".parse().unwrap(),
+            let addresses = match name.as_str() {
+                "first.invalid" => vec![self.first],
+                "second.invalid" => vec![
+                    "127.0.0.3:1080".parse().unwrap(),
+                    "127.0.0.2:1080".parse().unwrap(),
+                ],
+                "remote.invalid" => vec!["192.0.2.10:8080".parse().unwrap()],
                 _ => panic!("unexpected bootstrap lookup: {location}"),
             };
             self.calls.lock().unwrap().push(name);
-            Box::pin(async move { Ok(vec![address]) })
+            Box::pin(async move { Ok(addresses) })
         }
     }
     async fn socks(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), expected: [u8; 10]) {
@@ -1837,6 +1840,16 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
             {"address": "second.invalid:1080", "protocol": second}
         ])).unwrap();
         let fixture = tokio::spawn(async move {
+            let (mut rejected, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                socks_connect(&mut rejected).await,
+                [5, 1, 0, 1, 127, 0, 0, 3, 4, 56]
+            );
+            rejected
+                .write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            drop(rejected);
             let (mut stream, _) = listener.accept().await.unwrap();
             socks(&mut stream, [5, 1, 0, 1, 127, 0, 0, 2, 4, 56]).await;
             if tls {
@@ -1878,7 +1891,12 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
             .unwrap();
         assert_eq!(
             *resolver.calls.lock().unwrap(),
-            ["remote.invalid", "second.invalid", "first.invalid"]
+            [
+                "remote.invalid",
+                "second.invalid",
+                "first.invalid",
+                "first.invalid"
+            ]
         );
     }
 }
