@@ -25,17 +25,34 @@ pub(crate) fn visit_chain(chain: &mut ClientChain, visitor: &mut Visitor<'_>) ->
 }
 
 pub(crate) fn visit_hop(hop: &mut ClientChainHop, visitor: &mut Visitor<'_>) -> io::Result<()> {
+    visit_hop_clients(hop, &mut |client| visit_client(client, visitor))
+}
+
+// Visits composition leaves; the callback owns traversal into WireGuard carriers.
+pub(crate) fn visit_hop_clients(
+    hop: &mut ClientChainHop,
+    visitor: &mut Visitor<'_>,
+) -> io::Result<()> {
     match hop {
         ClientChainHop::Choice(choice) => {
             for chain in &mut choice.members {
-                visit_chain(chain, visitor)?;
+                for hop in chain.hops.iter_mut() {
+                    visit_hop_clients(hop, visitor)?;
+                }
             }
             Ok(())
         }
-        ClientChainHop::Single(selection) => visit_selection(selection, visitor),
+        ClientChainHop::Single(selection) => {
+            if let ConfigSelection::Config(client) = selection {
+                visitor(client)?;
+            }
+            Ok(())
+        }
         ClientChainHop::Pool(selections) => {
             for selection in selections.iter_mut() {
-                visit_selection(selection, visitor)?;
+                if let ConfigSelection::Config(client) = selection {
+                    visitor(client)?;
+                }
             }
             Ok(())
         }
