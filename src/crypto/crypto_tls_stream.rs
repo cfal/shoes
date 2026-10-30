@@ -2,11 +2,9 @@
 
 use bytes::{Buf, Bytes};
 use futures::ready;
-use futures::task::{ArcWake, AtomicWaker, waker_ref};
 use std::io::{self, BufRead, Write};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -79,26 +77,14 @@ impl TlsState {
     }
 }
 
-#[derive(Default)]
-struct TlsWake {
-    reader: AtomicWaker,
-    writer: AtomicWaker,
-}
-
-impl ArcWake for TlsWake {
-    fn wake_by_ref(this: &Arc<Self>) {
-        this.reader.wake();
-        this.writer.wake();
-    }
-}
-
+/// Writes may buffer output; callers must flush before waiting for a response.
+/// Reads only drive input, except for best-effort fatal alerts.
 pub struct CryptoTlsStream<IO> {
     io: IO,
-    wake: Arc<TlsWake>,
+    writer_waker: Option<Waker>,
     pub(super) session: TlsConnection,
     state: TlsState,
     need_flush: bool,
-    output_progress: bool,
     input: TlsInput,
     write_raw: bool,
     raw_write_prefix: Option<Bytes>,
@@ -127,11 +113,10 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
     fn with_input(io: IO, session: TlsConnection, input: TlsInput) -> Self {
         Self {
             io,
-            wake: Arc::default(),
+            writer_waker: None,
             session,
             state: TlsState::Stream,
             need_flush: false,
-            output_progress: false,
             input,
             write_raw: false,
             raw_write_prefix: None,
@@ -264,13 +249,6 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
     }
 
     pub(super) fn poll_receive_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let wake = self.wake.clone();
-        wake.reader.register(cx.waker());
-        let waker = waker_ref(&wake);
-        self.poll_receive_tls_inner(&mut Context::from_waker(&waker))
-    }
-
-    fn poll_receive_tls_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let n = match &mut self.input {
             TlsInput::Stream => {
                 let mut adapter = SyncReadAdapter {
@@ -339,7 +317,6 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
         match self.session.write_tls(&mut adapter) {
             Ok(n) => {
                 self.need_flush |= n != 0;
-                self.output_progress |= n != 0;
                 Poll::Ready(Ok(n))
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
@@ -348,13 +325,11 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
     }
 
     pub fn poll_drain_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let wake = self.wake.clone();
-        wake.writer.register(cx.waker());
-        let waker = waker_ref(&wake);
-        self.poll_drain_tls_inner(&mut Context::from_waker(&waker))
+        self.register_writer(cx);
+        self.poll_drain_tls_inner(cx)
     }
 
-    // Internal helpers receive the dispatcher context and must not register it as a caller.
+    // The fatal read-error path also drains output, without registering as the writer.
     fn poll_drain_tls_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // The peer no longer accepts TLS records once this direction is raw.
         if let Some(prefix) = &mut self.raw_write_prefix {
@@ -365,7 +340,6 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
                 }
                 prefix.advance(written);
                 self.need_flush = true;
-                self.output_progress = true;
             }
         } else if !self.write_raw {
             while self.session.wants_write() {
@@ -377,23 +351,11 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_flush_inner(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.write_raw {
-            ready!(self.poll_drain_tls_inner(cx))?;
-            ready!(Pin::new(&mut self.io).poll_flush(cx))?;
-            self.output_progress |= self.need_flush || self.raw_write_prefix.is_some();
-            self.raw_write_prefix = None;
-            self.need_flush = false;
-            return Poll::Ready(Ok(()));
+    fn register_writer(&mut self, cx: &Context<'_>) {
+        match &mut self.writer_waker {
+            Some(waker) => waker.clone_from(cx.waker()),
+            None => self.writer_waker = Some(cx.waker().clone()),
         }
-        self.session.writer().flush()?;
-        ready!(self.poll_drain_tls_inner(cx))?;
-        if self.need_flush {
-            ready!(Pin::new(&mut self.io).poll_flush(cx))?;
-            self.output_progress = true;
-            self.need_flush = false;
-        }
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -407,11 +369,6 @@ impl<IO: AsyncStream> AsyncRead for CryptoTlsStream<IO> {
         if buf.remaining() == 0 || !this.state.readable() {
             return Poll::Ready(Ok(()));
         }
-        // Reads flush TLS responses too, without replacing a split writer's registration.
-        let wake = this.wake.clone();
-        wake.reader.register(cx.waker());
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
         if let TlsInput::Raw(pending) = &mut this.input {
             if !pending.is_empty() {
                 let len = buf.remaining().min(pending.len());
@@ -440,18 +397,10 @@ impl<IO: AsyncStream> AsyncRead for CryptoTlsStream<IO> {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => return Poll::Ready(Err(error)),
             }
-            // Service post-handshake responses without blocking readable plaintext
-            // on output backpressure.
-            this.output_progress = false;
-            let flushed = this.poll_flush_inner(cx);
-            if this.output_progress || matches!(flushed, Poll::Ready(Err(_))) {
-                wake.writer.wake();
-            }
-            if let Poll::Ready(Err(error)) = flushed {
-                return Poll::Ready(Err(error));
-            }
-            if let Err(error) = ready!(this.poll_receive_tls_inner(cx)) {
-                wake.writer.wake();
+            if let Err(error) = ready!(this.poll_receive_tls(cx)) {
+                if let Some(writer) = this.writer_waker.take() {
+                    writer.wake();
+                }
                 let _ = this.poll_drain_tls_inner(cx);
                 return Poll::Ready(Err(error));
             }
@@ -465,10 +414,7 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let wake = self.wake.clone();
-        wake.writer.register(cx.waker());
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
+        self.register_writer(cx);
         if !self.state.writeable() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -477,7 +423,7 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
         }
         if self.write_raw {
             if self.raw_write_prefix.is_some() {
-                ready!(self.poll_flush_inner(cx))?;
+                ready!(self.as_mut().poll_flush(cx))?;
             }
             return Pin::new(&mut self.io).poll_write(cx, buf);
         }
@@ -500,10 +446,7 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        let wake = self.wake.clone();
-        wake.writer.register(cx.waker());
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
+        self.register_writer(cx);
         if !self.state.writeable() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -512,7 +455,7 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
         }
         if self.write_raw {
             if self.raw_write_prefix.is_some() {
-                ready!(self.poll_flush_inner(cx))?;
+                ready!(self.as_mut().poll_flush(cx))?;
             }
             return Pin::new(&mut self.io).poll_write_vectored(cx, bufs);
         }
@@ -545,17 +488,21 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let wake = self.wake.clone();
-        wake.writer.register(cx.waker());
-        let waker = waker_ref(&wake);
-        self.poll_flush_inner(&mut Context::from_waker(&waker))
+        self.register_writer(cx);
+        if !self.write_raw {
+            self.session.writer().flush()?;
+        }
+        ready!(self.poll_drain_tls_inner(cx))?;
+        if self.write_raw || self.need_flush {
+            ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+            self.raw_write_prefix = None;
+            self.need_flush = false;
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let wake = self.wake.clone();
-        wake.writer.register(cx.waker());
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
+        self.register_writer(cx);
         if !self.write_raw {
             if self.state.writeable() {
                 self.session.send_close_notify();
@@ -563,9 +510,9 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
             }
             // A failed ordinary TLS session still has output to send before writer.flush fails.
             ready!(self.poll_drain_tls_inner(cx))?;
-            ready!(self.poll_flush_inner(cx))?;
+            ready!(self.as_mut().poll_flush(cx))?;
         } else {
-            ready!(self.poll_flush_inner(cx))?;
+            ready!(self.as_mut().poll_flush(cx))?;
             self.state.shutdown_write();
         }
         match Pin::new(&mut self.io).poll_shutdown(cx) {
@@ -583,10 +530,7 @@ impl<IO: AsyncStream> AsyncPing for CryptoTlsStream<IO> {
     }
 
     fn poll_write_ping(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        let wake = self.wake.clone();
-        wake.writer.register(cx.waker());
-        let waker = waker_ref(&wake);
-        let cx = &mut Context::from_waker(&waker);
+        self.register_writer(cx);
         let written = ready!(Pin::new(&mut self.io).poll_write_ping(cx))?;
         self.need_flush |= written;
         Poll::Ready(Ok(written))

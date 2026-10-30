@@ -506,6 +506,111 @@ async fn authenticated_non_vision_oversized_preread_returns_error_without_panick
 }
 
 #[tokio::test]
+async fn authenticated_vless_handoff_flushes_buffered_response() {
+    use crate::async_stream::test_streams::FlushGatedStream;
+    use crate::client_proxy_chain::InitialHopEntry;
+    use crate::reality::CipherSuite;
+    use crate::reality::tests::reality_fixtures::configs;
+    use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+    use crate::vless::vless_server_handler::VlessTcpServerHandler;
+
+    const USER_ID: &str = "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4";
+    let (cc, sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+    let mut client = cc.create_connection().unwrap();
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello).unwrap();
+    let response = crate::reality::default_target_records(&hello[44..76]).concat();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let dest = NetLocation::new(
+        crate::address::Address::Hostname("localhost".into()),
+        listener.local_addr().unwrap().port(),
+    );
+    let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let target = RealityServerTarget {
+        mldsa65_key: None,
+        private_key: sc.private_key,
+        short_ids: sc.short_ids,
+        dest,
+        max_time_diff: None,
+        min_client_version: None,
+        max_client_version: None,
+        cipher_suites: sc.cipher_suites,
+        effective_selector: selector.clone(),
+        inner_protocol: InnerProtocol::Normal(Box::new(
+            VlessTcpServerHandler::new(
+                USER_ID,
+                false,
+                selector,
+                resolver.clone(),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        )),
+        dest_client_chain: ClientProxyChain::new(
+            vec![InitialHopEntry::Direct(Arc::new(
+                SocketConnectorImpl::from_config(&crate::config::ClientConfig::default(), None)
+                    .unwrap(),
+            ))],
+            Vec::new(),
+        ),
+    };
+    let (io, mut peer) = tokio::io::duplex(64);
+    let server = async {
+        let mut io: Box<dyn AsyncStream> = Box::new(FlushGatedStream::new(io));
+        let parsed = crate::shadow_tls::read_client_hello(&mut io).await.unwrap();
+        let setup = setup_reality_server_stream(io, &target, parsed, &resolver)
+            .await
+            .unwrap();
+        let TcpServerSetupResult::TcpForward {
+            mut stream,
+            need_initial_flush,
+            connection_success_response,
+            ..
+        } = setup
+        else {
+            panic!("expected TCP forwarding");
+        };
+        assert!(need_initial_flush, "REALITY must flush the inner handoff");
+        stream
+            .write_all(&connection_success_response.unwrap())
+            .await
+            .unwrap();
+        if need_initial_flush {
+            stream.flush().await.unwrap();
+        }
+    };
+    let decoy = async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut forwarded = vec![0; hello.len()];
+        socket.read_exact(&mut forwarded).await.unwrap();
+        assert_eq!(forwarded, hello);
+        socket.write_all(&response).await.unwrap();
+    };
+    let peer = async {
+        peer.write_all(&hello).await.unwrap();
+        let mut stream = CryptoTlsStream::handshake(peer, client, TlsReadMode::Stream, &[])
+            .await
+            .unwrap();
+        let mut request = vec![0];
+        request.extend_from_slice(&crate::uuid_util::parse_uuid(USER_ID).unwrap());
+        request.extend_from_slice(&[0, 1, 0, 80, 1, 127, 0, 0, 1]);
+        stream.write_all(&request).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut response = [0; 2];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [0, 0]);
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(server, decoy, peer);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn fallback_preread_backpressure_does_not_block_server_response() {
     let (client, mut client_peer) = tokio::io::duplex(64);
     let (dest, mut dest_peer) = tokio::io::duplex(64);
