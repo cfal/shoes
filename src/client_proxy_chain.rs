@@ -320,10 +320,8 @@ impl ClientProxyChain {
     }
 
     fn touch_automatic(&self, indices: &[usize], failed: bool) {
-        if !self.automatic_contexts.is_empty() {
-            for context in &self.automatic_contexts {
-                context.touch(failed);
-            }
+        for context in &self.automatic_contexts {
+            context.touch(failed);
         }
         if self
             .selection
@@ -547,28 +545,23 @@ impl ClientProxyChain {
         resolver: &Arc<dyn Resolver>,
         path: Option<&mut Vec<String>>,
     ) -> std::io::Result<TcpClientSetupResult> {
-        if let Some(composition) = &self.composition {
-            let pinned = composition.select(false)?;
+        let pinned;
+        let (chain, indices) = if let Some(composition) = &self.composition {
+            pinned = composition.select(false)?;
             let indices = vec![0; pinned.num_hops()];
-            if let Some(path) = path {
-                *path = pinned.route_names(&indices);
-            }
-            return pinned
-                .with_route_activity(
-                    &indices,
-                    pinned.connect_tcp_selected(remote_location, resolver, &indices),
-                )
-                .await;
-        }
-        let indices = self.select_indices(false)?;
+            (&pinned, indices)
+        } else {
+            (self, self.select_indices(false)?)
+        };
         if let Some(path) = path {
-            *path = self.route_names(&indices);
+            *path = chain.route_names(&indices);
         }
-        self.with_route_activity(
-            &indices,
-            self.connect_tcp_selected(remote_location, resolver, &indices),
-        )
-        .await
+        chain
+            .with_route_activity(
+                &indices,
+                chain.connect_tcp_selected(remote_location, resolver, &indices),
+            )
+            .await
     }
 
     async fn connect_tcp_selected(
@@ -698,36 +691,29 @@ impl ClientProxyChain {
         target: ResolvedLocation,
         path: Option<&mut Vec<String>>,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-        if let Some(composition) = &self.composition {
-            let pinned = composition.select(true)?;
+        let pinned;
+        let (chain, indices) = if let Some(composition) = &self.composition {
+            pinned = composition.select(true)?;
             let indices = vec![0; pinned.num_hops()];
-            if let Some(path) = path {
-                *path = pinned.route_names(&indices);
+            (&pinned, indices)
+        } else {
+            if self.udp_final_hop_indices.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Chain does not support UDP",
+                ));
             }
-            return pinned
-                .with_route_activity(
-                    &indices,
-                    pinned.connect_udp_selected(resolver, target, &indices),
-                )
-                .await;
-        }
-        // Check if UDP is supported
-        if self.udp_final_hop_indices.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Chain does not support UDP",
-            ));
-        }
-
-        let indices = self.select_indices(true)?;
+            (self, self.select_indices(true)?)
+        };
         if let Some(path) = path {
-            *path = self.route_names(&indices);
+            *path = chain.route_names(&indices);
         }
-        self.with_route_activity(
-            &indices,
-            self.connect_udp_selected(resolver, target, &indices),
-        )
-        .await
+        chain
+            .with_route_activity(
+                &indices,
+                chain.connect_udp_selected(resolver, target, &indices),
+            )
+            .await
     }
 
     async fn connect_udp_selected(
