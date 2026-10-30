@@ -479,6 +479,11 @@ standalone history. There are at most 1,024 live automatic contexts per generati
 Each separately built forwarding route owns its occurrences, including copies of
 rules across inbounds. A single route over the limit fails validation; the combined
 live-route limit is enforced when constructing routes, including lazy carriers.
+Live contexts also share a limit of 65,536 selector dependency entries, including
+resolver dependencies. Each selector/member pair in a distinct dependency path
+counts once per context; an empty path counts as one entry. Route construction
+fails if either limit would be exceeded. Dropping routes releases both their
+context and dependency budgets.
 URL-test groups are not supported by FFI.
 
 Only one `cache_file_path` is allowed across all input files. Its absence disables
