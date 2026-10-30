@@ -2225,18 +2225,23 @@ be `system`, an IP-based DNS URL, or a named DNS group. Target and proxy hostnam
 use this resolver; failed refresh routing never falls back to direct. Automatic
 refresh uses the active generation's DNS, proxy clients, and selector choices.
 
-Omit `rule_cache_dir` for memory-only loading. Shoes downloads required sources
-before starting listeners, retains their compiled rules in memory, and reuses
-unchanged sources across configuration reloads. Periodic refresh still applies;
+All runtime remote sources use compiled rules retained in memory, including when
+disk caching is enabled. Reloads reuse sources whose URL and decoding options
+are unchanged; runtime compilation never falls back to cache files.
+Omit `rule_cache_dir` to disable persistence. Shoes downloads required sources
+before starting listeners. Periodic refresh still applies;
 failed downloads or rejected candidates leave the active rules unchanged. No
 cache, lock, staging, or temporary files are created. Download buffers are released
-after compilation, and byte-identical refreshes do not recompile the rules.
+after validation and optional cache saving; byte-identical refreshes do not recompile the rules.
 A cold start requires network access; a remote outage prevents startup when
 there is no persistent cache. `check` and `--dry-run` remain offline and cannot
 validate memory-only remote sources. Local file sources still require `path`.
 
-`rule_cache_dir` enables persistence in one private managed directory across all
-config files.
+`rule_cache_dir` enables best-effort persistence in one private managed directory
+across all config files. Valid downloads remain usable even when saving fails.
+Cache-save failures are logged; the next successful download retries saving,
+including byte-identical downloads. Until a save succeeds, a restart may restore
+older cached rules or require network access.
 Use persistent caching on routers that must restart while the origin is unavailable.
 Its value is relative to the declaring file and fixed for the process lifetime:
 adding, changing, or removing it requires a restart, even without remote sources.
@@ -2253,7 +2258,8 @@ and `..` traversal are rejected. `owner.lock`, `.shoes-update.lock`, and
 `.shoes-update.tmp` sidecars are reserved. The daemon holds an exclusive directory
 lease; another daemon cannot use the same directory concurrently.
 Replacing the directory or `owner.lock` invalidates the lease; subsequent runtime
-cache access is rejected until restart. Already compiled rules remain available.
+cache reads and writes are rejected until restart, without acquiring a replacement
+lease. Retained rules, downloads, and configuration reloads can continue in memory.
 Identical declarations sharing a cache are deduplicated;
 conflicting declarations are rejected. Local-only file sources are unchanged.
 
@@ -2263,17 +2269,19 @@ are supported; DAT still needs explicit format/code, and Mihomo YAML/text needs
 behavior. Invalid decoding never retries a different format.
 
 `update_interval` defaults to `24h`; use a positive integer with `s`, `m`, `h`, or
-`d`, from `1s` through `365d`. With persistent caching, daemon startup and reload
-fetch required **missing** caches using their configured download routes before
-preparing candidate listeners.
-Existing files are never replaced by bootstrap: invalid or empty caches fail
-validation. Repair them externally, or remove them and restart/reload to fetch
-again. Unsafe ownership, permissions, and symlinks are hard errors, not reasons
-to download. `check` and `--dry-run` stay strictly offline: no fetching, directory
+`d`, from `1s` through `365d`. Daemon startup restores valid cached sources into
+memory. Missing, unreadable, invalid, or empty cached sources are fetched through
+their configured download routes before preparing candidate listeners. Unsafe
+files are never read or replaced; a fresh download may still run in memory.
+Initial directory creation and exclusive lease acquisition must succeed when
+`rule_cache_dir` is configured. Reloads prefer retained rules, so removing or editing
+a cache does not force a refetch. Changing a retained source's URL or decoding
+options fetches a new source instead of reusing its old cache.
+`check` and `--dry-run` stay strictly offline: no fetching, directory
 creation, leases, or installation. They fail for missing or invalid caches; run
 the daemon to populate missing files.
 
-Missing-cache bootstrap supports built-in `direct`, inline TCP proxy chains and
+Bootstrap downloads support built-in `direct`, inline TCP proxy chains and
 pools, and normal outbound TLS settings with inline, named, or file-backed PEMs.
 Its `bootstrap_url` must be `system` or a literal-IP `udp://`, `tcp://`, `tls://`,
 or `https://` DNS URL. Target and proxy hostnames use that resolver. Every pool
@@ -2301,32 +2309,35 @@ never repairs permissions. If owner access is missing, create the directory with
 recreate a removed root.
 
 Declarations and all required bootstrap routes are preflighted before fetching.
-With persistent caching, files are downloaded, decoder-validated, and atomically installed serially, then
-the complete configuration is compiled normally. A failed startup exits before
-serving; a failed reload retains the active generation. Earlier completed installs
-remain if a later download, configuration check, or activation fails. This is a
+Sources are downloaded and decoder-validated serially, retained in memory, and
+optionally saved to disk, then the complete configuration is compiled normally.
+A failed startup exits before serving; a failed reload retains the active generation.
+Earlier completed saves remain if a later download, configuration check, or activation fails. This is a
 per-file repair, not a multi-file disk transaction or a promise of activation.
 
 The process refreshes due sources serially, with 10% jitter and capped exponential
 failure backoff. Downloaded sources pass Shoes' actual decoders, compilation budgets,
-and validation against the active configuration snapshot before replacement.
-The initial due time is based on cache mtime, or the initial download time in
-memory-only mode; future mtimes are treated as due.
-Successful check times are remembered only in memory. Changing a URL with an
-explicit, unchanged cache path can serve the old bytes until the next due time; use a new
-cache name and bootstrap it when immediate replacement is needed. Failures keep the
-last-good file and active rules; identical bytes preserve inode/mtime and do not
-reload. Each file replacement is atomic, not a multi-file transaction. A post-rename
-directory-sync failure reports uncertain durability but still activates the
-validated replacement. New flows use the reloaded rules; existing flows retain
+and validation against the active configuration snapshot before replacing retained
+rules. Persistent and nonpersistent sources use this same validation path.
+The initial due time is based on a restored cache's mtime or the initial download
+time; future mtimes are treated as due.
+Successful check times are remembered only in memory. On a cold start, an explicit
+cache path does not record the URL it came from; use a new cache name when changing
+the URL between process lifetimes if immediate replacement is required.
+Download or validation failures retain the last-good rules and cache. Cache-save
+failures do not reject validated rules. Identical downloads reuse compiled rules
+and do not reload, but still retry saving if necessary; identical cached bytes
+preserve inode/mtime. Each file replacement is atomic, not a multi-file transaction.
+A post-rename directory-sync failure reports uncertain durability without rejecting
+the update. New flows use the reloaded rules; existing flows retain
 their previous configuration. Reload/removal/shutdown cancels in-flight refreshes.
 `--no-reload` disables filesystem-triggered reloads, not configured remote refresh.
 Managed caches are excluded from generic filesystem watching. An automatic changed
-source requests one immediate reload; external cache edits require SIGHUP or restart.
+source requests one immediate reload; external cache edits are read only after restart,
+not on SIGHUP. Use local file sources for externally managed live rule updates.
 Reload reads the configuration files, including any unrelated edits. If activation
-fails, the validated replacement remains available in memory or on disk while
-old rules remain active. Correct the
-configuration and reload explicitly; a later byte-identical fetch does not retry
+fails, the validated replacement remains available in memory while old rules remain
+active. Correct the configuration and reload explicitly; a later byte-identical fetch does not retry
 activation. Atomic installation does not provide a disk/activation or power-loss
 transaction.
 Bulk file reads, writes, and synchronization run off the forwarding executor.

@@ -3,7 +3,7 @@ use crate::rule_set::{CACHE_LOCK_SUFFIX, CACHE_STAGE_SUFFIX};
 use crate::rules::invalid;
 use std::ffi::{CString, OsStr};
 use std::fs::{File, Metadata};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -129,7 +129,7 @@ pub(crate) fn cache_lease(directory: &Path) -> io::Result<CacheLease> {
 }
 
 pub(super) struct Install {
-    pub(super) lease: Option<Arc<CacheLease>>,
+    lease: Option<Arc<CacheLease>>,
     directory: File,
     destination: CString,
     stage: CString,
@@ -149,6 +149,7 @@ pub(super) enum Outcome {
     DurabilityUncertain,
 }
 
+#[cfg(test)]
 impl Outcome {
     pub(super) fn changed(&self) -> bool {
         !matches!(self, Self::Unchanged)
@@ -156,15 +157,23 @@ impl Outcome {
 }
 
 impl Install {
-    pub(super) fn require_missing(&self) -> io::Result<()> {
-        if self.original.is_some() {
-            return Err(invalid(
-                "cache appeared before bootstrap; retry configuration loading",
-            ));
-        }
-        Ok(())
+    pub(super) async fn save(
+        path: &Path,
+        bytes: Vec<u8>,
+        digest: blake3::Hash,
+        lease: Option<Arc<CacheLease>>,
+    ) -> io::Result<Outcome> {
+        let path = path.to_owned();
+        let install = blocking(move || {
+            let mut install = Self::open_with_lease(&path, lease)?;
+            install.file.write_all(&bytes)?;
+            Ok(install)
+        })
+        .await?;
+        install.finish_async(digest).await
     }
 
+    #[cfg(test)]
     pub(super) async fn open_async(
         path: &Path,
         lease: Option<Arc<CacheLease>>,
@@ -251,14 +260,6 @@ impl Install {
             .file
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         Ok(install)
-    }
-
-    pub(super) async fn check_unchanged(self, digest: blake3::Hash) -> io::Result<(Self, bool)> {
-        blocking(move || {
-            let unchanged = self.unchanged(digest)?;
-            Ok((self, unchanged))
-        })
-        .await
     }
 
     pub(super) async fn finish_async(self, digest: blake3::Hash) -> io::Result<Outcome> {

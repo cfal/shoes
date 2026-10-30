@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -102,7 +103,7 @@ fn bootstrap_routes_are_inline_tcp_and_preserve_dns_name_precedence() {
 }
 
 #[tokio::test]
-async fn bootstrap_only_fetches_missing_caches_and_preflights_all_required_routes() {
+async fn bootstrap_refetches_invalid_caches_and_preflights_all_required_routes() {
     let dir = directory();
     let path = dir.path().join("cache.json");
     let (url, fixture) = serve(response(200, "", VALID)).await;
@@ -115,15 +116,22 @@ async fn bootstrap_only_fetches_missing_caches_and_preflights_all_required_route
     write_rule(&path, b"DOWNLOADED_SECRET invalid");
     let mut unsupported = remote.clone();
     unsupported.download.as_mut().unwrap().bootstrap_url = "named".into();
-    let config = bootstrap(configs(&unsupported), &[]).await.unwrap();
-    let error = crate::config::compile_configs(config)
+    let error = bootstrap(configs(&unsupported), &[])
         .await
-        .err()
-        .unwrap()
+        .unwrap_err()
         .to_string();
-    assert!(error.contains("repair or remove"), "{error}");
+    assert!(error.contains("invalid rule bootstrap_url"), "{error}");
     assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
     assert_eq!(std::fs::read(&path).unwrap(), b"DOWNLOADED_SECRET invalid");
+
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let repaired = source(&url, &path);
+    let (_, memory) = super::bootstrap(configs(&repaired), &[], Default::default(), None)
+        .await
+        .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(memory[&path].digest, blake3::hash(VALID));
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
 
     std::fs::remove_file(&path).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -151,7 +159,7 @@ async fn bootstrap_only_fetches_missing_caches_and_preflights_all_required_route
 }
 
 #[tokio::test]
-async fn bootstrap_does_not_replace_a_cache_created_after_probing() {
+async fn bootstrap_can_replace_a_safe_cache_created_while_downloading() {
     let dir = directory();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
@@ -167,10 +175,15 @@ async fn bootstrap_does_not_replace_a_cache_created_after_probing() {
     request(&mut stream).await;
     write_rule(&second.path, OLD);
     stream.write_all(&response(200, "", VALID)).await.unwrap();
-    let error = task.await.unwrap().unwrap_err();
-    assert!(error.to_string().contains("cache appeared"), "{error}");
+    let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    request(&mut stream).await;
+    stream.write_all(&response(200, "", VALID)).await.unwrap();
+    task.await.unwrap().unwrap();
     assert_eq!(std::fs::read(&first.path).unwrap(), VALID);
-    assert_eq!(std::fs::read(&second.path).unwrap(), OLD);
+    assert_eq!(std::fs::read(&second.path).unwrap(), VALID);
     assert!(
         timeout(Duration::from_millis(50), listener.accept())
             .await
@@ -401,6 +414,13 @@ fn write_rule(path: &Path, bytes: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+fn cached_sources(sources: &[RuleSource]) -> MemorySources {
+    sources
+        .iter()
+        .map(|source| (source.path.clone(), load_cached(source, None).unwrap()))
+        .collect()
+}
+
 fn source(url: &str, path: &Path) -> RuleSource {
     let mut source = RuleSource::from_path(path.into());
     source.url = Some(url.into());
@@ -461,8 +481,7 @@ async fn memory_bootstrap_reuses_compiled_sources_and_invalidates_changed_urls()
     let validated = validate_inputs(
         config.clone(),
         RuleInputs {
-            memory: reused.clone(),
-            ..Default::default()
+            memory: Some(reused.clone()),
         },
     )
     .await
@@ -495,9 +514,8 @@ async fn memory_refresh_validates_changed_candidates_without_replacing_on_failur
         let source = crate::rule_set::remote_sources(&mut config)
             .unwrap()
             .remove(0);
-        let original = Arc::new(
-            crate::rule_set::load_memory(&source, OLD.to_vec(), blake3::hash(OLD)).unwrap(),
-        );
+        let original =
+            Arc::new(crate::rule_set::load_memory(&source, OLD, blake3::hash(OLD)).unwrap());
         let mut memory = MemorySources::from([(source.path.clone(), original.clone())]);
         if !valid_config {
             config.push(
@@ -507,13 +525,14 @@ async fn memory_refresh_validates_changed_candidates_without_replacing_on_failur
                 .unwrap(),
             );
         }
-        let result = refresh_memory(
+        let result = refresh_source(
             &source,
             &config,
             &mut memory,
             &DnsRegistry::new(),
             GlobalLimits::default(),
             &mut http::DownloadState::default(),
+            None,
         )
         .await;
         fixture.await.unwrap();
@@ -541,7 +560,7 @@ async fn memory_refresh_validates_changed_candidates_without_replacing_on_failur
 }
 
 #[tokio::test]
-async fn staged_validation_rejects_replaced_namespace_for_other_sources() {
+async fn retained_sources_do_not_read_a_replaced_cache_namespace() {
     let dir = directory();
     let root = dir.path().join("cache");
     create_cache_directory(&root).unwrap();
@@ -550,44 +569,64 @@ async fn staged_validation_rejects_replaced_namespace_for_other_sources() {
     write_rule(&first.path, OLD);
     write_rule(&second.path, OLD);
     let lease = Arc::new(cache_lease(&root).unwrap());
-    let mut install = Install::open_async(&first.path, Some(lease.clone()))
-        .await
-        .unwrap();
-    install.file.write_all(VALID).unwrap();
+    let memory = MemorySources::from([
+        (
+            first.path.clone(),
+            load_cached(&first, Some(&lease)).unwrap(),
+        ),
+        (
+            second.path.clone(),
+            load_cached(&second, Some(&lease)).unwrap(),
+        ),
+    ]);
     let mut config = configs(&first);
     config.extend(configs(&second).into_iter().skip(1));
-    validate_staged(config.clone(), &first.path, &install)
-        .await
-        .unwrap();
+    let original = validate_inputs(
+        config.clone(),
+        RuleInputs {
+            memory: Some(memory.clone()),
+        },
+    )
+    .await
+    .unwrap();
     let moved = dir.path().join("moved");
     std::fs::rename(&root, &moved).unwrap();
     create_cache_directory(&root).unwrap();
     write_rule(&first.path, VALID);
     write_rule(&second.path, VALID);
     let _other = cache_lease(&root).unwrap();
-    let error = validate_staged(config.clone(), &first.path, &install)
+    let (_, reused) = super::bootstrap(config.clone(), &[], memory.clone(), Some(lease.clone()))
         .await
-        .err()
         .unwrap();
+    assert!(Arc::ptr_eq(&reused[&second.path], &memory[&second.path]));
+    let validated = validate_inputs(
+        config.clone(),
+        RuleInputs {
+            memory: Some(reused.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    Refresh::new(
+        config.clone(),
+        &[first.clone(), second.clone()],
+        reused,
+        None,
+        Some(lease.clone()),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(
+        &predicates(&validated)[0],
+        &predicates(&original)[0]
+    ));
+    let error = Install::save(&first.path, OLD.to_vec(), blake3::hash(OLD), Some(lease))
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("lease lost"), "{error}");
-    assert!(
-        super::bootstrap(config.clone(), &[], Default::default(), Some(lease.clone()))
-            .await
-            .is_err()
-    );
-    assert!(
-        Refresh::new(
-            config.clone(),
-            &[first, second],
-            Default::default(),
-            None,
-            Some(lease)
-        )
-        .is_err()
-    );
+    assert_eq!(std::fs::read(&first.path).unwrap(), VALID);
+    assert_eq!(std::fs::read(&second.path).unwrap(), VALID);
     // Offline checks remain independent of a daemon's runtime lease.
     crate::config::compile_configs(config).await.unwrap();
-    drop(install);
     assert!(!moved.join("a.json.shoes-update.tmp").exists());
 }
 
@@ -607,17 +646,17 @@ async fn memory_refresh_validates_new_source_and_preserves_other_sources() {
         .iter()
         .find(|source| source.url == second.url)
         .unwrap();
-    let original =
-        Arc::new(crate::rule_set::load_memory(first, OLD.to_vec(), blake3::hash(OLD)).unwrap());
+    let original = Arc::new(crate::rule_set::load_memory(first, OLD, blake3::hash(OLD)).unwrap());
     let mut memory = MemorySources::from([(first.path.clone(), original.clone())]);
     assert!(
-        refresh_memory(
+        refresh_source(
             second,
             &config,
             &mut memory,
             &DnsRegistry::new(),
             GlobalLimits::default(),
-            &mut http::DownloadState::default()
+            &mut http::DownloadState::default(),
+            None,
         )
         .await
         .unwrap()
@@ -639,7 +678,7 @@ async fn pathless_cached_sources_get_stable_names_and_restart_offline() {
         .await
         .unwrap();
     fixture.await.unwrap();
-    assert!(memory.is_empty());
+    assert_eq!(memory.len(), 1);
     let mut copy = config.clone();
     let sources = crate::rule_set::remote_sources(&mut copy).unwrap();
     assert_eq!(sources[0].path.parent().unwrap(), dir.path());
@@ -648,8 +687,178 @@ async fn pathless_cached_sources_get_stable_names_and_restart_offline() {
     let (restarted, memory) = super::bootstrap(config, &[], Default::default(), None)
         .await
         .unwrap();
-    assert!(memory.is_empty());
+    assert_eq!(memory.len(), 1);
     crate::config::compile_configs(restarted).await.unwrap();
+}
+
+#[tokio::test]
+async fn cache_save_failure_keeps_validated_rules_and_identical_download_retries_saving() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = source(
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+        &path,
+    );
+    let config = configs(&remote);
+    let mut memory = cached_sources(std::slice::from_ref(&remote));
+    let lease = Arc::new(cache_lease(dir.path()).unwrap());
+    let trap = dir.path().join("untouched");
+    write_rule(&trap, b"untouched");
+    symlink(&trap, stage_path(&path)).unwrap();
+    let fixture = tokio::spawn(async move {
+        for body in [VALID, VALID, b"invalid data".as_slice()] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            request(&mut stream).await;
+            stream.write_all(&response(200, "", body)).await.unwrap();
+        }
+    });
+    assert!(
+        refresh_source(
+            &remote,
+            &config,
+            &mut memory,
+            &DnsRegistry::new(),
+            GlobalLimits::default(),
+            &mut http::DownloadState::default(),
+            Some(lease.clone())
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(memory[&path].digest, blake3::hash(VALID));
+    assert_eq!(std::fs::read(&path).unwrap(), OLD);
+    assert_eq!(stamp(&std::fs::metadata(&path).unwrap()), stamp(&original));
+    assert_eq!(std::fs::read(&trap).unwrap(), b"untouched");
+    let loaded = memory[&path].clone();
+    std::fs::remove_file(stage_path(&path)).unwrap();
+    assert!(
+        !refresh_source(
+            &remote,
+            &config,
+            &mut memory,
+            &DnsRegistry::new(),
+            GlobalLimits::default(),
+            &mut http::DownloadState::default(),
+            Some(lease.clone())
+        )
+        .await
+        .unwrap()
+    );
+    assert!(Arc::ptr_eq(&loaded, &memory[&path]));
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    assert!(
+        refresh_source(
+            &remote,
+            &config,
+            &mut memory,
+            &DnsRegistry::new(),
+            GlobalLimits::default(),
+            &mut http::DownloadState::default(),
+            Some(lease.clone())
+        )
+        .await
+        .is_err()
+    );
+    fixture.await.unwrap();
+    assert!(Arc::ptr_eq(&loaded, &memory[&path]));
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    std::fs::remove_file(&path).unwrap();
+    let (_, retained) = super::bootstrap(config, &[], memory, Some(lease))
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&loaded, &retained[&path]));
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn bootstrap_can_use_downloaded_rules_when_the_cache_cannot_be_saved() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    let trap = dir.path().join("untouched");
+    write_rule(&trap, b"untouched");
+    symlink(&trap, stage_path(&path)).unwrap();
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let remote = source(&url, &path);
+    let lease = Arc::new(cache_lease(dir.path()).unwrap());
+    let (config, memory) = super::bootstrap(configs(&remote), &[], Default::default(), Some(lease))
+        .await
+        .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(memory[&path].digest, blake3::hash(VALID));
+    validate_inputs(
+        config.clone(),
+        RuleInputs {
+            memory: Some(memory),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(crate::config::compile_configs(config).await.is_err());
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&trap).unwrap(), b"untouched");
+    assert!(stage_path(&path).is_symlink());
+}
+
+#[tokio::test]
+async fn refresh_after_lease_loss_updates_only_memory() {
+    for replace_root in [false, true] {
+        let dir = directory();
+        let root = dir.path().join("cache");
+        create_cache_directory(&root).unwrap();
+        let (url, fixture) = serve(response(200, "", VALID)).await;
+        let first = source(&url, &root.join("first.json"));
+        let second = source(
+            "https://unused.invalid/second.json",
+            &root.join("second.json"),
+        );
+        write_rule(&first.path, OLD);
+        write_rule(&second.path, OLD);
+        let mut config = configs(&first);
+        config.extend(configs(&second).into_iter().skip(1));
+        let lease = Arc::new(cache_lease(&root).unwrap());
+        let (_, mut memory) =
+            super::bootstrap(config.clone(), &[], Default::default(), Some(lease.clone()))
+                .await
+                .unwrap();
+        let other = memory[&second.path].clone();
+        if replace_root {
+            std::fs::rename(&root, dir.path().join("original")).unwrap();
+            create_cache_directory(&root).unwrap();
+        } else {
+            std::fs::remove_file(root.join("owner.lock")).unwrap();
+        }
+        let _replacement = cache_lease(&root).unwrap();
+        write_rule(&first.path, b"replacement namespace");
+        write_rule(&second.path, b"replacement namespace");
+        assert!(
+            refresh_source(
+                &first,
+                &config,
+                &mut memory,
+                &DnsRegistry::new(),
+                GlobalLimits::default(),
+                &mut http::DownloadState::default(),
+                Some(lease)
+            )
+            .await
+            .unwrap()
+        );
+        fixture.await.unwrap();
+        assert_eq!(memory[&first.path].digest, blake3::hash(VALID));
+        assert!(Arc::ptr_eq(&other, &memory[&second.path]));
+        assert_eq!(
+            std::fs::read(&first.path).unwrap(),
+            b"replacement namespace"
+        );
+        assert_eq!(
+            std::fs::read(&second.path).unwrap(),
+            b"replacement namespace"
+        );
+        assert!(!stage_path(&first.path).exists());
+    }
 }
 
 #[tokio::test]
@@ -662,8 +871,7 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
     let remote = crate::rule_set::remote_sources(&mut config)
         .unwrap()
         .remove(0);
-    let loaded =
-        Arc::new(crate::rule_set::load_memory(&remote, OLD.to_vec(), blake3::hash(OLD)).unwrap());
+    let loaded = Arc::new(crate::rule_set::load_memory(&remote, OLD, blake3::hash(OLD)).unwrap());
     let memory = MemorySources::from([(remote.path, loaded)]);
     let Config::Server(server) = &mut config[0] else {
         panic!("expected server")
@@ -676,8 +884,7 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
         &validate_inputs(
             config.clone(),
             RuleInputs {
-                memory: memory.clone(),
-                ..Default::default()
+                memory: Some(memory.clone()),
             },
         )
         .await
@@ -687,8 +894,7 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
         &validate_inputs(
             config.clone(),
             RuleInputs {
-                memory: memory.clone(),
-                ..Default::default()
+                memory: Some(memory.clone()),
             },
         )
         .await
@@ -702,8 +908,7 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
         validate_inputs(
             config,
             RuleInputs {
-                memory,
-                ..Default::default()
+                memory: Some(memory),
             }
         )
         .await
@@ -712,18 +917,35 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
 }
 
 async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str> {
-    let staged = super::stage(
+    let downloaded = download_source(
         source,
-        Install::open_async(&source.path, None).await?,
+        None,
         &DnsRegistry::new(),
         GlobalLimits::default(),
         limits,
         &mut http::DownloadState::default(),
     )
     .await?;
-    validate_staged(configs(source), &source.path, &staged.install).await?;
+    validate_inputs(
+        configs(source),
+        RuleInputs {
+            memory: Some(MemorySources::from([(
+                source.path.clone(),
+                downloaded.loaded.clone(),
+            )])),
+        },
+    )
+    .await?;
     Ok(
-        if staged.install.finish_async(staged.digest).await?.changed() {
+        if Install::save(
+            &source.path,
+            downloaded.bytes,
+            downloaded.loaded.digest,
+            None,
+        )
+        .await?
+        .changed()
+        {
             "updated"
         } else {
             "unchanged"
@@ -995,7 +1217,7 @@ fn ownership_lock_stale_stage_and_unsafe_paths() {
 }
 
 #[tokio::test]
-async fn cancellation_removes_stage_and_releases_lock() {
+async fn cancelled_download_never_opens_a_stage_or_update_lock() {
     let dir = directory();
     let path = dir.path().join("rules.json");
     write_rule(&path, OLD);
@@ -1010,7 +1232,8 @@ async fn cancellation_removes_stage_and_releases_lock() {
             result = &mut future => panic!("unexpected completion: {result:?}"),
             accepted = listener.accept() => {
                 let _stream = accepted.unwrap();
-                assert!(stage_path(&path).exists());
+                assert!(!stage_path(&path).exists());
+                assert!(!dir.path().join("rules.json.shoes-update.lock").exists());
             }
         }
     }
@@ -1359,7 +1582,7 @@ async fn every_existing_decoder_validates_downloads() {
         source.format = Some(format);
         source.behavior = behavior;
         source.code = code.map(str::to_owned);
-        crate::rule_set::load_memory(&source, bytes.clone(), blake3::hash(&bytes)).unwrap();
+        crate::rule_set::load_memory(&source, &bytes, blake3::hash(&bytes)).unwrap();
         assert_eq!(
             update(&source, Limits::default()).await.unwrap(),
             "updated",
@@ -1426,9 +1649,9 @@ async fn stalled_url_address_does_not_block_another_guarded_candidate() {
     drop(
         timeout(
             Duration::from_secs(2),
-            stage(
+            download_source(
                 &source,
-                Install::open_async(&source.path, None).await.unwrap(),
+                None,
                 &dns,
                 GlobalLimits::default(),
                 Limits::default(),
@@ -1561,10 +1784,12 @@ async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
             crate::control::runtime::ControlService::new(validated.control.clone()).unwrap();
         control.runtime.prepare(&mut validated).await.unwrap();
         let remote = &validated.remote_rules[0];
+        let mut memory = cached_sources(std::slice::from_ref(remote));
         assert!(
             refresh_source(
                 remote,
                 &config,
+                &mut memory,
                 &DnsRegistry::new(),
                 GlobalLimits::default(),
                 &mut http::DownloadState::default(),
@@ -1578,6 +1803,7 @@ async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
             refresh_source(
                 remote,
                 &config,
+                &mut memory,
                 &DnsRegistry::new(),
                 GlobalLimits::default(),
                 &mut http::DownloadState::default(),
@@ -1613,7 +1839,7 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
     let mut refresh = Refresh::new(
         configs(&source),
         std::slice::from_ref(&source),
-        Default::default(),
+        cached_sources(std::slice::from_ref(&source)),
         None,
         None,
     )
@@ -1632,7 +1858,7 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
     let next = Refresh::new(
         configs(&source),
         &[source],
-        Default::default(),
+        refresh.memory.clone(),
         Some(&refresh),
         None,
     )
@@ -1705,14 +1931,21 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                 .await
                 .unwrap()
                 .remote_rules;
-            let mut refresh =
-                Refresh::new(config.clone(), &sources, Default::default(), None, None).unwrap();
+            let mut refresh = Refresh::new(
+                config.clone(),
+                &sources,
+                cached_sources(&sources),
+                None,
+                None,
+            )
+            .unwrap();
             for attempt in 0..3 {
                 let item = &mut refresh.scheduled[0];
                 let dns = DnsRegistry::new();
                 let future = refresh_source(
                     &item.source,
                     &config,
+                    &mut refresh.memory,
                     &dns,
                     GlobalLimits::default(),
                     &mut item.download,
@@ -1737,7 +1970,7 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                     refresh = Refresh::new(
                         config.clone(),
                         &sources,
-                        Default::default(),
+                        refresh.memory.clone(),
                         Some(&refresh),
                         None,
                     )
@@ -1771,7 +2004,7 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
     let mut previous = Refresh::new(
         configs(&source),
         std::slice::from_ref(&source),
-        Default::default(),
+        cached_sources(std::slice::from_ref(&source)),
         None,
         None,
     )
@@ -1782,7 +2015,7 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
     let next = Refresh::new(
         configs(&source),
         std::slice::from_ref(&source),
-        Default::default(),
+        previous.memory.clone(),
         Some(&previous),
         None,
     )
@@ -1793,14 +2026,33 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
     source.url = Some("https://example.com/second.json".into());
     let changed = Refresh::new(
         configs(&source),
-        &[source],
-        Default::default(),
+        std::slice::from_ref(&source),
+        cached_sources(std::slice::from_ref(&source)),
         Some(&previous),
         None,
     )
     .unwrap();
     assert!(changed.scheduled[0].due <= Instant::now());
     assert_eq!(changed.scheduled[0].failures, 0);
+}
+
+#[test]
+fn cached_source_age_is_preserved_when_the_refresh_interval_changes() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    File::open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    let mut source = source("https://unused.invalid/rules.json", &path);
+    source.update_interval = Some("1s".into());
+    let memory = cached_sources(std::slice::from_ref(&source));
+    source.update_interval = Some("2h".into());
+    let refresh = Refresh::new(configs(&source), &[source], memory, None, None).unwrap();
+    let remaining = refresh.scheduled[0].due.duration_since(Instant::now());
+    assert!(remaining > Duration::from_secs(3595));
+    assert!(remaining <= Duration::from_secs(3600));
 }
 
 #[tokio::test]
@@ -1822,6 +2074,7 @@ async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
         let result = refresh_source(
             &source,
             &config,
+            &mut cached_sources(std::slice::from_ref(&source)),
             &DnsRegistry::new(),
             GlobalLimits::default(),
             &mut http::DownloadState::default(),
@@ -1845,7 +2098,7 @@ async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
 }
 
 #[tokio::test]
-async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
+async fn runtime_validation_uses_retained_sources_and_never_falls_back_to_disk() {
     let dir = directory();
     let mut first = source(
         "https://example.com/first.json",
@@ -1858,8 +2111,13 @@ async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
     );
     write_rule(&first.path, b"SRS invalid old cache");
     write_rule(&second.path, OLD);
-    let mut install = Install::open(&first.path).unwrap();
-    install.file.write_all(VALID).unwrap();
+    let memory = MemorySources::from([
+        (
+            first.path.clone(),
+            Arc::new(crate::rule_set::load_memory(&first, VALID, blake3::hash(VALID)).unwrap()),
+        ),
+        (second.path.clone(), load_cached(&second, None).unwrap()),
+    ]);
     let config: Vec<Config> = serde_json::from_value(serde_json::json!([
         {"rule_cache_dir": dir.path()},
         {"rule_source_group": "shared", "rules": [first]},
@@ -1870,9 +2128,14 @@ async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
         ]}
     ]))
     .unwrap();
-    let validated = validate_staged(config.clone(), &first.path, &install)
-        .await
-        .unwrap();
+    let validated = validate_inputs(
+        config.clone(),
+        RuleInputs {
+            memory: Some(memory.clone()),
+        },
+    )
+    .await
+    .unwrap();
     let predicates = predicates(&validated);
     assert!(Arc::ptr_eq(&predicates[0], &predicates[1]));
     assert!(!Arc::ptr_eq(&predicates[0], &predicates[2]));
@@ -1882,12 +2145,30 @@ async fn staged_validation_reuses_one_input_and_reads_other_caches_normally() {
     );
 
     std::fs::remove_file(&second.path).unwrap();
-    let error = validate_staged(config, &first.path, &install)
-        .await
-        .err()
-        .unwrap();
+    validate_inputs(
+        config.clone(),
+        RuleInputs {
+            memory: Some(memory.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    write_rule(&second.path, VALID);
+    let mut incomplete = memory;
+    incomplete.remove(&second.path);
+    let error = validate_inputs(
+        config,
+        RuleInputs {
+            memory: Some(incomplete),
+        },
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(
-        error.to_string().contains("remote cache unavailable"),
+        error
+            .to_string()
+            .contains("remote rules unavailable in memory"),
         "{error}"
     );
 }
@@ -1929,9 +2210,9 @@ async fn explicit_bootstrap_resolves_target_without_system_dns() {
         &path,
     );
     source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
-    let mut staged = super::stage(
+    let downloaded = download_source(
         &source,
-        Install::open_async(&source.path, None).await.unwrap(),
+        None,
         &dns,
         GlobalLimits::default(),
         Limits::default(),
@@ -1939,7 +2220,14 @@ async fn explicit_bootstrap_resolves_target_without_system_dns() {
     )
     .await
     .unwrap();
-    staged.install.finish(staged.digest).unwrap();
+    Install::save(
+        &source.path,
+        downloaded.bytes,
+        downloaded.loaded.digest,
+        None,
+    )
+    .await
+    .unwrap();
     fixture.await.unwrap();
     assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
@@ -2044,9 +2332,9 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
                 serve_second(stream).await;
             }
         });
-        let staged = stage(
+        let downloaded = download_source(
             &source,
-            Install::open_async(&source.path, None).await.unwrap(),
+            None,
             &dns,
             GlobalLimits::default(),
             Limits::default(),
@@ -2054,7 +2342,7 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
         )
         .await
         .unwrap();
-        drop(staged);
+        drop(downloaded);
         timeout(Duration::from_secs(5), fixture)
             .await
             .unwrap()
@@ -2192,9 +2480,9 @@ async fn first_download_proxy_retains_bootstrap_address_fallback() {
             stream.write_all(&response(200, "", VALID)).await.unwrap();
         });
         drop(
-            stage(
+            download_source(
                 &source,
-                Install::open_async(&source.path, None).await.unwrap(),
+                None,
                 &dns,
                 GlobalLimits::default(),
                 Limits::default(),

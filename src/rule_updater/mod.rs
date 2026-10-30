@@ -3,9 +3,9 @@ mod bootstrap;
 mod http;
 mod install;
 
-use std::io;
-use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::io::{self, Read};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::{Config, GlobalLimits, ValidatedConfigs};
 use crate::dns::DnsRegistry;
@@ -36,29 +36,9 @@ impl Default for Limits {
 pub(crate) use bootstrap::prepare as bootstrap;
 pub(crate) use install::{CacheLease, cache_file, cache_lease, create_cache_directory};
 
-struct Staged {
-    install: Install,
-    digest: blake3::Hash,
-}
-
-async fn stage(
-    source: &RuleSource,
-    install: Install,
-    dns: &DnsRegistry,
-    global: GlobalLimits,
-    limits: Limits,
-    state: &mut http::DownloadState,
-) -> io::Result<Staged> {
-    let mut file = tokio::fs::File::from_std(install.file.try_clone()?);
-    let digest = download(source, dns, global, &mut file, limits, state).await?;
-    let validation_source = source.clone();
-    let file = install.file.try_clone()?;
-    crate::config::blocking_compile(move || {
-        crate::rule_set::validate_file(&validation_source, file)
-            .map_err(|_| invalid("download failed Shoes rule validation"))
-    })
-    .await?;
-    Ok(Staged { install, digest })
+struct Downloaded {
+    bytes: Vec<u8>,
+    loaded: Arc<MemorySource>,
 }
 
 async fn download(
@@ -81,44 +61,72 @@ async fn download(
         .map_err(|_| invalid("overall rule download deadline exceeded"))?
 }
 
-async fn download_memory(
+async fn download_source(
     source: &RuleSource,
-    previous: Option<&MemorySource>,
+    previous: Option<&Arc<MemorySource>>,
     dns: &DnsRegistry,
     global: GlobalLimits,
+    limits: Limits,
     state: &mut http::DownloadState,
-) -> io::Result<Option<std::sync::Arc<MemorySource>>> {
+) -> io::Result<Downloaded> {
     let mut bytes = Vec::new();
-    let digest = download(source, dns, global, &mut bytes, Limits::default(), state).await?;
+    let digest = download(source, dns, global, &mut bytes, limits, state).await?;
     if let Some(previous) = previous
         && previous.digest == digest
         && previous.matches(source)?
     {
-        return Ok(None);
+        return Ok(Downloaded {
+            bytes,
+            loaded: previous.clone(),
+        });
     }
     let source = source.clone();
-    let loaded = crate::config::blocking_compile(move || {
-        crate::rule_set::load_memory(&source, bytes, digest)
-            .map_err(|_| invalid("download failed Shoes rule validation"))
+    crate::config::blocking_compile(move || {
+        let loaded = crate::rule_set::load_memory(&source, &bytes, digest)
+            .map_err(|_| invalid("download failed Shoes rule validation"))?;
+        Ok(Downloaded {
+            bytes,
+            loaded: Arc::new(loaded),
+        })
     })
-    .await?;
-    Ok(Some(std::sync::Arc::new(loaded)))
+    .await
 }
 
-async fn validate_staged(
-    configs: Vec<Config>,
-    path: &Path,
-    install: &Install,
-) -> io::Result<ValidatedConfigs> {
-    validate_inputs(
-        configs,
-        RuleInputs {
-            file: Some((path.to_owned(), install.file.try_clone()?)),
-            cache_lease: install.lease.clone(),
-            ..Default::default()
-        },
-    )
-    .await
+fn load_cached(source: &RuleSource, lease: Option<&CacheLease>) -> io::Result<Arc<MemorySource>> {
+    let file = cache_file(&source.path, lease)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_BYTES {
+        return Err(invalid("rule source input exceeds 64 MiB"));
+    }
+    let interval = source.interval()?;
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .unwrap_or(interval);
+    let mut bytes = Vec::new();
+    file.take(metadata.len() + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(invalid("rule cache changed while reading"));
+    }
+    let mut loaded = crate::rule_set::load_memory(source, &bytes, blake3::hash(&bytes))?;
+    let now = std::time::Instant::now();
+    loaded.updated = now.checked_sub(age).unwrap_or(now - interval);
+    Ok(Arc::new(loaded))
+}
+
+async fn save_cache(
+    source: &RuleSource,
+    bytes: Vec<u8>,
+    digest: blake3::Hash,
+    lease: Option<Arc<CacheLease>>,
+) {
+    if let Err(error) = Install::save(&source.path, bytes, digest, lease).await {
+        log::warn!(
+            "Remote rule cache not saved for {}: {error}; validated rules remain available in memory",
+            source.path.display()
+        );
+    }
 }
 
 async fn validate_inputs(configs: Vec<Config>, inputs: RuleInputs) -> io::Result<ValidatedConfigs> {
@@ -150,53 +158,41 @@ struct Scheduled {
 async fn refresh_source(
     source: &RuleSource,
     configs: &[Config],
-    dns: &DnsRegistry,
-    global: GlobalLimits,
-    state: &mut http::DownloadState,
-    lease: Option<std::sync::Arc<CacheLease>>,
-) -> io::Result<bool> {
-    let install = Install::open_async(&source.path, lease).await?;
-    let Staged { install, digest } =
-        stage(source, install, dns, global, Limits::default(), state).await?;
-    let (install, unchanged) = install.check_unchanged(digest).await?;
-    if unchanged {
-        return Ok(false);
-    }
-    validate_staged(configs.to_vec(), &source.path, &install).await?;
-    Ok(install.finish_async(digest).await?.changed())
-}
-
-async fn refresh_memory(
-    source: &RuleSource,
-    configs: &[Config],
     memory: &mut MemorySources,
     dns: &DnsRegistry,
     global: GlobalLimits,
     state: &mut http::DownloadState,
+    lease: Option<Arc<CacheLease>>,
 ) -> io::Result<bool> {
-    let Some(loaded) = download_memory(
+    let Downloaded { bytes, loaded } = download_source(
         source,
-        memory.get(&source.path).map(AsRef::as_ref),
+        memory.get(&source.path),
         dns,
         global,
+        Limits::default(),
         state,
     )
-    .await?
-    else {
-        return Ok(false);
-    };
-    let mut candidate = memory.clone();
-    candidate.insert(source.path.clone(), loaded.clone());
-    validate_inputs(
-        configs.to_vec(),
-        RuleInputs {
-            memory: candidate,
-            ..Default::default()
-        },
-    )
     .await?;
-    memory.insert(source.path.clone(), loaded);
-    Ok(true)
+    let changed = memory
+        .get(&source.path)
+        .is_none_or(|previous| !Arc::ptr_eq(previous, &loaded));
+    if changed {
+        let mut candidate = memory.clone();
+        candidate.insert(source.path.clone(), loaded.clone());
+        validate_inputs(
+            configs.to_vec(),
+            RuleInputs {
+                memory: Some(candidate),
+            },
+        )
+        .await?;
+        memory.insert(source.path.clone(), loaded.clone());
+    }
+    if crate::rule_set::cache_directory(configs)?.is_some() {
+        // Identical downloads also retry persistence after a previous cache failure.
+        save_cache(source, bytes, loaded.digest, lease).await;
+    }
+    Ok(changed)
 }
 
 /// Polled by the process select loop. Dropping that future cancels the HTTP
@@ -205,8 +201,7 @@ pub(crate) struct Refresh {
     configs: Vec<Config>,
     scheduled: Vec<Scheduled>,
     pub(crate) memory: MemorySources,
-    persistent: bool,
-    cache_lease: Option<std::sync::Arc<CacheLease>>,
+    cache_lease: Option<Arc<CacheLease>>,
 }
 
 impl Refresh {
@@ -215,12 +210,8 @@ impl Refresh {
         sources: &[RuleSource],
         memory: MemorySources,
         previous: Option<&Self>,
-        cache_lease: Option<std::sync::Arc<CacheLease>>,
+        cache_lease: Option<Arc<CacheLease>>,
     ) -> io::Result<Self> {
-        if let Some(lease) = &cache_lease {
-            lease.check()?;
-        }
-        let persistent = crate::rule_set::cache_directory(&configs)?.is_some();
         let mut scheduled = Vec::new();
         for source in sources {
             let identity = serde_json::to_value(source)?;
@@ -236,20 +227,7 @@ impl Refresh {
             } else if let Some(loaded) = memory.get(&source.path) {
                 Instant::now() + interval.saturating_sub(loaded.updated.elapsed())
             } else {
-                let modified = if let Some(lease) = &cache_lease {
-                    cache_file(&source.path, Some(lease))?
-                        .metadata()?
-                        .modified()
-                        .ok()
-                } else {
-                    std::fs::metadata(&source.path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                };
-                let remaining = modified
-                    .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
-                    .map_or(Duration::ZERO, |age| interval.saturating_sub(age));
-                Instant::now() + remaining
+                return Err(invalid("remote rules unavailable in memory"));
             };
             scheduled.push(Scheduled {
                 identity,
@@ -264,7 +242,6 @@ impl Refresh {
             configs,
             scheduled,
             memory,
-            persistent,
             cache_lease,
         })
     }
@@ -276,27 +253,16 @@ impl Refresh {
                 return;
             };
             tokio::time::sleep_until(item.due).await;
-            let result = if self.persistent {
-                refresh_source(
-                    &item.source,
-                    &self.configs,
-                    dns,
-                    global,
-                    &mut item.download,
-                    self.cache_lease.clone(),
-                )
-                .await
-            } else {
-                refresh_memory(
-                    &item.source,
-                    &self.configs,
-                    &mut self.memory,
-                    dns,
-                    global,
-                    &mut item.download,
-                )
-                .await
-            };
+            let result = refresh_source(
+                &item.source,
+                &self.configs,
+                &mut self.memory,
+                dns,
+                global,
+                &mut item.download,
+                self.cache_lease.clone(),
+            )
+            .await;
             let interval = item.source.interval().expect("validated interval");
             let delay = match &result {
                 Ok(_) => {

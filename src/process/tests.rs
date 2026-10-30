@@ -65,7 +65,7 @@ async fn load_validated(
 
 #[cfg(unix)]
 #[tokio::test]
-async fn runtime_reload_rechecks_cache_lease_even_without_sources() {
+async fn runtime_reload_retains_a_lost_lease_without_reacquiring_it() {
     for replace_root in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -91,7 +91,7 @@ async fn runtime_reload_rechecks_cache_lease_even_without_sources() {
         let _other = crate::rule_updater::cache_lease(&cache).unwrap();
         let mut lease = previous.cache_lease.clone();
         let configs = config::load_config_files(&paths).await.unwrap();
-        let error = load_candidate(
+        load_candidate(
             &paths,
             configs,
             &mut |_, _, _| {},
@@ -101,8 +101,12 @@ async fn runtime_reload_rechecks_cache_lease_even_without_sources() {
             &[],
         )
         .await
-        .err()
         .unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            lease.as_ref().unwrap(),
+            previous.cache_lease.as_ref().unwrap()
+        ));
+        let error = lease.unwrap().check().unwrap_err();
         assert!(error.to_string().contains("lease lost"), "{error}");
         load_validated(&paths, &mut |_, _, _| {}).await.unwrap();
     }

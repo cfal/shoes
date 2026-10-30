@@ -89,10 +89,8 @@ impl MemorySource {
 
 #[derive(Default)]
 pub(crate) struct RuleInputs {
-    pub(crate) file: Option<(PathBuf, std::fs::File)>,
-    pub(crate) memory: MemorySources,
-    #[cfg(unix)]
-    pub(crate) cache_lease: Option<Arc<crate::rule_updater::CacheLease>>,
+    // Runtime compilation never falls back to disk for a missing retained source.
+    pub(crate) memory: Option<MemorySources>,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -613,7 +611,13 @@ pub fn load_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<A
 
 fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<Predicate>> {
     if compiler.remote_files.contains_key(&source.path) {
-        if let Some(loaded) = compiler.inputs.memory.get(&source.path).cloned() {
+        if let Some(loaded) = compiler
+            .inputs
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.get(&source.path))
+            .cloned()
+        {
             let key = SourceKey::new(source.path.clone(), loaded.format, source);
             if let Some(predicate) = compiler.sources.get(&key) {
                 return Ok(predicate.clone());
@@ -627,7 +631,7 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             compiler.sources.insert(key, loaded.predicate.clone());
             return Ok(loaded.predicate.clone());
         }
-        if compiler.memory_only {
+        if compiler.memory_only || compiler.inputs.memory.is_some() {
             return Err(invalid(
                 "remote rules unavailable in memory; offline checks never download; daemon startup fetches remote sources",
             ));
@@ -638,24 +642,9 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             "rule source path must be absolute for string configs; file configs anchor paths to their declaring file",
         ));
     }
-    if let Some((path, file)) = &compiler.inputs.file
-        && path == &source.path
-    {
-        return read_file(source, file.try_clone()?, source.path.clone(), compiler).map_err(
-            |error| {
-                io::Error::new(
-                    error.kind(),
-                    "staged rule data failed validation (details redacted)",
-                )
-            },
-        );
-    }
     #[cfg(unix)]
     if source.url.is_some() || compiler.remote_files.contains_key(&source.path) {
-        let file = crate::rule_updater::cache_file(
-            &source.path,
-            compiler.inputs.cache_lease.as_deref(),
-        )
+        let file = crate::rule_updater::cache_file(&source.path, None)
         .map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -668,7 +657,7 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             io::Error::new(
                 error.kind(),
                 format!(
-                    "{error}; existing invalid caches are not downloaded again; repair or remove the cache explicitly"
+                    "{error}; offline checks never download; daemon startup can refetch invalid caches"
                 ),
             )
         });
@@ -688,10 +677,6 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
     read_file(source, options.open(&path)?, path, compiler)
 }
 
-pub(crate) fn validate_file(source: &RuleSource, file: std::fs::File) -> io::Result<()> {
-    read_file(source, file, source.path.clone(), &mut Compiler::default()).map(|_| ())
-}
-
 fn read_file(
     source: &RuleSource,
     file: std::fs::File,
@@ -703,7 +688,7 @@ fn read_file(
 
 pub(crate) fn load_memory(
     source: &RuleSource,
-    bytes: Vec<u8>,
+    bytes: &[u8],
     digest: blake3::Hash,
 ) -> io::Result<MemorySource> {
     let (format, predicate) = read_data(
@@ -721,15 +706,15 @@ pub(crate) fn load_memory(
     })
 }
 
-enum SourceInput {
+enum SourceInput<'a> {
     File(std::fs::File),
-    Memory(Vec<u8>),
+    Memory(&'a [u8]),
 }
 
 fn read_data(
     source: &RuleSource,
     path: PathBuf,
-    mut input: SourceInput,
+    mut input: SourceInput<'_>,
     compiler: &mut Compiler,
 ) -> io::Result<(Format, Arc<Predicate>)> {
     let url_hint = source.url_format()?;
@@ -793,14 +778,14 @@ fn read_data(
             let factor = if format == Format::SingboxJson { 4 } else { 2 };
             compiler.charge(size.saturating_mul(factor).saturating_add(64), 0)?;
             let bytes = match input {
-                SourceInput::Memory(bytes) => bytes,
+                SourceInput::Memory(bytes) => std::borrow::Cow::Borrowed(bytes),
                 SourceInput::File(file) => {
                     let mut bytes = Vec::with_capacity(size + 1);
                     file.take(size as u64 + 1).read_to_end(&mut bytes)?;
                     if bytes.len() != size {
                         return Err(invalid("rule source changed while reading; retry with an atomic file replacement"));
                     }
-                    bytes
+                    std::borrow::Cow::Owned(bytes)
                 }
             };
             match format {

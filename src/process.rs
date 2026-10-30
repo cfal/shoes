@@ -69,10 +69,6 @@ async fn load_candidate(
             ));
         }
         #[cfg(unix)]
-        if let Some(lease) = cache_lease {
-            lease.check()?;
-        }
-        #[cfg(unix)]
         if for_runtime
             && cache_lease.is_none()
             && let Some(directory) = cache_dir
@@ -115,10 +111,7 @@ async fn load_candidate(
         let mut validated = config::compile_configs_with_inputs(
             configs,
             crate::rule_set::RuleInputs {
-                file: None,
-                memory: memory.clone(),
-                #[cfg(unix)]
-                cache_lease: cache_lease.clone(),
+                memory: for_runtime.then(|| memory.clone()),
             },
         )
         .await?;

@@ -1,4 +1,4 @@
-use super::{Limits, download_memory, http, install, stage};
+use super::{Limits, download_source, http, install, load_cached, save_cache};
 use crate::config::Config;
 use crate::dns::DnsRegistry;
 use crate::rule_set::MemorySources;
@@ -17,27 +17,30 @@ pub(crate) async fn prepare(
             let mut missing = Vec::new();
             let persistent = crate::rule_set::cache_directory(&configs)?.is_some();
             let mut memory = MemorySources::new();
+            let mut budget = crate::rules::Compiler::default();
             for source in crate::rule_set::remote_sources(&mut configs)? {
-                if !persistent {
-                    if let Some(loaded) = previous.get(&source.path)
-                        && loaded.matches(&source)?
-                    {
+                if let Some(loaded) = previous.get(&source.path) {
+                    if loaded.matches(&source)? {
+                        budget.charge(loaded.retained_bytes(), 0)?;
                         memory.insert(source.path.clone(), loaded.clone());
                     } else {
                         missing.push(source);
                     }
                     continue;
                 }
-                match install::cache_file(&source.path, cache_lease.as_deref()) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(source),
-                    Err(error) => {
-                        return Err(io::Error::new(
-                            error.kind(),
-                            format!("rule cache {}: {error}", source.path.display()),
-                        ));
+                if persistent {
+                    match load_cached(&source, cache_lease.as_deref()) {
+                        Ok(loaded) => {
+                            budget.charge(loaded.retained_bytes(), 0)?;
+                            memory.insert(source.path.clone(), loaded);
+                            continue;
+                        }
+                        Err(error) => {
+                            log::warn!("Remote rule cache unavailable for {}: {error}; fetching fresh rules", source.path.display());
+                        }
                     }
                 }
+                missing.push(source);
             }
             let global = if missing.is_empty() {
                 Default::default()
@@ -68,60 +71,34 @@ pub(crate) async fn prepare(
         })?;
     }
     for source in missing {
-        if !persistent {
-            log::info!(
-                "Bootstrapping remote rules in memory {}",
-                source.path.display()
-            );
-            let loaded = download_memory(
-                &source,
-                None,
-                &dns,
-                global,
-                &mut http::DownloadState::default(),
+        log::info!("Bootstrapping remote rules {}", source.path.display());
+        let downloaded = download_source(
+            &source,
+            None,
+            &dns,
+            global,
+            Limits::default(),
+            &mut http::DownloadState::default(),
+        )
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "rule bootstrap {}: {error}; no direct fallback",
+                    source.path.display()
+                ),
             )
-            .await
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "rule bootstrap {}: {error}; no direct fallback",
-                        source.path.display()
-                    ),
-                )
-            })?
-            .expect("initial download always decodes");
-            memory.insert(source.path.clone(), loaded);
-            let mut budget = crate::rules::Compiler::default();
-            for loaded in memory.values() {
-                budget.charge(loaded.retained_bytes(), 0)?;
-            }
-            continue;
+        })?;
+        let digest = downloaded.loaded.digest;
+        memory.insert(source.path.clone(), downloaded.loaded);
+        let mut budget = crate::rules::Compiler::default();
+        for loaded in memory.values() {
+            budget.charge(loaded.retained_bytes(), 0)?;
         }
-        log::info!("Bootstrapping missing rule cache {}", source.path.display());
-        let result = async {
-            let install = install::Install::open_async(&source.path, lease.clone()).await?;
-            install.require_missing()?;
-            let staged = stage(
-                &source,
-                install,
-                &dns,
-                global,
-                Limits::default(),
-                &mut http::DownloadState::default(),
-            )
-            .await?;
-            staged.install.finish_async(staged.digest).await
+        if persistent {
+            save_cache(&source, downloaded.bytes, digest, lease.clone()).await;
         }
-        .await;
-        result.map_err(|error| io::Error::new(error.kind(), format!(
-            "rule bootstrap {}: {error}; no direct fallback; earlier completed cache installs remain",
-            source.path.display()
-        )))?;
-        log::info!(
-            "Installed bootstrap cache {}; full candidate validation is still pending",
-            source.path.display()
-        );
     }
     Ok((configs, memory))
 }
