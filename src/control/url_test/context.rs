@@ -7,6 +7,16 @@ use std::sync::{Arc, Weak};
 use tokio::sync::Notify;
 
 pub(crate) const MAX_CONTEXTS: usize = 1024;
+const MAX_DEPENDENCY_ENTRIES: usize = 65_536;
+
+pub(crate) fn check_dependency_capacity(entries: usize) -> io::Result<()> {
+    if entries > MAX_DEPENDENCY_ENTRIES {
+        return Err(crate::control::health::capacity_error(format!(
+            "URL-test exceeds {MAX_DEPENDENCY_ENTRIES} selector dependency entries"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 pub(crate) struct Contexts {
@@ -29,6 +39,16 @@ impl Contexts {
                 "URL-test exceeds 1024 active route contexts".into(),
             ));
         }
+        let retained_entries: usize = live
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|context| context.dependency_entries())
+            .sum();
+        let added_entries: usize = contexts
+            .iter()
+            .map(|context| context.dependency_entries())
+            .sum();
+        check_dependency_capacity(retained_entries + added_entries)?;
         for context in contexts {
             // The caller holds the selection read lock until registration completes.
             context.gate.lock().choices = relevant_choices(&context.dependencies, choices);
@@ -115,10 +135,6 @@ impl Context {
         owner: Weak<Composition>,
         resolver: Arc<dyn Resolver>,
     ) -> Arc<Self> {
-        let mut dependencies = definition.dependencies;
-        dependencies.extend(resolver.manual_selector_paths());
-        dependencies.sort_unstable();
-        dependencies.dedup();
         let members = definition.labels;
         Arc::new(Self {
             name: definition.name,
@@ -135,9 +151,13 @@ impl Context {
             occurrence: definition.occurrence,
             ancestors: definition.ancestors,
             required: definition.required,
-            dependencies,
+            dependencies: definition.dependencies,
             gate: Mutex::default(),
         })
+    }
+
+    fn dependency_entries(&self) -> usize {
+        self.dependencies.iter().map(|path| path.len().max(1)).sum()
     }
 
     pub(crate) fn active(&self, choices: &Choices) -> bool {
@@ -228,6 +248,117 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn dependency_catalog(
+        occurrences: usize,
+        members: usize,
+        depth: usize,
+    ) -> crate::control::catalog::Catalog {
+        let mut configs = vec![
+            json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
+                "client_chains":[{"address":"192.0.2.1:80", "protocol":{"type":"http"}}]}),
+            json!({"client_group":"wide", "client_chains":vec!["auto"; occurrences]}),
+            json!({"client_group":"s0", "type":"selector", "client_chains":
+                (0..members).map(|index| json!({"name":format!("leaf-{index}"),
+                    "address":"192.0.2.2:80", "protocol":{"type":"http"}})).collect::<Vec<_>>()
+            }),
+        ];
+        for index in 1..depth {
+            configs.push(
+                json!({"client_group":format!("s{index}"), "type":"selector",
+                "client_chains":[format!("s{}", index - 1)]}),
+            );
+        }
+        configs.push(json!({"client_group":"route",
+            "client_chains":[{"chain":["wide", format!("s{}", depth - 1)]}]}));
+        crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
+            .unwrap()
+            .catalog
+            .unwrap()
+    }
+
+    fn build_route(
+        catalog: &crate::control::catalog::Catalog,
+        resolver: Arc<dyn Resolver>,
+    ) -> io::Result<crate::client_proxy_chain::ClientProxyChain> {
+        crate::tcp::chain_builder::try_build_client_proxy_chain(
+            catalog.route("route").unwrap().hops,
+            resolver,
+        )
+    }
+
+    #[test]
+    fn dependency_budget_rejects_distinct_paths_multiplied_across_contexts() {
+        let catalog = dependency_catalog(64, 256, 9);
+        let error =
+            build_route(&catalog, Arc::new(crate::resolver::NativeResolver::new())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("65536 selector dependency entries"),
+            "{error}"
+        );
+        assert!(catalog.selection.contexts.snapshot().is_empty());
+    }
+
+    #[test]
+    fn dependency_budget_spans_roots_and_reclaims_dropped_routes() {
+        let catalog = dependency_catalog(16, 256, 8);
+        let build = || build_route(&catalog, Arc::new(crate::resolver::NativeResolver::new()));
+        let first = build().unwrap();
+        let second = build().unwrap();
+        assert_eq!(catalog.selection.contexts.snapshot().len(), 32);
+        let error = build().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("65536 selector dependency entries"),
+            "{error}"
+        );
+        assert_eq!(catalog.selection.contexts.snapshot().len(), 32);
+        drop(first);
+        let replacement = build().unwrap();
+        assert_eq!(catalog.selection.contexts.snapshot().len(), 32);
+        drop((second, replacement));
+        assert!(catalog.selection.contexts.snapshot().is_empty());
+    }
+
+    #[derive(Debug)]
+    struct SelectorResolver(Vec<ManualSelectorPath>);
+
+    impl Resolver for SelectorResolver {
+        fn resolve_location(
+            &self,
+            _: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            unreachable!()
+        }
+
+        fn manual_selector_paths(&self) -> Vec<ManualSelectorPath> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn dependency_budget_includes_resolver_paths_and_path_depth() {
+        let catalog = dependency_catalog(16, 1, 1);
+        let paths = (0..64)
+            .map(|path| {
+                (0..64)
+                    .map(|pair| (format!("dns-{path}-{pair}"), "member".into()))
+                    .collect()
+            })
+            .collect();
+        let error = build_route(&catalog, Arc::new(SelectorResolver(paths))).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("65536 selector dependency entries"),
+            "{error}"
+        );
+        assert!(catalog.selection.contexts.snapshot().is_empty());
+    }
 
     #[test]
     fn review_selector_dependencies_store_only_distinct_paths() {

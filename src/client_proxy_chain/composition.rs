@@ -2,7 +2,7 @@ use super::*;
 use crate::config::{ClientChainHop, ClientConfig, ConfigSelection, GlobalLimits, GroupType};
 use crate::control::health::{Health, ProbeJob};
 use crate::control::selection::{Choices, ManualSelectorPath, SelectionView};
-use crate::control::url_test::context::{Context, Definition};
+use crate::control::url_test::context::{Context, Definition, check_dependency_capacity};
 use crate::option_util::OneOrSome;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
 use std::collections::{BTreeSet, HashMap};
@@ -126,22 +126,35 @@ impl Composition {
                 });
             }
         }
+        let mut definitions = Vec::new();
+        if !standalone && selection.is_some() {
+            root.context_definitions(&[], &[], &mut definitions);
+        }
+        if !definitions.is_empty() {
+            let resolver_paths = resolver.manual_selector_paths();
+            let mut entries = 0;
+            for definition in &mut definitions {
+                let mut dependencies = BTreeSet::new();
+                root.dependencies(&definition.ancestors, &mut dependencies);
+                dependencies.extend(&resolver_paths);
+                entries += dependencies
+                    .iter()
+                    .map(|path| path.len().max(1))
+                    .sum::<usize>();
+                // Bounds owned paths before cloning, including resolver dependencies.
+                check_dependency_capacity(entries)?;
+                definition.dependencies = dependencies.into_iter().cloned().collect();
+            }
+        }
         let mut registered = Vec::new();
         let result = Arc::new_cyclic(|owner| {
             let mut contexts = HashMap::new();
-            if !standalone && selection.is_some() {
-                let mut definitions = Vec::new();
-                root.context_definitions(&[], &[], &mut definitions);
-                for mut definition in definitions {
-                    let mut dependencies = BTreeSet::new();
-                    root.dependencies(&definition.ancestors, &mut dependencies);
-                    definition.dependencies = dependencies.into_iter().cloned().collect();
-                    let id = definition.occurrence;
-                    let context = Context::new(definition, owner.clone(), resolver.clone());
-                    // Definitions follow occurrence order, which breaks admission ties.
-                    registered.push(context.clone());
-                    contexts.insert(id, context);
-                }
+            for definition in definitions {
+                let id = definition.occurrence;
+                let context = Context::new(definition, owner.clone(), resolver.clone());
+                // Definitions follow occurrence order, which breaks admission ties.
+                registered.push(context.clone());
+                contexts.insert(id, context);
             }
             Self {
                 root,
