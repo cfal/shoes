@@ -304,7 +304,7 @@ A configuration file is a YAML array containing one or more configuration entrie
 
 # Client config groups have 'client_group'
 - client_group: my-upstream
-  client_proxy: ...
+  client_chains: ...
 
 # Rule config groups have 'rule_group'
 - rule_group: my-rules
@@ -434,9 +434,13 @@ for example, XHTTP upload cancellation can lose the original cause and count as 
 remote failure.
 User payloads are never retried across candidates. Probes use HTTP HEAD and accept
 any HTTP response status, without redirects; HTTPS certificates are verified.
-Local probe lookups use guarded system DNS, not a server's configured DNS group.
+Contextual checks use the forwarding route's resolver, with the same probe
+destination-policy guard. Standalone controller checks use guarded system DNS.
 API probes with the same normalized URL and wildcard/default expected status also
-update selection. Other URLs and explicit status expectations cannot overwrite it.
+update standalone selection, never contextual measurements. Other URLs and explicit
+status expectations cannot overwrite selection samples.
+Nested automatic choices in controller probes also use the standalone dashboard
+state; API connector caches do not create additional automatic contexts.
 
 Periodic and API probes share a 16-probe limit. Each periodic round's timeout
 includes admission/queue time; members not admitted before the deadline retain
@@ -445,8 +449,9 @@ preserves prior health; successful probes and explicit remote errors still updat
 Members with no full-budget attempt, then the oldest full-budget attempts, lead each
 round, independently of health. Local failures cannot monopolize these slots, and
 queued attempts can receive a full budget on a later round. Tied members rotate on admission.
-Due groups with the oldest unqueued admission get priority, with stable catalog order
-breaking ties.
+Due groups with the oldest unqueued admission get priority, with stable catalog
+and context-registration order breaking ties. Contextual admission timestamps are
+independent of standalone API attempts.
 Under sustained saturation, reduce group size, increase
 timeout/interval, or expect unprobed/stale members. Scheduling has one-second
 granularity and does not overlap rounds within a group; other groups can run while
@@ -454,7 +459,7 @@ a slow round is in flight. Activation/reload cancels old work and rejects obsole
 results; an interrupted round is immediately eligible when its generation resumes.
 New committed generations start with unprobed health.
 
-The controller reports `type: URLTest`, effective TCP `now`, optional `udpNow`,
+The controller reports `type: URLTest`, standalone TCP `now`, optional `udpNow`,
 `testUrl`, and selected-member `health` (`unprobed`, `healthy`, `dead`, or `stale`).
 Its `alive` is true only for fresh healthy results. Manual selection PUTs for
 automatic groups are rejected; automatic choices are neither pinned nor persisted.
@@ -462,8 +467,19 @@ Leaf histories remain bounded to ten samples per URL and eight URLs. Automatic
 selection retains its configured-URL samples and full-budget attempt timestamps
 independently of API eviction; other attempt URLs are capped at eight per member
 for each of filtered and unfiltered probes.
-Automatic checks test each immediate member as a standalone outbound, not every
-surrounding chain or destination. URL-test groups are not supported by FFI.
+Each URL-test occurrence in a forwarding route has independent state. A check
+forces one immediate member and samples one complete route, including its enclosing
+prefix and suffix. Nested round-robin choices are sampled, not exhaustively tested;
+probes do not advance forwarding counters. Manual selector changes affecting the
+route or its resolver invalidate samples and fence in-flight results. Routes in
+manually deselected branches are not checked.
+The dashboard is a standalone projection, not a summary of all route contexts;
+its `now` can differ from forwarding choices. Contextual results never overwrite
+standalone history. There are at most 1,024 live automatic contexts per generation.
+Each separately built forwarding route owns its occurrences, including copies of
+rules across inbounds. A single route over the limit fails validation; the combined
+live-route limit is enforced when constructing routes, including lazy carriers.
+URL-test groups are not supported by FFI.
 
 Only one `cache_file_path` is allowed across all input files. Its absence disables
 persistence; relative paths resolve against the process working directory.
@@ -2116,7 +2132,52 @@ rules:
 
 ## Named Groups
 
-### Client Proxy Group
+### Client Group
+
+`client_chains` declares nonempty alternatives. Each member is a group reference,
+an inline client, or an explicit `{name: ..., chain: [...]}` path. Group references
+inside a path contribute their entire selected path, so alternatives may have
+different hop counts. Bare nested lists and unknown chain-wrapper fields are rejected.
+Path stages are client objects or group references; use a named group for a pool.
+The old group fields `client_proxy` and `client_proxies` are not accepted.
+
+```yaml
+- client_group: a1-selected-nl
+  client_chains:
+    - chain: [a1-selected, nl-hop]
+
+- client_group: geo-reddit-selected
+  type: selector
+  default: a1-selected-nl
+  client_chains:
+    - a1-selected
+    - a1-selected-nl
+    - name: via-us
+      chain: [a1-selected, us-hop]
+    - direct
+```
+
+Inline selector clients and paths require explicit names. Other policies generate
+definition-site labels for unnamed paths; use explicit names for stable controller
+identities. Labels do not introduce another routing-reference namespace.
+The controller exposes named paths as `Relay` nodes, with whole-path delay probes
+and final-hop UDP capability.
+
+Round-robin selects immediate alternatives before their descendants, with independent
+counters per occurrence. Duplicate round-robin entries provide extra tickets;
+selector, URL-test and fallback members must be distinct. A nested group with ten
+members has the same outer weight as one inline client, not ten times its weight.
+Each new flow snapshots manual choices once and pins the complete selected path.
+Selecting a TCP-only path for UDP fails rather than choosing another selector member.
+Existing streams, UDP associations and carrier redials retain their pinned paths.
+
+The same composition works in routing, DNS, WireGuard peer chains, ShadowTLS
+handshake chains and REALITY destination chains. Direct, WireGuard and XHTTP H3
+clients are valid only at physical hop zero. UDP/H3 DNS still requires a direct-only
+route. Resolution rejects cycles, more than 16,384 expanded nodes, more than 64
+nested choices, or paths longer than 64 hops. Fixed one-hop round-robin aliases
+do not add choice depth. Fallback retains its 256-concrete-path bound.
+
 ```yaml
 - client_group: my-upstream
   client_chains:              # Define proxies in this group
