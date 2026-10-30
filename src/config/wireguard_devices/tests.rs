@@ -613,6 +613,31 @@ fn copied_clients_share_with_equivalent_carrier_socket_defaults() {
 }
 
 #[test]
+fn simplification_round_robin_carrier_names_do_not_affect_device_identity() {
+    let mut first = client();
+    first["protocol"]["peer_client_chain"] = json!("relay");
+    let mut second = client();
+    second["protocol"]["peer_client_chain"] = json!([{"pool":["direct", "direct"]}]);
+    let configs = json!([
+        {"client_group":"relay", "client_chains":["direct", "direct"]},
+        {"address":"0.0.0.0:1080", "protocol":{"type":"socks"},
+            "rules":[{"masks":"0.0.0.0/0", "action":"allow",
+                "client_chain":[{"pool":[first, second]}]}]}
+    ]);
+    let validated = validate(configs.clone()).unwrap();
+    assert_eq!(validated.wireguard_endpoints.len(), 1);
+    let mut different_weight = configs;
+    different_weight[0]["client_chains"] = json!(["direct", "direct", "direct"]);
+    assert!(
+        validate(different_weight)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("conflicting")
+    );
+}
+
+#[test]
 fn carrier_mtu_checks_single_hop_choice_members() {
     use crate::config::ClientChain;
     use crate::option_util::OneOrSome;

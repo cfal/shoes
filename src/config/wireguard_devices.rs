@@ -40,6 +40,11 @@ impl ClientRegistry {
         settings.control = None;
         let mut selection_paths = Vec::new();
         visit_client(&mut settings, &mut |carrier| {
+            if let ClientProxyConfig::Wireguard(config) = &mut carrier.protocol
+                && let Some(chain) = &mut config.peer_client_chain
+            {
+                normalize_round_robin_names(chain);
+            }
             selection_paths.push(
                 carrier
                     .control
@@ -91,6 +96,22 @@ impl ClientRegistry {
         self.devices.push(device);
         self.settings.push(settings);
         Ok(())
+    }
+}
+
+fn normalize_round_robin_names(chain: &mut super::ClientChain) {
+    for hop in chain.hops.iter_mut() {
+        if let ClientChainHop::Choice(choice) = hop {
+            if choice.group_type == super::GroupType::RoundRobin {
+                choice.name.clear();
+                choice.labels = (0..choice.members.len())
+                    .map(|index| index.to_string())
+                    .collect();
+            }
+            for member in &mut choice.members {
+                normalize_round_robin_names(member);
+            }
+        }
     }
 }
 
