@@ -442,6 +442,63 @@ fn sudoku_mask_outer_prefix_preserves_tls_alpn_validation() {
     }
 }
 
+thread_local! {
+    pub(super) static CLIENT_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+#[cfg(unix)]
+fn review_nested_carrier_validation_visits_each_client_once() {
+    use base64::Engine;
+    use serde_json::json;
+
+    let key = |byte| base64::engine::general_purpose::STANDARD.encode([byte; 32]);
+    let public = gotatun::x25519::PublicKey::from(&gotatun::x25519::StaticSecret::from([99; 32]));
+    for depth in [4, 8] {
+        let mut nested = None;
+        for index in 0..depth {
+            let mut client = json!({
+                "address":format!("192.0.2.{}:51820", index + 1),
+                "protocol":{
+                    "type":"wireguard", "private_key":key(index + 1),
+                    "public_key":base64::engine::general_purpose::STANDARD.encode(public.as_bytes()),
+                    "addresses":["10.77.0.2/32"], "mtu":1280
+                }
+            });
+            if let Some(nested) = nested {
+                client["protocol"]["peer_client_chain"] = json!([
+                    nested,
+                    {"address":"192.0.2.99:443", "protocol":{
+                        "type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+                    }}
+                ]);
+            }
+            nested = Some(client);
+        }
+        let client = nested.unwrap();
+        let mut chain: ClientChain = serde_json::from_value(json!([client])).unwrap();
+        CLIENT_VALIDATIONS.set(0);
+        validate_client_chain(
+            &mut chain.hops,
+            &HashMap::new(),
+            &HashMap::new(),
+            GlobalLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(CLIENT_VALIDATIONS.get(), usize::from(depth) * 2 - 1);
+
+        CLIENT_VALIDATIONS.set(0);
+        create_server_configs(
+            serde_json::from_value(json!([
+                {"client_group":"nested", "client_chains":[client]}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(CLIENT_VALIDATIONS.get() <= usize::from(depth) * 4 + 10);
+    }
+}
+
 #[test]
 fn ffi_group_support_preserves_selectors_and_controller_error_precedence() {
     use serde_json::json;

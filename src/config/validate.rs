@@ -227,7 +227,7 @@ pub(super) fn create_server_configs_with_memory(
 
     // Embed PEMs into all client configs in groups before they're used
     for group in client_groups.values_mut() {
-        super::client_visit::visit_hop(group, &mut |client| {
+        super::client_visit::visit_hop_clients(group, &mut |client| {
             validate_client_config(client, &named_pems, global_limits)
         })?;
         super::composition::validate(&OneOrSome::One(group.clone()))?;
@@ -1561,6 +1561,8 @@ fn validate_client_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::CLIENT_VALIDATIONS.with(|count| count.set(count.get() + 1));
     crate::sudoku_mask::validate_client(&client_config.protocol, &client_config.transport)?;
     client_config.validate_quic_key_exchange(true)?;
     crate::quic_client::validate(client_config, true)?;
@@ -2455,7 +2457,9 @@ fn validate_client_chain(
 ) -> std::io::Result<()> {
     for hop in hops.iter_mut() {
         super::client_visit::visit_hop(hop, &mut |client| {
-            expand_peer_chains(client, client_groups)?;
+            expand_peer_chains(client, client_groups)
+        })?;
+        super::client_visit::visit_hop_clients(hop, &mut |client| {
             validate_client_config(client, named_pems, global_limits)
         })?;
     }
