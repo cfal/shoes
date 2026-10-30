@@ -478,14 +478,9 @@ async fn memory_bootstrap_reuses_compiled_sources_and_invalidates_changed_urls()
     let first = memory.values().next().unwrap().clone();
     let (config, reused) = super::bootstrap(config, &[], memory, None).await.unwrap();
     assert!(Arc::ptr_eq(&first, reused.values().next().unwrap()));
-    let validated = validate_inputs(
-        config.clone(),
-        RuleInputs {
-            memory: Some(reused.clone()),
-        },
-    )
-    .await
-    .unwrap();
+    let validated = validate_memory(config.clone(), reused.clone())
+        .await
+        .unwrap();
     let refresh = Refresh::new(
         config.clone(),
         &validated.remote_rules,
@@ -581,14 +576,9 @@ async fn retained_sources_do_not_read_a_replaced_cache_namespace() {
     ]);
     let mut config = configs(&first);
     config.extend(configs(&second).into_iter().skip(1));
-    let original = validate_inputs(
-        config.clone(),
-        RuleInputs {
-            memory: Some(memory.clone()),
-        },
-    )
-    .await
-    .unwrap();
+    let original = validate_memory(config.clone(), memory.clone())
+        .await
+        .unwrap();
     let moved = dir.path().join("moved");
     std::fs::rename(&root, &moved).unwrap();
     create_cache_directory(&root).unwrap();
@@ -599,14 +589,9 @@ async fn retained_sources_do_not_read_a_replaced_cache_namespace() {
         .await
         .unwrap();
     assert!(Arc::ptr_eq(&reused[&second.path], &memory[&second.path]));
-    let validated = validate_inputs(
-        config.clone(),
-        RuleInputs {
-            memory: Some(reused.clone()),
-        },
-    )
-    .await
-    .unwrap();
+    let validated = validate_memory(config.clone(), reused.clone())
+        .await
+        .unwrap();
     Refresh::new(
         config.clone(),
         &[first.clone(), second.clone()],
@@ -788,14 +773,7 @@ async fn bootstrap_can_use_downloaded_rules_when_the_cache_cannot_be_saved() {
         .unwrap();
     fixture.await.unwrap();
     assert_eq!(memory[&path].digest, blake3::hash(VALID));
-    validate_inputs(
-        config.clone(),
-        RuleInputs {
-            memory: Some(memory),
-        },
-    )
-    .await
-    .unwrap();
+    validate_memory(config.clone(), memory).await.unwrap();
     assert!(crate::config::compile_configs(config).await.is_err());
     assert!(!path.exists());
     assert_eq!(std::fs::read(&trap).unwrap(), b"untouched");
@@ -881,39 +859,20 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
         serde_json::from_value(serde_json::json!({"path": local, "action": "block"})).unwrap();
     server.rules = crate::option_util::NoneOrSome::Some(vec![first.clone(), first, local_rule]);
     let first = predicates(
-        &validate_inputs(
-            config.clone(),
-            RuleInputs {
-                memory: Some(memory.clone()),
-            },
-        )
-        .await
-        .unwrap(),
+        &validate_memory(config.clone(), memory.clone())
+            .await
+            .unwrap(),
     );
     let second = predicates(
-        &validate_inputs(
-            config.clone(),
-            RuleInputs {
-                memory: Some(memory.clone()),
-            },
-        )
-        .await
-        .unwrap(),
+        &validate_memory(config.clone(), memory.clone())
+            .await
+            .unwrap(),
     );
     assert!(Arc::ptr_eq(&first[0], &first[1]));
     assert!(Arc::ptr_eq(&first[0], &second[0]));
     assert!(!Arc::ptr_eq(&first[0], &first[2]));
     std::fs::remove_file(local).unwrap();
-    assert!(
-        validate_inputs(
-            config,
-            RuleInputs {
-                memory: Some(memory),
-            }
-        )
-        .await
-        .is_err()
-    );
+    assert!(validate_memory(config, memory).await.is_err());
 }
 
 async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str> {
@@ -926,14 +885,9 @@ async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str>
         &mut http::DownloadState::default(),
     )
     .await?;
-    validate_inputs(
+    validate_memory(
         configs(source),
-        RuleInputs {
-            memory: Some(MemorySources::from([(
-                source.path.clone(),
-                downloaded.loaded.clone(),
-            )])),
-        },
+        MemorySources::from([(source.path.clone(), downloaded.loaded.clone())]),
     )
     .await?;
     Ok(
@@ -2128,14 +2082,9 @@ async fn runtime_validation_uses_retained_sources_and_never_falls_back_to_disk()
         ]}
     ]))
     .unwrap();
-    let validated = validate_inputs(
-        config.clone(),
-        RuleInputs {
-            memory: Some(memory.clone()),
-        },
-    )
-    .await
-    .unwrap();
+    let validated = validate_memory(config.clone(), memory.clone())
+        .await
+        .unwrap();
     let predicates = predicates(&validated);
     assert!(Arc::ptr_eq(&predicates[0], &predicates[1]));
     assert!(!Arc::ptr_eq(&predicates[0], &predicates[2]));
@@ -2145,26 +2094,13 @@ async fn runtime_validation_uses_retained_sources_and_never_falls_back_to_disk()
     );
 
     std::fs::remove_file(&second.path).unwrap();
-    validate_inputs(
-        config.clone(),
-        RuleInputs {
-            memory: Some(memory.clone()),
-        },
-    )
-    .await
-    .unwrap();
+    validate_memory(config.clone(), memory.clone())
+        .await
+        .unwrap();
     write_rule(&second.path, VALID);
     let mut incomplete = memory;
     incomplete.remove(&second.path);
-    let error = validate_inputs(
-        config,
-        RuleInputs {
-            memory: Some(incomplete),
-        },
-    )
-    .await
-    .err()
-    .unwrap();
+    let error = validate_memory(config, incomplete).await.err().unwrap();
     assert!(
         error
             .to_string()

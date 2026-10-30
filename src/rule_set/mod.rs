@@ -87,12 +87,6 @@ impl MemorySource {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct RuleInputs {
-    // Runtime compilation never falls back to disk for a missing retained source.
-    pub(crate) memory: Option<MemorySources>,
-}
-
 #[derive(PartialEq, Eq, Hash)]
 pub(crate) struct SourceKey {
     path: PathBuf,
@@ -612,7 +606,6 @@ pub fn load_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<A
 fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<Predicate>> {
     if compiler.remote_files.contains_key(&source.path) {
         if let Some(loaded) = compiler
-            .inputs
             .memory
             .as_ref()
             .and_then(|memory| memory.get(&source.path))
@@ -631,7 +624,7 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             compiler.sources.insert(key, loaded.predicate.clone());
             return Ok(loaded.predicate.clone());
         }
-        if compiler.memory_only || compiler.inputs.memory.is_some() {
+        if compiler.memory_only || compiler.memory.is_some() {
             return Err(invalid(
                 "remote rules unavailable in memory; offline checks never download; daemon startup fetches remote sources",
             ));

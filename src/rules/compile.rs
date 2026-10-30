@@ -20,7 +20,8 @@ pub struct Compiler {
     resolving_groups: HashSet<String>,
     pub(crate) policy_groups: HashSet<String>,
     pub(crate) sources: HashMap<crate::rule_set::SourceKey, Arc<Predicate>>,
-    pub(crate) inputs: crate::rule_set::RuleInputs,
+    // Runtime compilation never falls back to disk for a missing retained source.
+    pub(crate) memory: Option<crate::rule_set::MemorySources>,
     pub(crate) memory_only: bool,
     pub(crate) remote_files: HashMap<std::path::PathBuf, Option<crate::rule_set::Format>>,
     bytes: usize,

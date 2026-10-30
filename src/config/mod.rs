@@ -115,14 +115,14 @@ pub(crate) async fn load_config_files(args: &[String]) -> std::io::Result<Vec<Co
 }
 
 pub async fn compile_configs(configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
-    compile_configs_with_inputs(configs, Default::default()).await
+    compile_configs_with_memory(configs, None).await
 }
 
-pub(crate) async fn compile_configs_with_inputs(
+pub(crate) async fn compile_configs_with_memory(
     configs: Vec<Config>,
-    inputs: crate::rule_set::RuleInputs,
+    memory: Option<crate::rule_set::MemorySources>,
 ) -> std::io::Result<ValidatedConfigs> {
-    blocking_compile(move || validate::create_server_configs_with_inputs(configs, inputs)).await
+    blocking_compile(move || validate::create_server_configs_with_memory(configs, memory)).await
 }
 
 pub(crate) async fn blocking_compile<T: Send + 'static>(

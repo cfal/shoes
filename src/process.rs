@@ -98,23 +98,14 @@ async fn load_candidate(
             )
             .await?;
         }
-        let mut has_remote = false;
-        crate::rule_set::visit_sources(&mut configs, &mut |source| {
-            has_remote |= source.url.is_some();
-            Ok(())
-        })?;
-        let snapshot = if for_runtime && has_remote {
-            configs.clone()
-        } else {
+        let snapshot = if memory.is_empty() {
             Vec::new()
+        } else {
+            configs.clone()
         };
-        let mut validated = config::compile_configs_with_inputs(
-            configs,
-            crate::rule_set::RuleInputs {
-                memory: for_runtime.then(|| memory.clone()),
-            },
-        )
-        .await?;
+        let mut validated =
+            config::compile_configs_with_memory(configs, for_runtime.then(|| memory.clone()))
+                .await?;
         validated.reload_files = dependencies;
         tokio::task::spawn_blocking(move || {
             if validated.catalog.is_some() {

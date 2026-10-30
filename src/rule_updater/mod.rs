@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::config::{Config, GlobalLimits, ValidatedConfigs};
 use crate::dns::DnsRegistry;
-use crate::rule_set::{MemorySource, MemorySources, RuleInputs, RuleSource};
+use crate::rule_set::{MemorySource, MemorySources, RuleSource};
 use crate::rules::invalid;
 use install::Install;
 use tokio::time::{Instant, timeout};
@@ -129,8 +129,11 @@ async fn save_cache(
     }
 }
 
-async fn validate_inputs(configs: Vec<Config>, inputs: RuleInputs) -> io::Result<ValidatedConfigs> {
-    let validated = crate::config::compile_configs_with_inputs(configs, inputs)
+async fn validate_memory(
+    configs: Vec<Config>,
+    memory: MemorySources,
+) -> io::Result<ValidatedConfigs> {
+    let validated = crate::config::compile_configs_with_memory(configs, Some(memory))
         .await
         .map_err(|error| {
             invalid(format!(
@@ -164,28 +167,14 @@ async fn refresh_source(
     state: &mut http::DownloadState,
     lease: Option<Arc<CacheLease>>,
 ) -> io::Result<bool> {
-    let Downloaded { bytes, loaded } = download_source(
-        source,
-        memory.get(&source.path),
-        dns,
-        global,
-        Limits::default(),
-        state,
-    )
-    .await?;
-    let changed = memory
-        .get(&source.path)
-        .is_none_or(|previous| !Arc::ptr_eq(previous, &loaded));
+    let previous = memory.get(&source.path);
+    let Downloaded { bytes, loaded } =
+        download_source(source, previous, dns, global, Limits::default(), state).await?;
+    let changed = previous.is_none_or(|previous| !Arc::ptr_eq(previous, &loaded));
     if changed {
         let mut candidate = memory.clone();
         candidate.insert(source.path.clone(), loaded.clone());
-        validate_inputs(
-            configs.to_vec(),
-            RuleInputs {
-                memory: Some(candidate),
-            },
-        )
-        .await?;
+        validate_memory(configs.to_vec(), candidate).await?;
         memory.insert(source.path.clone(), loaded.clone());
     }
     if crate::rule_set::cache_directory(configs)?.is_some() {
