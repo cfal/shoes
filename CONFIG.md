@@ -415,8 +415,11 @@ still restrict eligibility, and intermediate chain hops only need TCP support.
 Changing selection affects new connections, not established streams or associations.
 
 There is one initial check after activation, including for lazy groups. Thereafter
-`lazy: true` checks only groups used by new forwarding connections during the last
-interval. Probes, dashboard reads, and WireGuard carrier maintenance never count as use.
+`lazy: true` normally checks only groups used by new forwarding connections during
+the last interval. Every effective manual selector change also makes all URL-test
+groups due for a check, including idle lazy groups unrelated to that selector.
+An active round finishes before the new check starts.
+Probes, dashboard reads, and WireGuard carrier maintenance never count as use.
 New outbound connections through a WireGuard endpoint wake its carrier groups,
 including nested carriers, without changing their existing associations. Inbound-only
 endpoints and long-lived flows need `lazy: false` for continuous checks. `lazy: false` checks idle
@@ -468,10 +471,13 @@ for each of filtered and unfiltered probes.
 All occurrences of a URL-test group share its samples and TCP/UDP incumbents.
 There are no route contexts, per-occurrence probe rounds, or contextual samplers.
 Forwarding and dashboard selection consult the same group state, subject to each
-caller's transport eligibility. Selector changes within a declared member invalidate
-the affected group's samples and fence in-flight results; surrounding route choices
-do not create additional health identities. Complete chains declared as members
-are probed end to end. External caller prefixes and suffixes are not tested.
+caller's transport eligibility. Any effective manual selector change clears all
+URL-test samples and incumbents and fences in-flight results, even for unrelated
+groups. Selecting the same effective choice preserves samples. Groups become due
+again, after any active round finishes; no selector dependency graph is maintained.
+Surrounding route choices do not create additional health identities. Complete
+chains declared as members are probed end to end. External caller prefixes and
+suffixes are not tested.
 Probe connectors have separate round-robin counters, so probes never advance
 forwarding counters.
 

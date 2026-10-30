@@ -39,7 +39,7 @@ impl SelectionView {
         if **previous == *choices {
             return;
         }
-        self.automatic.choices_changed(&previous, &choices);
+        self.automatic.choices_changed();
         *previous = choices;
     }
 }
