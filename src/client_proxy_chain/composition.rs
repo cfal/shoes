@@ -982,6 +982,11 @@ mod tests {
             }
         }
         assert!(prefixes.iter().all(|seen| seen.len() == 2));
+        // An odd probe count exposes accidental advancement of the two-member prefix.
+        context
+            .sample(0, &catalog.selection.snapshot())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             addresses(&tree.select(false).unwrap()),
             ["192.0.2.3:80", "192.0.2.1:80", "192.0.2.5:80"]
