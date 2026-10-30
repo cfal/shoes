@@ -29,6 +29,7 @@ All server protocols plus:
 - **XTLS Reality**
   - Hybrid-first X25519MLKEM768 key exchange and optional ML-DSA-65 server authentication
 - **XTLS Vision** (for VLESS)
+- **Sudoku TCP mask** (Xray FinalMask-compatible, composable client/server wrapper; [configuration](CONFIG.md#sudoku-tcp-mask))
 
 ### TUN/VPN Mode
 - **WireGuard** - Userspace TCP/UDP server and client protocols using GotaTun, without root, an OS TUN, or host route changes (Unix only). See [WireGuard configuration](CONFIG.md#wireguard).
@@ -741,7 +742,7 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
 - Advanced placement/padding obfuscation, custom session IDs, separate downloads,
   full XMUX policy, and legacy Vision over XHTTP are not supported. Unsupported
   options are rejected rather than silently ignored. Public CDN compatibility is not implied.
-- REALITY XHTTP interoperates with Xray 26.10.21 in both directions over H2,
+- REALITY XHTTP interoperates with Xray 26.10.29 in both directions over H2,
   including all three modes and `auto`. REALITY prefers X25519MLKEM768 with
   X25519 fallback according to the cover target. Optional `mldsa65_seed` and
   `mldsa65_verify` apply to the outer REALITY configuration, independently of

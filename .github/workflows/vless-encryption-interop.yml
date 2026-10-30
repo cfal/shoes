@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: XTLS/Xray-core
-          ref: 1b1647cd9ddf0abc34b981d4611fc03bcac1ca74
+          ref: 0afec66085a85191e9dd2a4a6646c7c9a94688d1
           path: peers/xray
       - uses: actions/checkout@v7
         with:
@@ -65,12 +65,18 @@ jobs:
       - name: Build legacy sing-box peer
         working-directory: peers/sing-box
         run: go build -p 1 -tags with_utls,with_quic -o "$RUNNER_TEMP/sing-box" ./cmd/sing-box
-      - name: Native VLESS peer matrix
+      - name: Native VLESS and Sudoku TCP peer matrix
         env:
           XRAY_BINARY: ${{ runner.temp }}/xray
           MIHOMO_BINARY: ${{ runner.temp }}/mihomo
           SHOES_TEST_SING_BOX_BIN: ${{ runner.temp }}/sing-box
-        run: cargo test --locked --features optional-peer-tests --test vless_encryption_interop -- --test-threads=1
+        run: .github/require-tests.sh cargo test --locked --features optional-peer-tests --test vless_encryption_interop -- --test-threads=1
+      - name: Sudoku cross-language wire vectors
+        run: |
+          .github/require-tests.sh cargo test --locked --lib sudoku_mask:: -- --test-threads=1
+          SUDOKU_RUST_VECTORS="$RUNNER_TEMP/sudoku-rust.json" .github/require-tests.sh cargo test --locked --lib export_rust_wire_samples -- --ignored
+          cd peers/xray
+          go run -p 1 ../../tests/fixtures/sudoku/xray.go -verify "$RUNNER_TEMP/sudoku-rust.json"
       - name: Cross-language cryptography vectors
         run: |
           .github/require-tests.sh cargo test --locked --lib vless::encryption:: -- --test-threads=1

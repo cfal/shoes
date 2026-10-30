@@ -14,7 +14,10 @@ use serde_json::{Value, json};
 use shoes_test_support::process::ProcessGuard;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{
+        TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
@@ -32,6 +35,8 @@ mod composition;
 mod legacy;
 #[path = "vless_encryption/lifecycle.rs"]
 mod lifecycle;
+#[path = "vless_encryption/sudoku_mask.rs"]
+mod sudoku_mask;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -399,42 +404,64 @@ fn client_config(kind: Kind, port: u16, server_port: u16, encryption: &str, visi
 
 type Captures = Arc<Mutex<Vec<Vec<u8>>>>;
 
+async fn relay_capturing(
+    mut reader: OwnedReadHalf,
+    mut writer: OwnedWriteHalf,
+    captures: Captures,
+    index: usize,
+) -> io::Result<()> {
+    let mut bytes = [0; 8192];
+    loop {
+        let n = reader.read(&mut bytes).await?;
+        if n == 0 {
+            break;
+        }
+        {
+            let mut captures = captures.lock().unwrap();
+            let recorded = n.min((256 * 1024usize).saturating_sub(captures[index].len()));
+            captures[index].extend_from_slice(&bytes[..recorded]);
+        }
+        writer.write_all(&bytes[..n]).await?;
+    }
+    writer.shutdown().await
+}
+
 async fn tap(upstream: u16) -> (u16, Captures, Task) {
+    let (port, uplink, _, task) = tap_both(upstream).await;
+    (port, uplink, task)
+}
+
+async fn tap_both(upstream: u16) -> (u16, Captures, Captures, Task) {
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let captures: Captures = Arc::default();
-    let output = captures.clone();
+    let uplink: Captures = Arc::default();
+    let uplink_output = uplink.clone();
+    let downlink: Captures = Arc::default();
+    let downlink_output = downlink.clone();
     let task = tokio::spawn(async move {
         let mut children = JoinSet::new();
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     let Ok((client, _)) = result else { break };
-                    let captures = captures.clone();
+                    let uplink = uplink.clone();
+                    let downlink = downlink.clone();
                     children.spawn(async move {
                         let index = {
-                            let mut guard = captures.lock().unwrap();
-                            let index = guard.len();
-                            guard.push(Vec::new());
+                            let mut uplink = uplink.lock().unwrap();
+                            let mut downlink = downlink.lock().unwrap();
+                            let index = uplink.len();
+                            uplink.push(Vec::new());
+                            downlink.push(Vec::new());
                             index
                         };
                         let server = TcpStream::connect(("127.0.0.1", upstream)).await?;
-                        let (mut cr, mut cw) = client.into_split();
-                        let (mut sr, mut sw) = server.into_split();
-                        tokio::try_join!(async {
-                            let mut bytes = [0; 8192];
-                            loop {
-                                let n = cr.read(&mut bytes).await?;
-                                if n == 0 { break; }
-                                {
-                                    let mut captures = captures.lock().unwrap();
-                                    let n = n.min(262144usize.saturating_sub(captures[index].len()));
-                                    captures[index].extend_from_slice(&bytes[..n]);
-                                }
-                                sw.write_all(&bytes[..n]).await?;
-                            }
-                            sw.shutdown().await
-                        }, async { tokio::io::copy(&mut sr, &mut cw).await?; cw.shutdown().await })?;
+                        let (cr, cw) = client.into_split();
+                        let (sr, sw) = server.into_split();
+                        tokio::try_join!(
+                            relay_capturing(cr, sw, uplink, index),
+                            relay_capturing(sr, cw, downlink, index)
+                        )?;
                         Ok::<_, io::Error>(())
                     });
                 }
@@ -442,7 +469,7 @@ async fn tap(upstream: u16) -> (u16, Captures, Task) {
             }
         }
     });
-    (port, output, Task(task))
+    (port, uplink_output, downlink_output, Task(task))
 }
 
 async fn echo() -> (u16, Arc<AtomicUsize>, Task) {

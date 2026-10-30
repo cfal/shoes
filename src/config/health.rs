@@ -70,6 +70,7 @@ fn contains_naive(protocol: &ClientProxyConfig) -> bool {
         ClientProxyConfig::Reality { protocol, .. }
         | ClientProxyConfig::ShadowTls { protocol, .. } => contains_naive(protocol),
         ClientProxyConfig::Websocket(config) => contains_naive(&config.protocol),
+        ClientProxyConfig::SudokuMask(config) => contains_naive(&config.protocol),
         ClientProxyConfig::Xhttp(config) => contains_naive(&config.protocol),
         _ => false,
     }
@@ -194,6 +195,7 @@ mod tests {
         let naive = json!({"type":"naive", "username":"user", "password":"secret"});
         for protocol in [
             naive.clone(),
+            json!({"type":"sudoku_mask", "protocol":{"type":"tls", "verify":false, "protocol":naive.clone()}}),
             json!({"type":"tls", "verify":false, "protocol":naive.clone()}),
             json!({"type":"ws", "protocol":naive.clone()}),
             json!({"type":"shadowtls", "password":"secret", "protocol":naive.clone()}),

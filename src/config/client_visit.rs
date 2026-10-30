@@ -172,6 +172,7 @@ fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -
                 visit_protocol(&mut target.protocol, visitor)?;
             }
         }
+        ServerProxyConfig::SudokuMask(config) => visit_protocol(&mut config.protocol, visitor)?,
         ServerProxyConfig::Xhttp(config) => visit_protocol(&mut config.protocol, visitor)?,
         _ => {}
     }

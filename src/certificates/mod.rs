@@ -522,6 +522,7 @@ fn visit_proxy(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> i
                 visit_proxy(&mut target.protocol, visitor)?;
             }
         }
+        ServerProxyConfig::SudokuMask(target) => visit_proxy(&mut target.protocol, visitor)?,
         ServerProxyConfig::Xhttp(target) => visit_proxy(&mut target.protocol, visitor)?,
         _ => {}
     }

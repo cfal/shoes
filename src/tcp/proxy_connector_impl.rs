@@ -39,6 +39,7 @@ impl ProxyConnectorImpl {
         config: ClientConfig,
         resolver: Arc<dyn Resolver>,
     ) -> std::io::Result<Option<Self>> {
+        crate::sudoku_mask::validate_client(&config.protocol, &config.transport)?;
         if config.protocol.is_direct() {
             return Ok(None);
         }

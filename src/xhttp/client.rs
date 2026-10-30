@@ -122,6 +122,7 @@ pub struct Client {
     version: XhttpVersion,
     mode: XhttpMode,
     security: Security,
+    masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
     memory: Arc<Budget>,
     admission: Arc<Budget>,
     tasks: Tasks,
@@ -170,6 +171,7 @@ impl Client {
             version,
             mode,
             security,
+            masks: Vec::new(),
             slots: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -193,6 +195,11 @@ impl Client {
         });
     }
 
+    pub(super) fn with_masks(mut self, masks: Vec<Arc<crate::sudoku_mask::Prepared>>) -> Self {
+        self.masks = masks;
+        self
+    }
+
     async fn dial(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Arc<Carrier>> {
         let header_limit = 8192 + MAX_PADDING_BYTES as usize;
         tokio::time::timeout(
@@ -201,10 +208,20 @@ impl Client {
                 if self.version == XhttpVersion::H3 {
                     Carrier::quic(dialer.open_quic().await?, header_limit).await
                 } else {
+                    let mut stream = dialer.open_stream().await?;
+                    for config in &self.masks {
+                        stream = Box::new(crate::sudoku_mask::SudokuStream::new(
+                            stream,
+                            config.clone(),
+                            crate::sudoku_mask::Role::Client,
+                        ));
+                    }
+                    let stream = self
+                        .security
+                        .wrap(stream, &self.endpoint, self.version)
+                        .await?;
                     Carrier::tcp_with_windows(
-                        self.security
-                            .wrap(dialer.open_stream().await?, &self.endpoint, self.version)
-                            .await?,
+                        stream,
                         self.version,
                         header_limit,
                         self.config.limits.h2_windows(),
@@ -787,6 +804,48 @@ mod tests {
     use super::*;
     use rustls::NamedGroup;
     use serde_json::json;
+
+    #[test]
+    fn sudoku_mask_carriers_preserve_security_scheme_and_disabled_sni() {
+        let resolver: Arc<dyn crate::resolver::Resolver> =
+            Arc::new(crate::resolver::NativeResolver::new());
+        let xhttp = json!({"type":"xhttp","protocol":{"type":"socks"}});
+        let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
+        for (protocol, secure, count) in [
+            (mask(xhttp.clone()), false, 1),
+            (mask(mask(xhttp.clone())), false, 2),
+            (mask(json!({"type":"tls","protocol":xhttp})), true, 1),
+            (mask(mask(json!({"type":"tls","protocol":xhttp}))), true, 2),
+        ] {
+            let config =
+                serde_json::from_value(json!({"address":"origin.example:443","protocol":protocol}))
+                    .unwrap();
+            let (client, _) = super::super::connector::build(&config, resolver.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(client.masks.len(), count);
+            let request = client.request("session", None, false, Body::Empty).unwrap();
+            assert_eq!(
+                request.uri().scheme_str(),
+                Some(if secure { "https" } else { "http" })
+            );
+            if let Security::Tls { name, .. } = &client.security {
+                assert_eq!(name.to_str(), "origin.example");
+            }
+        }
+        let config = serde_json::from_value(
+            json!({"address":"origin.example:443","protocol":mask(json!({
+            "type":"tls","sni_hostname":null,"protocol":xhttp}))}),
+        )
+        .unwrap();
+        let (client, _) = super::super::connector::build(&config, resolver)
+            .unwrap()
+            .unwrap();
+        let Security::Tls { config, .. } = &client.security else {
+            panic!("expected TLS")
+        };
+        assert!(!config.enable_sni);
+    }
 
     #[test]
     fn default_client_admission_is_uncapped() {

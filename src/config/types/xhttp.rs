@@ -487,6 +487,7 @@ impl XhttpServerConfig {
 
 pub(crate) fn contains_server(protocol: &ServerProxyConfig) -> bool {
     match protocol {
+        ServerProxyConfig::SudokuMask(config) => contains_server(&config.protocol),
         ServerProxyConfig::Xhttp(_) => true,
         ServerProxyConfig::Tls {
             tls_targets,
@@ -517,7 +518,11 @@ pub(crate) fn validate_server_transport(
     protocol: &ServerProxyConfig,
     transport: &super::Transport,
 ) -> io::Result<()> {
+    crate::sudoku_mask::validate_server(protocol, transport)?;
     match protocol {
+        ServerProxyConfig::SudokuMask(config) => {
+            validate_server_transport(&config.protocol, transport)?
+        }
         ServerProxyConfig::Xhttp(config) => {
             let quic = *transport == super::Transport::Quic;
             if (quic && !matches!(config.http_version, XhttpVersion::Auto | XhttpVersion::H3))
@@ -538,13 +543,7 @@ pub(crate) fn validate_server_transport(
             if *transport == super::Transport::Quic && contains_server(protocol) {
                 return Err(invalid("QUIC XHTTP must be a top-level protocol"));
             }
-            for target in tls_targets.values() {
-                if let ServerProxyConfig::Xhttp(config) = &target.protocol {
-                    config.tls_alpn(&target.alpn_protocols)?;
-                }
-                validate_server_transport(&target.protocol, transport)?;
-            }
-            if let Some(target) = default_tls_target {
+            for target in tls_targets.values().chain(default_tls_target.as_deref()) {
                 if let ServerProxyConfig::Xhttp(config) = &target.protocol {
                     config.tls_alpn(&target.alpn_protocols)?;
                 }

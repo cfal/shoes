@@ -144,6 +144,7 @@ fn protocol(ranges: &[IpNetwork], config: &ServerProxyConfig) -> io::Result<()> 
                 protocol(ranges, &target.protocol)?;
             }
         }
+        ServerProxyConfig::SudokuMask(config) => protocol(ranges, &config.protocol)?,
         ServerProxyConfig::Xhttp(config) => protocol(ranges, &config.protocol)?,
         _ => {}
     }

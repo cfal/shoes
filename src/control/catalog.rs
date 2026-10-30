@@ -383,6 +383,7 @@ pub fn protocol_type(protocol: &ClientProxyConfig) -> &str {
         ClientProxyConfig::Reality { protocol, .. }
         | ClientProxyConfig::ShadowTls { protocol, .. } => protocol_type(protocol),
         ClientProxyConfig::Websocket(config) => protocol_type(&config.protocol),
+        ClientProxyConfig::SudokuMask(config) => protocol_type(&config.protocol),
         ClientProxyConfig::Xhttp(config) => protocol_type(&config.protocol),
         ClientProxyConfig::Socks { .. } => "Socks5",
         ClientProxyConfig::Vless { .. } => "VLESS",
@@ -394,6 +395,22 @@ pub fn protocol_type(protocol: &ClientProxyConfig) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sudoku_masks_preserve_inner_protocol_type() {
+        let protocol = serde_json::from_value(serde_json::json!({
+            "type": "sudoku_mask",
+            "protocol": {
+                "type": "sudoku_mask",
+                "protocol": {
+                    "type": "tls",
+                    "protocol": {"type": "socks"}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(protocol_type(&protocol), "Socks5");
+    }
 
     #[cfg(unix)]
     #[test]

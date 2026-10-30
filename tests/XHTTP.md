@@ -3,7 +3,7 @@
 The `xhttp_interop` integration target runs real Shoes processes against Shoes,
 Xray-core, and Mihomo Alpha. CI builds and caches these peers from pinned source:
 
-- Xray-core: `1b1647cd9ddf0abc34b981d4611fc03bcac1ca74` (26.10.21).
+- Xray-core: `0afec66085a85191e9dd2a4a6646c7c9a94688d1` (26.10.29).
 - Mihomo Alpha: `94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f`.
 
 Use Go 1.27.3, `GOMAXPROCS=1`, and `go build -p 1`. Build Xray's `./main` package.

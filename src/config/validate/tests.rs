@@ -2,6 +2,330 @@ use super::*;
 use crate::config::pem::convert_cert_paths;
 use crate::dns::IpStrategy;
 
+#[tokio::test]
+async fn sudoku_mask_walkers_reach_certificates_rules_clients_and_fake_dns_targets() {
+    use serde_json::json;
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let cert = directory.path().join("client.crt");
+    let key = directory.path().join("client.key");
+    std::fs::write(&cert, certificate.cert.pem()).unwrap();
+    std::fs::write(&key, certificate.signing_key.serialize_pem()).unwrap();
+    let mut configs: Vec<Config> = serde_json::from_value(json!([{
+        "address":"0.0.0.0:1080", "rules":"block-all",
+        "protocol":{"type":"sudoku_mask","protocol":{"type":"tls","default_target":{
+            "cert":cert, "key":key,
+            "protocol":{"type":"socks"},
+            "override_rules":[{"masks":"0.0.0.0/0","action":"allow",
+                "override_address":"198.18.0.2:443",
+                "client_chain":{"address":"proxy.example:443","protocol":{
+                    "type":"sudoku_mask","protocol":{"type":"tls","cert":cert,"key":key,
+                        "protocol":{"type":"socks"}}
+                }}
+            }]
+        }}}
+    }]))
+    .unwrap();
+    let dependencies = crate::config::pem::pem_reload_dependencies(&mut configs).unwrap();
+    assert!(dependencies.contains(&cert));
+    assert!(dependencies.contains(&key));
+    let sources = crate::certificates::configure(&mut configs).unwrap();
+    assert_eq!(sources.len(), 1);
+    let (configs, loaded) = convert_cert_paths(configs).await.unwrap();
+    assert_eq!(loaded, 2);
+    let mut validated = create_server_configs(configs).unwrap();
+    let mut clients = 0;
+    validated
+        .visit_clients(&mut |client| {
+            clients += 1;
+            let ClientProxyConfig::SudokuMask(mask) = &client.protocol else {
+                panic!("mask lost")
+            };
+            let ClientProxyConfig::Tls(tls) = mask.protocol.as_ref() else {
+                panic!("TLS lost")
+            };
+            assert!(tls.cert.as_ref().unwrap().contains("BEGIN CERTIFICATE"));
+            assert!(tls.key.as_ref().unwrap().contains("BEGIN PRIVATE KEY"));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(clients, 1);
+    let mut overrides = 0;
+    crate::config::rule_visit::visit(
+        &mut validated.configs,
+        &mut |rule| {
+            assert!(rule.criteria.compiled.is_some());
+            if matches!(
+                &rule.action,
+                RuleActionConfig::Allow {
+                    override_address: Some(_),
+                    ..
+                }
+            ) {
+                overrides += 1;
+            }
+            Ok(())
+        },
+        &mut |_| panic!("unexpanded group"),
+    )
+    .unwrap();
+    assert_eq!(overrides, 1);
+    let error = validated
+        .validate_network_endpoints(&["198.18.0.0/15".parse().unwrap()])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("rule override overlaps"),
+        "{error}"
+    );
+}
+
+#[test]
+fn sudoku_mask_round_trip_preserves_tag_options_and_protocol() {
+    let value = serde_json::json!({"type":"sudoku_mask","password":"never-log-me","paddingMax":300,
+        "protocol":{"type":"socks"}});
+    let client: ClientProxyConfig = serde_json::from_value(value.clone()).unwrap();
+    let server: ServerProxyConfig = serde_json::from_value(value).unwrap();
+    for (export, debug) in [
+        (
+            serde_json::to_value(&client).unwrap(),
+            format!("{client:?}"),
+        ),
+        (
+            serde_json::to_value(&server).unwrap(),
+            format!("{server:?}"),
+        ),
+    ] {
+        assert_eq!(export["type"], "sudoku_mask");
+        assert_eq!(export["padding_max"], 300);
+        assert_eq!(export["protocol"]["type"], "socks");
+        assert!(!debug.contains("never-log-me"));
+    }
+}
+
+#[test]
+fn sudoku_mask_rejects_non_tcp_transports_even_inside_xhttp() {
+    use serde_json::json;
+    let mask = json!({"type":"sudoku_mask","protocol":{"type":"socks"}});
+    let clients = [
+        mask.clone(),
+        json!({"type":"tls","protocol":mask}),
+        json!({"type":"websocket","protocol":mask}),
+        json!({"type":"xhttp","protocol":mask}),
+    ];
+    for protocol in clients {
+        for transport in ["quic", "udp"] {
+            let mut config: ClientConfig = serde_json::from_value(
+                json!({"address":"localhost:1234","transport":transport,"protocol":protocol}),
+            )
+            .unwrap();
+            let error =
+                validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default())
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("sudoku_mask requires TCP"),
+                "{error}"
+            );
+        }
+    }
+    let servers = [
+        mask.clone(),
+        json!({"type":"xhttp","protocol":mask}),
+        json!({"type":"tls","default_target":{"cert":"unused","key":"unused","protocol":mask}}),
+        json!({"type":"websocket","targets":[{"protocol":mask}]}),
+    ];
+    for protocol in servers {
+        for transport in ["quic", "udp"] {
+            let mut config: ServerConfig = serde_json::from_value(
+                json!({"address":"0.0.0.0:1234","transport":transport,"protocol":protocol}),
+            )
+            .unwrap();
+            let error = validate_server_config(
+                &mut config,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                GlobalLimits::default(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("sudoku_mask requires TCP"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sudoku_mask_preserves_sni_and_existing_immediate_child_constraints() {
+    use serde_json::json;
+    let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
+    let mut reality: ClientProxyConfig = serde_json::from_value(mask(json!({"type":"reality",
+        "public_key":"CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","protocol":{"type":"socks"}})))
+    .unwrap();
+    validate_client_proxy_config(&mut reality, &HashMap::new(), Some("origin.example")).unwrap();
+    let resolver = std::sync::Arc::new(crate::resolver::NativeResolver::new());
+    crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
+        reality,
+        Some("origin.example".into()),
+        resolver,
+    )
+    .unwrap();
+    let vless = json!({"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"});
+    for (protocol, valid) in [
+        (
+            mask(json!({"type":"tls","vision":true,"protocol":vless})),
+            true,
+        ),
+        (
+            json!({"type":"tls","vision":true,"protocol":mask(vless)}),
+            false,
+        ),
+        (mask(json!({"type":"direct"})), false),
+    ] {
+        let protocol = serde_json::from_value(protocol).unwrap();
+        assert_eq!(validate_client_proxy_structure(&protocol).is_ok(), valid);
+    }
+    let naive = json!({"type":"naive","users":[{"username":"user","password":"secret"}]});
+    let mut protocol = serde_json::from_value(mask(naive.clone())).unwrap();
+    let error = validate_server_proxy_config(
+        &mut protocol,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        ServerProtocolContext::Tls,
+        GlobalLimits::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("NaiveProxy must be used inside"));
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let configs = serde_json::from_value(json!([{
+        "address": "0.0.0.0:1234",
+        "protocol": mask(json!({
+            "type": "tls",
+            "default_target": {
+                "cert": cert.cert.pem(),
+                "key": cert.signing_key.serialize_pem(),
+                "protocol": naive
+            }
+        }))
+    }]))
+    .unwrap();
+    assert!(create_server_configs(configs).is_ok());
+}
+
+#[test]
+fn sudoku_mask_rejects_inner_client_placements() {
+    use serde_json::json;
+    let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
+    let inner = mask(json!({"type":"socks"}));
+    for protocol in [
+        json!({"type":"tls","protocol":inner}),
+        json!({"type":"reality","public_key":"unused","protocol":inner}),
+        json!({"type":"shadowtls","password":"secret","protocol":inner}),
+        json!({"type":"websocket","protocol":inner}),
+        json!({"type":"xhttp","protocol":inner}),
+        json!({"type":"tls","protocol":{"type":"xhttp","protocol":inner}}),
+    ] {
+        for protocol in [protocol.clone(), mask(mask(protocol))] {
+            let mut config: ClientConfig = serde_json::from_value(json!({
+                "address":"localhost:443", "protocol":protocol
+            }))
+            .unwrap();
+            let error =
+                validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default())
+                    .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                error.to_string().contains("outermost protocol layer"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sudoku_mask_rejects_inner_server_placements_in_every_target_branch() {
+    use serde_json::json;
+    let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
+    let inner = mask(json!({"type":"socks"}));
+    let tls_target = json!({"protocol":inner});
+    for protocol in [
+        json!({"type":"xhttp","protocol":inner}),
+        json!({"type":"websocket","targets":[{"protocol":inner}]}),
+        json!({"type":"tls","default_target":tls_target}),
+        json!({"type":"tls","tls_targets":{"localhost":tls_target}}),
+        json!({"type":"tls","shadowtls_targets":{"localhost":{
+            "password":"secret","handshake":{"address":"localhost:443"},"protocol":inner
+        }}}),
+        json!({"type":"tls","reality_targets":{"localhost":{
+            "private_key":"unused","dest":"localhost:443","protocol":inner
+        }}}),
+        json!({"type":"tls","default_target":{
+            "protocol":{"type":"xhttp","protocol":inner}
+        }}),
+    ] {
+        for protocol in [protocol.clone(), mask(mask(protocol))] {
+            let mut config: ServerConfig = serde_json::from_value(json!({
+                "address":"0.0.0.0:443", "protocol":protocol
+            }))
+            .unwrap();
+            let error = validate_server_config(
+                &mut config,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                GlobalLimits::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                error.to_string().contains("outermost protocol layer"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sudoku_mask_accepts_consecutive_outer_prefixes() {
+    use serde_json::json;
+    for depth in 1..=2 {
+        let mut protocol = json!({"type":"socks"});
+        for _ in 0..depth {
+            protocol = json!({"type":"sudoku_mask","protocol":protocol});
+        }
+        let mut client: ClientConfig = serde_json::from_value(json!({
+            "address":"localhost:1080","protocol":protocol
+        }))
+        .unwrap();
+        validate_client_config(&mut client, &HashMap::new(), GlobalLimits::default()).unwrap();
+        let configs = serde_json::from_value(json!([{
+            "address":"0.0.0.0:1080","protocol":protocol
+        }]))
+        .unwrap();
+        create_server_configs(configs).unwrap();
+    }
+}
+
+#[test]
+fn sudoku_mask_outer_prefix_preserves_tls_alpn_validation() {
+    use serde_json::json;
+    let xhttp = json!({"type":"xhttp","http_version":"h2","protocol":{"type":"socks"}});
+    let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
+    for (alpn, valid) in [(json!(["http/1.1"]), false), (json!(["h2"]), true)] {
+        let tls = json!({"type":"tls","default_target":{
+            "cert":"unused","key":"unused","alpn_protocols":alpn,"protocol":xhttp
+        }});
+        for protocol in [mask(tls.clone()), mask(mask(tls))] {
+            let protocol = serde_json::from_value(protocol).unwrap();
+            assert_eq!(
+                crate::config::xhttp::validate_server_transport(&protocol, &Transport::Tcp).is_ok(),
+                valid
+            );
+        }
+    }
+}
+
 #[test]
 fn native_vless_configuration_rejects_ambiguous_vision_and_secrets() {
     use serde_json::json;

@@ -86,6 +86,7 @@ mod socks_handler;
 #[cfg(target_os = "linux")]
 mod splice;
 mod stream_reader;
+mod sudoku_mask;
 mod sync_adapter;
 mod tcp;
 mod thread_util;

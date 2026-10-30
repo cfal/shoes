@@ -152,6 +152,12 @@ impl Builder {
                     );
                 }
             }
+            ServerProxyConfig::SudokuMask(config) => self.project_protocol(
+                &mut config.protocol,
+                inbound,
+                &format!("{scope}/sudoku_mask"),
+                inherited,
+            ),
             ServerProxyConfig::Xhttp(config) => self.project_target(
                 &mut NoneOrSome::None,
                 &mut config.protocol,
@@ -177,6 +183,7 @@ pub fn inbound_type(protocol: &ServerProxyConfig) -> &'static str {
         ServerProxyConfig::Wireguard(_) => "WireGuard",
         ServerProxyConfig::Tls { .. } => "TLS",
         ServerProxyConfig::Websocket { .. } => "WebSocket",
+        ServerProxyConfig::SudokuMask(config) => inbound_type(&config.protocol),
         ServerProxyConfig::Xhttp(_) => "XHTTP",
         _ => "Shoes",
     }
@@ -240,6 +247,69 @@ pub fn attach(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sudoku_mask_preserves_nested_rule_scope_and_flow_context() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let configs = serde_json::from_value(serde_json::json!([{
+            "name": "masked",
+            "address": "127.0.0.1:1080",
+            "rules": "allow-all-direct",
+            "protocol": {
+                "type": "sudoku_mask",
+                "protocol": {
+                    "type": "tls",
+                    "default_target": {
+                        "cert": cert.cert.pem(),
+                        "key": cert.signing_key.serialize_pem(),
+                        "override_rules": "block-all",
+                        "protocol": {"type": "socks"}
+                    }
+                }
+            }
+        }]))
+        .unwrap();
+        let mut validated = crate::config::create_server_configs(configs).unwrap();
+        let registry = Arc::new(FlowRegistry::default());
+        let rules = attach(&mut validated, 7, Some(registry.clone())).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["shoes"]["scope"], "root");
+        assert_eq!(rules[0]["proxy"], "DIRECT");
+        assert_eq!(rules[1]["shoes"]["inbound"], "masked");
+        assert_eq!(rules[1]["shoes"]["scope"], "root/sudoku_mask/tls/default");
+        assert_eq!(rules[1]["proxy"], "REJECT");
+
+        let Config::Server(server) = &validated.configs[0] else {
+            panic!()
+        };
+        assert_eq!(inbound_type(&server.protocol), "TLS");
+        let ServerProxyConfig::SudokuMask(mask) = &server.protocol else {
+            panic!()
+        };
+        let ServerProxyConfig::Tls {
+            default_tls_target: Some(target),
+            ..
+        } = mask.protocol.as_ref()
+        else {
+            panic!()
+        };
+        let ConfigSelection::Config(rule) = target.override_rules.iter().next().unwrap() else {
+            panic!()
+        };
+        let context = rule
+            .criteria
+            .description
+            .as_ref()
+            .unwrap()
+            .context
+            .as_ref()
+            .unwrap();
+        assert!(Arc::ptr_eq(&context.registry, &registry));
+        assert_eq!(context.generation, 7);
+        assert_eq!(context.inbound, "masked");
+        assert_eq!(context.scope, "root/sudoku_mask/tls/default");
+        assert_eq!(context.protocol, "Socks5");
+    }
 
     #[test]
     fn rule_projection_without_tracking_leaves_flow_context_absent() {

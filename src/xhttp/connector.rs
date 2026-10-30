@@ -72,6 +72,7 @@ impl Security {
 
 pub fn contains(config: &ClientProxyConfig) -> bool {
     match config {
+        ClientProxyConfig::SudokuMask(config) => contains(&config.protocol),
         ClientProxyConfig::Xhttp(_) => true,
         ClientProxyConfig::Tls(tls) => contains(&tls.protocol),
         ClientProxyConfig::Reality { protocol, .. }
@@ -100,10 +101,17 @@ pub(crate) fn build_with_limits(
     if !contains(&config.protocol) {
         return Ok(None);
     }
+    crate::sudoku_mask::validate_client(&config.protocol, &config.transport)?;
     if config.transport == Transport::Udp {
         return Err(invalid("XHTTP requires TCP or QUIC transport"));
     }
-    let mut outer = config.protocol.clone();
+    let mut protocol = &config.protocol;
+    let mut masks = Vec::new();
+    while let ClientProxyConfig::SudokuMask(mask) = protocol {
+        masks.push(mask.prepare()?);
+        protocol = &mask.protocol;
+    }
+    let mut outer = protocol.clone();
     let default_sni = config.address.address().hostname().map(str::to_owned);
     let (xhttp, effective_sni, security, tls_alpn, reality) = match &mut outer {
         ClientProxyConfig::Xhttp(xhttp) => (
@@ -179,15 +187,15 @@ pub(crate) fn build_with_limits(
             vision,
             ..
         } => {
-            let ClientProxyConfig::Xhttp(xhttp) = protocol.as_ref() else {
+            let ClientProxyConfig::Xhttp(xhttp) =
+                std::mem::replace(protocol.as_mut(), ClientProxyConfig::PortForward)
+            else {
                 return Err(invalid("XHTTP must be directly inside REALITY"));
             };
             if *vision {
                 return Err(invalid("Vision cannot wrap XHTTP"));
             }
-            let xhttp = xhttp.clone();
             let sni = sni_hostname.clone().or(default_sni.clone());
-            **protocol = ClientProxyConfig::PortForward;
             let handler = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
                 outer,
                 default_sni,
@@ -261,23 +269,46 @@ pub(crate) fn build_with_limits(
         None,
         resolver,
     )?;
-    Ok(Some((
-        Arc::new(Client::new(
-            xhttp,
-            config.address.clone(),
-            authority,
-            version,
-            mode,
-            security,
-        )?),
-        inner,
-    )))
+    let client = Client::new(
+        xhttp,
+        config.address.clone(),
+        authority,
+        version,
+        mode,
+        security,
+    )?
+    .with_masks(masks);
+    Ok(Some((Arc::new(client), inner)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn xhttp_rejects_masks_inside_security_and_logical_sessions() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
+        let xhttp = json!({"type":"xhttp","protocol":{"type":"socks"}});
+        for protocol in [
+            json!({"type":"tls","protocol":mask(xhttp.clone())}),
+            json!({"type":"reality","public_key":"unused","protocol":mask(xhttp)}),
+            json!({"type":"xhttp","protocol":mask(json!({"type":"socks"}))}),
+        ] {
+            for protocol in [protocol.clone(), mask(protocol)] {
+                let config = serde_json::from_value(json!({
+                    "address":"localhost:443","protocol":protocol
+                }))
+                .unwrap();
+                let error = build(&config, resolver.clone()).unwrap_err();
+                assert!(
+                    error.to_string().contains("outermost protocol layer"),
+                    "{error}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn ipv6_literal_endpoints_do_not_require_a_host_override() {

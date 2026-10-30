@@ -41,6 +41,7 @@ pub enum TcpServerSetupResult {
         proxy_selector: Arc<ClientProxySelector>,
     },
     /// Long-lived work, polled outside the setup deadline and cancelled with its owner.
+    /// The producer/session owns output flushing; `need_initial_flush` does not apply.
     Session(Pin<Box<dyn Future<Output = ()> + Send>>),
 }
 

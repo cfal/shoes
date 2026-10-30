@@ -94,6 +94,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
 
     for (index, configs) in hops.iter().enumerate() {
         for config in configs {
+            crate::sudoku_mask::validate_client(&config.protocol, &config.transport)?;
             config.validate_quic_key_exchange(index == 0)?;
         }
     }
@@ -306,6 +307,47 @@ mod tests {
 
     fn direct_config() -> ClientConfig {
         ClientConfig::default()
+    }
+
+    #[test]
+    fn sudoku_mask_placement_is_checked_in_every_chain_hop_and_pool() {
+        use serde_json::json;
+        let mask = json!({"type":"sudoku_mask","protocol":{"type":"socks"}});
+        for (protocol, valid) in [
+            (mask.clone(), true),
+            (json!({"type":"tls","protocol":mask}), false),
+        ] {
+            let config: ClientConfig = serde_json::from_value(json!({
+                "address":"localhost:1080","protocol":protocol
+            }))
+            .unwrap();
+            for hop in [
+                ClientChainHop::Single(ConfigSelection::Config(config.clone())),
+                ClientChainHop::Pool(OneOrSome::Some(vec![
+                    ConfigSelection::Config(socks_config(1081)),
+                    ConfigSelection::Config(config),
+                ])),
+            ] {
+                for index in 0..=1 {
+                    let mut hops = Vec::new();
+                    if index == 1 {
+                        hops.push(ClientChainHop::Single(ConfigSelection::Config(
+                            direct_config(),
+                        )));
+                    }
+                    hops.push(hop.clone());
+                    let result =
+                        try_build_client_proxy_chain(OneOrSome::Some(hops), mock_resolver());
+                    assert_eq!(result.is_ok(), valid);
+                    if let Err(error) = result {
+                        assert!(
+                            error.to_string().contains("outermost protocol layer"),
+                            "{error}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

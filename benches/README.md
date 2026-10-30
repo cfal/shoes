@@ -1,3 +1,37 @@
+# Sudoku measurements
+
+The ignored `sudoku_measurement` unit test exercises the production codec and
+`SudokuStream` with 3 KiB plaintext writes, entropy/ASCII/custom/three-layout rotation,
+classic/packed directions, and 0%/10% padding. Build and run it explicitly:
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test --release --locked --lib sudoku_measurement --no-run
+SUDOKU_BENCH_MS=500 SUDOKU_BENCH_SAMPLES=7 taskset -c 0 \
+  target/release/deps/shoes-TEST_HASH sudoku_measurement --ignored --nocapture
+```
+
+Use the test executable reported by Cargo. `SUDOKU_BENCH_FILTER` selects case
+names by substring. Output rows are `SUDOKU,case,sample,iterations,ns,MiB/s`;
+`ns` is per iteration and throughput counts plaintext bytes. `codec_decode`
+iterations cover three writes (9 KiB), restoring the three-layout rotation
+position; other cases cover one write (3 KiB). Compare normalized MiB/s, not
+nanoseconds across different batch sizes. Optional
+`SUDOKU_BENCH_WIRE_DIR` supplies identical `entropy-classic-pad0.bin`-style wire
+files for entropy/ASCII comparisons; each must decode to the benchmark's
+deterministic plaintext. Otherwise, wire inputs use a fixed ChaCha12 seed so
+baseline and candidate decode identical bytes when encoder RNG ordering is unchanged.
+
+Stream cases use a repeating in-memory source and discard sink, not sockets,
+TLS, or a Tokio scheduler. Setup and allocation occur outside timed iterations;
+the production ChaCha12 RNG is retained. These numbers measure codec and wrapper
+cost, not network throughput. Compare separately built baseline/candidate
+executables on the same pinned CPU, alternate their run order, retain raw
+samples and binary/source hashes, and use isolated Cargo targets to prevent
+stale artifacts from another source tree. Go comparisons must disclose RNG and
+wrapper differences rather than imply equivalent end-to-end workloads.
+
+This library test uses the system allocator, not the application's jemalloc.
+
 # Selector measurements
 
 For the small, advisory selector/reload collection and comparison workflow, see
