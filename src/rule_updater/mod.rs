@@ -1,4 +1,4 @@
-//! Staged delivery of immutable rule files. No updater state enters forwarding.
+//! Delivery of immutable rules, with optional persistent caching.
 mod bootstrap;
 mod http;
 mod install;
@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::config::{Config, GlobalLimits, ValidatedConfigs};
 use crate::dns::DnsRegistry;
-use crate::rule_set::RuleSource;
+use crate::rule_set::{MemorySource, MemorySources, RuleInputs, RuleSource};
 use crate::rules::invalid;
 use install::Install;
 use tokio::time::{Instant, timeout};
@@ -52,16 +52,7 @@ async fn stage(
     state: &mut http::DownloadState,
 ) -> io::Result<Staged> {
     let mut file = tokio::fs::File::from_std(install.file.try_clone()?);
-    let digest = crate::control::url_test::BACKGROUND
-        .scope(
-            (),
-            timeout(
-                limits.overall,
-                http::download(source, dns, global, &mut file, limits, state),
-            ),
-        )
-        .await
-        .map_err(|_| invalid("overall rule download deadline exceeded"))??;
+    let digest = download(source, dns, global, &mut file, limits, state).await?;
     let validation_source = source.clone();
     let file = install.file.try_clone()?;
     crate::config::blocking_compile(move || {
@@ -72,13 +63,67 @@ async fn stage(
     Ok(Staged { install, digest })
 }
 
+async fn download(
+    source: &RuleSource,
+    dns: &DnsRegistry,
+    global: GlobalLimits,
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    limits: Limits,
+    state: &mut http::DownloadState,
+) -> io::Result<blake3::Hash> {
+    crate::control::url_test::BACKGROUND
+        .scope(
+            (),
+            timeout(
+                limits.overall,
+                http::download(source, dns, global, output, limits, state),
+            ),
+        )
+        .await
+        .map_err(|_| invalid("overall rule download deadline exceeded"))?
+}
+
+async fn download_memory(
+    source: &RuleSource,
+    previous: Option<&MemorySource>,
+    dns: &DnsRegistry,
+    global: GlobalLimits,
+    state: &mut http::DownloadState,
+) -> io::Result<Option<std::sync::Arc<MemorySource>>> {
+    let mut bytes = Vec::new();
+    let digest = download(source, dns, global, &mut bytes, Limits::default(), state).await?;
+    if let Some(previous) = previous
+        && previous.digest == digest
+        && previous.matches(source)?
+    {
+        return Ok(None);
+    }
+    let source = source.clone();
+    crate::config::blocking_compile(move || {
+        crate::rule_set::load_memory(source, bytes, digest)
+            .map(|loaded| Some(std::sync::Arc::new(loaded)))
+            .map_err(|_| invalid("download failed Shoes rule validation"))
+    })
+    .await
+}
+
 async fn validate_staged(
     configs: Vec<Config>,
     path: &Path,
     install: &Install,
 ) -> io::Result<ValidatedConfigs> {
-    let input = (path.to_owned(), install.file.try_clone()?);
-    let validated = crate::config::compile_configs_with_input(configs, Some(input))
+    validate_inputs(
+        configs,
+        RuleInputs {
+            file: Some((path.to_owned(), install.file.try_clone()?)),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn validate_inputs(configs: Vec<Config>, inputs: RuleInputs) -> io::Result<ValidatedConfigs> {
+    let validated = crate::config::compile_configs_with_inputs(configs, inputs)
         .await
         .map_err(|error| {
             invalid(format!(
@@ -121,19 +166,56 @@ async fn refresh_source(
     Ok(install.finish_async(digest).await?.changed())
 }
 
+async fn refresh_memory(
+    source: &RuleSource,
+    configs: &[Config],
+    memory: &mut MemorySources,
+    dns: &DnsRegistry,
+    global: GlobalLimits,
+    state: &mut http::DownloadState,
+) -> io::Result<bool> {
+    let Some(loaded) = download_memory(
+        source,
+        memory.get(&source.path).map(AsRef::as_ref),
+        dns,
+        global,
+        state,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let mut candidate = memory.clone();
+    candidate.insert(source.path.clone(), loaded);
+    validate_inputs(
+        configs.to_vec(),
+        RuleInputs {
+            file: None,
+            memory: candidate.clone(),
+        },
+    )
+    .await?;
+    *memory = candidate;
+    Ok(true)
+}
+
 /// Polled by the process select loop. Dropping that future cancels the HTTP
 /// connection and removes its stage; no detached task retains a generation.
 pub(crate) struct Refresh {
     configs: Vec<Config>,
     scheduled: Vec<Scheduled>,
+    pub(crate) memory: MemorySources,
+    persistent: bool,
 }
 
 impl Refresh {
     pub(crate) fn new(
         configs: Vec<Config>,
         sources: &[RuleSource],
+        memory: MemorySources,
         previous: Option<&Self>,
     ) -> io::Result<Self> {
+        let persistent = crate::rule_set::cache_directory(&configs)?.is_some();
         let mut scheduled = Vec::new();
         for source in sources {
             let identity = serde_json::to_value(source)?;
@@ -146,6 +228,8 @@ impl Refresh {
             let interval = source.interval()?;
             let due = if let Some(prior) = prior {
                 prior.due
+            } else if let Some(loaded) = memory.get(&source.path) {
+                Instant::now() + interval.saturating_sub(loaded.updated.elapsed())
             } else {
                 let remaining = std::fs::metadata(&source.path)
                     .and_then(|m| m.modified())
@@ -163,7 +247,12 @@ impl Refresh {
                     .map_or_else(http::DownloadState::default, |item| item.download.clone()),
             });
         }
-        Ok(Self { configs, scheduled })
+        Ok(Self {
+            configs,
+            scheduled,
+            memory,
+            persistent,
+        })
     }
 
     pub(crate) async fn changed(&mut self, dns: &DnsRegistry, global: GlobalLimits) {
@@ -173,8 +262,19 @@ impl Refresh {
                 return;
             };
             tokio::time::sleep_until(item.due).await;
-            let result =
-                refresh_source(&item.source, &self.configs, dns, global, &mut item.download).await;
+            let result = if self.persistent {
+                refresh_source(&item.source, &self.configs, dns, global, &mut item.download).await
+            } else {
+                refresh_memory(
+                    &item.source,
+                    &self.configs,
+                    &mut self.memory,
+                    dns,
+                    global,
+                    &mut item.download,
+                )
+                .await
+            };
             let interval = item.source.interval().expect("validated interval");
             let delay = match &result {
                 Ok(_) => {

@@ -27,17 +27,23 @@ async fn remote_refresh_is_rejected_before_ffi_opens_resources() {
     let (_wire, tun) = UnixDatagram::pair().unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let flags = unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) };
-    let config = json!([
+    let mut config = json!([
         {"device_fd": tun.as_raw_fd(), "rules": [{
             "url": "http://127.0.0.1:1/cache.json", "path": path,
             "download": {"client_chain": "direct", "bootstrap_url": "system"}, "action": "block"
         }]},
         {"address": listener.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}}
     ]);
-    for state in ["valid", "corrupt", "missing"] {
+    for state in ["valid", "corrupt", "missing", "memory"] {
         match state {
             "corrupt" => std::fs::write(&path, b"invalid JSON").unwrap(),
             "missing" => std::fs::remove_file(&path).unwrap(),
+            "memory" => {
+                config[0]["rules"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("path");
+            }
             _ => {}
         }
         let (_shutdown, rx) = oneshot::channel();

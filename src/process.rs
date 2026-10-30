@@ -24,7 +24,7 @@ async fn validate_configs(
 ) -> io::Result<ValidatedConfigs> {
     load_candidate(paths, configs, discovered, false, None, &mut None, &[])
         .await
-        .map(|(validated, _)| validated)
+        .map(|(validated, _, _)| validated)
 }
 
 async fn load_candidate(
@@ -32,11 +32,17 @@ async fn load_candidate(
     mut configs: Vec<Config>,
     discovered: &mut DiscoverDependencies<'_>,
     for_runtime: bool,
-    expected_cache_dir: Option<&Option<PathBuf>>,
+    previous_servers: Option<&PreparedServers>,
     cache_lease: &mut Option<std::sync::Arc<std::fs::File>>,
     retained_ranges: &[ipnetwork::IpNetwork],
-) -> io::Result<(ValidatedConfigs, Vec<Config>)> {
+) -> io::Result<(
+    ValidatedConfigs,
+    Vec<Config>,
+    crate::rule_set::MemorySources,
+)> {
     async {
+        let expected_cache_dir =
+            previous_servers.map(|previous| &previous.validated.rule_cache_dir);
         let cache_dir = crate::rule_set::cache_directory(&configs)?;
         let mut dependencies = crate::rule_set::dependencies(&mut configs)?;
         let mut recovery_dependencies = config::pem_candidate_dependencies(&mut configs)?;
@@ -74,9 +80,17 @@ async fn load_candidate(
         #[cfg(not(unix))]
         let _ = (cache_lease, retained_ranges);
         let (mut configs, _) = config::convert_cert_paths(configs).await?;
+        let mut memory = crate::rule_set::MemorySources::new();
         #[cfg(unix)]
         if for_runtime {
-            configs = crate::rule_updater::bootstrap(configs, retained_ranges).await?;
+            (configs, memory) = crate::rule_updater::bootstrap(
+                configs,
+                retained_ranges,
+                previous_servers
+                    .map(|previous| previous.remote_rules.memory.clone())
+                    .unwrap_or_default(),
+            )
+            .await?;
         }
         let mut has_remote = false;
         crate::rule_set::visit_sources(&mut configs, &mut |source| {
@@ -88,13 +102,20 @@ async fn load_candidate(
         } else {
             Vec::new()
         };
-        let mut validated = config::compile_configs(configs).await?;
+        let mut validated = config::compile_configs_with_inputs(
+            configs,
+            crate::rule_set::RuleInputs {
+                file: None,
+                memory: memory.clone(),
+            },
+        )
+        .await?;
         validated.reload_files = dependencies;
         tokio::task::spawn_blocking(move || {
             if validated.catalog.is_some() {
                 crate::control::validation::validate_resources(&validated)?;
             }
-            Ok((validated, snapshot))
+            Ok((validated, snapshot, memory))
         })
         .await
         .map_err(io::Error::other)?
@@ -149,12 +170,12 @@ async fn prepare_tracking(
     network: &crate::desktop::NetworkSession,
 ) -> io::Result<PreparedServers> {
     let mut cache_lease = previous_servers.and_then(|previous| previous.cache_lease.clone());
-    let (mut validated, snapshot) = load_candidate(
+    let (mut validated, snapshot, memory) = load_candidate(
         paths,
         configs,
         discovered,
         true,
-        previous_servers.map(|previous| &previous.validated.rule_cache_dir),
+        previous_servers,
         &mut cache_lease,
         previous.map_or(&[], DnsRegistry::forbidden_ranges),
     )
@@ -315,6 +336,7 @@ async fn prepare_tracking(
         remote_rules: crate::rule_updater::Refresh::new(
             snapshot,
             &validated.remote_rules,
+            memory,
             previous_servers.map(|servers| &servers.remote_rules),
         )?,
         generation,

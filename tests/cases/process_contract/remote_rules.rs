@@ -113,6 +113,202 @@ async fn quiet(child: &mut Process) {
     );
 }
 
+fn memory_config(
+    path: &Path,
+    address: std::net::SocketAddr,
+    target: std::net::SocketAddr,
+    url: &str,
+    interval: &str,
+) -> serde_json::Value {
+    let mut value = config(path, address, target, url, interval);
+    value.as_array_mut().unwrap().remove(0);
+    value[0]["rules"][0].as_object_mut().unwrap().remove("path");
+    std::fs::write(path, value.to_string()).unwrap();
+    value
+}
+
+#[tokio::test]
+async fn memory_sources_bootstrap_once_reuse_on_reload_and_require_network_after_restart() {
+    let dir = directory();
+    std::fs::remove_dir(dir.path().join("cache")).unwrap();
+    let path = dir.path().join("config.yaml");
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    let mut value = memory_config(
+        &path,
+        address,
+        echo.local_addr(),
+        &format!("http://{}/rules.json?SECRET", origin.local_addr().unwrap()),
+        "7d",
+    );
+    let duplicate = value[0]["rules"][0].clone();
+    value[0]["rules"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, duplicate);
+    std::fs::write(&path, value.to_string()).unwrap();
+
+    let offline = command(&path, &["--dry-run"]).await;
+    assert!(!offline.status.success());
+    assert!(String::from_utf8_lossy(&offline.stderr).contains("offline checks never download"));
+    assert!(
+        timeout(Duration::from_millis(50), origin.accept())
+            .await
+            .is_err()
+    );
+    let mut child = Process::start(&path, &["--no-reload"]);
+    let pending = request(&origin).await;
+    assert!(TcpStream::connect(address).await.is_err());
+    respond(pending, MISS).await;
+    child.wait_for("Servers ready").await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    assert!(
+        timeout(Duration::from_millis(50), origin.accept())
+            .await
+            .is_err()
+    );
+    drop(origin);
+
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+    let restarted = command(&path, &["--no-reload"]).await;
+    assert!(!restarted.status.success());
+    assert!(!String::from_utf8_lossy(&restarted.stdout).contains("Servers ready"));
+    assert!(!String::from_utf8_lossy(&restarted.stderr).contains("SECRET"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn memory_refresh_replaces_rules_and_retains_them_on_unchanged_or_invalid_downloads() {
+    let dir = directory();
+    std::fs::remove_dir(dir.path().join("cache")).unwrap();
+    let path = dir.path().join("config.yaml");
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    memory_config(
+        &path,
+        address,
+        echo.local_addr(),
+        &format!("http://{}/rules.json", origin.local_addr().unwrap()),
+        "1s",
+    );
+    let mut child = Process::start(&path, &["--no-reload"]);
+    respond(request(&origin).await, MISS).await;
+    child.wait_for("Servers ready").await;
+    let mut retained = TcpStream::connect(address).await.unwrap();
+    roundtrip(&mut retained).await;
+    respond(request(&origin).await, BLOCK).await;
+    child.wait_for("Servers ready").await;
+    blocked(address).await;
+    roundtrip(&mut retained).await;
+    respond(request(&origin).await, BLOCK).await;
+    respond(request(&origin).await, b"SECRET invalid data").await;
+    let pending = request(&origin).await;
+    quiet(&mut child).await;
+    blocked(address).await;
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+    drop(pending);
+}
+
+#[tokio::test]
+async fn memory_refresh_survives_activation_failure_and_recovers_without_download() {
+    let dir = directory();
+    std::fs::remove_dir(dir.path().join("cache")).unwrap();
+    let path = dir.path().join("config.yaml");
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    let mut value = memory_config(
+        &path,
+        address,
+        echo.local_addr(),
+        &format!("http://{}/rules.json", origin.local_addr().unwrap()),
+        "1s",
+    );
+    let mut child = Process::start(&path, &["--no-reload"]);
+    respond(request(&origin).await, MISS).await;
+    child.wait_for("Servers ready").await;
+    let mut retained = TcpStream::connect(address).await.unwrap();
+    roundtrip(&mut retained).await;
+    let pending = request(&origin).await;
+    value[0]["rules"][0]["update_interval"] = serde_json::json!("7d");
+    value.as_array_mut().unwrap().push(serde_json::json!({
+        "path": dir.path().join("missing/listener.sock"), "protocol": {"type": "socks"}
+    }));
+    std::fs::write(&path, value.to_string()).unwrap();
+    respond(pending, BLOCK).await;
+    child
+        .wait_for("Reload rejected; previous servers restored")
+        .await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    roundtrip(&mut retained).await;
+    value.as_array_mut().unwrap().pop();
+    std::fs::write(&path, value.to_string()).unwrap();
+    drop(origin);
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    blocked(address).await;
+    roundtrip(&mut retained).await;
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+}
+
+#[tokio::test]
+async fn generated_cache_paths_allow_restart_during_an_origin_outage() {
+    let dir = directory();
+    let path = dir.path().join("config.yaml");
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = available_address();
+    let mut value = memory_config(
+        &path,
+        address,
+        address,
+        &format!("http://{}/rules.json", origin.local_addr().unwrap()),
+        "7d",
+    );
+    value
+        .as_array_mut()
+        .unwrap()
+        .insert(0, serde_json::json!({"rule_cache_dir": "./cache"}));
+    std::fs::write(&path, value.to_string()).unwrap();
+    let mut child = Process::start(&path, &["--no-reload"]);
+    respond(request(&origin).await, BLOCK).await;
+    child.wait_for("Servers ready").await;
+    blocked(address).await;
+    let files: Vec<_> = std::fs::read_dir(dir.path().join("cache"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rules"))
+        .collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(std::fs::read(&files[0]).unwrap(), BLOCK);
+    assert_eq!(std::fs::metadata(&files[0]).unwrap().mode() & 0o777, 0o600);
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+    drop(origin);
+    assert!(command(&path, &["--dry-run"]).await.status.success());
+    let mut restarted = Process::start(&path, &["--no-reload"]);
+    restarted.wait_for("Servers ready").await;
+    blocked(address).await;
+    restarted.signal(libc::SIGTERM);
+    assert!(restarted.exit().await.success());
+}
+
 #[tokio::test]
 async fn offline_checks_and_invalid_caches_never_download() {
     let dir = directory();

@@ -42,6 +42,7 @@ pub enum Format {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleSource {
+    #[serde(default)]
     pub path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -64,6 +65,32 @@ pub struct RuleSource {
 pub struct Download {
     pub client_chain: crate::config::ClientChain,
     pub bootstrap_url: String,
+}
+
+pub(crate) type MemorySources = std::collections::BTreeMap<PathBuf, Arc<MemorySource>>;
+
+pub(crate) struct MemorySource {
+    identity: blake3::Hash,
+    format: Format,
+    predicate: Arc<Predicate>,
+    pub(crate) digest: blake3::Hash,
+    pub(crate) updated: std::time::Instant,
+}
+
+impl MemorySource {
+    pub(crate) fn matches(&self, source: &RuleSource) -> io::Result<bool> {
+        Ok(self.identity == source.content_identity()?)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.predicate.retained_bytes()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RuleInputs {
+    pub(crate) file: Option<(PathBuf, std::fs::File)>,
+    pub(crate) memory: MemorySources,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -95,6 +122,17 @@ impl SourceKey {
 }
 
 impl RuleSource {
+    fn content_identity(&self) -> io::Result<blake3::Hash> {
+        let identity = serde_json::to_vec(&(
+            &self.url,
+            self.format,
+            self.behavior,
+            &self.code,
+            &self.attributes,
+        ))?;
+        Ok(blake3::hash(&identity))
+    }
+
     pub(crate) fn from_path(path: PathBuf) -> Self {
         Self {
             path,
@@ -164,6 +202,9 @@ impl RuleSource {
 
     pub(crate) fn parsed_url(&self) -> io::Result<Option<url::Url>> {
         let Some(raw) = &self.url else {
+            if self.path.as_os_str().is_empty() {
+                return Err(invalid("local rule source requires path"));
+            }
             if self.download.is_some() || self.update_interval.is_some() {
                 return Err(invalid("download/update_interval requires url"));
             }
@@ -239,17 +280,33 @@ pub fn dependencies(configs: &mut [Config]) -> io::Result<Vec<PathBuf>> {
 }
 
 pub(crate) fn remote_sources(configs: &mut [Config]) -> io::Result<Vec<RuleSource>> {
+    let directory = cache_directory(configs)?;
     let mut sources = std::collections::BTreeMap::<PathBuf, RuleSource>::new();
     visit_sources(configs, &mut |source| {
         if source.parsed_url()?.is_none() {
             return Ok(());
         }
-        if !source.path.is_absolute() {
+        if directory.is_none() || source.path.as_os_str().is_empty() {
+            let name = format!("{}.rules", source.content_identity()?);
+            let path = directory.as_ref().map_or_else(
+                || PathBuf::from(format!("remote:{name}")),
+                |dir| dir.join(&name),
+            );
+            if directory.is_none() && !source.path.as_os_str().is_empty() && source.path != path {
+                return Err(invalid(
+                    "remote path requires rule_cache_dir; omit path for memory-only sources",
+                ));
+            }
+            source.path = path;
+        }
+        if directory.is_some() && !source.path.is_absolute() {
             return Err(invalid(
                 "remote cache paths must be absolute for string configs",
             ));
         }
-        source.path = std::path::absolute(&source.path)?;
+        if source.path.is_absolute() {
+            source.path = std::path::absolute(&source.path)?;
+        }
         if let Some(previous) = sources.get(&source.path) {
             if serde_json::to_value(previous)? != serde_json::to_value(&source)? {
                 return Err(invalid("conflicting remote sources share a cache path"));
@@ -325,11 +382,7 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
     use source_identity as identity;
     let remotes = remote_sources(configs)?;
     let Some(directory) = cache_directory(configs)? else {
-        return if remotes.is_empty() {
-            Ok(())
-        } else {
-            Err(invalid("remote sources require a private rule_cache_dir"))
-        };
+        return Ok(());
     };
     if !cfg!(unix) {
         return Err(io::Error::new(
@@ -484,7 +537,7 @@ pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
         }
     }
     visit_sources(configs, &mut |source| {
-        if source.path.is_relative() {
+        if !source.path.as_os_str().is_empty() && source.path.is_relative() {
             source.path = base.join(&source.path);
         }
         Ok(())
@@ -556,12 +609,33 @@ pub fn load_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<A
 }
 
 fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<Predicate>> {
+    if compiler.remote_files.contains_key(&source.path) {
+        if let Some(loaded) = compiler.inputs.memory.get(&source.path).cloned() {
+            let key = SourceKey::new(source.path.clone(), loaded.format, source);
+            if let Some(predicate) = compiler.sources.get(&key) {
+                return Ok(predicate.clone());
+            }
+            if compiler.sources.len() >= 1024 {
+                return Err(invalid(
+                    "rule source limit exceeded (1024 distinct sources)",
+                ));
+            }
+            compiler.charge(loaded.retained_bytes(), 0)?;
+            compiler.sources.insert(key, loaded.predicate.clone());
+            return Ok(loaded.predicate.clone());
+        }
+        if compiler.memory_only {
+            return Err(invalid(
+                "remote rules unavailable in memory; offline checks never download; daemon startup fetches remote sources",
+            ));
+        }
+    }
     if !source.path.is_absolute() {
         return Err(invalid(
             "rule source path must be absolute for string configs; file configs anchor paths to their declaring file",
         ));
     }
-    if let Some((path, file)) = &compiler.input_file
+    if let Some((path, file)) = &compiler.inputs.file
         && path == &source.path
     {
         return read_staged(source, file.try_clone()?, source.path.clone(), compiler);
@@ -617,25 +691,70 @@ fn read_staged(
 
 fn read_file(
     source: &RuleSource,
-    mut file: std::fs::File,
+    file: std::fs::File,
     path: PathBuf,
     compiler: &mut Compiler,
 ) -> io::Result<Arc<Predicate>> {
+    read_data(source, path, SourceInput::File(file), compiler).map(|(_, predicate)| predicate)
+}
+
+pub(crate) fn load_memory(
+    source: RuleSource,
+    bytes: Vec<u8>,
+    digest: blake3::Hash,
+) -> io::Result<MemorySource> {
+    let (format, predicate) = read_data(
+        &source,
+        source.path.clone(),
+        SourceInput::Memory(bytes),
+        &mut Compiler::default(),
+    )?;
+    Ok(MemorySource {
+        identity: source.content_identity()?,
+        format,
+        predicate,
+        digest,
+        updated: std::time::Instant::now(),
+    })
+}
+
+enum SourceInput {
+    File(std::fs::File),
+    Memory(Vec<u8>),
+}
+
+fn read_data(
+    source: &RuleSource,
+    path: PathBuf,
+    mut input: SourceInput,
+    compiler: &mut Compiler,
+) -> io::Result<(Format, Arc<Predicate>)> {
     let url = source.parsed_url()?;
     let start = std::time::Instant::now();
-    file.rewind()?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(invalid("rule source must be a regular file"));
-    }
-    if metadata.len() > MAX_INPUT as u64 {
+    let size = match &mut input {
+        SourceInput::File(file) => {
+            file.rewind()?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(invalid("rule source must be a regular file"));
+            }
+            metadata.len()
+        }
+        SourceInput::Memory(bytes) => bytes.len() as u64,
+    };
+    if size > MAX_INPUT as u64 {
         return Err(invalid("rule source input exceeds 64 MiB"));
     }
-    let size = metadata.len() as usize;
+    let size = size as usize;
     let mut prefix = [0; 4];
     let prefix = &mut prefix[..size.min(4)];
-    file.read_exact(prefix)?;
-    file.rewind()?;
+    match &mut input {
+        SourceInput::File(file) => {
+            file.read_exact(prefix)?;
+            file.rewind()?;
+        }
+        SourceInput::Memory(bytes) => prefix.copy_from_slice(&bytes[..prefix.len()]),
+    }
     let remote_hint = compiler.remote_files.get(&path).copied().flatten();
     let url_hint = url.and_then(|url| extension(Path::new(url.path())));
     let format = source.format_with_hint(prefix, url_hint.or(remote_hint))?;
@@ -659,7 +778,7 @@ fn read_file(
         if remote && matches!(predicate.kind, crate::rules::Kind::Constant(false)) {
             return Err(invalid("refusing an empty remote rule set"));
         }
-        return Ok(predicate.clone());
+        return Ok((format, predicate.clone()));
     }
     if compiler.sources.len() >= 1024 {
         return Err(invalid(
@@ -671,13 +790,17 @@ fn read_file(
             // JSON may retain doubled escape scratch alongside an owned map key.
             let factor = if format == Format::SingboxJson { 4 } else { 2 };
             compiler.charge(size.saturating_mul(factor).saturating_add(64), 0)?;
-            let mut bytes = Vec::with_capacity(size + 1);
-            file.take(size as u64 + 1).read_to_end(&mut bytes)?;
-            if bytes.len() != size {
-                return Err(invalid(
-                    "rule source changed while reading; retry with an atomic file replacement",
-                ));
-            }
+            let bytes = match input {
+                SourceInput::Memory(bytes) => bytes,
+                SourceInput::File(file) => {
+                    let mut bytes = Vec::with_capacity(size + 1);
+                    file.take(size as u64 + 1).read_to_end(&mut bytes)?;
+                    if bytes.len() != size {
+                        return Err(invalid("rule source changed while reading; retry with an atomic file replacement"));
+                    }
+                    bytes
+                }
+            };
             match format {
                 Format::Srs => srs::decode(&bytes, compiler),
                 Format::SingboxJson => singbox::decode(&bytes, compiler),
@@ -721,7 +844,7 @@ fn read_file(
         start.elapsed()
     );
     compiler.sources.insert(key, predicate.clone());
-    Ok(predicate)
+    Ok((format, predicate))
 }
 
 #[cfg(test)]

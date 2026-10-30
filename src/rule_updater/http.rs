@@ -12,8 +12,7 @@ use hyper_util::rt::TokioIo;
 use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 const MAX_HEADER_COUNT: usize = 64;
@@ -156,7 +155,7 @@ pub(super) async fn download(
     source: &RuleSource,
     dns: &DnsRegistry,
     global: GlobalLimits,
-    file: &mut File,
+    file: &mut (impl AsyncWrite + Unpin),
     limits: Limits,
     state: &mut DownloadState,
 ) -> io::Result<blake3::Hash> {

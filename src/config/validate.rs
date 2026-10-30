@@ -87,12 +87,12 @@ impl ValidatedConfigs {
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
 pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
-    create_server_configs_with_input(all_configs, None)
+    create_server_configs_with_inputs(all_configs, Default::default())
 }
 
-pub(super) fn create_server_configs_with_input(
+pub(super) fn create_server_configs_with_inputs(
     mut all_configs: Vec<Config>,
-    input: Option<(std::path::PathBuf, std::fs::File)>,
+    mut inputs: crate::rule_set::RuleInputs,
 ) -> std::io::Result<ValidatedConfigs> {
     crate::rule_set::validate_remote_paths(&mut all_configs, &[])?;
     let rule_cache_dir = crate::rule_set::cache_directory(&all_configs)?;
@@ -100,9 +100,12 @@ pub(super) fn create_server_configs_with_input(
     let catalog = crate::control::catalog::Catalog::capture(&mut all_configs)?;
     let mut control = super::ControlConfig::default();
     let mut compiler = crate::rules::Compiler::default();
-    compiler.input_file = input
+    inputs.file = inputs
+        .file
         .map(|(path, file)| std::path::absolute(path).map(|path| (path, file)))
         .transpose()?;
+    compiler.inputs = inputs;
+    compiler.memory_only = rule_cache_dir.is_none();
     let mut reload_files = crate::rule_set::dependencies(&mut all_configs)?;
     reload_files.extend(super::pem_reload_dependencies(&mut all_configs)?);
     let mut remote_rules = crate::rule_set::normalize_sources(&mut all_configs, &mut compiler)?;

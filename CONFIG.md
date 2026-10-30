@@ -2185,7 +2185,7 @@ rules:
 
 ### Remote Rule Sources
 
-Add `url` to a file source to manage its local cache automatically. The same
+Use `url` to load a remote source. Persistent caching is optional. The same
 source object works in `rule_source_group.rules`, under `masks` (including
 `all`/`any`/`not`), or flat alongside `action` in a policy group's rules, a server's
 `rules`, or supported `override_rules`. A flat source cannot also specify `masks`.
@@ -2196,7 +2196,6 @@ source object works in `rule_source_group.rules`, under `masks` (including
 - rule_source_group: regional
   rules:
     - url: https://example.net/geoip-cn.srs
-      path: ./cache/geoip-cn.srs
       update_interval: 7d
       download:
         client_chain: direct
@@ -2208,7 +2207,6 @@ source object works in `rule_source_group.rules`, under `masks` (including
     - masks: {rule_source_group: regional}
       action: block
     - url: https://example.net/blocked.json
-      path: ./cache/blocked.json
       download:
         client_chain:
           address: "proxy.example.net:1080"
@@ -2227,10 +2225,24 @@ be `system`, an IP-based DNS URL, or a named DNS group. Target and proxy hostnam
 use this resolver; failed refresh routing never falls back to direct. Automatic
 refresh uses the active generation's DNS, proxy clients, and selector choices.
 
-`rule_cache_dir` declares one private managed directory across all config files.
+Omit `rule_cache_dir` for memory-only loading. Shoes downloads required sources
+before starting listeners, retains their compiled rules in memory, and reuses
+unchanged sources across configuration reloads. Periodic refresh still applies;
+failed downloads or rejected candidates leave the active rules unchanged. No
+cache, lock, staging, or temporary files are created. Download buffers are released
+after compilation, and byte-identical refreshes do not recompile the rules.
+A cold start requires network access; a remote outage prevents startup when
+there is no persistent cache. `check` and `--dry-run` remain offline and cannot
+validate memory-only remote sources. Local file sources still require `path`.
+
+`rule_cache_dir` enables persistence in one private managed directory across all
+config files.
+Use persistent caching on routers that must restart while the origin is unavailable.
 Its value is relative to the declaring file and fixed for the process lifetime:
 adding, changing, or removing it requires a restart, even without remote sources.
-Every remote `path` must be a direct child of that directory. Configuration, local
+Remote `path` is optional: when omitted, Shoes generates a stable filename from
+the URL and decoding options. Explicit remote paths require `rule_cache_dir` and
+must be direct children of that directory. Configuration, local
 rule sources (including aliases), PEMs, sockets, and other state must be outside
 it. ACME state directories cannot contain or be contained by the cache directory.
 The directory must be owned by the running user and not group- or world-writable
@@ -2249,8 +2261,9 @@ are supported; DAT still needs explicit format/code, and Mihomo YAML/text needs
 behavior. Invalid decoding never retries a different format.
 
 `update_interval` defaults to `24h`; use a positive integer with `s`, `m`, `h`, or
-`d`, from `1s` through `365d`. Daemon startup and reload fetch required **missing**
-caches using their configured download routes before preparing candidate listeners.
+`d`, from `1s` through `365d`. With persistent caching, daemon startup and reload
+fetch required **missing** caches using their configured download routes before
+preparing candidate listeners.
 Existing files are never replaced by bootstrap: invalid or empty caches fail
 validation. Repair them externally, or remove them and restart/reload to fetch
 again. Unsafe ownership, permissions, and symlinks are hard errors, not reasons
@@ -2269,33 +2282,36 @@ named `system` is still a named group, not the built-in resolver. No failed or
 unsupported route falls back to direct TCP or system DNS. Literal bootstrap DNS
 URLs keep their existing direct routing semantics; OS VPN/TUN routing still applies.
 
-These restrictions apply only when a cache is missing. With usable caches,
-startup accepts the normal refresh routes, including dynamic client and named DNS
+These restrictions apply whenever a source must be downloaded during startup or
+reload, including every memory-only source on a cold start. With usable caches or
+retained in-memory sources, preparation accepts the normal refresh routes,
+including dynamic client and named DNS
 groups. Populate such caches externally, or bootstrap with a supported route
 before switching to a runtime-dependent route. Bootstrap must not depend on this
 instance's own listeners; indirect dependencies can fail at the download deadline.
 Candidate and retained Fake-IP ranges remain excluded from download destinations,
 proxy hops, and bootstrap DNS.
 
-Startup creates the final cache directory if missing, then acquires its lease.
+When configured, startup creates the final cache directory if missing, then acquires its lease.
 The parent directory must already exist. Creation respects the process umask and
 never repairs permissions. If owner access is missing, create the directory with
 `install -d -m 700 cache` before starting. Reload reuses the lease and does not
 recreate a removed root.
 
 Declarations and all required bootstrap routes are preflighted before fetching.
-Files are downloaded, decoder-validated, and atomically installed serially, then
+With persistent caching, files are downloaded, decoder-validated, and atomically installed serially, then
 the complete configuration is compiled normally. A failed startup exits before
 serving; a failed reload retains the active generation. Earlier completed installs
 remain if a later download, configuration check, or activation fails. This is a
 per-file repair, not a multi-file disk transaction or a promise of activation.
 
 The process refreshes due sources serially, with 10% jitter and capped exponential
-failure backoff. Downloaded files pass Shoes' actual decoders, compilation budgets,
-and validation against the active configuration snapshot before atomic replacement.
-The initial due time is based on cache mtime; future mtimes are treated as due.
-Successful check times are remembered only in memory. Changing a URL without
-changing its cache path can serve the old bytes until the next due time; use a new
+failure backoff. Downloaded sources pass Shoes' actual decoders, compilation budgets,
+and validation against the active configuration snapshot before replacement.
+The initial due time is based on cache mtime, or the initial download time in
+memory-only mode; future mtimes are treated as due.
+Successful check times are remembered only in memory. Changing a URL with an
+explicit, unchanged cache path can serve the old bytes until the next due time; use a new
 cache name and bootstrap it when immediate replacement is needed. Failures keep the
 last-good file and active rules; identical bytes preserve inode/mtime and do not
 reload. Each file replacement is atomic, not a multi-file transaction. A post-rename
@@ -2304,9 +2320,10 @@ validated replacement. New flows use the reloaded rules; existing flows retain
 their previous configuration. Reload/removal/shutdown cancels in-flight refreshes.
 `--no-reload` disables filesystem-triggered reloads, not configured remote refresh.
 Managed caches are excluded from generic filesystem watching. An automatic changed
-install requests one immediate reload; external edits require SIGHUP or restart.
+source requests one immediate reload; external cache edits require SIGHUP or restart.
 Reload reads the configuration files, including any unrelated edits. If activation
-fails, the new cache can remain on disk while old rules remain active. Correct the
+fails, the validated replacement remains available in memory or on disk while
+old rules remain active. Correct the
 configuration and reload explicitly; a later byte-identical fetch does not retry
 activation. Atomic installation does not provide a disk/activation or power-loss
 transaction.
