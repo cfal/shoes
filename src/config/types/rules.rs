@@ -428,20 +428,18 @@ impl Serialize for RuleConfig {
     }
 }
 
-/// A single hop in a proxy chain.
+/// A step in a proxy chain, possibly expanded into a complete group member path.
 ///
 /// Each hop represents one step in the chain. A hop can be:
-/// - A single proxy (inline config or group reference)
-/// - A pool of proxies for load balancing (mix of inline configs and group refs)
+/// - An inline proxy or a group reference retaining the group's selection policy
+/// - A round-robin pool of immediate alternatives (inline proxies or groups)
 #[derive(Debug, Clone)]
 pub enum ClientChainHop {
-    /// Single proxy for this hop - either an inline config or a group reference.
-    /// If a group reference, the group's proxies become the pool for this hop.
+    /// Inline proxy or group reference, preserving the group's policy and member paths.
     Single(ConfigSelection<ClientConfig>),
 
-    /// Pool of proxies for this hop (round-robin load balancing).
-    /// Can mix inline configs and group references.
-    /// Group references are expanded, and all configs are combined into one pool.
+    /// Round-robin pool of inline proxies and group references.
+    /// Each listed alternative gets one turn; nested groups retain their own policy.
     Pool(OneOrSome<ConfigSelection<ClientConfig>>),
 
     /// Resolved alternatives retain their policy boundary and complete paths.
