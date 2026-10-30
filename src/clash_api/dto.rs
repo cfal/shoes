@@ -2,8 +2,8 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io;
 
-use crate::config::{ClientChain, ClientChainHop, ConfigSelection, GroupType};
-use crate::control::catalog::{Catalog, CatalogNode, protocol_type};
+use crate::config::{ClientChain, ClientChainHop, ClientConfig, ConfigSelection, GroupType};
+use crate::control::catalog::{Catalog, CatalogNode, api_group, protocol_type};
 use crate::control::runtime::Generation;
 use crate::control::selection::Choices;
 use crate::control::url_test::AutomaticGroup;
@@ -109,14 +109,27 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str) -> bool 
             continue;
         }
         match generation.catalog.nodes.get(name) {
-            Some(CatalogNode::Chain(_)) => {
-                if generation
-                    .catalog
-                    .route(name)
-                    .is_ok_and(|chain| route_udp(generation, choices, &chain.hops))
+            Some(CatalogNode::Chain(chain)) => {
+                let Some(hop) = chain.hops.iter().last() else {
+                    continue;
+                };
+                let selections: Box<dyn Iterator<Item = &ConfigSelection<ClientConfig>>> = match hop
                 {
-                    return true;
-                }
+                    ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
+                    ClientChainHop::Pool(pool) => pool.iter(),
+                    ClientChainHop::Choice(_) => {
+                        unreachable!("catalog chains retain source references")
+                    }
+                };
+                pending.extend(selections.map(|selection| {
+                    match selection {
+                        ConfigSelection::GroupName(name) => api_group(name),
+                        ConfigSelection::Config(client) => client
+                            .control
+                            .as_ref()
+                            .map_or("DIRECT", |origin| origin.name.as_ref()),
+                    }
+                }));
             }
             Some(CatalogNode::Group {
                 members,
@@ -142,28 +155,6 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str) -> bool 
         }
     }
     false
-}
-
-fn route_udp(generation: &Generation, choices: &Choices, hops: &OneOrSome<ClientChainHop>) -> bool {
-    match hops.iter().last() {
-        Some(ClientChainHop::Choice(choice)) => {
-            choice.members.iter().enumerate().any(|(index, chain)| {
-                (choice.group_type != GroupType::Selector
-                    || choices.get(&choice.name) == Some(&choice.labels[index]))
-                    && route_udp(generation, choices, &chain.hops)
-            })
-        }
-        Some(hop) => crate::config::composition::clients(hop).any(|client| {
-            client.control.as_ref().is_some_and(|origin| {
-                generation
-                    .leaf_udp_support
-                    .get(origin.name.as_ref())
-                    .copied()
-                    .unwrap_or(false)
-            })
-        }),
-        None => false,
-    }
 }
 
 pub fn proxies(generation: &Generation) -> Value {
@@ -196,6 +187,68 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn relay_udp_support_follows_only_terminal_members_and_selector_choices() {
+        let configs = serde_json::from_value(json!([
+            {"client_group":"manual", "type":"selector", "default":"tcp", "client_chains":[
+                {"name":"tcp", "address":"192.0.2.1:80", "protocol":{"type":"http"}},
+                {"name":"udp", "address":"192.0.2.2:443", "protocol":{
+                    "type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+                }}
+            ]},
+            {"client_group":"prefix", "client_chains":[
+                {"address":"192.0.2.4:80", "protocol":{"type":"http"}}
+            ]},
+            {"client_group":"relays", "client_chains":[
+                {"name":"via-manual", "chain":["prefix", "manual"]},
+                {"name":"inline", "chain":["prefix",
+                    {"name":"inline-udp", "address":"192.0.2.3:443", "protocol":{
+                        "type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+                    }}
+                ]}
+            ]}
+        ]))
+        .unwrap();
+        let mut catalog = crate::config::create_server_configs(configs)
+            .unwrap()
+            .catalog
+            .unwrap();
+        catalog.nodes.insert(
+            "pooled".into(),
+            CatalogNode::Chain(Box::new(ClientChain {
+                hops: OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
+                    ConfigSelection::GroupName("manual".into()),
+                    ConfigSelection::GroupName("direct".into()),
+                ]))),
+            })),
+        );
+        let generation = Generation {
+            id: 1,
+            leaf_udp_support: leaf_udp_support(&catalog).unwrap(),
+            catalog,
+            rules: Vec::new(),
+            probes: super::super::probes::ProbeState::new(
+                Arc::new(crate::resolver::NativeResolver::new()),
+                Vec::new(),
+            ),
+        };
+        let mut owner = SelectionOwner::new(None).unwrap();
+        owner
+            .activate(generation.catalog.selection.clone())
+            .unwrap();
+        for (selected, expected) in [("tcp", false), ("udp", true)] {
+            owner.select("manual", selected).unwrap();
+            let choices = generation.catalog.selection.snapshot();
+            assert_eq!(
+                proxy(&generation, &choices, "via-manual").unwrap()["udp"],
+                expected
+            );
+            assert_eq!(proxy(&generation, &choices, "inline").unwrap()["udp"], true);
+            assert_eq!(proxy(&generation, &choices, "pooled").unwrap()["udp"], true);
+        }
+    }
+
+    #[test]
+
     fn url_test_dto_reports_transport_eligible_members_and_url_health() {
         let configs = serde_json::from_value(json!([
             {"client_group":"manual", "type":"selector", "default":"tcp", "client_chains":[
