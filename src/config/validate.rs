@@ -687,7 +687,7 @@ fn resolve_client_groups_topologically(
             }
             super::composition::expand(&mut chain.hops, &resolved)?;
             for hop in chain.hops.iter_mut() {
-                prepend_origin(hop, &name, &label);
+                prepend_origin(hop, &name, &label)?;
                 nodes = nodes.saturating_add(super::composition::measure(hop, 0)?.0);
                 if nodes > super::composition::MAX_NODES {
                     return Err(super::composition::invalid(
@@ -717,35 +717,16 @@ fn resolve_client_groups_topologically(
     Ok(resolved)
 }
 
-fn prepend_origin(hop: &mut ClientChainHop, group: &str, member: &str) {
+fn prepend_origin(hop: &mut ClientChainHop, group: &str, member: &str) -> std::io::Result<()> {
     if group == "direct" {
-        return;
+        return Ok(());
     }
-    match hop {
-        ClientChainHop::Choice(choice) => {
-            for chain in &mut choice.members {
-                for hop in chain.hops.iter_mut() {
-                    prepend_origin(hop, group, member);
-                }
-            }
+    super::client_visit::visit_hop_clients(hop, &mut |client| {
+        if let Some(origin) = &mut client.control {
+            origin.path.insert(0, (group.to_owned(), member.to_owned()));
         }
-        ClientChainHop::Single(selection) => {
-            if let ConfigSelection::Config(client) = selection
-                && let Some(origin) = &mut client.control
-            {
-                origin.path.insert(0, (group.to_owned(), member.to_owned()));
-            }
-        }
-        ClientChainHop::Pool(pool) => {
-            for selection in pool.iter_mut() {
-                if let ConfigSelection::Config(client) = selection
-                    && let Some(origin) = &mut client.control
-                {
-                    origin.path.insert(0, (group.to_owned(), member.to_owned()));
-                }
-            }
-        }
-    }
+        Ok(())
+    })
 }
 
 fn collect_hop_dependencies(hop: &ClientChainHop, dependencies: &mut Vec<String>) {

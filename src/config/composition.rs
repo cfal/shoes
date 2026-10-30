@@ -343,6 +343,41 @@ mod tests {
         assert_eq!(measure(named.hops.iter().next().unwrap(), 0).unwrap().1, 2);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn group_origins_do_not_enter_wireguard_carriers_or_include_builtin_direct() {
+        let mut wireguard = crate::wireguard::test_support::client(51820);
+        wireguard["client_chains"][0]["name"] = json!("tunnel");
+        wireguard["client_chains"][0]["protocol"]["peer_client_chain"] = json!("carrier");
+        let validated = validate(json!([
+            {"client_group":"carrier","type":"selector","client_chains":["direct"]},
+            wireguard,
+            {"client_group":"out","type":"selector","client_chains":["wg","direct"]},
+            {"address":"127.0.0.1:0","protocol":{"type":"socks"},
+             "rules":[{"mask":"0.0.0.0/0","action":"allow","client_chain":"out"}]}
+        ]))
+        .unwrap();
+        let hop = route(&validated).hops.iter().next().unwrap();
+        let leaves: Vec<_> = clients(hop).collect();
+        assert_eq!(
+            leaves[0].control.as_ref().unwrap().path,
+            [("out".into(), "wg".into()), ("wg".into(), "tunnel".into())]
+        );
+        assert_eq!(
+            leaves[1].control.as_ref().unwrap().path,
+            [("out".into(), "DIRECT".into())]
+        );
+        let super::super::ClientProxyConfig::Wireguard(config) = &leaves[0].protocol else {
+            panic!()
+        };
+        let carrier = config.peer_client_chain.as_ref().unwrap();
+        let leaf = clients(carrier.hops.iter().next().unwrap()).next().unwrap();
+        assert_eq!(
+            leaf.control.as_ref().unwrap().path,
+            [("carrier".into(), "DIRECT".into())]
+        );
+    }
+
     #[test]
     fn group_chain_wrappers_are_strict_and_selector_labels_are_explicit() {
         for members in [
