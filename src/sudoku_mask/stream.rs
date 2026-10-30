@@ -373,6 +373,14 @@ mod tests {
         out
     }
 
+    fn decode_wire(wire: &[u8], role: Role) -> Vec<u8> {
+        let mut decoder = Decoder::new(super::super::tests::config(json!({})), role);
+        wire.iter()
+            .filter_map(|byte| decoder.decode_byte(*byte).transpose())
+            .collect::<io::Result<_>>()
+            .unwrap()
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum Operation {
         Write,
@@ -483,16 +491,7 @@ mod tests {
                     readiness.wake();
                     assert_eq!(reader.0.load(Ordering::Relaxed), 1);
                     assert_eq!(writer.0.load(Ordering::Relaxed), 1);
-                    let mut decoder =
-                        Decoder::new(super::super::tests::config(json!({})), peer_role);
-                    let decoded: Vec<_> = state
-                        .lock()
-                        .unwrap()
-                        .sent
-                        .iter()
-                        .filter_map(|b| decoder.decode_byte(*b).transpose())
-                        .collect::<io::Result<_>>()
-                        .unwrap();
+                    let decoded = decode_wire(&state.lock().unwrap().sent, peer_role);
                     assert_eq!(
                         decoded,
                         if matches!(operation, Operation::Write | Operation::WriteVectored) {
@@ -600,14 +599,7 @@ mod tests {
             Poll::Ready(Err(_))
         ));
         let state = state.lock().unwrap();
-        let mut decoder = Decoder::new(super::super::tests::config(json!({})), Role::Server);
-        let bytes: Vec<_> = state
-            .sent
-            .iter()
-            .filter_map(|b| decoder.decode_byte(*b).transpose())
-            .collect::<io::Result<_>>()
-            .unwrap();
-        assert_eq!(bytes, b"onetwothreefour");
+        assert_eq!(decode_wire(&state.sent, Role::Server), b"onetwothreefour");
         assert_eq!(state.events, ["ping", "flush", "shutdown"]);
         assert_eq!(
             (stream.read_wire.len(), stream.write_wire.len()),
@@ -698,14 +690,7 @@ mod tests {
                 Poll::Ready(Ok(()))
             ));
             let state = state.lock().unwrap();
-            let mut decoder = Decoder::new(super::super::tests::config(json!({})), Role::Client);
-            let decoded: Vec<_> = state
-                .sent
-                .iter()
-                .filter_map(|b| decoder.decode_byte(*b).transpose())
-                .collect::<io::Result<_>>()
-                .unwrap();
-            assert_eq!(decoded, b"one");
+            assert_eq!(decode_wire(&state.sent, Role::Client), b"one");
         }
     }
 

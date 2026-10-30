@@ -177,9 +177,7 @@ mod tests {
                             .write_all(&connection_success_response.unwrap())
                             .await
                             .unwrap();
-                        if need_initial_flush {
-                            stream.flush().await.unwrap();
-                        }
+                        stream.flush().await.unwrap();
                     };
                     tokio::join!(connect, accept);
                 })
@@ -241,9 +239,7 @@ mod tests {
                                     .write_all(&connection_success_response.unwrap())
                                     .await
                                     .unwrap();
-                                if need_initial_flush {
-                                    stream.flush().await.unwrap();
-                                }
+                                stream.flush().await.unwrap();
                             }
                             TcpServerSetupResult::BidirectionalUdp {
                                 mut stream,
@@ -252,13 +248,11 @@ mod tests {
                             } => {
                                 assert_eq!(command, 2);
                                 assert!(need_initial_flush);
-                                if need_initial_flush {
-                                    futures::future::poll_fn(|cx| {
-                                        Pin::new(&mut stream).poll_flush_message(cx)
-                                    })
-                                    .await
-                                    .unwrap();
-                                }
+                                futures::future::poll_fn(|cx| {
+                                    Pin::new(&mut stream).poll_flush_message(cx)
+                                })
+                                .await
+                                .unwrap();
                             }
                             TcpServerSetupResult::SessionBasedUdp {
                                 mut stream,
@@ -267,13 +261,11 @@ mod tests {
                             } => {
                                 assert_eq!(command, 3);
                                 assert!(need_initial_flush);
-                                if need_initial_flush {
-                                    futures::future::poll_fn(|cx| {
-                                        Pin::new(&mut stream).poll_flush_message(cx)
-                                    })
-                                    .await
-                                    .unwrap();
-                                }
+                                futures::future::poll_fn(|cx| {
+                                    Pin::new(&mut stream).poll_flush_message(cx)
+                                })
+                                .await
+                                .unwrap();
                             }
                             TcpServerSetupResult::Session(_) => assert!(session),
                             _ => panic!("unexpected setup result"),

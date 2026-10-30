@@ -197,10 +197,8 @@ mod tests {
         {
             let order: Vec<u16> =
                 serde_json::from_value(vectors[index + 6]["order"].clone()).unwrap();
-            assert_eq!(Mapping::new(password).forward.as_slice(), &order[..256]);
-        }
-        for password in ["", "example", "not-for-logs", " test password "] {
             let mapping = Mapping::new(password);
+            assert_eq!(mapping.forward.as_slice(), &order[..256]);
             assert_eq!(mapping.inverse.iter().filter(|b| **b == 256).count(), 32);
             for (byte, grid) in mapping.forward.iter().enumerate() {
                 assert_eq!(mapping.inverse[*grid as usize] as usize, byte);
