@@ -224,9 +224,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 {
                     // Send VLESS success response before spawning h2mux session
                     write_all(&mut server_stream, SERVER_RESPONSE_HEADER).await?;
-                    if self.encryption.is_some() {
-                        server_stream.flush().await?;
-                    }
+                    server_stream.flush().await?;
 
                     let proxy_selector = self.proxy_selector.clone();
                     let resolver = self.resolver.clone();
@@ -567,6 +565,33 @@ mod tests {
                 b"GET / HTTP/1.1\r\nHost: front.example\r\n\r\n".to_vec(),
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn h2mux_response_is_flushed_before_session_handoff() {
+        use crate::async_stream::test_streams::FlushGatedStream;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (server_io, mut client) = tokio::io::duplex(4096);
+            let mut request = vec![0];
+            request.extend_from_slice(&parse_uuid(USER_ID).unwrap());
+            request.extend_from_slice(&[0, COMMAND_TCP]);
+            request.extend_from_slice(&MUX_DESTINATION_PORT.to_be_bytes());
+            request.extend_from_slice(&[2, MUX_DESTINATION_HOST.len() as u8]);
+            request.extend_from_slice(MUX_DESTINATION_HOST.as_bytes());
+            client.write_all(&request).await.unwrap();
+
+            let setup = handler(None)
+                .setup_server_stream(Box::new(FlushGatedStream::new(server_io)))
+                .await
+                .unwrap();
+            assert!(matches!(setup, TcpServerSetupResult::Session(_)));
+            let mut response = [0; 2];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, SERVER_RESPONSE_HEADER);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

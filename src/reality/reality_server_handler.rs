@@ -193,7 +193,7 @@ pub async fn setup_reality_server_stream(
         tls_stream.negotiated_group()
     );
 
-    match &target.inner_protocol {
+    let mut setup_result = match &target.inner_protocol {
         InnerProtocol::Normal(handler) => handler.setup_server_stream(Box::new(tls_stream)).await,
         InnerProtocol::VisionVless(vision_cfg) => {
             crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
@@ -215,7 +215,9 @@ pub async fn setup_reality_server_stream(
             )
             .await
         }
-    }
+    }?;
+    setup_result.set_need_initial_flush(true);
+    Ok(setup_result)
 }
 
 struct TargetFlight {
