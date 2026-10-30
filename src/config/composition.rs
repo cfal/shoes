@@ -32,6 +32,15 @@ pub(crate) fn clients(hop: &ClientChainHop) -> Box<dyn Iterator<Item = &ClientCo
     }
 }
 
+pub(crate) fn pool_choice(members: Vec<ClientChain>) -> ClientChainHop {
+    ClientChainHop::Choice(Box::new(super::ClientChoice {
+        name: String::new(),
+        group_type: GroupType::RoundRobin,
+        labels: (0..members.len()).map(|index| index.to_string()).collect(),
+        members,
+    }))
+}
+
 pub(crate) fn expand(hops: &mut OneOrSome<ClientChainHop>, groups: &Groups) -> io::Result<()> {
     fn member(
         selection: &ConfigSelection<ClientConfig>,
@@ -87,12 +96,7 @@ pub(crate) fn expand(hops: &mut OneOrSome<ClientChainHop>, groups: &Groups) -> i
                         hops: OneOrSome::One(member(selection, groups)?),
                     });
                 }
-                ClientChainHop::Choice(Box::new(super::ClientChoice {
-                    name: String::new(),
-                    group_type: GroupType::RoundRobin,
-                    labels: (0..members.len()).map(|index| index.to_string()).collect(),
-                    members,
-                }))
+                pool_choice(members)
             }
             ClientChainHop::Choice(_) => continue,
         };

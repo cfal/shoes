@@ -41,7 +41,7 @@ pub(crate) struct Composition {
     root: Node,
     selection: Option<Arc<SelectionView>>,
     checked: Vec<CheckedPath>,
-    contexts: std::sync::OnceLock<HashMap<usize, Arc<Context>>>,
+    contexts: HashMap<usize, Arc<Context>>,
     standalone: bool,
 }
 
@@ -99,20 +99,14 @@ impl Composition {
             });
         let mut ordinal = 0;
         let root = sequence(hops, true, &resolver, limits, &mut ordinal)?;
-        let mut result = Self {
-            root,
-            selection,
-            checked: Vec::new(),
-            contexts: Default::default(),
-            standalone,
-        };
-        if result.root.has_fallback() {
-            if result.selection.is_none() {
+        let mut checked = Vec::new();
+        if root.has_fallback() {
+            if selection.is_none() {
                 return Err(crate::config::composition::invalid(
                     "fallback requires a prepared selection view",
                 ));
             }
-            let paths = result.root.paths()?;
+            let paths = root.paths()?;
             for (leaves, decisions) in paths {
                 let configs: Vec<Vec<_>> = leaves
                     .iter()
@@ -124,40 +118,36 @@ impl Composition {
                     .into_iter()
                     .flat_map(|path| path.checks)
                     .collect();
-                result.checked.push(CheckedPath {
+                checked.push(CheckedPath {
                     leaves,
                     decisions,
                     checks,
                 });
             }
         }
-        let result = Arc::new(result);
-        let mut contexts = HashMap::new();
-        if !standalone && let Some(view) = &result.selection {
-            let choices = view.snapshot();
-            let mut definitions = Vec::new();
-            result.root.context_definitions(&[], &[], &mut definitions);
-            for mut definition in definitions {
-                result
-                    .root
-                    .dependencies(&definition.ancestors, &mut definition.dependencies);
-                let id = definition.occurrence;
-                let context = Context::new(
-                    definition,
-                    Arc::downgrade(&result),
-                    resolver.clone(),
-                    &choices,
-                );
-                contexts.insert(id, context);
+        let mut registered = Vec::new();
+        let result = Arc::new_cyclic(|owner| {
+            let mut contexts = HashMap::new();
+            if !standalone && selection.is_some() {
+                let mut definitions = Vec::new();
+                root.context_definitions(&[], &[], &mut definitions);
+                for mut definition in definitions {
+                    root.dependencies(&definition.ancestors, &mut definition.dependencies);
+                    let id = definition.occurrence;
+                    let context = Context::new(definition, owner.clone(), resolver.clone());
+                    // Definitions follow occurrence order, which breaks admission ties.
+                    registered.push(context.clone());
+                    contexts.insert(id, context);
+                }
             }
-        }
-        let mut registered: Vec<_> = contexts.iter().collect();
-        registered.sort_by_key(|(id, _)| **id);
-        let registered: Vec<_> = registered
-            .into_iter()
-            .map(|(_, context)| context.clone())
-            .collect();
-        result.contexts.set(contexts).ok().unwrap();
+            Self {
+                root,
+                selection,
+                checked,
+                contexts,
+                standalone,
+            }
+        });
         if let Some(view) = &result.selection {
             view.register_contexts(&registered)?;
         }
@@ -249,9 +239,7 @@ impl Composition {
         let mut leaves = Vec::new();
         let mut context = Selection {
             choices,
-            contexts: self.contexts.get().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::WouldBlock, "route is being prepared")
-            })?,
+            contexts: &self.contexts,
             standalone: self
                 .selection
                 .as_ref()
@@ -286,10 +274,8 @@ impl Composition {
         if crate::control::url_test::is_background() {
             return;
         }
-        if let Some(contexts) = self.contexts.get() {
-            for context in contexts.values() {
-                context.touch(false);
-            }
+        for context in self.contexts.values() {
+            context.touch(false);
         }
         self.root.record_demand(self.selection.as_deref());
     }
@@ -298,7 +284,7 @@ impl Composition {
 #[cfg(test)]
 impl Composition {
     pub(super) fn test_contexts(&self) -> Vec<Arc<Context>> {
-        self.contexts.get().unwrap().values().cloned().collect()
+        self.contexts.values().cloned().collect()
     }
     fn test_pools(&self) -> Vec<Vec<Arc<Leaf>>> {
         fn collect(node: &Node, start: usize, pools: &mut Vec<Vec<Arc<Leaf>>>) -> usize {
@@ -401,12 +387,12 @@ fn node(
         ),
         ClientChainHop::Single(ConfigSelection::Config(config)) => {
             let (initial, proxy, udp) = if first {
+                let mut initial_config = config.clone();
+                initial_config.control = None;
                 let chain = crate::tcp::chain_builder::build_client_proxy_chain_with_limits(
-                    OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config({
-                        let mut c = config.clone();
-                        c.control = None;
-                        c
-                    }))),
+                    OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                        initial_config,
+                    ))),
                     resolver.clone(),
                     limits,
                 )?;
@@ -429,20 +415,14 @@ fn node(
             })))
         }
         ClientChainHop::Pool(pool) => node(
-            ClientChainHop::Choice(Box::new(crate::config::ClientChoice {
-                name: String::new(),
-                group_type: GroupType::RoundRobin,
-                labels: (0..pool.iter().count())
-                    .map(|index| index.to_string())
-                    .collect(),
-                members: pool
-                    .into_vec()
+            crate::config::composition::pool_choice(
+                pool.into_vec()
                     .into_iter()
                     .map(|selection| crate::config::ClientChain {
                         hops: OneOrSome::One(ClientChainHop::Single(selection)),
                     })
                     .collect(),
-            })),
+            ),
             first,
             resolver,
             limits,
@@ -1042,11 +1022,26 @@ mod tests {
     }
 
     #[test]
+    fn automatic_contexts_register_in_occurrence_order() {
+        let (chain, catalog) =
+            super::super::health_tests::build(automatic_config(), json!(vec!["auto"; 8]));
+        let tree = chain.composition.as_ref().unwrap();
+        let mut contexts: Vec<_> = tree.contexts.iter().collect();
+        contexts.sort_by_key(|(id, _)| **id);
+        let registered = catalog.selection.contexts.snapshot();
+        assert_eq!(registered.len(), 8);
+        assert_eq!(registered.len(), contexts.len());
+        for (registered, (_, context)) in registered.iter().zip(&contexts) {
+            assert!(Arc::ptr_eq(registered, context));
+        }
+    }
+
+    #[test]
     fn repeated_automatic_occurrences_and_standalone_samples_are_isolated() {
         let (chain, catalog) =
             super::super::health_tests::build(automatic_config(), json!(["auto", "auto"]));
         let tree = chain.composition.as_ref().unwrap();
-        let mut contexts: Vec<_> = tree.contexts.get().unwrap().iter().collect();
+        let mut contexts: Vec<_> = tree.contexts.iter().collect();
         contexts.sort_by_key(|(id, _)| **id);
         contexts[0].1.record(1, 0, Some(1));
         contexts[1].1.record(0, 0, Some(1));
