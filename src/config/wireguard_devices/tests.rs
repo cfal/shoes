@@ -613,6 +613,44 @@ fn copied_clients_share_with_equivalent_carrier_socket_defaults() {
 }
 
 #[test]
+fn carrier_mtu_checks_single_hop_choice_members() {
+    use crate::config::ClientChain;
+    use crate::option_util::OneOrSome;
+
+    for mtu in [1359, 1360] {
+        let mut carrier = client();
+        carrier["protocol"]["mtu"] = json!(mtu);
+        let single: ClientChain = serde_json::from_value(json!([carrier])).unwrap();
+        let multiple: ClientChain = serde_json::from_value(json!([
+            carrier,
+            {"address":"192.0.2.1:1080", "protocol":{"type":"socks"}}
+        ]))
+        .unwrap();
+        let choice = ClientChain {
+            hops: OneOrSome::One(super::super::composition::pool_choice(vec![
+                multiple.clone(),
+                single,
+            ])),
+        };
+        let result = validate_carrier_chain_mtu(&choice, 1280);
+        if mtu < 1360 {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "WireGuard peer_client_chain requires carrier MTU >= 1360"
+            );
+        } else {
+            result.unwrap();
+        }
+        let choice = ClientChain {
+            hops: OneOrSome::One(super::super::composition::pool_choice(vec![multiple])),
+        };
+        validate_carrier_chain_mtu(&choice, 1280).unwrap();
+    }
+}
+
+#[test]
 fn copied_clients_share_local_addresses_with_different_prefix_lengths() {
     let mut second = client();
     second["protocol"]["addresses"] = json!(["10.77.0.2/24", "fd77::2/64"]);
