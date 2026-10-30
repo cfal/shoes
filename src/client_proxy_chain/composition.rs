@@ -1,15 +1,16 @@
 use super::*;
 use crate::config::{ClientChainHop, ClientConfig, ConfigSelection, GlobalLimits, GroupType};
 use crate::control::health::{Health, ProbeJob};
-use crate::control::selection::{Choices, SelectionView};
+use crate::control::selection::{Choices, ManualSelectorPath, SelectionView};
 use crate::control::url_test::context::{Context, Definition};
 use crate::option_util::OneOrSome;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 
 struct Leaf {
     config: ClientConfig,
+    dependencies: Vec<ManualSelectorPath>,
     initial: Option<Arc<InitialHopEntry>>,
     proxy: Option<Arc<dyn ProxyConnector>>,
     udp: bool,
@@ -132,7 +133,9 @@ impl Composition {
                 let mut definitions = Vec::new();
                 root.context_definitions(&[], &[], &mut definitions);
                 for mut definition in definitions {
-                    root.dependencies(&definition.ancestors, &mut definition.dependencies);
+                    let mut dependencies = BTreeSet::new();
+                    root.dependencies(&definition.ancestors, &mut dependencies);
+                    definition.dependencies = dependencies.into_iter().cloned().collect();
                     let id = definition.occurrence;
                     let context = Context::new(definition, owner.clone(), resolver.clone());
                     // Definitions follow occurrence order, which breaks admission ties.
@@ -408,6 +411,7 @@ fn node(
                 (None, Some(proxy), udp)
             };
             Ok(Node::Client(Arc::new(Leaf {
+                dependencies: crate::control::catalog::client_selector_paths(&config),
                 config,
                 initial,
                 proxy,
@@ -725,14 +729,14 @@ impl Node {
         }
     }
 
-    fn dependencies(
-        &self,
+    fn dependencies<'a>(
+        &'a self,
         forced: &[(usize, usize)],
-        paths: &mut Vec<crate::control::selection::ManualSelectorPath>,
+        paths: &mut BTreeSet<&'a ManualSelectorPath>,
     ) {
         match self {
             Self::Client(leaf) => {
-                paths.extend(crate::control::catalog::client_selector_paths(&leaf.config));
+                paths.extend(&leaf.dependencies);
             }
             Self::Sequence(nodes) => {
                 for node in nodes {

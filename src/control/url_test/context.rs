@@ -117,6 +117,8 @@ impl Context {
     ) -> Arc<Self> {
         let mut dependencies = definition.dependencies;
         dependencies.extend(resolver.manual_selector_paths());
+        dependencies.sort_unstable();
+        dependencies.dedup();
         let members = definition.labels;
         Arc::new(Self {
             name: definition.name,
@@ -220,5 +222,50 @@ impl Context {
 
     pub(crate) fn attempted(&self, member: usize) {
         self.attempts.lock()[member] = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_selector_dependencies_store_only_distinct_paths() {
+        let configs = serde_json::from_value(serde_json::json!([
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
+             "client_chains":[
+                {"name":"a", "address":"192.0.2.1:80", "protocol":{"type":"http"}},
+                {"name":"b", "address":"192.0.2.2:80", "protocol":{"type":"http"}}
+             ]},
+            {"client_group":"wide", "client_chains":vec!["auto"; 8]},
+            {"client_group":"left", "type":"selector", "client_chains":["wide"]},
+            {"client_group":"right", "type":"selector", "client_chains":["wide"]},
+            {"client_group":"route", "client_chains":[{"chain":["left", "right"]}]},
+            {"client_group":"outer", "type":"url-test", "url":"http://probe.invalid/",
+             "client_chains":["route"]}
+        ]))
+        .unwrap();
+        let catalog = crate::config::create_server_configs(configs)
+            .unwrap()
+            .catalog
+            .unwrap();
+        let _chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
+            catalog.route("route").unwrap().hops,
+            Arc::new(crate::resolver::NativeResolver::new()),
+        )
+        .unwrap();
+        let expected = vec![
+            vec![("left".into(), "wide".into())],
+            vec![("right".into(), "wide".into())],
+        ];
+        let contexts = catalog.selection.contexts.snapshot();
+        assert_eq!(contexts.len(), 16);
+        for context in contexts {
+            assert_eq!(context.dependencies, expected);
+        }
+        assert_eq!(
+            *catalog.selection.automatic.0["outer"].dependencies.lock(),
+            expected
+        );
     }
 }
