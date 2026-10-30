@@ -17,11 +17,12 @@ use crate::xudp::message_stream::MAX_XUDP_ROUTES;
 #[tokio::test]
 async fn fake_unknown_and_blocked_routes_recover_without_poisoning_wire_cache() {
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
-    use crate::dns::fake_ip::{FakeDnsContext, FakeIpOptions};
+    use crate::dns::DnsContext;
+    use crate::dns::fake_ip::FakeIpOptions;
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let context = Arc::new(
-        FakeDnsContext::new(
+        DnsContext::new(
             FakeIpOptions {
                 ipv4_range: Some("198.18.0.0/29".into()),
                 max_entries: 1,

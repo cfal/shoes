@@ -180,3 +180,227 @@ fn check_dry_run_validates_all_files_without_forwarding_or_state_writes() {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_check_requires_literal_listener_addresses() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("managed.yaml");
+    let example = include_str!("../../../examples/tun_desktop.yaml");
+    let unix = serde_yaml::to_string(&serde_json::json!([{
+        "clash_api_path": directory.path().join("api.sock"),
+        "secret": "test",
+    }]))
+    .unwrap();
+    for mode in ["check", "--dry-run"] {
+        for (listener, valid) in [
+            ("", true),
+            (
+                "- address: 'localhost:1080'\n  protocol: {type: socks}\n",
+                false,
+            ),
+            (
+                "- addresses: ['127.0.0.1:1080', 'localhost:1081']\n  protocol: {type: socks}\n",
+                false,
+            ),
+            (
+                "- clash_api_address: 'localhost:9090'\n  secret: test\n",
+                false,
+            ),
+            (
+                "- addresses: ['127.0.0.1:1080-1081', '[::1]:1080', '[fe80::1%2]:1080']\n  protocol: {type: socks}\n",
+                true,
+            ),
+            (
+                "- clash_api_address: '127.0.0.1:9090'\n  secret: test\n",
+                true,
+            ),
+            (unix.as_str(), true),
+        ] {
+            std::fs::write(&path, format!("{example}\n{listener}")).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(if valid { 0 } else { 1 }),
+                "{listener}: {diagnostic}"
+            );
+            if !valid {
+                assert!(
+                    diagnostic.contains("managed TUN requires literal listener addresses"),
+                    "{diagnostic}"
+                );
+                std::fs::write(&path, listener).unwrap();
+                let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                    .args([mode, "-t", "1"])
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "manual listeners must still accept hostnames"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires sudo and util-linux; isolates cleanup dispatch from host networking"]
+fn check_dry_run_does_not_dispatch_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cleanup-tun");
+    for mode in ["check", "--dry-run"] {
+        for (config, expected) in [
+            (
+                "- address: '127.0.0.1:12345'\n  protocol: {type: socks}\n",
+                0,
+            ),
+            ("invalid configuration", 1),
+        ] {
+            std::fs::write(&path, config).unwrap();
+            let output = Command::new("sudo")
+                .current_dir(directory.path())
+                .args([
+                    "-n", "--", "unshare", "--net", "--mount", "--propagation", "private",
+                    "--", "/bin/sh", "-ec",
+                    "mount -t tmpfs -o size=1m,mode=755 tmpfs /run\nstatus=0\n\"$@\" || status=$?\ntest ! -e /run/shoes || exit 99\nexit \"$status\"",
+                    "sh",
+                    env!("CARGO_BIN_EXE_shoes"), mode, "-t", "1", "cleanup-tun",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn config_pipe_writer(path: &Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(writer) => break writer,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("open configuration pipe: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("configuration reader did not open the pipe")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn check_dry_run_keeps_default_signal_actions() {
+    use std::os::unix::{ffi::OsStrExt, process::ExitStatusExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("blocked.yaml");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    for mode in ["check", "--dry-run"] {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut process = super::Process::from_child(child);
+            process.wait_for("Starting dry run.").await;
+            // Opening the writer proves validation reached the blocking configuration read.
+            let writer = config_pipe_writer(&path).await;
+            process.signal(signal);
+            assert_eq!(process.exit().await.signal(), Some(signal), "{mode}");
+            drop(writer);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_reads_configuration_once_and_remains_interruptible() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("startup.yaml");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    for signal in [Some(libc::SIGINT), Some(libc::SIGTERM), None] {
+        let mut process = super::Process::start(&path, &["--no-reload"]);
+        let mut writer = config_pipe_writer(&path).await;
+        if let Some(signal) = signal {
+            process.signal(signal);
+            assert!(process.exit().await.success());
+            drop(writer);
+        } else {
+            writer
+                .write_all(b"- address: '127.0.0.1:0'\n  protocol: {type: socks}\n")
+                .unwrap();
+            drop(writer);
+            process.wait_for("Servers ready").await;
+            process.signal(libc::SIGTERM);
+            assert!(process.exit().await.success());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_keeps_configuration_changes_queued_during_initial_read() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("server.yaml");
+    std::fs::write(
+        &config,
+        "- address: '127.0.0.1:0'\n  protocol: {type: socks}\n",
+    )
+    .unwrap();
+    let pipe = directory.path().join("blocked.yaml");
+    let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut process = super::Process::start(&pipe, &[config.to_str().unwrap()]);
+    let mut writer = config_pipe_writer(&pipe).await;
+
+    // The second read holds startup open after the first config has been loaded.
+    std::fs::write(&config, "invalid configuration").unwrap();
+    writer.write_all(b"[]\n").unwrap();
+    let replacement = directory.path().join("replacement.yaml");
+    std::fs::write(&replacement, "[]\n").unwrap();
+    std::fs::rename(&replacement, &pipe).unwrap();
+    drop(writer);
+
+    process.wait_for("Servers ready").await;
+    process.wait_for("Reload rejected").await;
+    process.signal(libc::SIGTERM);
+    assert!(process.exit().await.success());
+}

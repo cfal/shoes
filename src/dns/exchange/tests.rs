@@ -163,11 +163,9 @@ async fn fake_dns_raw_forwarding_over_verified_tls_preserves_and_guards_answers(
             }
             stopped.await.unwrap();
         }));
-        let context = crate::dns::fake_ip::FakeDnsContext::new(
-            Default::default(),
-            Arc::new(Encrypted(Arc::new(raw))),
-        )
-        .unwrap();
+        let context =
+            crate::dns::DnsContext::new(Default::default(), Arc::new(Encrypted(Arc::new(raw))))
+                .unwrap();
         for tcp in [false, true] {
             for (index, (name, kind, expected)) in [
                 ("synth.example.", RecordType::A, ResponseCode::NoError),

@@ -42,6 +42,7 @@ pub const PACKET_QUEUE_CAPACITY: usize = 64;
 
 /// Tracks socket info including addresses for proper cleanup.
 struct SocketInfo {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     control: Arc<TcpConnectionControl>,
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
@@ -80,6 +81,7 @@ pub struct NewTcpConnection {
 }
 
 struct StackChannels {
+    admission: Option<Arc<tokio::sync::Semaphore>>,
     udp: Sender<PacketBuffer>,
     tcp: mpsc::UnboundedSender<NewTcpConnection>,
     ready: oneshot::Sender<()>,
@@ -134,18 +136,19 @@ impl TcpStackDirect {
 
     #[cfg(test)]
     pub fn with_config(tun_fd: OwnedFd, config: TunServerConfig) -> io::Result<Self> {
-        Self::with_offload(tun_fd, config, false)
+        Self::with_offload(tun_fd, config, false, None)
     }
 
     pub fn with_offload(
         tun_fd: OwnedFd,
         config: TunServerConfig,
         offload: bool,
+        admission: Option<Arc<tokio::sync::Semaphore>>,
     ) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
         set_nonblocking(fd)?;
         let (wake, wake_rx) = Wake::new()?;
-        Self::start(tun_fd, config, wake, wake_rx, offload)
+        Self::start(tun_fd, config, wake, wake_rx, offload, admission)
     }
 
     fn start(
@@ -154,6 +157,7 @@ impl TcpStackDirect {
         wake: Wake,
         wake_rx: WakeReceiver,
         offload: bool,
+        admission: Option<Arc<tokio::sync::Semaphore>>,
     ) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
         let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
@@ -180,6 +184,7 @@ impl TcpStackDirect {
                             device,
                             config,
                             StackChannels {
+                                admission,
                                 udp: udp_tx,
                                 tcp: tcp_tx,
                                 ready: ready_tx,
@@ -481,6 +486,7 @@ fn run_direct_stack_thread(
     mut wake_rx: WakeReceiver,
 ) -> io::Result<()> {
     let StackChannels {
+        admission,
         udp: udp_tx,
         tcp: tcp_tx,
         ready,
@@ -608,6 +614,13 @@ fn run_direct_stack_thread(
                     {
                         continue;
                     }
+                    let permit = match &admission {
+                        Some(admission) => match admission.clone().try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => continue,
+                        },
+                        None => None,
+                    };
                     create_tcp_connection(
                         src,
                         dst,
@@ -615,7 +628,7 @@ fn run_direct_stack_thread(
                         &stack_wake,
                         limits.tcp_buffer_size,
                     )
-                    .map(|connection| (src, dst, connection))
+                    .map(|connection| (src, dst, connection, permit))
                 }
                 _ => None,
             };
@@ -624,7 +637,7 @@ fn run_direct_stack_thread(
             if let Some(error) = device.tx_error.take() {
                 return Err(error);
             }
-            if let Some((src_addr, dst_addr, incoming)) = incoming {
+            if let Some((src_addr, dst_addr, incoming, permit)) = incoming {
                 let handle = incoming.handle;
                 // Admission follows smoltcp's TCP flag and option validation.
                 if socket_set.get::<TcpSocket>(handle).state() != TcpState::SynReceived {
@@ -634,6 +647,7 @@ fn run_direct_stack_thread(
                 sockets.insert(
                     handle,
                     SocketInfo {
+                        _permit: permit,
                         control: incoming.control,
                         src_addr,
                         dst_addr,

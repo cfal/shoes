@@ -87,9 +87,8 @@ async fn queued_fake_dns_writes_continue_polling_delayed_replies() {
             })
         }
     }
-    let context = Arc::new(
-        crate::dns::fake_ip::FakeDnsContext::new(Default::default(), Arc::new(DelayedDns)).unwrap(),
-    );
+    let context =
+        Arc::new(crate::dns::DnsContext::new(Default::default(), Arc::new(DelayedDns)).unwrap());
     let budget = Arc::new(Budget::new(Some(4096)));
     let slots = Arc::new(Budget::new(Some(1)));
     let (tx, rx) = mpsc::channel(8);

@@ -231,6 +231,7 @@ pub async fn start_from_config(
 
     let mut validated = crate::config::compile_configs(configs).await?;
     validated.validate_ffi_support()?;
+    crate::dns::check_interception(&validated.configs, &validated.dns_groups).await?;
     let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
@@ -245,9 +246,17 @@ pub async fn start_from_config(
 
     // Build DNS registry from expanded groups
     let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated_configs).collect();
-    let mut dns_registry =
-        build_dns_registry_for_runtime(dns_groups, global_limits, None, &synthetic_endpoints)
-            .await?;
+    let protect_tun_endpoints = validated_configs
+        .iter()
+        .any(|config| matches!(config, Config::TunServer(tun) if tun.dns_hijack == Some(true)));
+    let mut dns_registry = build_dns_registry_for_runtime(
+        dns_groups,
+        global_limits,
+        None,
+        &synthetic_endpoints,
+        protect_tun_endpoints,
+    )
+    .await?;
     let dns_snapshots = dns_registry.snapshot_task();
 
     // Separate TUN config from server configs, validate exactly one TUN with device_fd

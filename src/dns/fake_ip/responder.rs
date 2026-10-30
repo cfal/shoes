@@ -7,7 +7,7 @@ use hickory_resolver::proto::rr::{DNSClass, RData, Record, RecordType, rdata};
 
 use super::pool::canonical_hostname;
 use super::{FakeIpOptions, FakeIpPool, HttpsRecords, MissingFamily};
-pub(super) use crate::dns::message::UDP_PAYLOAD_LIMIT;
+use crate::dns::message::UDP_PAYLOAD_LIMIT;
 
 pub const SYNTHETIC_TTL: u32 = 60;
 
@@ -20,7 +20,7 @@ pub enum DnsDecision {
 
 #[derive(Debug)]
 pub struct FakeDnsResponder {
-    pub(super) pool: Arc<FakeIpPool>,
+    pub(in crate::dns) pool: Arc<FakeIpPool>,
     options: FakeIpOptions,
 }
 
@@ -31,28 +31,8 @@ impl FakeDnsResponder {
     }
 
     pub fn decide(&self, request: &Message) -> DnsDecision {
-        if request.metadata.message_type != MessageType::Query {
-            return DnsDecision::Drop;
-        }
-        if request.metadata.op_code != OpCode::Query {
-            return DnsDecision::Answer(response(request, ResponseCode::Refused));
-        }
-        // Upstream handles may rewrite IDs and wire encoding; signatures cannot survive that.
-        if crate::dns::message::is_signed(request) {
-            return DnsDecision::Answer(response(request, ResponseCode::Refused));
-        }
-        if request.queries.len() != 1 {
-            return DnsDecision::Answer(response(request, ResponseCode::FormErr));
-        }
-        if request.version() != 0 {
-            return DnsDecision::Answer(response(request, ResponseCode::BADVERS));
-        }
-        if request
-            .queries
-            .iter()
-            .any(|q| matches!(q.query_type, RecordType::AXFR | RecordType::IXFR))
-        {
-            return DnsDecision::Answer(response(request, ResponseCode::Refused));
+        if let Some(decision) = precheck(request) {
+            return decision;
         }
         if !request.answers.is_empty()
             || !request.authorities.is_empty()
@@ -112,7 +92,30 @@ impl FakeDnsResponder {
     }
 }
 
-pub(super) fn response(request: &Message, code: ResponseCode) -> Message {
+pub(in crate::dns) fn precheck(request: &Message) -> Option<DnsDecision> {
+    if request.metadata.message_type != MessageType::Query {
+        return Some(DnsDecision::Drop);
+    }
+    let code =
+        if request.metadata.op_code != OpCode::Query || crate::dns::message::is_signed(request) {
+            // Upstream handles rewrite IDs and wire encoding; signatures cannot survive that.
+            ResponseCode::Refused
+        } else if request.queries.len() != 1 {
+            ResponseCode::FormErr
+        } else if request.version() != 0 {
+            ResponseCode::BADVERS
+        } else if matches!(
+            request.queries[0].query_type,
+            RecordType::AXFR | RecordType::IXFR
+        ) {
+            ResponseCode::Refused
+        } else {
+            return None;
+        };
+    Some(DnsDecision::Answer(response(request, code)))
+}
+
+pub(in crate::dns) fn response(request: &Message, code: ResponseCode) -> Message {
     let mut response = Message::error_msg(request.metadata.id, request.metadata.op_code, code);
     response.queries.clone_from(&request.queries);
     response.metadata.recursion_desired = request.metadata.recursion_desired;

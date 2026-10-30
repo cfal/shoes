@@ -190,8 +190,7 @@ async fn unknown_fake_destinations_send_error_synack_then_fin() {
         timeout(Duration::from_secs(5), async {
             let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
             let context = Arc::new(
-                crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
-                    .unwrap(),
+                crate::dns::DnsContext::new(Default::default(), resolver.clone()).unwrap(),
             );
             let selector =
                 ClientProxySelector::new(vec![crate::client_proxy_selector::ConnectRule::new(

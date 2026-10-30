@@ -107,6 +107,8 @@ class ReleaseNoticesTests(unittest.TestCase):
                 "src/polyfill/once_cell/LICENSE-MIT", "third_party/fiat/LICENSE",
             ],
             "h3": ["../LICENSE"], "h3-quinn": ["../LICENSE"],
+            "netlink-packet-core": ["LICENSE-MIT"], "netlink-proto": ["LICENSE-MIT"],
+            "netlink-sys": ["LICENSE-MIT"], "rtnetlink": ["LICENSE-MIT"],
         }
         for package in metadata["packages"]:
             if (package["name"], "v" + package["version"]) not in production:

@@ -15,7 +15,7 @@
 //! - **iOS**: Requires a file descriptor from `NEPacketTunnelProvider.packetFlow`.
 //!   Use `packet_information: true` if using the socket FD directly.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,28 @@ use super::common::default_true;
 use super::dns::DnsConfig;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinuxTunOptions {
+    pub table: u32,
+    pub rule_priority: u32,
+    pub capture_mark: u32,
+    pub bypass_mark: u32,
+    pub mark_mask: u32,
+}
+
+impl Default for LinuxTunOptions {
+    fn default() -> Self {
+        Self {
+            table: 12000,
+            rule_priority: 12000,
+            capture_mark: 0x20000000,
+            bypass_mark: 0x40000000,
+            mark_mask: 0x60000000,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -161,6 +183,28 @@ fn default_mtu() -> u16 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunConfig {
+    #[serde(default, skip_serializing_if = "super::common::is_false")]
+    pub auto_route: bool,
+    #[serde(default, skip_serializing_if = "super::common::is_false")]
+    pub auto_redirect: bool,
+    /// Defaults to true in managed mode. False leaves host resolver settings untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_dns: Option<bool>,
+    /// Dual-stack interface CIDRs for managed mode, separate from manual device configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<ipnetwork::IpNetwork>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_address: Vec<ipnetwork::IpNetwork>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_exclude_address: Vec<ipnetwork::IpNetwork>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bootstrap_dns: Vec<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux: Option<LinuxTunOptions>,
+    /// Intercepts captured TCP/UDP DNS independently of synthetic addressing.
+    /// Omitted follows the selected fake-IP policy for unmanaged TUNs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_hijack: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "super::common::is_false")]
@@ -233,4 +277,33 @@ pub struct TunConfig {
     /// Can reference a dns_group by name or specify inline DNS servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsConfig>,
+}
+
+impl TunConfig {
+    pub(crate) fn has_managed_options(&self) -> bool {
+        self.auto_route
+            || self.auto_redirect
+            || self.auto_dns.is_some()
+            || self.linux.is_some()
+            || !self.addresses.is_empty()
+            || !self.bootstrap_dns.is_empty()
+            || !self.route_address.is_empty()
+            || !self.route_exclude_address.is_empty()
+    }
+
+    pub(crate) fn virtual_dns_addresses(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.addresses
+            .iter()
+            .filter(|_| self.auto_route && (self.auto_dns.unwrap_or(true) || self.auto_redirect))
+            .filter_map(|network| next_ip_address(network.ip()))
+    }
+}
+
+pub(crate) fn next_ip_address(address: IpAddr) -> Option<IpAddr> {
+    match address {
+        IpAddr::V4(ip) => u32::from(ip).checked_add(1).map(|ip| IpAddr::V4(ip.into())),
+        IpAddr::V6(ip) => u128::from(ip)
+            .checked_add(1)
+            .map(|ip| IpAddr::V6(ip.into())),
+    }
 }

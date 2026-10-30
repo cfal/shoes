@@ -10,8 +10,11 @@
 //! TCP-based protocols (tcp://, tls://, https://) support routing through
 //! proxy chains via the ProxyRuntimeProvider.
 
+#[cfg(target_os = "linux")]
+mod bootstrap;
 mod builder;
 mod composite_resolver;
+mod context;
 mod exchange;
 pub mod fake_ip;
 mod guard;
@@ -19,7 +22,13 @@ mod hickory_resolver;
 mod message;
 mod parsed;
 mod proxy_runtime;
+mod stream;
 mod system;
+
+#[cfg(target_os = "linux")]
+pub(crate) use bootstrap::controlled as controlled_bootstrap;
+pub(crate) use builder::check_interception;
+pub use context::{DnsContext, FakeDnsResolver};
 
 pub(crate) use guard::{SyntheticDnsAnswer, real_only};
 

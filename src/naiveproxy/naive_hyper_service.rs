@@ -736,7 +736,7 @@ mod sniff_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
             let context = Arc::new(
-                crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
+                crate::dns::DnsContext::new(Default::default(), resolver.clone())
                     .unwrap(),
             );
             let known = context.allocate("known.example", false).unwrap();

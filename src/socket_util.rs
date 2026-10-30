@@ -30,6 +30,7 @@ pub fn new_hostname_udp_socket(
     let socket = prefer_ipv6_socket(|ipv6| {
         new_socket2_udp_socket(ipv6, None, Some(get_unspecified_socket_addr(ipv6)), false)
     })?;
+    crate::socket_policy::apply(socket2::SockRef::from(&socket), bind_interface.as_deref())?;
     bind_udp_interface(&socket, bind_interface.as_deref())?;
     #[cfg(any(target_os = "android", target_os = "ios", all(unix, feature = "ffi")))]
     crate::tun::protect_socket(socket.as_raw_fd())?;
@@ -114,6 +115,7 @@ pub fn new_socket2_udp_socket_with_buffer_size(
 ) -> std::io::Result<socket2::Socket> {
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    crate::socket_policy::apply(socket2::SockRef::from(&socket), bind_interface.as_deref())?;
 
     if is_ipv6 {
         socket.set_only_v6(false)?;
@@ -197,6 +199,10 @@ pub fn new_tcp_socket(
     } else {
         tokio::net::TcpSocket::new_v4()?
     };
+    crate::socket_policy::apply(
+        socket2::SockRef::from(&tcp_socket),
+        bind_interface.as_deref(),
+    )?;
     #[cfg(any(target_os = "android", target_os = "ios", all(unix, feature = "ffi")))]
     crate::tun::protect_socket(tcp_socket.as_raw_fd())?;
 
@@ -252,8 +258,10 @@ pub fn new_tcp_listener(
         Domain::IPV4
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    crate::socket_policy::apply(socket2::SockRef::from(&socket), bind_interface.as_deref())?;
 
     socket.set_nonblocking(true)?;
+    #[cfg(not(windows))]
     socket.set_reuse_address(true)?;
 
     if let Some(ref interface) = bind_interface {

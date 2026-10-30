@@ -208,13 +208,18 @@ impl HickoryResolver {
         )
     }
 
-    fn build_with_ns_configs(
+    pub(super) fn build_with_ns_configs(
         ns_configs: Vec<NameServerConfig>,
         chain_group: Arc<ClientChainGroup>,
         bootstrap: Arc<dyn ShoesResolver>,
         options: HickoryResolverOptions,
         description: String,
     ) -> std::io::Result<Self> {
+        if chain_group.may_connect_directly() {
+            for server in &ns_configs {
+                crate::socket_policy::check_dns_endpoint(server.ip)?;
+            }
+        }
         let config = ResolverConfig::from_parts(None, vec![], ns_configs.clone());
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, bootstrap, options.connect_timeout)

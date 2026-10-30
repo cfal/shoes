@@ -1,0 +1,13 @@
+# Linux desktop capture. Requires nft and, with auto_dns, systemd-resolved,
+# and busctl. Run through the supplied systemd service.
+# DIRECT is intentional here; replace rules with the desired proxy chains.
+- device_name: shoes0
+  auto_route: true
+  auto_redirect: true
+  auto_dns: true
+  addresses: [10.233.0.1/30, 'fd73:686f:6573::1/126']
+  bootstrap_dns: ['1.1.1.1:53', '9.9.9.9:53']
+  dns_hijack: true
+  dns:
+    servers: ['udp://1.1.1.1', 'tcp://1.1.1.1']
+  rules: allow-all-direct

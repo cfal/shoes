@@ -37,6 +37,10 @@ fn print_usage_and_exit(arg0: String) -> ! {
     eprintln!("COMMANDS:");
     eprintln!("    check <config.yaml>                            Validate configuration and exit");
     eprintln!("    version                                        Print version information");
+    #[cfg(target_os = "linux")]
+    eprintln!(
+        "    cleanup-tun                                    Recover owned managed-TUN state in this network namespace"
+    );
     eprintln!("    SIGHUP reloads configuration even with --no-reload.");
     eprintln!("    SIGINT/SIGTERM stop listeners and exit without waiting for TCP reload drains.");
     eprintln!(
@@ -306,7 +310,14 @@ fn run() -> i32 {
         .build()
         .expect("Could not build tokio runtime");
 
-    let code = match runtime.block_on(process::run(args, dry_run, no_reload)) {
+    let result = runtime.block_on(async {
+        #[cfg(target_os = "linux")]
+        if !dry_run && args.len() == 1 && args[0] == "cleanup-tun" {
+            return crate::desktop::cleanup().await;
+        }
+        process::run(args, dry_run, no_reload).await
+    });
+    let code = match result {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("shoes: {error}");

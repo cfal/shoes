@@ -229,6 +229,7 @@ async fn disabling_and_removing_contexts_retains_real_only_guards() {
         crate::resources::limits(),
         None,
         &["10.99.0.1".parse().unwrap()],
+        false,
     )
     .await
     .unwrap();
@@ -274,11 +275,36 @@ async fn literal_upstreams_cannot_target_tun_endpoints_outside_the_pool() {
             crate::resources::limits(),
             None,
             &[endpoint.parse().unwrap()],
+            false,
         )
         .await
         .err()
         .unwrap();
         assert_eq!(failure.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
+
+#[tokio::test]
+async fn real_only_tun_endpoints_are_guarded_only_when_intercepting() {
+    for intercept in [false, true] {
+        let mut groups = fake_groups(false);
+        groups[0].specs = vec![make_spec("udp://10.99.0.1:53")];
+        let result = build_dns_registry_for_runtime(
+            groups,
+            crate::resources::limits(),
+            None,
+            &["10.99.0.1".parse().unwrap()],
+            intercept,
+        )
+        .await;
+        if intercept {
+            assert_eq!(
+                result.err().unwrap().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        } else {
+            assert!(result.unwrap().forbidden_ranges().is_empty());
+        }
     }
 }
 

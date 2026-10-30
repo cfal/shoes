@@ -1101,6 +1101,63 @@ async fn test_tun_config_parsing() {
     assert!(result.is_ok(), "TUN config validation failed: {:?}", result);
 }
 
+#[test]
+fn tun_dns_interception_override_roundtrips() {
+    for value in [None, Some(false), Some(true)] {
+        let mut yaml = serde_json::json!({"device_fd":42});
+        if let Some(value) = value {
+            yaml["dns_hijack"] = value.into();
+        }
+        let tun: TunConfig = serde_json::from_value(yaml).unwrap();
+        assert_eq!(tun.dns_hijack, value);
+        let restored: TunConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&tun).unwrap()).unwrap();
+        assert_eq!(restored.dns_hijack, value);
+    }
+}
+
+#[test]
+fn tun_managed_options_distinguish_absent_and_disabled_settings() {
+    let manual = serde_json::json!({
+        "device_fd": 42,
+        "auto_route": false,
+        "auto_redirect": false,
+        "dns_hijack": true,
+    });
+    let tun: TunConfig = serde_json::from_value(manual.clone()).unwrap();
+    assert!(!tun.has_managed_options());
+    for (field, value) in [
+        ("auto_route", serde_json::json!(true)),
+        ("auto_redirect", serde_json::json!(true)),
+        ("auto_dns", serde_json::json!(false)),
+        ("linux", serde_json::json!({})),
+        ("addresses", serde_json::json!(["10.233.0.1/30"])),
+        ("bootstrap_dns", serde_json::json!(["192.0.2.53:53"])),
+        ("route_address", serde_json::json!(["0.0.0.0/0"])),
+        ("route_exclude_address", serde_json::json!(["192.0.2.0/24"])),
+    ] {
+        let mut config = manual.clone();
+        config[field] = value;
+        let tun: TunConfig = serde_json::from_value(config).unwrap();
+        assert!(tun.has_managed_options(), "{field}");
+    }
+}
+
+#[test]
+fn tun_adjacent_dns_addresses_preserve_family_and_check_overflow() {
+    for (address, next) in [
+        ("10.233.0.1", Some("10.233.0.2")),
+        ("fd73::1", Some("fd73::2")),
+        ("255.255.255.255", None),
+        ("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", None),
+    ] {
+        assert_eq!(
+            crate::config::tun::next_ip_address(address.parse().unwrap()),
+            next.map(|address| address.parse().unwrap()),
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_tun_config_with_device_fd() {
     let yaml = r#"
@@ -1151,6 +1208,15 @@ async fn test_tun_config_defaults() {
 async fn test_tun_icmp_requires_tcp() {
     // ICMP requires TCP to be enabled
     let tun_config = TunConfig {
+        auto_route: false,
+        auto_redirect: false,
+        auto_dns: None,
+        addresses: Vec::new(),
+        route_address: Vec::new(),
+        route_exclude_address: Vec::new(),
+        bootstrap_dns: Vec::new(),
+        linux: None,
+        dns_hijack: None,
         name: None,
         sniff: false,
         segmentation_offload: None,

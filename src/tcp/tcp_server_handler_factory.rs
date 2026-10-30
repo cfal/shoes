@@ -767,10 +767,10 @@ mod tests {
         use crate::address::{NetLocation, NetLocationMask};
         use crate::client_proxy_selector::IngressTarget;
         use crate::config::RuleActionConfig;
-        use crate::dns::fake_ip::FakeDnsContext;
+        use crate::dns::DnsContext;
 
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-        let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+        let context = Arc::new(DnsContext::new(Default::default(), resolver.clone()).unwrap());
         let parent = Arc::new(
             ClientProxySelector::new(vec![])
                 .with_sniff(true)

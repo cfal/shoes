@@ -671,6 +671,8 @@ Package: ctutils 0.4.6
 Repository: https://github.com/RustCrypto/utils
 Package: lru-slab 0.1.3
 Repository: https://github.com/Ralith/lru-slab
+Package: nftables 0.6.3
+Repository: https://github.com/nftables-rs/nftables-rs
 Package: tinyvec 1.13.3
 Repository: https://github.com/Lokathor/tinyvec
 Package: utf8_iter 1.0.4
@@ -5492,6 +5494,8 @@ Package: hashbrown 0.17.1
 Repository: https://github.com/rust-lang/hashbrown
 Package: heapless 0.9.3
 Repository: https://github.com/rust-embedded/heapless
+Package: heck 0.5.0
+Repository: https://github.com/withoutboats/heck
 Package: httparse 1.10.1
 Repository: https://github.com/seanmonstar/httparse
 Package: idna 1.1.0
@@ -8297,6 +8301,8 @@ Package: constant_time_eq 0.4.2
 Repository: https://github.com/cesarb/constant_time_eq
 Package: dunce 1.0.5
 Repository: https://gitlab.com/kornelski/dunce
+Package: dyn-clone 1.0.20
+Repository: https://github.com/dtolnay/dyn-clone
 Package: etherparse 0.21.0
 Repository: https://github.com/JulianSchmid/etherparse
 Package: fiat-crypto 0.2.9
@@ -8347,6 +8353,10 @@ Package: rand_chacha 0.9.0
 Repository: https://github.com/rust-random/rand
 Package: rcgen 0.14.10
 Repository: https://github.com/rustls/rcgen
+Package: ref-cast-impl 1.0.27
+Repository: https://github.com/dtolnay/ref-cast
+Package: ref-cast 1.0.27
+Repository: https://github.com/dtolnay/ref-cast
 Package: rustc-hash 2.1.3
 Repository: https://github.com/rust-lang/rustc-hash
 Package: rustls-platform-verifier-android 0.2.0
@@ -8363,8 +8373,12 @@ Package: serde_core 1.0.229
 Repository: https://github.com/serde-rs/serde
 Package: serde_derive 1.0.229
 Repository: https://github.com/serde-rs/serde
+Package: serde_derive_internals 0.30.0
+Repository: https://github.com/serde-rs/serde
 Package: serde_json 1.0.154
 Repository: https://github.com/serde-rs/json
+Package: serde_path_to_error 0.1.20
+Repository: https://github.com/dtolnay/path-to-error
 Package: serde_yaml 0.9.34+deprecated
 Repository: https://github.com/dtolnay/serde-yaml
 Package: shlex 2.0.1
@@ -11018,12 +11032,70 @@ SOFTWARE.
 
 
 License: MIT License (MIT)
+Package: schemars 1.2.3
+Repository: https://github.com/GREsau/schemars
+Package: schemars_derive 1.2.3
+Repository: https://github.com/GREsau/schemars
+
+MIT License
+
+Copyright (c) 2019 Graham Esau
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+License: MIT License (MIT)
 Package: ruzstd 0.9.1
 Repository: https://github.com/KillingSpark/zstd-rs
 
 MIT License
 
 Copyright (c) 2019 Moritz Borcherding
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+License: MIT License (MIT)
+Package: strum 0.27.2
+Repository: https://github.com/Peternator7/strum
+Package: strum_macros 0.27.2
+Repository: https://github.com/Peternator7/strum
+
+MIT License
+
+Copyright (c) 2019 Peter Glotfelty
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -11231,6 +11303,66 @@ DEALINGS IN THE SOFTWARE.
 
 
 License: MIT License (MIT)
+Package: netlink-packet-core 0.9.0
+Repository: https://github.com/rust-netlink/netlink-packet-core
+Package: netlink-proto 0.13.0
+Repository: https://github.com/rust-netlink/netlink-proto
+Package: netlink-sys 0.9.0
+Repository: https://github.com/rust-netlink/netlink-sys
+Package: rtnetlink 0.23.0
+Repository: https://github.com/rust-netlink/rtnetlink
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+Distributions of all or part of the Software intended to be used by the
+recipients as they would use the unmodified Software, containing modifications
+that substantially alter, remove, or disable functionality of the Software,
+outside of the documented configuration mechanisms provided by the Software,
+shall be modified such that the Original Author's bug reporting email addresses
+and urls are either replaced with the contact information of the parties
+responsible for the changes, or removed entirely.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+License: MIT License (MIT)
+Package: netlink-packet-route 0.33.0
+Repository: https://github.com/rust-netlink/netlink-packet-route
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+License: MIT License (MIT)
 Package: aho-corasick 1.1.5
 Repository: https://github.com/BurntSushi/aho-corasick
 Package: byteorder 1.5.0
@@ -11265,6 +11397,8 @@ THE SOFTWARE.
 
 License: MIT License (MIT)
 Package: nix 0.31.3
+Repository: https://github.com/nix-rust/nix
+Package: nix 0.30.1
 Repository: https://github.com/nix-rust/nix
 
 The MIT License (MIT)

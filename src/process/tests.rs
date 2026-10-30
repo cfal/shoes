@@ -1,5 +1,13 @@
 use super::*;
 
+async fn load_validated(
+    paths: &[String],
+    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
+) -> io::Result<ValidatedConfigs> {
+    let configs = config::load_configs(&paths.to_vec()).await?;
+    validate_configs(paths, configs, discovered).await
+}
+
 #[tokio::test]
 async fn validation_errors_preserve_io_kind_and_file_context() {
     let directory = tempfile::tempdir().unwrap();

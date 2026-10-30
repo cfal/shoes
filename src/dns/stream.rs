@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use hickory_resolver::proto::op::{Header, ResponseCode};
+use hickory_resolver::proto::serialize::binary::{BinDecodable, BinDecoder};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::task::JoinHandle;
 
@@ -13,14 +15,14 @@ use crate::async_stream::{
     AsyncStream, AsyncWriteMessage,
 };
 
-use super::FakeDnsContext;
+use super::DnsContext;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 type Exchange = Pin<Box<dyn Future<Output = io::Result<Option<Vec<u8>>>> + Send>>;
 
 pub(super) struct UdpDnsStream {
-    context: Arc<FakeDnsContext>,
+    context: Arc<DnsContext>,
     exchange: Option<Exchange>,
     reader: Option<Waker>,
     writer: Option<Waker>,
@@ -28,7 +30,7 @@ pub(super) struct UdpDnsStream {
 }
 
 impl UdpDnsStream {
-    pub fn new(context: Arc<FakeDnsContext>) -> Self {
+    pub fn new(context: Arc<DnsContext>) -> Self {
         Self {
             context,
             exchange: None,
@@ -71,6 +73,12 @@ impl AsyncReadMessage for UdpDnsStream {
                         io::ErrorKind::InvalidInput,
                         "DNS reply buffer too small",
                     )));
+                }
+                // Empty-question probes must release UDP admission after their local error reply.
+                if Header::read(&mut BinDecoder::new(&bytes)).is_ok_and(|header| {
+                    header.counts.queries == 0 && header.response_code == ResponseCode::FormErr
+                }) {
+                    self.closed = true;
                 }
                 buf.put_slice(&bytes);
                 Poll::Ready(Ok(()))
@@ -152,7 +160,7 @@ pub(super) struct TcpDnsStream {
 }
 
 impl TcpDnsStream {
-    pub fn new(context: Arc<FakeDnsContext>) -> Self {
+    pub fn new(context: Arc<DnsContext>) -> Self {
         let (stream, mut peer) = tokio::io::duplex(16 * 1024);
         let task = tokio::spawn(async move {
             let _ = serve_tcp(&mut peer, context).await;
@@ -161,7 +169,7 @@ impl TcpDnsStream {
     }
 }
 
-async fn serve_tcp(peer: &mut DuplexStream, context: Arc<FakeDnsContext>) -> io::Result<()> {
+async fn serve_tcp(peer: &mut DuplexStream, context: Arc<DnsContext>) -> io::Result<()> {
     loop {
         let length = tokio::time::timeout(IDLE_TIMEOUT, peer.read_u16()).await?? as usize;
         if length == 0 {

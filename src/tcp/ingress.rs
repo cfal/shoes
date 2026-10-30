@@ -34,7 +34,7 @@ pub(crate) struct TcpRoute<'a> {
 }
 
 enum TcpRouteTarget<'a> {
-    LocalDns(Arc<crate::dns::fake_ip::FakeDnsContext>),
+    LocalDns(Arc<crate::dns::DnsContext>),
     Forward(ConnectDecision<'a>),
 }
 

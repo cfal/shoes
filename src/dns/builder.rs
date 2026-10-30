@@ -6,7 +6,8 @@ use std::time::Duration;
 use ipnetwork::IpNetwork;
 use rustc_hash::FxHashMap;
 
-use super::fake_ip::{FakeDnsContext, FakeDnsResolver, FakeIpOptions, FakeIpPool};
+use super::context::{DnsContext, FakeDnsResolver};
+use super::fake_ip::{FakeIpOptions, FakeIpPool};
 use super::real_only;
 use super::system::SystemResolver;
 use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
@@ -20,6 +21,44 @@ use crate::resolver::{
     ResolverFactory, TimeoutResolver,
 };
 use crate::tcp::chain_builder::{build_client_chain_group_with_limits, build_direct_chain_group};
+
+pub(crate) async fn check_interception(
+    configs: &[crate::config::Config],
+    groups: &[ExpandedDnsGroup],
+) -> std::io::Result<()> {
+    let mut forbidden: Vec<IpNetwork> = groups
+        .iter()
+        .filter_map(|group| group.fake_ip.as_ref())
+        .flat_map(|options| options.ipv4_range.iter().chain(options.ipv6_range.iter()))
+        .map(|range| range.parse().map_err(std::io::Error::other))
+        .collect::<std::io::Result<_>>()?;
+    forbidden.extend(
+        crate::config::tun_endpoint_ips(configs).map(|ip| IpNetwork::from(ip.to_canonical())),
+    );
+    let forbidden: Arc<[IpNetwork]> = forbidden.into();
+    for config in configs {
+        let crate::config::Config::TunServer(tun) = config else {
+            continue;
+        };
+        if tun.dns_hijack != Some(true) {
+            continue;
+        }
+        let uses_system = match tun.dns.as_ref().and_then(DnsConfig::resolved_group) {
+            None => true,
+            Some(name) => groups
+                .iter()
+                .find(|group| group.name == name)
+                .is_some_and(|group| {
+                    group.use_default_resolver
+                        || group.specs.iter().any(|spec| spec.url == "system")
+                }),
+        };
+        if uses_system {
+            SystemResolver::check_configuration(forbidden.clone()).await?;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct PoolState {
@@ -657,7 +696,7 @@ pub async fn build_dns_registry_reusing(
     limits: GlobalLimits,
     previous: Option<&DnsRegistry>,
 ) -> std::io::Result<DnsRegistry> {
-    build_dns_registry_for_runtime(groups, limits, previous, &[]).await
+    build_dns_registry_for_runtime(groups, limits, previous, &[], false).await
 }
 
 pub async fn build_dns_registry_for_runtime(
@@ -665,6 +704,7 @@ pub async fn build_dns_registry_for_runtime(
     limits: GlobalLimits,
     previous: Option<&DnsRegistry>,
     synthetic_endpoints: &[std::net::IpAddr],
+    protect_tun_endpoints: bool,
 ) -> std::io::Result<DnsRegistry> {
     let active_options = groups.iter().filter_map(|group| group.fake_ip.as_ref());
     let retained_options = previous
@@ -686,7 +726,7 @@ pub async fn build_dns_registry_for_runtime(
             }
         }
     }
-    if !forbidden.is_empty() {
+    if !forbidden.is_empty() || protect_tun_endpoints {
         for endpoint in synthetic_endpoints {
             let range = IpNetwork::from(endpoint.to_canonical());
             if !forbidden.contains(&range) {
@@ -768,7 +808,7 @@ pub async fn build_dns_registry_for_runtime(
                     pool: pool.clone(),
                 },
             );
-            let context = Arc::new(FakeDnsContext::with_pool(options, real.clone(), pool)?);
+            let context = Arc::new(DnsContext::with_pool(options, real.clone(), pool)?);
             Arc::new(FakeDnsResolver::new(real, context))
         } else {
             if old.is_some() {

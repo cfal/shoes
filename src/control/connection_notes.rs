@@ -186,7 +186,7 @@ impl Resolver for NotedResolver {
         })
     }
 
-    fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
+    fn fake_dns_context(&self) -> Option<Arc<crate::dns::DnsContext>> {
         self.inner.fake_dns_context()
     }
 
@@ -254,9 +254,9 @@ mod tests {
 
     #[tokio::test]
     async fn connection_notes_resolver_forwards_without_retaining_buffers() {
-        use crate::dns::fake_ip::FakeDnsContext;
+        use crate::dns::DnsContext;
         struct Fixture {
-            fake_dns: Arc<FakeDnsContext>,
+            fake_dns: Arc<DnsContext>,
             deadline: tokio::time::Instant,
         }
         impl std::fmt::Debug for Fixture {
@@ -279,7 +279,7 @@ mod tests {
                     }
                 })
             }
-            fn fake_dns_context(&self) -> Option<Arc<FakeDnsContext>> {
+            fn fake_dns_context(&self) -> Option<Arc<DnsContext>> {
                 Some(self.fake_dns.clone())
             }
             fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
@@ -295,7 +295,7 @@ mod tests {
             }
         }
         let fake_dns = Arc::new(
-            FakeDnsContext::new(
+            DnsContext::new(
                 Default::default(),
                 Arc::new(crate::resolver::NativeResolver),
             )

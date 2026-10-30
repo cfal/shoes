@@ -260,7 +260,7 @@ async fn prepared_fake_names_survive_recycling_with_and_without_sni() {
     use crate::dns::fake_ip::FakeIpOptions;
     let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
     let context = Arc::new(
-        FakeDnsContext::new(
+        DnsContext::new(
             FakeIpOptions {
                 ipv4_range: Some("198.18.0.0/29".into()),
                 max_entries: 1,
@@ -332,7 +332,7 @@ async fn prepared_fake_names_survive_recycling_with_and_without_sni() {
 async fn fake_dns_sni_bypasses_cached_hostname_rules_without_resolving() {
     let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
     let context = Arc::new(
-        FakeDnsContext::new(
+        DnsContext::new(
             crate::dns::fake_ip::FakeIpOptions {
                 ipv6_range: Some("2001:2::/48".into()),
                 ..Default::default()
@@ -414,8 +414,7 @@ async fn fake_dns_sni_ip_rules_resolve_only_the_restored_target_in_rule_order() 
             } else {
                 Arc::new(NoDns)
             };
-            let context =
-                Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+            let context = Arc::new(DnsContext::new(Default::default(), resolver.clone()).unwrap());
             let mut rules = vec![
                 block_rule(vec!["127.0.0.0/8"]),
                 allow_rule(vec!["sniff.example"]),
@@ -474,7 +473,7 @@ async fn supplied_hostnames_remain_ineligible_for_sniffing() {
 
 #[test]
 fn domain_encoded_ips_restore_without_changing_wire_identity() {
-    let context = Arc::new(FakeDnsContext::new(Default::default(), Arc::new(NoDns)).unwrap());
+    let context = Arc::new(DnsContext::new(Default::default(), Arc::new(NoDns)).unwrap());
     let selector = ClientProxySelector::new(vec![])
         .with_fake_dns_context(Some(context.clone()))
         .unwrap();
@@ -528,7 +527,7 @@ fn domain_encoded_ips_restore_without_changing_wire_identity() {
 #[tokio::test]
 async fn preparation_precedes_dns_dispatch_and_nested_rule_gates() {
     let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
-    let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+    let context = Arc::new(DnsContext::new(Default::default(), resolver.clone()).unwrap());
     let parent = ClientProxySelector::new(vec![allow_rule(vec!["parent.example"])])
         .with_sniff(true)
         .with_fake_dns_context(Some(context.clone()))
@@ -568,6 +567,54 @@ async fn preparation_precedes_dns_dispatch_and_nested_rule_gates() {
             .with_fake_dns_context(Some(context))
             .is_err()
     );
+}
+
+#[test]
+fn dns_interception_is_independent_and_inherited_without_reenabling_it() {
+    let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+    let context = Arc::new(DnsContext::new(Default::default(), resolver.clone()).unwrap());
+    let fake = context.allocate("restored.example", false).unwrap();
+    let wire = NetLocation::from_ip_addr("192.0.2.53".parse().unwrap(), 53);
+    for synthesis in [false, true] {
+        for enabled in [false, true] {
+            let parent = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"])])
+                .with_fake_dns_context(synthesis.then(|| context.clone()))
+                .unwrap()
+                .with_dns_interception(resolver.clone(), enabled);
+            let child = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"])])
+                .inherit_inbound_policy(&parent)
+                .unwrap();
+            for selector in [&parent, &child] {
+                assert_eq!(
+                    matches!(
+                        selector.prepare(wire.clone().into()).unwrap(),
+                        IngressTarget::LocalDns { .. }
+                    ),
+                    enabled
+                );
+                if synthesis {
+                    for port in [53, 443] {
+                        if port == 53 && enabled {
+                            continue;
+                        }
+                        let IngressTarget::Forward(target) = selector
+                            .prepare(NetLocation::from_ip_addr(fake, port).into())
+                            .unwrap()
+                        else {
+                            panic!()
+                        };
+                        assert!(target.is_fake_dns());
+                    }
+                }
+            }
+            if enabled {
+                assert!(Arc::ptr_eq(
+                    parent.dns_interception.as_ref().unwrap(),
+                    child.dns_interception.as_ref().unwrap()
+                ));
+            }
+        }
+    }
 }
 
 #[tokio::test]

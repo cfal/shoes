@@ -143,7 +143,7 @@ hyper-tungstenite = "0.30.0"
 memory-stats = "1.2.0"
 indexmap = "*"
 instant-acme = { version = "=0.8.5", default-features = false, features = ["aws-lc-rs", "rcgen", "time", "x509-parser"] }
-ipnetwork = "0.21"
+ipnetwork = { version = "0.21", features = ["serde"] }
 libc = "*"
 log = { version = "*", features = ["std", "release_max_level_info"] }
 lru = "*"
@@ -170,13 +170,14 @@ serde_json = { version = "*", features = ["preserve_order"] }
 serde_yaml = "*"
 shake = "*"
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "segmentation-offload"] }
-socket2 = "*"
+socket2 = { version = "*", features = ["all"] }
 subtle = "*"
 tokio = { version = "*", features = [
     "fs",
     "io-util",
     "macros",
     "net",
+    "process",
     "rt-multi-thread",
     "signal",
     "sync",
@@ -198,6 +199,10 @@ tokio-rustls = "*"
 
 [target.'cfg(unix)'.dependencies]
 gotatun = { version = "*", default-features = false, features = ["device", "aws-lc-rs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.23"
+nftables = "0.6.3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 hickory-resolver = { version = "*", default-features = false, features = ["system-config"] }

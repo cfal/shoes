@@ -139,7 +139,8 @@ mod tests {
 
     #[tokio::test]
     async fn service_binding_hints_obey_global_and_context_address_guards() {
-        use crate::dns::fake_ip::{FakeDnsContext, FakeIpOptions};
+        use crate::dns::DnsContext;
+        use crate::dns::fake_ip::FakeIpOptions;
         use hickory_resolver::proto::{
             op::{Message, Query, ResponseCode},
             rr::{Name, RecordType},
@@ -174,7 +175,7 @@ mod tests {
                     ipv6_range: Some("2001:2::/48".into()),
                     ..Default::default()
                 };
-                let context = FakeDnsContext::new(options, reply.clone()).unwrap();
+                let context = DnsContext::new(options, reply.clone()).unwrap();
                 let response = context
                     .exchange(bytes.clone(), true)
                     .await

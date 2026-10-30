@@ -28,6 +28,9 @@ pub(super) struct SystemResolver {
 
 impl SystemResolver {
     pub(super) async fn check_configuration(forbidden: Arc<[IpNetwork]>) -> io::Result<()> {
+        if crate::socket_policy::bootstrap().is_some() {
+            return Ok(());
+        }
         tokio::task::spawn_blocking(move || {
             let (mut config, _) = discover()?;
             filter_endpoints(&mut config, &forbidden)
@@ -49,6 +52,12 @@ impl SystemResolver {
         request: Vec<u8>,
         deadline: Option<tokio::time::Instant>,
     ) -> DnsExchangeFuture {
+        if let Some(bootstrap) = crate::socket_policy::bootstrap() {
+            return match deadline {
+                Some(deadline) => bootstrap.exchange_with_deadline(request, deadline),
+                None => bootstrap.exchange(request),
+            };
+        }
         let snapshot = self.snapshot.clone();
         let forbidden = self.forbidden.clone();
         let lookup = self.lookup.clone();

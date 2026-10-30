@@ -22,6 +22,8 @@ jobs:
     - name: Check kernel test prerequisites
       run: |
         sudo -n true
+        sudo apt-get update
+        sudo apt-get install -y nftables
         test -c /dev/net/tun
         command -v ip
         ip -j -6 address show dev lo | jq --exit-status 'any(.[].addr_info[]; .local == "::1")'
@@ -42,3 +44,14 @@ jobs:
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --features privileged-tests
         --test privileged tun_kernel:: --verbose -- --test-threads=1
+
+    - name: Run managed capture and recovery tests
+      run: |
+        mkdir -p "$RUNNER_TEMP/resolved"
+        (cd "$RUNNER_TEMP/resolved" && apt-get download systemd-resolved)
+        dpkg-deb --extract "$RUNNER_TEMP"/resolved/*.deb "$RUNNER_TEMP/resolved/root"
+        SHOES_RESOLVED_ROOT="$RUNNER_TEMP/resolved/root/usr" .github/require-tests.sh cargo test -p shoes --locked --lib \
+          desktop::linux::tests::managed_kernel_capture_and_cleanup \
+          -- --ignored --nocapture --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --test process_contract \
+          config_tooling::check_dry_run_does_not_dispatch_cleanup -- --ignored --nocapture

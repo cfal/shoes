@@ -15,11 +15,13 @@ use crate::address::NetLocation;
 use crate::async_stream::{AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage};
 use crate::resolver::{DnsExchangeFuture, ResolveFuture, Resolver};
 
-use super::{FakeDnsContext, FakeIpOptions};
+use super::FakeIpOptions;
+use crate::dns::DnsContext;
 
 #[derive(Debug, Default)]
 struct RecordingResolver {
     exchanges: AtomicUsize,
+    positive: bool,
 }
 
 impl Resolver for RecordingResolver {
@@ -29,19 +31,32 @@ impl Resolver for RecordingResolver {
 
     fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
         self.exchanges.fetch_add(1, Ordering::SeqCst);
+        let positive = self.positive;
         Box::pin(async move {
             let mut answer = Message::from_vec(&request)
                 .map_err(io::Error::other)?
                 .into_response();
-            answer.metadata.response_code = ResponseCode::NXDomain;
+            if positive {
+                use hickory_resolver::proto::rr::{RData, Record, rdata};
+                let query = &answer.queries[0];
+                let data = match query.query_type {
+                    RecordType::A => RData::A(rdata::A("192.0.2.7".parse().unwrap())),
+                    RecordType::AAAA => RData::AAAA(rdata::AAAA("2001:db8::7".parse().unwrap())),
+                    RecordType::TXT => RData::TXT(rdata::TXT::new(vec!["unchanged".to_owned()])),
+                    _ => unreachable!(),
+                };
+                answer.add_answer(Record::from_rdata(query.name.clone(), 37, data));
+            } else {
+                answer.metadata.response_code = ResponseCode::NXDomain;
+            }
             answer.to_vec().map_err(io::Error::other)
         })
     }
 }
 
-fn context() -> (Arc<FakeDnsContext>, Arc<RecordingResolver>) {
+fn context() -> (Arc<DnsContext>, Arc<RecordingResolver>) {
     let real = Arc::new(RecordingResolver::default());
-    let context = Arc::new(FakeDnsContext::new(FakeIpOptions::default(), real.clone()).unwrap());
+    let context = Arc::new(DnsContext::new(FakeIpOptions::default(), real.clone()).unwrap());
     (context, real)
 }
 
@@ -56,17 +71,123 @@ fn query(kind: RecordType) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn real_dns_interception_uses_message_exchange_without_synthetic_addresses() {
+    let real = Arc::new(RecordingResolver {
+        positive: true,
+        ..Default::default()
+    });
+    let context = Arc::new(DnsContext::real(real.clone()));
+    assert!(!context.contains("198.18.0.1".parse().unwrap()));
+    assert_eq!(
+        context.restore("198.18.0.1".parse().unwrap()).unwrap(),
+        None
+    );
+    for kind in [RecordType::A, RecordType::AAAA, RecordType::TXT] {
+        for tcp in [false, true] {
+            let reply = context.exchange(query(kind), tcp).await.unwrap().unwrap();
+            let reply = Message::from_vec(&reply).unwrap();
+            assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+            assert_eq!(reply.answers.len(), 1);
+            assert_eq!(reply.answers[0].record_type(), kind);
+            assert_eq!(reply.answers[0].ttl, 37);
+            let data = reply.answers[0].data.to_string();
+            assert_eq!(
+                data,
+                match kind {
+                    RecordType::A => "192.0.2.7",
+                    RecordType::AAAA => "2001:db8::7",
+                    _ => "unchanged",
+                }
+            );
+        }
+    }
+    let mut stream = context.tcp_stream();
+    let request = query(RecordType::A);
+    stream.write_u16(request.len() as u16).await.unwrap();
+    stream.write_all(&request).await.unwrap();
+    let length = stream.read_u16().await.unwrap() as usize;
+    let mut reply = vec![0; length];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(
+        Message::from_vec(&reply).unwrap().metadata.response_code,
+        ResponseCode::NoError
+    );
+    assert_eq!(real.exchanges.load(Ordering::SeqCst), 7);
+}
+
+#[tokio::test]
+async fn real_interception_rejects_unsupported_operations_before_forwarding() {
+    use hickory_resolver::proto::op::{Edns, OpCode};
+    let real = Arc::new(RecordingResolver::default());
+    let context = DnsContext::real(real.clone());
+    let ordinary = Message::from_vec(&query(RecordType::A)).unwrap();
+    let mut cases = Vec::new();
+    for kind in [RecordType::AXFR, RecordType::IXFR] {
+        cases.push((
+            Message::from_vec(&query(kind)).unwrap(),
+            ResponseCode::Refused,
+        ));
+    }
+    let mut message = ordinary.clone();
+    message.metadata.op_code = OpCode::Update;
+    cases.push((message, ResponseCode::Refused));
+    let mut message = ordinary.clone();
+    message.queries.clear();
+    cases.push((message, ResponseCode::FormErr));
+    let mut message = ordinary;
+    message.edns = Some(Edns::new().set_version(1).clone());
+    cases.push((message, ResponseCode::BADVERS));
+    for (request, code) in cases {
+        for tcp in [false, true] {
+            let answer = context
+                .exchange(request.to_vec().unwrap(), tcp)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                u16::from(Message::from_vec(&answer).unwrap().metadata.response_code),
+                u16::from(code)
+            );
+        }
+    }
+    assert_eq!(real.exchanges.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn interception_drops_responses_before_synthesis_or_forwarding() {
+    let real = Arc::new(RecordingResolver::default());
+    for context in [
+        DnsContext::real(real.clone()),
+        DnsContext::new(Default::default(), real.clone()).unwrap(),
+    ] {
+        for tcp in [false, true] {
+            let response = Message::from_vec(&query(RecordType::A))
+                .unwrap()
+                .into_response()
+                .to_vec()
+                .unwrap();
+            assert!(context.exchange(response, tcp).await.unwrap().is_none());
+        }
+    }
+    assert_eq!(real.exchanges.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn signed_requests_are_refused_without_forwarding() {
     use hickory_resolver::proto::rr::{RData, Record, rdata::TSIG, rdata::tsig::TsigAlgorithm};
 
-    for persistent in [false, true] {
+    for (fake, persistent) in [(false, false), (true, false), (true, true)] {
         let directory = tempfile::tempdir().unwrap();
         let options = FakeIpOptions {
             state_file: persistent.then(|| directory.path().join("state.json")),
             ..Default::default()
         };
         let real = Arc::new(RecordingResolver::default());
-        let context = FakeDnsContext::new(options, real.clone()).unwrap();
+        let context = if fake {
+            DnsContext::new(options, real.clone()).unwrap()
+        } else {
+            DnsContext::real(real.clone())
+        };
         for kind in [RecordType::A, RecordType::TXT] {
             let mut request = Message::from_vec(&query(kind)).unwrap();
             request.add_additional(Record::from_rdata(
@@ -222,7 +343,7 @@ async fn truncated_fallback_survives_deadlines_without_bypassing_guards() {
             )),
             vec!["203.0.113.0/24".parse().unwrap()].into(),
         );
-        let context = FakeDnsContext::new(Default::default(), real).unwrap();
+        let context = DnsContext::new(Default::default(), real).unwrap();
         let started = tokio::time::Instant::now();
         let reply = context
             .exchange(query(RecordType::TXT), true)
@@ -257,7 +378,7 @@ async fn persistent_work_waits_for_admission_with_a_deadline() {
         .acquire_many_owned(16)
         .await
         .unwrap();
-    let context = FakeDnsContext::with_pool(
+    let context = DnsContext::with_pool(
         options,
         Arc::new(RecordingResolver::default()),
         pool.clone(),
@@ -335,6 +456,33 @@ async fn context_separates_synthesis_real_exchange_and_malformed_input() {
     );
     context.exchange(query(RecordType::A), false).await.unwrap();
     assert_eq!(real.exchanges.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn empty_question_udp_probe_releases_its_stream_after_reply() {
+    let (context, real) = context();
+    let mut stream = context.udp_stream();
+    let request = Message::query().to_vec().unwrap();
+    std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &request))
+        .await
+        .unwrap();
+    let mut bytes = [0; 512];
+    let mut buffer = tokio::io::ReadBuf::new(&mut bytes);
+    std::future::poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buffer))
+        .await
+        .unwrap();
+    assert_eq!(
+        Message::from_vec(buffer.filled())
+            .unwrap()
+            .metadata
+            .response_code,
+        ResponseCode::FormErr
+    );
+    assert_eq!(real.exchanges.load(Ordering::SeqCst), 0);
+    let error = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buffer))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
 }
 
 #[tokio::test]
@@ -512,7 +660,7 @@ async fn dropping_tcp_peer_cancels_upstream_exchange() {
     }
     let dropped = Arc::new(AtomicUsize::new(0));
     let context = Arc::new(
-        FakeDnsContext::new(FakeIpOptions::default(), Arc::new(Stalled(dropped.clone()))).unwrap(),
+        DnsContext::new(FakeIpOptions::default(), Arc::new(Stalled(dropped.clone()))).unwrap(),
     );
     let mut stream = context.tcp_stream();
     let query = query(RecordType::TXT);
