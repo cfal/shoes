@@ -214,47 +214,13 @@ pub(crate) fn validate(hops: &OneOrSome<ClientChainHop>) -> io::Result<()> {
     }
     let mut nodes = 0usize;
     let mut longest = 0usize;
-    let mut paths = 1usize;
     for hop in hops.iter() {
-        let (count, length, branches) = measure(hop, 0)?;
+        let (count, length, _) = measure(hop, 0)?;
         nodes = nodes.saturating_add(count);
         longest = longest.saturating_add(length);
-        paths = paths.saturating_mul(branches);
     }
     if nodes > MAX_NODES || longest > MAX_HOPS {
         return Err(invalid("client composition exceeds 16384 nodes or 64 hops"));
-    }
-    fn automatic_count(hop: &ClientChainHop) -> usize {
-        match hop {
-            ClientChainHop::Choice(choice) => {
-                usize::from(matches!(choice.group_type, GroupType::UrlTest(_)))
-                    + choice
-                        .members
-                        .iter()
-                        .flat_map(|chain| chain.hops.iter())
-                        .map(automatic_count)
-                        .sum::<usize>()
-            }
-            _ => 0,
-        }
-    }
-    if hops.iter().map(automatic_count).sum::<usize>()
-        > crate::control::url_test::context::MAX_CONTEXTS
-    {
-        return Err(crate::control::health::capacity_error(
-            "URL-test exceeds 1024 route contexts".into(),
-        ));
-    }
-    if hops.iter().flat_map(clients).any(|client| {
-        client
-            .control
-            .as_ref()
-            .is_some_and(crate::control::catalog::MemberOrigin::has_fallback)
-    }) && paths > crate::control::health::MAX_PATHS
-    {
-        return Err(crate::control::health::capacity_error(
-            "fallback exceeds 256 concrete chain paths".into(),
-        ));
     }
     super::health::validate_composition(hops)?;
     walk(hops, 0).map(|_| ())
@@ -458,24 +424,55 @@ mod tests {
 
     #[test]
     fn fixed_aliases_have_the_same_depth_in_forwarding_and_probe_routes() {
-        let mut groups =
-            vec![json!({"client_group":"g0","type":"selector","client_chains":["direct"]})];
-        for index in 1..80 {
-            groups.push(json!({"client_group":format!("g{index}"),"client_chains":[format!("g{}",index-1)]}));
+        for explicit_chain in [false, true] {
+            let mut groups =
+                vec![json!({"client_group":"g0","type":"selector","client_chains":["direct"]})];
+            for index in 1..256 {
+                let previous = format!("g{}", index - 1);
+                let member = if explicit_chain {
+                    json!({"chain":[previous]})
+                } else {
+                    json!(previous)
+                };
+                groups.push(json!({"client_group":format!("g{index}"),"client_chains":[member]}));
+            }
+            let validated = validate(json!(groups)).unwrap();
+            let chain = validated.catalog.unwrap().route("g255").unwrap();
+            super::validate(&chain.hops).unwrap();
+            assert!(direct_only(&chain.hops));
         }
-        let validated = validate(json!(groups)).unwrap();
-        let chain = validated.catalog.unwrap().route("g79").unwrap();
-        super::validate(&chain.hops).unwrap();
-        assert!(direct_only(&chain.hops));
     }
 
     #[test]
-    fn automatic_occurrence_budget_is_checked_before_building_transports() {
-        let members = vec!["auto"; crate::control::url_test::context::MAX_CONTEXTS + 1];
-        let error = validate(json!([
+    fn probe_node_budget_counts_normalized_routes_not_fixed_alias_visits() {
+        let mut groups = vec![json!({"client_group":"g0","client_chains":[proxy("leaf")]})];
+        for index in 1..=16 {
+            groups.push(json!({"client_group":format!("g{index}"),"client_chains":[format!("g{}",index-1)]}));
+        }
+        groups.extend([
+            json!({"client_group":"wide","client_chains":vec!["g16";1024]}),
+            json!({"client_group":"out","type":"fallback",
+                "health_check":{"url":"http://192.0.2.1/","interval_secs":30},
+                "client_chains":["wide"]}),
+        ]);
+        let validated = validate(json!(groups)).unwrap();
+        let catalog = validated.catalog.unwrap();
+        for (name, nodes) in [("wide", 1025), ("out", 1026)] {
+            let chain = catalog.route(name).unwrap();
+            assert_eq!(
+                measure(chain.hops.iter().next().unwrap(), 0).unwrap().0,
+                nodes
+            );
+            super::validate(&chain.hops).unwrap();
+        }
+    }
+
+    #[test]
+    fn repeated_automatic_occurrences_do_not_allocate_health_contexts() {
+        let members = vec!["auto"; 2048];
+        validate(json!([
             {"client_group":"auto","type":"url-test","url":"http://probe.invalid/","client_chains":["direct"]},
             {"client_group":"wide","client_chains":members}
-        ])).err().unwrap();
-        assert!(error.to_string().contains("1024 route contexts"), "{error}");
+        ])).unwrap();
     }
 }

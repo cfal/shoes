@@ -14,6 +14,99 @@ async fn publish_for_api_probes(runtime: &ControlRuntime, generation: &Arc<Gener
 }
 
 #[tokio::test]
+async fn automatic_probes_use_declared_chains_not_callers_and_keep_group_settings_separate() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let catalog = crate::config::create_server_configs(
+            serde_json::from_value(json!([
+                {"client_group":"path","client_chains":[{"name":"declared","chain":[
+                    {"address":address,"protocol":{"type":"http"}},
+                    {"address":"exit.invalid:80","protocol":{"type":"http"}}
+                ]}]},
+                {"client_group":"auto","type":"url-test","url":"http://192.0.2.1/",
+                 "timeout":1000,"client_chains":["path"]},
+                {"client_group":"other","type":"url-test","url":"http://192.0.2.1/",
+                 "timeout":10,"client_chains":["path"]},
+                {"client_group":"route","client_chains":[{"chain":[
+                    {"address":"caller.invalid:80","protocol":{"type":"http"}},"auto",
+                    {"address":"suffix.invalid:80","protocol":{"type":"http"}}
+                ]}]}
+            ]))
+            .unwrap(),
+        )
+        .unwrap()
+        .catalog
+        .unwrap();
+        let caller_resolver = Arc::new(PendingAnswers::default());
+        let _caller = crate::tcp::chain_builder::try_build_client_proxy_chain(
+            catalog.route("route").unwrap().hops,
+            caller_resolver.clone(),
+        )
+        .unwrap();
+        let generation = Arc::new(generation(
+            catalog,
+            Arc::new(crate::resolver::NativeResolver::new()),
+        ));
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        publish_for_api_probes(&service.runtime, &generation).await;
+        let group = &generation.catalog.selection.automatic.0["auto"];
+        let now = tokio::time::Instant::now();
+        let members = group.due_members(now).unwrap();
+        let epoch = service.runtime.probe_epoch();
+        let serve = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for target in ["exit.invalid:80", "192.0.2.1:80"] {
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(stream.read_u8().await.unwrap());
+                }
+                assert!(header.starts_with(format!("CONNECT {target} HTTP/1.1").as_bytes()));
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(stream.read_u8().await.unwrap());
+            }
+            assert!(header.starts_with(b"HEAD / HTTP/1.1"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        };
+        tokio::join!(
+            serve,
+            run_automatic_round(
+                AutomaticRound {
+                    group,
+                    completed: false
+                },
+                &service.runtime,
+                &generation,
+                members,
+                now,
+                &epoch,
+            )
+        );
+        assert_eq!(group.health("path"), "healthy");
+        assert_eq!(
+            generation.catalog.selection.automatic.0["other"].health("path"),
+            "unprobed"
+        );
+        assert_eq!(
+            caller_resolver.0.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        service.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn review_reject_probe_preserves_history() {
     let mut catalog = catalog();
     catalog.nodes.insert("REJECT".into(), CatalogNode::Reject);
@@ -172,244 +265,6 @@ fn scheduled_generation(
     Arc::new(generation(catalog, resolver))
 }
 
-fn contextual_catalog() -> Catalog {
-    crate::config::create_server_configs(
-        serde_json::from_value(json!([
-            {"client_group":"auto","type":"url-test","url":"http://probe.invalid/",
-             "interval":10,"timeout":1000,"lazy":false,"client_chains":[
-                {"name":"a","address":"a.invalid:80","protocol":{"type":"http"}},
-                {"name":"b","address":"b.invalid:80","protocol":{"type":"http"}}
-             ]},
-            {"client_group":"route","client_chains":[{"chain":[
-                {"name":"prefix","address":"prefix.invalid:80","protocol":{"type":"http"}},
-                "auto",
-                {"name":"suffix","address":"suffix.invalid:80","protocol":{"type":"http"}}
-            ]}]}
-        ]))
-        .unwrap(),
-    )
-    .unwrap()
-    .catalog
-    .unwrap()
-}
-
-fn contextual_chain(catalog: &Catalog, resolver: Arc<dyn Resolver>) -> ClientChainGroup {
-    ClientChainGroup::new(vec![
-        crate::tcp::chain_builder::try_build_client_proxy_chain(
-            catalog.route("route").unwrap().hops,
-            resolver,
-        )
-        .unwrap(),
-    ])
-}
-
-fn context_round(context: Arc<crate::control::url_test::context::Context>) -> ContextRound {
-    ContextRound {
-        revision: context.revision(),
-        context,
-        completed: false,
-    }
-}
-
-#[tokio::test]
-async fn contextual_rounds_probe_complete_routes_with_isolated_resolvers_and_samples() {
-    async fn peer(failed: &'static str) -> (SocketAddr, tokio_util::task::AbortOnDropHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-        let address = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
-        let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                tasks.spawn(async move {
-                    for target in [None, Some("suffix.invalid:80"), Some("probe.invalid:80")] {
-                        let mut header = Vec::new();
-                        while !header.ends_with(b"\r\n\r\n") {
-                            header.push(stream.read_u8().await.unwrap());
-                        }
-                        let header = String::from_utf8(header).unwrap();
-                        if let Some(target) = target {
-                            assert!(
-                                header.starts_with(&format!("CONNECT {target} HTTP/1.1\r\n")),
-                                "{header}"
-                            );
-                        } else {
-                            assert!(
-                                header.starts_with("CONNECT a.invalid:80 ")
-                                    || header.starts_with("CONNECT b.invalid:80 ")
-                            );
-                            if header.starts_with(&format!("CONNECT {failed}.invalid:80 ")) {
-                                return;
-                            }
-                        }
-                        stream
-                            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                            .await
-                            .unwrap();
-                    }
-                    let mut header = Vec::new();
-                    while !header.ends_with(b"\r\n\r\n") {
-                        header.push(stream.read_u8().await.unwrap());
-                    }
-                    assert!(header.starts_with(b"HEAD / HTTP/1.1\r\n"));
-                    stream
-                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-                        .await
-                        .unwrap();
-                });
-            }
-            while let Some(result) = tasks.join_next().await {
-                result.unwrap();
-            }
-        }));
-        (address, task)
-    }
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let (first, first_peer) = peer("a").await;
-        let (second, second_peer) = peer("b").await;
-        let catalog = contextual_catalog();
-        let first_chain = contextual_chain(&catalog, Arc::new(Answers(vec![first])));
-        let second_chain = contextual_chain(&catalog, Arc::new(Answers(vec![second])));
-        let contexts = catalog.selection.contexts.snapshot();
-        assert_eq!(contexts.len(), 2);
-        let generation = Arc::new(generation(catalog, Arc::new(Answers(Vec::new()))));
-        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
-        publish_for_api_probes(&service.runtime, &generation).await;
-        let epoch = service.runtime.probe_epoch();
-        for context in &contexts {
-            let now = tokio::time::Instant::now();
-            let members = context.group.due_members(now).unwrap();
-            run_context_round(
-                context_round(context.clone()),
-                &service.runtime,
-                &generation,
-                members,
-                now,
-                &epoch,
-            )
-            .await;
-        }
-        first_peer.await.unwrap();
-        second_peer.await.unwrap();
-        assert_eq!(contexts[0].group.health("a"), "dead");
-        assert_eq!(contexts[0].group.health("b"), "healthy");
-        assert_eq!(contexts[1].group.health("a"), "healthy");
-        assert_eq!(contexts[1].group.health("b"), "dead");
-        let choices = generation.catalog.selection.snapshot();
-        let names = ["a", "b"].into_iter().collect();
-        assert_eq!(
-            contexts[0]
-                .choose(&names, false, &choices, tokio::time::Instant::now())
-                .as_deref(),
-            Some("b")
-        );
-        assert_eq!(
-            contexts[1]
-                .choose(&names, false, &choices, tokio::time::Instant::now())
-                .as_deref(),
-            Some("a")
-        );
-        assert!(generation.probes.history.lock().is_empty());
-        assert_eq!(
-            generation.catalog.selection.automatic.0["auto"].health("a"),
-            "unprobed"
-        );
-        generation
-            .catalog
-            .selection
-            .automatic
-            .record("b", "http://probe.invalid/", Some(1));
-        assert_eq!(contexts[1].group.health("b"), "dead");
-        drop((first_chain, second_chain));
-        assert!(contexts.iter().all(|context| !context.active(&choices)));
-        service.shutdown().await;
-        assert_eq!(service.runtime.probes.available_permits(), 16);
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test(start_paused = true)]
-async fn contextual_queue_cancellation_and_local_failures_preserve_samples() {
-    let catalog = contextual_catalog();
-    let pending = Arc::new(PendingAnswers::default());
-    let _chain = contextual_chain(&catalog, pending.clone());
-    let context = catalog.selection.contexts.snapshot().pop().unwrap();
-    context.record(0, context.revision(), Some(7));
-    let generation = Arc::new(generation(catalog, Arc::new(Answers(Vec::new()))));
-    let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
-    publish_for_api_probes(&service.runtime, &generation).await;
-    let epoch = service.runtime.probe_epoch();
-    let occupied = service.runtime.probes.acquire_many(16).await.unwrap();
-    let now = tokio::time::Instant::now();
-    run_context_round(
-        context_round(context.clone()),
-        &service.runtime,
-        &generation,
-        vec![0],
-        now,
-        &epoch,
-    )
-    .await;
-    assert_eq!(context.group.health("a"), "healthy");
-    assert!(context.group.last_unqueued_admission().is_none());
-    assert_eq!(pending.0.load(std::sync::atomic::Ordering::Relaxed), 0);
-    drop(occupied);
-    let now = tokio::time::Instant::now();
-    let members = context.group.due_members(now).unwrap();
-    {
-        let round = run_context_round(
-            context_round(context.clone()),
-            &service.runtime,
-            &generation,
-            members,
-            now,
-            &epoch,
-        );
-        tokio::pin!(round);
-        assert!(futures::poll!(&mut round).is_pending());
-        assert_eq!(service.runtime.probes.available_permits(), 14);
-        epoch.cancel();
-        round.await;
-    }
-    assert_eq!(service.runtime.probes.available_permits(), 16);
-    assert_eq!(context.group.health("a"), "healthy");
-    assert!(
-        context
-            .group
-            .due_members(tokio::time::Instant::now())
-            .is_some()
-    );
-
-    let local = Arc::new(ScheduledAnswers {
-        local_failures: ["prefix.invalid".into()].into(),
-        ..Default::default()
-    });
-    let _chain = contextual_chain(&generation.catalog, local);
-    let context = generation
-        .catalog
-        .selection
-        .contexts
-        .snapshot()
-        .pop()
-        .unwrap();
-    context.record(0, context.revision(), Some(9));
-    let epoch = CancellationToken::new();
-    let now = tokio::time::Instant::now();
-    run_context_round(
-        context_round(context.clone()),
-        &service.runtime,
-        &generation,
-        vec![0],
-        now,
-        &epoch,
-    )
-    .await;
-    assert_eq!(context.group.health("a"), "healthy");
-    assert!(context.group.last_unqueued_admission().is_some());
-    assert!(generation.probes.history.lock().is_empty());
-    service.shutdown().await;
-}
-
 async fn advance_rounds(seconds: u64) {
     for _ in 0..seconds * 10 {
         tokio::time::advance(Duration::from_millis(100)).await;
@@ -501,28 +356,23 @@ async fn url_test_other_url_eviction_does_not_change_admission() {
 #[tokio::test(start_paused = true)]
 async fn url_test_expansion_limits_preserve_health_without_dialing() {
     for automatic in [false, true] {
-        let mut configs: Vec<_> = (0..128)
-            .map(|index| {
-                let member = if index == 127 {
-                    "direct".into()
-                } else {
-                    format!("deep-{}", index + 1)
-                };
-                json!({
-                    "client_group": format!("deep-{index}"),
-                    "client_chains": [member]
-                })
-            })
-            .collect();
-        configs.push(json!({
+        let configs = json!([
+            {"client_group":"deep-0","client_chains":["direct"]},
+            {
             "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
             "interval":10, "timeout":1000, "lazy":false, "client_chains":["deep-0"]
-        }));
+            }
+        ]);
         let validated =
-            crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
-                .unwrap();
+            crate::config::create_server_configs(serde_json::from_value(configs).unwrap()).unwrap();
+        let mut catalog = validated.catalog.unwrap();
+        // Exercise the defensive limit after bypassing configuration validation.
+        let CatalogNode::Group { members, .. } = catalog.nodes.get_mut("deep-0").unwrap() else {
+            panic!()
+        };
+        *members = vec!["DIRECT".into(); crate::config::composition::MAX_NODES];
         let resolver = Arc::new(TrackedAnswers::default());
-        let generation = Arc::new(generation(validated.catalog.unwrap(), resolver.clone()));
+        let generation = Arc::new(generation(catalog, resolver.clone()));
         generation
             .catalog
             .selection
@@ -1555,7 +1405,6 @@ async fn url_test_automatic_real_proxy_probes_select_fast_sticky_recovered_membe
         for name in ["manual", "parent", "via-manual"] {
             probe(&service.runtime, &generation, name, &other).await.unwrap();
         }
-        assert!(generation.catalog.selection.contexts.snapshot().is_empty());
         assert!(
             group
                 .due_members(initial + Duration::from_secs(300))
@@ -1568,7 +1417,6 @@ async fn url_test_automatic_real_proxy_probes_select_fast_sticky_recovered_membe
         for name in ["manual", "parent", "via-manual"] {
             probe(&service.runtime, &generation, name, &other).await.unwrap();
         }
-        assert!(generation.catalog.selection.contexts.snapshot().is_empty());
         assert!(
             service
                 .runtime

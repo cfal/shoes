@@ -171,23 +171,10 @@ impl ProbeState {
             return Ok(connector.clone());
         }
         let route = catalog.route(name)?;
-        let chain = if route
-            .hops
-            .iter()
-            .any(|hop| matches!(hop, crate::config::ClientChainHop::Choice(_)))
-        {
-            crate::client_proxy_chain::ClientProxyChain::composed(
-                route.hops,
-                self.resolver.clone(),
-                crate::resources::limits(),
-                true,
-            )?
-        } else {
-            crate::tcp::chain_builder::try_build_client_proxy_chain(
-                route.hops,
-                self.resolver.clone(),
-            )?
-        };
+        let chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
+            route.hops,
+            self.resolver.clone(),
+        )?;
         let connector = Arc::new(ClientChainGroup::new(vec![chain]));
         Ok(self
             .connectors
@@ -294,6 +281,7 @@ pub async fn probe(
         tokio::time::Instant::now() + query.timeout,
         false,
         &epoch,
+        None,
     )
     .await
 }
@@ -345,6 +333,7 @@ pub async fn probe_group(
                     deadline,
                     waited || ordinal >= PROBE_CONCURRENCY,
                     epoch,
+                    None,
                 )
                 .await;
                 (name, Some(result))
@@ -406,6 +395,7 @@ fn with_probe_epoch<T>(
     })?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn probe_until(
     runtime: &ControlRuntime,
     generation: &Generation,
@@ -414,6 +404,7 @@ async fn probe_until(
     deadline: tokio::time::Instant,
     queued: bool,
     epoch: &CancellationToken,
+    group: Option<&super::url_test::AutomaticGroup>,
 ) -> io::Result<u16> {
     with_probe_epoch(runtime, generation, epoch, || {
         if !queued {
@@ -426,11 +417,16 @@ async fn probe_until(
     })?;
     let probe_request =
         crate::control::url_test::BACKGROUND.scope((), request(generation, name, query));
-    let tickets = generation
-        .catalog
-        .selection
-        .automatic
-        .tickets(name, query.url.as_str());
+    let tickets = group.map_or_else(
+        || {
+            generation
+                .catalog
+                .selection
+                .automatic
+                .tickets(name, query.url.as_str())
+        },
+        |group| vec![(group, group.revision())],
+    );
     let result = tokio::select! {
         biased;
         _ = runtime.shutdown.cancelled() => {
@@ -547,9 +543,7 @@ pub(crate) async fn run_automatic(
         .keys()
         .filter_map(|name| generation.catalog.selection.automatic.0.get(name))
         .collect();
-    let mut rounds: futures::stream::FuturesUnordered<
-        futures::future::BoxFuture<'_, (bool, usize)>,
-    > = futures::stream::FuturesUnordered::new();
+    let mut rounds = futures::stream::FuturesUnordered::new();
     let mut checking = std::collections::HashSet::new();
     loop {
         let Some(runtime) = runtime.upgrade() else {
@@ -563,7 +557,6 @@ pub(crate) async fn run_automatic(
                 checking.remove(&index);
                 continue;
             }
-            _ = generation.catalog.selection.contexts.changed.notified() => {},
             _ = ticker.tick() => {}
         }
         if runtime.with_probe_generation(generation.id, || ()).is_err() {
@@ -573,149 +566,26 @@ pub(crate) async fn run_automatic(
         let mut due: Vec<_> = groups
             .iter()
             .enumerate()
-            .filter(|(index, _)| !checking.contains(&(false, *index)))
-            .filter_map(|(index, group)| {
-                group.due_members(now).map(|members| (index, None, members))
-            })
+            .filter(|(index, _)| !checking.contains(index))
+            .filter_map(|(index, group)| group.due_members(now).map(|members| (index, members)))
             .collect();
-        let choices = generation.catalog.selection.snapshot();
-        for context in generation.catalog.selection.contexts.snapshot() {
-            let id = Arc::as_ptr(&context) as usize;
-            if !checking.contains(&(true, id))
-                && context.active(&choices)
-                && let Some(members) = context.group.due_members(now)
-            {
-                due.push((id, Some(context), members));
-            }
-        }
         // A busy, short-interval group must not reset a waiting group's priority.
-        due.sort_by_key(|(index, context, _)| {
-            context.as_ref().map_or_else(
-                || groups[*index].last_unqueued_admission(),
-                |context| context.group.last_unqueued_admission(),
-            )
-        });
-        for (index, context, members) in due {
-            let key = (context.is_some(), index);
-            checking.insert(key);
+        due.sort_by_key(|(index, _)| groups[*index].last_unqueued_admission());
+        for (index, members) in due {
+            checking.insert(index);
             let runtime = runtime.clone();
             let generation = &generation;
             let epoch = &epoch;
-            if let Some(context) = context {
-                let round = ContextRound {
-                    revision: context.revision(),
-                    context,
-                    completed: false,
-                };
-                rounds.push(Box::pin(async move {
-                    run_context_round(round, &runtime, generation, members, now, epoch).await;
-                    key
-                }));
-            } else {
-                let round = AutomaticRound {
-                    group: groups[index],
-                    completed: false,
-                };
-                rounds.push(Box::pin(async move {
-                    run_automatic_round(round, &runtime, generation, members, now, epoch).await;
-                    key
-                }));
-            }
+            let round = AutomaticRound {
+                group: groups[index],
+                completed: false,
+            };
+            rounds.push(async move {
+                run_automatic_round(round, &runtime, generation, members, now, epoch).await;
+                index
+            });
         }
     }
-}
-
-struct ContextRound {
-    context: Arc<super::url_test::context::Context>,
-    revision: u64,
-    completed: bool,
-}
-
-impl Drop for ContextRound {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.context.cancel(self.revision);
-        }
-    }
-}
-
-async fn run_context_round(
-    mut round: ContextRound,
-    runtime: &ControlRuntime,
-    generation: &Generation,
-    mut members: Vec<usize>,
-    started: tokio::time::Instant,
-    epoch: &CancellationToken,
-) {
-    let context = &round.context;
-    let query = ProbeQuery {
-        url: url::Url::parse(&context.group.config.url).expect("validated URL-test URL"),
-        timeout: Duration::from_millis(context.group.config.timeout),
-        expected: Vec::new(),
-    };
-    let deadline = started + query.timeout;
-    context.order(&mut members);
-    let mut probes = futures::stream::iter(members.into_iter().enumerate())
-        .map(|(ordinal, member)| {
-            let query = &query;
-            async move {
-                let Ok((_permit, waited)) = acquire_probe(runtime, deadline).await else {
-                    return;
-                };
-                if tokio::time::Instant::now() >= deadline {
-                    return;
-                }
-                let queued = waited || ordinal >= PROBE_CONCURRENCY;
-                if with_probe_epoch(runtime, generation, epoch, || {
-                    context.group.admitted(member, queued);
-                    if !queued {
-                        context.attempted(member);
-                    }
-                })
-                .is_err()
-                {
-                    return;
-                }
-                // Selection publication fences the ticket before publishing new choices.
-                let revision = context.revision();
-                let choices = generation.catalog.selection.snapshot();
-                let Ok(Some(chain)) = context.sample(member, &choices) else {
-                    return;
-                };
-                let request = super::url_test::BACKGROUND.scope(
-                    (),
-                    request_via(
-                        &chain,
-                        context.resolver.clone(),
-                        &generation.probes.forbidden,
-                        query,
-                        crate::rustls_config_util::create_dns_client_config,
-                    ),
-                );
-                let result = tokio::select! {
-                    biased;
-                    _ = runtime.shutdown.cancelled() => return,
-                    _ = epoch.cancelled() => return,
-                    result = tokio::time::timeout_at(deadline, request) => match result {
-                        Ok(result) => result,
-                        Err(_) if queued => return,
-                        Err(_) => Err(io::ErrorKind::TimedOut.into()),
-                    }
-                };
-                if result.as_ref().is_err_and(local_failure) {
-                    return;
-                }
-                let delay = result
-                    .ok()
-                    .and_then(|(delay, satisfied)| satisfied.then_some(delay));
-                let _ = with_probe_epoch(runtime, generation, epoch, || {
-                    context.record(member, revision, delay)
-                });
-            }
-        })
-        .buffer_unordered(PROBE_CONCURRENCY);
-    while probes.next().await.is_some() {}
-    round.completed = with_probe_epoch(runtime, generation, epoch, || ()).is_ok();
 }
 
 struct AutomaticRound<'a> {
@@ -774,6 +644,7 @@ async fn run_automatic_round(
                     deadline,
                     queued,
                     epoch,
+                    Some(group),
                 )
                 .await;
             }
@@ -783,7 +654,7 @@ async fn run_automatic_round(
     round.completed = with_probe_epoch(runtime, generation, epoch, || ()).is_ok();
 }
 
-async fn request(
+pub(crate) async fn request(
     generation: &Generation,
     name: &str,
     query: &ProbeQuery,

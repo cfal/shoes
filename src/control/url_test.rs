@@ -7,8 +7,6 @@ use tokio::time::Instant;
 
 use crate::config::UrlTestConfig;
 
-pub(crate) mod context;
-
 tokio::task_local! {
     pub static BACKGROUND: ();
 }
@@ -195,6 +193,10 @@ impl AutomaticGroups {
 }
 
 impl AutomaticGroup {
+    pub(crate) fn revision(&self) -> u64 {
+        self.state.lock().revision
+    }
+
     pub(crate) fn set_dependencies(
         &self,
         paths: impl IntoIterator<Item = super::selection::ManualSelectorPath>,

@@ -407,29 +407,69 @@ impl Catalog {
     }
 
     pub(crate) fn route(&self, name: &str) -> io::Result<ClientChain> {
-        self.expand_route(name, &[], 0, &mut 0)
+        self.expand_route(name, Vec::new(), 0, &mut 0)
     }
 
     fn expand_route(
         &self,
         name: &str,
-        path: &[(String, String)],
+        mut path: Vec<(String, String)>,
         depth: usize,
         count: &mut usize,
     ) -> io::Result<ClientChain> {
         use crate::option_util::OneOrSome;
-        *count += 1;
-        if depth >= 128 || *count > crate::config::composition::MAX_NODES {
+        fn charge(count: &mut usize) -> io::Result<()> {
+            *count += 1;
+            if *count > crate::config::composition::MAX_NODES {
+                return Err(super::health::capacity_error(
+                    "probe route exceeds composition limits".into(),
+                ));
+            }
+            Ok(())
+        }
+        if depth > 2 * crate::config::composition::MAX_DEPTH {
             return Err(super::health::capacity_error(
                 "probe route exceeds composition limits".into(),
             ));
         }
-        let hop = match self.nodes.get(name) {
+        // Fixed one-hop aliases do not consume composition nodes or recursion depth.
+        let mut name = name.to_owned();
+        let mut aliases = 0;
+        loop {
+            match self.nodes.get(&name) {
+                Some(CatalogNode::Group {
+                    members,
+                    group_type: GroupType::RoundRobin,
+                }) if members.len() == 1
+                    && !matches!(self.nodes.get(&members[0]), Some(CatalogNode::Chain(chain)) if chain.hops.iter().count() != 1) =>
+                {
+                    path.push((name, members[0].clone()));
+                    name = members[0].clone();
+                }
+                Some(CatalogNode::Chain(chain)) if chain.hops.iter().count() == 1 => {
+                    let ClientChainHop::Single(selection) = chain.hops.iter().next().unwrap()
+                    else {
+                        break;
+                    };
+                    name = member_name(selection);
+                }
+                _ => break,
+            }
+            aliases += 1;
+            if aliases > self.nodes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cyclic probe route",
+                ));
+            }
+        }
+        let hop = match self.nodes.get(&name) {
             Some(CatalogNode::Leaf(client)) => {
+                charge(count)?;
                 let mut client = (**client).clone();
                 client.control = Some(MemberOrigin {
-                    name: Arc::from(name),
-                    path: path.to_vec(),
+                    name: Arc::from(name.as_str()),
+                    path,
                     selection: self.selection.clone(),
                 });
                 ClientChainHop::Single(ConfigSelection::Config(client))
@@ -440,9 +480,9 @@ impl Catalog {
             }) => {
                 let mut branches = Vec::new();
                 for member in members {
-                    let mut path = path.to_vec();
+                    let mut path = path.clone();
                     path.push((name.to_owned(), member.clone()));
-                    branches.push(self.expand_route(member, &path, depth + 1, count)?);
+                    branches.push(self.expand_route(member, path, depth + 1, count)?);
                 }
                 if *group_type == GroupType::RoundRobin
                     && branches.len() == 1
@@ -450,8 +490,9 @@ impl Catalog {
                 {
                     return Ok(branches.remove(0));
                 }
+                charge(count)?;
                 ClientChainHop::Choice(Box::new(crate::config::ClientChoice {
-                    name: name.into(),
+                    name,
                     group_type: group_type.clone(),
                     labels: members.clone(),
                     members: branches,
@@ -461,7 +502,7 @@ impl Catalog {
                 let mut hops = Vec::new();
                 for hop in chain.hops.iter() {
                     let mut expand = |selection: &ConfigSelection<ClientConfig>| {
-                        self.expand_route(&member_name(selection), path, depth + 1, count)
+                        self.expand_route(&member_name(selection), path.clone(), depth + 1, count)
                     };
                     match hop {
                         ClientChainHop::Single(selection) => {
@@ -472,6 +513,7 @@ impl Catalog {
                                 .iter()
                                 .map(&mut expand)
                                 .collect::<io::Result<Vec<_>>>()?;
+                            charge(count)?;
                             hops.push(ClientChainHop::Choice(Box::new(
                                 crate::config::ClientChoice {
                                     name: String::new(),

@@ -1,12 +1,8 @@
 use super::*;
 use crate::config::{ClientChainHop, ClientConfig, ConfigSelection, GlobalLimits, GroupType};
-use crate::control::health::{Health, ProbeJob};
 use crate::control::selection::{Choices, SelectionView};
-use crate::control::url_test::context::{Context, Definition};
 use crate::option_util::OneOrSome;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
-use rand::{RngExt, rngs::SmallRng};
-use std::collections::HashMap;
 use std::io;
 
 struct Leaf {
@@ -20,7 +16,6 @@ enum Node {
     Client(Arc<Leaf>),
     Sequence(Vec<Node>),
     Choice {
-        id: usize,
         name: String,
         kind: GroupType,
         labels: Vec<String>,
@@ -30,42 +25,21 @@ enum Node {
     },
 }
 
-struct CheckedPath {
-    leaves: Vec<Arc<Leaf>>,
-    decisions: Vec<(usize, usize)>,
-    checks: Vec<Arc<ProbeJob>>,
-}
-
-type ConcretePath = (Vec<Arc<Leaf>>, Vec<(usize, usize)>);
-
 pub(crate) struct Composition {
     root: Node,
     selection: Option<Arc<SelectionView>>,
-    checked: Vec<CheckedPath>,
-    contexts: HashMap<usize, Arc<Context>>,
-    standalone: bool,
 }
 
 struct Selection<'a> {
     choices: &'a Choices,
-    contexts: &'a HashMap<usize, Arc<Context>>,
-    standalone: Option<&'a crate::control::url_test::AutomaticGroups>,
-    paths: &'a [CheckedPath],
-    candidates: Vec<(usize, bool)>,
-    forced: &'a [(usize, usize)],
-    sampler: Option<&'a mut SmallRng>,
-    touched: Vec<Arc<Context>>,
-    now: tokio::time::Instant,
+    view: Option<&'a SelectionView>,
 }
 
-impl Selection<'_> {
-    fn next(&mut self, counter: &AtomicU32, len: usize) -> usize {
-        if let Some(sampler) = &mut self.sampler {
-            sampler.random_range(0..len)
-        } else {
-            counter.fetch_add(1, Ordering::Relaxed) as usize % len
-        }
-    }
+fn unavailable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "fallback has no healthy or unknown eligible member",
+    )
 }
 
 fn unsupported() -> io::Error {
@@ -83,7 +57,6 @@ impl Composition {
         hops: OneOrSome<ClientChainHop>,
         resolver: Arc<dyn Resolver>,
         limits: GlobalLimits,
-        standalone: bool,
     ) -> io::Result<Arc<Self>> {
         crate::config::composition::validate(&hops)?;
         let selection = hops
@@ -95,60 +68,8 @@ impl Composition {
                     .as_ref()
                     .map(|origin| origin.selection.clone())
             });
-        let mut ordinal = 0;
-        let root = sequence(hops, true, &resolver, limits, &mut ordinal)?;
-        let mut checked = Vec::new();
-        if root.has_fallback() {
-            if selection.is_none() {
-                return Err(crate::config::composition::invalid(
-                    "fallback requires a prepared selection view",
-                ));
-            }
-            let paths = root.paths()?;
-            for (leaves, decisions) in paths {
-                let configs: Vec<Vec<_>> = leaves
-                    .iter()
-                    .map(|leaf| vec![leaf.config.clone()])
-                    .collect();
-                let chain = pinned(&leaves).with_health(&configs, 1, resolver.clone())?;
-                let checks = chain
-                    .health_paths
-                    .into_iter()
-                    .flat_map(|path| path.checks)
-                    .collect();
-                checked.push(CheckedPath {
-                    leaves,
-                    decisions,
-                    checks,
-                });
-            }
-        }
-        let mut definitions = Vec::new();
-        if !standalone && selection.is_some() {
-            root.context_definitions(&[], &[], &mut definitions);
-        }
-        let mut registered = Vec::new();
-        let result = Arc::new_cyclic(|owner| {
-            let mut contexts = HashMap::new();
-            for definition in definitions {
-                let id = definition.occurrence;
-                let context = Context::new(definition, owner.clone(), resolver.clone());
-                // Definitions follow occurrence order, which breaks admission ties.
-                registered.push(context.clone());
-                contexts.insert(id, context);
-            }
-            Self {
-                root,
-                selection,
-                checked,
-                contexts,
-                standalone,
-            }
-        });
-        if let Some(view) = &result.selection {
-            view.register_contexts(&registered)?;
-        }
-        Ok(result)
+        let root = sequence(hops, true, &resolver, limits)?;
+        Ok(Arc::new(Self { root, selection }))
     }
 
     pub(super) fn select(&self, udp: bool) -> io::Result<ClientProxyChain> {
@@ -157,102 +78,13 @@ impl Composition {
             .as_ref()
             .map(|view| view.snapshot())
             .unwrap_or_default();
-        self.select_with(udp, &choices, &[], None)
-    }
-
-    pub(crate) fn sample_probe(
-        &self,
-        choices: &Choices,
-        forced: &[(usize, usize)],
-        sampler: &mut SmallRng,
-    ) -> io::Result<ClientProxyChain> {
-        let mut selected = self.select_with(false, choices, forced, Some(sampler))?;
-        selected.selection = None;
-        selected.automatic_contexts.clear();
-        Ok(selected)
-    }
-
-    fn select_with(
-        &self,
-        udp: bool,
-        choices: &Choices,
-        forced: &[(usize, usize)],
-        sampler: Option<&mut SmallRng>,
-    ) -> io::Result<ClientProxyChain> {
-        let mut candidates = Vec::new();
-        if !self.checked.is_empty() {
-            let now = self.selection.as_ref().unwrap().health.sample_time();
-            let mut samples = HashMap::new();
-            let mut compatible = false;
-            for (index, path) in self.checked.iter().enumerate() {
-                if !forced
-                    .iter()
-                    .all(|decision| path.decisions.contains(decision))
-                {
-                    continue;
-                }
-                if udp && !path.leaves.last().unwrap().udp {
-                    continue;
-                }
-                if !path.leaves.iter().all(|leaf| {
-                    leaf.config
-                        .control
-                        .as_ref()
-                        .is_none_or(|origin| origin.allowed(choices))
-                }) {
-                    continue;
-                }
-                compatible = true;
-                let mut healthy = true;
-                let mut failed = false;
-                for check in &path.checks {
-                    match *samples
-                        .entry(Arc::as_ptr(check))
-                        .or_insert_with(|| check.health(choices, now))
-                    {
-                        Health::Healthy => {}
-                        Health::Unknown => healthy = false,
-                        Health::Failed | Health::Stale => {
-                            failed = true;
-                            break;
-                        }
-                    }
-                }
-                if !failed {
-                    candidates.push((index, healthy));
-                }
-            }
-            if !compatible {
-                return Err(unsupported());
-            }
-            if candidates.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "fallback has no healthy or unknown eligible path",
-                ));
-            }
-            self.root.prefer_fallbacks(&self.checked, &mut candidates);
-        }
-        let mut leaves = Vec::new();
-        let mut context = Selection {
-            choices,
-            contexts: &self.contexts,
-            standalone: self
-                .selection
-                .as_ref()
-                .filter(|_| self.standalone)
-                .map(|view| &view.automatic),
-            paths: &self.checked,
-            candidates,
-            forced,
-            sampler,
-            touched: Vec::new(),
-            now: tokio::time::Instant::now(),
+        let selection = Selection {
+            choices: &choices,
+            view: self.selection.as_deref(),
         };
-        self.root.select(udp, &mut context, &mut leaves)?;
-        let mut chain = pinned(&leaves);
-        chain.automatic_contexts = context.touched;
-        Ok(chain)
+        let mut leaves = Vec::new();
+        self.root.select(udp, &selection, &mut leaves)?;
+        Ok(pinned(&leaves))
     }
 
     pub(super) fn supports_udp(&self) -> bool {
@@ -271,18 +103,12 @@ impl Composition {
         if crate::control::url_test::is_background() {
             return;
         }
-        for context in self.contexts.values() {
-            context.touch(false);
-        }
         self.root.record_demand(self.selection.as_deref());
     }
 }
 
 #[cfg(test)]
 impl Composition {
-    pub(super) fn test_contexts(&self) -> Vec<Arc<Context>> {
-        self.contexts.values().cloned().collect()
-    }
     fn test_pools(&self) -> Vec<Vec<Arc<Leaf>>> {
         fn collect(node: &Node, start: usize, pools: &mut Vec<Vec<Arc<Leaf>>>) -> usize {
             match node {
@@ -331,23 +157,6 @@ impl Composition {
         }
         Ok(indices)
     }
-
-    pub(super) fn test_health_paths(&self) -> Vec<HealthPath> {
-        self.checked
-            .iter()
-            .map(|path| HealthPath {
-                indices: Vec::new(),
-                checks: path.checks.clone(),
-            })
-            .collect()
-    }
-
-    pub(super) fn test_initial_hops(&self) -> Vec<Arc<InitialHopEntry>> {
-        self.test_pools()[0]
-            .iter()
-            .map(|leaf| leaf.initial.as_ref().unwrap().clone())
-            .collect()
-    }
 }
 
 fn sequence(
@@ -355,11 +164,10 @@ fn sequence(
     first: bool,
     resolver: &Arc<dyn Resolver>,
     limits: GlobalLimits,
-    ordinal: &mut usize,
 ) -> io::Result<Node> {
     let mut nodes = Vec::new();
     for (index, hop) in hops.into_vec().into_iter().enumerate() {
-        nodes.push(node(hop, first && index == 0, resolver, limits, ordinal)?);
+        nodes.push(node(hop, first && index == 0, resolver, limits)?);
     }
     if nodes.is_empty() {
         return Err(crate::config::composition::invalid("chain cannot be empty"));
@@ -376,7 +184,6 @@ fn node(
     first: bool,
     resolver: &Arc<dyn Resolver>,
     limits: GlobalLimits,
-    ordinal: &mut usize,
 ) -> io::Result<Node> {
     match hop {
         ClientChainHop::Single(ConfigSelection::GroupName(name)) => Err(
@@ -423,17 +230,14 @@ fn node(
             first,
             resolver,
             limits,
-            ordinal,
         ),
         ClientChainHop::Choice(choice) => {
-            let id = *ordinal;
-            *ordinal += 1;
             let mut members = Vec::new();
             for member in choice.members {
-                members.push(sequence(member.hops, first, resolver, limits, ordinal)?);
+                members.push(sequence(member.hops, first, resolver, limits)?);
             }
             let static_members = (choice.group_type == GroupType::RoundRobin
-                && !members.iter().any(Node::has_manual))
+                && !members.iter().any(Node::has_dynamic_policy))
             .then(|| {
                 [
                     (0..members.len()).collect(),
@@ -445,7 +249,6 @@ fn node(
                 ]
             });
             Ok(Node::Choice {
-                id,
                 name: choice.name,
                 kind: choice.group_type,
                 labels: choice.labels,
@@ -470,7 +273,6 @@ fn pinned(leaves: &[Arc<Leaf>]) -> ClientProxyChain {
         .collect();
     ClientProxyChain {
         composition: None,
-        automatic_contexts: Vec::new(),
         origins,
         selection: leaves.iter().find_map(|leaf| {
             leaf.config
@@ -479,7 +281,6 @@ fn pinned(leaves: &[Arc<Leaf>]) -> ClientProxyChain {
                 .map(|origin| origin.selection.clone())
         }),
         selector_hops: vec![false; leaves.len()],
-        health_paths: Vec::new(),
         initial_hop: vec![leaves[0].initial.as_ref().unwrap().clone()],
         initial_hop_next_index: AtomicU32::new(0),
         subsequent_next_indices: subsequent_hops.iter().map(|_| AtomicU32::new(0)).collect(),
@@ -498,12 +299,13 @@ impl Node {
             Self::Choice { members, .. } => members.iter().map(Self::num_hops).max().unwrap_or(0),
         }
     }
-    fn has_manual(&self) -> bool {
+    fn has_dynamic_policy(&self) -> bool {
         match self {
             Self::Client(_) => false,
-            Self::Sequence(nodes) => nodes.iter().any(Self::has_manual),
+            Self::Sequence(nodes) => nodes.iter().any(Self::has_dynamic_policy),
             Self::Choice { kind, members, .. } => {
-                *kind == GroupType::Selector || members.iter().any(Self::has_manual)
+                matches!(kind, GroupType::Selector | GroupType::Fallback { .. })
+                    || members.iter().any(Self::has_dynamic_policy)
             }
         }
     }
@@ -547,13 +349,33 @@ impl Node {
             }),
         }
     }
-    fn has_fallback(&self) -> bool {
+    fn available(&self, udp: bool, selection: &Selection<'_>) -> bool {
         match self {
-            Self::Client(_) => false,
-            Self::Sequence(nodes) => nodes.iter().any(Self::has_fallback),
-            Self::Choice { kind, members, .. } => {
-                matches!(kind, GroupType::Fallback { .. }) || members.iter().any(Self::has_fallback)
-            }
+            Self::Client(leaf) => !udp || leaf.udp,
+            Self::Sequence(nodes) => nodes
+                .iter()
+                .enumerate()
+                .all(|(index, node)| node.available(udp && index + 1 == nodes.len(), selection)),
+            Self::Choice {
+                name,
+                kind,
+                labels,
+                members,
+                ..
+            } => members.iter().enumerate().any(|(index, member)| {
+                (*kind != GroupType::Selector
+                    || selection.choices.get(name) == Some(&labels[index]))
+                    && (!matches!(kind, GroupType::Fallback { .. })
+                        || selection.view.is_some_and(|view| {
+                            matches!(
+                                view.health
+                                    .member_health(name, &labels[index], selection.choices),
+                                crate::control::health::Health::Healthy
+                                    | crate::control::health::Health::Unknown
+                            )
+                        }))
+                    && member.available(udp, selection)
+            }),
         }
     }
     fn record_demand(&self, selection: Option<&SelectionView>) {
@@ -581,7 +403,7 @@ impl Node {
     fn select(
         &self,
         udp: bool,
-        context: &mut Selection<'_>,
+        selection: &Selection<'_>,
         leaves: &mut Vec<Arc<Leaf>>,
     ) -> io::Result<()> {
         match self {
@@ -592,12 +414,15 @@ impl Node {
                 leaves.push(leaf.clone());
             }
             Self::Sequence(nodes) => {
+                // Capability errors precede health failures, without enumerating paths.
+                if !self.eligible(udp, selection.choices) {
+                    return Err(unsupported());
+                }
                 for (index, node) in nodes.iter().enumerate() {
-                    node.select(udp && index + 1 == nodes.len(), context, leaves)?;
+                    node.select(udp && index + 1 == nodes.len(), selection, leaves)?;
                 }
             }
             Self::Choice {
-                id,
                 name,
                 kind,
                 labels,
@@ -605,207 +430,64 @@ impl Node {
                 next,
                 static_members,
             } => {
-                let forced = context
-                    .forced
-                    .iter()
-                    .find(|(node, _)| node == id)
-                    .map(|(_, branch)| *branch);
-                if forced.is_none()
-                    && context.paths.is_empty()
-                    && let Some(eligible) = static_members
-                {
+                if let Some(eligible) = static_members {
                     let eligible = &eligible[usize::from(udp)];
                     if eligible.is_empty() {
                         return Err(unsupported());
                     }
-                    let selected = eligible[context.next(&next[usize::from(udp)], eligible.len())];
-                    return members[selected].select(udp, context, leaves);
+                    let selected = eligible[next[usize::from(udp)].fetch_add(1, Ordering::Relaxed)
+                        as usize
+                        % eligible.len()];
+                    return members[selected].select(udp, selection, leaves);
                 }
-                let eligible: Vec<_> = members
+                let mut eligible: Vec<_> = members
                     .iter()
                     .enumerate()
                     .filter_map(|(index, member)| {
-                        let selected = *kind != GroupType::Selector
-                            || context.choices.get(name) == Some(&labels[index]);
-                        let checked = context.paths.is_empty()
-                            || context.candidates.iter().any(|(path, _)| {
-                                context.paths[*path].decisions.contains(&(*id, index))
-                            });
-                        (selected
-                            && checked
-                            && forced.is_none_or(|forced| forced == index)
-                            && member.eligible(udp, context.choices))
+                        ((*kind != GroupType::Selector
+                            || selection.choices.get(name) == Some(&labels[index]))
+                            && member.eligible(udp, selection.choices))
                         .then_some(index)
                     })
                     .collect();
                 if eligible.is_empty() {
                     return Err(unsupported());
                 }
-                let selected = if let Some(forced) = forced {
-                    forced
-                } else if let GroupType::UrlTest(_) = kind {
-                    let names = eligible
-                        .iter()
-                        .map(|index| labels[*index].as_str())
-                        .collect();
-                    let selected = if let Some(groups) = context.standalone {
-                        groups
-                            .0
-                            .get(name)
-                            .ok_or_else(unsupported)?
-                            .choose(&names, udp)
-                    } else {
-                        let group = context.contexts.get(id).ok_or_else(unsupported)?;
-                        context.touched.push(group.clone());
-                        group.choose(&names, udp, context.choices, context.now)
+                eligible.retain(|index| members[*index].available(udp, selection));
+                if eligible.is_empty() {
+                    return Err(unavailable());
+                }
+                let selected = match kind {
+                    GroupType::UrlTest(_) | GroupType::Fallback { .. } => {
+                        let view = selection.view.ok_or_else(unsupported)?;
+                        let names = eligible
+                            .iter()
+                            .map(|index| labels[*index].as_str())
+                            .collect();
+                        let selected = if matches!(kind, GroupType::UrlTest(_)) {
+                            view.automatic
+                                .0
+                                .get(name)
+                                .ok_or_else(unsupported)?
+                                .choose(&names, udp)
+                        } else {
+                            view.health.choose(name, &names, selection.choices)
+                        }
+                        .ok_or_else(unavailable)?;
+                        eligible
+                            .into_iter()
+                            .find(|index| labels[*index] == selected)
+                            .unwrap()
                     }
-                    .ok_or_else(unsupported)?;
-                    eligible
-                        .into_iter()
-                        .find(|index| labels[*index] == selected)
-                        .unwrap()
-                } else {
-                    eligible[context.next(&next[usize::from(udp)], eligible.len())]
+                    _ => {
+                        eligible[next[usize::from(udp)].fetch_add(1, Ordering::Relaxed) as usize
+                            % eligible.len()]
+                    }
                 };
-                context
-                    .candidates
-                    .retain(|(path, _)| context.paths[*path].decisions.contains(&(*id, selected)));
-                members[selected].select(udp, context, leaves)?;
+                members[selected].select(udp, selection, leaves)?;
             }
         }
         Ok(())
-    }
-
-    fn context_definitions(
-        &self,
-        ancestors: &[(usize, usize)],
-        required: &[(String, String)],
-        result: &mut Vec<Definition>,
-    ) {
-        match self {
-            Self::Client(_) => {}
-            Self::Sequence(nodes) => {
-                for node in nodes {
-                    node.context_definitions(ancestors, required, result);
-                }
-            }
-            Self::Choice {
-                id,
-                name,
-                kind,
-                labels,
-                members,
-                ..
-            } => {
-                if let GroupType::UrlTest(config) = kind {
-                    result.push(Definition {
-                        name: name.clone(),
-                        config: config.clone(),
-                        labels: labels.clone(),
-                        occurrence: *id,
-                        ancestors: ancestors.to_vec(),
-                        required: required.to_vec(),
-                    });
-                }
-                for (index, member) in members.iter().enumerate() {
-                    let mut ancestors = ancestors.to_vec();
-                    ancestors.push((*id, index));
-                    let mut required = required.to_vec();
-                    if *kind == GroupType::Selector {
-                        required.push((name.clone(), labels[index].clone()));
-                    }
-                    member.context_definitions(&ancestors, &required, result);
-                }
-            }
-        }
-    }
-
-    fn prefer_fallbacks(&self, paths: &[CheckedPath], candidates: &mut Vec<(usize, bool)>) {
-        match self {
-            Self::Client(_) => {}
-            Self::Sequence(nodes) => {
-                for node in nodes {
-                    node.prefer_fallbacks(paths, candidates);
-                }
-            }
-            Self::Choice {
-                id, kind, members, ..
-            } => {
-                if matches!(kind, GroupType::Fallback { .. }) {
-                    let preferred = [true, false].into_iter().find_map(|healthy| {
-                        (0..members.len())
-                            .find(|member| {
-                                candidates.iter().any(|(path, state)| {
-                                    *state == healthy
-                                        && paths[*path].decisions.contains(&(*id, *member))
-                                })
-                            })
-                            .map(|member| (member, healthy))
-                    });
-                    if let Some((member, healthy)) = preferred {
-                        candidates.retain(|(path, state)| {
-                            paths[*path]
-                                .decisions
-                                .iter()
-                                .find(|(node, _)| node == id)
-                                .is_none_or(|(_, branch)| *branch == member && (!healthy || *state))
-                        });
-                    }
-                }
-                for member in members {
-                    member.prefer_fallbacks(paths, candidates);
-                }
-            }
-        }
-    }
-    fn paths(&self) -> io::Result<Vec<ConcretePath>> {
-        let limit = crate::control::health::MAX_PATHS;
-        let capacity = || {
-            crate::control::health::capacity_error(
-                "fallback exceeds 256 concrete chain paths".into(),
-            )
-        };
-        match self {
-            Self::Client(leaf) => Ok(vec![(vec![leaf.clone()], Vec::new())]),
-            Self::Choice { id, members, .. } => {
-                let mut paths = Vec::new();
-                for (index, member) in members.iter().enumerate() {
-                    for (leaves, mut decisions) in member.paths()? {
-                        if paths.len() == limit {
-                            return Err(capacity());
-                        }
-                        decisions.insert(0, (*id, index));
-                        paths.push((leaves, decisions));
-                    }
-                }
-                Ok(paths)
-            }
-            Self::Sequence(nodes) => {
-                let mut paths = vec![(Vec::new(), Vec::new())];
-                for node in nodes {
-                    let suffixes = node.paths()?;
-                    if paths
-                        .len()
-                        .checked_mul(suffixes.len())
-                        .is_none_or(|count| count > limit)
-                    {
-                        return Err(capacity());
-                    }
-                    let mut joined = Vec::new();
-                    for (prefix, decisions) in paths {
-                        for (suffix, following) in &suffixes {
-                            let mut leaves = prefix.clone();
-                            leaves.extend(suffix.iter().cloned());
-                            let mut choices = decisions.clone();
-                            choices.extend(following);
-                            joined.push((leaves, choices));
-                        }
-                    }
-                    paths = joined;
-                }
-                Ok(paths)
-            }
-        }
     }
 }
 
@@ -889,281 +571,46 @@ mod tests {
     }
 
     #[test]
-    fn fallback_prioritizes_healthy_complete_paths_of_different_lengths() {
+    fn probe_connectors_do_not_advance_forwarding_counters_or_reselect_pinned_flows() {
         let (chain, catalog) = super::super::health_tests::build(
-            json!([{"client_group":"out","type":"fallback",
-            "health_check":{"url":"http://probe.invalid/","interval_secs":10},
-            "client_chains":[
-                {"name":"long","chain":[
-                    {"address":"192.0.2.1:80","protocol":{"type":"http"}},
-                    {"address":"192.0.2.2:80","protocol":{"type":"http"}}
-                ]},
-                {"name":"short","address":"192.0.2.3:80","protocol":{"type":"http"}}
-            ]}]),
-            json!("out"),
-        );
-        let tree = chain.composition.as_ref().unwrap();
-        let choices = catalog.selection.snapshot();
-        assert_eq!(tree.select(false).unwrap().num_hops(), 2);
-        let record = |path: usize, healthy| {
-            for check in &tree.checked[path].checks {
-                check.record(
-                    Ok((1, healthy)),
-                    choices.clone(),
-                    tokio::time::Instant::now(),
-                );
-            }
-        };
-        record(1, true);
-        assert_eq!(addresses(&tree.select(false).unwrap()), ["192.0.2.3:80"]);
-        record(0, true);
-        assert_eq!(tree.select(false).unwrap().num_hops(), 2);
-        record(0, false);
-        assert_eq!(tree.select(false).unwrap().num_hops(), 1);
-        record(1, false);
-        assert_eq!(
-            tree.select(false).unwrap_err().kind(),
-            io::ErrorKind::NotConnected
-        );
-    }
-
-    fn automatic_config() -> serde_json::Value {
-        json!([
-            {"client_group":"auto","type":"url-test","url":"http://probe.invalid/","client_chains":[
-                {"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}},
-                {"name":"b","address":"192.0.2.2:80","protocol":{"type":"http"}}
-            ]},
-            {"client_group":"prefix","client_chains":[
-                {"name":"p1","address":"192.0.2.3:80","protocol":{"type":"http"}},
-                {"name":"p2","address":"192.0.2.4:80","protocol":{"type":"http"}}
-            ]},
-            {"client_group":"suffix","client_chains":[{"name":"end","address":"192.0.2.5:80","protocol":{"type":"http"}}]}
-        ])
-    }
-
-    fn addresses(chain: &ClientProxyChain) -> Vec<String> {
-        let mut addresses = Vec::new();
-        if let InitialHopEntry::Proxy { proxy, .. } = chain.initial_hop[0].as_ref() {
-            addresses.push(proxy.proxy_location().to_string());
-        }
-        addresses.extend(
-            chain
-                .subsequent_hops
-                .iter()
-                .map(|hop| hop[0].proxy_location().to_string()),
-        );
-        addresses
-    }
-
-    #[test]
-    fn automatic_probes_include_prefix_and_suffix_without_advancing_flow_counters() {
-        let (chain, catalog) = super::super::health_tests::build(
-            automatic_config(),
-            json!(["prefix", "auto", "suffix"]),
-        );
-        let tree = chain.composition.as_ref().unwrap();
-        let context = tree.test_contexts().pop().unwrap();
-        let mut prefixes: [std::collections::HashSet<String>; 2] = Default::default();
-        for _ in 0..64 {
-            for (member, seen) in prefixes.iter_mut().enumerate() {
-                let sample = context
-                    .sample(member, &catalog.selection.snapshot())
-                    .unwrap()
-                    .unwrap();
-                let addresses = addresses(&sample.chains[0]);
-                assert!(["192.0.2.3:80", "192.0.2.4:80"].contains(&addresses[0].as_str()));
-                seen.insert(addresses[0].clone());
-                assert_eq!(
-                    addresses[1..],
-                    [format!("192.0.2.{}:80", member + 1), "192.0.2.5:80".into()]
-                );
-                assert!(sample.chains[0].composition.is_none());
-                assert!(sample.chains[0].automatic_contexts.is_empty());
-            }
-        }
-        assert!(prefixes.iter().all(|seen| seen.len() == 2));
-        // An odd probe count exposes accidental advancement of the two-member prefix.
-        context
-            .sample(0, &catalog.selection.snapshot())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            addresses(&tree.select(false).unwrap()),
-            ["192.0.2.3:80", "192.0.2.1:80", "192.0.2.5:80"]
-        );
-        assert_eq!(
-            addresses(&tree.select(false).unwrap()),
-            ["192.0.2.4:80", "192.0.2.1:80", "192.0.2.5:80"]
-        );
-    }
-
-    #[test]
-    fn automatic_contexts_register_in_occurrence_order() {
-        let (chain, catalog) =
-            super::super::health_tests::build(automatic_config(), json!(vec!["auto"; 8]));
-        let tree = chain.composition.as_ref().unwrap();
-        let mut contexts: Vec<_> = tree.contexts.iter().collect();
-        contexts.sort_by_key(|(id, _)| **id);
-        let registered = catalog.selection.contexts.snapshot();
-        assert_eq!(registered.len(), 8);
-        assert_eq!(registered.len(), contexts.len());
-        for (registered, (_, context)) in registered.iter().zip(&contexts) {
-            assert!(Arc::ptr_eq(registered, context));
-        }
-    }
-
-    #[test]
-    fn repeated_automatic_occurrences_and_standalone_samples_are_isolated() {
-        let (chain, catalog) =
-            super::super::health_tests::build(automatic_config(), json!(["auto", "auto"]));
-        let tree = chain.composition.as_ref().unwrap();
-        let mut contexts: Vec<_> = tree.contexts.iter().collect();
-        contexts.sort_by_key(|(id, _)| **id);
-        contexts[0].1.record(1, 0, Some(1));
-        contexts[1].1.record(0, 0, Some(1));
-        catalog
-            .selection
-            .automatic
-            .record("b", "http://probe.invalid/", Some(1));
-        assert_eq!(tree.test_select_indices(false).unwrap(), [1, 0]);
-        assert_eq!(contexts[1].1.group.health("b"), "unprobed");
-        let snapshot = crate::control::runtime::Generation {
-            id: 1,
-            leaf_udp_support: crate::clash_api::dto::leaf_udp_support(&catalog).unwrap(),
-            catalog,
-            rules: Vec::new(),
-            probes: crate::control::probes::ProbeState::new(
-                Arc::new(crate::resolver::NativeResolver::new()),
-                Vec::new(),
-            ),
-        };
-        crate::clash_api::dto::proxies(&snapshot);
-        assert_eq!(tree.test_select_indices(false).unwrap(), [1, 0]);
-    }
-
-    #[test]
-    fn automatic_context_budget_spans_roots_and_reclaims_dropped_routes() {
-        let limit = crate::control::url_test::context::MAX_CONTEXTS;
-        let (first, catalog) = super::super::health_tests::build(
             json!([
-                {"client_group":"auto","type":"url-test","url":"http://probe.invalid/","client_chains":["direct"]},
-                {"client_group":"wide","client_chains":vec!["auto"; limit / 2]}
+                {"client_group":"pool","client_chains":[
+                    {"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}},
+                    {"name":"b","address":"192.0.2.2:80","protocol":{"type":"http"}}
+                ]},
+                {"client_group":"auto","type":"url-test","url":"http://192.0.2.3/",
+                 "client_chains":["pool","direct"]}
             ]),
-            json!("wide"),
+            json!("auto"),
         );
-        let build = |name| {
-            crate::tcp::chain_builder::try_build_client_proxy_chain(
-                catalog.route(name).unwrap().hops,
-                Arc::new(crate::resolver::NativeResolver::new()),
-            )
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let probe = crate::tcp::chain_builder::try_build_client_proxy_chain(
+            catalog.route("pool").unwrap().hops,
+            resolver,
+        )
+        .unwrap();
+        for _ in 0..3 {
+            probe.composition.as_ref().unwrap().select(false).unwrap();
+        }
+        let pinned = chain.composition.as_ref().unwrap().select(false).unwrap();
+        let InitialHopEntry::Proxy { proxy, .. } = pinned.initial_hop[0].as_ref() else {
+            panic!()
         };
-        let second = build("wide").unwrap();
-        assert_eq!(catalog.selection.contexts.snapshot().len(), limit);
-        let error = build("auto").unwrap_err();
-        assert!(
-            error.to_string().contains("1024 active route contexts"),
-            "{error}"
-        );
-        assert_eq!(catalog.selection.contexts.snapshot().len(), limit);
-        drop(first);
-        let replacement = build("wide").unwrap();
-        assert_eq!(catalog.selection.contexts.snapshot().len(), limit);
-        drop((second, replacement));
-        assert!(catalog.selection.contexts.snapshot().is_empty());
-    }
-
-    #[test]
-    fn simplification_contextual_samples_are_fenced_by_all_selector_changes() {
-        let mut config = automatic_config();
-        config.as_array_mut().unwrap().push(
-            json!({"client_group":"manual","type":"selector","client_chains":["prefix","suffix"]}),
-        );
-        config.as_array_mut().unwrap().push(json!({"client_group":"unrelated","type":"selector","client_chains":["prefix","suffix"]}));
-        let (chain, catalog) = super::super::health_tests::build(config, json!(["manual", "auto"]));
-        let context = chain
-            .composition
-            .as_ref()
-            .unwrap()
-            .test_contexts()
-            .pop()
-            .unwrap();
-        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
-        owner.activate(catalog.selection.clone()).unwrap();
-        let old_choices = catalog.selection.snapshot();
-        let revision = context.revision();
-        context.record(1, revision, Some(1));
+        assert_eq!(proxy.proxy_location().to_string(), "192.0.2.1:80");
         catalog
             .selection
             .automatic
-            .record("b", "http://probe.invalid/", Some(1));
-        owner.select("unrelated", "prefix").unwrap();
-        assert_eq!(context.revision(), revision);
-        assert!(Arc::ptr_eq(&old_choices, &catalog.selection.snapshot()));
-        owner.select("unrelated", "suffix").unwrap();
-        assert_ne!(context.revision(), revision);
-        assert_eq!(catalog.selection.automatic.0["auto"].health("b"), "healthy");
-        assert_eq!(context.group.health("b"), "unprobed");
-        owner.select("unrelated", "prefix").unwrap();
-        assert_eq!(*old_choices, *catalog.selection.snapshot());
-        context.record(1, revision, Some(1));
-        assert_eq!(context.group.health("b"), "unprobed");
-        context.record(1, context.revision(), Some(1));
-        let eligible = ["a", "b"].into_iter().collect();
-        assert_eq!(
-            context
-                .choose(&eligible, false, &old_choices, tokio::time::Instant::now())
-                .as_deref(),
-            Some("a")
-        );
-        assert_eq!(
-            context
-                .choose(
-                    &eligible,
-                    false,
-                    &catalog.selection.snapshot(),
-                    tokio::time::Instant::now()
-                )
-                .as_deref(),
-            Some("b")
-        );
-        owner.select("manual", "suffix").unwrap();
-        context.record(1, revision, Some(1));
-        assert_eq!(context.group.health("b"), "unprobed");
-    }
-
-    #[test]
-    fn probe_ancestors_are_forced_without_bypassing_manual_guards_or_retaining_roots() {
-        let mut config = automatic_config();
-        config.as_array_mut().unwrap().push(
-            json!({"client_group":"guard","type":"selector","client_chains":["auto","prefix"]}),
-        );
-        config
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"client_group":"outer","client_chains":["suffix","guard"]}));
-        let (chain, catalog) = super::super::health_tests::build(config, json!("outer"));
-        let tree = chain.composition.as_ref().unwrap();
-        let context = tree.test_contexts().pop().unwrap();
-        let sampled = context
-            .sample(1, &catalog.selection.snapshot())
-            .unwrap()
-            .unwrap();
-        assert_eq!(addresses(&sampled.chains[0]), ["192.0.2.2:80"]);
-        assert_eq!(addresses(&tree.select(false).unwrap()), ["192.0.2.5:80"]);
-        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
-        owner.activate(catalog.selection.clone()).unwrap();
-        owner.select("guard", "prefix").unwrap();
+            .record("DIRECT", "http://192.0.2.3/", Some(1));
         assert!(
-            context
-                .sample(1, &catalog.selection.snapshot())
+            chain
+                .composition
+                .as_ref()
                 .unwrap()
-                .is_none()
+                .select(false)
+                .unwrap()
+                .is_direct_only()
         );
-        let weak = Arc::downgrade(tree);
-        drop(chain);
-        assert!(weak.upgrade().is_none());
-        assert!(!context.active(&catalog.selection.snapshot()));
-        drop(context);
-        assert!(catalog.selection.contexts.snapshot().is_empty());
+        assert!(!pinned.is_direct_only());
+        assert_eq!(proxy.proxy_location().to_string(), "192.0.2.1:80");
     }
 }
