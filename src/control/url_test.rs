@@ -48,9 +48,7 @@ struct State {
     incumbent: [Option<String>; 2],
     last_touch: Option<Instant>,
     last_check: Option<Instant>,
-    last_unqueued_admission: Option<Instant>,
     recheck: bool,
-    cursor: usize,
 }
 
 #[derive(Debug)]
@@ -274,22 +272,7 @@ impl AutomaticGroup {
         }
         state.last_check = Some(now);
         state.recheck = false;
-        let members = (state.cursor..self.members.len())
-            .chain(0..state.cursor)
-            .collect();
-        Some(members)
-    }
-
-    pub fn admitted(&self, index: usize, queued: bool) {
-        let mut state = self.state.lock();
-        state.cursor = (index + 1) % self.members.len();
-        if !queued {
-            state.last_unqueued_admission = Some(Instant::now());
-        }
-    }
-
-    pub fn last_unqueued_admission(&self) -> Option<Instant> {
-        self.state.lock().last_unqueued_admission
+        Some((0..self.members.len()).collect())
     }
 
     pub fn cancel_check(&self) {

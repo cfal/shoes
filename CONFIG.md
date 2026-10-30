@@ -444,30 +444,34 @@ the same normalized URL and wildcard/default expected status also update matchin
 groups. Other URLs and explicit status expectations cannot overwrite selection
 samples. Nested automatic groups use their shared group state.
 
-Periodic and API probes share a 16-probe limit. Each periodic round's timeout
-includes admission/queue time; members not admitted before the deadline retain
-their previous health. A deadline expiry after queueing is inconclusive and also
-preserves prior health; successful probes and explicit remote errors still update it.
-Members with no full-budget attempt, then the oldest full-budget attempts, lead each
-round, independently of health. Local failures cannot monopolize these slots, and
-queued attempts can receive a full budget on a later round. Tied members rotate on admission.
-Due groups with the oldest unqueued admission get priority, with stable catalog
-order breaking ties.
-Under sustained saturation, reduce group size, increase
-timeout/interval, or expect unprobed/stale members. Scheduling has one-second
+Periodic and API probes share a 16-probe limit. Each automatic member check gets
+its full timeout after admission; waiting for capacity does not consume that
+timeout or change health. An admitted check that times out records a failure.
+Due groups start in catalog order, and each round checks members in configuration
+order. Rounds have no overall deadline and can exceed the configured interval
+under load. Under sustained saturation, reduce group size or adjust
+timeouts/intervals, or expect unprobed/stale members. Scheduling has one-second
 granularity and does not overlap rounds within a group; other groups can run while
 a slow round is in flight. Activation/reload cancels old work and rejects obsolete
 results; an interrupted round is immediately eligible when its generation resumes.
 New committed generations start with unprobed health.
+
+Manual API group probes retain a request-wide deadline, including queue time.
+Expiry after queued admission is inconclusive and preserves prior health.
+API batches prioritize members with no full-budget API attempt, then the oldest
+such attempts; automatic rounds do not track or use these priorities.
+Long automatic rounds can keep capacity busy across multiple member timeouts,
+causing single-node API probes to report busy or API group probes to time out.
 
 The controller reports `type: URLTest`, group TCP `now`, optional `udpNow`,
 `testUrl`, and selected-member `health` (`unprobed`, `healthy`, `dead`, or `stale`).
 Its `alive` is true only for fresh healthy results. Manual selection PUTs for
 automatic groups are rejected; automatic choices are neither pinned nor persisted.
 Leaf histories remain bounded to ten samples per URL and eight URLs. Automatic
-selection retains its configured-URL samples and full-budget attempt timestamps
-independently of API eviction; other attempt URLs are capped at eight per member
-for each of filtered and unfiltered probes.
+selection retains its configured-URL samples independently of API eviction.
+API full-budget attempt timestamps for configured URLs also survive eviction;
+other attempt URLs are capped at eight per member for each of filtered and
+unfiltered probes.
 All occurrences of a URL-test group share its samples and TCP/UDP incumbents.
 There are no route contexts, per-occurrence probe rounds, or contextual samplers.
 Forwarding and dashboard selection consult the same group state, subject to each

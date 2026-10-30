@@ -35,6 +35,7 @@ struct UrlHistory {
 
 #[derive(Default)]
 struct FullBudgetAttempts {
+    // API batches retain request-wide deadlines and prioritize full-budget attempts.
     configured: IndexMap<String, tokio::time::Instant>,
     unfiltered: IndexMap<String, tokio::time::Instant>,
     filtered: IndexMap<String, tokio::time::Instant>,
@@ -407,7 +408,7 @@ async fn probe_until(
     group: Option<&super::url_test::AutomaticGroup>,
 ) -> io::Result<u16> {
     with_probe_epoch(runtime, generation, epoch, || {
-        if !queued {
+        if group.is_none() && !queued {
             generation.probes.record_full_budget_attempt(
                 name,
                 query,
@@ -563,25 +564,23 @@ pub(crate) async fn run_automatic(
             return;
         }
         let now = tokio::time::Instant::now();
-        let mut due: Vec<_> = groups
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !checking[*index])
-            .filter_map(|(index, group)| group.due_members(now).map(|members| (index, members)))
-            .collect();
-        // A busy, short-interval group must not reset a waiting group's priority.
-        due.sort_by_key(|(index, _)| groups[*index].last_unqueued_admission());
-        for (index, members) in due {
+        for (index, group) in groups.iter().enumerate() {
+            if checking[index] {
+                continue;
+            }
+            let Some(members) = group.due_members(now) else {
+                continue;
+            };
             checking[index] = true;
             let runtime = runtime.clone();
             let generation = &generation;
             let epoch = &epoch;
             let round = AutomaticRound {
-                group: groups[index],
+                group,
                 completed: false,
             };
             rounds.push(async move {
-                run_automatic_round(round, &runtime, generation, members, now, epoch).await;
+                run_automatic_round(round, &runtime, generation, members, epoch).await;
                 index
             });
         }
@@ -605,8 +604,7 @@ async fn run_automatic_round(
     mut round: AutomaticRound<'_>,
     runtime: &ControlRuntime,
     generation: &Generation,
-    mut members: Vec<usize>,
-    started: tokio::time::Instant,
+    members: Vec<usize>,
     epoch: &CancellationToken,
 ) {
     let group = round.group;
@@ -615,34 +613,26 @@ async fn run_automatic_round(
         timeout: Duration::from_millis(group.config.timeout),
         expected: Vec::new(),
     };
-    let deadline = started + query.timeout;
-    // Local failures do not change health, but must not monopolize full-budget slots.
-    generation
-        .probes
-        .order_members(&mut members, &group.members, &query);
-    let mut probes = futures::stream::iter(members.into_iter().enumerate())
-        .map(|(ordinal, index)| {
+    let mut probes = futures::stream::iter(members)
+        .map(|index| {
             let query = &query;
             async move {
-                let Ok((_permit, waited)) = acquire_probe(runtime, deadline).await else {
+                let permit = tokio::select! {
+                    biased;
+                    _ = runtime.shutdown.cancelled() => return,
+                    _ = epoch.cancelled() => return,
+                    permit = runtime.probes.acquire() => permit,
+                };
+                let Ok(_permit) = permit else {
                     return;
                 };
-                if tokio::time::Instant::now() >= deadline {
-                    return;
-                }
-                let queued = waited || ordinal >= PROBE_CONCURRENCY;
-                if with_probe_epoch(runtime, generation, epoch, || group.admitted(index, queued))
-                    .is_err()
-                {
-                    return;
-                }
                 let _ = probe_until(
                     runtime,
                     generation,
                     &group.members[index],
                     query,
-                    deadline,
-                    queued,
+                    tokio::time::Instant::now() + query.timeout,
+                    false,
                     epoch,
                     Some(group),
                 )
