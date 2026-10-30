@@ -293,15 +293,6 @@ impl ClientProxyChain {
             .collect()
     }
 
-    #[cfg(test)]
-    fn test_record_automatic(&self, member: &str, url: &str, delay: Option<u16>) {
-        self.selection
-            .as_ref()
-            .unwrap()
-            .automatic
-            .record(member, url, delay);
-    }
-
     fn origin(&self, hop: usize, index: usize) -> Option<&MemberOrigin> {
         self.origins.get(hop)?.get(index)?.as_ref()
     }

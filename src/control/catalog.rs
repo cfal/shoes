@@ -484,12 +484,6 @@ impl Catalog {
                     path.push((name.to_owned(), member.clone()));
                     branches.push(self.expand_route(member, path, depth + 1, count)?);
                 }
-                if *group_type == GroupType::RoundRobin
-                    && branches.len() == 1
-                    && branches[0].hops.iter().count() == 1
-                {
-                    return Ok(branches.remove(0));
-                }
                 charge(count)?;
                 ClientChainHop::Choice(Box::new(crate::config::ClientChoice {
                     name,

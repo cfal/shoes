@@ -230,7 +230,6 @@ pub(super) fn create_server_configs_with_memory(
         super::client_visit::visit_hop_clients(group, &mut |client| {
             validate_client_config(client, &named_pems, global_limits)
         })?;
-        super::composition::validate(&OneOrSome::One(group.clone()))?;
     }
 
     // Extract inline DNS configs from server/tun configs into dns_groups.

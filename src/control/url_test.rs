@@ -227,10 +227,7 @@ impl AutomaticGroup {
     }
 
     pub fn choose(&self, eligible: &HashSet<&str>, udp: bool) -> Option<String> {
-        self.choose_at(eligible, udp, Instant::now())
-    }
-
-    fn choose_at(&self, eligible: &HashSet<&str>, udp: bool, now: Instant) -> Option<String> {
+        let now = Instant::now();
         let mut state = self.state.lock();
         let delay = |name: &str| {
             state
