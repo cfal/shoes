@@ -604,7 +604,7 @@ async fn run_automatic_round(
     mut round: AutomaticRound<'_>,
     runtime: &ControlRuntime,
     generation: &Generation,
-    members: Vec<usize>,
+    members: std::ops::Range<usize>,
     epoch: &CancellationToken,
 ) {
     let group = round.group;

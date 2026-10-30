@@ -252,7 +252,7 @@ impl AutomaticGroup {
         }
     }
 
-    pub fn due_members(&self, now: Instant) -> Option<Vec<usize>> {
+    pub fn due_members(&self, now: Instant) -> Option<std::ops::Range<usize>> {
         let mut state = self.state.lock();
         let interval = Duration::from_secs(self.config.interval);
         if let Some(last_check) = state.last_check {
@@ -272,7 +272,7 @@ impl AutomaticGroup {
         }
         state.last_check = Some(now);
         state.recheck = false;
-        Some((0..self.members.len()).collect())
+        Some(0..self.members.len())
     }
 
     pub fn cancel_check(&self) {
@@ -397,7 +397,7 @@ mod tests {
     async fn lazy_startup_probe_suppression_touch_and_rate_limited_recheck() {
         let groups = groups();
         let group = &groups.0["one"];
-        assert!(group.due_members(Instant::now()).is_some());
+        assert_eq!(group.due_members(Instant::now()), Some(0..2));
         tokio::time::advance(Duration::from_secs(10)).await;
         BACKGROUND
             .scope((), async {
@@ -406,11 +406,11 @@ mod tests {
             .await;
         assert!(group.due_members(Instant::now()).is_none());
         groups.touch("one", false);
-        assert!(group.due_members(Instant::now()).is_some());
+        assert_eq!(group.due_members(Instant::now()), Some(0..2));
         groups.touch("one", true);
         assert!(group.due_members(Instant::now()).is_none());
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(group.due_members(Instant::now()).is_some());
+        assert_eq!(group.due_members(Instant::now()), Some(0..2));
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(group.due_members(Instant::now()).is_none());
     }
