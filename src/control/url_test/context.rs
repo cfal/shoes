@@ -30,6 +30,7 @@ impl Contexts {
             ));
         }
         for context in contexts {
+            // The caller holds the selection read lock until registration completes.
             context.gate.lock().choices = relevant_choices(&context.dependencies, choices);
             live.push(Arc::downgrade(context));
         }
@@ -69,6 +70,7 @@ fn relevant_choices(paths: &[ManualSelectorPath], choices: &Choices) -> Choices 
         .collect()
 }
 
+#[derive(Default)]
 struct Gate {
     revision: u64,
     choices: Choices,
@@ -112,12 +114,10 @@ impl Context {
         definition: Definition,
         owner: Weak<Composition>,
         resolver: Arc<dyn Resolver>,
-        choices: &Choices,
     ) -> Arc<Self> {
         let mut dependencies = definition.dependencies;
         dependencies.extend(resolver.manual_selector_paths());
         let members = definition.labels;
-        let choices = relevant_choices(&dependencies, choices);
         Arc::new(Self {
             name: definition.name,
             attempts: Mutex::new(vec![None; members.len()]),
@@ -134,10 +134,7 @@ impl Context {
             ancestors: definition.ancestors,
             required: definition.required,
             dependencies,
-            gate: Mutex::new(Gate {
-                revision: 0,
-                choices,
-            }),
+            gate: Mutex::default(),
         })
     }
 
