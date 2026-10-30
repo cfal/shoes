@@ -105,12 +105,13 @@ pub(crate) fn build_with_limits(
     if config.transport == Transport::Udp {
         return Err(invalid("XHTTP requires TCP or QUIC transport"));
     }
-    let mut outer = config.protocol.clone();
+    let mut protocol = &config.protocol;
     let mut masks = Vec::new();
-    while let ClientProxyConfig::SudokuMask(config) = outer {
-        masks.push(config.prepare()?);
-        outer = *config.protocol;
+    while let ClientProxyConfig::SudokuMask(mask) = protocol {
+        masks.push(mask.prepare()?);
+        protocol = &mask.protocol;
     }
+    let mut outer = protocol.clone();
     let default_sni = config.address.address().hostname().map(str::to_owned);
     let (xhttp, effective_sni, security, tls_alpn, reality) = match &mut outer {
         ClientProxyConfig::Xhttp(xhttp) => (
@@ -268,20 +269,16 @@ pub(crate) fn build_with_limits(
         None,
         resolver,
     )?;
-    Ok(Some((
-        Arc::new(
-            Client::new(
-                xhttp,
-                config.address.clone(),
-                authority,
-                version,
-                mode,
-                security,
-            )?
-            .with_masks(masks),
-        ),
-        inner,
-    )))
+    let client = Client::new(
+        xhttp,
+        config.address.clone(),
+        authority,
+        version,
+        mode,
+        security,
+    )?
+    .with_masks(masks);
+    Ok(Some((Arc::new(client), inner)))
 }
 
 #[cfg(test)]

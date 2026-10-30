@@ -68,10 +68,10 @@ fn contains_server(protocol: &ServerProxyConfig) -> bool {
             reality_targets,
             ..
         } => {
-            tls_targets.values().any(|c| contains_server(&c.protocol))
-                || default_tls_target
-                    .as_ref()
-                    .is_some_and(|c| contains_server(&c.protocol))
+            tls_targets
+                .values()
+                .chain(default_tls_target.as_deref())
+                .any(|c| contains_server(&c.protocol))
                 || shadowtls_targets
                     .values()
                     .any(|c| contains_server(&c.protocol))
