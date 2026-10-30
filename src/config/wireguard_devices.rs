@@ -135,34 +135,36 @@ fn normalize_client(client: &mut ClientConfig) -> io::Result<()> {
     normalize_cidrs(&mut config.addresses, false)?;
     normalize_cidrs(&mut config.allowed_ips, true)?;
     config.resource_limits = config.device(&client.address, None).limits();
-    if let Some(chain) = &mut config.peer_client_chain {
-        normalize_fixed_chain(chain);
-    }
+    config.peer_client_chain = config.peer_client_chain.take().map(normalize_fixed_chain);
     Ok(())
 }
 
-fn normalize_fixed_chain(chain: &mut super::ClientChain) {
+fn normalize_fixed_chain(chain: super::ClientChain) -> super::ClientChain {
     let mut hops = Vec::new();
-    for mut hop in chain.hops.clone().into_vec() {
-        match &mut hop {
+    for hop in chain.hops.into_vec() {
+        match hop {
             ClientChainHop::Pool(pool) if pool.iter().count() == 1 => {
-                hops.push(ClientChainHop::Single(pool.iter().next().unwrap().clone()));
+                hops.push(ClientChainHop::Single(pool.into_vec().remove(0)));
             }
-            ClientChainHop::Choice(choice) => {
-                for member in &mut choice.members {
-                    normalize_fixed_chain(member);
-                }
+            ClientChainHop::Choice(mut choice) => {
+                choice.members = choice
+                    .members
+                    .into_iter()
+                    .map(normalize_fixed_chain)
+                    .collect();
                 // A fixed alias carries no scheduling policy; leaf origins retain selectors.
                 if choice.group_type == super::GroupType::RoundRobin && choice.members.len() == 1 {
                     hops.extend(choice.members.remove(0).hops.into_vec());
                 } else {
-                    hops.push(hop);
+                    hops.push(ClientChainHop::Choice(choice));
                 }
             }
-            _ => hops.push(hop),
+            hop => hops.push(hop),
         }
     }
-    chain.hops = crate::option_util::OneOrSome::Some(hops);
+    super::ClientChain {
+        hops: crate::option_util::OneOrSome::Some(hops),
+    }
 }
 
 fn normalize_cidrs(prefixes: &mut Vec<String>, routes: bool) -> io::Result<()> {
@@ -187,6 +189,10 @@ fn validate_carrier_mtu(device: &WireguardDeviceConfig) -> io::Result<()> {
     let Some(chain) = &device.peer_client_chain else {
         return Ok(());
     };
+    validate_carrier_chain_mtu(chain, device.mtu)
+}
+
+fn validate_carrier_chain_mtu(chain: &super::ClientChain, mtu: u16) -> io::Result<()> {
     if chain.hops.iter().count() != 1 {
         return Ok(());
     }
@@ -196,7 +202,7 @@ fn validate_carrier_mtu(device: &WireguardDeviceConfig) -> io::Result<()> {
         };
         if let ClientProxyConfig::Wireguard(carrier) = &client.protocol {
             // IPv6 UDP plus WireGuard header, tag and worst-case padding.
-            let required = device.mtu.next_multiple_of(16) + 80;
+            let required = mtu.next_multiple_of(16) + 80;
             if carrier.mtu < required {
                 return Err(invalid(format!(
                     "WireGuard peer_client_chain requires carrier MTU >= {required}"
@@ -208,9 +214,7 @@ fn validate_carrier_mtu(device: &WireguardDeviceConfig) -> io::Result<()> {
     match chain.hops.iter().next().unwrap() {
         ClientChainHop::Choice(choice) => {
             for member in &choice.members {
-                let mut device = device.clone();
-                device.peer_client_chain = Some(member.clone());
-                validate_carrier_mtu(&device)?;
+                validate_carrier_chain_mtu(member, mtu)?;
             }
             Ok(())
         }
