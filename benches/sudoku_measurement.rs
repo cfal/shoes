@@ -2,6 +2,7 @@ use super::super::{SudokuStream, tests};
 use super::*;
 use crate::async_stream::{AsyncPing, AsyncStream};
 use futures::task::noop_waker_ref;
+use rand::SeedableRng;
 use serde_json::json;
 use std::{
     hint::black_box,
@@ -105,7 +106,7 @@ fn measure(name: &str, bytes: usize, mut operation: impl FnMut()) {
 fn sudoku_measurement() {
     assert!(!cfg!(debug_assertions), "use --release");
     let plain: Vec<_> = (0..3072).map(|i| (i * 37 + i / 256) as u8).collect();
-    for layout in ["entropy", "ascii", "rotating"] {
+    for layout in ["entropy", "ascii", "custom", "rotating"] {
         for padding in [0, 10] {
             let mut options = json!({
                 "password": "sudoku-perf",
@@ -114,6 +115,8 @@ fn sudoku_measurement() {
             });
             if layout == "rotating" {
                 options["custom_tables"] = json!(["", "xpxvvpvv", "vxpvxvvp"]);
+            } else if layout == "custom" {
+                options["custom_table"] = json!("xpxvvpvv");
             } else {
                 options["ascii"] = json!(layout);
             }
@@ -124,6 +127,7 @@ fn sudoku_measurement() {
             ] {
                 let name = format!("{layout}/{mode}/pad{padding}");
                 let mut encoder = Encoder::new(config.clone(), write);
+                encoder.rng = StdRng::seed_from_u64(42);
                 let mut buffer = vec![0; plain.len() * 9 + 8];
                 // Three writes return both codecs to layout zero for the rotating case.
                 let mut wire = Vec::new();
@@ -131,7 +135,7 @@ fn sudoku_measurement() {
                     let n = encoder.encode(&plain, &mut buffer);
                     wire.extend_from_slice(&buffer[..n]);
                 }
-                if layout != "rotating"
+                if matches!(layout, "entropy" | "ascii")
                     && let Some(directory) = std::env::var_os("SUDOKU_BENCH_WIRE_DIR")
                 {
                     let path = std::path::Path::new(&directory)
