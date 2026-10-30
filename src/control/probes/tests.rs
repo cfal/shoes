@@ -14,6 +14,29 @@ async fn publish_for_api_probes(runtime: &ControlRuntime, generation: &Arc<Gener
 }
 
 #[tokio::test]
+async fn review_reject_probe_preserves_history() {
+    let mut catalog = catalog();
+    catalog.nodes.insert("REJECT".into(), CatalogNode::Reject);
+    let generation = Arc::new(generation(catalog, Arc::new(Answers(Vec::new()))));
+    let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+    publish_for_api_probes(&service.runtime, &generation).await;
+    let before = crate::clash_api::dto::proxy(&generation, &Default::default(), "REJECT").unwrap();
+    let error = probe(&service.runtime, &generation, "REJECT", &query())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    let after = crate::clash_api::dto::proxy(&generation, &Default::default(), "REJECT").unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        generation
+            .probes
+            .url_history("REJECT", "http://probe.invalid/"),
+        json!([])
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test]
 async fn probe_epoch_fence_preserves_errors_and_skips_stale_writes() {
     let generation = Arc::new(generation(catalog(), Arc::new(Answers(Vec::new()))));
     let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();

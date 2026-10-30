@@ -473,7 +473,13 @@ impl Catalog {
                     hops: OneOrSome::Some(hops),
                 });
             }
-            _ => {
+            Some(CatalogNode::Reject) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "REJECT cannot carry a probe",
+                ));
+            }
+            None => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "proxy does not exist or cannot carry a probe",
