@@ -2419,24 +2419,31 @@ async fn streaming_body_limit_preserves_last_good_cache() {
 
 #[tokio::test]
 async fn chunked_body_is_bounded_and_validated() {
-    let dir = directory();
-    let path = dir.path().join("rules.json");
-    let mut bytes = format!(
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
-        VALID.len()
-    )
-    .into_bytes();
-    bytes.extend_from_slice(VALID);
-    bytes.extend_from_slice(b"\r\n0\r\n\r\n");
-    let (url, fixture) = serve(bytes).await;
-    assert_eq!(
-        update(&source(&url, &path), Limits::default())
-            .await
-            .unwrap(),
-        "updated"
-    );
-    fixture.await.unwrap();
-    assert_eq!(std::fs::read(path).unwrap(), VALID);
+    for length in [
+        "",
+        "Content-Length: 0\r\n",
+        "Content-Length: 1\r\n",
+        "Content-Length: 67108865\r\n",
+    ] {
+        let dir = directory();
+        let path = dir.path().join("rules.json");
+        let mut bytes = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n{length}\r\n{:x}\r\n",
+            VALID.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(VALID);
+        bytes.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (url, fixture) = serve(bytes).await;
+        assert_eq!(
+            update(&source(&url, &path), Limits::default())
+                .await
+                .unwrap(),
+            "updated"
+        );
+        fixture.await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), VALID);
+    }
 }
 
 #[tokio::test]

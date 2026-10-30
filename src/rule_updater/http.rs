@@ -8,6 +8,7 @@ use crate::rules::invalid;
 use bytes::Bytes;
 use http::{Request, StatusCode, Uri, header};
 use http_body_util::{BodyExt, Empty};
+use hyper::body::Body;
 use hyper_util::rt::TokioIo;
 use std::io;
 use std::net::IpAddr;
@@ -212,10 +213,7 @@ pub(super) async fn download(
         {
             return Err(invalid("HTTP content encoding unsupported; serve identity"));
         }
-        let length = headers
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
+        let length = response.body().size_hint().exact();
         if length.is_some_and(|length| length == 0 || length > MAX_BYTES) {
             return Err(invalid("download size outside permitted range"));
         }
