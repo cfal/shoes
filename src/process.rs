@@ -264,9 +264,7 @@ async fn prepare_tracking(
     let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated.configs).collect();
     validated.refresh_catalog()?;
     dns::check_interception(&validated.configs, &validated.dns_groups).await?;
-    let protect_tun_endpoints = validated.configs.iter().any(|config| {
-        matches!(config, Config::TunServer(tun) if tun.auto_route || tun.dns_hijack == Some(true))
-    });
+    let protect_tun_endpoints = config::protects_tun_endpoints(&validated.configs);
     let mut dns = dns::build_dns_registry_for_runtime(
         std::mem::take(&mut validated.dns_groups),
         validated.global_limits,

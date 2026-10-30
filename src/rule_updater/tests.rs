@@ -244,7 +244,7 @@ async fn bootstrap_preserves_inline_tls_names_and_loads_local_pems() {
 
 #[tokio::test]
 async fn bootstrap_preflights_later_synthetic_endpoints_before_any_download() {
-    for retained in [false, true] {
+    for guard in ["fake-ip", "retained", "tun"] {
         for endpoint in ["destination", "proxy", "DNS"] {
             let dir = directory();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -269,13 +269,19 @@ async fn bootstrap_preflights_later_synthetic_endpoints_before_any_download() {
             }
             let mut config = configs(&first);
             config.extend(configs(&second).into_iter().skip(1));
-            let ranges = if retained {
+            let ranges = if guard == "retained" {
                 vec!["198.18.0.0/15".parse().unwrap()]
             } else {
                 config.push(
-                    serde_json::from_value(serde_json::json!({
-                        "dns_group": "fake", "dns_servers": "system", "fake_ip": {}
-                    }))
+                    serde_json::from_value(if guard == "tun" {
+                        serde_json::json!({
+                            "device_name": "tun-test", "address": "198.18.0.1", "dns_hijack": true
+                        })
+                    } else {
+                        serde_json::json!({
+                            "dns_group": "fake", "dns_servers": "system", "fake_ip": {}
+                        })
+                    })
                     .unwrap(),
                 );
                 Vec::new()
@@ -298,6 +304,70 @@ async fn bootstrap_preflights_later_synthetic_endpoints_before_any_download() {
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bootstrap_preflights_managed_system_dns_before_any_download() {
+    const CHILD: &str = "SHOES_BOOTSTRAP_PREFLIGHT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rule_updater::tests::bootstrap_preflights_managed_system_dns_before_any_download",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let dir = directory();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut first = source(
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+        &dir.path().join("first.json"),
+    );
+    first.download.as_mut().unwrap().bootstrap_url = "tcp://192.0.2.53".into();
+    let mut second = first.clone();
+    second.path = dir.path().join("second.json");
+    second.download.as_mut().unwrap().bootstrap_url = "system".into();
+    let mut configs = configs(&first);
+    configs.extend(self::configs(&second).into_iter().skip(1));
+    let endpoints = vec!["198.18.0.53:53".parse().unwrap()];
+    let _policy = crate::socket_policy::SocketPolicy::install(
+        "tun-test".into(),
+        1,
+        1,
+        vec!["10.233.0.1/30".parse().unwrap()],
+        crate::dns::controlled_bootstrap(&endpoints).unwrap(),
+        endpoints,
+    )
+    .unwrap();
+    let error = timeout(
+        Duration::from_secs(3),
+        bootstrap(configs, &["198.18.0.0/15".parse().unwrap()]),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("system DNS endpoint overlaps"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("second.json"), "{error}");
+    assert!(!first.path.exists() && !second.path.exists());
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

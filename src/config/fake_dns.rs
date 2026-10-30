@@ -10,6 +10,12 @@ use super::{
 use crate::address::NetLocation;
 use crate::option_util::NoneOrSome;
 
+pub(crate) fn protects_tun_endpoints(configs: &[Config]) -> bool {
+    configs.iter().any(|config| {
+        matches!(config, Config::TunServer(tun) if tun.auto_route || tun.dns_hijack == Some(true))
+    })
+}
+
 pub(crate) fn tun_endpoint_ips(configs: &[Config]) -> impl Iterator<Item = IpAddr> + '_ {
     configs
         .iter()

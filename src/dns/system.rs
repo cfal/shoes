@@ -31,19 +31,19 @@ impl SystemResolver {
         if forbidden.is_empty() {
             return Ok(());
         }
+        if let Some(endpoints) = crate::socket_policy::bootstrap_endpoints() {
+            return check_native_endpoints(
+                endpoints.iter().map(|endpoint| endpoint.ip()),
+                &forbidden,
+            );
+        }
         tokio::task::spawn_blocking(move || {
             let (mut config, _) = discover()?;
             // Native lookup uses the OS configuration, not our filtered copy.
-            if config.name_servers.iter().any(|server| {
-                forbidden
-                    .iter()
-                    .any(|range| range.contains(server.ip.to_canonical()))
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "system DNS endpoint overlaps a synthetic endpoint",
-                ));
-            }
+            check_native_endpoints(
+                config.name_servers.iter().map(|server| server.ip),
+                &forbidden,
+            )?;
             filter_endpoints(&mut config, &forbidden)
         })
         .await
@@ -172,6 +172,24 @@ impl Resolver for SystemResolver {
     }
 }
 
+fn check_native_endpoints(
+    endpoints: impl Iterator<Item = std::net::IpAddr>,
+    forbidden: &[IpNetwork],
+) -> io::Result<()> {
+    for endpoint in endpoints {
+        if forbidden
+            .iter()
+            .any(|range| range.contains(endpoint.to_canonical()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "system DNS endpoint overlaps a synthetic endpoint",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn filter_endpoints(config: &mut ResolverConfig, forbidden: &[IpNetwork]) -> io::Result<()> {
     config.name_servers.retain(|server| {
         !server.ip.is_unspecified()
@@ -206,6 +224,59 @@ fn discover() -> io::Result<(hickory_resolver::config::ResolverConfig, ResolverO
 mod tests {
     use super::*;
     use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_preflight_checks_managed_bootstrap_instead_of_os_dns() {
+        const CHILD: &str = "SHOES_NATIVE_PREFLIGHT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "dns::system::tests::native_preflight_checks_managed_bootstrap_instead_of_os_dns", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (config, _) = discover().unwrap();
+        let os_endpoints: Vec<_> = config
+            .name_servers
+            .iter()
+            .map(|server| IpNetwork::from(server.ip.to_canonical()))
+            .collect();
+        let endpoint = ["192.0.2.53:53", "198.51.100.53:53"]
+            .into_iter()
+            .map(|value| value.parse::<std::net::SocketAddr>().unwrap())
+            .find(|endpoint| {
+                !os_endpoints
+                    .iter()
+                    .any(|range| range.contains(endpoint.ip()))
+            })
+            .unwrap();
+        let _policy = crate::socket_policy::SocketPolicy::install(
+            "tun-test".into(),
+            1,
+            1,
+            vec!["10.233.0.1/30".parse().unwrap()],
+            crate::dns::controlled_bootstrap(&[endpoint]).unwrap(),
+            vec![endpoint],
+        )
+        .unwrap();
+        SystemResolver::check_native_configuration(os_endpoints.into())
+            .await
+            .unwrap();
+        let error =
+            SystemResolver::check_native_configuration(Arc::from([IpNetwork::from(endpoint.ip())]))
+                .await
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("system DNS endpoint overlaps"),
+            "{error}"
+        );
+    }
 
     #[tokio::test]
     async fn cached_system_exchange_retains_partial_at_caller_deadline() {

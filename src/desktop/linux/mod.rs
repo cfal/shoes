@@ -85,6 +85,7 @@ impl Session {
             spec.linux.mark_mask,
             spec.addresses.clone(),
             bootstrap,
+            spec.bootstrap_dns.clone(),
         )?;
         for endpoint in &spec.bootstrap_dns {
             crate::socket_policy::check_dns_endpoint(endpoint.ip())?;

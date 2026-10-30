@@ -122,7 +122,8 @@ impl DnsRegistry {
                 }
             }
         }
-        if !forbidden.is_empty() {
+        let protect_tun_endpoints = crate::config::protects_tun_endpoints(configs);
+        if !forbidden.is_empty() || protect_tun_endpoints {
             forbidden.extend(
                 crate::config::tun_endpoint_ips(configs)
                     .map(|ip| IpNetwork::from(ip.to_canonical())),

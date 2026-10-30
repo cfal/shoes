@@ -25,7 +25,7 @@ mod validate;
 #[cfg(unix)]
 mod wireguard_devices;
 
-pub(crate) use fake_dns::{tun_endpoint_ips, validate_tun_endpoints};
+pub(crate) use fake_dns::{protects_tun_endpoints, tun_endpoint_ips, validate_tun_endpoints};
 pub use pem::convert_cert_paths;
 pub(crate) use pem::{is_pem_file_path, pem_candidate_dependencies, pem_reload_dependencies};
 pub use types::*;
