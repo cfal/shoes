@@ -41,26 +41,6 @@ struct Downloaded {
     loaded: Arc<MemorySource>,
 }
 
-async fn download(
-    source: &RuleSource,
-    dns: &DnsRegistry,
-    global: GlobalLimits,
-    output: &mut (impl tokio::io::AsyncWrite + Unpin),
-    limits: Limits,
-    state: &mut http::DownloadState,
-) -> io::Result<blake3::Hash> {
-    crate::control::url_test::BACKGROUND
-        .scope(
-            (),
-            timeout(
-                limits.overall,
-                http::download(source, dns, global, output, limits, state),
-            ),
-        )
-        .await
-        .map_err(|_| invalid("overall rule download deadline exceeded"))?
-}
-
 async fn download_source(
     source: &RuleSource,
     previous: Option<&Arc<MemorySource>>,
@@ -70,7 +50,16 @@ async fn download_source(
     state: &mut http::DownloadState,
 ) -> io::Result<Downloaded> {
     let mut bytes = Vec::new();
-    let digest = download(source, dns, global, &mut bytes, limits, state).await?;
+    let digest = crate::control::url_test::BACKGROUND
+        .scope(
+            (),
+            timeout(
+                limits.overall,
+                http::download(source, dns, global, &mut bytes, limits, state),
+            ),
+        )
+        .await
+        .map_err(|_| invalid("overall rule download deadline exceeded"))??;
     if let Some(previous) = previous
         && previous.digest == digest
         && previous.matches(source)?

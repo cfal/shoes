@@ -12,7 +12,6 @@ use hyper_util::rt::TokioIo;
 use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 const MAX_HEADER_COUNT: usize = 64;
@@ -155,7 +154,7 @@ pub(super) async fn download(
     source: &RuleSource,
     dns: &DnsRegistry,
     global: GlobalLimits,
-    output: &mut (impl AsyncWrite + Unpin),
+    output: &mut Vec<u8>,
     limits: Limits,
     state: &mut DownloadState,
 ) -> io::Result<blake3::Hash> {
@@ -237,13 +236,12 @@ pub(super) async fn download(
             if bytes > MAX_BYTES || length.is_some_and(|length| bytes > length) {
                 return Err(invalid("download exceeds byte limit"));
             }
-            output.write_all(&data).await?;
+            output.extend_from_slice(&data);
             digest.update(&data);
         }
         if bytes == 0 || length.is_some_and(|length| bytes != length) {
             return Err(invalid("truncated HTTP body"));
         }
-        output.flush().await?;
         Ok(digest.finalize())
     };
     // Drive HTTP in this future, so timeout/cancellation drops the socket too.
