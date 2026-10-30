@@ -1,5 +1,357 @@
 use super::*;
 use futures::task::noop_waker_ref;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::task::{Wake, Waker};
+
+#[derive(Default)]
+struct WriteReadiness {
+    allowance: usize,
+    waker: Option<Waker>,
+    input: Vec<u8>,
+    flush_blocked: bool,
+    shutdown_blocked: bool,
+}
+
+struct SingleWriteWaiter(Arc<Mutex<WriteReadiness>>);
+
+impl AsyncRead for SingleWriteWaiter {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut state = self.0.lock().unwrap();
+        if state.input.is_empty() {
+            return Poll::Pending;
+        }
+        let n = buf.remaining().min(state.input.len());
+        buf.put_slice(&state.input[..n]);
+        state.input.drain(..n);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for SingleWriteWaiter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut state = self.0.lock().unwrap();
+        if state.allowance == 0 {
+            state.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let n = state.allowance.min(buf.len());
+        state.allowance -= n;
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut state = self.0.lock().unwrap();
+        if state.flush_blocked {
+            state.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut state = self.0.lock().unwrap();
+        if state.shutdown_blocked {
+            state.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncPing for SingleWriteWaiter {
+    fn supports_ping(&self) -> bool {
+        true
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        self.poll_write(cx, b"ping")
+            .map(|result| result.map(|_| true))
+    }
+}
+
+impl AsyncStream for SingleWriteWaiter {}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WriteOperation {
+    Write,
+    WriteVectored,
+    Flush,
+    Shutdown,
+    DrainTls,
+    Ping,
+}
+
+impl WriteOperation {
+    fn poll<IO: AsyncStream>(
+        self,
+        stream: &mut CryptoTlsStream<IO>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<()>> {
+        match self {
+            Self::Write => Pin::new(stream).poll_write(cx, data).map(|r| r.map(|_| ())),
+            Self::WriteVectored => Pin::new(stream)
+                .poll_write_vectored(cx, &[io::IoSlice::new(data)])
+                .map(|r| r.map(|_| ())),
+            Self::Flush => Pin::new(stream).poll_flush(cx),
+            Self::Shutdown => Pin::new(stream).poll_shutdown(cx),
+            Self::DrainTls => stream.poll_drain_tls(cx),
+            Self::Ping => Pin::new(stream).poll_write_ping(cx).map(|r| r.map(|_| ())),
+        }
+    }
+}
+
+fn saturate_tls_output<IO: AsyncStream>(stream: &mut CryptoTlsStream<IO>, cx: &mut Context<'_>) {
+    for _ in 0..32 {
+        if Pin::new(&mut *stream)
+            .poll_write(cx, &[7; 16384])
+            .is_pending()
+        {
+            return;
+        }
+    }
+    panic!("TLS output did not reach backpressure");
+}
+
+#[test]
+fn split_tls_tasks_keep_write_readiness_through_read_flushes() {
+    for reality in [false, true] {
+        for synchronous_progress in [false, true] {
+            for operation in [
+                WriteOperation::Write,
+                WriteOperation::WriteVectored,
+                WriteOperation::Flush,
+                WriteOperation::Shutdown,
+                WriteOperation::DrainTls,
+            ] {
+                let state = Arc::new(Mutex::new(WriteReadiness::default()));
+                let io: Box<dyn AsyncStream> = Box::new(SingleWriteWaiter(state.clone()));
+                let session = if reality {
+                    completed_reality_connection()
+                } else {
+                    completed_ordinary_connections().0
+                };
+                let mut stream = CryptoTlsStream::new(io, session, None);
+                let writer = Arc::new(WakeCount::default());
+                let reader = Arc::new(WakeCount::default());
+                let (write_waker, read_waker) = (writer.clone().into(), reader.clone().into());
+                let mut write_cx = Context::from_waker(&write_waker);
+                let mut read_cx = Context::from_waker(&read_waker);
+                saturate_tls_output(&mut stream, &mut write_cx);
+                assert!(
+                    operation
+                        .poll(&mut stream, &mut write_cx, &[7; 16384])
+                        .is_pending(),
+                    "expected {operation:?} to block"
+                );
+                assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+                if synchronous_progress {
+                    state.lock().unwrap().allowance = 1;
+                }
+                assert!(
+                    Pin::new(&mut stream)
+                        .poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0]))
+                        .is_pending()
+                );
+                if !synchronous_progress {
+                    assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+                    // Cancel the reader: only the transport readiness notification remains.
+                    let readiness = state.lock().unwrap().waker.take().unwrap();
+                    readiness.wake();
+                    assert!(reader.0.load(Ordering::Relaxed) > 0);
+                }
+                assert!(
+                    writer.0.load(Ordering::Relaxed) > 0,
+                    "lost writer: reality={reality}, synchronous={synchronous_progress}, operation={operation:?}"
+                );
+                state.lock().unwrap().allowance = usize::MAX;
+                assert!(matches!(
+                    Pin::new(&mut stream).poll_flush(&mut write_cx),
+                    Poll::Ready(Ok(()))
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn split_tls_tasks_keep_raw_and_ping_write_readiness() {
+    for raw_read in [false, true] {
+        for operation in [
+            WriteOperation::Write,
+            WriteOperation::WriteVectored,
+            WriteOperation::Flush,
+            WriteOperation::Shutdown,
+            WriteOperation::Ping,
+        ] {
+            let state = Arc::new(Mutex::new(WriteReadiness::default()));
+            let mut stream = CryptoTlsStream::new(
+                SingleWriteWaiter(state.clone()),
+                completed_reality_connection(),
+                Some(TlsDeframer::new()),
+            );
+            stream.start_raw_write(b"last TLS bytes").unwrap();
+            if raw_read {
+                stream.start_raw_read().unwrap();
+            }
+            let writer = Arc::new(WakeCount::default());
+            let reader = Arc::new(WakeCount::default());
+            let (write_waker, read_waker) = (writer.clone().into(), reader.clone().into());
+            let mut write_cx = Context::from_waker(&write_waker);
+            let mut read_cx = Context::from_waker(&read_waker);
+            assert!(
+                operation
+                    .poll(&mut stream, &mut write_cx, b"raw")
+                    .is_pending(),
+                "expected {operation:?} to block"
+            );
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0]))
+                    .is_pending()
+            );
+            state.lock().unwrap().waker.take().unwrap().wake();
+            assert!(writer.0.load(Ordering::Relaxed) > 0);
+        }
+    }
+}
+
+#[test]
+fn tls_receive_errors_wake_writers_without_outbound_progress() {
+    for session in [
+        completed_ordinary_connections().0,
+        completed_reality_connection(),
+    ] {
+        let state = Arc::new(Mutex::new(WriteReadiness::default()));
+        let mut stream = CryptoTlsStream::new(SingleWriteWaiter(state.clone()), session, None);
+        let writer = Arc::new(WakeCount::default());
+        let waker = writer.clone().into();
+        let mut write_cx = Context::from_waker(&waker);
+        let mut read_cx = Context::from_waker(noop_waker_ref());
+        saturate_tls_output(&mut stream, &mut write_cx);
+        assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+        state.lock().unwrap().input = vec![23, 3, 3, 0, 1, 0];
+        assert!(
+            matches!(Pin::new(&mut stream).poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0])),
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::InvalidData)
+        );
+        assert!(writer.0.load(Ordering::Relaxed) > 0);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut write_cx, b"next"),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(state.lock().unwrap().allowance, 0);
+    }
+}
+
+#[test]
+fn tls_writer_progress_does_not_wake_itself() {
+    for raw in [false, true] {
+        let state = Arc::new(Mutex::new(WriteReadiness {
+            allowance: usize::MAX,
+            ..Default::default()
+        }));
+        let mut stream = CryptoTlsStream::new(
+            SingleWriteWaiter(state),
+            completed_ordinary_connections().0,
+            None,
+        );
+        if raw {
+            stream.start_raw_write(b"last TLS bytes").unwrap();
+        }
+        let writer = Arc::new(WakeCount::default());
+        let waker = writer.clone().into();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"data"),
+            Poll::Ready(Ok(4))
+        ));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write_vectored(&mut cx, &[io::IoSlice::new(b"more")]),
+            Poll::Ready(Ok(4))
+        ));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn tls_control_readiness_survives_reader_cancellation() {
+    for shutdown in [false, true] {
+        let state = Arc::new(Mutex::new(WriteReadiness {
+            allowance: usize::MAX,
+            flush_blocked: !shutdown,
+            shutdown_blocked: shutdown,
+            ..Default::default()
+        }));
+        let mut stream = CryptoTlsStream::new(
+            SingleWriteWaiter(state.clone()),
+            completed_ordinary_connections().0,
+            None,
+        );
+        let writer = Arc::new(WakeCount::default());
+        let waker = writer.clone().into();
+        let mut write_cx = Context::from_waker(&waker);
+        let mut read_cx = Context::from_waker(noop_waker_ref());
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut write_cx, b"data"),
+            Poll::Ready(Ok(4))
+        ));
+        let poll_control = |stream: &mut CryptoTlsStream<_>, cx: &mut Context<'_>| {
+            if shutdown {
+                Pin::new(stream).poll_shutdown(cx)
+            } else {
+                Pin::new(stream).poll_flush(cx)
+            }
+        };
+        assert!(poll_control(&mut stream, &mut write_cx).is_pending());
+        assert!(
+            Pin::new(&mut stream)
+                .poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0]))
+                .is_pending()
+        );
+        assert_eq!(writer.0.load(Ordering::Relaxed), 0);
+        let readiness = {
+            let mut state = state.lock().unwrap();
+            state.flush_blocked = false;
+            state.shutdown_blocked = false;
+            state.waker.take().unwrap()
+        };
+        readiness.wake();
+        assert!(writer.0.load(Ordering::Relaxed) > 0);
+        assert!(matches!(
+            poll_control(&mut stream, &mut write_cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+}
 
 struct PendingWriteIo;
 
@@ -251,6 +603,24 @@ fn ordinary_connections() -> (TlsConnection, TlsConnection) {
         rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
             .unwrap(),
     );
+    (client, server)
+}
+
+fn completed_ordinary_connections() -> (TlsConnection, TlsConnection) {
+    let (mut client, mut server) = ordinary_connections();
+    for _ in 0..8 {
+        let mut wire = Vec::new();
+        client.write_tls(&mut wire).unwrap();
+        server.feed(&wire).unwrap();
+        wire.clear();
+        server.write_tls(&mut wire).unwrap();
+        client.feed(&wire).unwrap();
+        if !client.is_handshaking() && !server.is_handshaking() && !client.wants_write() {
+            break;
+        }
+    }
+    assert!(!client.is_handshaking() && !server.is_handshaking());
+    assert!(!client.wants_write() && !server.wants_write());
     (client, server)
 }
 
