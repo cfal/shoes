@@ -11,7 +11,7 @@ pub(crate) async fn prepare(
     lease: Option<std::sync::Arc<install::CacheLease>>,
 ) -> io::Result<(Vec<Config>, MemorySources)> {
     let cache_lease = lease.clone();
-    let (configs, missing, global, persistent, mut memory) =
+    let (configs, missing, global, persistent, mut memory, mut budget) =
         crate::config::blocking_compile(move || {
             let mut configs = configs;
             let mut missing = Vec::new();
@@ -47,7 +47,7 @@ pub(crate) async fn prepare(
             } else {
                 crate::config::validate_rule_bootstrap(&configs, &mut missing)?
             };
-            Ok((configs, missing, global, persistent, memory))
+            Ok((configs, missing, global, persistent, memory, budget))
         })
         .await?;
     if missing.is_empty() {
@@ -91,11 +91,9 @@ pub(crate) async fn prepare(
             )
         })?;
         let digest = downloaded.loaded.digest;
+        let retained_bytes = downloaded.loaded.retained_bytes();
         memory.insert(source.path.clone(), downloaded.loaded);
-        let mut budget = crate::rules::Compiler::default();
-        for loaded in memory.values() {
-            budget.charge(loaded.retained_bytes(), 0)?;
-        }
+        budget.charge(retained_bytes, 0)?;
         if persistent {
             save_cache(&source, downloaded.bytes, digest, lease.clone()).await;
         }

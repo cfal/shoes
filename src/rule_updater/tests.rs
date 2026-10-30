@@ -159,6 +159,80 @@ async fn bootstrap_refetches_invalid_caches_and_preflights_all_required_routes()
 }
 
 #[tokio::test]
+async fn bootstrap_budget_counts_retained_cached_and_downloaded_sources_before_saving() {
+    let dir = directory();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+    let cached = source(&url, &dir.path().join("cached.json"));
+    let first = source(&url, &dir.path().join("first.json"));
+    let second = source(&url, &dir.path().join("second.json"));
+    let domains: Vec<_> = (0..10_000)
+        .map(|index| format!("{index:05}.{}.example", "x".repeat(48)))
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "rules": [{"domain": domains}]
+    }))
+    .unwrap();
+    let loaded =
+        Arc::new(crate::rule_set::load_memory(&cached, &body, blake3::hash(&body)).unwrap());
+    let retained_bytes = loaded.retained_bytes();
+    assert!(retained_bytes > 0);
+    let mut budget = crate::rules::Compiler::default();
+    let mut capacity = 0;
+    while budget.charge(retained_bytes, 0).is_ok() {
+        capacity += 1;
+    }
+    assert!((3..1024).contains(&capacity));
+    write_rule(&cached.path, &body);
+    let original = std::fs::metadata(&cached.path).unwrap();
+    let mut sources = vec![cached.clone(), first.clone(), second.clone()];
+    let mut previous = MemorySources::new();
+    // Shared predicates exercise the aggregate limit without allocating 512 MiB.
+    for index in 0..capacity - 2 {
+        let retained = source(&url, &dir.path().join(format!("retained-{index:04}.json")));
+        previous.insert(retained.path.clone(), loaded.clone());
+        sources.push(retained);
+    }
+    let config = vec![
+        Config::RuleCacheDirectory(dir.path().to_path_buf()),
+        Config::RuleSourceGroup(crate::config::RuleSourceGroup {
+            rule_source_group: "remote".into(),
+            rules: sources
+                .into_iter()
+                .map(crate::rules::Expression::Source)
+                .collect(),
+        }),
+    ];
+    let fixture = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            request(&mut stream).await;
+            stream.write_all(&response(200, "", &body)).await.unwrap();
+        }
+    });
+    let error = super::bootstrap(config, &[], previous, None)
+        .await
+        .err()
+        .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(error.to_string(), "rule compilation budget exceeded");
+    assert_eq!(
+        blake3::hash(&std::fs::read(&first.path).unwrap()),
+        loaded.digest
+    );
+    assert_eq!(
+        stamp(&std::fs::metadata(&cached.path).unwrap()),
+        stamp(&original)
+    );
+    assert!(!second.path.exists());
+    assert!(!stage_path(&second.path).exists());
+    assert!(!dir.path().join("second.json.shoes-update.lock").exists());
+}
+
+#[tokio::test]
 async fn bootstrap_can_replace_a_safe_cache_created_while_downloading() {
     let dir = directory();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
