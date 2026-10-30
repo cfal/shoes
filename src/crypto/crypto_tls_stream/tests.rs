@@ -145,7 +145,7 @@ fn split_tls_tasks_keep_write_readiness_through_read_flushes() {
                 WriteOperation::DrainTls,
             ] {
                 let state = Arc::new(Mutex::new(WriteReadiness::default()));
-                let io: Box<dyn AsyncStream> = Box::new(SingleWriteWaiter(state.clone()));
+                let io = SingleWriteWaiter(state.clone());
                 let session = if reality {
                     completed_reality_connection()
                 } else {
@@ -215,10 +215,9 @@ fn split_tls_tasks_keep_raw_and_ping_write_readiness() {
                 stream.start_raw_read().unwrap();
             }
             let writer = Arc::new(WakeCount::default());
-            let reader = Arc::new(WakeCount::default());
-            let (write_waker, read_waker) = (writer.clone().into(), reader.clone().into());
+            let write_waker = writer.clone().into();
             let mut write_cx = Context::from_waker(&write_waker);
-            let mut read_cx = Context::from_waker(&read_waker);
+            let mut read_cx = Context::from_waker(noop_waker_ref());
             assert!(
                 operation
                     .poll(&mut stream, &mut write_cx, b"raw")
@@ -304,11 +303,11 @@ fn tls_writer_progress_does_not_wake_itself() {
 
 #[test]
 fn tls_control_readiness_survives_reader_cancellation() {
-    for shutdown in [false, true] {
+    for operation in [WriteOperation::Flush, WriteOperation::Shutdown] {
         let state = Arc::new(Mutex::new(WriteReadiness {
             allowance: usize::MAX,
-            flush_blocked: !shutdown,
-            shutdown_blocked: shutdown,
+            flush_blocked: matches!(operation, WriteOperation::Flush),
+            shutdown_blocked: matches!(operation, WriteOperation::Shutdown),
             ..Default::default()
         }));
         let mut stream = CryptoTlsStream::new(
@@ -324,14 +323,7 @@ fn tls_control_readiness_survives_reader_cancellation() {
             Pin::new(&mut stream).poll_write(&mut write_cx, b"data"),
             Poll::Ready(Ok(4))
         ));
-        let poll_control = |stream: &mut CryptoTlsStream<_>, cx: &mut Context<'_>| {
-            if shutdown {
-                Pin::new(stream).poll_shutdown(cx)
-            } else {
-                Pin::new(stream).poll_flush(cx)
-            }
-        };
-        assert!(poll_control(&mut stream, &mut write_cx).is_pending());
+        assert!(operation.poll(&mut stream, &mut write_cx, &[]).is_pending());
         assert!(
             Pin::new(&mut stream)
                 .poll_read(&mut read_cx, &mut ReadBuf::new(&mut [0]))
@@ -347,7 +339,7 @@ fn tls_control_readiness_survives_reader_cancellation() {
         readiness.wake();
         assert!(writer.0.load(Ordering::Relaxed) > 0);
         assert!(matches!(
-            poll_control(&mut stream, &mut write_cx),
+            operation.poll(&mut stream, &mut write_cx, &[]),
             Poll::Ready(Ok(()))
         ));
     }

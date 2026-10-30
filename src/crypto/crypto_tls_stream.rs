@@ -441,7 +441,7 @@ impl<IO: AsyncStream> AsyncRead for CryptoTlsStream<IO> {
                 Err(error) => return Poll::Ready(Err(error)),
             }
             // Service post-handshake responses without blocking readable plaintext
-            // on output backpressure or replacing a parked writer's registration.
+            // on output backpressure.
             this.output_progress = false;
             let flushed = this.poll_flush_inner(cx);
             if this.output_progress || matches!(flushed, Poll::Ready(Err(_))) {
