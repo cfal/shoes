@@ -434,13 +434,12 @@ for example, XHTTP upload cancellation can lose the original cause and count as 
 remote failure.
 User payloads are never retried across candidates. Probes use HTTP HEAD and accept
 any HTTP response status, without redirects; HTTPS certificates are verified.
-Contextual checks use the forwarding route's resolver, with the same probe
-destination-policy guard. Standalone controller checks use guarded system DNS.
-API probes with the same normalized URL and wildcard/default expected status also
-update standalone selection, never contextual measurements. Other URLs and explicit
-status expectations cannot overwrite selection samples.
-Nested automatic choices in controller probes also use the standalone dashboard
-state; API connector caches do not create additional automatic contexts.
+Checks use the generation's guarded system probe resolver and each member's
+declared chain, not a caller's surrounding route or DNS bootstrap.
+Background results update only the group performing the check. API probes with
+the same normalized URL and wildcard/default expected status also update matching
+groups. Other URLs and explicit status expectations cannot overwrite selection
+samples. Nested automatic groups use their shared group state.
 
 Periodic and API probes share a 16-probe limit. Each periodic round's timeout
 includes admission/queue time; members not admitted before the deadline retain
@@ -450,8 +449,7 @@ Members with no full-budget attempt, then the oldest full-budget attempts, lead 
 round, independently of health. Local failures cannot monopolize these slots, and
 queued attempts can receive a full budget on a later round. Tied members rotate on admission.
 Due groups with the oldest unqueued admission get priority, with stable catalog
-and context-registration order breaking ties. Contextual admission timestamps are
-independent of standalone API attempts.
+order breaking ties.
 Under sustained saturation, reduce group size, increase
 timeout/interval, or expect unprobed/stale members. Scheduling has one-second
 granularity and does not overlap rounds within a group; other groups can run while
@@ -459,7 +457,7 @@ a slow round is in flight. Activation/reload cancels old work and rejects obsole
 results; an interrupted round is immediately eligible when its generation resumes.
 New committed generations start with unprobed health.
 
-The controller reports `type: URLTest`, standalone TCP `now`, optional `udpNow`,
+The controller reports `type: URLTest`, group TCP `now`, optional `udpNow`,
 `testUrl`, and selected-member `health` (`unprobed`, `healthy`, `dead`, or `stale`).
 Its `alive` is true only for fresh healthy results. Manual selection PUTs for
 automatic groups are rejected; automatic choices are neither pinned nor persisted.
@@ -467,23 +465,15 @@ Leaf histories remain bounded to ten samples per URL and eight URLs. Automatic
 selection retains its configured-URL samples and full-budget attempt timestamps
 independently of API eviction; other attempt URLs are capped at eight per member
 for each of filtered and unfiltered probes.
-Each URL-test occurrence in a forwarding route has independent state. A check
-forces one immediate member and samples one complete route, including its enclosing
-prefix and suffix. Nested round-robin choices are randomly sampled, not
-exhaustively tested, using fixed-size per-member sampler state; probes do not
-advance forwarding counters. Any effective manual selector change invalidates
-all contextual samples in the generation and fences in-flight results, even for
-unrelated routes. This can temporarily change preferred members while new
-measurements arrive. Selecting the same effective choice does not invalidate
-samples. Routes in manually deselected branches are not checked. Standalone
-URL-test and fallback health retain their dependency-specific invalidation.
-The dashboard is a standalone projection, not a summary of all route contexts;
-its `now` can differ from forwarding choices. Contextual results never overwrite
-standalone history. There are at most 1,024 live automatic contexts per generation.
-Each separately built forwarding route owns its occurrences, including copies of
-rules across inbounds. A single route over the limit fails validation; the combined
-live-route limit is enforced when constructing routes, including lazy carriers.
-URL-test groups are not supported by FFI.
+All occurrences of a URL-test group share its samples and TCP/UDP incumbents.
+There are no route contexts, per-occurrence probe rounds, or contextual samplers.
+Forwarding and dashboard selection consult the same group state, subject to each
+caller's transport eligibility. Selector changes within a declared member invalidate
+the affected group's samples and fence in-flight results; surrounding route choices
+do not create additional health identities. Complete chains declared as members
+are probed end to end. External caller prefixes and suffixes are not tested.
+Probe connectors have separate round-robin counters, so probes never advance
+forwarding counters.
 
 Only one `cache_file_path` is allowed across all input files. Its absence disables
 persistence; relative paths resolve against the process working directory.
@@ -2180,7 +2170,8 @@ handshake chains and REALITY destination chains. Direct, WireGuard and XHTTP H3
 clients are valid only at physical hop zero. UDP/H3 DNS still requires a direct-only
 route. Resolution rejects cycles, more than 16,384 expanded nodes, more than 64
 nested choices, or paths longer than 64 hops. Fixed one-hop round-robin aliases
-do not add choice depth. Fallback retains its 256-concrete-path bound.
+do not add choice depth. Health state is bounded by declared groups and members,
+not the number of route combinations.
 
 ```yaml
 - client_group: my-upstream
