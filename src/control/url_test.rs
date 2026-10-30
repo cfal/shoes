@@ -58,7 +58,6 @@ pub struct AutomaticGroup {
     pub config: UrlTestConfig,
     pub members: Vec<String>,
     state: Mutex<State>,
-    dependencies: Mutex<Vec<super::selection::ManualSelectorPath>>,
 }
 
 #[derive(Debug, Default)]
@@ -130,7 +129,6 @@ impl AutomaticGroups {
                 config,
                 members,
                 state: Mutex::default(),
-                dependencies: Mutex::default(),
             },
         );
         Ok(())
@@ -161,23 +159,13 @@ impl AutomaticGroups {
             .collect()
     }
 
-    pub(crate) fn choices_changed(
-        &self,
-        previous: &super::selection::Choices,
-        current: &super::selection::Choices,
-    ) {
+    pub(crate) fn choices_changed(&self) {
         for group in self.0.values() {
-            if super::selection::manual_choices_changed(
-                &group.dependencies.lock(),
-                previous,
-                current,
-            ) {
-                let mut state = group.state.lock();
-                state.revision = state.revision.wrapping_add(1);
-                state.samples.clear();
-                state.incumbent = [None, None];
-                state.last_check = None;
-            }
+            let mut state = group.state.lock();
+            state.revision = state.revision.wrapping_add(1);
+            state.samples.clear();
+            state.incumbent = [None, None];
+            state.last_check = None;
         }
     }
 
@@ -195,17 +183,6 @@ impl AutomaticGroups {
 impl AutomaticGroup {
     pub(crate) fn revision(&self) -> u64 {
         self.state.lock().revision
-    }
-
-    pub(crate) fn set_dependencies(
-        &self,
-        paths: impl IntoIterator<Item = super::selection::ManualSelectorPath>,
-    ) {
-        *self.dependencies.lock() = paths
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
     }
 
     pub(crate) fn record_if_current(&self, member: &str, revision: u64, delay: Option<u16>) {
@@ -348,23 +325,48 @@ mod tests {
     }
 
     #[test]
-    fn standalone_tickets_reject_selector_aba_but_preserve_unrelated_changes() {
-        use crate::control::selection::Choices;
-        let groups = groups();
+    fn every_selector_change_invalidates_all_groups_but_noops_preserve_samples() {
+        use crate::control::selection::{SelectionOwner, SelectorDefinition};
+        use std::sync::Arc;
+
+        let mut owner = SelectionOwner::new(None).unwrap();
+        let mut view = owner
+            .prepare(BTreeMap::from([(
+                "unrelated".into(),
+                SelectorDefinition {
+                    members: vec!["a".into(), "b".into()],
+                    default: None,
+                },
+            )]))
+            .unwrap();
+        Arc::get_mut(&mut view).unwrap().automatic = groups();
+        owner.activate(view.clone()).unwrap();
+        let groups = &view.automatic;
         let group = &groups.0["one"];
-        group.set_dependencies(vec![vec![("manual".into(), "a".into())]]);
-        let previous = Choices::from([("manual".into(), "a".into())]);
-        let mut current = previous.clone();
-        current.insert("other".into(), "b".into());
-        let (_, revision) = groups.tickets("a", &group.config.url)[0];
-        groups.choices_changed(&previous, &current);
-        group.record_if_current("a", revision, Some(5));
-        assert_eq!(group.health("a"), "healthy");
-        current.insert("manual".into(), "b".into());
-        groups.choices_changed(&previous, &current);
-        groups.choices_changed(&current, &previous);
-        group.record_if_current("a", revision, Some(1));
-        assert_eq!(group.health("a"), "unprobed");
+        let eligible = HashSet::from(["a", "b"]);
+        for group in groups.0.values() {
+            groups.record("b", &group.config.url, Some(5));
+            assert_eq!(group.choose(&eligible, false).as_deref(), Some("b"));
+            assert_eq!(group.choose(&eligible, true).as_deref(), Some("b"));
+            assert!(group.due_members(Instant::now()).is_some());
+        }
+        let (_, revision) = groups.tickets("b", &group.config.url)[0];
+        owner.select("unrelated", "a").unwrap();
+        assert_eq!(group.revision(), revision);
+        for group in groups.0.values() {
+            assert_eq!(group.health("b"), "healthy");
+            assert!(group.due_members(Instant::now()).is_none());
+        }
+
+        owner.select("unrelated", "b").unwrap();
+        owner.select("unrelated", "a").unwrap();
+        group.record_if_current("b", revision, Some(1));
+        for group in groups.0.values() {
+            assert_eq!(group.health("b"), "unprobed");
+            assert_eq!(group.choose(&eligible, false).as_deref(), Some("a"));
+            assert_eq!(group.choose(&eligible, true).as_deref(), Some("a"));
+            assert!(group.due_members(Instant::now()).is_some());
+        }
         let (_, revision) = groups.tickets("a", &group.config.url)[0];
         group.record_if_current("a", revision, Some(3));
         assert_eq!(group.health("a"), "healthy");
