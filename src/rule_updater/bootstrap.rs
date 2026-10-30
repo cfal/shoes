@@ -8,7 +8,9 @@ pub(crate) async fn prepare(
     configs: Vec<Config>,
     retained_ranges: &[ipnetwork::IpNetwork],
     previous: MemorySources,
+    lease: Option<std::sync::Arc<install::CacheLease>>,
 ) -> io::Result<(Vec<Config>, MemorySources)> {
+    let cache_lease = lease.clone();
     let (configs, missing, global, persistent, mut memory) =
         crate::config::blocking_compile(move || {
             let mut configs = configs;
@@ -26,7 +28,7 @@ pub(crate) async fn prepare(
                     }
                     continue;
                 }
-                match install::cache_file(&source.path) {
+                match install::cache_file(&source.path, cache_lease.as_deref()) {
                     Ok(_) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(source),
                     Err(error) => {
@@ -98,7 +100,7 @@ pub(crate) async fn prepare(
         }
         log::info!("Bootstrapping missing rule cache {}", source.path.display());
         let result = async {
-            let install = install::Install::open_async(&source.path).await?;
+            let install = install::Install::open_async(&source.path, lease.clone()).await?;
             install.require_missing()?;
             let staged = stage(
                 &source,

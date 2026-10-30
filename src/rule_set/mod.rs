@@ -91,6 +91,8 @@ impl MemorySource {
 pub(crate) struct RuleInputs {
     pub(crate) file: Option<(PathBuf, std::fs::File)>,
     pub(crate) memory: MemorySources,
+    #[cfg(unix)]
+    pub(crate) cache_lease: Option<Arc<crate::rule_updater::CacheLease>>,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -650,19 +652,26 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
     }
     #[cfg(unix)]
     if source.url.is_some() || compiler.remote_files.contains_key(&source.path) {
-        return read_file(
-            source,
-            crate::rule_updater::cache_file(&source.path).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("remote cache unavailable; offline checks never download; daemon startup can fetch missing caches: {e}"),
-                )
-            })?,
-            source.path.clone(),
-            compiler,
-        ).map_err(|error| io::Error::new(error.kind(), format!(
-            "{error}; existing invalid caches are not downloaded again; repair or remove the cache explicitly"
-        )));
+        let file = crate::rule_updater::cache_file(
+            &source.path,
+            compiler.inputs.cache_lease.as_deref(),
+        )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "remote cache unavailable; offline checks never download; daemon startup can fetch missing caches: {error}"
+                ),
+            )
+        })?;
+        return read_file(source, file, source.path.clone(), compiler).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; existing invalid caches are not downloaded again; repair or remove the cache explicitly"
+                ),
+            )
+        });
     }
     let path = std::fs::canonicalize(&source.path)?;
     if !std::fs::metadata(&path)?.is_file() {

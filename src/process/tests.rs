@@ -63,6 +63,51 @@ async fn load_validated(
     validate_configs(paths, configs, discovered).await
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_reload_rechecks_cache_lease_even_without_sources() {
+    for replace_root in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cache = root.join("cache");
+        let config = root.join("config.yaml");
+        std::fs::write(
+            &config,
+            serde_json::json!([
+                {"rule_cache_dir": cache},
+                {"address":"127.0.0.1:0", "protocol":{"type":"socks"}}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let paths = [config.to_str().unwrap().to_owned()];
+        let previous = prepare(&paths, None).await.unwrap();
+        if replace_root {
+            std::fs::rename(&cache, root.join("moved")).unwrap();
+            crate::rule_updater::create_cache_directory(&cache).unwrap();
+        } else {
+            std::fs::remove_file(cache.join("owner.lock")).unwrap();
+        }
+        let _other = crate::rule_updater::cache_lease(&cache).unwrap();
+        let mut lease = previous.cache_lease.clone();
+        let configs = config::load_config_files(&paths).await.unwrap();
+        let error = load_candidate(
+            &paths,
+            configs,
+            &mut |_, _, _| {},
+            true,
+            Some(&previous),
+            &mut lease,
+            &[],
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("lease lost"), "{error}");
+        load_validated(&paths, &mut |_, _, _| {}).await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn validation_errors_preserve_io_kind_and_file_context() {
     let directory = tempfile::tempdir().unwrap();

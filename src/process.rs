@@ -13,6 +13,11 @@ use crate::option_util::OneOrSome;
 use crate::resources;
 use crate::tcp::tcp_server::TcpListeners;
 
+#[cfg(unix)]
+use crate::rule_updater::CacheLease;
+#[cfg(not(unix))]
+type CacheLease = std::fs::File;
+
 const RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
 type DiscoverDependencies<'a> = dyn FnMut(&[PathBuf], &[PathBuf], Option<&Path>) + Send + 'a;
@@ -33,7 +38,7 @@ async fn load_candidate(
     discovered: &mut DiscoverDependencies<'_>,
     for_runtime: bool,
     previous_servers: Option<&PreparedServers>,
-    cache_lease: &mut Option<std::sync::Arc<std::fs::File>>,
+    cache_lease: &mut Option<std::sync::Arc<CacheLease>>,
     retained_ranges: &[ipnetwork::IpNetwork],
 ) -> io::Result<(
     ValidatedConfigs,
@@ -64,6 +69,10 @@ async fn load_candidate(
             ));
         }
         #[cfg(unix)]
+        if let Some(lease) = cache_lease {
+            lease.check()?;
+        }
+        #[cfg(unix)]
         if for_runtime
             && cache_lease.is_none()
             && let Some(directory) = cache_dir
@@ -89,6 +98,7 @@ async fn load_candidate(
                 previous_servers
                     .map(|previous| previous.remote_rules.memory.clone())
                     .unwrap_or_default(),
+                cache_lease.clone(),
             )
             .await?;
         }
@@ -107,6 +117,8 @@ async fn load_candidate(
             crate::rule_set::RuleInputs {
                 file: None,
                 memory: memory.clone(),
+                #[cfg(unix)]
+                cache_lease: cache_lease.clone(),
             },
         )
         .await?;
@@ -132,7 +144,7 @@ async fn load_candidate(
 struct PreparedServers {
     #[cfg(target_os = "linux")]
     managed: Option<std::sync::Arc<crate::desktop::Ingress>>,
-    cache_lease: Option<std::sync::Arc<std::fs::File>>,
+    cache_lease: Option<std::sync::Arc<CacheLease>>,
     #[cfg(unix)]
     remote_rules: crate::rule_updater::Refresh,
     generation: Option<std::sync::Arc<crate::control::runtime::Generation>>,
@@ -329,13 +341,14 @@ async fn prepare_tracking(
     Ok(PreparedServers {
         #[cfg(target_os = "linux")]
         managed: network.ingress(),
-        cache_lease,
+        cache_lease: cache_lease.clone(),
         #[cfg(unix)]
         remote_rules: crate::rule_updater::Refresh::new(
             snapshot,
             &validated.remote_rules,
             memory,
             previous_servers.map(|servers| &servers.remote_rules),
+            cache_lease,
         )?,
         generation,
         certificates,

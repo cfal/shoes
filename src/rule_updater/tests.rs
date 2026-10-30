@@ -27,7 +27,7 @@ async fn bootstrap(
     configs: Vec<Config>,
     ranges: &[ipnetwork::IpNetwork],
 ) -> io::Result<Vec<Config>> {
-    super::bootstrap(configs, ranges, Default::default())
+    super::bootstrap(configs, ranges, Default::default(), None)
         .await
         .map(|(configs, _)| configs)
 }
@@ -450,13 +450,13 @@ fn predicates(validated: &ValidatedConfigs) -> Vec<Arc<crate::rules::Predicate>>
 async fn memory_bootstrap_reuses_compiled_sources_and_invalidates_changed_urls() {
     let (url, fixture) = serve(response(200, "", OLD)).await;
     let remote = source(&url, Path::new(""));
-    let (config, memory) = super::bootstrap(memory_configs(&remote), &[], Default::default())
+    let (config, memory) = super::bootstrap(memory_configs(&remote), &[], Default::default(), None)
         .await
         .unwrap();
     fixture.await.unwrap();
     assert_eq!(memory.len(), 1);
     let first = memory.values().next().unwrap().clone();
-    let (config, reused) = super::bootstrap(config, &[], memory).await.unwrap();
+    let (config, reused) = super::bootstrap(config, &[], memory, None).await.unwrap();
     assert!(Arc::ptr_eq(&first, reused.values().next().unwrap()));
     let validated = validate_inputs(
         config.clone(),
@@ -472,13 +472,14 @@ async fn memory_bootstrap_reuses_compiled_sources_and_invalidates_changed_urls()
         &validated.remote_rules,
         reused.clone(),
         None,
+        None,
     )
     .unwrap();
     assert!(refresh.scheduled[0].due > Instant::now() + Duration::from_secs(23 * 3600));
 
     let (url, fixture) = serve(response(200, "", VALID)).await;
     let changed = source(&url, Path::new(""));
-    let (_, replaced) = super::bootstrap(memory_configs(&changed), &[], reused)
+    let (_, replaced) = super::bootstrap(memory_configs(&changed), &[], reused, None)
         .await
         .unwrap();
     fixture.await.unwrap();
@@ -540,6 +541,57 @@ async fn memory_refresh_validates_changed_candidates_without_replacing_on_failur
 }
 
 #[tokio::test]
+async fn staged_validation_rejects_replaced_namespace_for_other_sources() {
+    let dir = directory();
+    let root = dir.path().join("cache");
+    create_cache_directory(&root).unwrap();
+    let first = source("https://unused.invalid/a.json", &root.join("a.json"));
+    let second = source("https://unused.invalid/b.json", &root.join("b.json"));
+    write_rule(&first.path, OLD);
+    write_rule(&second.path, OLD);
+    let lease = Arc::new(cache_lease(&root).unwrap());
+    let mut install = Install::open_async(&first.path, Some(lease.clone()))
+        .await
+        .unwrap();
+    install.file.write_all(VALID).unwrap();
+    let mut config = configs(&first);
+    config.extend(configs(&second).into_iter().skip(1));
+    validate_staged(config.clone(), &first.path, &install)
+        .await
+        .unwrap();
+    let moved = dir.path().join("moved");
+    std::fs::rename(&root, &moved).unwrap();
+    create_cache_directory(&root).unwrap();
+    write_rule(&first.path, VALID);
+    write_rule(&second.path, VALID);
+    let _other = cache_lease(&root).unwrap();
+    let error = validate_staged(config.clone(), &first.path, &install)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("lease lost"), "{error}");
+    assert!(
+        super::bootstrap(config.clone(), &[], Default::default(), Some(lease.clone()))
+            .await
+            .is_err()
+    );
+    assert!(
+        Refresh::new(
+            config.clone(),
+            &[first, second],
+            Default::default(),
+            None,
+            Some(lease)
+        )
+        .is_err()
+    );
+    // Offline checks remain independent of a daemon's runtime lease.
+    crate::config::compile_configs(config).await.unwrap();
+    drop(install);
+    assert!(!moved.join("a.json.shoes-update.tmp").exists());
+}
+
+#[tokio::test]
 async fn memory_refresh_validates_new_source_and_preserves_other_sources() {
     let (url, fixture) = serve(response(200, "", VALID)).await;
     let first = source("https://unused.invalid/a.json", Path::new(""));
@@ -583,7 +635,7 @@ async fn pathless_cached_sources_get_stable_names_and_restart_offline() {
     let remote = source(&url, Path::new(""));
     let mut config = memory_configs(&remote);
     config.insert(0, Config::RuleCacheDirectory(dir.path().to_path_buf()));
-    let (config, memory) = super::bootstrap(config, &[], Default::default())
+    let (config, memory) = super::bootstrap(config, &[], Default::default(), None)
         .await
         .unwrap();
     fixture.await.unwrap();
@@ -593,7 +645,7 @@ async fn pathless_cached_sources_get_stable_names_and_restart_offline() {
     assert_eq!(sources[0].path.parent().unwrap(), dir.path());
     assert_eq!(std::fs::read(&sources[0].path).unwrap(), VALID);
     assert!(!sources[0].path.to_string_lossy().contains("http"));
-    let (restarted, memory) = super::bootstrap(config, &[], Default::default())
+    let (restarted, memory) = super::bootstrap(config, &[], Default::default(), None)
         .await
         .unwrap();
     assert!(memory.is_empty());
@@ -662,7 +714,7 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
 async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str> {
     let staged = super::stage(
         source,
-        Install::open_async(&source.path).await?,
+        Install::open_async(&source.path, None).await?,
         &DnsRegistry::new(),
         GlobalLimits::default(),
         limits,
@@ -1376,7 +1428,7 @@ async fn stalled_url_address_does_not_block_another_guarded_candidate() {
             Duration::from_secs(2),
             stage(
                 &source,
-                Install::open_async(&source.path).await.unwrap(),
+                Install::open_async(&source.path, None).await.unwrap(),
                 &dns,
                 GlobalLimits::default(),
                 Limits::default(),
@@ -1515,7 +1567,8 @@ async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
                 &config,
                 &DnsRegistry::new(),
                 GlobalLimits::default(),
-                &mut http::DownloadState::default()
+                &mut http::DownloadState::default(),
+                None,
             )
             .await
             .unwrap()
@@ -1527,7 +1580,8 @@ async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
                 &config,
                 &DnsRegistry::new(),
                 GlobalLimits::default(),
-                &mut http::DownloadState::default()
+                &mut http::DownloadState::default(),
+                None,
             )
             .await
             .is_err()
@@ -1561,6 +1615,7 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
         std::slice::from_ref(&source),
         Default::default(),
         None,
+        None,
     )
     .unwrap();
     assert!(refresh.scheduled[0].due <= Instant::now());
@@ -1579,11 +1634,12 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
         &[source],
         Default::default(),
         Some(&refresh),
+        None,
     )
     .unwrap();
     assert_eq!(next.scheduled[0].due, refresh.scheduled[0].due);
     assert!(
-        Refresh::new(Vec::new(), &[], Default::default(), Some(&next))
+        Refresh::new(Vec::new(), &[], Default::default(), Some(&next), None)
             .unwrap()
             .scheduled
             .is_empty()
@@ -1650,7 +1706,7 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                 .unwrap()
                 .remote_rules;
             let mut refresh =
-                Refresh::new(config.clone(), &sources, Default::default(), None).unwrap();
+                Refresh::new(config.clone(), &sources, Default::default(), None, None).unwrap();
             for attempt in 0..3 {
                 let item = &mut refresh.scheduled[0];
                 let dns = DnsRegistry::new();
@@ -1660,6 +1716,7 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                     &dns,
                     GlobalLimits::default(),
                     &mut item.download,
+                    None,
                 );
                 if first_result == "cancelled" && attempt == 0 {
                     assert!(timeout(Duration::from_millis(100), future).await.is_err());
@@ -1677,9 +1734,14 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                     future.await.unwrap();
                 }
                 if replace_generation {
-                    refresh =
-                        Refresh::new(config.clone(), &sources, Default::default(), Some(&refresh))
-                            .unwrap();
+                    refresh = Refresh::new(
+                        config.clone(),
+                        &sources,
+                        Default::default(),
+                        Some(&refresh),
+                        None,
+                    )
+                    .unwrap();
                 }
             }
             assert_eq!(fixture.await.unwrap(), [0, 1, 0]);
@@ -1711,6 +1773,7 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
         std::slice::from_ref(&source),
         Default::default(),
         None,
+        None,
     )
     .unwrap();
     previous.scheduled[0].due = Instant::now() + Duration::from_secs(3600);
@@ -1721,6 +1784,7 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
         std::slice::from_ref(&source),
         Default::default(),
         Some(&previous),
+        None,
     )
     .unwrap();
     assert_eq!(next.scheduled[0].due, previous.scheduled[0].due);
@@ -1732,6 +1796,7 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
         &[source],
         Default::default(),
         Some(&previous),
+        None,
     )
     .unwrap();
     assert!(changed.scheduled[0].due <= Instant::now());
@@ -1760,6 +1825,7 @@ async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
             &DnsRegistry::new(),
             GlobalLimits::default(),
             &mut http::DownloadState::default(),
+            None,
         )
         .await;
         fixture.await.unwrap();
@@ -1865,7 +1931,7 @@ async fn explicit_bootstrap_resolves_target_without_system_dns() {
     source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
     let mut staged = super::stage(
         &source,
-        Install::open_async(&source.path).await.unwrap(),
+        Install::open_async(&source.path, None).await.unwrap(),
         &dns,
         GlobalLimits::default(),
         Limits::default(),
@@ -1980,7 +2046,7 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
         });
         let staged = stage(
             &source,
-            Install::open_async(&source.path).await.unwrap(),
+            Install::open_async(&source.path, None).await.unwrap(),
             &dns,
             GlobalLimits::default(),
             Limits::default(),
@@ -2128,7 +2194,7 @@ async fn first_download_proxy_retains_bootstrap_address_fallback() {
         drop(
             stage(
                 &source,
-                Install::open_async(&source.path).await.unwrap(),
+                Install::open_async(&source.path, None).await.unwrap(),
                 &dns,
                 GlobalLimits::default(),
                 Limits::default(),

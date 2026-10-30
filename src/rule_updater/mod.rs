@@ -34,7 +34,7 @@ impl Default for Limits {
 }
 
 pub(crate) use bootstrap::prepare as bootstrap;
-pub(crate) use install::{cache_file, cache_lease, create_cache_directory};
+pub(crate) use install::{CacheLease, cache_file, cache_lease, create_cache_directory};
 
 struct Staged {
     install: Install,
@@ -114,6 +114,7 @@ async fn validate_staged(
         configs,
         RuleInputs {
             file: Some((path.to_owned(), install.file.try_clone()?)),
+            cache_lease: install.lease.clone(),
             ..Default::default()
         },
     )
@@ -152,8 +153,9 @@ async fn refresh_source(
     dns: &DnsRegistry,
     global: GlobalLimits,
     state: &mut http::DownloadState,
+    lease: Option<std::sync::Arc<CacheLease>>,
 ) -> io::Result<bool> {
-    let install = Install::open_async(&source.path).await?;
+    let install = Install::open_async(&source.path, lease).await?;
     let Staged { install, digest } =
         stage(source, install, dns, global, Limits::default(), state).await?;
     let (install, unchanged) = install.check_unchanged(digest).await?;
@@ -204,6 +206,7 @@ pub(crate) struct Refresh {
     scheduled: Vec<Scheduled>,
     pub(crate) memory: MemorySources,
     persistent: bool,
+    cache_lease: Option<std::sync::Arc<CacheLease>>,
 }
 
 impl Refresh {
@@ -212,7 +215,11 @@ impl Refresh {
         sources: &[RuleSource],
         memory: MemorySources,
         previous: Option<&Self>,
+        cache_lease: Option<std::sync::Arc<CacheLease>>,
     ) -> io::Result<Self> {
+        if let Some(lease) = &cache_lease {
+            lease.check()?;
+        }
         let persistent = crate::rule_set::cache_directory(&configs)?.is_some();
         let mut scheduled = Vec::new();
         for source in sources {
@@ -229,9 +236,17 @@ impl Refresh {
             } else if let Some(loaded) = memory.get(&source.path) {
                 Instant::now() + interval.saturating_sub(loaded.updated.elapsed())
             } else {
-                let remaining = std::fs::metadata(&source.path)
-                    .and_then(|m| m.modified())
-                    .ok()
+                let modified = if let Some(lease) = &cache_lease {
+                    cache_file(&source.path, Some(lease))?
+                        .metadata()?
+                        .modified()
+                        .ok()
+                } else {
+                    std::fs::metadata(&source.path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                };
+                let remaining = modified
                     .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
                     .map_or(Duration::ZERO, |age| interval.saturating_sub(age));
                 Instant::now() + remaining
@@ -250,6 +265,7 @@ impl Refresh {
             scheduled,
             memory,
             persistent,
+            cache_lease,
         })
     }
 
@@ -261,7 +277,15 @@ impl Refresh {
             };
             tokio::time::sleep_until(item.due).await;
             let result = if self.persistent {
-                refresh_source(&item.source, &self.configs, dns, global, &mut item.download).await
+                refresh_source(
+                    &item.source,
+                    &self.configs,
+                    dns,
+                    global,
+                    &mut item.download,
+                    self.cache_lease.clone(),
+                )
+                .await
             } else {
                 refresh_memory(
                     &item.source,

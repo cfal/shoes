@@ -2252,6 +2252,8 @@ or sticky mode bits. Symlinks in any path component
 and `..` traversal are rejected. `owner.lock`, `.shoes-update.lock`, and
 `.shoes-update.tmp` sidecars are reserved. The daemon holds an exclusive directory
 lease; another daemon cannot use the same directory concurrently.
+Replacing the directory or `owner.lock` invalidates the lease; subsequent runtime
+cache access is rejected until restart. Already compiled rules remain available.
 Identical declarations sharing a cache are deduplicated;
 conflicting declarations are rejected. Local-only file sources are unchanged.
 
