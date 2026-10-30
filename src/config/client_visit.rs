@@ -17,7 +17,7 @@ pub(crate) fn sorted_targets<T>(targets: &mut HashMap<String, T>) -> Vec<(&Strin
     targets
 }
 
-fn visit_chain(chain: &mut ClientChain, visitor: &mut Visitor<'_>) -> io::Result<()> {
+pub(crate) fn visit_chain(chain: &mut ClientChain, visitor: &mut Visitor<'_>) -> io::Result<()> {
     for hop in chain.hops.iter_mut() {
         visit_hop(hop, visitor)?;
     }
@@ -26,6 +26,12 @@ fn visit_chain(chain: &mut ClientChain, visitor: &mut Visitor<'_>) -> io::Result
 
 pub(crate) fn visit_hop(hop: &mut ClientChainHop, visitor: &mut Visitor<'_>) -> io::Result<()> {
     match hop {
+        ClientChainHop::Choice(choice) => {
+            for chain in &mut choice.members {
+                visit_chain(chain, visitor)?;
+            }
+            Ok(())
+        }
         ClientChainHop::Single(selection) => visit_selection(selection, visitor),
         ClientChainHop::Pool(selections) => {
             for selection in selections.iter_mut() {
@@ -97,7 +103,14 @@ pub(crate) fn visit_configs(configs: &mut [Config], visitor: &mut Visitor<'_>) -
         match config {
             Config::ClientConfigGroup(group) => {
                 for member in group.client_chains.iter_mut() {
-                    visit_selection(member, visitor)?;
+                    match member {
+                        super::ClientGroupMember::Client(client) => {
+                            visit_selection(client, visitor)?
+                        }
+                        super::ClientGroupMember::Chain { chain, .. } => {
+                            visit_chain(chain, visitor)?
+                        }
+                    }
                 }
             }
             Config::RuleConfigGroup(group) => {

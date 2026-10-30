@@ -8,6 +8,7 @@ use super::client::ClientConfig;
 use super::dns::DnsConfigGroup;
 use super::global::GlobalSettings;
 use super::rules::RuleConfig;
+use super::rules::{ClientChain, ClientChainHop};
 use super::selection::ConfigSelection;
 use super::server::ServerConfig;
 use super::tun::TunConfig;
@@ -24,7 +25,109 @@ pub struct ClientConfigGroup {
     pub group_type: GroupType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
-    pub client_chains: OneOrSome<ConfigSelection<ClientConfig>>,
+    pub client_chains: OneOrSome<ClientGroupMember>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ClientGroupMember {
+    Client(ConfigSelection<ClientConfig>),
+    Chain {
+        name: Option<String>,
+        chain: ClientChain,
+    },
+}
+
+impl From<ConfigSelection<ClientConfig>> for ClientGroupMember {
+    fn from(client: ConfigSelection<ClientConfig>) -> Self {
+        Self::Client(client)
+    }
+}
+
+impl ClientGroupMember {
+    pub(crate) fn chain(&self) -> ClientChain {
+        match self {
+            Self::Client(client) => ClientChain {
+                hops: OneOrSome::One(ClientChainHop::Single(client.clone())),
+            },
+            Self::Chain { chain, .. } => chain.clone(),
+        }
+    }
+
+    pub(crate) fn explicit_name(&self) -> Option<&str> {
+        match self {
+            Self::Client(ConfigSelection::GroupName(name)) => Some(name),
+            Self::Client(ConfigSelection::Config(client)) => client.name.as_deref(),
+            Self::Chain { name, .. } => name.as_deref(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientGroupMember {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        if value.is_sequence() {
+            return Err(D::Error::custom(
+                "use {chain: [...]} for a sequential group member",
+            ));
+        }
+        if value
+            .as_mapping()
+            .is_some_and(|map| map.contains_key("chain"))
+        {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Fields {
+                name: Option<String>,
+                chain: Vec<ConfigSelection<ClientConfig>>,
+            }
+            let fields: Fields = serde_yaml::from_value(value).map_err(D::Error::custom)?;
+            if fields.chain.is_empty() {
+                return Err(D::Error::custom("chain cannot be empty"));
+            }
+            Ok(Self::Chain {
+                name: fields.name,
+                chain: ClientChain {
+                    hops: OneOrSome::Some(
+                        fields
+                            .chain
+                            .into_iter()
+                            .map(ClientChainHop::Single)
+                            .collect(),
+                    ),
+                },
+            })
+        } else {
+            serde_yaml::from_value(value)
+                .map(Self::Client)
+                .map_err(D::Error::custom)
+        }
+    }
+}
+
+impl Serialize for ClientGroupMember {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            Self::Client(client) => client.serialize(serializer),
+            Self::Chain { name, chain } => {
+                let mut map = serializer.serialize_map(None)?;
+                if let Some(name) = name {
+                    map.serialize_entry("name", name)?;
+                }
+                map.serialize_entry("chain", &chain.hops.iter().collect::<Vec<_>>())?;
+                map.end()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientChoice {
+    pub name: String,
+    pub group_type: GroupType,
+    pub labels: Vec<String>,
+    pub members: Vec<ClientChain>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -52,7 +155,7 @@ struct RawClientGroup {
     #[serde(rename = "type", default = "default_group_type")]
     kind: String,
     default: Option<String>,
-    client_chains: OneOrSome<ConfigSelection<ClientConfig>>,
+    client_chains: OneOrSome<ClientGroupMember>,
     url: Option<String>,
     interval: Option<u64>,
     timeout: Option<u64>,

@@ -276,8 +276,16 @@ fn gather_pem_file_paths_from_client_config_group(
     visitor: &mut PemVisitor<'_>,
 ) {
     for selection in client_group_config.client_chains.iter_mut() {
-        if let ConfigSelection::Config(client_config) = selection {
-            gather_pem_file_paths_from_client_config(client_config, visitor);
+        match selection {
+            super::ClientGroupMember::Client(ConfigSelection::Config(client)) => {
+                gather_pem_file_paths_from_client_config(client, visitor)
+            }
+            super::ClientGroupMember::Chain { chain, .. } => {
+                for hop in chain.hops.iter_mut() {
+                    gather_pem_file_paths_from_chain_hop(hop, visitor);
+                }
+            }
+            _ => {}
         }
         // GroupName selections are resolved later, skip here
     }
@@ -444,6 +452,13 @@ fn gather_pem_file_paths_from_rule(
 
 fn gather_pem_file_paths_from_chain_hop(hop: &mut ClientChainHop, visitor: &mut PemVisitor<'_>) {
     match hop {
+        ClientChainHop::Choice(choice) => {
+            for member in &mut choice.members {
+                for hop in member.hops.iter_mut() {
+                    gather_pem_file_paths_from_chain_hop(hop, visitor);
+                }
+            }
+        }
         ClientChainHop::Single(selection) => {
             if let ConfigSelection::Config(client_config) = selection {
                 gather_pem_file_paths_from_client_config(client_config, visitor);
@@ -684,7 +699,9 @@ mod tests {
         let Config::ClientConfigGroup(group) = &configs[2] else {
             panic!()
         };
-        let ConfigSelection::Config(client) = group.client_chains.iter().next().unwrap() else {
+        let crate::config::ClientGroupMember::Client(ConfigSelection::Config(client)) =
+            group.client_chains.iter().next().unwrap()
+        else {
             panic!()
         };
         let ClientProxyConfig::Tls(tls) = &client.protocol else {

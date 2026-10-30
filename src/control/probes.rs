@@ -15,10 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::address::NetLocation;
 use crate::client_proxy_chain::ClientChainGroup;
-use crate::config::{ClientChainHop, ClientConfig, ConfigSelection};
-use crate::control::catalog::{Catalog, CatalogNode, MemberOrigin};
+use crate::control::catalog::Catalog;
 use crate::control::runtime::{ControlRuntime, Generation};
-use crate::option_util::OneOrSome;
 use crate::resolver::Resolver;
 
 pub(crate) const PROBE_CONCURRENCY: usize = 16;
@@ -172,14 +170,24 @@ impl ProbeState {
         if let Some(connector) = self.connectors.lock().get(name) {
             return Ok(connector.clone());
         }
-        let mut clients = Vec::new();
-        expand(catalog, name, &mut Vec::new(), &mut clients)?;
-        let chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
-            OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(
-                clients.into_iter().map(ConfigSelection::Config).collect(),
-            ))),
-            self.resolver.clone(),
-        )?;
+        let route = catalog.route(name)?;
+        let chain = if route
+            .hops
+            .iter()
+            .any(|hop| matches!(hop, crate::config::ClientChainHop::Choice(_)))
+        {
+            crate::client_proxy_chain::ClientProxyChain::composed(
+                route.hops,
+                self.resolver.clone(),
+                crate::resources::limits(),
+                true,
+            )?
+        } else {
+            crate::tcp::chain_builder::try_build_client_proxy_chain(
+                route.hops,
+                self.resolver.clone(),
+            )?
+        };
         let connector = Arc::new(ClientChainGroup::new(vec![chain]));
         Ok(self
             .connectors
@@ -188,51 +196,6 @@ impl ProbeState {
             .or_insert(connector)
             .clone())
     }
-}
-
-fn expand(
-    catalog: &Catalog,
-    name: &str,
-    path: &mut Vec<(String, String)>,
-    clients: &mut Vec<ClientConfig>,
-) -> io::Result<()> {
-    if clients.len() >= 16_384 || path.len() >= 128 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "probe subject expansion exceeds limit",
-        ));
-    }
-    match catalog.nodes.get(name) {
-        Some(CatalogNode::Leaf(config)) => {
-            let mut config = (**config).clone();
-            config.control = Some(MemberOrigin {
-                name: Arc::from(name),
-                path: path.clone(),
-                selection: catalog.selection.clone(),
-            });
-            clients.push(config);
-        }
-        Some(CatalogNode::Group { members, .. }) => {
-            for member in members {
-                path.push((name.into(), member.clone()));
-                expand(catalog, member, path, clients)?;
-                path.pop();
-            }
-        }
-        Some(CatalogNode::Reject) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "REJECT cannot carry a probe",
-            ));
-        }
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "proxy does not exist",
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub struct ProbeQuery {
@@ -463,6 +426,11 @@ async fn probe_until(
     })?;
     let probe_request =
         crate::control::url_test::BACKGROUND.scope((), request(generation, name, query));
+    let tickets = generation
+        .catalog
+        .selection
+        .automatic
+        .tickets(name, query.url.as_str());
     let result = tokio::select! {
         biased;
         _ = runtime.shutdown.cancelled() => {
@@ -491,11 +459,9 @@ async fn probe_until(
             .probes
             .record(name, query.url.as_str(), delay, satisfied);
         if query.expected.is_empty() {
-            generation.catalog.selection.automatic.record(
-                name,
-                query.url.as_str(),
-                (satisfied && delay != 0).then_some(delay),
-            );
+            for (group, revision) in tickets {
+                group.record_if_current(name, revision, (satisfied && delay != 0).then_some(delay));
+            }
         }
     })?;
     result.map(|(delay, _)| delay)
@@ -581,8 +547,10 @@ pub(crate) async fn run_automatic(
         .keys()
         .filter_map(|name| generation.catalog.selection.automatic.0.get(name))
         .collect();
-    let mut rounds = futures::stream::FuturesUnordered::new();
-    let mut checking = vec![false; groups.len()];
+    let mut rounds: futures::stream::FuturesUnordered<
+        futures::future::BoxFuture<'_, (bool, usize)>,
+    > = futures::stream::FuturesUnordered::new();
+    let mut checking = std::collections::HashSet::new();
     loop {
         let Some(runtime) = runtime.upgrade() else {
             return;
@@ -592,9 +560,10 @@ pub(crate) async fn run_automatic(
             _ = runtime.shutdown.cancelled() => return,
             _ = epoch.cancelled() => return,
             Some(index) = rounds.next(), if !rounds.is_empty() => {
-                checking[index] = false;
+                checking.remove(&index);
                 continue;
             }
+            _ = generation.catalog.selection.contexts.changed.notified() => {},
             _ = ticker.tick() => {}
         }
         if runtime.with_probe_generation(generation.id, || ()).is_err() {
@@ -604,27 +573,149 @@ pub(crate) async fn run_automatic(
         let mut due: Vec<_> = groups
             .iter()
             .enumerate()
-            .filter(|(index, _)| !checking[*index])
-            .filter_map(|(index, group)| group.due_members(now).map(|members| (index, members)))
+            .filter(|(index, _)| !checking.contains(&(false, *index)))
+            .filter_map(|(index, group)| {
+                group.due_members(now).map(|members| (index, None, members))
+            })
             .collect();
+        let choices = generation.catalog.selection.snapshot();
+        for context in generation.catalog.selection.contexts.snapshot() {
+            let id = Arc::as_ptr(&context) as usize;
+            if !checking.contains(&(true, id))
+                && context.active(&choices)
+                && let Some(members) = context.group.due_members(now)
+            {
+                due.push((id, Some(context), members));
+            }
+        }
         // A busy, short-interval group must not reset a waiting group's priority.
-        due.sort_by_key(|(index, _)| groups[*index].last_unqueued_admission());
-        for (index, members) in due {
-            let group = groups[index];
-            checking[index] = true;
-            let round = AutomaticRound {
-                group,
-                completed: false,
-            };
+        due.sort_by_key(|(index, context, _)| {
+            context.as_ref().map_or_else(
+                || groups[*index].last_unqueued_admission(),
+                |context| context.group.last_unqueued_admission(),
+            )
+        });
+        for (index, context, members) in due {
+            let key = (context.is_some(), index);
+            checking.insert(key);
             let runtime = runtime.clone();
             let generation = &generation;
             let epoch = &epoch;
-            rounds.push(async move {
-                run_automatic_round(round, &runtime, generation, members, now, epoch).await;
-                index
-            });
+            if let Some(context) = context {
+                let round = ContextRound {
+                    revision: context.revision(),
+                    context,
+                    completed: false,
+                };
+                rounds.push(Box::pin(async move {
+                    run_context_round(round, &runtime, generation, members, now, epoch).await;
+                    key
+                }));
+            } else {
+                let round = AutomaticRound {
+                    group: groups[index],
+                    completed: false,
+                };
+                rounds.push(Box::pin(async move {
+                    run_automatic_round(round, &runtime, generation, members, now, epoch).await;
+                    key
+                }));
+            }
         }
     }
+}
+
+struct ContextRound {
+    context: Arc<super::url_test::context::Context>,
+    revision: u64,
+    completed: bool,
+}
+
+impl Drop for ContextRound {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.context.cancel(self.revision);
+        }
+    }
+}
+
+async fn run_context_round(
+    mut round: ContextRound,
+    runtime: &ControlRuntime,
+    generation: &Generation,
+    mut members: Vec<usize>,
+    started: tokio::time::Instant,
+    epoch: &CancellationToken,
+) {
+    let context = &round.context;
+    let query = ProbeQuery {
+        url: url::Url::parse(&context.group.config.url).expect("validated URL-test URL"),
+        timeout: Duration::from_millis(context.group.config.timeout),
+        expected: Vec::new(),
+    };
+    let deadline = started + query.timeout;
+    context.order(&mut members);
+    let mut probes = futures::stream::iter(members.into_iter().enumerate())
+        .map(|(ordinal, member)| {
+            let query = &query;
+            async move {
+                let Ok((_permit, waited)) = acquire_probe(runtime, deadline).await else {
+                    return;
+                };
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                let queued = waited || ordinal >= PROBE_CONCURRENCY;
+                if with_probe_epoch(runtime, generation, epoch, || {
+                    context.group.admitted(member, queued);
+                    if !queued {
+                        context.attempted(member);
+                    }
+                })
+                .is_err()
+                {
+                    return;
+                }
+                // Selection publication fences the ticket before publishing new choices.
+                let revision = context.revision();
+                let choices = generation.catalog.selection.snapshot();
+                let Ok(Some(chain)) = context.sample(member, &choices) else {
+                    return;
+                };
+                let request = super::url_test::BACKGROUND.scope(
+                    (),
+                    request_via(
+                        &chain,
+                        context.resolver.clone(),
+                        &generation.probes.forbidden,
+                        query,
+                        crate::rustls_config_util::create_dns_client_config,
+                    ),
+                );
+                let result = tokio::select! {
+                    biased;
+                    _ = runtime.shutdown.cancelled() => return,
+                    _ = epoch.cancelled() => return,
+                    result = tokio::time::timeout_at(deadline, request) => match result {
+                        Ok(result) => result,
+                        Err(_) if queued => return,
+                        Err(_) => Err(io::ErrorKind::TimedOut.into()),
+                    }
+                };
+                if result.as_ref().is_err_and(local_failure) {
+                    return;
+                }
+                let delay = result
+                    .ok()
+                    .and_then(|(delay, satisfied)| satisfied.then_some(delay));
+                let _ = with_probe_epoch(runtime, generation, epoch, || {
+                    context.record(member, revision, delay)
+                });
+            }
+        })
+        .buffer_unordered(PROBE_CONCURRENCY);
+    while probes.next().await.is_some() {}
+    round.completed = with_probe_epoch(runtime, generation, epoch, || ()).is_ok();
 }
 
 struct AutomaticRound<'a> {

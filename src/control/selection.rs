@@ -21,9 +21,17 @@ pub struct SelectionView {
     definitions: SelectorDefinitions,
     choices: RwLock<Arc<Choices>>,
     pub automatic: super::url_test::AutomaticGroups,
+    pub(crate) contexts: super::url_test::context::Contexts,
+    pub(crate) health: super::health::HealthState,
 }
 
 impl SelectionView {
+    pub(crate) fn register_contexts(
+        &self,
+        contexts: &[Arc<super::url_test::context::Context>],
+    ) -> io::Result<()> {
+        self.contexts.register(contexts, &self.choices.read())
+    }
     pub fn snapshot(&self) -> Arc<Choices> {
         self.choices.read().clone()
     }
@@ -33,7 +41,10 @@ impl SelectionView {
     }
 
     fn publish_choices(&self, choices: Arc<Choices>) {
-        *self.choices.write() = choices;
+        let mut previous = self.choices.write();
+        self.automatic.choices_changed(&previous, &choices);
+        self.contexts.choices_changed(&previous, &choices);
+        *previous = choices;
     }
 }
 
@@ -66,6 +77,7 @@ impl SelectionOwner {
             choices: RwLock::new(Arc::new(effective(&definitions, &self.explicit))),
             definitions,
             automatic: Default::default(),
+            contexts: Default::default(),
         }))
     }
 

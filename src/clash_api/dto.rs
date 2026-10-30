@@ -33,6 +33,23 @@ pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<V
         CatalogNode::Leaf(client) => {
             json!({"name":name,"type":protocol_type(&client.protocol),"udp":udp})
         }
+        CatalogNode::Chain(chain) => {
+            let all: Vec<_> = chain
+                .hops
+                .iter()
+                .filter_map(|hop| match hop {
+                    ClientChainHop::Single(ConfigSelection::GroupName(name)) => {
+                        Some(crate::control::catalog::api_group(name).to_owned())
+                    }
+                    ClientChainHop::Single(ConfigSelection::Config(client)) => client
+                        .control
+                        .as_ref()
+                        .map(|origin| origin.name.to_string()),
+                    _ => None,
+                })
+                .collect();
+            json!({"name":name,"type":"Relay","all":all,"udp":udp})
+        }
         CatalogNode::Reject => json!({"name":name,"type":"Reject","udp":false}),
         CatalogNode::Group {
             members,
@@ -92,6 +109,15 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str) -> bool 
             continue;
         }
         match generation.catalog.nodes.get(name) {
+            Some(CatalogNode::Chain(_)) => {
+                if generation
+                    .catalog
+                    .route(name)
+                    .is_ok_and(|chain| route_udp(generation, choices, &chain.hops))
+                {
+                    return true;
+                }
+            }
             Some(CatalogNode::Group {
                 members,
                 group_type,
@@ -116,6 +142,28 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str) -> bool 
         }
     }
     false
+}
+
+fn route_udp(generation: &Generation, choices: &Choices, hops: &OneOrSome<ClientChainHop>) -> bool {
+    match hops.iter().last() {
+        Some(ClientChainHop::Choice(choice)) => {
+            choice.members.iter().enumerate().any(|(index, chain)| {
+                (choice.group_type != GroupType::Selector
+                    || choices.get(&choice.name) == Some(&choice.labels[index]))
+                    && route_udp(generation, choices, &chain.hops)
+            })
+        }
+        Some(hop) => crate::config::composition::clients(hop).any(|client| {
+            client.control.as_ref().is_some_and(|origin| {
+                generation
+                    .leaf_udp_support
+                    .get(origin.name.as_ref())
+                    .copied()
+                    .unwrap_or(false)
+            })
+        }),
+        None => false,
+    }
 }
 
 pub fn proxies(generation: &Generation) -> Value {

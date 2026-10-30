@@ -1154,7 +1154,7 @@ async fn selector_identity_prevents_dns_pooling_of_identical_members() {
     .unwrap();
     let validated = crate::config::create_server_configs(configs).unwrap();
     let specs = &validated.dns_groups[0].specs;
-    assert_eq!(
+    assert_ne!(
         serde_yaml::to_string(&specs[0].client_chains).unwrap(),
         serde_yaml::to_string(&specs[1].client_chains).unwrap()
     );
@@ -1177,11 +1177,19 @@ async fn selector_identity_prevents_dns_pooling_of_identical_members() {
     let resolver = build_hickory_resolver_group(&plans).await.unwrap();
     assert!(format!("{resolver:?}").contains("CompositeResolver"));
     assert_eq!(
-        plans[0].chain_group.select_bind_interface().unwrap(),
+        plans[0]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("east")
     );
     assert_eq!(
-        plans[1].chain_group.select_bind_interface().unwrap(),
+        plans[1]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("west")
     );
     let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
@@ -1190,20 +1198,36 @@ async fn selector_identity_prevents_dns_pooling_of_identical_members() {
         .unwrap();
     owner.select("first", "west").unwrap();
     assert_eq!(
-        plans[0].chain_group.select_bind_interface().unwrap(),
+        plans[0]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("west")
     );
     assert_eq!(
-        plans[1].chain_group.select_bind_interface().unwrap(),
+        plans[1]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("west")
     );
     owner.select("second", "east").unwrap();
     assert_eq!(
-        plans[0].chain_group.select_bind_interface().unwrap(),
+        plans[0]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("west")
     );
     assert_eq!(
-        plans[1].chain_group.select_bind_interface().unwrap(),
+        plans[1]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("east")
     );
 }

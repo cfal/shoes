@@ -51,11 +51,10 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
             crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver)
                 .unwrap();
         let chain = &group.chains[0];
-        let auto = &catalog.selection.automatic;
-        auto.record("http", "http://inner.invalid/", Some(10));
-        auto.record("udp", "http://inner.invalid/", Some(100));
-        auto.record("manual", "http://outer.invalid/", Some(10));
-        auto.record("DIRECT", "http://outer.invalid/", Some(200));
+        chain.test_record_automatic("http", "http://inner.invalid/", Some(10));
+        chain.test_record_automatic("udp", "http://inner.invalid/", Some(100));
+        chain.test_record_automatic("manual", "http://outer.invalid/", Some(10));
+        chain.test_record_automatic("DIRECT", "http://outer.invalid/", Some(200));
         if route == "outer" {
             assert_eq!(chain.select_indices(false).unwrap(), [0]);
             assert_eq!(chain.select_indices(true).unwrap(), [1]);
@@ -144,7 +143,7 @@ fn unselected_large_pools_keep_constant_time_round_robin() {
 }
 
 #[test]
-fn selectors_filter_all_hops_without_changing_flattened_weights() {
+fn selectors_preserve_declared_branch_weights_and_duplicate_tickets() {
     let yaml = "
 - client_group: leaves
   client_chains:
@@ -179,8 +178,8 @@ fn selectors_filter_all_hops_without_changing_flattened_weights() {
     let group =
         crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver).unwrap();
     let chain = &group.chains[0];
-    for index in 0..10 {
-        assert_eq!(chain.select_indices(false).unwrap(), [index % 5]);
+    for index in [0, 2, 4, 1, 3, 4, 0, 2, 4, 1, 3, 4] {
+        assert_eq!(chain.select_indices(false).unwrap(), [index]);
     }
     for index in [1, 3, 4, 1, 3, 4] {
         assert_eq!(chain.select_indices(true).unwrap(), [index]);
