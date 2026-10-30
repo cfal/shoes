@@ -469,21 +469,20 @@ independently of API eviction; other attempt URLs are capped at eight per member
 for each of filtered and unfiltered probes.
 Each URL-test occurrence in a forwarding route has independent state. A check
 forces one immediate member and samples one complete route, including its enclosing
-prefix and suffix. Nested round-robin choices are sampled, not exhaustively tested;
-probes do not advance forwarding counters. Manual selector changes affecting the
-route or its resolver invalidate samples and fence in-flight results. Routes in
-manually deselected branches are not checked.
+prefix and suffix. Nested round-robin choices are randomly sampled, not
+exhaustively tested, using fixed-size per-member sampler state; probes do not
+advance forwarding counters. Any effective manual selector change invalidates
+all contextual samples in the generation and fences in-flight results, even for
+unrelated routes. This can temporarily change preferred members while new
+measurements arrive. Selecting the same effective choice does not invalidate
+samples. Routes in manually deselected branches are not checked. Standalone
+URL-test and fallback health retain their dependency-specific invalidation.
 The dashboard is a standalone projection, not a summary of all route contexts;
 its `now` can differ from forwarding choices. Contextual results never overwrite
 standalone history. There are at most 1,024 live automatic contexts per generation.
 Each separately built forwarding route owns its occurrences, including copies of
 rules across inbounds. A single route over the limit fails validation; the combined
 live-route limit is enforced when constructing routes, including lazy carriers.
-Live contexts also share a limit of 65,536 selector dependency entries, including
-resolver dependencies. Each selector/member pair in a distinct dependency path
-counts once per context; an empty path counts as one entry. Route construction
-fails if either limit would be exceeded. Dropping routes releases both their
-context and dependency budgets.
 URL-test groups are not supported by FFI.
 
 Only one `cache_file_path` is allowed across all input files. Its absence disables

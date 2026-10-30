@@ -1,16 +1,16 @@
 use super::*;
 use crate::config::{ClientChainHop, ClientConfig, ConfigSelection, GlobalLimits, GroupType};
 use crate::control::health::{Health, ProbeJob};
-use crate::control::selection::{Choices, ManualSelectorPath, SelectionView};
-use crate::control::url_test::context::{Context, Definition, check_dependency_capacity};
+use crate::control::selection::{Choices, SelectionView};
+use crate::control::url_test::context::{Context, Definition};
 use crate::option_util::OneOrSome;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
-use std::collections::{BTreeSet, HashMap};
+use rand::{RngExt, rngs::SmallRng};
+use std::collections::HashMap;
 use std::io;
 
 struct Leaf {
     config: ClientConfig,
-    dependencies: Vec<ManualSelectorPath>,
     initial: Option<Arc<InitialHopEntry>>,
     proxy: Option<Arc<dyn ProxyConnector>>,
     udp: bool,
@@ -53,20 +53,17 @@ struct Selection<'a> {
     paths: &'a [CheckedPath],
     candidates: Vec<(usize, bool)>,
     forced: &'a [(usize, usize)],
-    sampler: Option<&'a mut HashMap<usize, u32>>,
+    sampler: Option<&'a mut SmallRng>,
     touched: Vec<Arc<Context>>,
     now: tokio::time::Instant,
 }
 
 impl Selection<'_> {
-    fn next(&mut self, id: usize, counter: &AtomicU32) -> usize {
+    fn next(&mut self, counter: &AtomicU32, len: usize) -> usize {
         if let Some(sampler) = &mut self.sampler {
-            let next = sampler.entry(id).or_default();
-            let value = *next;
-            *next = next.wrapping_add(1);
-            value as usize
+            sampler.random_range(0..len)
         } else {
-            counter.fetch_add(1, Ordering::Relaxed) as usize
+            counter.fetch_add(1, Ordering::Relaxed) as usize % len
         }
     }
 }
@@ -130,22 +127,6 @@ impl Composition {
         if !standalone && selection.is_some() {
             root.context_definitions(&[], &[], &mut definitions);
         }
-        if !definitions.is_empty() {
-            let resolver_paths = resolver.manual_selector_paths();
-            let mut entries = 0;
-            for definition in &mut definitions {
-                let mut dependencies = BTreeSet::new();
-                root.dependencies(&definition.ancestors, &mut dependencies);
-                dependencies.extend(&resolver_paths);
-                entries += dependencies
-                    .iter()
-                    .map(|path| path.len().max(1))
-                    .sum::<usize>();
-                // Bounds owned paths before cloning, including resolver dependencies.
-                check_dependency_capacity(entries)?;
-                definition.dependencies = dependencies.into_iter().cloned().collect();
-            }
-        }
         let mut registered = Vec::new();
         let result = Arc::new_cyclic(|owner| {
             let mut contexts = HashMap::new();
@@ -183,7 +164,7 @@ impl Composition {
         &self,
         choices: &Choices,
         forced: &[(usize, usize)],
-        sampler: &mut HashMap<usize, u32>,
+        sampler: &mut SmallRng,
     ) -> io::Result<ClientProxyChain> {
         let mut selected = self.select_with(false, choices, forced, Some(sampler))?;
         selected.selection = None;
@@ -196,7 +177,7 @@ impl Composition {
         udp: bool,
         choices: &Choices,
         forced: &[(usize, usize)],
-        sampler: Option<&mut HashMap<usize, u32>>,
+        sampler: Option<&mut SmallRng>,
     ) -> io::Result<ClientProxyChain> {
         let mut candidates = Vec::new();
         if !self.checked.is_empty() {
@@ -424,7 +405,6 @@ fn node(
                 (None, Some(proxy), udp)
             };
             Ok(Node::Client(Arc::new(Leaf {
-                dependencies: crate::control::catalog::client_selector_paths(&config),
                 config,
                 initial,
                 proxy,
@@ -638,8 +618,7 @@ impl Node {
                     if eligible.is_empty() {
                         return Err(unsupported());
                     }
-                    let selected =
-                        eligible[context.next(*id, &next[usize::from(udp)]) % eligible.len()];
+                    let selected = eligible[context.next(&next[usize::from(udp)], eligible.len())];
                     return members[selected].select(udp, context, leaves);
                 }
                 let eligible: Vec<_> = members
@@ -686,7 +665,7 @@ impl Node {
                         .find(|index| labels[*index] == selected)
                         .unwrap()
                 } else {
-                    eligible[context.next(*id, &next[usize::from(udp)]) % eligible.len()]
+                    eligible[context.next(&next[usize::from(udp)], eligible.len())]
                 };
                 context
                     .candidates
@@ -726,7 +705,6 @@ impl Node {
                         occurrence: *id,
                         ancestors: ancestors.to_vec(),
                         required: required.to_vec(),
-                        dependencies: Vec::new(),
                     });
                 }
                 for (index, member) in members.iter().enumerate() {
@@ -742,31 +720,6 @@ impl Node {
         }
     }
 
-    fn dependencies<'a>(
-        &'a self,
-        forced: &[(usize, usize)],
-        paths: &mut BTreeSet<&'a ManualSelectorPath>,
-    ) {
-        match self {
-            Self::Client(leaf) => {
-                paths.extend(&leaf.dependencies);
-            }
-            Self::Sequence(nodes) => {
-                for node in nodes {
-                    node.dependencies(forced, paths);
-                }
-            }
-            Self::Choice { id, members, .. } => {
-                if let Some((_, member)) = forced.iter().find(|(node, _)| node == id) {
-                    members[*member].dependencies(forced, paths);
-                } else {
-                    for member in members {
-                        member.dependencies(forced, paths);
-                    }
-                }
-            }
-        }
-    }
     fn prefer_fallbacks(&self, paths: &[CheckedPath], candidates: &mut Vec<(usize, bool)>) {
         match self {
             Self::Client(_) => {}
@@ -1010,24 +963,25 @@ mod tests {
         );
         let tree = chain.composition.as_ref().unwrap();
         let context = tree.test_contexts().pop().unwrap();
-        for index in 0..10 {
-            for member in 0..2 {
+        let mut prefixes: [std::collections::HashSet<String>; 2] = Default::default();
+        for _ in 0..64 {
+            for (member, seen) in prefixes.iter_mut().enumerate() {
                 let sample = context
                     .sample(member, &catalog.selection.snapshot())
                     .unwrap()
                     .unwrap();
+                let addresses = addresses(&sample.chains[0]);
+                assert!(["192.0.2.3:80", "192.0.2.4:80"].contains(&addresses[0].as_str()));
+                seen.insert(addresses[0].clone());
                 assert_eq!(
-                    addresses(&sample.chains[0]),
-                    [
-                        format!("192.0.2.{}:80", 3 + index % 2),
-                        format!("192.0.2.{}:80", member + 1),
-                        "192.0.2.5:80".into()
-                    ]
+                    addresses[1..],
+                    [format!("192.0.2.{}:80", member + 1), "192.0.2.5:80".into()]
                 );
                 assert!(sample.chains[0].composition.is_none());
                 assert!(sample.chains[0].automatic_contexts.is_empty());
             }
         }
+        assert!(prefixes.iter().all(|seen| seen.len() == 2));
         assert_eq!(
             addresses(&tree.select(false).unwrap()),
             ["192.0.2.3:80", "192.0.2.1:80", "192.0.2.5:80"]
@@ -1114,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn contextual_samples_are_fenced_by_relevant_selector_revisions() {
+    fn simplification_contextual_samples_are_fenced_by_all_selector_changes() {
         let mut config = automatic_config();
         config.as_array_mut().unwrap().push(
             json!({"client_group":"manual","type":"selector","client_chains":["prefix","suffix"]}),
@@ -1133,10 +1087,20 @@ mod tests {
         let old_choices = catalog.selection.snapshot();
         let revision = context.revision();
         context.record(1, revision, Some(1));
-        owner.select("unrelated", "suffix").unwrap();
+        catalog
+            .selection
+            .automatic
+            .record("b", "http://probe.invalid/", Some(1));
+        owner.select("unrelated", "prefix").unwrap();
         assert_eq!(context.revision(), revision);
-        assert_eq!(context.group.health("b"), "healthy");
-        owner.select("manual", "suffix").unwrap();
+        assert!(Arc::ptr_eq(&old_choices, &catalog.selection.snapshot()));
+        owner.select("unrelated", "suffix").unwrap();
+        assert_ne!(context.revision(), revision);
+        assert_eq!(catalog.selection.automatic.0["auto"].health("b"), "healthy");
+        assert_eq!(context.group.health("b"), "unprobed");
+        owner.select("unrelated", "prefix").unwrap();
+        assert_eq!(*old_choices, *catalog.selection.snapshot());
+        context.record(1, revision, Some(1));
         assert_eq!(context.group.health("b"), "unprobed");
         context.record(1, context.revision(), Some(1));
         let eligible = ["a", "b"].into_iter().collect();
@@ -1146,7 +1110,18 @@ mod tests {
                 .as_deref(),
             Some("a")
         );
-        owner.select("manual", "prefix").unwrap();
+        assert_eq!(
+            context
+                .choose(
+                    &eligible,
+                    false,
+                    &catalog.selection.snapshot(),
+                    tokio::time::Instant::now()
+                )
+                .as_deref(),
+            Some("b")
+        );
+        owner.select("manual", "suffix").unwrap();
         context.record(1, revision, Some(1));
         assert_eq!(context.group.health("b"), "unprobed");
     }

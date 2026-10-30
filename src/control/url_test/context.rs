@@ -1,22 +1,13 @@
 use super::*;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::client_proxy_chain::composition::Composition;
-use crate::control::selection::{Choices, ManualSelectorPath, manual_choices_changed};
+use crate::control::selection::{Choices, ManualSelectorPath};
 use crate::resolver::Resolver;
+use rand::{SeedableRng, rngs::SmallRng};
 use std::sync::{Arc, Weak};
 use tokio::sync::Notify;
 
 pub(crate) const MAX_CONTEXTS: usize = 1024;
-const MAX_DEPENDENCY_ENTRIES: usize = 65_536;
-
-pub(crate) fn check_dependency_capacity(entries: usize) -> io::Result<()> {
-    if entries > MAX_DEPENDENCY_ENTRIES {
-        return Err(crate::control::health::capacity_error(format!(
-            "URL-test exceeds {MAX_DEPENDENCY_ENTRIES} selector dependency entries"
-        )));
-    }
-    Ok(())
-}
 
 #[derive(Default)]
 pub(crate) struct Contexts {
@@ -31,7 +22,11 @@ impl std::fmt::Debug for Contexts {
 }
 
 impl Contexts {
-    pub(crate) fn register(&self, contexts: &[Arc<Context>], choices: &Choices) -> io::Result<()> {
+    pub(crate) fn register(
+        &self,
+        contexts: &[Arc<Context>],
+        choices: &Arc<Choices>,
+    ) -> io::Result<()> {
         let mut live = self.live.lock();
         live.retain(|context| context.strong_count() != 0);
         if live.len() + contexts.len() > MAX_CONTEXTS {
@@ -39,19 +34,9 @@ impl Contexts {
                 "URL-test exceeds 1024 active route contexts".into(),
             ));
         }
-        let retained_entries: usize = live
-            .iter()
-            .filter_map(Weak::upgrade)
-            .map(|context| context.dependency_entries())
-            .sum();
-        let added_entries: usize = contexts
-            .iter()
-            .map(|context| context.dependency_entries())
-            .sum();
-        check_dependency_capacity(retained_entries + added_entries)?;
         for context in contexts {
             // The caller holds the selection read lock until registration completes.
-            context.gate.lock().choices = relevant_choices(&context.dependencies, choices);
+            context.gate.lock().choices = choices.clone();
             live.push(Arc::downgrade(context));
         }
         self.changed.notify_one();
@@ -62,38 +47,27 @@ impl Contexts {
         self.live.lock().iter().filter_map(Weak::upgrade).collect()
     }
 
-    pub(crate) fn choices_changed(&self, previous: &Choices, current: &Choices) {
+    pub(crate) fn choices_changed(&self, previous: &Arc<Choices>, current: &Arc<Choices>) {
+        if Arc::ptr_eq(previous, current) {
+            return;
+        }
         for context in self.snapshot() {
-            if manual_choices_changed(&context.dependencies, previous, current) {
-                let mut gate = context.gate.lock();
-                gate.revision = gate.revision.wrapping_add(1);
-                gate.choices = relevant_choices(&context.dependencies, current);
-                let mut state = context.group.state.lock();
-                state.samples.clear();
-                state.incumbent = [None, None];
-                state.last_check = None;
-            }
+            let mut gate = context.gate.lock();
+            gate.revision = gate.revision.wrapping_add(1);
+            gate.choices = current.clone();
+            let mut state = context.group.state.lock();
+            state.samples.clear();
+            state.incumbent = [None, None];
+            state.last_check = None;
         }
         self.changed.notify_one();
     }
 }
 
-fn relevant_choices(paths: &[ManualSelectorPath], choices: &Choices) -> Choices {
-    paths
-        .iter()
-        .flatten()
-        .filter_map(|(group, _)| {
-            choices
-                .get(group)
-                .map(|member| (group.clone(), member.clone()))
-        })
-        .collect()
-}
-
 #[derive(Default)]
 struct Gate {
     revision: u64,
-    choices: Choices,
+    choices: Arc<Choices>,
 }
 
 pub(crate) struct Context {
@@ -104,9 +78,8 @@ pub(crate) struct Context {
     occurrence: usize,
     ancestors: Vec<(usize, usize)>,
     required: ManualSelectorPath,
-    dependencies: Vec<ManualSelectorPath>,
     gate: Mutex<Gate>,
-    samplers: Mutex<Vec<HashMap<usize, u32>>>,
+    samplers: Mutex<Vec<SmallRng>>,
     attempts: Mutex<Vec<Option<Instant>>>,
 }
 
@@ -126,7 +99,6 @@ pub(crate) struct Definition {
     pub occurrence: usize,
     pub ancestors: Vec<(usize, usize)>,
     pub required: ManualSelectorPath,
-    pub dependencies: Vec<ManualSelectorPath>,
 }
 
 impl Context {
@@ -139,7 +111,11 @@ impl Context {
         Arc::new(Self {
             name: definition.name,
             attempts: Mutex::new(vec![None; members.len()]),
-            samplers: Mutex::new(vec![HashMap::new(); members.len()]),
+            samplers: Mutex::new(
+                (0..members.len())
+                    .map(|member| SmallRng::seed_from_u64(member as u64))
+                    .collect(),
+            ),
             group: AutomaticGroup {
                 config: definition.config,
                 members,
@@ -151,13 +127,8 @@ impl Context {
             occurrence: definition.occurrence,
             ancestors: definition.ancestors,
             required: definition.required,
-            dependencies: definition.dependencies,
             gate: Mutex::default(),
         })
-    }
-
-    fn dependency_entries(&self) -> usize {
-        self.dependencies.iter().map(|path| path.len().max(1)).sum()
     }
 
     pub(crate) fn active(&self, choices: &Choices) -> bool {
@@ -193,7 +164,8 @@ impl Context {
         now: Instant,
     ) -> Option<String> {
         let gate = self.gate.lock();
-        if manual_choices_changed(&self.dependencies, &gate.choices, choices) {
+        // Old snapshots must not consume measurements made after a selector change.
+        if !std::ptr::eq(gate.choices.as_ref(), choices) {
             return self
                 .group
                 .members
@@ -250,6 +222,46 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn simplification_probe_sampler_storage_is_linear_in_members() {
+        let mut configs = vec![
+            json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
+                "client_chains":(0..64).map(|member| json!({"name":format!("m{member}"),
+                    "address":"192.0.2.1:80", "protocol":{"type":"http"}})).collect::<Vec<_>>()}),
+            json!({"client_group":"tail0", "client_chains":[
+                {"address":"192.0.2.2:80", "protocol":{"type":"http"}},
+                {"address":"192.0.2.3:80", "protocol":{"type":"http"}}
+            ]}),
+        ];
+        for level in 1..6 {
+            configs.push(json!({"client_group":format!("tail{level}"),
+                "client_chains":vec![format!("tail{}", level - 1); 2]}));
+        }
+        configs
+            .push(json!({"client_group":"route", "client_chains":[{"chain":["auto", "tail5"]}]}));
+        let catalog =
+            crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
+                .unwrap()
+                .catalog
+                .unwrap();
+        let _chain =
+            build_route(&catalog, Arc::new(crate::resolver::NativeResolver::new())).unwrap();
+        let context = catalog.selection.contexts.snapshot().pop().unwrap();
+        let choices = catalog.selection.snapshot();
+        let original = context.samplers.lock().clone();
+        context.sample(0, &choices).unwrap().unwrap();
+        assert_ne!(context.samplers.lock()[0], original[0]);
+        assert_eq!(context.samplers.lock()[1..], original[1..]);
+        for _ in 0..64 {
+            for member in 0..64 {
+                context.sample(member, &choices).unwrap().unwrap();
+            }
+        }
+        let samplers = context.samplers.lock();
+        assert_eq!(samplers.len(), 64);
+        assert!(std::mem::size_of_val(samplers.as_slice()) <= 64 * 32);
+    }
+
     fn dependency_catalog(
         occurrences: usize,
         members: usize,
@@ -289,43 +301,31 @@ mod tests {
     }
 
     #[test]
-    fn dependency_budget_rejects_distinct_paths_multiplied_across_contexts() {
+    fn simplification_contexts_share_one_snapshot_despite_many_selector_paths() {
         let catalog = dependency_catalog(64, 256, 9);
-        let error =
-            build_route(&catalog, Arc::new(crate::resolver::NativeResolver::new())).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("65536 selector dependency entries"),
-            "{error}"
-        );
-        assert!(catalog.selection.contexts.snapshot().is_empty());
-    }
-
-    #[test]
-    fn dependency_budget_spans_roots_and_reclaims_dropped_routes() {
-        let catalog = dependency_catalog(16, 256, 8);
-        let build = || build_route(&catalog, Arc::new(crate::resolver::NativeResolver::new()));
-        let first = build().unwrap();
-        let second = build().unwrap();
-        assert_eq!(catalog.selection.contexts.snapshot().len(), 32);
-        let error = build().unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("65536 selector dependency entries"),
-            "{error}"
-        );
-        assert_eq!(catalog.selection.contexts.snapshot().len(), 32);
-        drop(first);
-        let replacement = build().unwrap();
-        assert_eq!(catalog.selection.contexts.snapshot().len(), 32);
-        drop((second, replacement));
+        let chain =
+            build_route(&catalog, Arc::new(crate::resolver::NativeResolver::new())).unwrap();
+        let contexts = catalog.selection.contexts.snapshot();
+        assert_eq!(contexts.len(), 64);
+        let previous = catalog.selection.snapshot();
+        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+        owner.activate(catalog.selection.clone()).unwrap();
+        for context in &contexts {
+            context.record(0, context.revision(), Some(1));
+        }
+        owner.select("s0", "leaf-1").unwrap();
+        let current = catalog.selection.snapshot();
+        assert!(!Arc::ptr_eq(&previous, &current));
+        for context in &contexts {
+            assert!(Arc::ptr_eq(&context.gate.lock().choices, &current));
+            assert_eq!(context.group.health(&context.group.members[0]), "unprobed");
+        }
+        drop((contexts, chain));
         assert!(catalog.selection.contexts.snapshot().is_empty());
     }
 
     #[derive(Debug)]
-    struct SelectorResolver(Vec<ManualSelectorPath>);
+    struct SelectorResolver;
 
     impl Resolver for SelectorResolver {
         fn resolve_location(
@@ -336,32 +336,19 @@ mod tests {
         }
 
         fn manual_selector_paths(&self) -> Vec<ManualSelectorPath> {
-            self.0.clone()
+            panic!("contextual probes must not enumerate resolver dependencies")
         }
     }
 
     #[test]
-    fn dependency_budget_includes_resolver_paths_and_path_depth() {
+    fn simplification_contexts_do_not_enumerate_resolver_dependencies() {
         let catalog = dependency_catalog(16, 1, 1);
-        let paths = (0..64)
-            .map(|path| {
-                (0..64)
-                    .map(|pair| (format!("dns-{path}-{pair}"), "member".into()))
-                    .collect()
-            })
-            .collect();
-        let error = build_route(&catalog, Arc::new(SelectorResolver(paths))).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("65536 selector dependency entries"),
-            "{error}"
-        );
-        assert!(catalog.selection.contexts.snapshot().is_empty());
+        let _chain = build_route(&catalog, Arc::new(SelectorResolver)).unwrap();
+        assert_eq!(catalog.selection.contexts.snapshot().len(), 16);
     }
 
     #[test]
-    fn review_selector_dependencies_store_only_distinct_paths() {
+    fn standalone_selector_dependencies_store_only_distinct_paths() {
         let configs = serde_json::from_value(serde_json::json!([
             {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
              "client_chains":[
@@ -380,20 +367,10 @@ mod tests {
             .unwrap()
             .catalog
             .unwrap();
-        let _chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
-            catalog.route("route").unwrap().hops,
-            Arc::new(crate::resolver::NativeResolver::new()),
-        )
-        .unwrap();
         let expected = vec![
             vec![("left".into(), "wide".into())],
             vec![("right".into(), "wide".into())],
         ];
-        let contexts = catalog.selection.contexts.snapshot();
-        assert_eq!(contexts.len(), 16);
-        for context in contexts {
-            assert_eq!(context.dependencies, expected);
-        }
         assert_eq!(
             *catalog.selection.automatic.0["outer"].dependencies.lock(),
             expected
