@@ -62,7 +62,14 @@ mod request_tests {
             Arc::new(ClientProxySelector::new(vec![])),
             Arc::new(crate::resolver::NativeResolver::new()),
         );
-        (handler.setup_server_stream(Box::new(server)).await, client)
+        (
+            handler
+                .setup_server_stream(Box::new(
+                    crate::async_stream::test_streams::FlushGatedStream::new(server),
+                ))
+                .await,
+            client,
+        )
     }
 
     #[tokio::test]

@@ -987,6 +987,22 @@ mod tests {
         for (auth, request, expected) in [
             (None, vec![5, 1, 2], vec![5, 255]),
             (None, vec![5, 0], vec![5, 255]),
+            (credentials(), vec![5, 1, 0], vec![5, 255]),
+            (
+                credentials(),
+                b"\x05\x01\x02\x02\x04user\x04pass".to_vec(),
+                vec![5, 2, 1, 1],
+            ),
+            (
+                credentials(),
+                b"\x05\x01\x02\x01\x00".to_vec(),
+                vec![5, 2, 1, 1],
+            ),
+            (
+                credentials(),
+                b"\x05\x01\x02\x01\x04user\x00".to_vec(),
+                vec![5, 2, 1, 1],
+            ),
             (
                 credentials(),
                 b"\x05\x01\x02\x01\x04user\x04fail".to_vec(),
@@ -1001,13 +1017,16 @@ mod tests {
             let (mut client, stream) = tokio::io::duplex(1024);
             client.write_all(&request).await.unwrap();
             client.shutdown().await.unwrap();
-            assert!(
+            assert_eq!(
                 bounded(
                     server_handler(auth)
                         .setup_server_stream(Box::new(FlushGatedStream::new(stream)))
                 )
                 .await
-                .is_err()
+                .err()
+                .unwrap()
+                .kind(),
+                io::ErrorKind::InvalidInput
             );
             let mut received = Vec::new();
             bounded(client.read_to_end(&mut received)).await.unwrap();

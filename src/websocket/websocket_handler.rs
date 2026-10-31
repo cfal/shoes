@@ -105,7 +105,17 @@ mod request_tests {
             let result = WebsocketTcpServerHandler::new(vec![])
                 .setup_server_stream(Box::new(FlushGatedStream::new(server)))
                 .await;
-            assert!(result.is_err());
+            let error = result.err().unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                match status {
+                    "400" => "400 Bad Request",
+                    "426" => "426 Upgrade Required",
+                    "404" => "404 Not Found",
+                    _ => unreachable!(),
+                }
+            );
             let mut response = String::new();
             client.read_to_string(&mut response).await.unwrap();
             assert!(
@@ -116,6 +126,21 @@ mod request_tests {
                 response.contains("Sec-WebSocket-Version: 13"),
                 status == "426"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejection_reports_transport_errors_instead_of_protocol_errors() {
+        for buffered in [false, true] {
+            let (client, server) = tokio::io::duplex(2048);
+            drop(client);
+            let mut stream: Box<dyn AsyncStream> = if buffered {
+                Box::new(FlushGatedStream::new(server))
+            } else {
+                Box::new(server)
+            };
+            let error = reject_upgrade(&mut stream, "400 Bad Request").await;
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         }
     }
 
