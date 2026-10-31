@@ -4,7 +4,7 @@
 //! handling framing, multiplexing, padding, and stream routing.
 
 use crate::address::{Address, NetLocation};
-use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
+use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory, append_padding};
 use crate::anytls::anytls_stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
 use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec, StringMap};
 use crate::async_stream::AsyncTargetedMessageStream;
@@ -16,7 +16,7 @@ use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
 use crate::vless::VlessMessageStream;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use std::collections::HashMap;
 use std::io;
@@ -506,7 +506,8 @@ impl AnyTlsSession {
                 // Check padding-md5
                 if settings
                     .get("padding-md5")
-                    .is_some_and(|client_md5| client_md5 != self.padding.md5())
+                    .is_none_or(|client_md5| client_md5 != self.padding.md5())
+                    && self.padding.raw_scheme().len() <= u16::MAX as usize
                 {
                     // Send updated padding scheme
                     let update_frame = Frame::with_data(
@@ -585,7 +586,7 @@ impl AnyTlsSession {
         // Use reusable write buffer to avoid allocation
         let mut write_buf = self.write_buf.lock().await;
         write_buf.clear();
-        frame.encode_into(&mut write_buf);
+        frame.encode_into(&mut write_buf)?;
 
         // Handle buffering
         if self.buffering.load(Ordering::Relaxed) {
@@ -663,36 +664,15 @@ impl AnyTlsSession {
 
                 if padding_len > 0 {
                     // Append padding frame directly to data buffer (no intermediate allocation)
-                    data.reserve(FRAME_HEADER_SIZE + padding_len);
-                    data.put_u8(Command::Waste as u8);
-                    data.put_u32(0); // stream_id = 0
-                    data.put_u16(padding_len as u16);
-                    data.put_bytes(0, padding_len); // Zero-fill without allocation
+                    append_padding(&mut data, size - remain_payload_len, true);
                 }
 
                 writer.write_all(&data).await?;
                 data.clear();
             } else {
-                // This packet is all padding - write directly without intermediate buffer
-                // Use a small stack buffer for the header
-                let header = [
-                    Command::Waste as u8,
-                    0,
-                    0,
-                    0,
-                    0, // stream_id = 0
-                    (size >> 8) as u8,
-                    size as u8,
-                ];
-                writer.write_all(&header).await?;
-                // Write zeros for padding body - use a static buffer for small sizes
-                const ZERO_BUF: [u8; 1024] = [0u8; 1024];
-                let mut remaining = size;
-                while remaining > 0 {
-                    let chunk = remaining.min(ZERO_BUF.len());
-                    writer.write_all(&ZERO_BUF[..chunk]).await?;
-                    remaining -= chunk;
-                }
+                append_padding(&mut data, size, false);
+                writer.write_all(&data).await?;
+                data.clear();
             }
         }
 

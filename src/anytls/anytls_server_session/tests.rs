@@ -38,7 +38,7 @@ async fn fake_dns_udp_modes() {
                         .await
                         .unwrap();
                     let magic = NetLocation::from_str(UOT_V2_MAGIC_ADDRESS, Some(0)).unwrap();
-                    let mut header = crate::socks_handler::write_location_to_vec(&magic);
+                    let mut header = crate::socks_handler::write_location_to_vec(&magic).unwrap();
                     header.extend(fixture.uot_header(fixed));
                     peer.write_all(&Frame::data(id, Bytes::from(header)).encode())
                         .await
@@ -135,7 +135,7 @@ async fn fake_dns_adapter_contract() {
                 peer.write_all(
                     &Frame::data(
                         2,
-                        Bytes::from(crate::socks_handler::write_location_to_vec(&target)),
+                        Bytes::from(crate::socks_handler::write_location_to_vec(&target).unwrap()),
                     )
                     .encode(),
                 )
