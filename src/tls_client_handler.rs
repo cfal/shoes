@@ -179,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn verification_uses_hop_identity_even_without_wire_sni() {
         use crate::address::NetLocation;
-        use crate::tcp::tcp_client_handler_factory::tls_verification_name;
+        use crate::tcp::tcp_client_handler_factory::create_tcp_client_handler;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         #[derive(Debug)]
@@ -201,76 +201,123 @@ mod tests {
         }
 
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            for (hop, sni, expected) in [
-                ("localhost:443", None, "localhost"),
-                ("127.0.0.1:443", None, "127.0.0.1"),
-                ("[::1]:443", None, "::1"),
-                ("localhost:443", Some("override.test"), "override.test"),
-                ("localhost:443", Some("localhost"), "localhost"),
-            ] {
-                for correct in [true, false] {
-                    let certificate_name = if correct { expected } else { "wrong.test" };
-                    let cert =
-                        rcgen::generate_simple_self_signed(vec![certificate_name.into()]).unwrap();
-                    let mut roots = rustls::RootCertStore::empty();
-                    roots.add(cert.cert.der().clone()).unwrap();
-                    let mut client = rustls::ClientConfig::builder()
-                        .with_root_certificates(roots)
-                        .with_no_client_auth();
-                    client.enable_sni = sni.is_some();
-                    let mut server = rustls::ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_single_cert(
-                            vec![cert.cert.der().clone()],
-                            rustls::pki_types::PrivatePkcs8KeyDer::from(
-                                cert.signing_key.serialize_der(),
-                            )
-                            .into(),
-                        )
+            for nested in [false, true] {
+                for (hop, sni, expected, wire_sni) in [
+                    (
+                        "localhost:443",
+                        "",
+                        "localhost",
+                        if nested { None } else { Some("localhost") },
+                    ),
+                    ("localhost:443", "sni_hostname: null", "localhost", None),
+                    ("127.0.0.1:443", "", "127.0.0.1", None),
+                    ("127.0.0.1:443", "sni_hostname: null", "127.0.0.1", None),
+                    ("[::1]:443", "sni_hostname: null", "::1", None),
+                    (
+                        "localhost:443",
+                        "sni_hostname: override.test",
+                        "override.test",
+                        Some("override.test"),
+                    ),
+                    (
+                        "127.0.0.1:443",
+                        "sni_hostname: override.test",
+                        "override.test",
+                        Some("override.test"),
+                    ),
+                ] {
+                    for correct in [true, false] {
+                        let certificate_name = if correct { expected } else { "wrong.test" };
+                        let cert = rcgen::generate_simple_self_signed(vec![
+                            certificate_name.into(),
+                            "outer.test".into(),
+                        ])
                         .unwrap();
-                    let names = Arc::new(std::sync::Mutex::new(Vec::new()));
-                    server.cert_resolver = Arc::new(CaptureName {
-                        inner: server.cert_resolver,
-                        names: names.clone(),
-                    });
-                    let hop = NetLocation::from_str(hop, None).unwrap();
-                    let handler = TlsClientHandler::new(
-                        Arc::new(client),
-                        None,
-                        tls_verification_name(sni.map(str::to_owned), Some(&hop)).unwrap(),
-                        Box::new(crate::port_forward_handler::PortForwardClientHandler),
-                    );
-                    let (io, peer) = tokio::io::duplex(65536);
-                    let server_task = tokio::spawn(async move {
-                        let conn = TlsConnection::new(
-                            rustls::ServerConnection::new(Arc::new(server)).unwrap(),
-                        );
-                        let Ok(mut stream) =
-                            CryptoTlsStream::handshake(peer, conn, TlsReadMode::Stream, &[]).await
-                        else {
-                            return false;
-                        };
-                        let mut byte = [0];
-                        stream.read_exact(&mut byte).await.unwrap();
-                        assert_eq!(byte, [42]);
-                        true
-                    });
-                    let result = handler
-                        .setup_client_tcp_stream(
-                            Box::new(io),
-                            NetLocation::from_str("not-the-certificate.test:80", None)
-                                .unwrap()
+                        let mut roots = rustls::RootCertStore::empty();
+                        roots.add(cert.cert.der().clone()).unwrap();
+                        let mut server = rustls::ServerConfig::builder()
+                            .with_no_client_auth()
+                            .with_single_cert(
+                                vec![cert.cert.der().clone()],
+                                rustls::pki_types::PrivatePkcs8KeyDer::from(
+                                    cert.signing_key.serialize_der(),
+                                )
                                 .into(),
-                        )
-                        .await;
-                    assert_eq!(result.is_ok(), correct, "hop {hop}, SNI {sni:?}");
-                    let mut result = result.ok();
-                    if let Some(result) = &mut result {
-                        result.client_stream.write_all(&[42]).await.unwrap();
-                        result.client_stream.flush().await.unwrap();
+                            )
+                            .unwrap();
+                        let names = Arc::new(std::sync::Mutex::new(Vec::new()));
+                        server.cert_resolver = Arc::new(CaptureName {
+                            inner: server.cert_resolver,
+                            names: names.clone(),
+                        });
+                        let hop = NetLocation::from_str(hop, None).unwrap();
+                        let yaml =
+                            format!("type: tls\nverify: true\n{sni}\nprotocol: {{type: noop}}");
+                        let yaml = if nested {
+                            format!(
+                                "type: tls\nverify: true\nsni_hostname: outer.test\nprotocol:\n{}",
+                                yaml.lines()
+                                    .map(|line| format!("  {line}\n"))
+                                    .collect::<String>()
+                            )
+                        } else {
+                            yaml
+                        };
+                        let handler = crate::rustls_config_util::with_test_roots(roots, || {
+                            create_tcp_client_handler(
+                                serde_yaml::from_str(&yaml).unwrap(),
+                                Some(hop.clone()),
+                                Arc::new(crate::resolver::NativeResolver::new()),
+                            )
+                            .unwrap()
+                        });
+                        let (io, peer) = tokio::io::duplex(65536);
+                        let server_task = tokio::spawn(async move {
+                            let server = Arc::new(server);
+                            let mut stream: Box<dyn AsyncStream> = Box::new(peer);
+                            for _ in 0..if nested { 2 } else { 1 } {
+                                let conn = TlsConnection::new(
+                                    rustls::ServerConnection::new(server.clone()).unwrap(),
+                                );
+                                let Ok(tls) = CryptoTlsStream::handshake(
+                                    stream,
+                                    conn,
+                                    TlsReadMode::Stream,
+                                    &[],
+                                )
+                                .await
+                                else {
+                                    return false;
+                                };
+                                stream = Box::new(tls);
+                            }
+                            let mut byte = [0];
+                            stream.read_exact(&mut byte).await.unwrap();
+                            assert_eq!(byte, [42]);
+                            true
+                        });
+                        let result = handler
+                            .setup_client_tcp_stream(
+                                Box::new(io),
+                                NetLocation::from_str("not-the-certificate.test:80", None)
+                                    .unwrap()
+                                    .into(),
+                            )
+                            .await;
+                        assert_eq!(result.is_ok(), correct, "hop {hop}, SNI {sni:?}");
+                        let mut result = result.ok();
+                        if let Some(result) = &mut result {
+                            result.client_stream.write_all(&[42]).await.unwrap();
+                            result.client_stream.flush().await.unwrap();
+                        }
+                        assert_eq!(server_task.await.unwrap(), correct);
+                        let mut expected_names = Vec::new();
+                        if nested {
+                            expected_names.push(Some("outer.test".to_owned()));
+                        }
+                        expected_names.push(wire_sni.map(str::to_owned));
+                        assert_eq!(*names.lock().unwrap(), expected_names);
                     }
-                    assert_eq!(server_task.await.unwrap(), correct);
-                    assert_eq!(*names.lock().unwrap(), vec![sni.map(str::to_owned)]);
                 }
             }
         })

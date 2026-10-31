@@ -230,6 +230,10 @@ fn get_disabled_verifier() -> Arc<DisabledVerifier> {
 }
 
 fn get_root_cert_store() -> Arc<rustls::RootCertStore> {
+    #[cfg(test)]
+    if let Some(roots) = TEST_ROOTS.with_borrow(Clone::clone) {
+        return roots;
+    }
     static INSTANCE: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
     INSTANCE
         .get_or_init(|| {
@@ -239,6 +243,23 @@ fn get_root_cert_store() -> Arc<rustls::RootCertStore> {
             Arc::new(root_store)
         })
         .clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ROOTS: std::cell::RefCell<Option<Arc<rustls::RootCertStore>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_roots<T>(roots: rustls::RootCertStore, build: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Arc<rustls::RootCertStore>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_ROOTS.set(self.0.take());
+        }
+    }
+    let _restore = Restore(TEST_ROOTS.replace(Some(Arc::new(roots))));
+    build()
 }
 
 /// Creates a simple TLS ClientConfig with root CA verification.
