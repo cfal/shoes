@@ -167,8 +167,20 @@ mod tests {
 
     #[tokio::test]
     async fn verification_uses_hop_identity_even_without_wire_sni() {
+        check_hop_identity(false).await;
+    }
+
+    #[tokio::test]
+    async fn udp_verification_uses_hop_identity_even_without_wire_sni() {
+        check_hop_identity(true).await;
+    }
+
+    async fn check_hop_identity(udp: bool) {
         use crate::address::NetLocation;
+        use crate::async_stream::{AsyncFlushMessage, AsyncReadMessage, AsyncWriteMessage};
         use crate::tcp::tcp_client_handler_factory::create_tcp_client_handler;
+        use std::future::poll_fn;
+        use std::pin::Pin;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         #[derive(Debug)]
@@ -240,8 +252,12 @@ mod tests {
                             names: names.clone(),
                         });
                         let hop = NetLocation::from_str(hop, None).unwrap();
-                        let yaml =
-                            format!("type: tls\nverify: true\n{sni}\nprotocol: {{type: noop}}");
+                        let protocol = if udp {
+                            "{type: vless, user_id: '00000000-0000-4000-8000-000000000000', udp_enabled: true}"
+                        } else {
+                            "{type: noop}"
+                        };
+                        let yaml = format!("type: tls\nverify: true\ntls_buffer_size: 1024\n{sni}\nprotocol: {protocol}");
                         let yaml = if nested {
                             format!(
                                 "type: tls\nverify: true\nsni_hostname: outer.test\nprotocol:\n{}",
@@ -280,26 +296,63 @@ mod tests {
                                 };
                                 stream = Box::new(tls);
                             }
-                            let mut byte = [0];
-                            stream.read_exact(&mut byte).await.unwrap();
-                            assert_eq!(byte, [42]);
+                            if udp {
+                                let mut request = [0; 29];
+                                stream.read_exact(&mut request).await.unwrap();
+                                assert_eq!(
+                                    &request[..18],
+                                    &[0, 0, 0, 0, 0, 0, 0, 64, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0],
+                                );
+                                assert_eq!(&request[18..], &[2, 0, 53, 1, 192, 0, 2, 1, 0, 1, 42]);
+                                stream.write_all(&[0, 0, 0, 1, 43]).await.unwrap();
+                                stream.flush().await.unwrap();
+                            } else {
+                                let mut byte = [0];
+                                stream.read_exact(&mut byte).await.unwrap();
+                                assert_eq!(byte, [42]);
+                            }
                             true
                         });
-                        let result = handler
-                            .setup_client_tcp_stream(
-                                Box::new(io),
-                                NetLocation::from_str("not-the-certificate.test:80", None)
-                                    .unwrap()
-                                    .into(),
-                            )
-                            .await;
-                        assert_eq!(result.is_ok(), correct, "hop {hop}, SNI {sni:?}");
-                        let mut result = result.ok();
-                        if let Some(result) = &mut result {
-                            result.client_stream.write_all(&[42]).await.unwrap();
-                            result.client_stream.flush().await.unwrap();
+                        if udp {
+                            let result = handler
+                                .setup_client_udp_bidirectional(
+                                    Box::new(io),
+                                    NetLocation::from_str("192.0.2.1:53", None).unwrap().into(),
+                                )
+                                .await;
+                            assert_eq!(result.is_ok(), correct, "hop {hop}, SNI {sni:?}");
+                            if let Ok(mut stream) = result {
+                                poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &[42]))
+                                    .await
+                                    .unwrap();
+                                poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
+                                    .await
+                                    .unwrap();
+                                let mut response = [0; 1];
+                                let mut response = tokio::io::ReadBuf::new(&mut response);
+                                poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut response))
+                                    .await
+                                    .unwrap();
+                                assert_eq!(response.filled(), &[43]);
+                            }
+                            assert_eq!(server_task.await.unwrap(), correct);
+                        } else {
+                            let result = handler
+                                .setup_client_tcp_stream(
+                                    Box::new(io),
+                                    NetLocation::from_str("not-the-certificate.test:80", None)
+                                        .unwrap()
+                                        .into(),
+                                )
+                                .await;
+                            assert_eq!(result.is_ok(), correct, "hop {hop}, SNI {sni:?}");
+                            let mut result = result.ok();
+                            if let Some(result) = &mut result {
+                                result.client_stream.write_all(&[42]).await.unwrap();
+                                result.client_stream.flush().await.unwrap();
+                            }
+                            assert_eq!(server_task.await.unwrap(), correct);
                         }
-                        assert_eq!(server_task.await.unwrap(), correct);
                         let mut expected_names = Vec::new();
                         if nested {
                             expected_names.push(Some("outer.test".to_owned()));
