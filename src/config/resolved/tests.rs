@@ -130,6 +130,14 @@ fn lowering_preserves_defined_validation_precedence() {
             "direct cannot be used as an inner",
         ),
         (
+            json!([server(json!(["missing", invalid_client]))]),
+            "Unknown client group: missing",
+        ),
+        (
+            json!([server(json!([{"pool":[invalid_client, "missing"]}]))]),
+            "direct cannot be used as an inner",
+        ),
+        (
             json!([{"address":"127.0.0.1:0","protocol":{"type":"snell","cipher":"invalid","password":"secret"},
             "rules":[{"masks":"0.0.0.0/0","action":"allow","client_chain":"missing"}]}]),
             "Unknown client group: missing",
@@ -170,6 +178,62 @@ fn wireguard() -> Value {
         "public_key":base64::engine::general_purpose::STANDARD.encode(public.as_bytes()),
         "addresses":["10.77.0.2/32"],"mtu":1280,"peer_client_chain":"carrier"
     }})
+}
+
+#[cfg(unix)]
+#[test]
+fn catalog_only_carriers_obey_complete_client_node_and_depth_limits() {
+    for depth_limit in [false, true] {
+        for over_limit in [false, true] {
+            let mut configs = vec![
+                json!({"clash_api_address":"127.0.0.1:0","secret":"test"}),
+                json!({"client_group":"g0","client_chain":"direct"}),
+            ];
+            let levels = if depth_limit {
+                63 + usize::from(over_limit)
+            } else {
+                13
+            };
+            for index in 1..=levels {
+                let previous = format!("g{}", index - 1);
+                configs.push(if depth_limit {
+                    json!({"client_group":format!("g{index}"),"type":"selector","client_chain":previous})
+                } else {
+                    json!({"client_group":format!("g{index}"),"client_chains":[
+                        {"chain":[previous]},{"chain":[previous]}
+                    ]})
+                });
+            }
+            let mut carrier = vec![json!(format!("g{levels}"))];
+            if !depth_limit && over_limit {
+                carrier.push(json!({"address":"192.0.2.1:443","protocol":{
+                    "type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"
+                }}));
+            }
+            let mut client = wireguard();
+            client["protocol"]["peer_client_chain"] = json!(carrier);
+            configs.push(json!({"rule_group":"unused","rules":[{
+                "masks":"0.0.0.0/0","client_chain":client
+            }]}));
+            let result = compile(json!(configs));
+            if over_limit {
+                let error = result
+                    .err()
+                    .expect("catalog leaf exceeds the complete route limit");
+                let expected = if depth_limit {
+                    "64 levels"
+                } else {
+                    "16384 nodes"
+                };
+                assert!(error.to_string().contains(expected), "{error}");
+            } else {
+                let validated = result.unwrap();
+                assert!(validated.wireguard_endpoints.is_empty());
+                let route = validated.catalog.unwrap().route("vpn").unwrap();
+                crate::config::composition::validate(&route.hops).unwrap();
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
