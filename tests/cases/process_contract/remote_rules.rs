@@ -26,7 +26,7 @@ fn cached(path: &Path, body: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::File::open(path)
         .unwrap()
-        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+        .set_modified(std::time::SystemTime::now())
         .unwrap();
 }
 
@@ -348,8 +348,16 @@ async fn cache_save_failures_do_not_block_startup_refresh_or_reload() {
         } else {
             assert_eq!(std::fs::read(&cache).unwrap(), MISS);
         }
+        let mut cancelled = request(&origin).await;
         child.signal(libc::SIGHUP);
         child.wait_for("Servers ready").await;
+        assert!(
+            timeout(Duration::from_secs(2), cancelled.read_u8())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        drop(cancelled);
         blocked(address).await;
         std::fs::remove_file(&stage).unwrap();
         respond(request(&origin).await, BLOCK).await;
@@ -935,16 +943,15 @@ async fn cancelled_bootstrap_releases_lease_and_recovers_staging() {
         let _ = first.exit().await;
         drop(pending);
         assert!(!dir.path().join("cache/rules.json").exists());
+        let stage = dir.path().join("cache/rules.json.shoes-update.tmp");
+        cached(&stage, b"abandoned stage");
+        assert!(stage.exists());
         let mut recovered = Process::start(&path, &["--no-reload"]);
         respond(request(&listener).await, BLOCK).await;
         recovered.wait_for("Servers ready").await;
         recovered.signal(libc::SIGTERM);
         assert!(recovered.exit().await.success());
-        assert!(
-            !dir.path()
-                .join("cache/rules.json.shoes-update.tmp")
-                .exists()
-        );
+        assert!(!stage.exists());
         assert_eq!(
             std::fs::read(dir.path().join("cache/rules.json")).unwrap(),
             BLOCK
@@ -1010,11 +1017,7 @@ async fn post_install_activation_failure_restores_traffic_and_retry_uses_cache()
         if refresh {
             std::fs::File::open(&cache)
                 .unwrap()
-                .set_times(
-                    std::fs::FileTimes::new().set_modified(
-                        std::time::SystemTime::now() - Duration::from_secs(8 * 86400),
-                    ),
-                )
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 86400))
                 .unwrap();
         }
         drop(reservation);
@@ -1104,11 +1107,7 @@ async fn public_https_bootstrap_and_refresh_use_verified_tls() {
             cached(&cache, BLOCK);
             std::fs::File::open(&cache)
                 .unwrap()
-                .set_times(
-                    std::fs::FileTimes::new().set_modified(
-                        std::time::SystemTime::now() - Duration::from_secs(8 * 86400),
-                    ),
-                )
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 86400))
                 .unwrap();
         }
         drop((hit_reservation, miss_reservation));

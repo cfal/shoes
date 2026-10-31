@@ -1,4 +1,4 @@
-use super::install::FAIL_RENAME;
+use super::install::{FAIL_RENAME, Outcome};
 use super::*;
 use std::fs::{File, Metadata};
 use std::io::{Read, Write};
@@ -31,6 +31,24 @@ async fn bootstrap(
     super::bootstrap(configs, ranges, Default::default(), None)
         .await
         .map(|(configs, _)| configs)
+}
+
+async fn refresh_once(
+    source: &RuleSource,
+    configs: &[Config],
+    memory: &mut MemorySources,
+    lease: Option<Arc<CacheLease>>,
+) -> io::Result<bool> {
+    refresh_source(
+        source,
+        configs,
+        memory,
+        &DnsRegistry::new(),
+        GlobalLimits::default(),
+        &mut http::DownloadState::default(),
+        lease,
+    )
+    .await
 }
 
 #[test]
@@ -302,16 +320,7 @@ async fn remote_decode_scratch_counts_retained_sources_before_cache_or_memory_ch
         let error = if mode == "refresh" {
             let previous = load_cached(&remote, None, 0).unwrap();
             memory.insert(remote.path.clone(), previous.clone());
-            let result = refresh_source(
-                &remote,
-                &configs,
-                &mut memory,
-                &DnsRegistry::new(),
-                Default::default(),
-                &mut http::DownloadState::default(),
-                None,
-            )
-            .await;
+            let result = refresh_once(&remote, &configs, &mut memory, None).await;
             assert!(Arc::ptr_eq(&previous, &memory[&remote.path]));
             result.unwrap_err()
         } else {
@@ -439,17 +448,9 @@ async fn refresh_decode_excludes_replaced_indexes_and_reuses_identical_bytes_nea
             }),
         ];
         assert_eq!(
-            refresh_source(
-                &remote,
-                &config,
-                &mut memory,
-                &DnsRegistry::new(),
-                Default::default(),
-                &mut http::DownloadState::default(),
-                None,
-            )
-            .await
-            .unwrap(),
+            refresh_once(&remote, &config, &mut memory, None)
+                .await
+                .unwrap(),
             !identical,
         );
         fixture.await.unwrap();
@@ -706,6 +707,92 @@ async fn bootstrap_rejects_retained_synthetic_addresses_before_connecting() {
     assert!(!source.path.exists());
 }
 
+#[tokio::test]
+async fn resolved_synthetic_targets_and_downstream_proxies_are_rejected_before_connecting() {
+    #[derive(Debug)]
+    struct Bootstrap {
+        address: std::net::SocketAddr,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::resolver::Resolver for Bootstrap {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.address().to_string(), "synthetic.invalid");
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let address = self.address;
+            Box::pin(async move { Ok(vec![address]) })
+        }
+    }
+    for downstream in [false, true] {
+        let dir = directory();
+        let path = dir.path().join("cache.json");
+        write_rule(&path, OLD);
+        let original = std::fs::metadata(&path).unwrap();
+        let forbidden = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = TcpListener::bind("[::1]:0").await.unwrap();
+        let resolver = Arc::new(Bootstrap {
+            address: forbidden.local_addr().unwrap(),
+            calls: Default::default(),
+        });
+        let url = if downstream {
+            format!("http://{}/rules", first.local_addr().unwrap())
+        } else {
+            format!("http://synthetic.invalid:{}/rules", resolver.address.port())
+        };
+        let mut source = source(&url, &path);
+        let download = source.download.as_mut().unwrap();
+        download.bootstrap_url = "bootstrap".into();
+        if downstream {
+            download.client_chain = serde_json::from_value(serde_json::json!([
+                {"address": first.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+                {"address": format!("synthetic.invalid:{}", resolver.address.port()), "protocol": {"type": "socks"}}
+            ])).unwrap();
+        }
+        let mut dns = DnsRegistry::for_rule_bootstrap(
+            &configs(&source),
+            &["127.0.0.1/32".parse().unwrap()],
+            GlobalLimits::default(),
+        )
+        .unwrap();
+        dns.register("bootstrap".into(), resolver.clone());
+        let error = download_source(
+            &source,
+            None,
+            &dns,
+            GlobalLimits::default(),
+            Limits {
+                connect: Duration::from_secs(1),
+                ..Limits::default()
+            },
+            &mut http::DownloadState::default(),
+            0,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            if downstream {
+                "configured rule download chain failed"
+            } else {
+                "rule download bootstrap lookup failed"
+            }
+        );
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        for listener in [&forbidden, &first] {
+            assert!(
+                timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+        assert_preserved(&path, &original);
+    }
+}
+
 fn directory() -> tempfile::TempDir {
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -823,16 +910,7 @@ async fn memory_refresh_validates_changed_candidates_without_replacing_on_failur
                 .unwrap(),
             );
         }
-        let result = refresh_source(
-            &source,
-            &config,
-            &mut memory,
-            &DnsRegistry::new(),
-            GlobalLimits::default(),
-            &mut http::DownloadState::default(),
-            None,
-        )
-        .await;
+        let result = refresh_once(&source, &config, &mut memory, None).await;
         fixture.await.unwrap();
         if body == OLD {
             assert!(!result.unwrap());
@@ -938,17 +1016,9 @@ async fn memory_refresh_validates_new_source_and_preserves_other_sources() {
         Arc::new(crate::rule_set::load_memory(first, OLD, blake3::hash(OLD), 0).unwrap());
     let mut memory = MemorySources::from([(first.path.clone(), original.clone())]);
     assert!(
-        refresh_source(
-            second,
-            &config,
-            &mut memory,
-            &DnsRegistry::new(),
-            GlobalLimits::default(),
-            &mut http::DownloadState::default(),
-            None,
-        )
-        .await
-        .unwrap()
+        refresh_once(second, &config, &mut memory, None)
+            .await
+            .unwrap()
     );
     fixture.await.unwrap();
     assert_eq!(memory.len(), 2);
@@ -1005,17 +1075,9 @@ async fn cache_save_failure_keeps_validated_rules_and_identical_download_retries
         }
     });
     assert!(
-        refresh_source(
-            &remote,
-            &config,
-            &mut memory,
-            &DnsRegistry::new(),
-            GlobalLimits::default(),
-            &mut http::DownloadState::default(),
-            Some(lease.clone())
-        )
-        .await
-        .unwrap()
+        refresh_once(&remote, &config, &mut memory, Some(lease.clone()))
+            .await
+            .unwrap()
     );
     assert_eq!(memory[&path].digest, blake3::hash(VALID));
     assert_eq!(std::fs::read(&path).unwrap(), OLD);
@@ -1024,32 +1086,16 @@ async fn cache_save_failure_keeps_validated_rules_and_identical_download_retries
     let loaded = memory[&path].clone();
     std::fs::remove_file(stage_path(&path)).unwrap();
     assert!(
-        !refresh_source(
-            &remote,
-            &config,
-            &mut memory,
-            &DnsRegistry::new(),
-            GlobalLimits::default(),
-            &mut http::DownloadState::default(),
-            Some(lease.clone())
-        )
-        .await
-        .unwrap()
+        !refresh_once(&remote, &config, &mut memory, Some(lease.clone()))
+            .await
+            .unwrap()
     );
     assert!(Arc::ptr_eq(&loaded, &memory[&path]));
     assert_eq!(std::fs::read(&path).unwrap(), VALID);
     assert!(
-        refresh_source(
-            &remote,
-            &config,
-            &mut memory,
-            &DnsRegistry::new(),
-            GlobalLimits::default(),
-            &mut http::DownloadState::default(),
-            Some(lease.clone())
-        )
-        .await
-        .is_err()
+        refresh_once(&remote, &config, &mut memory, Some(lease.clone()))
+            .await
+            .is_err()
     );
     fixture.await.unwrap();
     assert!(Arc::ptr_eq(&loaded, &memory[&path]));
@@ -1116,17 +1162,9 @@ async fn refresh_after_lease_loss_updates_only_memory() {
         write_rule(&first.path, b"replacement namespace");
         write_rule(&second.path, b"replacement namespace");
         assert!(
-            refresh_source(
-                &first,
-                &config,
-                &mut memory,
-                &DnsRegistry::new(),
-                GlobalLimits::default(),
-                &mut http::DownloadState::default(),
-                Some(lease)
-            )
-            .await
-            .unwrap()
+            refresh_once(&first, &config, &mut memory, Some(lease))
+                .await
+                .unwrap()
         );
         fixture.await.unwrap();
         assert_eq!(memory[&first.path].digest, blake3::hash(VALID));
@@ -1180,7 +1218,7 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
     assert!(validate_memory(config, memory).await.is_err());
 }
 
-async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str> {
+async fn update(source: &RuleSource, limits: Limits) -> io::Result<Outcome> {
     let downloaded = download_source(
         source,
         None,
@@ -1196,21 +1234,13 @@ async fn update(source: &RuleSource, limits: Limits) -> io::Result<&'static str>
         MemorySources::from([(source.path.clone(), downloaded.loaded.clone())]),
     )
     .await?;
-    Ok(
-        if Install::save(
-            &source.path,
-            downloaded.bytes,
-            downloaded.loaded.digest,
-            None,
-        )
-        .await?
-        .changed()
-        {
-            "updated"
-        } else {
-            "unchanged"
-        },
+    Install::save(
+        &source.path,
+        downloaded.bytes,
+        downloaded.loaded.digest,
+        None,
     )
+    .await
 }
 
 fn response(status: u16, headers: &str, body: &[u8]) -> Vec<u8> {
@@ -1280,7 +1310,7 @@ async fn validated_fixture_replaces_atomically_and_unchanged_does_not_rename() {
     write_rule(&path, OLD);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
     let mut held_reader = File::open(&path).unwrap();
-    for expected in ["updated", "unchanged"] {
+    for expected in [Outcome::Updated, Outcome::Unchanged] {
         let before = std::fs::metadata(&path).unwrap();
         let (url, fixture) = serve(response(200, "", VALID)).await;
         let report = update(&source(&url, &path), Limits::default())
@@ -1289,8 +1319,8 @@ async fn validated_fixture_replaces_atomically_and_unchanged_does_not_rename() {
         fixture.await.unwrap();
         assert_eq!(report, expected);
         let after = std::fs::metadata(&path).unwrap();
-        assert_eq!(before.ino() == after.ino(), expected == "unchanged");
-        if expected == "unchanged" {
+        assert_eq!(before.ino() == after.ino(), expected == Outcome::Unchanged);
+        if expected == Outcome::Unchanged {
             assert_eq!(stamp(&before), stamp(&after));
         }
         assert_eq!(after.mode() & 0o777, 0o640);
@@ -1355,6 +1385,19 @@ async fn rejects_http_and_parser_failures_without_touching_last_good() {
         (
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n".to_vec(),
             "validation",
+        ),
+        (
+            [
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Trailer\r\n\r\n{:x}\r\n",
+                    VALID.len()
+                )
+                .as_bytes(),
+                VALID,
+                b"\r\n0\r\nX-Trailer: SECRET\r\n\r\n",
+            ]
+            .concat(),
+            "trailers",
         ),
         (
             response(
@@ -1422,7 +1465,7 @@ async fn future_mtime_is_not_freshness_and_offline_fetch_preserves_bytes() {
         .await
         .unwrap();
     fixture.await.unwrap();
-    assert_eq!(report, "unchanged");
+    assert_eq!(report, Outcome::Unchanged);
     assert_preserved(&path, &original);
 }
 
@@ -1625,8 +1668,7 @@ fn post_rename_sync_failure_reports_replacement_not_retention() {
     install.file.write_all(VALID).unwrap();
     super::install::FAIL_AFTER_RENAME.with(|flag| flag.set(true));
     let outcome = install.finish(blake3::hash(VALID)).unwrap();
-    assert_eq!(outcome, super::install::Outcome::DurabilityUncertain);
-    assert!(outcome.changed());
+    assert_eq!(outcome, Outcome::DurabilityUncertain);
     assert_eq!(std::fs::read(path).unwrap(), VALID);
 }
 
@@ -1845,7 +1887,7 @@ async fn every_existing_decoder_validates_downloads() {
         crate::rule_set::load_memory(&source, &bytes, blake3::hash(&bytes), 0).unwrap();
         assert_eq!(
             update(&source, Limits::default()).await.unwrap(),
-            "updated",
+            Outcome::Updated,
             "{format:?}"
         );
         fixture.await.unwrap();
@@ -1978,7 +2020,7 @@ async fn ipv6_literal_download_reaches_the_exact_url_port() {
         update(&source(&url, &path), Limits::default())
             .await
             .unwrap(),
-        "updated"
+        Outcome::Updated
     );
     fixture.await.unwrap();
 }
@@ -2047,31 +2089,15 @@ async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
         let remote = &validated.remote_rules[0];
         let mut memory = cached_sources(std::slice::from_ref(remote));
         assert!(
-            refresh_source(
-                remote,
-                &config,
-                &mut memory,
-                &DnsRegistry::new(),
-                GlobalLimits::default(),
-                &mut http::DownloadState::default(),
-                None,
-            )
-            .await
-            .unwrap()
+            refresh_once(remote, &config, &mut memory, None)
+                .await
+                .unwrap()
         );
         fixture.await.unwrap();
         assert!(
-            refresh_source(
-                remote,
-                &config,
-                &mut memory,
-                &DnsRegistry::new(),
-                GlobalLimits::default(),
-                &mut http::DownloadState::default(),
-                None,
-            )
-            .await
-            .is_err()
+            refresh_once(remote, &config, &mut memory, None)
+                .await
+                .is_err()
         );
         assert!(
             timeout(Duration::from_millis(50), trap.accept())
@@ -2081,6 +2107,91 @@ async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
         assert_eq!(std::fs::read(&path).unwrap(), VALID);
         control.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn url_test_downloads_stay_background_after_success_and_failure() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    write_rule(&path, OLD);
+    let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut source = source(
+        &format!("http://{}/rules", trap.local_addr().unwrap()),
+        &path,
+    );
+    source.download.as_mut().unwrap().client_chain =
+        serde_json::from_value(serde_json::json!("auto")).unwrap();
+    let mut config = configs(&source);
+    config.insert(
+        0,
+        serde_json::from_value(serde_json::json!({
+            "client_group": "auto", "type": "url-test", "lazy": true, "interval": 60,
+            "url": "http://probe.invalid/", "client_proxies": [{
+                "name": "working", "address": proxy.local_addr().unwrap().to_string(),
+                "protocol": {"type": "socks"}
+            }]
+        }))
+        .unwrap(),
+    );
+    let validated = crate::config::compile_configs(config.clone())
+        .await
+        .unwrap();
+    let automatic = &validated.catalog.as_ref().unwrap().selection.automatic;
+    let group = &automatic.0["auto"];
+    assert!(
+        group
+            .due_members(Instant::now() - Duration::from_secs(60))
+            .is_some()
+    );
+    assert!(group.due_members(Instant::now()).is_none());
+    let fixture = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await.unwrap();
+        assert_eq!(&socks_connect(&mut stream).await[..4], &[5, 1, 0, 1]);
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+        request(&mut stream).await;
+        stream.write_all(&response(200, "", VALID)).await.unwrap();
+        drop(stream);
+        let (failed, _) = proxy.accept().await.unwrap();
+        drop(failed);
+    });
+    let remote = &validated.remote_rules[0];
+    let mut memory = cached_sources(std::slice::from_ref(remote));
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            refresh_once(remote, &config, &mut memory, None)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    );
+    assert!(group.due_members(Instant::now()).is_none());
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            refresh_once(remote, &config, &mut memory, None)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert!(group.due_members(Instant::now()).is_none());
+    timeout(Duration::from_secs(5), fixture)
+        .await
+        .unwrap()
+        .unwrap();
+    automatic.touch("auto", false);
+    assert!(group.due_members(Instant::now()).is_some());
+    assert!(
+        timeout(Duration::from_millis(50), trap.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
 }
 
 #[tokio::test]
@@ -2108,7 +2219,7 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
     assert!(refresh.scheduled[0].due <= Instant::now());
     assert!(
         timeout(
-            Duration::from_millis(100),
+            Duration::from_secs(2),
             refresh.changed(&DnsRegistry::new(), GlobalLimits::default())
         )
         .await
@@ -2332,13 +2443,10 @@ async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
             }))
             .unwrap(),
         );
-        let result = refresh_source(
+        let result = refresh_once(
             &source,
             &config,
             &mut cached_sources(std::slice::from_ref(&source)),
-            &DnsRegistry::new(),
-            GlobalLimits::default(),
-            &mut http::DownloadState::default(),
             None,
         )
         .await;
@@ -2407,13 +2515,15 @@ async fn runtime_validation_uses_retained_sources_and_never_falls_back_to_disk()
     write_rule(&second.path, VALID);
     let mut incomplete = memory;
     incomplete.remove(&second.path);
-    let error = validate_memory(config, incomplete).await.err().unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("remote rules unavailable in memory"),
-        "{error}"
-    );
+    for memory in [incomplete, MemorySources::new()] {
+        let error = validate_memory(config.clone(), memory).await.err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("remote rules unavailable in memory"),
+            "{error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2674,7 +2784,7 @@ async fn chunked_body_is_bounded_and_validated() {
             update(&source(&url, &path), Limits::default())
                 .await
                 .unwrap(),
-            "updated"
+            Outcome::Updated
         );
         fixture.await.unwrap();
         assert_eq!(std::fs::read(path).unwrap(), VALID);

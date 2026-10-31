@@ -172,20 +172,7 @@ impl DnsRegistry {
                 "rule bootstrap endpoint overlaps a synthetic endpoint",
             ));
         }
-        let native = real_only(Arc::new(NativeResolver::new()), self.forbidden.clone());
-        let entry = ParsedDnsServerEntry::new(
-            server,
-            Arc::new(build_direct_chain_group(native.clone())),
-            native,
-            super::IpStrategy::default(),
-            10,
-            5,
-            2,
-        );
-        Ok(real_only(
-            build_resolver_with_limits(vec![entry], self.limits, self.forbidden.clone())?,
-            self.forbidden.clone(),
-        ))
+        build_native_bootstrap(server, self.limits, &self.forbidden)
     }
 
     /// Creates a new empty registry.
@@ -295,6 +282,27 @@ impl DnsRegistry {
             }
         })))
     }
+}
+
+fn build_native_bootstrap(
+    server: ParsedDnsServer,
+    limits: GlobalLimits,
+    forbidden: &Arc<[IpNetwork]>,
+) -> std::io::Result<Arc<dyn Resolver>> {
+    let native = real_only(Arc::new(NativeResolver::new()), forbidden.clone());
+    let entry = ParsedDnsServerEntry::new(
+        server,
+        Arc::new(build_direct_chain_group(native.clone())),
+        native,
+        super::IpStrategy::default(),
+        10, // Default timeout for bootstrap
+        5,  // Default connect timeout for bootstrap
+        2,  // Default attempts for bootstrap
+    );
+    Ok(real_only(
+        build_resolver_with_limits(vec![entry], limits, forbidden.clone())?,
+        forbidden.clone(),
+    ))
 }
 
 fn group_uses_system(
@@ -1039,26 +1047,7 @@ async fn build_entry_and_plan(
                     .to_parsed_server(None)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-                let native = real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone());
-                let direct_chain = Arc::new(build_direct_chain_group(native.clone()));
-                // Bootstrap resolvers use default timeout (10s) and 2 attempts
-                let bootstrap_entry = ParsedDnsServerEntry::new(
-                    bootstrap_server,
-                    direct_chain,
-                    native,
-                    super::IpStrategy::default(),
-                    10, // Default timeout for bootstrap
-                    5,  // Default connect timeout for bootstrap
-                    2,  // Default attempts for bootstrap
-                );
-                real_only(
-                    build_resolver_with_limits(
-                        vec![bootstrap_entry],
-                        registry.limits,
-                        registry.forbidden.clone(),
-                    )?,
-                    registry.forbidden.clone(),
-                )
+                build_native_bootstrap(bootstrap_server, registry.limits, &registry.forbidden)?
             }
             None => real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone()),
         };

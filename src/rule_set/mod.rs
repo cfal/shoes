@@ -639,7 +639,7 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             compiler.sources.insert(key, loaded.predicate.clone());
             return Ok(loaded.predicate.clone());
         }
-        if compiler.memory_only || compiler.memory.is_some() {
+        if compiler.memory.is_some() {
             return Err(invalid(
                 "remote rules unavailable in memory; offline checks never download; daemon startup fetches remote sources",
             ));

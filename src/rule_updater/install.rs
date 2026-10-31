@@ -138,6 +138,7 @@ pub(super) struct Install {
     lock_name: CString,
     original: Option<Metadata>,
     old_digest: Option<blake3::Hash>,
+    // Must drop after the lease and lock to preserve the test's completion barrier.
     #[cfg(test)]
     preparation_gate: Option<PreparationGate>,
 }
@@ -147,13 +148,6 @@ pub(super) enum Outcome {
     Unchanged,
     Updated,
     DurabilityUncertain,
-}
-
-#[cfg(test)]
-impl Outcome {
-    pub(super) fn changed(&self) -> bool {
-        !matches!(self, Self::Unchanged)
-    }
 }
 
 impl Install {
@@ -713,6 +707,26 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_blocking_preparation_cannot_publish_or_stall_the_runtime() {
+        const CHILD: &str = "SHOES_RULE_CANCELLED_PREPARATION_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolation prevents concurrent test subprocesses from inheriting flock descriptors.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rule_updater::install::tests::cancelled_blocking_preparation_cannot_publish_or_stall_the_runtime",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "{stdout} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.path().join("rules.json");

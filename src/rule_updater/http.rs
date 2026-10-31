@@ -155,10 +155,9 @@ pub(super) async fn download(
     source: &RuleSource,
     dns: &DnsRegistry,
     global: GlobalLimits,
-    output: &mut Vec<u8>,
     limits: Limits,
     state: &mut DownloadState,
-) -> io::Result<blake3::Hash> {
+) -> io::Result<(Vec<u8>, blake3::Hash)> {
     let url = source
         .parsed_url()?
         .ok_or_else(|| invalid("remote URL required"))?;
@@ -218,7 +217,7 @@ pub(super) async fn download(
             return Err(invalid("download size outside permitted range"));
         }
         let mut body = response.into_body();
-        let mut bytes = 0u64;
+        let mut output = Vec::new();
         let mut digest = blake3::Hasher::new();
         while let Some(frame) = timeout(limits.idle, body.frame())
             .await
@@ -228,7 +227,7 @@ pub(super) async fn download(
             let data = frame
                 .into_data()
                 .map_err(|_| invalid("HTTP trailers unsupported"))?;
-            bytes = bytes
+            let bytes = (output.len() as u64)
                 .checked_add(data.len() as u64)
                 .ok_or_else(|| invalid("body size overflow"))?;
             if bytes > MAX_BYTES || length.is_some_and(|length| bytes > length) {
@@ -237,10 +236,10 @@ pub(super) async fn download(
             output.extend_from_slice(&data);
             digest.update(&data);
         }
-        if bytes == 0 || length.is_some_and(|length| bytes != length) {
+        if output.is_empty() || length.is_some_and(|length| output.len() as u64 != length) {
             return Err(invalid("truncated HTTP body"));
         }
-        Ok(digest.finalize())
+        Ok((output, digest.finalize()))
     };
     // Drive HTTP in this future, so timeout/cancellation drops the socket too.
     tokio::pin!(receive);

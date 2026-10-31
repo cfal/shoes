@@ -50,13 +50,12 @@ async fn download_source(
     state: &mut http::DownloadState,
     retained_bytes: usize,
 ) -> io::Result<Downloaded> {
-    let mut bytes = Vec::new();
-    let digest = crate::control::url_test::BACKGROUND
+    let (bytes, digest) = crate::control::url_test::BACKGROUND
         .scope(
             (),
             timeout(
                 limits.overall,
-                http::download(source, dns, global, &mut bytes, limits, state),
+                http::download(source, dns, global, limits, state),
             ),
         )
         .await

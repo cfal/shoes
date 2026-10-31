@@ -15,8 +15,8 @@ async fn network_reconciliation_does_not_cancel_inflight_refresh() {
         let path = cache.join("rules.json");
         std::fs::write(&path, br#"{"version":1,"rules":[{"domain":["old.example"]}]}"#).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::File::options().write(true).open(&path).unwrap().set_times(
-            std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH)
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(
+            std::time::SystemTime::UNIX_EPOCH
         ).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = root.join("config.yaml");
