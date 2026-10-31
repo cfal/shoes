@@ -401,7 +401,18 @@ async fn handle_udp_associate(
 
     // Uses 2MB buffer to prevent packet drops during bursts.
     const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-    let udp_bind_addr = SocketAddr::new(bind_ip, 0);
+    let udp_bind_addr = if bind_ip.is_unspecified() {
+        server_stream
+            .local_addr()
+            .filter(|address| address.is_ipv6() == bind_ip.is_ipv6())
+            .map(|mut address| {
+                address.set_port(0);
+                address
+            })
+            .unwrap_or_else(|| SocketAddr::new(bind_ip, 0))
+    } else {
+        SocketAddr::new(bind_ip, 0)
+    };
     let udp_socket: std::net::UdpSocket =
         match crate::socket_util::new_socket2_udp_socket_with_buffer_size(
             bind_ip.is_ipv6(),
@@ -831,6 +842,99 @@ pub fn write_location_to_vec(location: &NetLocation) -> std::io::Result<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wildcard_udp_replies_use_control_local_address_through_wrappers() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for ipv6 in [false, true] {
+                for wrapped in [false, true] {
+                    let wildcard: IpAddr = if ipv6 { "::" } else { "0.0.0.0" }.parse().unwrap();
+                    let loopback: IpAddr = if ipv6 { "::1" } else { "127.0.0.1" }.parse().unwrap();
+                    let listener = tokio::net::TcpListener::bind((wildcard, 0)).await.unwrap();
+                    let echo = tokio::net::UdpSocket::bind((loopback, 0)).await.unwrap();
+                    let target = echo.local_addr().unwrap();
+                    let resolver: Arc<dyn Resolver> =
+                        Arc::new(crate::resolver::NativeResolver::new());
+                    let selector = Arc::new(
+                        crate::tcp::tcp_client_handler_factory::create_test_selector(
+                            vec![crate::config::RuleConfig::default()],
+                            resolver.clone(),
+                        )
+                        .unwrap(),
+                    );
+                    let handler =
+                        SocksTcpServerHandler::new(None, true, wildcard, selector, resolver);
+                    let mut control = tokio::net::TcpStream::connect((
+                        loopback,
+                        listener.local_addr().unwrap().port(),
+                    ))
+                    .await
+                    .unwrap();
+                    let (server, _) = listener.accept().await.unwrap();
+                    let stream: Box<dyn AsyncStream> = if wrapped {
+                        Box::new(crate::prepend_stream::PrependStream::new(server, None))
+                    } else {
+                        Box::new(server)
+                    };
+                    let task = tokio::spawn(async move {
+                        let TcpServerSetupResult::Session(session) =
+                            handler.setup_server_stream(stream).await.unwrap()
+                        else {
+                            panic!("expected UDP session")
+                        };
+                        session.await;
+                    });
+                    control
+                        .write_all(&[5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    let mut method = [0; 2];
+                    control.read_exact(&mut method).await.unwrap();
+                    assert_eq!(method, [5, 0]);
+                    let mut reply = vec![0; if ipv6 { 22 } else { 10 }];
+                    control.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply[..3], &[5, 0, 0]);
+                    let address = if ipv6 {
+                        IpAddr::V6(std::net::Ipv6Addr::from(
+                            <[u8; 16]>::try_from(&reply[4..20]).unwrap(),
+                        ))
+                    } else {
+                        IpAddr::V4(std::net::Ipv4Addr::new(
+                            reply[4], reply[5], reply[6], reply[7],
+                        ))
+                    };
+                    assert_eq!(address, loopback);
+                    let relay = SocketAddr::new(
+                        address,
+                        u16::from_be_bytes(reply[reply.len() - 2..].try_into().unwrap()),
+                    );
+                    let udp = tokio::net::UdpSocket::bind((loopback, 0)).await.unwrap();
+                    let mut packet = vec![0, 0, 0];
+                    packet.extend_from_slice(
+                        &write_location_to_vec(&NetLocation::from_ip_addr(
+                            target.ip(),
+                            target.port(),
+                        ))
+                        .unwrap(),
+                    );
+                    packet.extend_from_slice(b"relay");
+                    udp.send_to(&packet, relay).await.unwrap();
+                    let mut payload = [0; 64];
+                    let (count, from) = echo.recv_from(&mut payload).await.unwrap();
+                    assert_eq!(&payload[..count], b"relay");
+                    echo.send_to(&payload[..count], from).await.unwrap();
+                    let (count, _) = udp.recv_from(&mut payload).await.unwrap();
+                    assert_eq!(&payload[..count], &packet);
+                    drop(control);
+                    task.await.unwrap();
+                    let rebound = tokio::net::UdpSocket::bind(relay).await.unwrap();
+                    drop(rebound);
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
     use crate::async_stream::test_streams::FlushGatedStream;
     use crate::resolver::NativeResolver;
     use std::io;
