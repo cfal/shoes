@@ -43,13 +43,10 @@ fn create_auth_credentials(
 
 pub fn create_tcp_client_handler(
     client_proxy_config: ClientProxyConfig,
-    hop_location: Option<NetLocation>,
+    hop_location: &NetLocation,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Box<dyn TcpClientHandler>> {
-    let default_sni_hostname = hop_location
-        .as_ref()
-        .and_then(|location| location.address().hostname())
-        .map(str::to_owned);
+    let default_sni_hostname = hop_location.address().hostname().map(str::to_owned);
     create_with_hop_context(
         client_proxy_config,
         hop_location,
@@ -60,22 +57,15 @@ pub fn create_tcp_client_handler(
 
 pub(crate) fn tls_verification_name(
     sni: Option<String>,
-    hop: Option<&NetLocation>,
+    hop: &NetLocation,
 ) -> std::io::Result<rustls::pki_types::ServerName<'static>> {
-    let identity = sni
-        .or_else(|| hop.map(|location| location.address().to_string()))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "TLS requires a verification identity",
-            )
-        })?;
+    let identity = sni.unwrap_or_else(|| hop.address().to_string());
     rustls::pki_types::ServerName::try_from(identity).map_err(std::io::Error::other)
 }
 
 fn create_with_hop_context(
     client_proxy_config: ClientProxyConfig,
-    hop_location: Option<NetLocation>,
+    hop_location: &NetLocation,
     default_sni_hostname: Option<String>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Box<dyn TcpClientHandler>> {
@@ -264,7 +254,7 @@ fn create_with_hop_context(
                 &key_exchange_groups,
             )?);
 
-            let server_name = tls_verification_name(sni_hostname, hop_location.as_ref())?;
+            let server_name = tls_verification_name(sni_hostname, hop_location)?;
 
             if vision {
                 let ClientProxyConfig::Vless {
@@ -428,15 +418,7 @@ fn create_with_hop_context(
                 websocket_client_config.early_data_header_name.as_deref(),
                 false,
             )?;
-            let authority = hop_location
-                .as_ref()
-                .map(crate::http2::client::format_authority)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "WebSocket requires a hop authority",
-                    )
-                })?;
+            let authority = crate::http2::client::format_authority(hop_location);
             let WebsocketClientConfig {
                 matching_path,
                 matching_headers,

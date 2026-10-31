@@ -51,6 +51,31 @@ impl TlsClientHandler {
             handler: TlsInnerClientHandler::VisionVless { uuid, udp_enabled },
         }
     }
+
+    async fn setup_client_stream_common(
+        &self,
+        client_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<CryptoTlsStream<Box<dyn AsyncStream>>> {
+        let mut client_conn =
+            rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Failed to create client connection: {e}"),
+                    )
+                })?;
+
+        if let Some(size) = self.tls_buffer_size {
+            client_conn.set_buffer_limit(Some(size));
+        }
+
+        let connection = TlsConnection::new(client_conn);
+        let mode = match self.handler {
+            TlsInnerClientHandler::VisionVless { .. } => TlsReadMode::PreserveRecords,
+            TlsInnerClientHandler::Default(_) => TlsReadMode::Stream,
+        };
+        CryptoTlsStream::handshake(client_stream, connection, mode, &[]).await
+    }
 }
 
 #[async_trait]
@@ -83,25 +108,7 @@ impl TcpClientHandler for TlsClientHandler {
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let mut client_conn =
-            rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Failed to create client connection: {e}"),
-                    )
-                })?;
-
-        if let Some(size) = self.tls_buffer_size {
-            client_conn.set_buffer_limit(Some(size));
-        }
-
-        let connection = TlsConnection::new(client_conn);
-        let mode = match self.handler {
-            TlsInnerClientHandler::VisionVless { .. } => TlsReadMode::PreserveRecords,
-            TlsInnerClientHandler::Default(_) => TlsReadMode::Stream,
-        };
-        let tls_stream = CryptoTlsStream::handshake(client_stream, connection, mode, &[]).await?;
+        let tls_stream = self.setup_client_stream_common(client_stream).await?;
 
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => {
@@ -133,25 +140,7 @@ impl TcpClientHandler for TlsClientHandler {
         client_stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-        let mut client_conn =
-            rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Failed to create client connection: {e}"),
-                    )
-                })?;
-
-        if let Some(size) = self.tls_buffer_size {
-            client_conn.set_buffer_limit(Some(size));
-        }
-
-        let connection = TlsConnection::new(client_conn);
-        let mode = match self.handler {
-            TlsInnerClientHandler::VisionVless { .. } => TlsReadMode::PreserveRecords,
-            TlsInnerClientHandler::Default(_) => TlsReadMode::Stream,
-        };
-        let tls_stream = CryptoTlsStream::handshake(client_stream, connection, mode, &[]).await?;
+        let tls_stream = self.setup_client_stream_common(client_stream).await?;
 
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => {
@@ -266,7 +255,7 @@ mod tests {
                         let handler = crate::rustls_config_util::with_test_roots(roots, || {
                             create_tcp_client_handler(
                                 serde_yaml::from_str(&yaml).unwrap(),
-                                Some(hop.clone()),
+                                &hop,
                                 Arc::new(crate::resolver::NativeResolver::new()),
                             )
                             .unwrap()

@@ -53,13 +53,11 @@ async fn reject_upgrade(stream: &mut Box<dyn AsyncStream>, status: &str) -> std:
     };
     let response =
         format!("HTTP/1.1 {status}\r\n{version}Content-Length: 0\r\nConnection: close\r\n\r\n");
-    match stream.write_all(response.as_bytes()).await {
-        Ok(()) => {
-            if let Err(error) = stream.flush().await {
-                return error;
-            }
-        }
-        Err(error) => return error,
+    if let Err(error) = stream.write_all(response.as_bytes()).await {
+        return error;
+    }
+    if let Err(error) = stream.flush().await {
+        return error;
     }
     std::io::Error::new(std::io::ErrorKind::InvalidData, status.to_owned())
 }
@@ -135,7 +133,7 @@ mod request_tests {
                 .unwrap();
                 let handler = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
                     config,
-                    Some(crate::address::NetLocation::from_str(authority, None).unwrap()),
+                    &crate::address::NetLocation::from_str(authority, None).unwrap(),
                     Arc::new(NativeResolver::new()),
                 )
                 .unwrap();

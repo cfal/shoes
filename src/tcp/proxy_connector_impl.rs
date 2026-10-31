@@ -65,12 +65,12 @@ impl ProxyConnectorImpl {
             }));
         }
 
-        let hop_location = Some(config.address.clone());
+        let client_handler = create_tcp_client_handler(config.protocol, &config.address, resolver)?;
 
         Ok(Some(Self {
             xhttp: None,
             location: config.address,
-            client_handler: create_tcp_client_handler(config.protocol, hop_location, resolver)?,
+            client_handler,
         }))
     }
 }

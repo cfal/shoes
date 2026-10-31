@@ -167,7 +167,7 @@ pub(crate) fn build_with_limits(
             )?;
             let name = crate::tcp::tcp_client_handler_factory::tls_verification_name(
                 sni.clone(),
-                Some(&config.address),
+                &config.address,
             )?;
             (
                 xhttp,
@@ -198,7 +198,7 @@ pub(crate) fn build_with_limits(
             let sni = sni_hostname.clone().or(default_sni.clone());
             let handler = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
                 outer,
-                Some(config.address.clone()),
+                &config.address,
                 resolver.clone(),
             )?;
             if !matches!(xhttp.http_version, XhttpVersion::Auto | XhttpVersion::H2) {
@@ -266,7 +266,7 @@ pub(crate) fn build_with_limits(
     }
     let inner = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
         *xhttp.protocol.clone(),
-        Some(config.address.clone()),
+        &config.address,
         resolver,
     )?;
     let client = Client::new(
