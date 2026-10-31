@@ -251,6 +251,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 let unparsed_data = stream_reader.unparsed_data();
 
                 Ok(TcpServerSetupResult::TcpForward {
+                    connection_failure_response: None,
                     remote_location,
                     stream: server_stream,
                     need_initial_flush: self.encryption.is_some(),
@@ -429,6 +430,7 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
                 .with_write_error_policy(policy);
 
             Ok(TcpServerSetupResult::TcpForward {
+                connection_failure_response: None,
                 remote_location,
                 stream: Box::new(vision_stream),
                 need_initial_flush: false,

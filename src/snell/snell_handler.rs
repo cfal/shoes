@@ -233,6 +233,7 @@ impl TcpServerHandler for SnellServerHandler {
                 // flush the tunnel response
                 need_initial_flush: true,
                 connection_success_response: Some(TCP_TUNNEL_RESPONSE.to_vec().into_boxed_slice()),
+                connection_failure_response: None,
                 initial_remote_data: stream_reader.unparsed_data_owned(),
                 proxy_selector: self.proxy_selector.clone(),
             })

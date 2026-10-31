@@ -87,7 +87,7 @@ mod client_handshake_tests {
                 create_password_hash("password").as_ref(),
                 &CRLF_BYTES,
                 &[CMD_CONNECT],
-                &write_location_to_vec(&location),
+                &write_location_to_vec(&location).unwrap(),
                 &CRLF_BYTES,
             ]
             .concat();
@@ -266,6 +266,7 @@ impl TcpServerHandler for TrojanTcpHandler {
             stream: server_stream,
             need_initial_flush: false,
             connection_success_response: None,
+            connection_failure_response: None,
             initial_remote_data: stream_reader.unparsed_data_owned(),
             proxy_selector: self
                 .proxy_selector
@@ -299,7 +300,7 @@ impl TcpClientHandler for TrojanTcpHandler {
             ));
         }
 
-        let location_bytes = write_location_to_vec(remote_location.location());
+        let location_bytes = write_location_to_vec(remote_location.location())?;
         // Xray's Trojan inbound requires the credentials in its first read.
         let mut header = Vec::with_capacity(self.password_hash.len() + location_bytes.len() + 5);
         header.extend_from_slice(&self.password_hash);
@@ -364,7 +365,7 @@ mod tests {
         // SHA-224("password"), independently fixed to verify client wire encoding too.
         let mut request =
             b"d63dc919e201d7bc4c825630d2cf25fdc93d4b2f0d46706d29038d01\r\n\x01".to_vec();
-        request.extend_from_slice(&write_location_to_vec(location));
+        request.extend_from_slice(&write_location_to_vec(location).unwrap());
         request.extend_from_slice(b"\r\n");
         request
     }

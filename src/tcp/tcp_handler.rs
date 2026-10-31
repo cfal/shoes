@@ -16,6 +16,7 @@ pub enum TcpServerSetupResult {
         need_initial_flush: bool,
         /// Response to write to the server stream after connection to remote location succeeds
         connection_success_response: Option<Box<[u8]>>,
+        connection_failure_response: Option<fn(std::io::ErrorKind) -> Vec<u8>>,
         /// Initial data to send to the remote location
         initial_remote_data: Option<Box<[u8]>>,
         /// The proxy selector to use for routing this connection

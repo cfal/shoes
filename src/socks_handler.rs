@@ -133,6 +133,8 @@ pub async fn setup_socks_server_stream_inner(
 
     let method_len = stream_reader.read_u8(&mut server_stream).await? as usize;
     if method_len < 1 {
+        server_stream.write_all(&[VER_SOCKS5, 0xff]).await?;
+        server_stream.flush().await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid method length: {method_len}"),
@@ -150,7 +152,8 @@ pub async fn setup_socks_server_stream_inner(
     };
 
     if !methods.contains(&supported_method) {
-        // TODO: consider writing response: [VER_SOCKS5, METHOD_INVALID]
+        server_stream.write_all(&[VER_SOCKS5, 0xff]).await?;
+        server_stream.flush().await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Supported SOCKS method not found",
@@ -165,6 +168,8 @@ pub async fn setup_socks_server_stream_inner(
     if let Some((target_username, target_password)) = auth_info {
         let auth_version = stream_reader.read_u8(&mut server_stream).await?;
         if auth_version != VER_AUTH {
+            server_stream.write_all(&[VER_AUTH, 1]).await?;
+            server_stream.flush().await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported SOCKS auth version",
@@ -173,6 +178,8 @@ pub async fn setup_socks_server_stream_inner(
 
         let username_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if username_len == 0 {
+            server_stream.write_all(&[VER_AUTH, 1]).await?;
+            server_stream.flush().await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported SOCKS username length",
@@ -187,6 +194,8 @@ pub async fn setup_socks_server_stream_inner(
 
         let password_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if password_len == 0 {
+            server_stream.write_all(&[VER_AUTH, 1]).await?;
+            server_stream.flush().await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported SOCKS password length",
@@ -204,6 +213,8 @@ pub async fn setup_socks_server_stream_inner(
         let password_match = target_password.as_bytes().ct_eq(password);
 
         if username_match.unwrap_u8() == 0 || password_match.unwrap_u8() == 0 {
+            server_stream.write_all(&[VER_AUTH, 1]).await?;
+            server_stream.flush().await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "SOCKS authentication failed",
@@ -246,9 +257,14 @@ pub async fn setup_socks_server_stream_inner(
     }
 
     if connection_request[1] != CMD_CONNECT {
+        let command = connection_request[1];
+        server_stream
+            .write_all(&build_error_response(REPLY_COMMAND_NOT_SUPPORTED))
+            .await?;
+        server_stream.flush().await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("Invalid command code: {}", connection_request[1]),
+            format!("Invalid command code: {command}"),
         ));
     }
 
@@ -266,7 +282,8 @@ pub async fn setup_socks_server_stream_inner(
         let mut location_vec = write_location_to_vec(&NetLocation::new(
             Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
             65535,
-        ));
+        ))
+        .expect("fixed IP address");
         response_bytes.append(&mut location_vec);
         response_bytes.into_boxed_slice()
     });
@@ -363,6 +380,7 @@ pub async fn setup_socks_server_stream_inner(
         stream: server_stream,
         need_initial_flush: true,
         connection_success_response: Some(connection_success_response.to_vec().into_boxed_slice()),
+        connection_failure_response: Some(connect_failure_response),
         initial_remote_data: stream_reader.unparsed_data_owned(),
         proxy_selector: proxy_selector.clone(),
     })
@@ -437,6 +455,17 @@ fn build_error_response(reply_code: u8) -> Vec<u8> {
         0,
         0, // port 0
     ]
+}
+
+fn connect_failure_response(kind: std::io::ErrorKind) -> Vec<u8> {
+    use std::io::ErrorKind;
+    build_error_response(match kind {
+        ErrorKind::PermissionDenied => 2,
+        ErrorKind::NetworkUnreachable => 3,
+        ErrorKind::HostUnreachable | ErrorKind::NotFound | ErrorKind::AddrNotAvailable => 4,
+        ErrorKind::ConnectionRefused => 5,
+        _ => REPLY_GENERAL_FAILURE,
+    })
 }
 
 /// Build a SOCKS5 UDP ASSOCIATE success response.
@@ -592,7 +621,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
             CMD_CONNECT,
             0x0, // reserved
         ];
-        connect_request.extend(write_location_to_vec(remote_location.location()));
+        connect_request.extend(write_location_to_vec(remote_location.location())?);
         write_all(&mut client_stream, &connect_request).await?;
         client_stream.flush().await?;
 
@@ -763,7 +792,7 @@ pub async fn read_location_direct<T: AsyncReadExt + Unpin>(
     }
 }
 
-pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
+pub fn write_location_to_vec(location: &NetLocation) -> std::io::Result<Vec<u8>> {
     let (address, port) = location.components();
     let mut vec = match address {
         Address::Ipv4(v4addr) => {
@@ -780,9 +809,15 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
         }
         Address::Hostname(domain_name) => {
             let domain_name_bytes = domain_name.as_bytes();
+            let length = u8::try_from(domain_name_bytes.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SOCKS hostname exceeds 255 bytes",
+                )
+            })?;
             let mut vec = Vec::with_capacity(4 + domain_name_bytes.len());
             vec.push(ADDR_TYPE_DOMAIN_NAME);
-            vec.push(domain_name_bytes.len() as u8);
+            vec.push(length);
             vec.extend_from_slice(domain_name_bytes);
             vec
         }
@@ -790,7 +825,7 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
 
     vec.push((port >> 8) as u8);
     vec.push((port & 0xff) as u8);
-    vec
+    Ok(vec)
 }
 
 #[cfg(test)]
@@ -838,6 +873,50 @@ mod tests {
         let mut bytes = vec![0; len];
         bounded(stream.read_exact(&mut bytes)).await.unwrap();
         bytes
+    }
+
+    #[tokio::test]
+    async fn negative_negotiation_replies_are_flushed_before_close() {
+        for (auth, request, expected) in [
+            (None, vec![5, 1, 2], vec![5, 255]),
+            (None, vec![5, 0], vec![5, 255]),
+            (
+                credentials(),
+                b"\x05\x01\x02\x01\x04user\x04fail".to_vec(),
+                vec![5, 2, 1, 1],
+            ),
+            (
+                None,
+                b"\x05\x01\x00\x05\x02\x00".to_vec(),
+                [vec![5, 0], build_error_response(7)].concat(),
+            ),
+        ] {
+            let (mut client, stream) = tokio::io::duplex(1024);
+            client.write_all(&request).await.unwrap();
+            client.shutdown().await.unwrap();
+            assert!(
+                bounded(
+                    server_handler(auth)
+                        .setup_server_stream(Box::new(FlushGatedStream::new(stream)))
+                )
+                .await
+                .is_err()
+            );
+            let mut received = Vec::new();
+            bounded(client.read_to_end(&mut received)).await.unwrap();
+            assert_eq!(received, expected);
+        }
+    }
+
+    #[test]
+    fn hostname_lengths_do_not_wrap() {
+        let valid = NetLocation::new(Address::Hostname("a".repeat(255)), 53);
+        let invalid = NetLocation::new(Address::Hostname("a".repeat(256)), 53);
+        assert_eq!(write_location_to_vec(&valid).unwrap()[1], 255);
+        assert_eq!(
+            write_location_to_vec(&invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[tokio::test]
