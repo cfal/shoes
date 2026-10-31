@@ -332,6 +332,9 @@ impl Decoder {
     }
 
     pub fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Decoded {
+        if self.mode == Mode::Classic && self.config.layouts.len() == 1 {
+            return self.decode_compacted(input, output);
+        }
         let mut result = Decoded::default();
         match self.mode {
             Mode::Classic => {
@@ -423,8 +426,82 @@ impl Decoder {
         result
     }
 
+    #[inline(never)]
+    fn decode_compacted(&mut self, input: &[u8], output: &mut [u8]) -> Decoded {
+        let mut result = Decoded::default();
+        let table = &self.config.layouts[0].classic;
+        let core = core();
+        let mut hints = [0u8; 256];
+        while result.consumed < input.len() && result.written < output.len() {
+            let initial = self.count;
+            hints[..initial].copy_from_slice(&self.hints[..initial]);
+            // Bounds raw lookahead so output saturation cannot consume a trailing byte.
+            let limit = ((output.len() - result.written).min(64) * 4 - initial)
+                .min(input.len() - result.consumed);
+            let start = result.consumed;
+            let mut count = initial;
+            for byte in &input[start..start + limit] {
+                let hint = table[*byte as usize];
+                hints[count] = hint;
+                count += usize::from(hint != SKIP);
+            }
+            for (index, group) in hints[..count].as_chunks::<4>().0.iter().enumerate() {
+                self.hints = *group;
+                self.count = 0;
+                let value = core
+                    .identify(*group)
+                    .map(|id| self.config.mapping.inverse[id]);
+                let Some(value) = value.filter(|b| *b < 256) else {
+                    // Recovers the scalar error position without per-hint offset bookkeeping.
+                    let needed = (index + 1) * 4 - initial;
+                    let mut seen = 0;
+                    for (offset, byte) in input[start..start + limit].iter().enumerate() {
+                        seen += usize::from(table[*byte as usize] != SKIP);
+                        if seen == needed {
+                            result.consumed = start + offset + 1;
+                            break;
+                        }
+                    }
+                    result.error = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid sudoku hint tuple",
+                    ));
+                    return result;
+                };
+                output[result.written] = value as u8;
+                result.written += 1;
+            }
+            self.count = count % 4;
+            self.hints[..self.count].copy_from_slice(&hints[count - self.count..count]);
+            result.consumed += limit;
+        }
+        result
+    }
+
     #[cfg(test)]
     pub fn decode_byte(&mut self, byte: u8) -> io::Result<Option<u8>> {
+        // Keeps the classic test oracle independent of the bulk compaction algorithm.
+        if self.mode == Mode::Classic {
+            let hint = self.config.layouts[self.layout].classic[byte as usize];
+            if hint == SKIP {
+                return Ok(None);
+            }
+            self.hints[self.count] = hint;
+            self.count += 1;
+            if self.count != 4 {
+                return Ok(None);
+            }
+            self.count = 0;
+            let value = core()
+                .identify(self.hints)
+                .map(|id| self.config.mapping.inverse[id])
+                .filter(|b| *b < 256)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid sudoku hint tuple")
+                })?;
+            self.layout = next_layout(self.layout, self.config.layouts.len());
+            return Ok(Some(value as u8));
+        }
         let mut output = [0];
         let result = self.decode(&[byte], &mut output);
         match result.error {
@@ -550,6 +627,94 @@ mod tests {
                     for capacity in 0..=16 {
                         check(&config, &wire, capacity);
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classic_compaction_preserves_windows_errors_and_partial_state() {
+        fn check(config: &Arc<Prepared>, wire: &[u8], capacity: usize) {
+            let mut bulk = Decoder::new(config.clone(), Role::Server);
+            let mut scalar = Decoder::new(config.clone(), Role::Server);
+            for mut input in wire.chunks(257) {
+                while !input.is_empty() {
+                    let state = (bulk.layout, bulk.hints, bulk.count, bulk.bits);
+                    let empty = bulk.decode(input, &mut []);
+                    assert_eq!((empty.consumed, empty.written), (0, 0));
+                    assert!(empty.error.is_none());
+                    assert_eq!((bulk.layout, bulk.hints, bulk.count, bulk.bits), state);
+
+                    let mut expected = [0xa5; 258];
+                    let mut written = 0;
+                    let mut consumed = 0;
+                    let mut error = None;
+                    for byte in input {
+                        consumed += 1;
+                        match scalar.decode_byte(*byte) {
+                            Ok(Some(byte)) => {
+                                expected[written] = byte;
+                                written += 1;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                error = Some(e);
+                                break;
+                            }
+                        }
+                        if written == capacity {
+                            break;
+                        }
+                    }
+                    let mut actual = [0xa5; 258];
+                    let result = bulk.decode(input, &mut actual[..capacity]);
+                    assert_eq!((result.consumed, result.written), (consumed, written));
+                    assert_eq!(actual, expected);
+                    assert_eq!(
+                        result.error.as_ref().map(|e| (e.kind(), e.to_string())),
+                        error.as_ref().map(|e| (e.kind(), e.to_string())),
+                    );
+                    assert_eq!(
+                        (bulk.layout, bulk.hints, bulk.count, bulk.bits),
+                        (scalar.layout, scalar.hints, scalar.count, scalar.bits),
+                    );
+                    if error.is_some() {
+                        return;
+                    }
+                    assert!(consumed > 0);
+                    input = &input[consumed..];
+                }
+            }
+        }
+
+        for options in [
+            json!({}),
+            json!({"ascii":"ascii"}),
+            json!({"custom_table":"xpxvvpvv"}),
+        ] {
+            let mut options = options;
+            options["padding_min"] = json!(10);
+            options["padding_max"] = json!(10);
+            let config = super::super::tests::config(options);
+            let mut encoder = Encoder::new(config.clone(), Role::Client);
+            encoder.rng = StdRng::seed_from_u64(42);
+            let plain: Vec<_> = (0..1024).map(|i| (i * 37) as u8).collect();
+            let mut wire = vec![0; plain.len() * 9 + 8];
+            let n = encoder.encode(&plain, &mut wire);
+            wire.truncate(n);
+            for position in [0, 1, 2, 3, 4, 7, 15, 255, 256, 257, 511, 1023] {
+                let saved = wire[position];
+                for byte in 0..=255 {
+                    wire[position] = byte;
+                    for capacity in [1, 3, 7, 64, 257] {
+                        check(&config, &wire, capacity);
+                    }
+                }
+                wire[position] = saved;
+            }
+            for byte in 0..=255 {
+                for capacity in [1, 3, 64] {
+                    check(&config, &[byte; 513], capacity);
                 }
             }
         }
