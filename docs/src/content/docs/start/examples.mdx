@@ -1,0 +1,32 @@
+---
+title: Configuration examples
+description: Complete YAML configurations, included directly from the Shoes source tree.
+---
+
+import { examples } from '../../../data/examples';
+
+Each example has its own page with the complete, copyable YAML file. Change
+addresses, credentials, certificates, and other deployment-specific values
+before using it. Run `shoes check` after adapting the configuration.
+
+## Start here
+
+- [Local SOCKS5 listener](/start/first-config/): loopback-only, no certificates or upstream services required.
+- [HTTP through SOCKS](/examples/http_through_socks/): connect an inbound listener to an upstream proxy.
+- [Multi-hop chain](/examples/multi_hop_chain/): route through more than one upstream.
+- [Routing with local rule sources](/examples/rule_sources/): requires the referenced rule files.
+- [Clash controller](/examples/clash_api/): runtime selectors and controller configuration.
+
+## Validation
+
+Rust tests check YAML decoding and rule compilation for all these files. A
+curated subset listed in `src/config/tests.rs` also passes native preparation
+checks with repository fixtures. Parsing or preparation does not prove that
+sockets, routes, external peers, or platform-specific features work on the
+deployment machine.
+
+## All examples
+
+<ul>
+  {examples.map(({ filename, slug }) => <li><a href={`/examples/${slug}/`}>{filename}</a></li>)}
+</ul>
