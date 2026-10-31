@@ -69,6 +69,52 @@ async fn pair(backend: Backend) -> (LegacyVision, LegacyVision) {
     )
 }
 
+#[tokio::test]
+async fn opaque_udp_never_retains_tls_prefixes_in_either_direction() {
+    for backend in BACKENDS {
+        let (client, server) = pair(backend).await;
+        let mut client = client.with_xudp();
+        let mut server = server.with_xudp();
+        for payload in [
+            b"request\x16".as_slice(),
+            b"request\x16\x03\x03",
+            b"prefix\x16\x03\x01\x00\xff\x01tail",
+        ]
+        .into_iter()
+        .cycle()
+        .take(12)
+        {
+            transfer(&mut client, &mut server, payload).await;
+            transfer(&mut server, &mut client, payload).await;
+            assert_ne!(client.write_mode, VisionMode::Direct);
+            assert_ne!(server.write_mode, VisionMode::Direct);
+        }
+        assert_eq!(client.write_mode, VisionMode::Tls);
+        assert_eq!(server.write_mode, VisionMode::Tls);
+    }
+}
+
+#[tokio::test]
+async fn large_unknown_prefix_writes_drain_before_immediate_shutdown() {
+    for backend in BACKENDS {
+        let (mut client, mut server) = pair(backend).await;
+        let payload = vec![42; 150000];
+        let expected = payload.clone();
+        timeout(Duration::from_secs(5), async {
+            let writer = tokio::spawn(async move {
+                client.write_all(&payload).await.unwrap();
+                client.shutdown().await.unwrap();
+            });
+            let mut received = Vec::new();
+            server.read_to_end(&mut received).await.unwrap();
+            writer.await.unwrap();
+            assert_eq!(received, expected);
+        })
+        .await
+        .unwrap();
+    }
+}
+
 pub(super) async fn transfer<S: VisionTransport>(
     sender: &mut VisionStream<S>,
     receiver: &mut VisionStream<S>,

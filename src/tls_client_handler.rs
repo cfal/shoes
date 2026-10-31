@@ -147,8 +147,11 @@ impl TcpClientHandler for TlsClientHandler {
         }
 
         let connection = TlsConnection::new(client_conn);
-        let tls_stream =
-            CryptoTlsStream::handshake(client_stream, connection, TlsReadMode::Stream, &[]).await?;
+        let mode = match self.handler {
+            TlsInnerClientHandler::VisionVless { .. } => TlsReadMode::PreserveRecords,
+            TlsInnerClientHandler::Default(_) => TlsReadMode::Stream,
+        };
+        let tls_stream = CryptoTlsStream::handshake(client_stream, connection, mode, &[]).await?;
 
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => {
@@ -157,10 +160,11 @@ impl TcpClientHandler for TlsClientHandler {
                     .await
             }
             TlsInnerClientHandler::VisionVless { uuid, .. } => {
-                crate::vless::vless_client_handler::setup_vless_udp_bidirectional(
+                crate::vless::vless_client_handler::setup_vision_vless_udp_bidirectional(
                     tls_stream,
                     uuid,
                     target.into_location(),
+                    crate::vless::VisionWriteErrorPolicy::Legacy,
                 )
                 .await
             }

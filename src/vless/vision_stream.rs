@@ -53,6 +53,7 @@ impl std::fmt::Display for VisionMode {
 }
 
 pub struct VisionStream<S> {
+    is_xudp: bool,
     tls: S,
     write_error_policy: VisionWriteErrorPolicy,
     write_error: Option<(io::ErrorKind, String)>,
@@ -149,6 +150,11 @@ where
         self
     }
 
+    pub(crate) fn with_xudp(mut self) -> Self {
+        self.is_xudp = true;
+        self
+    }
+
     fn output_status(&self) -> io::Result<()> {
         match &self.write_error {
             Some((kind, message)) => Err(io::Error::new(*kind, message.clone())),
@@ -176,6 +182,7 @@ where
         vless_response_to_send: bool,
     ) -> Self {
         Self {
+            is_xudp: false,
             tls,
             write_error_policy: VisionWriteErrorPolicy::Legacy,
             write_error: None,
@@ -396,7 +403,9 @@ where
 
         log::debug!("VISION READ: Unpadded to {} bytes", unpadded.len());
 
-        if !unpadded.is_empty() && self.filter.is_filtering() {
+        if !unpadded.is_empty() && self.is_xudp {
+            self.filter.decrement_filter_count();
+        } else if !unpadded.is_empty() && self.filter.is_filtering() {
             // Feed to deframer
             self.inner_read_deframer.feed(&unpadded);
 
@@ -485,6 +494,27 @@ where
             self.pending_tls_mode_switch = false;
             self.switch_write_to_tls_mode()?;
             return Pin::new(&mut self.tls).poll_write(cx, buf);
+        }
+
+        if self.is_xudp {
+            self.filter.decrement_filter_count();
+            let command = if self.filter.is_filtering() {
+                COMMAND_CONTINUE
+            } else {
+                COMMAND_END
+            };
+            let packet = if self.write_first_packet {
+                super::vision_pad::pad_with_uuid_and_command(buf, &self.user_uuid, command, false)
+            } else {
+                super::vision_pad::pad_with_command(buf, command, false)
+            };
+            self.write_first_packet = false;
+            self.pending_tls_mode_switch = command == COMMAND_END;
+            self.queue_padded_write(&packet);
+            if let Poll::Ready(Err(error)) = self.drain_all_writes_padding(cx) {
+                return self.fail_padded_write(error, buf.len());
+            }
+            return Poll::Ready(Ok(buf.len()));
         }
 
         // Feed write buffer to inner deframer and check for ApplicationData

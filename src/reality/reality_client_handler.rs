@@ -175,9 +175,11 @@ impl TcpClientHandler for RealityClientHandler {
         client_stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
-        let tls_stream = self
-            .setup_client_stream_common(client_stream, TlsReadMode::Stream)
-            .await?;
+        let mode = match self.handler {
+            RealityInnerClientHandler::VisionVless { .. } => TlsReadMode::PreserveRecords,
+            RealityInnerClientHandler::Default(_) => TlsReadMode::Stream,
+        };
+        let tls_stream = self.setup_client_stream_common(client_stream, mode).await?;
 
         match &self.handler {
             RealityInnerClientHandler::Default(handler) => {
@@ -186,10 +188,11 @@ impl TcpClientHandler for RealityClientHandler {
                     .await
             }
             RealityInnerClientHandler::VisionVless { uuid, .. } => {
-                crate::vless::vless_client_handler::setup_vless_udp_bidirectional(
+                crate::vless::vless_client_handler::setup_vision_vless_udp_bidirectional(
                     tls_stream,
                     uuid,
                     target.into_location(),
+                    crate::vless::VisionWriteErrorPolicy::Legacy,
                 )
                 .await
             }

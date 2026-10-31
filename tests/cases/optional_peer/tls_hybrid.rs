@@ -11,7 +11,9 @@ use tokio::{
     net::TcpStream,
 };
 
-fn start_xray(config: serde_json::Value) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
+pub(super) fn start_xray(
+    config: serde_json::Value,
+) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
     let binary = std::env::var_os("SHOES_TEST_XRAY_BIN").unwrap_or_else(|| "xray".into());
     let mut file = tempfile::Builder::new().suffix(".json").tempfile()?;
     file.write_all(config.to_string().as_bytes())?;
@@ -24,7 +26,7 @@ fn start_xray(config: serde_json::Value) -> io::Result<(ProcessGuard, tempfile::
     Ok((ProcessGuard::new(child, "xray hybrid TLS peer"), file))
 }
 
-async fn echo_through_http(port: u16, target_port: u16) -> io::Result<()> {
+pub(super) async fn echo_through_http(port: u16, target_port: u16) -> io::Result<()> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
     stream
         .write_all(

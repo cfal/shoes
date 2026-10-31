@@ -13,7 +13,7 @@ use super::vision_stream::{VisionStream, VisionWriteErrorPolicy};
 use super::vision_transport::VisionTransport;
 use super::vless_message_stream::VlessMessageStream;
 use super::vless_response_stream::VlessResponseStream;
-use super::vless_util::{COMMAND_TCP, COMMAND_UDP, vision_flow_addon_data};
+use super::vless_util::{COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, vision_flow_addon_data};
 
 pub struct VlessTcpClientHandler {
     user_id: Box<[u8]>,
@@ -99,7 +99,17 @@ impl TcpClientHandler for VlessTcpClientHandler {
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         if let Some(encryption) = &self.encryption {
-            client_stream = Box::new(encryption.handshake(client_stream).await?);
+            let stream = encryption.handshake(client_stream).await?;
+            if self.vision {
+                return setup_vision_vless_udp_bidirectional(
+                    stream,
+                    &self.user_id,
+                    target.into_location(),
+                    VisionWriteErrorPolicy::AcknowledgeAccepted,
+                )
+                .await;
+            }
+            client_stream = Box::new(stream);
         }
         write_vless_udp_header(&mut client_stream, &self.user_id, target.location()).await?;
         client_stream.flush().await?;
@@ -109,21 +119,38 @@ impl TcpClientHandler for VlessTcpClientHandler {
     }
 }
 
-/// Helper function for setup_client_udp_bidirectional that can be called from TlsClientHandler
-/// for Vision VLESS or regular VLESS over TLS.
-pub async fn setup_vless_udp_bidirectional<S>(
+pub(crate) async fn setup_vision_vless_udp_bidirectional<S>(
     mut stream: S,
     user_id: &[u8],
     target: NetLocation,
+    policy: VisionWriteErrorPolicy,
 ) -> std::io::Result<Box<dyn AsyncMessageStream>>
 where
-    S: AsyncStream + 'static,
+    S: VisionTransport + 'static,
 {
-    write_vless_udp_header(&mut stream, user_id, &target).await?;
+    stream.require_record_framing()?;
+    let addon = vision_flow_addon_data();
+    let mut header = vec![0];
+    header.extend_from_slice(user_id);
+    header.push(addon.len() as u8);
+    header.extend_from_slice(addon);
+    // MUX uses the implicit v1.mux.cool:666 destination, omitted from the wire header.
+    header.push(COMMAND_MUX);
+    stream.write_all(&header).await?;
     stream.flush().await?;
-    let response_stream = Box::new(VlessResponseStream::new(stream));
-    let message_stream = VlessMessageStream::new(response_stream);
-    Ok(Box::new(message_stream))
+    let uuid = user_id.try_into().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "VLESS UUID must be 16 bytes",
+        )
+    })?;
+    let vision = VisionStream::new_client(stream, uuid)?
+        .with_write_error_policy(policy)
+        .with_xudp();
+    Ok(Box::new(crate::xudp::client_stream::XudpClientStream::new(
+        Box::new(vision),
+        target,
+    )))
 }
 
 pub(crate) async fn setup_custom_tls_vision_vless_client_stream<S>(
