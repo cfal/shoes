@@ -30,7 +30,7 @@ async fn peer(
     let ready = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let ready_port = ready.local_addr().unwrap().port();
     drop((socket, ready));
-    let config = json!({
+    let mut config = json!({
         "log": {"level": "warn"},
         "inbounds": [
             {"type": "mixed", "listen": "0.0.0.0", "listen_port": ready_port},
@@ -40,6 +40,9 @@ async fn peer(
         ],
         "outbounds": [{"type": "direct"}]
     });
+    if kind == "tuic" {
+        config["inbounds"][1]["users"][0]["uuid"] = protocol["uuid"].clone();
+    }
     let (process, file) =
         shoes_test_support::process::start_singbox_server(&config.to_string()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -161,4 +164,16 @@ async fn hysteria2_sing_box_tcp_and_concurrent_udp() {
         "hysteria2",
     )
     .await;
+}
+
+#[tokio::test]
+async fn tuic_sing_box_tcp_and_both_udp_modes() {
+    for mode in ["native", "quic"] {
+        exercise(
+            json!({"type": "tuic", "uuid": "01234567-89ab-4def-8123-456789abcdef",
+            "password": "test-password", "udp_relay_mode": mode}),
+            "tuic",
+        )
+        .await;
+    }
 }

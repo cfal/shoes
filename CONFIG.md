@@ -1228,6 +1228,34 @@ Congestion control is adaptive (Quinn's default CUBIC), with unknown receive
 bandwidth advertised as zero. Brutal and fixed-bandwidth negotiation are not
 implemented; `up_mbps`, `down_mbps`, and 0-RTT options are rejected.
 
+### TUIC Client
+
+```yaml
+address: proxy.example.com:443
+quic_settings:
+  sni_hostname: proxy.example.com
+  verify: true
+protocol:
+  type: tuic # alias: tuicv5; version 5 only
+  uuid: 01234567-89ab-4def-8123-456789abcdef
+  password: your-password
+  udp_enabled: true
+  udp_relay_mode: native # native QUIC datagrams or quic unidirectional streams
+  heartbeat_interval_secs: 10 # 1..30
+```
+
+Transport defaults to QUIC, ALPN to `h3`. Placement and TLS settings follow the
+Hysteria2 client rules above. QUIC datagrams are required for heartbeats even
+with stream-mode UDP. Authentication uses the current TLS session exporter;
+TUIC has no authentication acknowledgement or TCP success response. Wrong
+credentials surface when the peer closes the connection, not necessarily during
+stream setup. Client 0-RTT is not supported.
+
+UDP associations share a bounded, connection-owned receiver. Association IDs
+are never reused within a connection; exhaustion creates a new connection while
+existing flows retain the old one. Explicit shutdown sends DISSOCIATE with a
+deadline; dropping an association queues a bounded best-effort notification.
+
 ### Direct
 ```yaml
 protocol:

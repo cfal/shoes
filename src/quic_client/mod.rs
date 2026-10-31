@@ -2,6 +2,7 @@ mod hysteria2;
 #[cfg(all(test, feature = "optional-peer-tests"))]
 mod interop;
 mod session;
+mod tuic;
 mod udp;
 
 use std::{io, sync::Arc};
@@ -30,6 +31,7 @@ pub(crate) fn validate(config: &ClientConfig, first: bool) -> io::Result<()> {
     }
     match &config.protocol {
         ClientProxyConfig::Hysteria2(settings) => settings.validate(),
+        ClientProxyConfig::Tuic(settings) => settings.validate(),
         _ => unreachable!(),
     }
 }
@@ -37,12 +39,14 @@ pub(crate) fn validate(config: &ClientConfig, first: bool) -> io::Result<()> {
 #[derive(Clone, Debug)]
 enum Protocol {
     Hysteria2(crate::config::quic_client::Hysteria2ClientConfig),
+    Tuic(crate::config::quic_client::TuicClientConfig),
 }
 
 impl Protocol {
     fn udp_enabled(&self) -> bool {
         match self {
             Self::Hysteria2(config) => config.udp_enabled,
+            Self::Tuic(config) => config.udp_enabled,
         }
     }
 }
@@ -66,6 +70,7 @@ impl Client {
         validate(&config, true)?;
         let protocol = match config.protocol {
             ClientProxyConfig::Hysteria2(config) => Protocol::Hysteria2(config),
+            ClientProxyConfig::Tuic(config) => Protocol::Tuic(config),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -104,6 +109,7 @@ impl ProxyConnector for Client {
             .await?;
         match &self.protocol {
             Protocol::Hysteria2(_) => hysteria2::connect(generation, target).await,
+            Protocol::Tuic(_) => tuic::connect(generation, target).await,
         }
     }
 

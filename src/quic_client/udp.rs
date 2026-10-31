@@ -10,10 +10,11 @@ use std::{
 use bytes::Bytes;
 use tokio::{io::ReadBuf, sync::mpsc};
 
-use super::{Protocol, hysteria2, session::Generation};
+use super::{Protocol, hysteria2, session::Generation, tuic};
 use crate::{
     address::NetLocation,
     async_stream::*,
+    config::quic_client::TuicUdpMode,
     udp_fragments::{MAX_UDP_PAYLOAD, UdpFragments},
 };
 
@@ -96,14 +97,28 @@ pub(super) async fn receive(
     protocol: Protocol,
 ) {
     let mut expiry = tokio::time::interval(Duration::from_secs(1));
+    let mut streams = tokio::task::JoinSet::new();
+    let is_tuic = matches!(protocol, Protocol::Tuic(_));
     loop {
         tokio::select! {
             packet = connection.read_datagram() => {
                 let Ok(packet) = packet else { break };
                 let fragment = match protocol {
                     Protocol::Hysteria2(_) => hysteria2::decode(&packet),
+                    Protocol::Tuic(_) => tuic::decode(&packet),
                 };
                 if let Ok(fragment) = fragment { registry.lock().deliver(fragment); }
+            }
+            stream = connection.accept_uni(), if is_tuic && streams.len() < QUEUE_SIZE => {
+                let Ok(mut stream) = stream else { break };
+                streams.spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(tuic::MAX_PACKET)).await
+                });
+            }
+            Some(packet) = streams.join_next(), if !streams.is_empty() => {
+                if let Ok(Ok(Ok(packet))) = packet {
+                    if let Ok(fragment) = tuic::decode(&packet) { registry.lock().deliver(fragment); }
+                }
             }
             _ = expiry.tick() => registry.lock().fragments.expire(),
         }
@@ -118,7 +133,11 @@ pub(super) struct Association {
     packet: u16,
     receiver: mpsc::Receiver<Bytes>,
     closed: bool,
+    write: Option<PendingIo>,
+    shutdown: Option<PendingIo>,
 }
+
+type PendingIo = Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + Sync>>;
 
 impl Association {
     pub fn new(generation: Arc<Generation>, target: NetLocation) -> io::Result<Option<Self>> {
@@ -130,20 +149,39 @@ impl Association {
             receiver,
             packet: 0,
             closed: false,
+            write: None,
+            shutdown: None,
         }))
     }
-    fn close(&mut self) {
+    fn close(&mut self) -> bool {
         if !self.closed {
             self.closed = true;
             self.generation.registry.lock().remove(self.id);
             self.receiver.close();
+            return true;
         }
+        false
+    }
+    fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(write) = &mut self.write {
+            let result = std::task::ready!(write.as_mut().poll(cx));
+            self.write = None;
+            return Poll::Ready(result);
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for Association {
     fn drop(&mut self) {
-        self.close();
+        if self.close() {
+            if let Some(sender) = &self.generation.dissociate {
+                let _ = sender.try_send(tuic::Dissociate {
+                    id: self.id as u16,
+                    completed: None,
+                });
+            }
+        }
     }
 }
 
@@ -183,11 +221,14 @@ impl AsyncReadMessage for Association {
 impl AsyncWriteMessage for Association {
     fn poll_write_message(
         mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<()>> {
         if self.closed {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if self.write.is_some() {
+            return self.poll_write(cx);
         }
         if data.len() > MAX_UDP_PAYLOAD {
             return Poll::Ready(Err(io::Error::new(
@@ -203,8 +244,27 @@ impl AsyncWriteMessage for Association {
             Protocol::Hysteria2(_) => {
                 hysteria2::encode(self.id, self.packet, &self.target, data, mtu)?
             }
+            Protocol::Tuic(config) => tuic::encode(
+                self.id,
+                self.packet,
+                &self.target,
+                data,
+                if config.udp_relay_mode == TuicUdpMode::Quic {
+                    tuic::MAX_PACKET
+                } else {
+                    mtu
+                },
+            )?,
         };
         self.packet = self.packet.wrapping_add(1);
+        if matches!(&self.generation.protocol, Protocol::Tuic(config) if config.udp_relay_mode == TuicUdpMode::Quic)
+        {
+            let connection = self.generation.connection().clone();
+            self.write = Some(Box::pin(async move {
+                tuic::send_command(&connection, &packets[0]).await
+            }));
+            return self.poll_write(cx);
+        }
         for packet in packets {
             self.generation
                 .connection()
@@ -215,16 +275,42 @@ impl AsyncWriteMessage for Association {
     }
 }
 impl AsyncFlushMessage for Association {
-    fn poll_flush_message(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush_message(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_write(cx)
     }
 }
 impl AsyncShutdownMessage for Association {
     fn poll_shutdown_message(
         mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        self.close();
+        std::task::ready!(self.poll_write(cx))?;
+        if self.close() {
+            if let Some(sender) = self.generation.dissociate.clone() {
+                let id = self.id as u16;
+                self.shutdown = Some(Box::pin(async move {
+                    tokio::time::timeout(Duration::from_secs(5), async move {
+                        let (completed, result) = tokio::sync::oneshot::channel();
+                        sender
+                            .send(tuic::Dissociate {
+                                id,
+                                completed: Some(completed),
+                            })
+                            .await
+                            .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
+                        result
+                            .await
+                            .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?
+                    })
+                    .await?
+                }));
+            }
+        }
+        if let Some(shutdown) = &mut self.shutdown {
+            let result = std::task::ready!(shutdown.as_mut().poll(cx));
+            self.shutdown = None;
+            return Poll::Ready(result);
+        }
         Poll::Ready(Ok(()))
     }
 }

@@ -223,6 +223,7 @@ impl SocketConnectorImpl {
 
                 let is_xhttp = crate::xhttp::connector::contains(&config.protocol);
                 let is_native = config.protocol.is_native_quic();
+                let is_tuic = matches!(config.protocol, crate::config::ClientProxyConfig::Tuic(_));
                 let alpn_protocols = if (is_xhttp || is_native) && alpn_protocols.is_unspecified() {
                     vec!["h3".to_owned()]
                 } else {
@@ -255,7 +256,14 @@ impl SocketConnectorImpl {
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
                     .max_concurrent_uni_streams(
-                        if is_xhttp || is_native { 16_u32 } else { 0 }.into(),
+                        if is_tuic {
+                            limits.max_streams_per_connection.unwrap_or(64).min(64) as u32
+                        } else if is_xhttp || is_native {
+                            16_u32
+                        } else {
+                            0
+                        }
+                        .into(),
                     )
                     .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
                     .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));

@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Added a native Hysteria2 client with shared HTTP/3 authentication, TCP streams, bounded UDP fragmentation and demultiplexing, and connection-owned reconnect lifetimes. Native QUIC clients must be outermost at chain hop 0; existing stream-based proxies can follow them. Brutal and 0-RTT are not supported.
+- Added a TUIC v5 client with TCP, native and QUIC-stream UDP relay modes, session-exporter authentication, heartbeats, and bounded association teardown.
 
 - Added the outermost `sudoku_mask` TCP client/server wrapper with Xray FinalMask interoperability, stacked outer masks, TLS/REALITY, WebSocket, native VLESS encryption/Vision, and XHTTP carriers. Masks inside other protocols are rejected. UDP forwarded inside TCP remains supported; native UDP/QUIC masking is not supported. Sudoku is obfuscation, not transport security; see [configuration and costs](CONFIG.md#sudoku-tcp-mask).
 - Raised the default `global_limits.quic_socket_buffer` request to 8 MiB and extended the setting from QUIC listeners to outbound QUIC proxies and DNS-over-HTTP/3. Buffer tuning remains best-effort; unsatisfied or unverifiable requests now warn at most once per receive/send direction per process, including SOCKS5 UDP's existing 2 MiB request.

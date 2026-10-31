@@ -3,7 +3,7 @@ use std::{collections::HashMap, io, sync::Arc, time::Duration};
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 
-use super::{Protocol, hysteria2, udp};
+use super::{Protocol, hysteria2, tuic, udp};
 use crate::tcp::carrier_dialer::{CarrierDialer, QuicCarrier, RouteKey};
 
 pub(super) const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -90,6 +90,7 @@ pub(super) struct Generation {
     pub protocol: Protocol,
     pub udp_enabled: bool,
     pub registry: Arc<parking_lot::Mutex<udp::Registry>>,
+    pub dissociate: Option<tokio::sync::mpsc::Sender<tuic::Dissociate>>,
     tasks: Vec<AbortOnDropHandle<()>>,
     // Retains pointer-based route identities for the entire pooled lifetime.
     _dialer: Arc<dyn CarrierDialer>,
@@ -98,11 +99,16 @@ pub(super) struct Generation {
 impl Generation {
     async fn open(dialer: Arc<dyn CarrierDialer>, protocol: Protocol) -> io::Result<Self> {
         let carrier = dialer.open_quic().await?;
+        let maximum = match &protocol {
+            Protocol::Hysteria2(_) => u32::MAX as u64,
+            Protocol::Tuic(_) => u16::MAX as u64,
+        };
         let mut generation = Self {
             carrier,
             protocol,
             udp_enabled: false,
-            registry: Arc::new(parking_lot::Mutex::new(udp::Registry::new(u32::MAX as u64))),
+            registry: Arc::new(parking_lot::Mutex::new(udp::Registry::new(maximum))),
+            dissociate: None,
             tasks: Vec::new(),
             _dialer: dialer,
         };
@@ -112,6 +118,30 @@ impl Generation {
                     hysteria2::authenticate(generation.connection(), config).await?;
                 generation.udp_enabled = config.udp_enabled && enabled;
                 generation.tasks.push(task);
+            }
+            Protocol::Tuic(config) => {
+                tuic::authenticate(generation.connection(), config).await?;
+                if generation.connection().max_datagram_size().is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "TUIC requires QUIC datagrams for heartbeat",
+                    ));
+                }
+                generation.udp_enabled = config.udp_enabled;
+                generation
+                    .tasks
+                    .push(AbortOnDropHandle::new(tokio::spawn(tuic::heartbeat(
+                        generation.connection().clone(),
+                        config.heartbeat_interval_secs,
+                    ))));
+                let (sender, receiver) = tokio::sync::mpsc::channel(64);
+                generation.dissociate = Some(sender);
+                generation
+                    .tasks
+                    .push(AbortOnDropHandle::new(tokio::spawn(tuic::dissociate_loop(
+                        generation.connection().clone(),
+                        receiver,
+                    ))));
             }
         }
         generation

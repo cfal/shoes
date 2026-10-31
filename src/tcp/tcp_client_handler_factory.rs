@@ -46,7 +46,7 @@ pub fn create_tcp_client_handler(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Box<dyn TcpClientHandler>> {
     Ok(match client_proxy_config {
-        ClientProxyConfig::Hysteria2(_) => {
+        ClientProxyConfig::Hysteria2(_) | ClientProxyConfig::Tuic(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "native QUIC requires an outermost first-hop connector",

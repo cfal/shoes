@@ -418,6 +418,8 @@ pub enum ClientProxyConfig {
     Wireguard(Box<super::wireguard::WireguardClientConfig>),
     #[serde(alias = "hy2")]
     Hysteria2(super::quic_client::Hysteria2ClientConfig),
+    #[serde(alias = "tuicv5")]
+    Tuic(super::quic_client::TuicClientConfig),
     Http {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
@@ -570,7 +572,7 @@ pub enum ClientProxyConfig {
 
 impl ClientProxyConfig {
     pub fn is_native_quic(&self) -> bool {
-        matches!(self, Self::Hysteria2(_))
+        matches!(self, Self::Hysteria2(_) | Self::Tuic(_))
     }
 
     pub fn is_wireguard(&self) -> bool {
@@ -588,6 +590,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::Direct => "Direct",
             ClientProxyConfig::Wireguard(_) => "WireGuard",
             ClientProxyConfig::Hysteria2(_) => "Hysteria2",
+            ClientProxyConfig::Tuic(_) => "TUIC",
             ClientProxyConfig::Http { .. } => "HTTP",
             ClientProxyConfig::Socks { .. } => "SOCKS5",
             ClientProxyConfig::Shadowsocks { .. } => "Shadowsocks",
