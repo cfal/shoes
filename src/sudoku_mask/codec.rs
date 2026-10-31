@@ -4,7 +4,7 @@ use rand::{RngExt, rngs::StdRng};
 
 use super::{
     Prepared, Role,
-    layout::{POISON, SKIP},
+    layout::{Layout, POISON, SKIP},
     table::core,
 };
 
@@ -57,6 +57,44 @@ fn pad(rng: &mut StdRng, padding: u8, pool: &[u8], output: &mut [u8]) -> usize {
     1
 }
 
+#[inline(never)]
+fn encode_unpadded_chunks(
+    layouts: &[Layout],
+    index: &mut usize,
+    chunks: &[[u8; 3]],
+    output: &mut [u8],
+) -> usize {
+    let written = chunks.len() * 4;
+    let output = output[..written].as_chunks_mut::<4>().0;
+    if let [layout] = layouts {
+        let table = &layout.encode;
+        for (&[a, b, c], encoded) in chunks.iter().zip(output) {
+            *encoded = [
+                table[(a >> 2) as usize],
+                table[((a & 3) << 4 | b >> 4) as usize],
+                table[((b & 15) << 2 | c >> 6) as usize],
+                table[(c & 63) as usize],
+            ];
+        }
+    } else {
+        for (&[a, b, c], encoded) in chunks.iter().zip(output) {
+            for (group, byte) in [
+                a >> 2,
+                (a & 3) << 4 | b >> 4,
+                (b & 15) << 2 | c >> 6,
+                c & 63,
+            ]
+            .into_iter()
+            .zip(encoded)
+            {
+                *byte = layouts[*index].encode[group as usize];
+                *index = next_layout(*index, layouts.len());
+            }
+        }
+    }
+    written
+}
+
 pub(super) struct Encoder {
     config: Arc<Prepared>,
     mode: Mode,
@@ -94,100 +132,150 @@ impl Encoder {
         if input.is_empty() {
             return 0;
         }
+        match self.mode {
+            Mode::Classic => self.encode_classic(input, output),
+            Mode::Packed => self.encode_packed(input, output),
+        }
+    }
+
+    // Keep classic/cache control flow out of the packed encoder's register allocation.
+    #[inline(never)]
+    fn encode_classic(&mut self, input: &[u8], output: &mut [u8]) -> usize {
+        if let Some(alphabet) = self.config.classic_alphabet {
+            return self.encode_cached_classic(alphabet.tuples(), input, output);
+        }
+        self.encode_uncached_classic(input, output)
+    }
+
+    #[inline(never)]
+    fn encode_uncached_classic(&mut self, input: &[u8], output: &mut [u8]) -> usize {
         let mut offset = 0;
         let layouts = &self.config.layouts;
         let padding = self.padding;
         let rng = &mut self.rng;
-        match self.mode {
-            Mode::Classic => {
-                let core = core();
-                for byte in input {
-                    let grid = self.config.mapping.forward[*byte as usize] as usize;
-                    let start = core.offsets[grid];
-                    let count = core.offsets[grid + 1] - start;
-                    // One uniform choice covers every tuple and each of its 24 orders.
-                    let choice = rng.random_range(0..count * 24);
-                    let hints = core.tuples[(start + choice / 24) as usize];
-                    let layout = &layouts[self.layout];
-                    let encoded = PERMUTATIONS[(choice % 24) as usize]
-                        .map(|index| layout.encode[hints[index] as usize]);
-                    if padding == 0 {
-                        output[offset..offset + 4].copy_from_slice(&encoded);
-                        offset += 4;
-                    } else {
-                        offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
-                        for byte in encoded {
-                            offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
-                            output[offset] = byte;
-                            offset += 1;
-                        }
-                    }
-                    self.layout = next_layout(self.layout, layouts.len());
+        let core = core();
+        for byte in input {
+            let grid = self.config.mapping.forward[*byte as usize] as usize;
+            let start = core.offsets[grid];
+            let count = core.offsets[grid + 1] - start;
+            // One uniform choice covers every tuple and each of its 24 orders.
+            let choice = rng.random_range(0..count * 24);
+            let hints = core.tuples[(start + choice / 24) as usize];
+            let layout = &layouts[self.layout];
+            let encoded = PERMUTATIONS[(choice % 24) as usize]
+                .map(|index| layout.encode[hints[index] as usize]);
+            if padding == 0 {
+                output[offset..offset + 4].copy_from_slice(&encoded);
+                offset += 4;
+            } else {
+                offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
+                for byte in encoded {
+                    offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
+                    output[offset] = byte;
+                    offset += 1;
                 }
             }
-            Mode::Packed => {
-                let (chunks, remainder) = input.as_chunks::<3>();
-                if padding == 0 && layouts.len() == 1 {
-                    let table = &layouts[0].encode;
-                    for &[a, b, c] in chunks {
-                        output[offset..offset + 4].copy_from_slice(&[
-                            table[(a >> 2) as usize],
-                            table[((a & 3) << 4 | b >> 4) as usize],
-                            table[((b & 15) << 2 | c >> 6) as usize],
-                            table[(c & 63) as usize],
-                        ]);
-                        offset += 4;
-                    }
-                } else {
-                    for &[a, b, c] in chunks {
-                        for group in [
-                            a >> 2,
-                            (a & 3) << 4 | b >> 4,
-                            (b & 15) << 2 | c >> 6,
-                            c & 63,
-                        ] {
-                            let layout = &layouts[self.layout];
-                            offset +=
-                                pad(rng, padding, &layout.packed_padding, &mut output[offset..]);
-                            output[offset] = layout.encode[group as usize];
-                            offset += 1;
-                            self.layout = next_layout(self.layout, layouts.len());
-                        }
-                    }
-                }
-                let mut bits = 0u16;
-                let mut count = 0;
-                for byte in remainder {
-                    bits = (bits << 8) | u16::from(*byte);
-                    count += 8;
-                    while count >= 6 {
-                        count -= 6;
-                        let layout = &layouts[self.layout];
-                        offset += pad(rng, padding, &layout.packed_padding, &mut output[offset..]);
-                        output[offset] = layout.encode[((bits >> count) & 63) as usize];
-                        offset += 1;
-                        self.layout = next_layout(self.layout, layouts.len());
-                    }
-                    bits &= (1 << count) - 1;
-                }
-                if count != 0 {
-                    let layout = &layouts[self.layout];
-                    offset += pad(rng, padding, &layout.packed_padding, &mut output[offset..]);
-                    output[offset] = layout.encode[(bits << (6 - count)) as usize];
-                    offset += 1;
-                    self.layout = next_layout(self.layout, layouts.len());
-                    output[offset] = layouts[self.layout].marker;
+            self.layout = next_layout(self.layout, layouts.len());
+        }
+        offset
+            + pad(
+                rng,
+                padding,
+                &layouts[self.layout].padding,
+                &mut output[offset..],
+            )
+    }
+
+    #[inline(never)]
+    fn encode_cached_classic(
+        &mut self,
+        tuples: &[[u8; 4]],
+        input: &[u8],
+        output: &mut [u8],
+    ) -> usize {
+        let core = core();
+        let layout = &self.config.layouts[0];
+        let padding = self.padding;
+        let rng = &mut self.rng;
+        let mut offset = 0;
+        for byte in input {
+            let grid = self.config.mapping.forward[*byte as usize] as usize;
+            let start = core.offsets[grid];
+            let count = core.offsets[grid + 1] - start;
+            let choice = rng.random_range(0..count * 24);
+            let tuple = tuples[(start + choice / 24) as usize];
+            let encoded = PERMUTATIONS[(choice % 24) as usize].map(|index| tuple[index]);
+            if padding == 0 {
+                output[offset..offset + 4].copy_from_slice(&encoded);
+                offset += 4;
+            } else {
+                offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
+                for byte in encoded {
+                    offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
+                    output[offset] = byte;
                     offset += 1;
                 }
             }
         }
-        let layout = &layouts[self.layout];
-        let pool = match self.mode {
-            Mode::Classic => &layout.padding,
-            Mode::Packed => &layout.packed_padding,
-        };
-        offset += pad(rng, padding, pool, &mut output[offset..]);
+        offset + pad(rng, padding, &layout.padding, &mut output[offset..])
+    }
+
+    #[inline(never)]
+    fn encode_packed(&mut self, input: &[u8], output: &mut [u8]) -> usize {
+        let mut offset = 0;
+        let layouts = &self.config.layouts;
+        let padding = self.padding;
+        let rng = &mut self.rng;
+        let (chunks, remainder) = input.as_chunks::<3>();
+        if padding == 0 {
+            offset = encode_unpadded_chunks(layouts, &mut self.layout, chunks, output);
+        } else {
+            for &[a, b, c] in chunks {
+                for group in [
+                    a >> 2,
+                    (a & 3) << 4 | b >> 4,
+                    (b & 15) << 2 | c >> 6,
+                    c & 63,
+                ] {
+                    let layout = &layouts[self.layout];
+                    offset += pad(rng, padding, &layout.packed_padding, &mut output[offset..]);
+                    output[offset] = layout.encode[group as usize];
+                    offset += 1;
+                    self.layout = next_layout(self.layout, layouts.len());
+                }
+            }
+        }
+        let mut bits = 0u16;
+        let mut count = 0;
+        for byte in remainder {
+            bits = (bits << 8) | u16::from(*byte);
+            count += 8;
+            while count >= 6 {
+                count -= 6;
+                let layout = &layouts[self.layout];
+                offset += pad(rng, padding, &layout.packed_padding, &mut output[offset..]);
+                output[offset] = layout.encode[((bits >> count) & 63) as usize];
+                offset += 1;
+                self.layout = next_layout(self.layout, layouts.len());
+            }
+            bits &= (1 << count) - 1;
+        }
+        if count != 0 {
+            let layout = &layouts[self.layout];
+            offset += pad(rng, padding, &layout.packed_padding, &mut output[offset..]);
+            output[offset] = layout.encode[(bits << (6 - count)) as usize];
+            offset += 1;
+            self.layout = next_layout(self.layout, layouts.len());
+            output[offset] = layouts[self.layout].marker;
+            offset += 1;
+        }
         offset
+            + pad(
+                rng,
+                padding,
+                &layouts[self.layout].packed_padding,
+                &mut output[offset..],
+            )
     }
 }
 
@@ -198,6 +286,26 @@ pub(super) struct Decoder {
     hints: [u8; 4],
     count: usize,
     bits: u16,
+}
+
+// Keeps the bulk loop independent of framing state and per-group span checks.
+#[inline(never)]
+fn decode_packed_chunks(table: &[u8; 256], input: &[u8], output: &mut [u8]) -> usize {
+    let mut decoded = 0;
+    for (wire, plain) in input
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(output.as_chunks_mut::<3>().0)
+    {
+        let [a, b, c, d] = wire.map(|b| table[b as usize]);
+        if (a | b | c | d) >= 64 {
+            break;
+        }
+        *plain = [a << 2 | b >> 4, b << 4 | c >> 2, c << 6 | d];
+        decoded += 1;
+    }
+    decoded
 }
 
 #[derive(Default)]
@@ -278,20 +386,18 @@ impl Decoder {
                         && output.len() - result.written >= 3
                         && layouts.len() == 1
                     {
-                        let [a, b, c, d] =
-                            [rest[0], rest[1], rest[2], rest[3]].map(|b| layout.packed[b as usize]);
-                        if (a | b | c | d) < 64 {
-                            output[result.written..result.written + 3].copy_from_slice(&[
-                                a << 2 | b >> 4,
-                                b << 4 | c >> 2,
-                                c << 6 | d,
-                            ]);
-                            result.consumed += 4;
-                            result.written += 3;
-                            continue;
+                        let decoded = decode_packed_chunks(
+                            &layout.packed,
+                            rest,
+                            &mut output[result.written..],
+                        );
+                        result.consumed += decoded * 4;
+                        result.written += decoded * 3;
+                        if result.consumed == input.len() || result.written == output.len() {
+                            break;
                         }
                     }
-                    let byte = rest[0];
+                    let byte = input[result.consumed];
                     result.consumed += 1;
                     let group = layout.packed[byte as usize];
                     if group == SKIP {
@@ -400,10 +506,61 @@ mod tests {
     }
 
     #[test]
+    fn packed_chunks_preserve_sentinels_and_partial_spans() {
+        fn check(config: &Arc<Prepared>, wire: &[u8], capacity: usize) {
+            let table = &config.layouts[0].packed;
+            let expected = wire
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(capacity / 3)
+                .take_while(|chunk| chunk.iter().all(|b| table[*b as usize] < 64))
+                .count();
+            let mut output = [0xa5; 16];
+            assert_eq!(
+                decode_packed_chunks(table, wire, &mut output[..capacity]),
+                expected
+            );
+            let mut scalar = Decoder::new(config.clone(), Role::Client);
+            let plain: Vec<_> = wire[..expected * 4]
+                .iter()
+                .filter_map(|b| scalar.decode_byte(*b).unwrap())
+                .collect();
+            assert_eq!(&output[..expected * 3], plain);
+            assert!(output[expected * 3..].iter().all(|b| *b == 0xa5));
+            assert_eq!((scalar.layout, scalar.bits, scalar.count), (0, 0, 0));
+        }
+
+        for options in [
+            json!({}),
+            json!({"ascii": "ascii"}),
+            json!({"custom_table": "xpxvvpvv"}),
+        ] {
+            let config = super::super::tests::config(options);
+            let valid: Vec<_> = (0..17).map(|i| config.layouts[0].encode[i * 3]).collect();
+            for length in 0..=valid.len() {
+                for capacity in 0..=16 {
+                    check(&config, &valid[..length], capacity);
+                }
+            }
+            for position in 0..16 {
+                for byte in 0..=255 {
+                    let mut wire = valid.clone();
+                    wire[position] = byte;
+                    for capacity in 0..=16 {
+                        check(&config, &wire, capacity);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn chunk_decoding_preserves_fragmentation_and_write_boundaries() {
         for options in [
             json!({}),
             json!({"ascii":"ascii"}),
+            json!({"custom_table":"xpxvvpvv"}),
             json!({"custom_tables":["xpxvvpvv", "vxpvxvvp", ""]}),
             json!({"custom_tables":["xpxvvpvv", "vxpvxvvp", "", "pxpxvvvv", "vvxxppvv"]}),
         ] {
@@ -475,6 +632,68 @@ mod tests {
         for _ in 0..32 {
             let wire: Vec<_> = (0..256).map(|_| rng.random()).collect();
             check_chunk_boundaries(config.clone(), Role::Server, &wire);
+        }
+    }
+
+    #[test]
+    fn cached_classic_encoding_preserves_wire_and_rng_across_writes() {
+        for ascii in ["entropy", "ascii"] {
+            for padding in [0, 10, 100] {
+                for password in ["", "different-mapping"] {
+                    let options = json!({
+                        "ascii": ascii, "password": password,
+                        "padding_min": padding, "padding_max": padding,
+                    });
+                    let mut config = super::super::tests::config(options.clone());
+                    Arc::get_mut(&mut config).unwrap().classic_alphabet = None;
+                    let mut original = Encoder::new(config, Role::Client);
+                    let mut cached =
+                        Encoder::new(super::super::tests::config(options), Role::Client);
+                    assert!(cached.config.classic_alphabet.is_some());
+                    cached.rng = StdRng::seed_from_u64(42);
+                    original.rng = StdRng::seed_from_u64(42);
+                    for length in (0..=8).chain([13, 14, 256, 4097]) {
+                        let plain: Vec<_> = (0..length).map(|i| (i * 37 + i / 256) as u8).collect();
+                        let mut actual = vec![0xa5; length * 9 + 8];
+                        let mut expected = actual.clone();
+                        let written = cached.encode(&plain, &mut actual);
+                        assert_eq!(written, original.encode(&plain, &mut expected));
+                        assert_eq!(actual, expected);
+                        assert_eq!(cached.layout, original.layout);
+                        assert_eq!(
+                            cached.rng.random::<[u8; 32]>(),
+                            original.rng.random::<[u8; 32]>(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_encoding_preserves_output_rng_and_layout() {
+        for options in [
+            json!({}),
+            json!({"ascii": "ascii"}),
+            json!({"custom_tables": ["", "xpxvvpvv", "vxpvxvvp"]}),
+        ] {
+            for role in [Role::Client, Role::Server] {
+                let mut options = options.clone();
+                options["padding_min"] = json!(100);
+                options["padding_max"] = json!(100);
+                let mut encoder = Encoder::new(super::super::tests::config(options), role);
+                let mut output = [0; 32];
+                encoder.encode(&[42], &mut output);
+                let layout = encoder.layout;
+                encoder.rng = StdRng::seed_from_u64(42);
+                let rng = StdRng::seed_from_u64(42).random::<[u8; 32]>();
+                output.fill(0xa5);
+                assert_eq!(encoder.encode(&[], &mut []), 0);
+                assert_eq!(encoder.encode(&[], &mut output), 0);
+                assert_eq!(output, [0xa5; 32]);
+                assert_eq!(encoder.layout, layout);
+                assert_eq!(encoder.rng.random::<[u8; 32]>(), rng);
+            }
         }
     }
 

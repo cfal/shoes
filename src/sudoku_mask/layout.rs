@@ -1,7 +1,59 @@
-use std::io;
+use std::{io, sync::OnceLock};
+
+use super::table::core;
 
 pub(super) const SKIP: u8 = 255;
 pub(super) const POISON: u8 = 64;
+
+fn entropy_alphabet() -> [u8; 64] {
+    std::array::from_fn(|g| (((g & 0x30) << 1) | (g & 0xf)) as u8)
+}
+
+fn ascii_alphabet() -> [u8; 64] {
+    std::array::from_fn(|g| if g == 63 { b'\n' } else { 0x40 | g as u8 })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClassicAlphabet {
+    Entropy,
+    Ascii,
+}
+
+impl ClassicAlphabet {
+    pub fn for_layouts(layouts: &[Layout]) -> Option<Self> {
+        let [layout] = layouts else {
+            return None;
+        };
+        if layout.encode == entropy_alphabet() {
+            Some(Self::Entropy)
+        } else if layout.encode == ascii_alphabet() {
+            Some(Self::Ascii)
+        } else {
+            None
+        }
+    }
+
+    pub fn tuples(self) -> &'static [[u8; 4]] {
+        // Tuples depend only on the wire alphabet, never passwords or config generations.
+        static ENTROPY: OnceLock<Box<[[u8; 4]]>> = OnceLock::new();
+        static ASCII: OnceLock<Box<[[u8; 4]]>> = OnceLock::new();
+        let cache = match self {
+            Self::Entropy => &ENTROPY,
+            Self::Ascii => &ASCII,
+        };
+        cache.get_or_init(|| {
+            let encode = match self {
+                Self::Entropy => entropy_alphabet(),
+                Self::Ascii => ascii_alphabet(),
+            };
+            core()
+                .tuples
+                .iter()
+                .map(|hints| hints.map(|hint| encode[hint as usize]))
+                .collect()
+        })
+    }
+}
 
 pub(super) struct Layout {
     pub encode: [u8; 64],
@@ -35,7 +87,7 @@ impl Layout {
 
     pub fn entropy() -> Self {
         Self::new(
-            std::array::from_fn(|g| (((g & 0x30) << 1) | (g & 0xf)) as u8),
+            entropy_alphabet(),
             |b| b & 0x90 == 0,
             (0..8).flat_map(|n| [0x80 + n, 0x10 + n]).collect(),
             0x80,
@@ -44,7 +96,7 @@ impl Layout {
 
     pub fn ascii() -> Self {
         let mut result = Self::new(
-            std::array::from_fn(|g| if g == 63 { b'\n' } else { 0x40 | g as u8 }),
+            ascii_alphabet(),
             |b| b & 0x40 != 0 || b == b'\n',
             (0x20..=0x3f).collect(),
             0x3f,

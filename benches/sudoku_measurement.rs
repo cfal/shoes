@@ -105,7 +105,9 @@ fn measure(name: &str, bytes: usize, mut operation: impl FnMut()) {
 )]
 fn sudoku_measurement() {
     assert!(!cfg!(debug_assertions), "use --release");
-    let plain: Vec<_> = (0..3072).map(|i| (i * 37 + i / 256) as u8).collect();
+    let length = variable("SUDOKU_BENCH_BYTES", 3072);
+    assert!(length > 0 && length <= 3640);
+    let plain: Vec<_> = (0..length).map(|i| (i * 37 + i / 256) as u8).collect();
     for layout in ["entropy", "ascii", "custom", "rotating"] {
         for padding in [0, 10] {
             let mut options = json!({
@@ -204,4 +206,40 @@ fn sudoku_measurement() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "compares seeded wire and final state across benchmark executables"]
+fn sudoku_encoding_fingerprint() {
+    let mut digest = blake3::Hasher::new();
+    for options in [
+        json!({}),
+        json!({"ascii": "ascii"}),
+        json!({"custom_table": "xpxvvpvv"}),
+        json!({"custom_tables": ["", "xpxvvpvv", "vxpvxvvp"]}),
+    ] {
+        for padding in [0, 10, 100] {
+            for password in ["", "different-mapping"] {
+                let mut options = options.clone();
+                options["padding_min"] = json!(padding);
+                options["padding_max"] = json!(padding);
+                options["password"] = json!(password);
+                let config = tests::config(options);
+                for role in [Role::Client, Role::Server] {
+                    let mut encoder = Encoder::new(config.clone(), role);
+                    encoder.rng = StdRng::seed_from_u64(42);
+                    for length in (0..=8).chain([13, 14, 256, 3072, 4097]) {
+                        let plain: Vec<_> = (0..length).map(|i| (i * 37 + i / 256) as u8).collect();
+                        let mut output = vec![0xa5; length * 9 + 8];
+                        let n = encoder.encode(&plain, &mut output);
+                        digest.update(&(n as u64).to_le_bytes());
+                        digest.update(&output);
+                        digest.update(&(encoder.layout as u64).to_le_bytes());
+                        digest.update(&encoder.rng.random::<[u8; 32]>());
+                    }
+                }
+            }
+        }
+    }
+    println!("SUDOKU_FINGERPRINT,{}", digest.finalize());
 }
