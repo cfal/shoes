@@ -281,14 +281,26 @@ fn chain_aliases_share_route_group_and_dns_sequence_semantics() {
                     "{field}: {value}"
                 );
                 assert_eq!(
-                    hops(group.client_chains.iter().map(ClientGroupMember::chain)),
+                    hops(
+                        group
+                            .client_chains
+                            .iter()
+                            .cloned()
+                            .map(ClientGroupMember::into_chain)
+                    ),
                     expected
                 );
                 assert_eq!(hops(dns.client_chains().iter().cloned()), expected);
                 let decoded: ClientConfigGroup =
                     serde_json::from_value(serde_json::to_value(group).unwrap()).unwrap();
                 assert_eq!(
-                    hops(decoded.client_chains.iter().map(ClientGroupMember::chain)),
+                    hops(
+                        decoded
+                            .client_chains
+                            .into_vec()
+                            .into_iter()
+                            .map(ClientGroupMember::into_chain)
+                    ),
                     expected
                 );
                 let decoded: DnsServerSpec =
@@ -328,6 +340,38 @@ fn group_chain_fields_reject_duplicates_conflicts_and_empty_values() {
                 .is_err()
             );
         }
+    }
+}
+
+#[test]
+fn owned_group_members_preserve_programmatic_chain_shapes() {
+    let selection = ConfigSelection::Config(create_test_client_config());
+    let single = ClientChainHop::Single(selection.clone());
+    let pool = ClientChainHop::Pool(OneOrSome::Some(vec![selection.clone(), selection.clone()]));
+    let choice = crate::config::composition::pool_choice(vec![ClientChain {
+        hops: OneOrSome::One(single.clone()),
+    }]);
+    for hops in [
+        OneOrSome::One(single.clone()),
+        OneOrSome::Some(vec![single.clone()]),
+        OneOrSome::One(pool.clone()),
+        OneOrSome::Some(vec![pool, single]),
+        OneOrSome::One(choice),
+    ] {
+        for name in [None, Some("named".to_owned())] {
+            let chain = ClientChain { hops: hops.clone() };
+            let expected = serde_json::to_value(&chain).unwrap();
+            let actual = ClientGroupMember::Chain { name, chain }.into_chain();
+            assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+        }
+    }
+    for selection in [selection, ConfigSelection::GroupName("group".into())] {
+        let expected = serde_json::to_value(&selection).unwrap();
+        let chain = ClientGroupMember::Client(selection).into_chain();
+        let OneOrSome::One(ClientChainHop::Single(client)) = chain.hops else {
+            panic!("client members must remain single hops")
+        };
+        assert_eq!(serde_json::to_value(client).unwrap(), expected);
     }
 }
 
