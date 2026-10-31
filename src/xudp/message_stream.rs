@@ -204,6 +204,12 @@ impl XudpMessageStream {
 
             let metadata_len =
                 u16::from_be_bytes([self.read_buffer[0], self.read_buffer[1]]) as usize;
+            if !(4..=512).contains(&metadata_len) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "XUDP metadata length outside 4..=512",
+                ));
+            }
 
             // Check if we have complete metadata
             if self.read_buffer.len() < 2 + metadata_len {
@@ -212,13 +218,6 @@ impl XudpMessageStream {
             }
 
             // Peek at metadata to check if frame has data
-            if metadata_len < 4 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("metadata too short: {}", metadata_len),
-                ));
-            }
-
             let option_byte = self.read_buffer[2 + 3];
             let has_data = option_byte & FrameOption::DATA != 0;
             let data_len_offset = 2 + metadata_len;

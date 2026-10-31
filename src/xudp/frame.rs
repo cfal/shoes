@@ -183,6 +183,12 @@ impl FrameMetadata {
         }
 
         let metadata_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        if !(4..=512).contains(&metadata_len) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "XUDP metadata length outside 4..=512",
+            ));
+        }
         log::debug!(
             "[XUDP DECODE] metadata_len={}, buf.len()={}, need={}",
             metadata_len,
@@ -199,25 +205,12 @@ impl FrameMetadata {
         // Skip length field
         buf.advance(2);
 
-        if metadata_len < 4 {
-            log::error!(
-                "[XUDP DECODE] Metadata too short: {} (buffer was {} bytes, first 8 bytes: {:?})",
-                metadata_len,
-                buf.len() + 2,
-                &buf[..std::cmp::min(8, buf.len())]
-            );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("metadata too short: {}", metadata_len),
-            ));
-        }
+        // Address parsing must not consume payload or a coalesced next frame.
+        let mut metadata = buf.split_to(metadata_len);
 
-        // Track how many metadata bytes we consume
-        let metadata_start = buf.len();
-
-        let session_id = buf.get_u16();
-        let status = SessionStatus::try_from(buf.get_u8())?;
-        let option = FrameOption::from(buf.get_u8());
+        let session_id = metadata.get_u16();
+        let status = SessionStatus::try_from(metadata.get_u8())?;
+        let option = FrameOption::from(metadata.get_u8());
 
         let mut network = None;
         let mut target = None;
@@ -229,25 +222,30 @@ impl FrameMetadata {
         // Check remaining_metadata > 0 to know if there's address data
         if remaining_metadata > 0
             && (status == SessionStatus::New
-                || (status == SessionStatus::Keep && buf.remaining() > 0 && buf[0] == 0x02))
+                || (status == SessionStatus::Keep && metadata[0] == 0x02))
         {
-            let net_byte = buf.get_u8();
+            let net_byte = metadata.get_u8();
             network = Some(TargetNetwork::try_from(net_byte)?);
 
-            let port = buf.get_u16();
-            let address = decode_address(buf)?;
+            if metadata.remaining() < 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated XUDP destination port",
+                ));
+            }
+            let port = metadata.get_u16();
+            let address = decode_address(&mut metadata)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             target = Some(NetLocation::new(address, port));
         }
 
         // Consume any remaining metadata bytes we didn't parse
-        let consumed = metadata_start - buf.len();
-        let unconsumed = metadata_len.saturating_sub(consumed);
+        let unconsumed = metadata.len();
         if unconsumed > 0 {
             log::debug!(
                 "[XUDP DECODE] Skipping {} unconsumed metadata bytes (GlobalID or padding)",
                 unconsumed
             );
-            buf.advance(unconsumed);
         }
 
         Ok(Some(FrameMetadata {
