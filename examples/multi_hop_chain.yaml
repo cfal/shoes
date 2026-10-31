@@ -116,8 +116,8 @@
         - chain:
             - us-proxies
             - exit-proxy
-        # Chain 2: Single hop (no chain: needed for one hop)
-        - eu-proxies
+        # Chain 2: Single hop
+        - chain: [eu-proxies]
 
 #
 # Example 5: Pool at a hop - alternate between groups and inline proxies
