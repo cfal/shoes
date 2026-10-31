@@ -14,7 +14,7 @@ use crate::rustls_connection_util::feed_rustls_client_connection;
 use crate::shadow_tls::shadow_tls_hmac::ShadowTlsHmac;
 use crate::shadow_tls::shadow_tls_stream::ShadowTlsStream;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::tcp::tcp_handler::{ClientTransport, TcpClientHandler, TcpClientSetupResult};
 use crate::util::{allocate_vec, write_all};
 
 use super::shadow_tls_server_handler::parse_validated_server_hello;
@@ -195,6 +195,28 @@ impl ShadowTlsClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for ShadowTlsClientHandler {
+    fn has_session_pool(&self) -> bool {
+        self.handler.has_session_pool()
+    }
+
+    async fn connect_client_tcp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let transport = transport.wrap(|stream| self.setup_client_stream_common(stream));
+        self.handler.connect_client_tcp(transport, target).await
+    }
+
+    async fn connect_client_udp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        let transport = transport.wrap(|stream| self.setup_client_stream_common(stream));
+        self.handler.connect_client_udp(transport, target).await
+    }
+
     async fn prepare_target(
         &self,
         target: ResolvedLocation,

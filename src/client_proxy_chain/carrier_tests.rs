@@ -499,6 +499,43 @@ async fn pinned_later_endpoint_does_not_replace_the_same_directly_dialed_hostnam
 }
 
 #[test]
+fn pooled_prefix_keys_include_each_selected_connector_identity() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let proxy = || -> Box<dyn ProxyConnector> {
+        Box::new(Proxy {
+            location: NetLocation::from_str("same.test:443", None).unwrap(),
+            lazy: true,
+            early_data: None,
+            calls: calls.clone(),
+        })
+    };
+    let chain = ClientProxyChain::new(
+        vec![
+            InitialHopEntry::Direct(Arc::new(Socket(0, calls.clone()))),
+            InitialHopEntry::Direct(Arc::new(Socket(1, calls.clone()))),
+        ],
+        vec![vec![proxy(), proxy()], vec![proxy()]],
+    );
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let mut keys = std::collections::HashSet::new();
+    for indices in [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0]] {
+        let key = || {
+            chain
+                .selected_route(&resolver, &indices)
+                .prefix(NetLocation::from_str("same.test:443", None).unwrap().into())
+                .route_key()
+                .clone()
+        };
+        let first = key();
+        assert_eq!(first, key());
+        assert!(
+            keys.insert(first),
+            "different prefix collapsed: {indices:?}"
+        );
+    }
+}
+
+#[test]
 fn pooled_prefix_does_not_retain_its_own_proxy() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let chain = ClientProxyChain::new(
