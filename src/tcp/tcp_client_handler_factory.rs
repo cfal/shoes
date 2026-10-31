@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use log::debug;
 
+use crate::address::NetLocation;
 use crate::anytls::{AnyTlsClientHandler, PaddingFactory};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::{
@@ -42,6 +43,39 @@ fn create_auth_credentials(
 
 pub fn create_tcp_client_handler(
     client_proxy_config: ClientProxyConfig,
+    hop_location: Option<NetLocation>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<Box<dyn TcpClientHandler>> {
+    let default_sni_hostname = hop_location
+        .as_ref()
+        .and_then(|location| location.address().hostname())
+        .map(str::to_owned);
+    create_with_hop_context(
+        client_proxy_config,
+        hop_location,
+        default_sni_hostname,
+        resolver,
+    )
+}
+
+pub(crate) fn tls_verification_name(
+    sni: Option<String>,
+    hop: Option<&NetLocation>,
+) -> std::io::Result<rustls::pki_types::ServerName<'static>> {
+    let identity = sni
+        .or_else(|| hop.map(|location| location.address().to_string()))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TLS requires a verification identity",
+            )
+        })?;
+    rustls::pki_types::ServerName::try_from(identity).map_err(std::io::Error::other)
+}
+
+fn create_with_hop_context(
+    client_proxy_config: ClientProxyConfig,
+    hop_location: Option<NetLocation>,
     default_sni_hostname: Option<String>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Box<dyn TcpClientHandler>> {
@@ -56,7 +90,12 @@ pub fn create_tcp_client_handler(
             let prepared = config.prepare()?;
             Box::new(crate::sudoku_mask::handler::ClientHandler {
                 config: prepared,
-                inner: create_tcp_client_handler(*config.protocol, default_sni_hostname, resolver)?,
+                inner: create_with_hop_context(
+                    *config.protocol,
+                    hop_location,
+                    default_sni_hostname,
+                    resolver,
+                )?,
             })
         }
         ClientProxyConfig::Xhttp(_) => {
@@ -225,14 +264,7 @@ pub fn create_tcp_client_handler(
                 &key_exchange_groups,
             )?);
 
-            let server_name = match sni_hostname {
-                Some(s) => {
-                    rustls::pki_types::ServerName::try_from(s).map_err(std::io::Error::other)?
-                }
-                // This is unused, since enable_sni is false, but connect_with still requires a
-                // parameter.
-                None => "example.com".try_into().unwrap(),
-            };
+            let server_name = tls_verification_name(sni_hostname, hop_location.as_ref())?;
 
             if vision {
                 let ClientProxyConfig::Vless {
@@ -255,7 +287,8 @@ pub fn create_tcp_client_handler(
                     *udp_enabled,
                 ))
             } else {
-                let handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
+                let handler =
+                    create_with_hop_context(*protocol, hop_location, None, resolver.clone())?;
 
                 Box::new(TlsClientHandler::new(
                     client_config,
@@ -317,7 +350,8 @@ pub fn create_tcp_client_handler(
                     .with_mldsa65_verify(mldsa65_verify),
                 )
             } else {
-                let inner_handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
+                let inner_handler =
+                    create_with_hop_context(*protocol, hop_location, None, resolver.clone())?;
                 Box::new(
                     RealityClientHandler::new(
                         public_key_bytes,
@@ -360,7 +394,7 @@ pub fn create_tcp_client_handler(
                 &Default::default(),
             )?);
 
-            let handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
+            let handler = create_with_hop_context(*protocol, hop_location, None, resolver.clone())?;
 
             Box::new(ShadowTlsClientHandler::new(
                 password,
@@ -394,6 +428,15 @@ pub fn create_tcp_client_handler(
                 websocket_client_config.early_data_header_name.as_deref(),
                 false,
             )?;
+            let authority = hop_location
+                .as_ref()
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "WebSocket requires a hop authority",
+                    )
+                })?;
             let WebsocketClientConfig {
                 matching_path,
                 matching_headers,
@@ -403,10 +446,11 @@ pub fn create_tcp_client_handler(
                 protocol,
             } = websocket_client_config;
 
-            let handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
+            let handler = create_with_hop_context(*protocol, hop_location, None, resolver.clone())?;
 
             Box::new(
                 WebsocketTcpClientHandler::new(
+                    authority,
                     matching_path,
                     matching_headers.map(|h| h.into_iter().collect()),
                     ping_type,

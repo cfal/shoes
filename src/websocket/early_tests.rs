@@ -14,6 +14,7 @@ use crate::client_proxy_selector::ClientProxySelector;
 
 fn handshake_options(max: usize, header: Option<&str>) -> Arc<ClientHandshake> {
     Arc::new(ClientHandshake {
+        authority: "example.test:80".into(),
         matching_path: Some("/ws".into()),
         matching_headers: Some(FxHashMap::from_iter([(
             "Host".into(),

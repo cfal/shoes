@@ -165,10 +165,10 @@ pub(crate) fn build_with_limits(
                 false,
                 &tls.key_exchange_groups,
             )?;
-            let name = rustls::pki_types::ServerName::try_from(
-                sni.clone().unwrap_or_else(|| "example.com".into()),
-            )
-            .map_err(io::Error::other)?;
+            let name = crate::tcp::tcp_client_handler_factory::tls_verification_name(
+                sni.clone(),
+                Some(&config.address),
+            )?;
             (
                 xhttp,
                 sni,
@@ -198,7 +198,7 @@ pub(crate) fn build_with_limits(
             let sni = sni_hostname.clone().or(default_sni.clone());
             let handler = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
                 outer,
-                default_sni,
+                Some(config.address.clone()),
                 resolver.clone(),
             )?;
             if !matches!(xhttp.http_version, XhttpVersion::Auto | XhttpVersion::H2) {
@@ -266,7 +266,7 @@ pub(crate) fn build_with_limits(
     }
     let inner = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
         *xhttp.protocol.clone(),
-        None,
+        Some(config.address.clone()),
         resolver,
     )?;
     let client = Client::new(

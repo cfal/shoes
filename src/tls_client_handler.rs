@@ -172,6 +172,108 @@ impl TcpClientHandler for TlsClientHandler {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn verification_uses_hop_identity_even_without_wire_sni() {
+        use crate::address::NetLocation;
+        use crate::tcp::tcp_client_handler_factory::tls_verification_name;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Debug)]
+        struct CaptureName {
+            inner: Arc<dyn rustls::server::ResolvesServerCert>,
+            names: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        }
+        impl rustls::server::ResolvesServerCert for CaptureName {
+            fn resolve(
+                &self,
+                hello: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                self.names
+                    .lock()
+                    .unwrap()
+                    .push(hello.server_name().map(str::to_owned));
+                self.inner.resolve(hello)
+            }
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for (hop, sni, expected) in [
+                ("localhost:443", None, "localhost"),
+                ("127.0.0.1:443", None, "127.0.0.1"),
+                ("[::1]:443", None, "::1"),
+                ("localhost:443", Some("override.test"), "override.test"),
+                ("localhost:443", Some("localhost"), "localhost"),
+            ] {
+                for correct in [true, false] {
+                    let certificate_name = if correct { expected } else { "wrong.test" };
+                    let cert =
+                        rcgen::generate_simple_self_signed(vec![certificate_name.into()]).unwrap();
+                    let mut roots = rustls::RootCertStore::empty();
+                    roots.add(cert.cert.der().clone()).unwrap();
+                    let mut client = rustls::ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth();
+                    client.enable_sni = sni.is_some();
+                    let mut server = rustls::ServerConfig::builder()
+                        .with_no_client_auth()
+                        .with_single_cert(
+                            vec![cert.cert.der().clone()],
+                            rustls::pki_types::PrivatePkcs8KeyDer::from(
+                                cert.signing_key.serialize_der(),
+                            )
+                            .into(),
+                        )
+                        .unwrap();
+                    let names = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    server.cert_resolver = Arc::new(CaptureName {
+                        inner: server.cert_resolver,
+                        names: names.clone(),
+                    });
+                    let hop = NetLocation::from_str(hop, None).unwrap();
+                    let handler = TlsClientHandler::new(
+                        Arc::new(client),
+                        None,
+                        tls_verification_name(sni.map(str::to_owned), Some(&hop)).unwrap(),
+                        Box::new(crate::port_forward_handler::PortForwardClientHandler),
+                    );
+                    let (io, peer) = tokio::io::duplex(65536);
+                    let server_task = tokio::spawn(async move {
+                        let conn = TlsConnection::new(
+                            rustls::ServerConnection::new(Arc::new(server)).unwrap(),
+                        );
+                        let Ok(mut stream) =
+                            CryptoTlsStream::handshake(peer, conn, TlsReadMode::Stream, &[]).await
+                        else {
+                            return false;
+                        };
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).await.unwrap();
+                        assert_eq!(byte, [42]);
+                        true
+                    });
+                    let result = handler
+                        .setup_client_tcp_stream(
+                            Box::new(io),
+                            NetLocation::from_str("not-the-certificate.test:80", None)
+                                .unwrap()
+                                .into(),
+                        )
+                        .await;
+                    assert_eq!(result.is_ok(), correct, "hop {hop}, SNI {sni:?}");
+                    let mut result = result.ok();
+                    if let Some(result) = &mut result {
+                        result.client_stream.write_all(&[42]).await.unwrap();
+                        result.client_stream.flush().await.unwrap();
+                    }
+                    assert_eq!(server_task.await.unwrap(), correct);
+                    assert_eq!(*names.lock().unwrap(), vec![sni.map(str::to_owned)]);
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[derive(Debug)]
     struct RejectReuse;
 
@@ -244,6 +346,7 @@ mod tests {
         }
         let wrappers: Vec<Box<dyn TcpClientHandler>> = vec![
             Box::new(crate::websocket::WebsocketTcpClientHandler::new(
+                "localhost:443".into(),
                 None,
                 None,
                 Default::default(),

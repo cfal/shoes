@@ -281,7 +281,7 @@ fn sudoku_mask_preserves_sni_and_existing_immediate_child_constraints() {
     let resolver = std::sync::Arc::new(crate::resolver::NativeResolver::new());
     crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
         reality,
-        Some("origin.example".into()),
+        Some(crate::address::NetLocation::from_str("origin.example:443", None).unwrap()),
         resolver,
     )
     .unwrap();
