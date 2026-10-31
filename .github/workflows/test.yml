@@ -141,6 +141,23 @@ jobs:
     - name: Run local tests
       run: cargo test --workspace --locked --lib --bins --verbose
 
+    - uses: actions/setup-go@v7
+      with:
+        go-version: '1.27.3'
+        cache: false
+
+    - name: Build pinned AnyTLS reference peer
+      working-directory: tests/fixtures/anytls-peer
+      run: GOMAXPROCS=1 go build -mod=readonly -p 1 -o "$RUNNER_TEMP/shoes-anytls-peer" .
+
+    - name: Test AnyTLS pooling against the reference peer
+      env:
+        ANYTLS_REFERENCE_PEER: ${{ runner.temp }}/shoes-anytls-peer
+        CARGO_BUILD_JOBS: 1
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --lib
+        reference_peer_tcp_uot_and_concurrent_session_reuse -- --ignored
+
     - name: Run process contract tests
       run: cargo test -p shoes --locked --test process_contract --verbose -- --test-threads=1
 
