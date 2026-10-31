@@ -11,6 +11,8 @@ env:
   RUST_BACKTRACE: 1
   SING_BOX_VERSION: 1.14.1
   SING_BOX_SHA256: 12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f
+  ANYTLS_SING_BOX_VERSION: 1.15.0-alpha.13
+  ANYTLS_SING_BOX_SHA256: bfc39f643a5ecc1b702c5723ff662e61dde813f12b3af0d0cfce4f629ff74047
   MIHOMO_VERSION: 1.19.31
   MIHOMO_SHA256: 04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
   XRAY_VERSION: 26.10.29
@@ -319,6 +321,19 @@ jobs:
         binary="$RUNNER_TEMP/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box"
         chmod +x "$binary"
         echo "SHOES_TEST_SING_BOX_BIN=$binary" >> "$GITHUB_ENV"
+
+    - name: Install sing-box AnyTLS padding test peer
+      if: matrix.target == 'optional_peer'
+      run: |
+        archive="$RUNNER_TEMP/sing-box-anytls.tar.gz"
+        curl --fail --location --retry 3 \
+          --output "$archive" \
+          "https://github.com/SagerNet/sing-box/releases/download/v${ANYTLS_SING_BOX_VERSION}/sing-box-${ANYTLS_SING_BOX_VERSION}-linux-amd64.tar.gz"
+        echo "${ANYTLS_SING_BOX_SHA256}  ${archive}" | sha256sum --check --strict
+        tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+        binary="$RUNNER_TEMP/sing-box-${ANYTLS_SING_BOX_VERSION}-linux-amd64/sing-box"
+        chmod +x "$binary"
+        echo "SHOES_TEST_ANYTLS_SING_BOX_BIN=$binary" >> "$GITHUB_ENV"
 
     - name: Install Mihomo test peer
       if: matrix.peer == 'mihomo'

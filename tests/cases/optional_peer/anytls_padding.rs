@@ -4,7 +4,7 @@ use serde_json::json;
 use shoes_test_support::{
     certs::generate_test_cert_files,
     port_helper::PortHelper,
-    test_fixture::{start_shoes_server, start_singbox_server},
+    test_fixture::{find_singbox_binary, start_shoes_server, start_singbox_server_with_binary},
     test_servers::start_tcp_stream_echo_server,
 };
 
@@ -12,6 +12,10 @@ use shoes_test_support::{
 async fn large_server_scheme_interoperates_in_both_directions()
 -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::timeout(Duration::from_secs(30), async {
+        let sing_binary = match std::env::var_os("SHOES_TEST_ANYTLS_SING_BOX_BIN") {
+            Some(path) => path.into(),
+            None => find_singbox_binary()?,
+        };
         let (cert, key) = generate_test_cert_files()?;
         let cert: &Path = cert.as_ref();
         let key: &Path = key.as_ref();
@@ -49,7 +53,7 @@ async fn large_server_scheme_interoperates_in_both_directions()
                 }))
             };
             let _shoes = start_shoes_server(&serde_yaml::to_string(&shoes)?)?;
-            let _sing = start_singbox_server(&sing.to_string())?;
+            let _sing = start_singbox_server_with_binary(&sing.to_string(), &sing_binary, &[("GOMAXPROCS", "1")])?;
             ports.wait_for_all_ports().await?;
             for _ in 0..3 {
                 super::tls_hybrid::echo_through_http(client, echo.local_addr().port()).await?;
