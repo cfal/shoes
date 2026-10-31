@@ -135,6 +135,7 @@ impl<P> SudokuMaskConfig<P> {
         let padding_max = self.padding_max.min(100).max(padding_min.into()) as u8;
         Ok(Arc::new(Prepared {
             mapping: Mapping::new(&self.password.0),
+            classic_alphabet: layout::ClassicAlphabet::for_layouts(&layouts),
             layouts,
             padding_min,
             padding_max,
@@ -173,6 +174,7 @@ impl<P> SudokuMaskConfig<P> {
 pub(crate) struct Prepared {
     mapping: Mapping,
     layouts: Vec<Layout>,
+    classic_alphabet: Option<layout::ClassicAlphabet>,
     padding_min: u8,
     padding_max: u8,
 }
@@ -209,6 +211,48 @@ mod tests {
             .unwrap()
             .prepare()
             .unwrap()
+    }
+
+    #[test]
+    fn classic_cache_selection_uses_normalized_layouts_and_shares_tables() {
+        use layout::ClassicAlphabet::{Ascii, Entropy};
+
+        for (options, expected) in [
+            (json!({}), Some(Entropy)),
+            (json!({"ascii": " PREFER_ENTROPY "}), Some(Entropy)),
+            (json!({"custom_tables": ["", " "]}), Some(Entropy)),
+            (
+                json!({"ascii": "ASCII", "custom_table": "ignored"}),
+                Some(Ascii),
+            ),
+            (json!({"ascii": " prefer_ascii "}), Some(Ascii)),
+            (json!({"custom_table": "xpxvvpvv"}), None),
+            (json!({"custom_tables": ["", "xpxvvpvv"]}), None),
+            (json!({"custom_tables": ["xpxvvpvv", "vxpvxvvp", ""]}), None),
+        ] {
+            let first = config(options.clone());
+            assert_eq!(first.classic_alphabet, expected);
+            if let Some(alphabet) = expected {
+                let tuples = alphabet.tuples();
+                let mut replacement = options;
+                replacement["password"] = json!("new-password");
+                replacement["padding_min"] = json!(10);
+                replacement["padding_max"] = json!(100);
+                let second = config(replacement);
+                assert!(std::ptr::eq(
+                    tuples,
+                    second.classic_alphabet.unwrap().tuples()
+                ));
+                assert_eq!(tuples.len(), 25_728);
+                for (tuple, hints) in tuples.iter().zip(&table::core().tuples) {
+                    assert_eq!(
+                        *tuple,
+                        hints.map(|hint| first.layouts[0].encode[hint as usize])
+                    );
+                }
+            }
+        }
+        assert!(!std::ptr::eq(Entropy.tuples(), Ascii.tuples()));
     }
 
     #[test]
