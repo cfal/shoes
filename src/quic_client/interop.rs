@@ -43,6 +43,9 @@ async fn peer(
     if kind == "tuic" {
         config["inbounds"][1]["users"][0]["uuid"] = protocol["uuid"].clone();
     }
+    if let Some(obfs) = protocol.get("obfs") {
+        config["inbounds"][1]["obfs"] = obfs.clone();
+    }
     let (process, file) =
         shoes_test_support::process::start_singbox_server(&config.to_string()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -176,4 +179,14 @@ async fn tuic_sing_box_tcp_and_both_udp_modes() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn hysteria2_sing_box_salamander() {
+    exercise(
+        json!({"type": "hysteria2", "password": "test-password",
+        "obfs": {"type": "salamander", "password": "obfs-password"}}),
+        "hysteria2",
+    )
+    .await;
 }

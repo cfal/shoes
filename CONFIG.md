@@ -1228,6 +1228,12 @@ Congestion control is adaptive (Quinn's default CUBIC), with unknown receive
 bandwidth advertised as zero. Brutal and fixed-bandwidth negotiation are not
 implemented; `up_mbps`, `down_mbps`, and 0-RTT options are rejected.
 
+Optional `obfs: {type: salamander, password: your-obfs-password}` wraps QUIC
+datagrams with Salamander obfuscation (minimum four password bytes). The peer
+must use the same setting. It adds eight bytes per wire datagram; the minimum
+path UDP payload is therefore 1208 bytes. Shoes' Hysteria2 server does not yet
+implement this option.
+
 ### TUIC Client
 
 ```yaml

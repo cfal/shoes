@@ -16,6 +16,8 @@ impl fmt::Debug for Secret {
 #[serde(deny_unknown_fields)]
 pub struct Hysteria2ClientConfig {
     pub password: Secret,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obfs: Option<Obfuscation>,
     #[serde(default = "super::common::default_true")]
     pub udp_enabled: bool,
 }
@@ -24,7 +26,31 @@ impl Hysteria2ClientConfig {
     pub fn validate(&self) -> io::Result<()> {
         http::HeaderValue::from_str(&self.password.0)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid HY2 auth header"))?;
+        if self
+            .obfs
+            .as_ref()
+            .is_some_and(|obfs| obfs.password().0.len() < 4)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Salamander password must contain at least 4 bytes",
+            ));
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum Obfuscation {
+    Salamander { password: Secret },
+}
+
+impl Obfuscation {
+    pub fn password(&self) -> &Secret {
+        match self {
+            Self::Salamander { password } => password,
+        }
     }
 }
 

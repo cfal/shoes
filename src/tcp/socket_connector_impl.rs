@@ -12,6 +12,7 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use log::{debug, error};
+use quinn::Runtime;
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
@@ -223,6 +224,10 @@ impl SocketConnectorImpl {
 
                 let is_xhttp = crate::xhttp::connector::contains(&config.protocol);
                 let is_native = config.protocol.is_native_quic();
+                let obfs = match &config.protocol {
+                    crate::config::ClientProxyConfig::Hysteria2(config) => config.obfs.clone(),
+                    _ => None,
+                };
                 let is_tuic = matches!(config.protocol, crate::config::ClientProxyConfig::Tuic(_));
                 let alpn_protocols = if (is_xhttp || is_native) && alpn_protocols.is_unspecified() {
                     vec!["h3".to_owned()]
@@ -272,6 +277,11 @@ impl SocketConnectorImpl {
                         .datagram_receive_buffer_size(None)
                         .datagram_send_buffer_size(0);
                 }
+                if obfs.is_some() {
+                    let mut mtu = quinn::MtuDiscoveryConfig::default();
+                    mtu.upper_bound(1452 - crate::quic_client::salamander::OVERHEAD);
+                    transport_config.mtu_discovery_config(Some(mtu));
+                }
 
                 quinn_client_config.transport_config(Arc::new(transport_config));
 
@@ -294,7 +304,15 @@ impl SocketConnectorImpl {
                         limits.quic_socket_buffer,
                     );
 
-                    let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes)?;
+                    let mut socket = quinn::TokioRuntime.wrap_udp_socket(udp_socket)?;
+                    if let Some(obfs) = &obfs {
+                        socket = crate::quic_client::salamander::Salamander::wrap(
+                            socket,
+                            obfs.password().clone(),
+                        );
+                    }
+                    let mut endpoint =
+                        QuicEndpoint::with_abstract_socket(None, socket, memory_bytes, None)?;
                     endpoint.set_default_client_config(quinn_client_config.clone());
                     endpoints.push(Arc::new(endpoint));
                 }

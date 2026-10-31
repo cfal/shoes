@@ -187,6 +187,7 @@ tokio-util = { version = "*", features = ["time", "io", "rt"] }
 tun = { version = "*", features = ["async"] }
 url = "*"
 uuid = "1"
+blake2 = "0.10"
 webpki-roots = { version = "*" }
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
 zeroize = "*"

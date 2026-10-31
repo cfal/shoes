@@ -2902,6 +2902,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "base64 0.23.1",
+ "blake2",
  "blake3",
  "bytes",
  "chrono",

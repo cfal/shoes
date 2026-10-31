@@ -97,6 +97,20 @@ impl QuicEndpoint {
         memory_bytes: usize,
         release: Option<oneshot::Sender<()>>,
     ) -> io::Result<Self> {
+        Self::with_abstract_socket(
+            config,
+            quinn::TokioRuntime.wrap_udp_socket(socket)?,
+            memory_bytes,
+            release,
+        )
+    }
+
+    pub(crate) fn with_abstract_socket(
+        config: Option<quinn::ServerConfig>,
+        socket: Arc<dyn AsyncUdpSocket>,
+        memory_bytes: usize,
+        release: Option<oneshot::Sender<()>>,
+    ) -> io::Result<Self> {
         let (runtime, retirement): (Arc<dyn Runtime>, _) = if release.is_some() {
             let retired = CancellationToken::new();
             let runtime = ListenerRuntime {
@@ -108,7 +122,7 @@ impl QuicEndpoint {
             (Arc::new(quinn::TokioRuntime), None)
         };
         let socket = MemorySocket {
-            inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
+            inner: socket,
             endpoint_memory: None,
             _release: release,
         };

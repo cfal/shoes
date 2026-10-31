@@ -203,6 +203,7 @@ mod tests {
     fn protocol() -> Protocol {
         Protocol::Hysteria2(Hysteria2ClientConfig {
             password: Secret("test".into()),
+            obfs: None,
             udp_enabled: true,
         })
     }

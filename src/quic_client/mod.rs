@@ -1,6 +1,7 @@
 mod hysteria2;
 #[cfg(all(test, feature = "optional-peer-tests"))]
 mod interop;
+pub(crate) mod salamander;
 mod session;
 mod tuic;
 mod udp;
