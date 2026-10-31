@@ -14,27 +14,17 @@ pub(crate) struct EventFilter {
 }
 
 impl EventFilter {
-    fn seed(&self, files: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    fn seed(&self, files: &HashSet<PathBuf>) {
         let mut stamps = self.stamps.lock();
-        let mut added = Vec::new();
         for path in files {
-            if let std::collections::hash_map::Entry::Vacant(entry) = stamps.entry(path.clone()) {
-                entry.insert(FileStamp::read(path));
-                added.push(path.clone());
-            }
+            stamps
+                .entry(path.clone())
+                .or_insert_with(|| FileStamp::read(path));
         }
-        added
     }
 
-    fn registered(&self, files: &HashSet<PathBuf>, added: Vec<PathBuf>, succeeded: bool) {
-        let mut stamps = self.stamps.lock();
-        if succeeded {
-            stamps.retain(|path, _| files.contains(path));
-        } else {
-            for path in added {
-                stamps.remove(&path);
-            }
-        }
+    fn registered(&self, files: &HashSet<PathBuf>) {
+        self.stamps.lock().retain(|path, _| files.contains(path));
     }
 
     fn notify<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>, tx: &mpsc::Sender<()>) {
@@ -166,6 +156,12 @@ pub(crate) fn watch_excluding<P: AsRef<Path>>(
         .filter(|path| path.is_file())
         .collect();
     files.extend(direct_files.iter().cloned());
+    // Preserve prior observations across rebuilds, including failed registrations:
+    // the caller may still read these paths before retrying the watch.
+    // Registration and watcher destruction must run without the callback's lock.
+    if let Some(filter) = filter {
+        filter.seed(&files);
+    }
     let files = Arc::new(files);
     let event_files = files.clone();
     let event_filter = filter.cloned();
@@ -193,19 +189,15 @@ pub(crate) fn watch_excluding<P: AsRef<Path>>(
             _ => {}
         })
         .map_err(io::Error::other)?;
-    // Preserve prior observations across rebuilds, including edits during bootstrap.
-    // Registration and watcher destruction must run without the callback's lock.
-    let added = filter.map_or_else(Vec::new, |filter| filter.seed(&files));
-    let result = register_paths(
+    register_paths(
         |path| watcher.watch(path, RecursiveMode::NonRecursive),
         &directories,
         &required_directories,
         &direct_files,
-    );
+    )?;
     if let Some(filter) = filter {
-        filter.registered(&files, added, result.is_ok());
+        filter.registered(&files);
     }
-    result?;
     Ok(watcher)
 }
 
@@ -402,17 +394,18 @@ mod tests {
         }
         let files = HashSet::from([first.clone(), second.clone()]);
         let filter = EventFilter::default();
-        let added = filter.seed(&files);
-        filter.registered(&files, added, true);
+        filter.seed(&files);
+        filter.registered(&files);
+        let before = filter.stamps.lock().clone();
         let (tx, mut changes) = mpsc::channel(1);
         filter.notify(files.iter(), &tx);
         assert!(changes.try_recv().is_err());
 
         std::fs::write(&first, "after").unwrap();
         std::fs::write(&second, "after").unwrap();
-        let added = filter.seed(&files);
-        assert!(added.is_empty());
-        filter.registered(&files, added, true);
+        filter.seed(&files);
+        filter.registered(&files);
+        assert_eq!(*filter.stamps.lock(), before);
         tx.try_send(()).unwrap();
         filter.notify(files.iter(), &tx);
         changes.try_recv().unwrap();
@@ -440,14 +433,20 @@ mod tests {
         filter.seed(&original);
         let before = filter.stamps.lock()[&first];
         let candidate = HashSet::from([second.clone()]);
-        let added = filter.seed(&candidate);
-        filter.registered(&candidate, added, false);
-        assert_eq!(filter.stamps.lock().len(), 1);
+        filter.seed(&candidate);
+        // A failed registration leaves the candidate read outside watcher coverage.
+        assert_eq!(filter.stamps.lock().len(), 2);
         assert_eq!(filter.stamps.lock()[&first], before);
 
-        let added = filter.seed(&candidate);
-        filter.registered(&candidate, added, true);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
+        std::fs::write(&second, "edited after the candidate read").unwrap();
+        filter.seed(&candidate);
+        filter.registered(&candidate);
         let (tx, mut changes) = mpsc::channel(1);
+        filter.notify(candidate.iter(), &tx);
+        changes
+            .try_recv()
+            .expect("the edit must survive a failed registration");
         filter.notify(original.iter(), &tx);
         changes.try_recv().unwrap();
         assert!(!filter.stamps.lock().contains_key(&first));
