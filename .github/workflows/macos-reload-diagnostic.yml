@@ -23,7 +23,12 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-tun-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Reproduce delayed native creation events
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi
+        diagnostic_late_creation_notifications -- --nocapture
     - name: Trace original remote-rule regressions
+      if: always()
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --test process_contract --features ffi
         remote_rules:: -- --test-threads=1 --nocapture

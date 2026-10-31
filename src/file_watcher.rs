@@ -257,6 +257,29 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn diagnostic_late_creation_notifications() {
+        let mut late = 0;
+        for _ in 0..64 {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.yaml");
+            std::fs::write(&path, "config").unwrap();
+            let before = diagnostic_stamp(&path);
+            let (tx, mut changes) = mpsc::channel(1);
+            let _watcher = watch(std::slice::from_ref(&path), tx).unwrap();
+            if tokio::time::timeout(Duration::from_millis(50), changes.recv())
+                .await
+                .is_ok()
+            {
+                assert_eq!(before, diagnostic_stamp(&path));
+                late += 1;
+            }
+        }
+        eprintln!("WATCH_DIAGNOSTIC late unchanged creation notifications: {late}/64");
+        assert!(late > 0, "no delayed native events reproduced");
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn stream_failure_is_fatal_for_every_registration_kind() {
         let directory = PathBuf::from("directory");
