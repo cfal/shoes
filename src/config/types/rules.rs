@@ -443,10 +443,6 @@ pub enum ClientChainHop {
     /// Round-robin pool of inline proxies and group references.
     /// Each listed alternative gets one turn; nested groups retain their own policy.
     Pool(OneOrSome<ConfigSelection<ClientConfig>>),
-
-    /// Resolved alternatives retain their policy boundary and complete paths.
-    /// Produced during validation; not accepted as input to `create_server_configs`.
-    Choice(Box<super::groups::ClientChoice>),
 }
 
 impl ClientChainHop {
@@ -551,7 +547,6 @@ impl serde::ser::Serialize for ClientChainHop {
         use serde::ser::SerializeMap;
 
         match self {
-            ClientChainHop::Choice(choice) => choice.serialize(serializer),
             ClientChainHop::Single(ConfigSelection::GroupName(name)) => {
                 serializer.serialize_str(name)
             }

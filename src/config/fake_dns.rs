@@ -4,23 +4,23 @@ use std::net::IpAddr;
 use ipnetwork::IpNetwork;
 
 use super::{
-    Config, ConfigSelection, RuleActionConfig, RuleConfig, ServerProxyConfig,
-    ShadowTlsServerHandshakeConfig, ValidatedConfigs,
+    ResolvedConfig, ResolvedRuleActionConfig, ResolvedRuleConfig, ResolvedServerProxyConfig,
+    ResolvedShadowTlsServerHandshakeConfig, ValidatedConfigs,
 };
 use crate::address::NetLocation;
 use crate::option_util::NoneOrSome;
 
-pub(crate) fn protects_tun_endpoints(configs: &[Config]) -> bool {
+pub(crate) fn protects_tun_endpoints(configs: &[ResolvedConfig]) -> bool {
     configs.iter().any(|config| {
-        matches!(config, Config::TunServer(tun) if tun.auto_route || tun.dns_hijack == Some(true))
+        matches!(config, ResolvedConfig::TunServer(tun) if tun.auto_route || tun.dns_hijack == Some(true))
     })
 }
 
-pub(crate) fn tun_endpoint_ips(configs: &[Config]) -> impl Iterator<Item = IpAddr> + '_ {
+pub(crate) fn tun_endpoint_ips(configs: &[ResolvedConfig]) -> impl Iterator<Item = IpAddr> + '_ {
     configs
         .iter()
         .filter_map(|config| match config {
-            Config::TunServer(tun) => Some(tun),
+            ResolvedConfig::TunServer(tun) => Some(tun),
             _ => None,
         })
         .flat_map(|tun| {
@@ -82,15 +82,9 @@ fn target(ranges: &[IpNetwork], location: &NetLocation, label: &str) -> io::Resu
     Ok(())
 }
 
-fn rules(ranges: &[IpNetwork], rules: &NoneOrSome<ConfigSelection<RuleConfig>>) -> io::Result<()> {
+fn rules(ranges: &[IpNetwork], rules: &NoneOrSome<ResolvedRuleConfig>) -> io::Result<()> {
     for rule in rules.iter() {
-        let ConfigSelection::Config(rule) = rule else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unexpanded fake DNS routing rules",
-            ));
-        };
-        if let RuleActionConfig::Allow {
+        if let ResolvedRuleActionConfig::Allow {
             override_address: Some(address),
             ..
         } = &rule.action
@@ -101,9 +95,9 @@ fn rules(ranges: &[IpNetwork], rules: &NoneOrSome<ConfigSelection<RuleConfig>>) 
     Ok(())
 }
 
-fn protocol(ranges: &[IpNetwork], config: &ServerProxyConfig) -> io::Result<()> {
+fn protocol(ranges: &[IpNetwork], config: &ResolvedServerProxyConfig) -> io::Result<()> {
     match config {
-        ServerProxyConfig::Tls {
+        ResolvedServerProxyConfig::Tls {
             tls_targets,
             default_tls_target,
             shadowtls_targets,
@@ -118,7 +112,8 @@ fn protocol(ranges: &[IpNetwork], config: &ServerProxyConfig) -> io::Result<()> 
                 protocol(ranges, &target.protocol)?;
             }
             for server in shadowtls_targets.values() {
-                if let ShadowTlsServerHandshakeConfig::Remote(handshake) = &server.handshake {
+                if let ResolvedShadowTlsServerHandshakeConfig::Remote(handshake) = &server.handshake
+                {
                     target(
                         ranges,
                         &handshake.address,
@@ -134,30 +129,34 @@ fn protocol(ranges: &[IpNetwork], config: &ServerProxyConfig) -> io::Result<()> 
                 protocol(ranges, &server.protocol)?;
             }
         }
-        ServerProxyConfig::Vless { fallback, .. } | ServerProxyConfig::Anytls { fallback, .. } => {
+        ResolvedServerProxyConfig::Vless { fallback, .. }
+        | ResolvedServerProxyConfig::Anytls { fallback, .. } => {
             if let Some(address) = fallback {
                 target(ranges, address, "authentication fallback destination")?;
             }
         }
-        ServerProxyConfig::PortForward { targets } => {
+        ResolvedServerProxyConfig::PortForward { targets } => {
             for address in targets.iter() {
                 target(ranges, address, "port-forward destination")?;
             }
         }
-        ServerProxyConfig::Websocket { targets } => {
+        ResolvedServerProxyConfig::Websocket { targets } => {
             for target in targets.iter() {
                 rules(ranges, &target.override_rules)?;
                 protocol(ranges, &target.protocol)?;
             }
         }
-        ServerProxyConfig::SudokuMask(config) => protocol(ranges, &config.protocol)?,
-        ServerProxyConfig::Xhttp(config) => protocol(ranges, &config.protocol)?,
+        ResolvedServerProxyConfig::SudokuMask(config) => protocol(ranges, &config.protocol)?,
+        ResolvedServerProxyConfig::Xhttp(config) => protocol(ranges, &config.protocol)?,
         _ => {}
     }
     Ok(())
 }
 
-pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
+pub(super) fn validate(
+    config: &mut ValidatedConfigs,
+    selection: Option<&crate::control::selection::SelectionView>,
+) -> io::Result<()> {
     let pool_ranges: Result<Vec<IpNetwork>, _> = config
         .dns_groups
         .iter()
@@ -174,11 +173,23 @@ pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
     let mut forbidden = pool_ranges;
     forbidden
         .extend(tun_endpoint_ips(&config.configs).map(|ip| IpNetwork::from(ip.to_canonical())));
-    config.validate_network_endpoints(&forbidden)
+    config.validate_network_endpoints_with_selection(&forbidden, selection)
 }
 
 impl ValidatedConfigs {
     pub(crate) fn validate_network_endpoints(&mut self, ranges: &[IpNetwork]) -> io::Result<()> {
+        let selection = self
+            .catalog
+            .as_ref()
+            .map(|catalog| catalog.selection.clone());
+        self.validate_network_endpoints_with_selection(ranges, selection.as_deref())
+    }
+
+    fn validate_network_endpoints_with_selection(
+        &mut self,
+        ranges: &[IpNetwork],
+        selection: Option<&crate::control::selection::SelectionView>,
+    ) -> io::Result<()> {
         for source in &self.remote_rules {
             let bootstrap = source
                 .download
@@ -204,13 +215,8 @@ impl ValidatedConfigs {
                 }
             }
         }
-        if let Some(catalog) = &self.catalog {
-            let urls = catalog
-                .selection
-                .automatic
-                .0
-                .values()
-                .map(|group| group.config.url.as_str());
+        if let Some(selection) = selection {
+            let urls = selection.automatic.0.values().map(|group| group.config.url.as_str());
             for url in urls {
                 let url = url::Url::parse(url).map_err(io::Error::other)?;
                 let ip = match url.host() {
@@ -225,17 +231,16 @@ impl ValidatedConfigs {
         }
         for config in &self.configs {
             match config {
-                Config::Server(server) => {
+                ResolvedConfig::Server(server) => {
                     rules(ranges, &server.rules)?;
                     protocol(ranges, &server.protocol)?;
                 }
-                Config::TunServer(tun) => {
+                ResolvedConfig::TunServer(tun) => {
                     rules(ranges, &tun.rules)?;
                     for endpoint in &tun.bootstrap_dns {
                         reject(ranges, endpoint.ip(), "managed bootstrap endpoint")?;
                     }
                 }
-                _ => {}
             }
         }
         for group in &self.dns_groups {
@@ -274,7 +279,6 @@ impl ValidatedConfigs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DnsConfig;
 
     fn validate_yaml(yaml: &str) -> io::Result<ValidatedConfigs> {
         super::super::create_server_configs(serde_yaml::from_str(yaml).map_err(io::Error::other)?)
@@ -347,7 +351,7 @@ mod tests {
 
     #[test]
     fn tun_endpoint_iteration_preserves_order_duplicates_and_address_form() {
-        let configs = serde_yaml::from_str::<Vec<Config>>(
+        let configs = crate::config::test_support::from_yaml::<Vec<ResolvedConfig>>(
             r#"
 - device_name: first
   address: '::ffff:198.18.0.1'
@@ -471,7 +475,7 @@ mod tests {
                     "- path: '{path}'\n  protocol: {{type: http}}\n  dns: {{fake_ip: {fake_ip}}}\n"
                 ))
                 .unwrap();
-                let Config::Server(server) = &configs.configs[0] else {
+                let ResolvedConfig::Server(server) = &configs.configs[0] else {
                     panic!()
                 };
                 let group = server.dns.as_ref().unwrap().resolved_group().unwrap();
@@ -486,7 +490,7 @@ mod tests {
                 "- device_name: 'tun://edge'\n  device_fd: 42\n  dns: {{fake_ip: {fake_ip}}}\n"
             ))
             .unwrap();
-            let Config::TunServer(tun) = &configs.configs[0] else {
+            let ResolvedConfig::TunServer(tun) = &configs.configs[0] else {
                 panic!()
             };
             let group = tun.dns.as_ref().unwrap().resolved_group().unwrap();
@@ -505,13 +509,13 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
-        let mut configs: Vec<Config> = serde_yaml::from_str(
+        let mut configs: Vec<crate::config::Config> = serde_yaml::from_str(
             "- path: /tmp/first.sock\n  protocol: {type: http}\n  dns: {fake_ip: true}\n\
              - path: /tmp/second.sock\n  protocol: {type: http}\n  dns: {fake_ip: true}\n",
         )
         .unwrap();
         for (config, byte) in configs.iter_mut().zip([0xfe, 0xff]) {
-            let Config::Server(server) = config else {
+            let crate::config::Config::Server(server) = config else {
                 panic!()
             };
             let mut path = b"/tmp/shoes-".to_vec();
@@ -528,10 +532,10 @@ mod tests {
     fn group_reference_shares_but_override_derives() {
         let configs = validate_yaml("- dns_group: shared\n  dns_servers: system\n  fake_ip: true\n- address: 127.0.0.1:1080\n  protocol: {type: socks}\n  dns: {servers: shared}\n- address: 127.0.0.1:1081\n  protocol: {type: socks}\n  dns: {servers: shared, fake_ip: false}\n").unwrap();
         assert_eq!(configs.dns_groups.len(), 2);
-        let Config::Server(first) = &configs.configs[0] else {
+        let ResolvedConfig::Server(first) = &configs.configs[0] else {
             panic!()
         };
-        let Config::Server(second) = &configs.configs[1] else {
+        let ResolvedConfig::Server(second) = &configs.configs[1] else {
             panic!()
         };
         assert_eq!(first.dns.as_ref().unwrap().resolved_group(), Some("shared"));
@@ -579,12 +583,15 @@ mod tests {
             "{fake_ip: true}",
             "{fake_ip: {ipv6_range: '2001:2::/48'}}",
         ] {
-            let config: DnsConfig = serde_yaml::from_str(text).unwrap();
-            let decoded: DnsConfig =
+            let config: crate::config::DnsConfig = serde_yaml::from_str(text).unwrap();
+            let decoded: crate::config::DnsConfig =
                 serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
             assert_eq!(config.fake_ip, decoded.fake_ip);
         }
-        assert!(serde_yaml::from_str::<DnsConfig>("{fake_ip: {surprise: true}}").is_err());
+        assert!(
+            serde_yaml::from_str::<crate::config::DnsConfig>("{fake_ip: {surprise: true}}")
+                .is_err()
+        );
     }
 
     #[test]

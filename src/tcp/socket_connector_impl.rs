@@ -1,7 +1,7 @@
 //! SocketConnectorImpl - Implementation of SocketConnector trait.
 //!
 //! Handles TCP and QUIC transports with bind_interface support.
-//! Created from the socket-related fields of any ClientConfig.
+//! Created from the socket-related fields of any ResolvedClientConfig.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -18,7 +18,7 @@ use tokio::net::UdpSocket;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
-use crate::config::{ClientConfig, ClientQuicConfig, Transport, quic_client::Obfuscation};
+use crate::config::{ResolvedClientConfig, ClientQuicConfig, Transport, quic_client::Obfuscation};
 use crate::quic_endpoint::QuicEndpoint;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
@@ -195,7 +195,7 @@ fn wrap_quic_socket(
 
 /// Implementation of SocketConnector for TCP and QUIC transports.
 ///
-/// Created from the socket-related fields of any ClientConfig:
+/// Created from the socket-related fields of any ResolvedClientConfig:
 /// - `bind_interface`
 /// - `transport`
 /// - `tcp_settings`
@@ -207,7 +207,7 @@ pub struct SocketConnectorImpl {
 }
 
 impl SocketConnectorImpl {
-    /// Create a SocketConnector from a ClientConfig's socket-related fields.
+    /// Create a SocketConnector from a ResolvedClientConfig's socket-related fields.
     ///
     /// # Arguments
     /// * `config` - The client config (socket fields are extracted)
@@ -218,14 +218,14 @@ impl SocketConnectorImpl {
     /// Returns any socket or QUIC endpoint initialization error.
     #[cfg(test)]
     pub fn from_config(
-        config: &ClientConfig,
+        config: &ResolvedClientConfig,
         target_address: Option<&NetLocation>,
     ) -> std::io::Result<Self> {
         Self::from_config_with_limits(config, target_address, crate::resources::limits())
     }
 
     pub fn from_config_with_limits(
-        config: &ClientConfig,
+        config: &ResolvedClientConfig,
         target_address: Option<&NetLocation>,
         limits: crate::config::GlobalLimits,
     ) -> std::io::Result<Self> {
@@ -938,7 +938,7 @@ mod tests {
                 vec![server_addr]
             };
             let resolver: Arc<dyn Resolver> = Arc::new(FixedResolver(addresses));
-            let config: ClientConfig = serde_yaml::from_str("address: 'localhost:443'\ntransport: quic\nquic_settings: {verify: false}\nprotocol: {type: socks}\n").unwrap();
+            let config: ResolvedClientConfig = crate::config::test_support::from_yaml("address: 'localhost:443'\ntransport: quic\nquic_settings: {verify: false}\nprotocol: {type: socks}\n").unwrap();
             let connector =
                 SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
             tokio::time::timeout(Duration::from_secs(3), async {
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_from_config_direct_protocol() {
-        let config = ClientConfig::default(); // default is direct protocol
+        let config = ResolvedClientConfig::default(); // default is direct protocol
         let connector = SocketConnectorImpl::from_config(&config, None);
         assert!(connector.is_ok());
         assert!(matches!(

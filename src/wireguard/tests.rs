@@ -732,7 +732,8 @@ async fn wireguard_copied_clients_share_a_connector_only_within_their_generation
     let mut references = 0;
     configs
         .visit_clients(&mut |client| {
-            if let ClientProxyConfig::Wireguard(reference) = &client.protocol {
+            if let crate::config::ResolvedClientProxyConfig::Wireguard(reference) = &client.protocol
+            {
                 assert!(Arc::ptr_eq(
                     reference.connector.as_ref().unwrap(),
                     &expected
@@ -1002,7 +1003,7 @@ async fn wireguard_outer_chain_requires_udp_before_starting() {
         assert!(error.to_string().contains("does not support UDP"));
         let mut configs = validate(&pair_config(51820)).unwrap();
         configs.wireguard_endpoints[CLIENT].peer_client_chain = Some(
-            serde_yaml::from_str(&format!(
+            crate::config::test_support::from_yaml(&format!(
                 "[{{address: '127.0.0.1:9', protocol: {protocol}}}]"
             ))
             .unwrap(),
@@ -1012,7 +1013,7 @@ async fn wireguard_outer_chain_requires_udp_before_starting() {
     }
     let mut configs = validate(&pair_config(51820)).unwrap();
     configs.wireguard_endpoints[CLIENT].peer_client_chain = Some(
-        serde_yaml::from_str(
+        crate::config::test_support::from_yaml(
             r#"
       - address: '127.0.0.1:9'
         protocol: {type: socks}
@@ -1100,19 +1101,17 @@ async fn wireguard_detoured_endpoint_keeps_encrypted_peers_separate() {
         other_server.id = "other-server".into();
         other_server.private_key = crate::config::wireguard::WireguardKey([44; 32]);
         other_server.listen = Some(second.local_addr().unwrap());
-        other_server.inbound.as_mut().unwrap().rules = serde_yaml::from_str(
+        other_server.inbound.as_mut().unwrap().rules = crate::config::test_support::from_yaml(
             "[{masks: '198.18.0.2/32', action: allow, override_address: '127.0.0.1:0'}]",
         )
         .unwrap();
         for selection in other_server.inbound.as_mut().unwrap().rules.iter_mut() {
-            let crate::config::ConfigSelection::Config(rule) = selection else {
-                panic!("expected an inline rule")
-            };
+            let rule = selection;
             rule.compile(&mut crate::rules::Compiler::default())
                 .unwrap();
         }
         let client = &mut configs.wireguard_endpoints[CLIENT];
-        client.peer_client_chain = Some(crate::config::ClientChain::default());
+        client.peer_client_chain = Some(crate::config::ResolvedClientChain::default());
         client.peers[0].allowed_ips = vec!["127.0.0.1/32".into()];
         let mut other_peer = client.peers[0].clone();
         other_peer.public_key = serde_yaml::from_str(&public(44)).unwrap();

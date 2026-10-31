@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
-use crate::config::ConfigSelection;
-use crate::config::{ClientChainHop, ClientConfig};
+use crate::config::{ResolvedClientConfig, ResolvedClientHop};
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::create_proxy_connector;
@@ -12,7 +11,9 @@ use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 
 /// Checks the final hop without creating sockets or resolving addresses.
-pub(crate) fn supports_udp_offline(chain: &crate::config::ClientChain) -> std::io::Result<bool> {
+pub(crate) fn supports_udp_offline(
+    chain: &crate::config::ResolvedClientChain,
+) -> std::io::Result<bool> {
     crate::config::composition::validate(&chain.hops)?;
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let mut supported = false;
@@ -32,53 +33,38 @@ pub(crate) fn supports_udp_offline(chain: &crate::config::ClientChain) -> std::i
 /// `protocol: direct` at hop 0 creates InitialHopEntry::Direct.
 #[cfg(test)]
 pub fn build_client_proxy_chain(
-    client_chain: crate::option_util::OneOrSome<ClientChainHop>,
+    client_chain: crate::option_util::OneOrSome<ResolvedClientHop>,
     resolver: Arc<dyn Resolver>,
 ) -> ClientProxyChain {
     try_build_client_proxy_chain(client_chain, resolver).expect("Failed to create client chain")
 }
 
 pub fn try_build_client_proxy_chain(
-    client_chain: crate::option_util::OneOrSome<ClientChainHop>,
+    client_chain: crate::option_util::OneOrSome<ResolvedClientHop>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<ClientProxyChain> {
     build_client_proxy_chain_with_limits(client_chain, resolver, crate::resources::limits())
 }
 
 pub(crate) fn build_client_proxy_chain_with_limits(
-    client_chain: crate::option_util::OneOrSome<ClientChainHop>,
+    client_chain: crate::option_util::OneOrSome<ResolvedClientHop>,
     resolver: Arc<dyn Resolver>,
     limits: crate::config::GlobalLimits,
 ) -> std::io::Result<ClientProxyChain> {
     if client_chain
         .iter()
-        .any(|hop| matches!(hop, ClientChainHop::Choice(_)))
+        .any(|hop| matches!(hop, ResolvedClientHop::Choice(_)))
     {
         return ClientProxyChain::composed(client_chain, resolver, limits);
     }
-    let hops: Vec<Vec<ClientConfig>> = client_chain
+    let hops: Vec<Vec<ResolvedClientConfig>> = client_chain
         .into_vec()
         .into_iter()
-        .map(|hop| {
-            let selections = match hop {
-                ClientChainHop::Choice(_) => unreachable!("composition handled above"),
-                ClientChainHop::Single(selection) => vec![selection],
-                ClientChainHop::Pool(selections) => selections.into_vec(),
-            };
-            selections
-                .into_iter()
-                .map(|selection| match selection {
-                    ConfigSelection::Config(config) => Ok(config),
-                    ConfigSelection::GroupName(group_name) => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "Group reference '{group_name}' was not resolved during config validation."
-                        ),
-                    )),
-                })
-                .collect::<std::io::Result<_>>()
+        .map(|hop| match hop {
+            ResolvedClientHop::Single(client) => vec![client],
+            ResolvedClientHop::Choice(_) => unreachable!("composition handled above"),
         })
-        .collect::<std::io::Result<_>>()?;
+        .collect();
 
     if hops.is_empty() {
         return Err(std::io::Error::new(
@@ -89,7 +75,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
 
     for (index, configs) in hops.iter().enumerate() {
         for config in configs {
-            crate::sudoku_mask::validate_client(&config.protocol, &config.transport)?;
+            crate::sudoku_mask::validate_resolved_client(&config.protocol, &config.transport)?;
             config.validate_quic_key_exchange(index == 0)?;
             crate::quic_client::validate(config, index == 0)?;
         }
@@ -99,7 +85,8 @@ pub(crate) fn build_client_proxy_chain_with_limits(
     let initial_hop: Vec<InitialHopEntry> = hops[0]
         .iter()
         .map(|config| {
-            if let crate::config::ClientProxyConfig::Wireguard(reference) = &config.protocol {
+            if let crate::config::ResolvedClientProxyConfig::Wireguard(reference) = &config.protocol
+            {
                 let connector = reference.connector.clone().ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::NotConnected,
@@ -171,8 +158,8 @@ pub(crate) fn build_client_proxy_chain_with_limits(
 
 /// Find the first proxy address in the chain (for socket connector target).
 fn find_first_proxy_address<'a>(
-    hops: &'a [Vec<ClientConfig>],
-    current_config: &'a ClientConfig,
+    hops: &'a [Vec<ResolvedClientConfig>],
+    current_config: &'a ResolvedClientConfig,
 ) -> Option<&'a crate::address::NetLocation> {
     // If current config is a proxy, use its address
     if !current_config.protocol.is_direct() {
@@ -199,7 +186,7 @@ pub fn build_direct_chain_group(resolver: Arc<dyn Resolver>) -> ClientChainGroup
 
 /// Build a ClientChainGroup from config chains.
 pub fn build_client_chain_group(
-    client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
+    client_chains: crate::option_util::NoneOrSome<crate::config::ResolvedClientChain>,
     resolver: Arc<dyn Resolver>,
 ) -> ClientChainGroup {
     try_build_client_chain_group(client_chains, resolver)
@@ -207,22 +194,22 @@ pub fn build_client_chain_group(
 }
 
 pub fn try_build_client_chain_group(
-    client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
+    client_chains: crate::option_util::NoneOrSome<crate::config::ResolvedClientChain>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<ClientChainGroup> {
     build_client_chain_group_with_limits(client_chains, resolver, crate::resources::limits())
 }
 
 pub fn build_client_chain_group_with_limits(
-    client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
+    client_chains: crate::option_util::NoneOrSome<crate::config::ResolvedClientChain>,
     resolver: Arc<dyn Resolver>,
     limits: crate::config::GlobalLimits,
 ) -> std::io::Result<ClientChainGroup> {
     let chains: Vec<ClientProxyChain> = if client_chains.is_empty() {
         vec![build_client_proxy_chain_with_limits(
-            crate::option_util::OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                ClientConfig::default(),
-            ))),
+            crate::option_util::OneOrSome::One(ResolvedClientHop::Single(
+                ResolvedClientConfig::default(),
+            )),
             resolver,
             limits,
         )?]
@@ -241,7 +228,7 @@ pub fn build_client_chain_group_with_limits(
 mod tests {
     use super::*;
     use crate::address::NetLocation;
-    use crate::config::{ClientChain, ClientProxyConfig};
+    use crate::config::{ResolvedClientChain, ResolvedClientProxyConfig};
     use crate::option_util::{NoneOrSome, OneOrSome};
     use crate::resolver::NativeResolver;
     use std::net::{IpAddr, Ipv4Addr};
@@ -249,22 +236,33 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn socket_initialization_failure_is_returned() {
-        let config: ClientConfig = serde_yaml::from_str("address: '127.0.0.1:443'\ntransport: quic\nbind_interface: shoes-missing-interface\nprotocol: {type: socks}\n").unwrap();
+        let config: ResolvedClientConfig = crate::config::test_support::from_yaml("address: '127.0.0.1:443'\ntransport: quic\nbind_interface: shoes-missing-interface\nprotocol: {type: socks}\n").unwrap();
         let result = try_build_client_proxy_chain(
-            OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(config))),
+            OneOrSome::One(ResolvedClientHop::Single(config)),
             mock_resolver(),
         );
         assert!(result.is_err());
+    }
+
+    fn pool(clients: Vec<ResolvedClientConfig>) -> ResolvedClientHop {
+        crate::config::composition::pool_choice(
+            clients
+                .into_iter()
+                .map(|client| ResolvedClientChain {
+                    hops: OneOrSome::One(ResolvedClientHop::Single(client)),
+                })
+                .collect(),
+        )
     }
 
     fn mock_resolver() -> Arc<dyn Resolver> {
         Arc::new(NativeResolver::new())
     }
 
-    fn socks_config(port: u16) -> ClientConfig {
-        ClientConfig {
+    fn socks_config(port: u16) -> ResolvedClientConfig {
+        ResolvedClientConfig {
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
-            protocol: ClientProxyConfig::Socks {
+            protocol: ResolvedClientProxyConfig::Socks {
                 username: None,
                 password: None,
             },
@@ -272,8 +270,8 @@ mod tests {
         }
     }
 
-    fn direct_config() -> ClientConfig {
-        ClientConfig::default()
+    fn direct_config() -> ResolvedClientConfig {
+        ResolvedClientConfig::default()
     }
 
     #[test]
@@ -284,23 +282,18 @@ mod tests {
             (mask.clone(), true),
             (json!({"type":"tls","protocol":mask}), false),
         ] {
-            let config: ClientConfig = serde_json::from_value(json!({
+            let config: ResolvedClientConfig = crate::config::test_support::from_json(json!({
                 "address":"localhost:1080","protocol":protocol
             }))
             .unwrap();
             for hop in [
-                ClientChainHop::Single(ConfigSelection::Config(config.clone())),
-                ClientChainHop::Pool(OneOrSome::Some(vec![
-                    ConfigSelection::Config(socks_config(1081)),
-                    ConfigSelection::Config(config),
-                ])),
+                ResolvedClientHop::Single(config.clone()),
+                pool(vec![socks_config(1081), config]),
             ] {
                 for index in 0..=1 {
                     let mut hops = Vec::new();
                     if index == 1 {
-                        hops.push(ClientChainHop::Single(ConfigSelection::Config(
-                            direct_config(),
-                        )));
+                        hops.push(ResolvedClientHop::Single(direct_config()));
                     }
                     hops.push(hop.clone());
                     let result =
@@ -333,24 +326,19 @@ mod tests {
                 true,
             ),
         ] {
-            let config: ClientConfig = serde_yaml::from_str(&format!(
+            let config: ResolvedClientConfig = crate::config::test_support::from_yaml(&format!(
                 "{{address: 'unresolvable.invalid:443', protocol: {protocol}}}"
             ))
             .unwrap();
-            let chain = ClientChain {
-                hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                    config.clone(),
-                ))),
+            let chain = ResolvedClientChain {
+                hops: OneOrSome::One(ResolvedClientHop::Single(config.clone())),
             };
             assert_eq!(supports_udp_offline(&chain).unwrap(), expected);
             let runtime =
                 try_build_client_proxy_chain(chain.hops.clone(), mock_resolver()).unwrap();
             assert_eq!(runtime.supports_udp(), expected);
-            let pool = ClientChain {
-                hops: OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
-                    ConfigSelection::Config(socks_config(1080)),
-                    ConfigSelection::Config(config),
-                ]))),
+            let pool = ResolvedClientChain {
+                hops: OneOrSome::One(pool(vec![socks_config(1080), config])),
             };
             assert_eq!(supports_udp_offline(&pool).unwrap(), expected);
         }
@@ -362,7 +350,7 @@ mod tests {
             let field = groups
                 .map(|g| format!("key_exchange_groups: [{g}]"))
                 .unwrap_or_default();
-            let direct: ClientConfig = serde_yaml::from_str(&format!(
+            let direct: ResolvedClientConfig = crate::config::test_support::from_yaml(&format!(
                 "protocol: {{type: direct}}\ntransport: quic\nquic_settings: {{{field}}}\n"
             ))
             .unwrap();
@@ -370,27 +358,20 @@ mod tests {
                 SocketConnectorImpl::from_config(&direct, None).is_err(),
                 groups.is_some()
             );
-            let direct_chain =
-                OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(direct)));
+            let direct_chain = OneOrSome::One(ResolvedClientHop::Single(direct));
             assert_eq!(
                 try_build_client_proxy_chain(direct_chain, mock_resolver()).is_err(),
                 groups.is_some()
             );
 
-            let proxy: ClientConfig = serde_yaml::from_str(&format!(
+            let proxy: ResolvedClientConfig = crate::config::test_support::from_yaml(&format!(
                 "address: '127.0.0.1:443'\nprotocol: {{type: socks}}\ntransport: quic\nquic_settings: {{{field}}}\n"
             )).unwrap();
             for hop in [
-                ClientChainHop::Single(ConfigSelection::Config(proxy.clone())),
-                ClientChainHop::Pool(OneOrSome::Some(vec![
-                    ConfigSelection::Config(socks_config(1080)),
-                    ConfigSelection::Config(proxy),
-                ])),
+                ResolvedClientHop::Single(proxy.clone()),
+                pool(vec![socks_config(1080), proxy]),
             ] {
-                let chain = OneOrSome::Some(vec![
-                    ClientChainHop::Single(ConfigSelection::Config(direct_config())),
-                    hop,
-                ]);
+                let chain = OneOrSome::Some(vec![ResolvedClientHop::Single(direct_config()), hop]);
                 let result = try_build_client_proxy_chain(chain, mock_resolver());
                 assert_eq!(result.is_err(), groups.is_some());
                 if let Err(error) = result {
@@ -403,9 +384,7 @@ mod tests {
     #[test]
     fn test_build_single_direct_hop() {
         let chain = build_client_proxy_chain(
-            OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                direct_config(),
-            ))),
+            OneOrSome::One(ResolvedClientHop::Single(direct_config())),
             mock_resolver(),
         );
 
@@ -417,9 +396,7 @@ mod tests {
     #[test]
     fn test_build_single_proxy_hop() {
         let chain = build_client_proxy_chain(
-            OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                socks_config(1080),
-            ))),
+            OneOrSome::One(ResolvedClientHop::Single(socks_config(1080))),
             mock_resolver(),
         );
 
@@ -431,8 +408,8 @@ mod tests {
     fn test_build_direct_then_proxy_chain() {
         let chain = build_client_proxy_chain(
             OneOrSome::Some(vec![
-                ClientChainHop::Single(ConfigSelection::Config(direct_config())),
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
+                ResolvedClientHop::Single(direct_config()),
+                ResolvedClientHop::Single(socks_config(1080)),
             ]),
             mock_resolver(),
         );
@@ -446,8 +423,8 @@ mod tests {
     fn test_build_two_proxy_hops() {
         let chain = build_client_proxy_chain(
             OneOrSome::Some(vec![
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1081))),
+                ResolvedClientHop::Single(socks_config(1080)),
+                ResolvedClientHop::Single(socks_config(1081)),
             ]),
             mock_resolver(),
         );
@@ -459,10 +436,7 @@ mod tests {
     #[test]
     fn test_build_pool_at_hop0() {
         let chain = build_client_proxy_chain(
-            OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
-                ConfigSelection::Config(socks_config(1080)),
-                ConfigSelection::Config(socks_config(1081)),
-            ]))),
+            OneOrSome::One(pool(vec![socks_config(1080), socks_config(1081)])),
             mock_resolver(),
         );
 
@@ -480,15 +454,11 @@ mod tests {
     #[test]
     fn test_build_client_chain_group_with_chains() {
         let chains = NoneOrSome::Some(vec![
-            ClientChain {
-                hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                    socks_config(1080),
-                ))),
+            ResolvedClientChain {
+                hops: OneOrSome::One(ResolvedClientHop::Single(socks_config(1080))),
             },
-            ClientChain {
-                hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                    direct_config(),
-                ))),
+            ResolvedClientChain {
+                hops: OneOrSome::One(ResolvedClientHop::Single(direct_config())),
             },
         ]);
         let group = build_client_chain_group(chains, mock_resolver());
@@ -500,8 +470,8 @@ mod tests {
     fn test_direct_at_hop1_returns_error() {
         let result = try_build_client_proxy_chain(
             OneOrSome::Some(vec![
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
-                ClientChainHop::Single(ConfigSelection::Config(direct_config())),
+                ResolvedClientHop::Single(socks_config(1080)),
+                ResolvedClientHop::Single(direct_config()),
             ]),
             mock_resolver(),
         );
@@ -515,11 +485,8 @@ mod tests {
     fn test_direct_in_pool_at_hop1_returns_error() {
         let result = try_build_client_proxy_chain(
             OneOrSome::Some(vec![
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
-                ClientChainHop::Pool(OneOrSome::Some(vec![
-                    ConfigSelection::Config(socks_config(1081)),
-                    ConfigSelection::Config(direct_config()),
-                ])),
+                ResolvedClientHop::Single(socks_config(1080)),
+                pool(vec![socks_config(1081), direct_config()]),
             ]),
             mock_resolver(),
         );
@@ -536,21 +503,6 @@ mod tests {
             result.err().unwrap().kind(),
             std::io::ErrorKind::InvalidInput
         );
-    }
-
-    #[test]
-    fn test_unresolved_group_reference_returns_error() {
-        let selection = ConfigSelection::GroupName("unresolved_group".to_string());
-        for hop in [
-            ClientChainHop::Single(selection.clone()),
-            ClientChainHop::Pool(OneOrSome::One(selection)),
-        ] {
-            let result = try_build_client_proxy_chain(OneOrSome::One(hop), mock_resolver());
-            assert_eq!(
-                result.err().unwrap().kind(),
-                std::io::ErrorKind::InvalidInput
-            );
-        }
     }
 
     #[test]

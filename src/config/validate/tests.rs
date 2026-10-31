@@ -154,10 +154,10 @@ async fn sudoku_mask_walkers_reach_certificates_rules_clients_and_fake_dns_targe
     validated
         .visit_clients(&mut |client| {
             clients += 1;
-            let ClientProxyConfig::SudokuMask(mask) = &client.protocol else {
+            let ResolvedClientProxyConfig::SudokuMask(mask) = &client.protocol else {
                 panic!("mask lost")
             };
-            let ClientProxyConfig::Tls(tls) = mask.protocol.as_ref() else {
+            let ResolvedClientProxyConfig::Tls(tls) = mask.protocol.as_ref() else {
                 panic!("TLS lost")
             };
             assert!(tls.cert.as_ref().unwrap().contains("BEGIN CERTIFICATE"));
@@ -166,26 +166,33 @@ async fn sudoku_mask_walkers_reach_certificates_rules_clients_and_fake_dns_targe
         })
         .unwrap();
     assert_eq!(clients, 1);
-    let mut overrides = 0;
-    crate::config::rule_visit::visit(
-        &mut validated.configs,
-        &mut |rule| {
-            assert!(rule.criteria.compiled.is_some());
-            if matches!(
-                &rule.action,
-                RuleActionConfig::Allow {
-                    override_address: Some(_),
-                    ..
-                }
-            ) {
-                overrides += 1;
-            }
-            Ok(())
-        },
-        &mut |_| panic!("unexpanded group"),
-    )
-    .unwrap();
-    assert_eq!(overrides, 1);
+    let ResolvedConfig::Server(server) = &validated.configs[0] else {
+        panic!("expected server")
+    };
+    let ResolvedServerProxyConfig::SudokuMask(mask) = &server.protocol else {
+        panic!("expected mask")
+    };
+    let ResolvedServerProxyConfig::Tls {
+        default_tls_target, ..
+    } = mask.protocol.as_ref()
+    else {
+        panic!("expected TLS")
+    };
+    let rule = default_tls_target
+        .as_ref()
+        .unwrap()
+        .override_rules
+        .iter()
+        .next()
+        .unwrap();
+    assert!(rule.criteria.compiled.is_some());
+    assert!(matches!(
+        &rule.action,
+        ResolvedRuleActionConfig::Allow {
+            override_address: Some(_),
+            ..
+        }
+    ));
     let error = validated
         .validate_network_endpoints(&["198.18.0.0/15".parse().unwrap()])
         .unwrap_err();
@@ -230,12 +237,12 @@ fn sudoku_mask_rejects_non_tcp_transports_even_inside_xhttp() {
     ];
     for protocol in clients {
         for transport in ["quic", "udp"] {
-            let mut config: ClientConfig = serde_json::from_value(
+            let config: ClientConfig = serde_json::from_value(
                 json!({"address":"localhost:1234","transport":transport,"protocol":protocol}),
             )
             .unwrap();
             let error =
-                validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default())
+                resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default())
                     .unwrap_err();
             assert!(
                 error.to_string().contains("sudoku_mask requires TCP"),
@@ -251,12 +258,12 @@ fn sudoku_mask_rejects_non_tcp_transports_even_inside_xhttp() {
     ];
     for protocol in servers {
         for transport in ["quic", "udp"] {
-            let mut config: ServerConfig = serde_json::from_value(
+            let config: ServerConfig = serde_json::from_value(
                 json!({"address":"0.0.0.0:1234","transport":transport,"protocol":protocol}),
             )
             .unwrap();
-            let error = validate_server_config(
-                &mut config,
+            let error = resolve_server_config(
+                config,
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
@@ -281,7 +288,7 @@ fn sudoku_mask_preserves_sni_and_existing_immediate_child_constraints() {
     validate_client_proxy_config(&mut reality, &HashMap::new(), Some("origin.example")).unwrap();
     let resolver = std::sync::Arc::new(crate::resolver::NativeResolver::new());
     crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
-        reality,
+        crate::config::test_support::Inline::inline(reality),
         &crate::address::NetLocation::from_str("origin.example:443", None).unwrap(),
         resolver,
     )
@@ -302,14 +309,14 @@ fn sudoku_mask_preserves_sni_and_existing_immediate_child_constraints() {
         assert_eq!(validate_client_proxy_structure(&protocol).is_ok(), valid);
     }
     let naive = json!({"type":"naive","users":[{"username":"user","password":"secret"}]});
-    let mut protocol = serde_json::from_value(mask(naive.clone())).unwrap();
-    let error = validate_server_proxy_config(
-        &mut protocol,
+    let protocol = serde_json::from_value(mask(naive.clone())).unwrap();
+    let error = resolve_server_proxy_config(
+        protocol,
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
-        ServerProtocolContext::Tls,
         GlobalLimits::default(),
+        ServerProtocolContext::Tls,
     )
     .unwrap_err();
     assert!(error.to_string().contains("NaiveProxy must be used inside"));
@@ -343,12 +350,12 @@ fn sudoku_mask_rejects_inner_client_placements() {
         json!({"type":"tls","protocol":{"type":"xhttp","protocol":inner}}),
     ] {
         for protocol in [protocol.clone(), mask(mask(protocol))] {
-            let mut config: ClientConfig = serde_json::from_value(json!({
+            let config: ClientConfig = serde_json::from_value(json!({
                 "address":"localhost:443", "protocol":protocol
             }))
             .unwrap();
             let error =
-                validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default())
+                resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default())
                     .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             assert!(
@@ -381,12 +388,12 @@ fn sudoku_mask_rejects_inner_server_placements_in_every_target_branch() {
         }}),
     ] {
         for protocol in [protocol.clone(), mask(mask(protocol))] {
-            let mut config: ServerConfig = serde_json::from_value(json!({
+            let config: ServerConfig = serde_json::from_value(json!({
                 "address":"0.0.0.0:443", "protocol":protocol
             }))
             .unwrap();
-            let error = validate_server_config(
-                &mut config,
+            let error = resolve_server_config(
+                config,
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
@@ -410,11 +417,11 @@ fn sudoku_mask_accepts_consecutive_outer_prefixes() {
         for _ in 0..depth {
             protocol = json!({"type":"sudoku_mask","protocol":protocol});
         }
-        let mut client: ClientConfig = serde_json::from_value(json!({
+        let client: ClientConfig = serde_json::from_value(json!({
             "address":"localhost:1080","protocol":protocol
         }))
         .unwrap();
-        validate_client_config(&mut client, &HashMap::new(), GlobalLimits::default()).unwrap();
+        resolve_client_config(client, None, &HashMap::new(), GlobalLimits::default()).unwrap();
         let configs = serde_json::from_value(json!([{
             "address":"0.0.0.0:1080","protocol":protocol
         }]))
@@ -476,10 +483,10 @@ fn review_nested_carrier_validation_visits_each_client_once() {
             nested = Some(client);
         }
         let client = nested.unwrap();
-        let mut chain: ClientChain = serde_json::from_value(json!([client])).unwrap();
+        let chain: ClientChain = serde_json::from_value(json!([client])).unwrap();
         CLIENT_VALIDATIONS.set(0);
-        validate_client_chain(
-            &mut chain.hops,
+        compiler::compile_chain(
+            chain.hops,
             &HashMap::new(),
             &HashMap::new(),
             GlobalLimits::default(),
@@ -560,25 +567,25 @@ fn native_vless_configuration_rejects_ambiguous_vision_and_secrets() {
         validate_client_vision_protocol(false, &client_config, outer).unwrap();
     }
     let validate_server = |value: serde_json::Value| {
-        let mut config = serde_json::from_value(value).unwrap();
-        validate_server_proxy_config(
-            &mut config,
+        let config = serde_json::from_value(value).unwrap();
+        let config = resolve_server_proxy_config(
+            config,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            ServerProtocolContext::Stream,
             GlobalLimits::default(),
+            ServerProtocolContext::Stream,
         )?;
         Ok::<_, std::io::Error>(config)
     };
     let server_config = validate_server(server.clone()).unwrap();
     assert!(
-        validate_server_vision(true, &server_config)
+        validate_resolved_server_vision(true, &server_config)
             .unwrap_err()
             .to_string()
             .contains("outer TLS/REALITY vision: false")
     );
-    validate_server_vision(false, &server_config).unwrap();
+    validate_resolved_server_vision(false, &server_config).unwrap();
     for (key, value) in [
         ("encryption", json!("none")),
         ("encryption", json!("invalid-secret-do-not-log")),
@@ -612,7 +619,7 @@ fn native_vless_configuration_rejects_ambiguous_vision_and_secrets() {
         let mut config = server.clone();
         config["decryption"] = json!(disabled);
         config["vision"] = json!(false);
-        validate_server_vision(true, &validate_server(config).unwrap()).unwrap();
+        validate_resolved_server_vision(true, &validate_server(config).unwrap()).unwrap();
     }
 }
 
@@ -791,14 +798,14 @@ fn server_protocol_context_enforces_transport_and_termination() {
             ServerProtocolContext::Tls,
             ServerProtocolContext::Quic,
         ] {
-            let mut protocol = serde_json::from_value(value.clone()).unwrap();
-            let result = validate_server_proxy_config(
-                &mut protocol,
+            let protocol = serde_json::from_value(value.clone()).unwrap();
+            let result = resolve_server_proxy_config(
+                protocol,
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
-                context,
                 GlobalLimits::default(),
+                context,
             );
             assert_eq!(result.is_ok(), context == valid_context);
             if let Err(error) = result {
@@ -823,7 +830,7 @@ fn server_protocol_context_enforces_transport_and_termination() {
 
 #[test]
 fn nested_structure_errors_precede_protocol_field_errors() {
-    let mut config = serde_json::from_value(serde_json::json!({
+    let config = serde_json::from_value(serde_json::json!({
         "address": "example.com:443",
         "protocol": {
             "type": "reality", "public_key": "invalid",
@@ -832,7 +839,7 @@ fn nested_structure_errors_precede_protocol_field_errors() {
     }))
     .unwrap();
     let error =
-        validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default()).unwrap_err();
+        resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default()).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(
         error.to_string(),
@@ -879,12 +886,12 @@ fn reality_sni_defaults_only_at_the_outer_client_layer() {
             false,
         ),
     ] {
-        let mut config: ClientConfig = serde_json::from_value(serde_json::json!({
+        let config: ClientConfig = serde_json::from_value(serde_json::json!({
             "address": address, "protocol": protocol
         }))
         .unwrap();
         assert_eq!(
-            validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default()).is_ok(),
+            resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default()).is_ok(),
             valid
         );
     }
@@ -909,9 +916,9 @@ fn reality_mldsa_client_key_validation() {
         if let Some(key) = key {
             value["protocol"]["mldsa65_verify"] = key.into();
         }
-        let mut config: ClientConfig = serde_json::from_value(value).unwrap();
+        let config: ClientConfig = serde_json::from_value(value).unwrap();
         assert_eq!(
-            validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default()).is_ok(),
+            resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default()).is_ok(),
             expected
         );
     }
@@ -941,7 +948,7 @@ async fn reality_mldsa_server_seed_validation() {
     }
 }
 
-async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
+async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<ResolvedConfig>> {
     let (converted_configs, _) = convert_cert_paths(configs).await?;
     let validated = create_server_configs(converted_configs)?;
     Ok(validated.configs)
@@ -1014,14 +1021,14 @@ fn hybrid_only_rejects_vision_and_tuic_early_handshakes() {
         serde_json::json!({"type": "tls", "tls_targets": {"localhost": tls_target}}),
         serde_json::json!({"type": "tls", "default_tls_target": tls_target}),
     ] {
-        let mut server: ServerProxyConfig = serde_json::from_value(protocol).unwrap();
-        let error = validate_server_proxy_config(
-            &mut server,
+        let server: ServerProxyConfig = serde_json::from_value(protocol).unwrap();
+        let error = resolve_server_proxy_config(
+            server,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            ServerProtocolContext::Stream,
             GlobalLimits::default(),
+            ServerProtocolContext::Stream,
         )
         .unwrap_err();
         assert!(error.to_string().contains("hybrid-only"), "{error}");
@@ -1037,14 +1044,14 @@ fn hybrid_only_rejects_vision_and_tuic_early_handshakes() {
             .to_string()
             .contains("hybrid-only")
     );
-    let mut server: ServerConfig = serde_json::from_value(serde_json::json!({
+    let server: ServerConfig = serde_json::from_value(serde_json::json!({
             "address": "0.0.0.0:443", "transport": "quic",
             "quic_settings": {"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem(), "key_exchange_groups": ["X25519MLKEM768"]},
             "protocol": {"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "test", "zero_rtt_handshake": true}
         })).unwrap();
     assert!(
-        validate_server_config(
-            &mut server,
+        resolve_server_config(
+            server,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -1070,16 +1077,16 @@ fn quic_allowlists_cannot_be_ignored_by_direct_or_later_hops() {
         }
         let direct =
             json!({"protocol": {"type": "direct"}, "transport": "quic", "quic_settings": settings});
-        let mut config: ClientConfig = serde_json::from_value(direct).unwrap();
-        let result = validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default());
+        let config: ClientConfig = serde_json::from_value(direct).unwrap();
+        let result = resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default());
         assert_eq!(result.is_err(), groups.is_some());
 
         let proxy = json!({"address": "127.0.0.1:443", "protocol": {"type": "socks"}, "transport": "quic", "quic_settings": settings});
         let group_configs = HashMap::from([(
             "proxy".into(),
-            ClientChainHop::Single(ConfigSelection::Config(
+            HopPlan::Single(DraftClient::Ready(crate::config::test_support::client(
                 serde_json::from_value::<ClientConfig>(proxy.clone()).unwrap(),
-            )),
+            ))),
         )]);
         for hop in [
             proxy.clone(),
@@ -1089,10 +1096,10 @@ fn quic_allowlists_cannot_be_ignored_by_direct_or_later_hops() {
             let direct = json!({"protocol": {"type": "direct"}});
             for chain in [json!([hop]), json!([direct, hop])] {
                 let later_hop = chain.as_array().unwrap().len() > 1;
-                let mut parsed: super::super::types::ClientChain =
+                let parsed: super::super::types::ClientChain =
                     serde_json::from_value(chain.clone()).unwrap();
-                let result = validate_client_chain(
-                    &mut parsed.hops,
+                let result = compiler::compile_chain(
+                    parsed.hops,
                     &group_configs,
                     &HashMap::new(),
                     GlobalLimits::default(),
@@ -1420,7 +1427,7 @@ async fn test_recursive_certificate_embedding() {
     assert_eq!(load_count, 11);
 
     let validated = create_server_configs(converted_configs).unwrap();
-    let Config::Server(server_config) = &validated.configs[0] else {
+    let ResolvedConfig::Server(server_config) = &validated.configs[0] else {
         panic!("expected Config::Server");
     };
 
@@ -1428,7 +1435,7 @@ async fn test_recursive_certificate_embedding() {
     assert!(quic_settings.cert.contains("BEGIN CERTIFICATE"));
     assert!(quic_settings.key.contains("BEGIN PRIVATE KEY"));
 
-    if let ServerProxyConfig::Tls {
+    if let ResolvedServerProxyConfig::Tls {
         tls_targets,
         shadowtls_targets,
         ..
@@ -1439,7 +1446,7 @@ async fn test_recursive_certificate_embedding() {
         assert!(tls_config.key.contains("BEGIN PRIVATE KEY"));
 
         let shadow_config = shadowtls_targets.get("shadow.com").unwrap();
-        if let ShadowTlsServerHandshakeConfig::Local(handshake) = &shadow_config.handshake {
+        if let ResolvedShadowTlsServerHandshakeConfig::Local(handshake) = &shadow_config.handshake {
             assert!(handshake.cert.contains("BEGIN CERTIFICATE"));
             assert!(handshake.key.contains("BEGIN PRIVATE KEY"));
         }
@@ -1453,7 +1460,10 @@ fn test_direct_connector_at_hop_0_allowed() {
         ClientConfig::default(), // default is direct
     )));
 
-    assert!(composition::validate(&hops).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 fn http_proxy_config() -> ClientProxyConfig {
@@ -1483,7 +1493,10 @@ fn test_direct_then_proxy_allowed() {
         })),
     ]);
 
-    assert!(composition::validate(&hops).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1500,7 +1513,10 @@ fn test_proxy_then_proxy_allowed() {
         })),
     ]);
 
-    assert!(composition::validate(&hops).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1514,7 +1530,8 @@ fn test_direct_at_hop_1_rejected() {
         ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())), // direct
     ]);
 
-    let result = composition::validate(&hops);
+    let result =
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("hop 1"));
@@ -1535,7 +1552,8 @@ fn test_direct_in_middle_of_chain_rejected() {
         })),
     ]);
 
-    let result = composition::validate(&hops);
+    let result =
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("hop 1"));
@@ -1552,7 +1570,10 @@ fn test_direct_in_pool_at_hop_0_allowed() {
         }),
     ])));
 
-    assert!(composition::validate(&hops).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1572,7 +1593,8 @@ fn test_direct_in_pool_at_hop_1_rejected() {
         ])),
     ]);
 
-    let result = composition::validate(&hops);
+    let result =
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("hop 1"));
@@ -1593,7 +1615,10 @@ fn test_three_hop_direct_first_then_proxies_allowed() {
         })),
     ]);
 
-    assert!(composition::validate(&hops).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -1821,7 +1846,7 @@ fn dns_chain_aliases_expand_sequential_groups_in_order() {
             .hops
             .iter()
             .map(|hop| {
-                let ClientChainHop::Single(ConfigSelection::Config(client)) = hop else {
+                let ResolvedClientHop::Single(client) = hop else {
                     panic!("expected a fixed hop")
                 };
                 client.address.to_string()
@@ -2316,11 +2341,9 @@ async fn test_empty_dns_lists_use_default_resolver() {
     assert_eq!(configs.len(), 2);
     for config in configs {
         let dns = match config {
-            Config::Server(server) => server.dns.unwrap(),
-            Config::TunServer(tun) => tun.dns.unwrap(),
-            _ => unreachable!(),
+            ResolvedConfig::Server(server) => server.dns.unwrap(),
+            ResolvedConfig::TunServer(tun) => tun.dns.unwrap(),
         };
-        assert!(matches!(dns.servers, NoneOrSome::None));
         assert_eq!(dns.resolved_group(), None);
     }
 }
@@ -2372,7 +2395,7 @@ async fn test_server_dns_with_group_ref() {
 
     // Verify servers is still the group name (not expanded)
     let validated = result.unwrap();
-    if let Config::Server(s) = &validated[0] {
+    if let ResolvedConfig::Server(s) = &validated[0] {
         assert_eq!(s.dns.as_ref().unwrap().resolved_group(), Some("my-dns"));
     }
 }
@@ -2427,7 +2450,7 @@ async fn test_server_dns_with_mixed_group_and_url() {
 
     // Verify servers was expanded to an inline group name
     let validated = result.unwrap();
-    if let Config::Server(s) = &validated[0] {
+    if let ResolvedConfig::Server(s) = &validated[0] {
         let group = s.dns.as_ref().unwrap().resolved_group().unwrap();
         assert!(
             group.starts_with("__inline_dns_"),
@@ -2492,7 +2515,7 @@ async fn test_server_dns_with_multiple_group_refs() {
 
     // Verify servers was expanded to an inline group name
     let validated = result.unwrap();
-    if let Config::Server(s) = &validated[0] {
+    if let ResolvedConfig::Server(s) = &validated[0] {
         let group = s.dns.as_ref().unwrap().resolved_group().unwrap();
         assert!(
             group.starts_with("__inline_dns_"),

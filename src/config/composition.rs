@@ -1,10 +1,13 @@
-use std::collections::HashMap;
 use std::io;
 
-use super::{ClientChain, ClientChainHop, ClientConfig, ConfigSelection, GroupType};
+#[cfg(test)]
+use super::resolved::ResolvedClientChain as ClientChain;
+use super::resolved::{
+    ResolvedClientConfig as ClientConfig, ResolvedClientHop as ClientChainHop,
+    ResolvedClientProxyConfig as ClientProxyConfig,
+};
 use crate::option_util::OneOrSome;
 
-pub(crate) type Groups = HashMap<String, ClientChainHop>;
 pub(crate) const MAX_NODES: usize = 16_384;
 pub(crate) const MAX_DEPTH: usize = 64;
 pub(crate) const MAX_HOPS: usize = 64;
@@ -14,152 +17,21 @@ pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 pub(crate) fn clients(hop: &ClientChainHop) -> Box<dyn Iterator<Item = &ClientConfig> + '_> {
-    fn client(selection: &ConfigSelection<ClientConfig>) -> &ClientConfig {
-        match selection {
-            ConfigSelection::Config(client) => client,
-            ConfigSelection::GroupName(_) => panic!("client groups must be resolved"),
-        }
-    }
-    match hop {
-        ClientChainHop::Single(selection) => Box::new(std::iter::once(client(selection))),
-        ClientChainHop::Pool(pool) => Box::new(pool.iter().map(client)),
-        ClientChainHop::Choice(choice) => Box::new(
-            choice
-                .members
-                .iter()
-                .flat_map(|chain| chain.hops.iter().flat_map(clients)),
-        ),
-    }
+    super::plan_ops::clients(hop)
 }
 
+#[cfg(test)]
 pub(crate) fn pool_choice(members: Vec<ClientChain>) -> ClientChainHop {
-    ClientChainHop::Choice(Box::new(super::ClientChoice {
-        name: String::new(),
-        group_type: GroupType::RoundRobin,
-        labels: (0..members.len()).map(|index| index.to_string()).collect(),
-        members,
-    }))
+    super::plan_ops::pool_choice(members)
 }
 
-pub(crate) fn expand(hops: &mut OneOrSome<ClientChainHop>, groups: &Groups) -> io::Result<()> {
-    fn member(
-        selection: &ConfigSelection<ClientConfig>,
-        groups: &Groups,
-    ) -> io::Result<ClientChainHop> {
-        match selection {
-            ConfigSelection::Config(_) => Ok(ClientChainHop::Single(selection.clone())),
-            ConfigSelection::GroupName(name) => groups
-                .get(name)
-                .cloned()
-                .ok_or_else(|| invalid(format!("Unknown client group: {name}"))),
-        }
-    }
-    // Charge referenced trees before cloning them into this occurrence.
-    let mut nodes = 0usize;
-    for hop in hops.iter() {
-        let selections = match hop {
-            ClientChainHop::Single(selection) | ClientChainHop::Pool(OneOrSome::One(selection)) => {
-                std::slice::from_ref(selection)
-            }
-            ClientChainHop::Pool(OneOrSome::Some(pool)) => pool.as_slice(),
-            ClientChainHop::Choice(_) => {
-                nodes = nodes.saturating_add(measure(hop, 0)?.0);
-                if nodes > MAX_NODES {
-                    return Err(invalid("client composition exceeds 16384 nodes"));
-                }
-                continue;
-            }
-        };
-        for selection in selections {
-            nodes = nodes.saturating_add(match selection {
-                ConfigSelection::Config(client) => client_nodes(client, 0)?,
-                ConfigSelection::GroupName(name) => {
-                    measure(
-                        groups
-                            .get(name)
-                            .ok_or_else(|| invalid(format!("Unknown client group: {name}")))?,
-                        0,
-                    )?
-                    .0
-                }
-            });
-            if nodes > MAX_NODES {
-                return Err(invalid("client composition exceeds 16384 nodes"));
-            }
-        }
-    }
-    for hop in hops.iter_mut() {
-        *hop = match hop {
-            ClientChainHop::Single(selection) => member(selection, groups)?,
-            ClientChainHop::Pool(pool) => {
-                let mut members = Vec::new();
-                for selection in pool.iter() {
-                    members.push(ClientChain {
-                        hops: OneOrSome::One(member(selection, groups)?),
-                    });
-                }
-                pool_choice(members)
-            }
-            ClientChainHop::Choice(_) => continue,
-        };
-    }
-    validate(hops)
-}
-
-// Returns expanded node count and maximum physical hop count.
 pub(crate) fn measure(hop: &ClientChainHop, depth: usize) -> io::Result<(usize, usize)> {
-    if depth > MAX_DEPTH {
-        return Err(invalid("client composition exceeds 64 levels"));
-    }
-    match hop {
-        ClientChainHop::Single(ConfigSelection::GroupName(name)) => {
-            Err(invalid(format!("unresolved client group: {name}")))
-        }
-        ClientChainHop::Single(ConfigSelection::Config(client)) => {
-            Ok((client_nodes(client, depth)?, 1))
-        }
-        ClientChainHop::Pool(pool) => {
-            if pool.iter().count() == 0 {
-                return Err(invalid("pool cannot be empty"));
-            }
-            let mut nodes = 0usize;
-            for selection in pool.iter() {
-                let ConfigSelection::Config(client) = selection else {
-                    return Err(invalid("unresolved client group in pool"));
-                };
-                nodes = nodes.saturating_add(client_nodes(client, depth)?);
-            }
-            Ok((nodes, 1))
-        }
-        ClientChainHop::Choice(choice) => {
-            if choice.members.is_empty() || choice.members.len() != choice.labels.len() {
-                return Err(invalid("choice requires nonempty, labeled members"));
-            }
-            let mut nodes = 1usize;
-            let mut longest = 0usize;
-            for member in &choice.members {
-                if member.hops.iter().count() == 0 {
-                    return Err(invalid("chain cannot be empty"));
-                }
-                let mut length = 0usize;
-                for hop in member.hops.iter() {
-                    let (count, hops) = measure(hop, depth + 1)?;
-                    nodes = nodes.saturating_add(count);
-                    length = length.saturating_add(hops);
-                }
-                longest = longest.max(length);
-            }
-            if nodes > MAX_NODES || longest > MAX_HOPS {
-                return Err(invalid("client composition exceeds 16384 nodes or 64 hops"));
-            }
-            Ok((nodes, longest))
-        }
-    }
+    super::plan_ops::measure(hop, depth, client_nodes)
 }
 
-fn client_nodes(client: &ClientConfig, depth: usize) -> io::Result<usize> {
+pub(crate) fn client_nodes(client: &ClientConfig, depth: usize) -> io::Result<usize> {
     let mut nodes = 1usize;
-    if let super::ClientProxyConfig::Wireguard(config) = &client.protocol
+    if let ClientProxyConfig::Wireguard(config) = &client.protocol
         && let Some(chain) = &config.peer_client_chain
     {
         for hop in chain.hops.iter() {
@@ -173,55 +45,45 @@ fn client_nodes(client: &ClientConfig, depth: usize) -> io::Result<usize> {
 }
 
 pub(crate) fn validate(hops: &OneOrSome<ClientChainHop>) -> io::Result<()> {
-    if hops.iter().count() == 0 {
-        return Err(invalid("chain cannot be empty"));
-    }
-    fn walk(hops: &OneOrSome<ClientChainHop>, mut offset: usize) -> io::Result<usize> {
-        for hop in hops.iter() {
-            let initial = offset == 0;
-            if let ClientChainHop::Choice(choice) = hop {
-                let mut end = offset;
-                for member in &choice.members {
-                    end = end.max(walk(&member.hops, offset)?);
-                }
-                offset = end;
-            } else {
-                for client in clients(hop) {
-                    client.validate_quic_key_exchange(initial)?;
-                    crate::quic_client::validate(client, initial)?;
-                    if !initial {
-                        if client.protocol.is_direct() {
-                            return Err(invalid(format!(
-                                "Direct connectors can only be used at hop 0, not hop {offset}"
-                            )));
-                        }
-                        if client.protocol.is_wireguard() {
-                            return Err(invalid("WireGuard is only supported at hop 0"));
-                        }
-                        if client.transport == super::Transport::Quic
-                            && crate::xhttp::connector::contains(&client.protocol)
-                        {
-                            return Err(invalid("XHTTP H3 is only supported at hop 0"));
-                        }
-                    }
-                }
-                offset += 1;
-            }
+    super::plan_ops::validate(
+        hops,
+        client_nodes,
+        super::health::validate_client,
+        validate_position,
+    )
+}
+
+pub(super) fn validate_position(client: &ClientConfig, offset: usize) -> io::Result<()> {
+    client.validate_quic_key_exchange(offset == 0)?;
+    validate_position_flags(
+        client.protocol.is_direct(),
+        client.protocol.is_wireguard(),
+        client.transport == super::Transport::Quic
+            && crate::xhttp::connector::contains(&client.protocol),
+        offset,
+    )
+}
+
+pub(super) fn validate_position_flags(
+    direct: bool,
+    wireguard: bool,
+    xhttp_h3: bool,
+    offset: usize,
+) -> io::Result<()> {
+    if offset != 0 {
+        if direct {
+            return Err(invalid(format!(
+                "Direct connectors can only be used at hop 0, not hop {offset}"
+            )));
         }
-        Ok(offset)
+        if wireguard {
+            return Err(invalid("WireGuard is only supported at hop 0"));
+        }
+        if xhttp_h3 {
+            return Err(invalid("XHTTP H3 is only supported at hop 0"));
+        }
     }
-    let mut nodes = 0usize;
-    let mut longest = 0usize;
-    for hop in hops.iter() {
-        let (count, length) = measure(hop, 0)?;
-        nodes = nodes.saturating_add(count);
-        longest = longest.saturating_add(length);
-    }
-    if nodes > MAX_NODES || longest > MAX_HOPS {
-        return Err(invalid("client composition exceeds 16384 nodes or 64 hops"));
-    }
-    super::health::validate_composition(hops)?;
-    walk(hops, 0).map(|_| ())
+    Ok(())
 }
 
 pub(crate) fn direct_only(hops: &OneOrSome<ClientChainHop>) -> bool {
@@ -254,7 +116,10 @@ pub(crate) fn final_clients(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, RuleActionConfig, ValidatedConfigs, create_server_configs};
+    use crate::config::{
+        ResolvedConfig as Config, ResolvedRuleActionConfig as RuleActionConfig, ValidatedConfigs,
+        create_server_configs,
+    };
     use serde_json::{Value, json};
 
     fn proxy(name: &str) -> Value {
@@ -269,9 +134,7 @@ mod tests {
         let Config::Server(server) = &value.configs[0] else {
             panic!()
         };
-        let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-            panic!()
-        };
+        let rule = server.rules.iter().next().unwrap();
         let RuleActionConfig::Allow { client_chains, .. } = &rule.action else {
             panic!()
         };
@@ -408,7 +271,7 @@ mod tests {
             leaves[1].control.as_ref().unwrap().path,
             [("out".into(), "DIRECT".into())]
         );
-        let super::super::ClientProxyConfig::Wireguard(config) = &leaves[0].protocol else {
+        let super::super::ResolvedClientProxyConfig::Wireguard(config) = &leaves[0].protocol else {
             panic!()
         };
         let carrier = config.peer_client_chain.as_ref().unwrap();

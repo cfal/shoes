@@ -7,9 +7,13 @@ use super::selection::{
     Choices, SelectionOwner, SelectionView, SelectorDefinition, SelectorDefinitions,
 };
 use super::store::valid_name;
+use crate::config::resolved::{
+    ResolvedClientChain, ResolvedClientChoice, ResolvedClientConfig, ResolvedClientHop,
+    ResolvedClientProxyConfig,
+};
 use crate::config::{
-    ClientChain, ClientChainHop, ClientConfig, ClientGroupMember, ClientProxyConfig, Config,
-    ConfigSelection, GroupType, RuleActionConfig,
+    ClientChain, ClientChainHop, ClientConfig, ClientGroupMember, Config, ConfigSelection,
+    GroupType, RuleActionConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -50,24 +54,21 @@ impl MemberOrigin {
 }
 
 pub fn chain_selection_key(
-    chains: &[crate::config::ClientChain],
+    chains: &[ResolvedClientChain],
 ) -> io::Result<Vec<Vec<(String, String)>>> {
-    let mut key = Vec::new();
-    for chain in chains {
-        for mut hop in chain.hops.iter().cloned() {
-            crate::config::client_visit::visit_hop(&mut hop, &mut |client| {
-                key.push(
-                    client
-                        .control
-                        .as_ref()
-                        .map(MemberOrigin::policy_path)
-                        .unwrap_or_default(),
-                );
-                Ok(())
-            })?;
-        }
-    }
-    Ok(key)
+    Ok(chains
+        .iter()
+        .flat_map(|chain| chain.hops.iter())
+        .flat_map(crate::config::composition::clients)
+        .flat_map(crate::config::resolved_visit::client_tree)
+        .map(|client| {
+            client
+                .control
+                .as_ref()
+                .map(MemberOrigin::policy_path)
+                .unwrap_or_default()
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone)]
@@ -78,20 +79,30 @@ pub struct RuleDescription {
 }
 
 #[derive(Debug, Clone)]
-pub enum CatalogNode {
+pub enum CatalogEntry<C> {
     Group {
         members: Vec<String>,
         group_type: GroupType,
     },
-    Leaf(Box<ClientConfig>),
+    Leaf(Box<C>),
     Chain(Box<ClientChain>),
     Reject,
 }
 
 #[derive(Debug)]
-pub struct Catalog {
-    pub nodes: IndexMap<String, CatalogNode>,
+pub struct CatalogRecord<C> {
+    pub nodes: IndexMap<String, CatalogEntry<C>>,
     pub selection: Arc<SelectionView>,
+}
+
+pub type CatalogNode = CatalogEntry<ResolvedClientConfig>;
+pub type Catalog = CatalogRecord<ResolvedClientConfig>;
+pub(crate) type CatalogDraft = CatalogRecord<DraftLeaf>;
+
+#[derive(Debug, Clone)]
+pub(crate) enum DraftLeaf {
+    Source(ClientConfig),
+    Resolved(ResolvedClientConfig),
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -115,7 +126,6 @@ fn member_name(member: &ConfigSelection<ClientConfig>) -> String {
 
 pub(crate) fn hop_target(hop: &ClientChainHop) -> String {
     match hop {
-        ClientChainHop::Choice(choice) => choice.name.clone(),
         ClientChainHop::Single(member) => member_name(member),
         ClientChainHop::Pool(members) => format!(
             "pool[{}]",
@@ -175,7 +185,7 @@ fn rule_target(action: &RuleActionConfig) -> String {
     })
 }
 
-impl Catalog {
+impl CatalogDraft {
     pub fn capture(configs: &mut [Config]) -> io::Result<Option<Self>> {
         for config in configs.iter() {
             if let Config::ClientConfigGroup(group) = config
@@ -195,8 +205,11 @@ impl Catalog {
         }
         let empty = Arc::<SelectionView>::default();
         let mut nodes = IndexMap::new();
-        nodes.insert("DIRECT".into(), CatalogNode::Leaf(Box::default()));
-        nodes.insert("REJECT".into(), CatalogNode::Reject);
+        nodes.insert(
+            "DIRECT".into(),
+            CatalogEntry::Leaf(Box::new(DraftLeaf::Source(ClientConfig::default()))),
+        );
+        nodes.insert("REJECT".into(), CatalogEntry::Reject);
         let mut names = std::collections::HashSet::from([
             "DIRECT".to_owned(),
             "REJECT".to_owned(),
@@ -230,7 +243,7 @@ impl Catalog {
                     // Reserve source order before populating members in the second pass.
                     nodes.insert(
                         group.client_group.clone(),
-                        CatalogNode::Group {
+                        CatalogEntry::Group {
                             members: Vec::new(),
                             group_type: group.group_type.clone(),
                         },
@@ -249,7 +262,7 @@ impl Catalog {
                 _ => {}
             }
             let mut ordinal = 0;
-            crate::config::client_visit::visit_configs(
+            crate::config::client_visit::visit_source_configs(
                 std::slice::from_mut(config),
                 &mut |client| {
                     ordinal += 1;
@@ -272,7 +285,10 @@ impl Catalog {
                         selection: empty.clone(),
                     });
                     if name != "DIRECT" {
-                        nodes.insert(name, CatalogNode::Leaf(Box::new(client.clone())));
+                        nodes.insert(
+                            name,
+                            CatalogEntry::Leaf(Box::new(DraftLeaf::Source(client.clone()))),
+                        );
                     }
                     Ok(())
                 },
@@ -288,7 +304,7 @@ impl Catalog {
                         chain,
                     } = member
                     {
-                        nodes.insert(name.clone(), CatalogNode::Chain(Box::new(chain.clone())));
+                        nodes.insert(name.clone(), CatalogEntry::Chain(Box::new(chain.clone())));
                     }
                 }
                 let members: Vec<_> = group
@@ -323,7 +339,7 @@ impl Catalog {
                 }
                 nodes.insert(
                     group.client_group.clone(),
-                    CatalogNode::Group {
+                    CatalogEntry::Group {
                         members,
                         group_type: group.group_type.clone(),
                     },
@@ -333,7 +349,7 @@ impl Catalog {
         let mut selection = SelectionOwner::new(None)?.prepare(definitions)?;
         let view = Arc::get_mut(&mut selection).unwrap();
         view.automatic = automatic;
-        crate::config::client_visit::visit_configs(configs, &mut |client| {
+        crate::config::client_visit::visit_source_configs(configs, &mut |client| {
             if let Some(origin) = &mut client.control {
                 origin.selection = selection.clone();
             }
@@ -366,7 +382,67 @@ impl Catalog {
         Ok(Some(Self { nodes, selection }))
     }
 
-    pub(crate) fn route(&self, name: &str) -> io::Result<ClientChain> {
+    pub(crate) fn update_client(&mut self, client: &ResolvedClientConfig) {
+        if let Some(origin) = &client.control
+            && let Some(CatalogEntry::Leaf(leaf)) = self.nodes.get_mut(origin.name.as_ref())
+        {
+            let mut client = client.clone();
+            if let Some(origin) = &mut client.control {
+                origin.path.clear();
+            }
+            **leaf = DraftLeaf::Resolved(client);
+        }
+    }
+
+    pub(crate) fn finish(
+        self,
+        mut resolve: impl FnMut(ClientConfig) -> io::Result<ResolvedClientConfig>,
+    ) -> io::Result<Catalog> {
+        let nodes = self
+            .nodes
+            .into_iter()
+            .map(|(name, node)| {
+                let node = match node {
+                    CatalogEntry::Group {
+                        members,
+                        group_type,
+                    } => CatalogEntry::Group {
+                        members,
+                        group_type,
+                    },
+                    CatalogEntry::Chain(chain) => CatalogEntry::Chain(chain),
+                    CatalogEntry::Reject => CatalogEntry::Reject,
+                    CatalogEntry::Leaf(client) => {
+                        let client = match *client {
+                            DraftLeaf::Resolved(client) => client,
+                            DraftLeaf::Source(mut client) => {
+                                crate::config::client_visit::visit_source_client(
+                                    &mut client,
+                                    &mut |client| {
+                                        if let Some(origin) = &mut client.control {
+                                            origin.selection = self.selection.clone();
+                                        }
+                                        Ok(())
+                                    },
+                                )?;
+                                resolve(client)?
+                            }
+                        };
+                        CatalogEntry::Leaf(Box::new(client))
+                    }
+                };
+                Ok((name, node))
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(Catalog {
+            nodes,
+            selection: self.selection,
+        })
+    }
+}
+
+impl Catalog {
+    pub(crate) fn route(&self, name: &str) -> io::Result<ResolvedClientChain> {
         self.expand_route(name, Vec::new(), 0, &mut 0)
     }
 
@@ -376,10 +452,10 @@ impl Catalog {
         mut path: Vec<(String, String)>,
         depth: usize,
         count: &mut usize,
-    ) -> io::Result<ClientChain> {
+    ) -> io::Result<ResolvedClientChain> {
         use crate::option_util::OneOrSome;
-        fn charge(count: &mut usize) -> io::Result<()> {
-            *count += 1;
+        fn charge(count: &mut usize, nodes: usize) -> io::Result<()> {
+            *count = count.saturating_add(nodes);
             if *count > crate::config::composition::MAX_NODES {
                 return Err(super::health::capacity_error(
                     "probe route exceeds composition limits".into(),
@@ -425,14 +501,14 @@ impl Catalog {
         }
         let hop = match self.nodes.get(&name) {
             Some(CatalogNode::Leaf(client)) => {
-                charge(count)?;
+                charge(count, crate::config::composition::client_nodes(client, 0)?)?;
                 let mut client = (**client).clone();
                 client.control = Some(MemberOrigin {
                     name: Arc::from(name.as_str()),
                     path,
                     selection: self.selection.clone(),
                 });
-                ClientChainHop::Single(ConfigSelection::Config(client))
+                ResolvedClientHop::Single(client)
             }
             Some(CatalogNode::Group {
                 members,
@@ -444,8 +520,8 @@ impl Catalog {
                     path.push((name.to_owned(), member.clone()));
                     branches.push(self.expand_route(member, path, depth + 1, count)?);
                 }
-                charge(count)?;
-                ClientChainHop::Choice(Box::new(crate::config::ClientChoice {
+                charge(count, 1)?;
+                ResolvedClientHop::Choice(Box::new(ResolvedClientChoice {
                     name,
                     group_type: group_type.clone(),
                     labels: members.clone(),
@@ -467,22 +543,17 @@ impl Catalog {
                                 .iter()
                                 .map(&mut expand)
                                 .collect::<io::Result<Vec<_>>>()?;
-                            charge(count)?;
-                            hops.push(ClientChainHop::Choice(Box::new(
-                                crate::config::ClientChoice {
-                                    name: String::new(),
-                                    group_type: GroupType::RoundRobin,
-                                    labels: pool.iter().map(member_name).collect(),
-                                    members,
-                                },
-                            )));
-                        }
-                        ClientChainHop::Choice(_) => {
-                            unreachable!("catalog chains retain source references")
+                            charge(count, 1)?;
+                            hops.push(ResolvedClientHop::Choice(Box::new(ResolvedClientChoice {
+                                name: String::new(),
+                                group_type: GroupType::RoundRobin,
+                                labels: pool.iter().map(member_name).collect(),
+                                members,
+                            })));
                         }
                     }
                 }
-                return Ok(ClientChain {
+                return Ok(ResolvedClientChain {
                     hops: OneOrSome::Some(hops),
                 });
             }
@@ -499,12 +570,12 @@ impl Catalog {
                 ));
             }
         };
-        Ok(ClientChain {
+        Ok(ResolvedClientChain {
             hops: OneOrSome::One(hop),
         })
     }
 
-    pub fn update_client(&mut self, client: &ClientConfig) {
+    pub fn update_client(&mut self, client: &ResolvedClientConfig) {
         if let Some(origin) = &client.control
             && let Some(CatalogNode::Leaf(config)) = self.nodes.get_mut(origin.name.as_ref())
         {
@@ -516,17 +587,17 @@ impl Catalog {
     }
 }
 
-pub fn protocol_type(protocol: &ClientProxyConfig) -> &str {
+pub fn protocol_type(protocol: &ResolvedClientProxyConfig) -> &str {
     match protocol {
-        ClientProxyConfig::Tls(config) => protocol_type(&config.protocol),
-        ClientProxyConfig::Reality { protocol, .. }
-        | ClientProxyConfig::ShadowTls { protocol, .. } => protocol_type(protocol),
-        ClientProxyConfig::Websocket(config) => protocol_type(&config.protocol),
-        ClientProxyConfig::SudokuMask(config) => protocol_type(&config.protocol),
-        ClientProxyConfig::Xhttp(config) => protocol_type(&config.protocol),
-        ClientProxyConfig::Socks { .. } => "Socks5",
-        ClientProxyConfig::Vless { .. } => "VLESS",
-        ClientProxyConfig::Vmess { .. } => "Vmess",
+        ResolvedClientProxyConfig::Tls(config) => protocol_type(&config.protocol),
+        ResolvedClientProxyConfig::Reality { protocol, .. }
+        | ResolvedClientProxyConfig::ShadowTls { protocol, .. } => protocol_type(protocol),
+        ResolvedClientProxyConfig::Websocket(config) => protocol_type(&config.protocol),
+        ResolvedClientProxyConfig::SudokuMask(config) => protocol_type(&config.protocol),
+        ResolvedClientProxyConfig::Xhttp(config) => protocol_type(&config.protocol),
+        ResolvedClientProxyConfig::Socks { .. } => "Socks5",
+        ResolvedClientProxyConfig::Vless { .. } => "VLESS",
+        ResolvedClientProxyConfig::Vmess { .. } => "Vmess",
         other => other.protocol_name(),
     }
 }
@@ -537,7 +608,7 @@ mod tests {
 
     #[test]
     fn sudoku_masks_preserve_inner_protocol_type() {
-        let protocol = serde_json::from_value(serde_json::json!({
+        let protocol = crate::config::test_support::from_json(serde_json::json!({
             "type": "sudoku_mask",
             "protocol": {
                 "type": "sudoku_mask",
@@ -603,7 +674,7 @@ mod tests {
                 let CatalogNode::Leaf(client) = &catalog.nodes["unused-tls"] else {
                     panic!()
                 };
-                let ClientProxyConfig::Tls(tls) = &client.protocol else {
+                let ResolvedClientProxyConfig::Tls(tls) = &client.protocol else {
                     panic!()
                 };
                 assert!(tls.server_fingerprints.is_unspecified());
@@ -641,17 +712,16 @@ mod tests {
         let validated =
             crate::config::create_server_configs(serde_yaml::from_str(CONFIG).unwrap()).unwrap();
         let catalog = validated.catalog.as_ref().unwrap();
-        let Config::Server(server) = &validated.configs[0] else {
+        let crate::config::ResolvedConfig::Server(server) = &validated.configs[0] else {
             panic!()
         };
-        let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-            panic!()
-        };
+        let rule = server.rules.iter().next().unwrap();
         assert_eq!(
             rule.criteria.description.as_ref().unwrap().proxy,
             "outbound"
         );
-        let RuleActionConfig::Allow { client_chains, .. } = &rule.action else {
+        let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = &rule.action
+        else {
             panic!()
         };
         let hop = client_chains

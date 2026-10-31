@@ -637,8 +637,8 @@ async fn cancelled_flows_release_reads_and_egress_before_bounded_fin() {
                 )
             } else {
                 crate::tcp::chain_builder::try_build_client_proxy_chain(
-                    crate::option_util::OneOrSome::One(crate::config::ClientChainHop::Single(
-                        crate::config::ConfigSelection::Config(client),
+                    crate::option_util::OneOrSome::One(crate::config::ResolvedClientHop::Single(
+                        crate::config::test_support::client(client),
                     )),
                     resolver.clone(),
                 )

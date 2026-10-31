@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::{Config, ResolvedClientProxyConfig, ServerProxyConfig};
 use serde_json::{Value, json};
 
 fn key(byte: u8) -> String {
@@ -526,7 +527,7 @@ fn copied_clients_share_after_defaults_and_normalization() {
     let mut ids = Vec::new();
     validated
         .visit_clients(&mut |client| {
-            if let ClientProxyConfig::Wireguard(config) = &client.protocol {
+            if let ResolvedClientProxyConfig::Wireguard(config) = &client.protocol {
                 ids.push(config.endpoint_id.clone());
             }
             Ok(())
@@ -640,14 +641,14 @@ fn simplification_round_robin_carrier_names_do_not_affect_device_identity() {
 
 #[test]
 fn carrier_mtu_checks_single_hop_choice_members() {
-    use crate::config::ClientChain;
+    use crate::config::ResolvedClientChain as ClientChain;
     use crate::option_util::OneOrSome;
 
     for mtu in [1359, 1360] {
         let mut carrier = client();
         carrier["protocol"]["mtu"] = json!(mtu);
-        let single: ClientChain = serde_json::from_value(json!([carrier])).unwrap();
-        let multiple: ClientChain = serde_json::from_value(json!([
+        let single: ClientChain = crate::config::test_support::from_json(json!([carrier])).unwrap();
+        let multiple: ClientChain = crate::config::test_support::from_json(json!([
             carrier,
             {"address":"192.0.2.1:1080", "protocol":{"type":"socks"}}
         ]))

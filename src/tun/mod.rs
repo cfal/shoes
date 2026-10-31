@@ -77,8 +77,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::address::{Address, NetLocation};
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::config::TunConfig;
-use crate::config::selection::ConfigSelection;
+use crate::config::ResolvedTunConfig;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
@@ -376,14 +375,14 @@ async fn handle_udp_packets(
 
 /// Start TUN server based on the provided configuration.
 pub async fn start_tun_server(
-    config: TunConfig,
+    config: ResolvedTunConfig,
     resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
 ) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
     start_tun_server_with_fd_ownership(config, resolver, true).await
 }
 
 pub(crate) async fn start_tun_server_with_fd_ownership(
-    config: TunConfig,
+    config: ResolvedTunConfig,
     resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
     close_fd_on_drop: bool,
 ) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
@@ -392,7 +391,7 @@ pub(crate) async fn start_tun_server_with_fd_ownership(
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn start_tun_server_retained(
-    config: TunConfig,
+    config: ResolvedTunConfig,
     resolver: Arc<dyn Resolver>,
     retained: Arc<RetainedDevice>,
     tcp_admission: Option<Arc<Semaphore>>,
@@ -410,7 +409,7 @@ pub(crate) async fn start_tun_server_retained(
 }
 
 async fn start_tun(
-    config: TunConfig,
+    config: ResolvedTunConfig,
     resolver: Arc<dyn Resolver>,
     close_fd_on_drop: bool,
     retained: Option<RetainedIngress>,
@@ -447,7 +446,7 @@ async fn start_tun(
 /// Run TUN server from config with external shutdown control.
 #[allow(dead_code)]
 pub async fn run_tun_from_config(
-    config: TunConfig,
+    config: ResolvedTunConfig,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     close_fd_on_drop: bool,
     resolver: Arc<dyn Resolver>,
@@ -464,7 +463,7 @@ pub async fn run_tun_from_config(
 }
 
 async fn run_tun_from_config_inner(
-    config: TunConfig,
+    config: ResolvedTunConfig,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     close_fd_on_drop: bool,
     resolver: Arc<dyn Resolver>,
@@ -524,14 +523,10 @@ async fn run_tun_from_config_inner(
 }
 
 pub(crate) fn proxy_selector(
-    config: &TunConfig,
+    config: &ResolvedTunConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Arc<ClientProxySelector>> {
-    let rules = config
-        .rules
-        .clone()
-        .map(ConfigSelection::unwrap_config)
-        .into_vec();
+    let rules = config.rules.clone().into_vec();
     let mut selector =
         create_tcp_client_proxy_selector(rules, resolver.clone())?.with_sniff(config.sniff);
     if let Some(enabled) = config.dns_hijack.or(config.auto_route.then_some(true)) {
@@ -545,12 +540,9 @@ mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
 
-    fn compiled_config(yaml: &str) -> TunConfig {
-        let mut config: TunConfig = serde_yaml::from_str(yaml).unwrap();
+    fn compiled_config(yaml: &str) -> ResolvedTunConfig {
+        let mut config: ResolvedTunConfig = crate::config::test_support::from_yaml(yaml).unwrap();
         for rule in config.rules.iter_mut() {
-            let ConfigSelection::Config(rule) = rule else {
-                panic!("test config contains an unexpanded rule group")
-            };
             rule.compile(&mut crate::rules::Compiler::default())
                 .unwrap();
         }
@@ -667,7 +659,7 @@ mod tests {
     async fn proxy_handshake_bytes_reach_the_tun_connection_before_relay_data() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let rule: crate::config::RuleConfig = serde_yaml::from_str(&format!(
+        let rule: crate::config::ResolvedRuleConfig = crate::config::test_support::from_yaml(&format!(
             "masks: '0.0.0.0/0'\nclient_proxy:\n  address: '{}'\n  protocol:\n    type: socks\n",
             proxy.local_addr().unwrap()
         ))

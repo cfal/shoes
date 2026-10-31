@@ -348,15 +348,11 @@ fn owned_group_members_preserve_programmatic_chain_shapes() {
     let selection = ConfigSelection::Config(create_test_client_config());
     let single = ClientChainHop::Single(selection.clone());
     let pool = ClientChainHop::Pool(OneOrSome::Some(vec![selection.clone(), selection.clone()]));
-    let choice = crate::config::composition::pool_choice(vec![ClientChain {
-        hops: OneOrSome::One(single.clone()),
-    }]);
     for hops in [
         OneOrSome::One(single.clone()),
         OneOrSome::Some(vec![single.clone()]),
         OneOrSome::One(pool.clone()),
         OneOrSome::Some(vec![pool, single]),
-        OneOrSome::One(choice),
     ] {
         for name in [None, Some("named".to_owned())] {
             let chain = ClientChain { hops: hops.clone() };

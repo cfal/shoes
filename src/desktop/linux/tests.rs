@@ -26,11 +26,11 @@ fn spec(redirect: bool) -> Spec {
 
 fn validated_configuration(
     config: crate::config::TunConfig,
-) -> io::Result<(crate::config::TunConfig, Spec)> {
+) -> io::Result<(crate::config::ResolvedTunConfig, Spec)> {
     let mut validated =
         crate::config::create_server_configs(vec![crate::config::Config::TunServer(config)])?;
-    let spec = Spec::from_configs(&validated.configs)?.unwrap();
-    let crate::config::Config::TunServer(config) = validated.configs.remove(0) else {
+    let spec = Spec::from_resolved_configs(&validated.configs)?.unwrap();
+    let crate::config::ResolvedConfig::TunServer(config) = validated.configs.remove(0) else {
         unreachable!()
     };
     Ok((config, spec))
@@ -654,7 +654,7 @@ async fn kernel_capture() -> io::Result<()> {
         let resolver: Arc<dyn crate::resolver::Resolver> =
             Arc::new(crate::resolver::NativeResolver::new());
         if !redirect {
-            let unexpanded = serde_json::from_value(json!({
+            let unexpanded = crate::config::test_support::from_json(json!({
                 "device_name":"unused", "rules":"unexpanded-rule"
             }))?;
             assert!(
@@ -754,12 +754,12 @@ async fn kernel_capture() -> io::Result<()> {
         }
         session.reconcile().await?;
         let index = session.record.ifindex;
-        session.validate(&[crate::config::Config::TunServer(config.clone())])?;
+        session.validate(&[crate::config::ResolvedConfig::TunServer(config.clone())])?;
         let mut changed = config.clone();
         changed.mtu += 1;
         assert!(
             session
-                .validate(&[crate::config::Config::TunServer(changed)])
+                .validate(&[crate::config::ResolvedConfig::TunServer(changed)])
                 .is_err()
         );
         for task in tasks.drain(..) {

@@ -122,14 +122,6 @@ impl Serialize for ClientGroupMember {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ClientChoice {
-    pub name: String,
-    pub group_type: GroupType,
-    pub labels: Vec<String>,
-    pub members: Vec<ClientChain>,
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum GroupType {

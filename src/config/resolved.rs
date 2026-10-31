@@ -20,6 +20,21 @@
 //! }
 //! ```
 
+//! Source routes cannot contain resolved choices.
+//! ```compile_fail
+//! use shoes::config::{ClientChainHop, resolved::ResolvedClientChoice};
+//! fn source(choice: ResolvedClientChoice) -> ClientChainHop {
+//!     ClientChainHop::Choice(Box::new(choice))
+//! }
+//! ```
+//!
+//! Executable routes cannot contain source chains.
+//! ```compile_fail
+//! use shoes::config::{ClientChain, resolved::ResolvedClientChain};
+//! fn execute(_: ResolvedClientChain) {}
+//! execute(ClientChain::default());
+//! ```
+
 use serde::Serialize;
 
 use super::GroupType;
@@ -34,7 +49,28 @@ pub type ResolvedTlsClientConfig = client::TlsClientRecord<ResolvedClientProxyCo
 pub type ResolvedWebsocketClientConfig = client::WebsocketClientRecord<ResolvedClientProxyConfig>;
 pub type ResolvedXhttpClientConfig = xhttp::XhttpClientRecord<ResolvedClientProxyConfig>;
 pub type ResolvedXhttpServerConfig = xhttp::XhttpServerRecord<ResolvedServerProxyConfig>;
-pub type ResolvedWireguardClientConfig = wireguard::WireguardClientRecord<ResolvedClientChain>;
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedWireguardClientConfig {
+    #[serde(flatten)]
+    pub(crate) settings: wireguard::WireguardClientRecord<ResolvedClientChain>,
+    #[serde(skip)]
+    pub(crate) endpoint_id: String,
+    #[serde(skip)]
+    pub(crate) connector: Option<std::sync::Arc<dyn crate::tcp::socket_connector::SocketConnector>>,
+}
+
+impl std::ops::Deref for ResolvedWireguardClientConfig {
+    type Target = wireguard::WireguardClientRecord<ResolvedClientChain>;
+    fn deref(&self) -> &Self::Target {
+        &self.settings
+    }
+}
+
+impl std::ops::DerefMut for ResolvedWireguardClientConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.settings
+    }
+}
 pub type ResolvedWireguardServerConfig = wireguard::WireguardServerRecord<ResolvedClientChain>;
 
 pub type ResolvedRuleConfig = rules::RuleRecord<ResolvedClientChain>;
@@ -58,12 +94,14 @@ pub type ResolvedShadowTlsRemoteHandshake =
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum ResolvedShadowTlsServerHandshakeConfig {
     Local(server::ShadowTlsLocalHandshake),
     Remote(ResolvedShadowTlsRemoteHandshake),
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ResolvedConfig {
     Server(ResolvedServerConfig),
     TunServer(ResolvedTunConfig),
@@ -122,6 +160,18 @@ impl Default for ResolvedClientChain {
     }
 }
 
+impl Default for ResolvedRuleConfig {
+    fn default() -> Self {
+        Self {
+            criteria: super::rules::RuleCriteria::default(),
+            action: ResolvedRuleActionConfig::Allow {
+                override_address: None,
+                client_chains: crate::option_util::NoneOrSome::One(ResolvedClientChain::default()),
+            },
+        }
+    }
+}
+
 impl ResolvedDnsConfig {
     pub fn resolved_group(&self) -> Option<&str> {
         self.group.as_deref()
@@ -129,30 +179,7 @@ impl ResolvedDnsConfig {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolved_routes_preserve_identity_serialization_shape() {
-        let source = super::super::ClientChain::default();
-        let resolved = ResolvedClientChain::default();
-        assert_eq!(
-            serde_json::to_value(source).unwrap(),
-            serde_json::to_value(&resolved).unwrap()
-        );
-        let choice = HopPlan::Choice(Box::new(ChoicePlan {
-            name: "out".into(),
-            group_type: GroupType::RoundRobin,
-            labels: vec!["direct".into()],
-            members: vec![resolved],
-        }));
-        let value = serde_json::to_value(choice).unwrap();
-        assert_eq!(value["name"], "out");
-        assert_eq!(value["labels"], serde_json::json!(["direct"]));
-        assert_eq!(value["members"][0]["chain"]["protocol"]["type"], "direct");
-        assert!(value.get("Choice").is_none());
-    }
-}
+mod tests;
 
 impl ResolvedClientConfig {
     pub fn validate_quic_key_exchange(&self, initial_hop: bool) -> std::io::Result<()> {

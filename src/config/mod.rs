@@ -14,11 +14,18 @@
 //! - [`singbox::convert_singbox_config`]: Convert sing-box configs to shoes format
 
 pub(crate) mod client_visit;
+mod compiler;
 pub(crate) mod composition;
 mod fake_dns;
+pub(crate) mod health;
+mod lower;
 mod pem;
+mod plan_ops;
 pub mod resolved;
+pub(crate) mod resolved_visit;
 pub(crate) mod rule_visit;
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -29,11 +36,14 @@ mod wireguard_devices;
 pub(crate) use fake_dns::{protects_tun_endpoints, tun_endpoint_ips, validate_tun_endpoints};
 pub use pem::convert_cert_paths;
 pub(crate) use pem::{is_pem_file_path, pem_candidate_dependencies, pem_reload_dependencies};
+pub use resolved::*;
 pub use types::*;
 #[cfg(unix)]
 pub(crate) use validate::validate_rule_bootstrap;
 pub use validate::{ValidatedConfigs, create_server_configs};
-pub(crate) use validate::{validate_client_vision_protocol, validate_server_vision};
+pub(crate) use validate::{
+    validate_resolved_client_vision_protocol, validate_resolved_server_vision,
+};
 
 fn parse_config_yaml(config_str: &str) -> Result<Vec<Config>, serde_yaml::Error> {
     use serde::de::{Deserializer, Error, SeqAccess, Visitor};

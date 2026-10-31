@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{ClientChainHop, ConfigSelection, GlobalLimits, GroupType};
+use crate::config::{GlobalLimits, GroupType, ResolvedClientHop};
 use crate::control::selection::{Choices, SelectionView};
 use crate::option_util::OneOrSome;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
@@ -55,7 +55,7 @@ impl Composition {
         self.selection.as_ref()
     }
     pub(super) fn build(
-        hops: OneOrSome<ClientChainHop>,
+        hops: OneOrSome<ResolvedClientHop>,
         resolver: Arc<dyn Resolver>,
         limits: GlobalLimits,
     ) -> io::Result<Arc<Self>> {
@@ -161,7 +161,7 @@ impl Composition {
 }
 
 fn sequence(
-    hops: OneOrSome<ClientChainHop>,
+    hops: OneOrSome<ResolvedClientHop>,
     first: bool,
     resolver: &Arc<dyn Resolver>,
     limits: GlobalLimits,
@@ -181,22 +181,19 @@ fn sequence(
 }
 
 fn node(
-    hop: ClientChainHop,
+    hop: ResolvedClientHop,
     first: bool,
     resolver: &Arc<dyn Resolver>,
     limits: GlobalLimits,
 ) -> io::Result<Node> {
     match hop {
-        ClientChainHop::Single(ConfigSelection::GroupName(name)) => Err(
-            crate::config::composition::invalid(format!("unresolved client group: {name}")),
-        ),
-        ClientChainHop::Single(ConfigSelection::Config(mut config)) => {
+        ResolvedClientHop::Single(mut config) => {
             let origin = config.control.clone();
             let direct = config.protocol.is_direct();
             let (initial, proxy, udp) = if first {
                 config.control = None;
                 let chain = crate::tcp::chain_builder::build_client_proxy_chain_with_limits(
-                    OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(config))),
+                    OneOrSome::One(ResolvedClientHop::Single(config)),
                     resolver.clone(),
                     limits,
                 )?;
@@ -219,20 +216,7 @@ fn node(
                 udp,
             }))
         }
-        ClientChainHop::Pool(pool) => node(
-            crate::config::composition::pool_choice(
-                pool.into_vec()
-                    .into_iter()
-                    .map(|selection| crate::config::ClientChain {
-                        hops: OneOrSome::One(ClientChainHop::Single(selection)),
-                    })
-                    .collect(),
-            ),
-            first,
-            resolver,
-            limits,
-        ),
-        ClientChainHop::Choice(choice) => {
+        ResolvedClientHop::Choice(choice) => {
             let mut members = Vec::new();
             for member in choice.members {
                 members.push(sequence(member.hops, first, resolver, limits)?);

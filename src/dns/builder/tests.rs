@@ -133,7 +133,7 @@ async fn native_cache_policy_distinguishes_implicit_and_explicit_system() {
         let configs =
             crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
         let mut registry = build_dns_registry(configs.dns_groups).await.unwrap();
-        let crate::config::Config::Server(server) = &configs.configs[0] else {
+        let crate::config::ResolvedConfig::Server(server) = &configs.configs[0] else {
             panic!("expected server")
         };
         let resolver = registry.get_for_server(server.dns.as_ref());

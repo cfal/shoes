@@ -50,7 +50,7 @@ async fn raw_fd_tcp_sniffs_http_and_replays_through_packet_ingress() {
     let wire = AsyncDatagram::from_std(wire).unwrap();
     let exit = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-    let rule = serde_yaml::from_str(&format!(
+    let rule = crate::config::test_support::from_yaml(&format!(
         "masks: sniff.example\naction: allow\noverride_address: 127.0.0.1:{}",
         exit.local_addr().unwrap().port(),
     ))
