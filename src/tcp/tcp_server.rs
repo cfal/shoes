@@ -30,12 +30,10 @@ async fn send_connect_failure(
     kind: std::io::ErrorKind,
 ) {
     let _ = timeout(crate::util::SHUTDOWN_TIMEOUT, async {
-        if let Some(response) = response {
-            let _ = async {
-                stream.write_all(&response(kind)).await?;
-                stream.flush().await
-            }
-            .await;
+        if let Some(response) = response
+            && stream.write_all(&response(kind)).await.is_ok()
+        {
+            let _ = stream.flush().await;
         }
         stream.shutdown().await
     })

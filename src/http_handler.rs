@@ -19,16 +19,25 @@ use crate::tcp::tcp_handler::{
 };
 
 const PROXY_AUTH_HEADER_PREFIX: &str = "proxy-authorization: basic ";
+const CONNECTION_HEADER_PREFIX: &str = "connection: ";
+const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 
 async fn authentication_challenge(
     stream: &mut Box<dyn AsyncStream>,
     version: &str,
 ) -> std::io::Result<()> {
-    stream.write_all(format!("{version} 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+    let response = format!(
+        concat!(
+            "{} 407 Proxy Authentication Required\r\n",
+            "Proxy-Authenticate: Basic realm=\"proxy\"\r\n",
+            "Content-Length: 0\r\n",
+            "Connection: close\r\n\r\n",
+        ),
+        version,
+    );
+    stream.write_all(response.as_bytes()).await?;
     stream.flush().await
 }
-const CONNECTION_HEADER_PREFIX: &str = "connection: ";
-const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 
 #[cfg(test)]
 #[path = "http2/client_proxy_tests.rs"]

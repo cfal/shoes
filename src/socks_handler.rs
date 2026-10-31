@@ -31,6 +31,7 @@ pub const ADDR_TYPE_DOMAIN_NAME: u8 = 0x03;
 pub const ADDR_TYPE_IPV6: u8 = 0x04;
 
 pub const RESULT_SUCCESS: u8 = 0x0;
+const RESULT_FAILURE: u8 = 0x01;
 
 pub const CMD_CONNECT: u8 = 0x01;
 pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
@@ -103,6 +104,11 @@ impl TcpServerHandler for SocksTcpServerHandler {
     }
 }
 
+async fn send_rejection(stream: &mut Box<dyn AsyncStream>, response: &[u8]) -> std::io::Result<()> {
+    stream.write_all(response).await?;
+    stream.flush().await
+}
+
 /// Core SOCKS5 server setup logic.
 /// Can be called from SocksTcpServerHandler or MixedTcpServerHandler.
 ///
@@ -133,8 +139,7 @@ pub async fn setup_socks_server_stream_inner(
 
     let method_len = stream_reader.read_u8(&mut server_stream).await? as usize;
     if method_len < 1 {
-        server_stream.write_all(&[VER_SOCKS5, 0xff]).await?;
-        server_stream.flush().await?;
+        send_rejection(&mut server_stream, &[VER_SOCKS5, METHOD_INVALID]).await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid method length: {method_len}"),
@@ -152,8 +157,7 @@ pub async fn setup_socks_server_stream_inner(
     };
 
     if !methods.contains(&supported_method) {
-        server_stream.write_all(&[VER_SOCKS5, 0xff]).await?;
-        server_stream.flush().await?;
+        send_rejection(&mut server_stream, &[VER_SOCKS5, METHOD_INVALID]).await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Supported SOCKS method not found",
@@ -168,8 +172,7 @@ pub async fn setup_socks_server_stream_inner(
     if let Some((target_username, target_password)) = auth_info {
         let auth_version = stream_reader.read_u8(&mut server_stream).await?;
         if auth_version != VER_AUTH {
-            server_stream.write_all(&[VER_AUTH, 1]).await?;
-            server_stream.flush().await?;
+            send_rejection(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported SOCKS auth version",
@@ -178,8 +181,7 @@ pub async fn setup_socks_server_stream_inner(
 
         let username_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if username_len == 0 {
-            server_stream.write_all(&[VER_AUTH, 1]).await?;
-            server_stream.flush().await?;
+            send_rejection(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported SOCKS username length",
@@ -194,8 +196,7 @@ pub async fn setup_socks_server_stream_inner(
 
         let password_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if password_len == 0 {
-            server_stream.write_all(&[VER_AUTH, 1]).await?;
-            server_stream.flush().await?;
+            send_rejection(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported SOCKS password length",
@@ -213,8 +214,7 @@ pub async fn setup_socks_server_stream_inner(
         let password_match = target_password.as_bytes().ct_eq(password);
 
         if username_match.unwrap_u8() == 0 || password_match.unwrap_u8() == 0 {
-            server_stream.write_all(&[VER_AUTH, 1]).await?;
-            server_stream.flush().await?;
+            send_rejection(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "SOCKS authentication failed",
@@ -258,10 +258,11 @@ pub async fn setup_socks_server_stream_inner(
 
     if connection_request[1] != CMD_CONNECT {
         let command = connection_request[1];
-        server_stream
-            .write_all(&build_error_response(REPLY_COMMAND_NOT_SUPPORTED))
-            .await?;
-        server_stream.flush().await?;
+        send_rejection(
+            &mut server_stream,
+            &build_error_response(REPLY_COMMAND_NOT_SUPPORTED),
+        )
+        .await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid command code: {command}"),
@@ -842,6 +843,11 @@ pub fn write_location_to_vec(location: &NetLocation) -> std::io::Result<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_stream::test_streams::FlushGatedStream;
+    use crate::resolver::NativeResolver;
+    use std::io;
+    use std::time::Duration;
+    use tokio::io::DuplexStream;
 
     #[tokio::test]
     async fn wildcard_udp_replies_use_control_local_address_through_wrappers() {
@@ -937,11 +943,6 @@ mod tests {
         .await
         .unwrap();
     }
-    use crate::async_stream::test_streams::FlushGatedStream;
-    use crate::resolver::NativeResolver;
-    use std::io;
-    use std::time::Duration;
-    use tokio::io::DuplexStream;
 
     /// RFC 1929 request carrying `credentials()`.
     const AUTH_REQUEST: &[u8] = b"\x01\x04user\x04pass";
