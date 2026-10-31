@@ -27,7 +27,7 @@ async fn exercise(xray: bool) -> Result<(), Box<dyn std::error::Error>> {
         let private = [42; 32];
         let public = aws_lc_rs::agreement::PrivateKey::from_private_key(&aws_lc_rs::agreement::X25519, &private)
             .unwrap().compute_public_key().unwrap();
-        for reality in [false, true] {
+        for (reality, buffer_size) in [(false, None), (false, Some(8)), (true, None)] {
             let mut ports = PortHelper::new();
             let (_, peer_port) = ports.get_localhost_listener_port();
             let (_, shoes_port) = ports.get_localhost_listener_port();
@@ -37,7 +37,8 @@ async fn exercise(xray: bool) -> Result<(), Box<dyn std::error::Error>> {
                 json!({"type": "reality", "public_key": URL_SAFE_NO_PAD.encode(public.as_ref()),
                     "short_id": "0123456789abcdef", "sni_hostname": "test.local", "vision": true, "protocol": inner})
             } else {
-                json!({"type": "tls", "verify": false, "sni_hostname": "test.local", "vision": true, "protocol": inner})
+                json!({"type": "tls", "verify": false, "sni_hostname": "test.local",
+                    "tls_buffer_size": buffer_size, "vision": true, "protocol": inner})
             };
             let mut shoes = json!([{
                 "address": format!("0.0.0.0:{shoes_port}"),
@@ -95,7 +96,7 @@ async fn exercise(xray: bool) -> Result<(), Box<dyn std::error::Error>> {
                 let mut data = data.clone();
                 data.extend_from_slice(b"\x16\x03\x03");
                 assert_eq!(client.recv_packet(Duration::from_secs(5)).await?, data,
-                    "xray={xray}, reality={reality}");
+                    "xray={xray}, reality={reality}, tls_buffer_size={buffer_size:?}");
             }
             super::tls_hybrid::echo_through_http(http_port, tcp_echo.local_addr().port()).await?;
         }

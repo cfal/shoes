@@ -264,9 +264,11 @@ pub(crate) fn build_with_limits(
             "XHTTP split modes require at least two request lanes",
         ));
     }
-    let inner = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
+    // Inner protocols keep the hop identity for verification, not default wire SNI.
+    let inner = crate::tcp::tcp_client_handler_factory::create_with_hop_context(
         *xhttp.protocol.clone(),
         &config.address,
+        None,
         resolver,
     )?;
     let client = Client::new(

@@ -27,6 +27,11 @@ impl TlsClientHandler {
         let mut connection =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())?;
         if let Some(size) = self.tls_buffer_size {
+            // Vision peers require the UUID and first frame header in one TLS record.
+            let size = match self.handler {
+                TlsInnerClientHandler::VisionVless { .. } => size.max(21),
+                TlsInnerClientHandler::Default(_) => size,
+            };
             connection.set_buffer_limit(Some(size));
         }
         Ok(connection)
@@ -218,17 +223,28 @@ impl TcpClientHandler for TlsClientHandler {
 mod tests {
     use super::*;
 
+    enum IdentityPath {
+        Tcp,
+        Udp,
+        Xhttp,
+    }
+
     #[tokio::test]
     async fn verification_uses_hop_identity_even_without_wire_sni() {
-        check_hop_identity(false).await;
+        check_hop_identity(IdentityPath::Tcp).await;
     }
 
     #[tokio::test]
     async fn udp_verification_uses_hop_identity_even_without_wire_sni() {
-        check_hop_identity(true).await;
+        check_hop_identity(IdentityPath::Udp).await;
     }
 
-    async fn check_hop_identity(udp: bool) {
+    #[tokio::test]
+    async fn xhttp_inner_tls_keeps_hop_identity_without_default_sni() {
+        check_hop_identity(IdentityPath::Xhttp).await;
+    }
+
+    async fn check_hop_identity(path: IdentityPath) {
         use crate::address::NetLocation;
         use crate::async_stream::{AsyncFlushMessage, AsyncReadMessage, AsyncWriteMessage};
         use crate::tcp::tcp_client_handler_factory::create_tcp_client_handler;
@@ -254,6 +270,8 @@ mod tests {
             }
         }
 
+        let udp = matches!(path, IdentityPath::Udp);
+        let xhttp = matches!(path, IdentityPath::Xhttp);
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             for nested in [false, true] {
                 for (hop, sni, expected, wire_sni) in [
@@ -261,7 +279,7 @@ mod tests {
                         "localhost:443",
                         "",
                         "localhost",
-                        if nested { None } else { Some("localhost") },
+                        if nested || xhttp { None } else { Some("localhost") },
                     ),
                     ("localhost:443", "sni_hostname: null", "localhost", None),
                     ("127.0.0.1:443", "", "127.0.0.1", None),
@@ -322,12 +340,22 @@ mod tests {
                             yaml
                         };
                         let handler = crate::rustls_config_util::with_test_roots(roots, || {
-                            create_tcp_client_handler(
-                                serde_yaml::from_str(&yaml).unwrap(),
-                                &hop,
-                                Arc::new(crate::resolver::NativeResolver::new()),
-                            )
-                            .unwrap()
+                            let protocol: crate::config::ClientProxyConfig =
+                                serde_yaml::from_str(&yaml).unwrap();
+                            let resolver = Arc::new(crate::resolver::NativeResolver::new());
+                            if xhttp {
+                                let config = serde_json::from_value(serde_json::json!({
+                                    "address": hop.to_string(),
+                                    "protocol": {"type": "xhttp", "protocol": protocol}
+                                }))
+                                .unwrap();
+                                crate::xhttp::connector::build(&config, resolver)
+                                    .unwrap()
+                                    .unwrap()
+                                    .1
+                            } else {
+                                create_tcp_client_handler(protocol, &hop, resolver).unwrap()
+                            }
                         });
                         let (io, peer) = tokio::io::duplex(65536);
                         let server_task = tokio::spawn(async move {

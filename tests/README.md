@@ -108,7 +108,7 @@ selection. The 1.14 releases require authentication padding to fit in their firs
 read and cannot handle this fixture's 40,000-byte auth padding. Other sing-box
 peer tests retain their existing pins.
 
-The SS2022 identity tests use Xray 26.10.29, shadowsocks-rust `ssserver` 1.25.0,
+The SS2022 identity tests use Xray 26.10.31, shadowsocks-rust `ssserver` 1.25.0,
 and sing-box 1.14.1 with multi-user Shadowsocks and SagerNet UoT. They cover
 both AES key sizes, concurrent users, ordered relays, wrong/missing/reordered
 identity rejection, large bidirectional transfers, half-close, server-first data,
