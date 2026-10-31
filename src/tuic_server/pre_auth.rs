@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
-use futures::future::{AbortHandle, Abortable, BoxFuture, FutureExt};
+use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
@@ -71,7 +71,6 @@ pub(super) enum UniCommand {
 
 pub(super) type UniReader = BoxFuture<'static, io::Result<Option<UniCommand>>>;
 pub(super) type BiReader = BoxFuture<'static, io::Result<Option<BufferedBi>>>;
-type IndexedReader<T> = BoxFuture<'static, (quinn::StreamId, io::Result<Option<T>>)>;
 
 pub(super) struct Pending {
     pub uni: Vec<UniReader>,
@@ -80,23 +79,11 @@ pub(super) struct Pending {
 
 #[derive(Default)]
 struct Readers {
-    victims: BTreeMap<quinn::StreamId, AbortHandle>,
     authenticating: bool,
     #[cfg(test)]
     polls: usize,
-}
-
-impl Readers {
-    fn insert(&mut self, id: quinn::StreamId, limit: usize) -> futures::future::AbortRegistration {
-        if self.victims.len() >= limit
-            && let Some((_, victim)) = self.victims.pop_first()
-        {
-            victim.abort();
-        }
-        let (handle, registration) = AbortHandle::new_pair();
-        self.victims.insert(id, handle);
-        registration
-    }
+    #[cfg(test)]
+    accepted: usize,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -154,7 +141,6 @@ async fn read_uni(
                 return Err(invalid("duplicate TUIC authentication"));
             }
             readers.authenticating = true;
-            readers.victims.remove(&stream.id());
         }
         let mut credentials = [0; 48];
         AsyncReadExt::read_exact(&mut stream, &mut credentials).await?;
@@ -370,17 +356,15 @@ async fn collect(
     connection
         .export_keying_material(&mut token, uuid, password.as_bytes())
         .map_err(|e| io::Error::other(format!("Failed to export keying material: {e:?}")))?;
-    let mut bi_victims = Readers::default();
-    let mut uni_reads: FuturesUnordered<IndexedReader<UniCommand>> = FuturesUnordered::new();
-    let mut bi_reads: FuturesUnordered<IndexedReader<BufferedBi>> = FuturesUnordered::new();
+    let mut uni_reads: FuturesUnordered<UniReader> = FuturesUnordered::new();
+    let mut bi_reads: FuturesUnordered<BiReader> = FuturesUnordered::new();
     let mut uni = Vec::new();
     let mut bi = Vec::new();
     let authenticated = CancellationToken::new();
     loop {
         tokio::select! {
             biased;
-            Some((id, result)) = uni_reads.next(), if !uni_reads.is_empty() => {
-                readers.lock().victims.remove(&id);
+            Some(result) = uni_reads.next(), if !uni_reads.is_empty() => {
                 match result? {
                     Some(UniCommand::Authenticate(credentials)) => {
                         if !bool::from(credentials[..16].ct_eq(uuid) & credentials[16..].ct_eq(&token)) {
@@ -389,26 +373,26 @@ async fn collect(
                         authenticated.cancel();
                         connection.set_max_concurrent_uni_streams((settings.uni_streams as u32).into());
                         let uni = uni.into_iter().map(|command| futures::future::ready(Ok(Some(command))).boxed())
-                            .chain(uni_reads.into_iter().map(|reader| async move { reader.await.1 }.boxed())).collect();
+                            .chain(uni_reads).collect();
                         let bi = bi.into_iter().map(|stream| futures::future::ready(Ok(Some(stream))).boxed())
-                            .chain(bi_reads.into_iter().map(|reader| async move { reader.await.1 }.boxed())).collect();
+                            .chain(bi_reads).collect();
                         return Ok(Pending { uni, bi });
                     }
                     Some(command) if uni.len() < settings.uni_streams => uni.push(command),
                     _ => {},
                 }
             },
-            Some((id, result)) = bi_reads.next(), if !bi_reads.is_empty() => {
-                bi_victims.victims.remove(&id);
-                if let Some(stream) = result? && bi.len() < settings.bi_streams { bi.push(stream); }
+            Some(result) = bi_reads.next(), if !bi_reads.is_empty() => {
+                if let Some(stream) = result? { bi.push(stream); }
             },
             stream = connection.accept_uni(), if uni_reads.len() <= settings.uni_streams => {
                 let stream = stream?;
-                let id = stream.id();
-                let registration = readers.lock().insert(id, settings.uni_streams);
+                // An unread stream may be AUTH whose first bytes were delayed; only complete
+                // commands or budget-denied bodies are discarded before the auth deadline.
                 let reader = read_uni(stream, Some((budget.clone(), readers.clone()))).boxed();
                 #[cfg(test)]
                 let reader = {
+                    readers.lock().accepted += 1;
                     let mut reader = reader;
                     let counter = readers.clone();
                     std::future::poll_fn(move |cx| {
@@ -416,14 +400,12 @@ async fn collect(
                         reader.as_mut().poll(cx)
                     }).boxed()
                 };
-                uni_reads.push(async move { (id, Abortable::new(reader, registration).await.unwrap_or(Ok(None))) }.boxed());
+                uni_reads.push(reader);
             },
-            stream = connection.accept_bi(), if bi_reads.len() <= settings.bi_streams => {
+            stream = connection.accept_bi(), if bi_reads.len() + bi.len() < settings.bi_streams => {
                 let (send, recv) = stream?;
-                let id = recv.id();
-                let registration = bi_victims.insert(id, settings.bi_streams);
                 let reader = read_bi(ResetOnDrop(Some(send)), recv, connection.remote_address(), budget.clone(), authenticated.clone());
-                bi_reads.push(async move { (id, Abortable::new(reader, registration).await.unwrap_or(Ok(None))) }.boxed());
+                bi_reads.push(reader.boxed());
             },
         }
     }
@@ -517,7 +499,7 @@ mod tests {
                     let mut stream = client.open_uni().await.unwrap();
                     stream.write_all(&[5]).await.unwrap();
                     streams.push(stream);
-                    while readers.lock().victims.len() != index + 1 {
+                    while readers.lock().accepted != index + 1 {
                         tokio::task::yield_now().await;
                     }
                 }
@@ -648,6 +630,52 @@ mod tests {
                 Err(quinn::ReadError::Reset(_))
             ));
             assert_eq!(send.stopped().await.unwrap(), Some(0u32.into()));
+            assert_eq!(budget.snapshot().active, 0);
+            client.close(0u32.into(), b"done");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_hands_off_a_partially_read_body_without_loss() {
+        timeout(Duration::from_secs(5), async {
+            let limits = GlobalLimits::default();
+            let settings = Settings::new(limits);
+            let (client, server, _endpoints) = pair(limits).await;
+            let budget = Arc::new(Budget::new(Some(settings.bytes)));
+            let task = tokio::spawn({
+                let budget = budget.clone();
+                async move {
+                    collect(
+                        &server,
+                        &UUID,
+                        PASSWORD,
+                        settings,
+                        budget,
+                        Arc::new(Mutex::new(Readers::default())),
+                    )
+                    .await
+                }
+            });
+            let mut packet = vec![5, 2, 0, 1, 0, 1, 1, 0, 64, 0, 0xff];
+            packet.extend((0..16384).map(|index| (index % 251) as u8));
+            let mut stream = client.open_uni().await.unwrap();
+            stream.write_all(&packet[..139]).await.unwrap();
+            while budget.snapshot().active == 0 {
+                tokio::task::yield_now().await;
+            }
+            send_auth(&client).await;
+            let mut pending = task.await.unwrap().unwrap();
+            assert_eq!(pending.uni.len(), 1);
+            let reader = tokio::spawn(pending.uni.pop().unwrap());
+            stream.write_all(&packet[139..]).await.unwrap();
+            let Some(UniCommand::Data(data)) = reader.await.unwrap().unwrap() else {
+                panic!("expected packet");
+            };
+            assert_eq!(data, packet);
+            assert_eq!(budget.snapshot().active, packet.len());
+            drop(data);
             assert_eq!(budget.snapshot().active, 0);
             client.close(0u32.into(), b"done");
         })

@@ -1563,6 +1563,46 @@ mod auth_tests {
     }
 
     #[tokio::test]
+    async fn delayed_auth_is_not_evicted_by_higher_stream_ids() {
+        timeout(Duration::from_secs(10), async {
+            for limit in [1, 2] {
+                for prefix_len in [0, 1] {
+                    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let peer = direct_peer(crate::config::GlobalLimits {
+                        max_streams_per_connection: Some(limit),
+                        quic_receive_window: 65536,
+                        quic_stream_window: 16384,
+                        ..Default::default()
+                    })
+                    .await;
+                    let command = authenticate_command(&peer.connection, PASSWORD);
+                    let mut auth = peer.connection.open_uni().await.unwrap();
+                    auth.write_all(&command[..prefix_len]).await.unwrap();
+                    let mut partials = Vec::new();
+                    for _ in 1..limit {
+                        partials.push(peer.connection.open_uni().await.unwrap());
+                    }
+                    let mut data = peer.connection.open_uni().await.unwrap();
+                    data.write_all(&packet(socket.local_addr().unwrap(), b"reordered"))
+                        .await
+                        .unwrap();
+                    // A higher stream ID implicitly opens earlier streams before their bytes arrive.
+                    assert_eq!(data.stopped().await.unwrap(), Some(0u32.into()));
+                    auth.write_all(&command[prefix_len..]).await.unwrap();
+                    let mut response = [0; 32];
+                    let len = socket.recv(&mut response).await.unwrap();
+                    assert_eq!(&response[..len], b"reordered");
+                    tcp_roundtrip(&peer).await;
+                    peer.connection.close(0u32.into(), b"done");
+                    let _ = peer.server.await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn stalled_headers_and_split_auth_keep_a_control_slot() {
         timeout(Duration::from_secs(15), async {
             for limit in [1, 4] {
@@ -1646,7 +1686,6 @@ mod auth_tests {
                     assert_eq!(send.stopped().await.unwrap(), Some(0u32.into()));
                 } else {
                     write.unwrap();
-                    send.finish().unwrap();
                 }
                 assert!(
                     timeout(Duration::from_millis(20), listener.accept())
@@ -1672,6 +1711,7 @@ mod auth_tests {
                     );
                 } else {
                     let (mut socket, _) = listener.accept().await.unwrap();
+                    send.finish().unwrap();
                     let echo = tokio::spawn(async move {
                         let mut data = Vec::new();
                         socket.read_to_end(&mut data).await.unwrap();
