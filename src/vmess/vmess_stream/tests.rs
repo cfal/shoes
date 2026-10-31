@@ -7,6 +7,54 @@ use shake::digest::{ExtendableOutput, Update};
 use tokio::io::AsyncReadExt;
 
 #[tokio::test]
+async fn message_padding_and_rejection_preserve_masks_and_nonces() {
+    for algorithm in [None, Some(&AES_128_GCM), Some(&CHACHA20_POLY1305)] {
+        for padding in [false, true] {
+            let (transport, mut peer) = tokio::io::duplex(32768);
+            let mut writer =
+                response_test_stream(Box::new(transport), algorithm, true, padding, None);
+            let mut masks = LengthMask::new(create_shake128_reader(&[23; 16]), padding);
+            let mut opening = algorithm.map(|algorithm| {
+                OpeningKey::new(
+                    UnboundKey::new(algorithm, &vec![42; algorithm.key_len()]).unwrap(),
+                    VmessNonceSequence::new(&[23; 16]),
+                )
+            });
+            for payload in [b"first".as_slice(), b"next", b""] {
+                let invalid = vec![0; 65536];
+                assert_eq!(
+                    std::future::poll_fn(
+                        |cx| Pin::new(&mut writer).poll_write_message(cx, &invalid)
+                    )
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                    std::io::ErrorKind::InvalidInput
+                );
+                std::future::poll_fn(|cx| Pin::new(&mut writer).poll_write_message(cx, payload))
+                    .await
+                    .unwrap();
+                std::future::poll_fn(|cx| Pin::new(&mut writer).poll_flush_message(cx))
+                    .await
+                    .unwrap();
+                let (pad, mask) = masks.next_values();
+                let length = peer.read_u16().await.unwrap() ^ mask;
+                assert_eq!(length as usize, payload.len() + writer.tag_len + pad);
+                let mut bytes = vec![0; length as usize];
+                peer.read_exact(&mut bytes).await.unwrap();
+                bytes.truncate(bytes.len() - pad);
+                if let Some(opening) = &mut opening {
+                    let data = opening.open_in_place(Aad::empty(), &mut bytes).unwrap();
+                    assert_eq!(data, payload);
+                } else {
+                    assert_eq!(bytes, payload);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn full_output_chunk_is_accepted_with_or_without_pending_length() {
     for pending in [false, true] {
         let (transport, _) = tokio::io::duplex(1);
