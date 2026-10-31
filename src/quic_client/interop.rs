@@ -16,7 +16,7 @@ use crate::{
 };
 
 async fn peer(
-    protocol: serde_json::Value,
+    mut protocol: serde_json::Value,
     kind: &str,
 ) -> (
     ClientProxyChain,
@@ -46,6 +46,9 @@ async fn peer(
     if let Some(obfs) = protocol.get("obfs") {
         config["inbounds"][1]["obfs"] = obfs.clone();
     }
+    if protocol.get("hopping").is_some() {
+        protocol["hopping"]["ports"] = json!(port.to_string());
+    }
     let (process, file) =
         shoes_test_support::process::start_singbox_server(&config.to_string()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -70,6 +73,7 @@ async fn peer(
 }
 
 async fn exercise(protocol: serde_json::Value, kind: &str) {
+    let hopping = protocol.get("hopping").is_some();
     let (chain, resolver, _peer, _config) = peer(protocol, kind).await;
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let target = NetLocation::from_str(
@@ -113,6 +117,9 @@ async fn exercise(protocol: serde_json::Value, kind: &str) {
             );
         }
         let data = vec![42; 256 * 1024];
+        if hopping {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+        }
         for mut stream in streams {
             let (mut read, mut write) = tokio::io::split(&mut stream);
             let mut response = vec![0; data.len()];
@@ -132,6 +139,9 @@ async fn exercise(protocol: serde_json::Value, kind: &str) {
             );
         }
         for length in [0, 1, 1200, 4096] {
+            if hopping && length == 1200 {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+            }
             // No retries: every association must receive its own first packet.
             for (index, association) in associations.iter_mut().enumerate() {
                 let data = vec![index as u8; length];
@@ -186,6 +196,17 @@ async fn hysteria2_sing_box_salamander() {
     exercise(
         json!({"type": "hysteria2", "password": "test-password",
         "obfs": {"type": "salamander", "password": "obfs-password"}}),
+        "hysteria2",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn hysteria2_sing_box_hopping_with_salamander_keeps_existing_flows() {
+    exercise(
+        json!({"type": "hysteria2", "password": "test-password",
+        "obfs": {"type": "salamander", "password": "obfs-password"},
+        "hopping": {"ports": "peer", "interval_secs": 5}}),
         "hysteria2",
     )
     .await;

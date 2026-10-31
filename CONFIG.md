@@ -1234,6 +1234,24 @@ must use the same setting. It adds eight bytes per wire datagram; the minimum
 path UDP payload is therefore 1208 bytes. Shoes' Hysteria2 server does not yet
 implement this option.
 
+Optional port hopping uses a dedicated connection-owned endpoint:
+
+```yaml
+protocol:
+  type: hysteria2
+  password: your-password
+  hopping:
+    ports: '443,20000-30000' # Inclusive ranges, nonzero ports
+    interval_secs: 30       # Minimum 5; default 30
+    # Alternatively: min_interval_secs: 5, max_interval_secs: 30
+```
+
+All listed ports must reach the same server connection state (usually through
+server-side UDP port redirection). A hostname is resolved once per connection;
+hops retain that IP and randomly choose a destination port. Each hop creates a
+fresh protected, interface-bound socket and retains the preceding socket for
+late replies until the next hop. Hopping can be combined with Salamander.
+
 ### TUIC Client
 
 ```yaml

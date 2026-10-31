@@ -116,7 +116,48 @@ enum TransportConfig {
         sni_hostname: Option<String>,
         endpoints: Vec<Arc<QuicEndpoint>>,
         next_endpoint_index: AtomicU8,
+        hopping: Option<Box<HoppingEndpoint>>,
     },
+}
+
+#[derive(Debug)]
+struct HoppingEndpoint {
+    settings: crate::config::quic_client::HoppingConfig,
+    obfs: Option<crate::config::quic_client::Obfuscation>,
+    config: quinn::ClientConfig,
+    memory_bytes: usize,
+    socket_buffer: usize,
+}
+
+impl HoppingEndpoint {
+    fn open(
+        &self,
+        address: SocketAddr,
+        bind_interface: Option<String>,
+    ) -> std::io::Result<Arc<QuicEndpoint>> {
+        let obfs = self.obfs.clone();
+        let socket_buffer = self.socket_buffer;
+        let factory = Arc::new(move || {
+            let socket = new_udp_socket(address.is_ipv6(), bind_interface.clone())?.into_std()?;
+            crate::socket_util::set_udp_socket_buffers(
+                socket2::SockRef::from(&socket),
+                socket_buffer,
+            );
+            let mut socket = quinn::TokioRuntime.wrap_udp_socket(socket)?;
+            if let Some(obfs) = &obfs {
+                socket = crate::quic_client::salamander::Salamander::wrap(
+                    socket,
+                    obfs.password().clone(),
+                );
+            }
+            Ok(socket)
+        });
+        let socket = crate::quic_client::hop::HoppingSocket::new(factory, address, &self.settings)?;
+        let mut endpoint =
+            QuicEndpoint::with_abstract_socket(None, socket, self.memory_bytes, None)?;
+        endpoint.set_default_client_config(self.config.clone());
+        Ok(Arc::new(endpoint))
+    }
 }
 
 /// Implementation of SocketConnector for TCP and QUIC transports.
@@ -228,6 +269,10 @@ impl SocketConnectorImpl {
                     crate::config::ClientProxyConfig::Hysteria2(config) => config.obfs.clone(),
                     _ => None,
                 };
+                let hopping = match &config.protocol {
+                    crate::config::ClientProxyConfig::Hysteria2(config) => config.hopping.clone(),
+                    _ => None,
+                };
                 let is_tuic = matches!(config.protocol, crate::config::ClientProxyConfig::Tuic(_));
                 let alpn_protocols = if (is_xhttp || is_native) && alpn_protocols.is_unspecified() {
                     vec!["h3".to_owned()]
@@ -285,7 +330,9 @@ impl SocketConnectorImpl {
 
                 quinn_client_config.transport_config(Arc::new(transport_config));
 
-                let endpoints_len = if is_native {
+                let endpoints_len = if hopping.is_some() {
+                    0
+                } else if is_native {
                     1
                 } else {
                     std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS)
@@ -321,6 +368,15 @@ impl SocketConnectorImpl {
                     sni_hostname,
                     endpoints,
                     next_endpoint_index: AtomicU8::new(0),
+                    hopping: hopping.map(|settings| {
+                        Box::new(HoppingEndpoint {
+                            settings,
+                            obfs,
+                            config: quinn_client_config,
+                            memory_bytes,
+                            socket_buffer: limits.quic_socket_buffer,
+                        })
+                    }),
                 }
             }
         };
@@ -351,6 +407,7 @@ impl SocketConnectorImpl {
             endpoints,
             next_endpoint_index,
             sni_hostname,
+            hopping,
         } = &self.transport
         else {
             return Err(std::io::Error::new(
@@ -369,9 +426,13 @@ impl SocketConnectorImpl {
         let domain = sni_hostname.as_deref().unwrap_or(&verification_name);
         let mut last_error = std::io::Error::other("no resolved addresses succeeded");
         for address in addresses {
-            let index =
-                next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
-            let endpoint = endpoints[index].clone();
+            let endpoint = if let Some(hopping) = hopping {
+                hopping.open(address, self.bind_interface.clone())?
+            } else {
+                let index =
+                    next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
+                endpoints[index].clone()
+            };
             let result = match endpoint.connect(address, domain) {
                 Ok(connecting) => {
                     tokio::time::timeout(std::time::Duration::from_secs(5), connecting)

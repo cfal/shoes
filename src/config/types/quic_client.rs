@@ -18,6 +18,8 @@ pub struct Hysteria2ClientConfig {
     pub password: Secret,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obfs: Option<Obfuscation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hopping: Option<HoppingConfig>,
     #[serde(default = "super::common::default_true")]
     pub udp_enabled: bool,
 }
@@ -36,6 +38,10 @@ impl Hysteria2ClientConfig {
                 "Salamander password must contain at least 4 bytes",
             ));
         }
+        if let Some(hopping) = &self.hopping {
+            hopping.parse_ports()?;
+            hopping.interval()?;
+        }
         Ok(())
     }
 }
@@ -51,6 +57,68 @@ impl Obfuscation {
         match self {
             Self::Salamander { password } => password,
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoppingConfig {
+    pub ports: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_interval_secs: Option<u64>,
+}
+
+impl HoppingConfig {
+    pub(crate) fn parse_ports(&self) -> io::Result<Vec<u16>> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid HY2 hopping ports: expected ports or inclusive start-end ranges in 1..65535",
+            )
+        };
+        let mut ports = std::collections::BTreeSet::new();
+        for part in self.ports.split(',') {
+            let (start, end) = part.split_once('-').unwrap_or((part, part));
+            let start: u16 = start.trim().parse().map_err(|_| invalid())?;
+            let end: u16 = end.trim().parse().map_err(|_| invalid())?;
+            if start == 0 || end < start {
+                return Err(invalid());
+            }
+            ports.extend(start..=end);
+        }
+        Ok(ports.into_iter().collect())
+    }
+
+    pub(crate) fn interval(&self) -> io::Result<(u64, u64)> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HY2 hopping requires interval_secs (default 30) or an ordered min_interval_secs/max_interval_secs pair, at least 5 seconds",
+            )
+        };
+        let (min, max) = match (
+            self.interval_secs,
+            self.min_interval_secs,
+            self.max_interval_secs,
+        ) {
+            (None, None, None) => (30, 30),
+            (Some(interval), None, None) => (interval, interval),
+            (None, Some(min), Some(max)) => (min, max),
+            _ => return Err(invalid()),
+        };
+        if min < 5
+            || max < min
+            || std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(max))
+                .is_none()
+        {
+            return Err(invalid());
+        }
+        Ok((min, max))
     }
 }
 
@@ -105,6 +173,7 @@ impl TuicClientConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::HoppingConfig;
     use crate::config::{ClientConfig, Transport};
 
     #[test]
@@ -141,6 +210,35 @@ mod tests {
         ] {
             let config = serde_yaml::from_str(&invalid).unwrap();
             assert!(crate::quic_client::validate(&config, true).is_err());
+        }
+    }
+
+    #[test]
+    fn hopping_ranges_and_intervals_are_validated() {
+        let mut config = HoppingConfig {
+            ports: "443, 1000-1002,443,65535".into(),
+            interval_secs: None,
+            min_interval_secs: None,
+            max_interval_secs: None,
+        };
+        assert_eq!(
+            config.parse_ports().unwrap(),
+            [443, 1000, 1001, 1002, 65535]
+        );
+        assert_eq!(config.interval().unwrap(), (30, 30));
+        config.min_interval_secs = Some(5);
+        config.max_interval_secs = Some(10);
+        assert_eq!(config.interval().unwrap(), (5, 10));
+        config.interval_secs = Some(5);
+        assert!(config.interval().is_err());
+        config.interval_secs = None;
+        config.max_interval_secs = None;
+        assert!(config.interval().is_err());
+        config.max_interval_secs = Some(4);
+        assert!(config.interval().is_err());
+        for ports in ["", "0", "443,0", "65536", "3-1", "1-", "1:3"] {
+            config.ports = ports.into();
+            assert!(config.parse_ports().is_err());
         }
     }
 }

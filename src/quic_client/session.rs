@@ -204,6 +204,7 @@ mod tests {
         Protocol::Hysteria2(Hysteria2ClientConfig {
             password: Secret("test".into()),
             obfs: None,
+            hopping: None,
             udp_enabled: true,
         })
     }
