@@ -273,7 +273,7 @@ impl ProxyConnector for Proxy {
     fn proxy_location(&self) -> &NetLocation {
         &self.location
     }
-    fn supports_udp_over_tcp(&self) -> bool {
+    fn supports_udp(&self) -> bool {
         true
     }
     fn needs_carrier_dialer(&self) -> bool {

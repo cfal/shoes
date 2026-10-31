@@ -81,7 +81,7 @@ impl InitialHopEntry {
     pub fn supports_udp(&self) -> bool {
         match self {
             InitialHopEntry::Direct(_) | InitialHopEntry::Wireguard(_) => true,
-            InitialHopEntry::Proxy { proxy, .. } => proxy.supports_udp_over_tcp(),
+            InitialHopEntry::Proxy { proxy, .. } => proxy.supports_udp(),
         }
     }
 }
@@ -622,7 +622,7 @@ impl ClientProxyChain {
             let indices = final_hop
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| p.supports_udp_over_tcp())
+                .filter(|(_, p)| p.supports_udp())
                 .map(|(i, _)| i)
                 .collect();
             (indices, false)
@@ -1083,7 +1083,7 @@ impl CarrierDialer for PrefixDialer {
         if self.route.last_proxy().is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "HTTP/3 requires a first-hop QUIC carrier",
+                "native QUIC requires a first-hop QUIC carrier",
             ));
         }
         self.route

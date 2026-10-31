@@ -21,7 +21,7 @@ pub trait CarrierDialer: Debug + Send + Sync {
     async fn open_quic(&self) -> io::Result<QuicCarrier> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "HTTP/3 requires a first-hop QUIC carrier",
+            "native QUIC requires a first-hop QUIC carrier",
         ))
     }
 }

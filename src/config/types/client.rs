@@ -349,6 +349,8 @@ impl<'de> Deserialize<'de> for ClientConfig {
         let transport = fields.transport.unwrap_or_else(|| {
             if fields.protocol.is_wireguard() {
                 Transport::Udp
+            } else if fields.protocol.is_native_quic() {
+                Transport::Quic
             } else {
                 Transport::Tcp
             }
@@ -414,6 +416,8 @@ pub enum ClientProxyConfig {
     SudokuMask(crate::sudoku_mask::SudokuMaskConfig<ClientProxyConfig>),
     Direct,
     Wireguard(Box<super::wireguard::WireguardClientConfig>),
+    #[serde(alias = "hy2")]
+    Hysteria2(super::quic_client::Hysteria2ClientConfig),
     Http {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
@@ -565,6 +569,10 @@ pub enum ClientProxyConfig {
 }
 
 impl ClientProxyConfig {
+    pub fn is_native_quic(&self) -> bool {
+        matches!(self, Self::Hysteria2(_))
+    }
+
     pub fn is_wireguard(&self) -> bool {
         matches!(self, Self::Wireguard(_))
     }
@@ -579,6 +587,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::SudokuMask(_) => "Sudoku mask",
             ClientProxyConfig::Direct => "Direct",
             ClientProxyConfig::Wireguard(_) => "WireGuard",
+            ClientProxyConfig::Hysteria2(_) => "Hysteria2",
             ClientProxyConfig::Http { .. } => "HTTP",
             ClientProxyConfig::Socks { .. } => "SOCKS5",
             ClientProxyConfig::Shadowsocks { .. } => "Shadowsocks",

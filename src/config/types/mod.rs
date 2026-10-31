@@ -19,6 +19,7 @@ pub mod common;
 pub mod dns;
 pub mod global;
 pub mod groups;
+pub mod quic_client;
 pub mod rules;
 pub mod selection;
 pub mod server;

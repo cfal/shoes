@@ -1199,6 +1199,35 @@ socket settings. See [WireGuard](#wireguard) for their protocol fields.
 
 ## Client Protocols
 
+### Hysteria2 Client
+
+```yaml
+address: proxy.example.com:443
+quic_settings:
+  sni_hostname: proxy.example.com
+  verify: true
+protocol:
+  type: hysteria2 # alias: hy2
+  password: your-password
+  udp_enabled: true
+```
+
+Transport defaults to QUIC and ALPN to `h3`. TLS verification, certificate
+fingerprints, client certificates, and key-exchange groups use `quic_settings`.
+The protocol must be outermost at chain hop 0. It can carry subsequent
+stream-based proxies, but cannot follow another proxy or run inside TLS,
+WebSocket, or another stream wrapper.
+
+TCP streams and UDP associations share an authenticated connection. Connection
+replacement never migrates existing flows or replays application bytes. UDP
+queues and fragmented-packet reassembly are bounded; overload drops packets.
+UDP requires permission from the server. TCP target errors surface when reading
+the response, allowing application writes before the server's success response.
+
+Congestion control is adaptive (Quinn's default CUBIC), with unknown receive
+bandwidth advertised as zero. Brutal and fixed-bandwidth negotiation are not
+implemented; `up_mbps`, `down_mbps`, and 0-RTT options are rejected.
+
 ### Direct
 ```yaml
 protocol:

@@ -7,7 +7,7 @@ use crate::config::ConfigSelection;
 use crate::config::{ClientChainHop, ClientConfig};
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
-use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
+use crate::tcp::proxy_connector_impl::create_proxy_connector;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 
@@ -31,8 +31,8 @@ pub(crate) fn supports_udp_offline(chain: &crate::config::ClientChain) -> std::i
         };
         supports_udp |= config.protocol.is_direct()
             || config.protocol.is_wireguard()
-            || ProxyConnectorImpl::from_config(config.clone(), resolver.clone())?
-                .is_some_and(|proxy| proxy.supports_udp_over_tcp());
+            || create_proxy_connector(config.clone(), resolver.clone())?
+                .is_some_and(|proxy| proxy.supports_udp());
     }
     Ok(supports_udp)
 }
@@ -96,6 +96,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
         for config in configs {
             crate::sudoku_mask::validate_client(&config.protocol, &config.transport)?;
             config.validate_quic_key_exchange(index == 0)?;
+            crate::quic_client::validate(config, index == 0)?;
         }
     }
     crate::config::health::validate_chain(hops.iter().map(|hop| hop.iter()))?;
@@ -147,9 +148,8 @@ pub(crate) fn build_client_proxy_chain_with_limits(
                 Ok(InitialHopEntry::Direct(socket))
             } else {
                 // Proxy: socket + proxy paired
-                let proxy = ProxyConnectorImpl::from_config(config.clone(), resolver.clone())?
-                    .map(|p| Box::new(p) as Box<dyn ProxyConnector>)
-                    .ok_or_else(|| {
+                let proxy =
+                    create_proxy_connector(config.clone(), resolver.clone())?.ok_or_else(|| {
                         std::io::Error::other(
                             "Missing proxy connector for non-direct configuration",
                         )
@@ -187,8 +187,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
                         ));
                     }
 
-                    ProxyConnectorImpl::from_config(config, resolver.clone())?
-                        .map(|p| Box::new(p) as Box<dyn ProxyConnector>)
+                    create_proxy_connector(config, resolver.clone())?
                         .ok_or_else(|| std::io::Error::other("Missing proxy connector for subsequent hop"))
                 })
                 .collect::<std::io::Result<_>>()

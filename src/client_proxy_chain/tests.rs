@@ -65,7 +65,7 @@ impl ProxyConnector for ReusableProxy {
     fn proxy_location(&self) -> &NetLocation {
         &self.location
     }
-    fn supports_udp_over_tcp(&self) -> bool {
+    fn supports_udp(&self) -> bool {
         false
     }
     async fn try_reuse_tcp_stream(
@@ -152,7 +152,7 @@ impl ProxyConnector for MockProxyConnector {
         &self.location
     }
 
-    fn supports_udp_over_tcp(&self) -> bool {
+    fn supports_udp(&self) -> bool {
         self.supports_udp
     }
 

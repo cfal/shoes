@@ -222,7 +222,8 @@ impl SocketConnectorImpl {
                 });
 
                 let is_xhttp = crate::xhttp::connector::contains(&config.protocol);
-                let alpn_protocols = if is_xhttp && alpn_protocols.is_unspecified() {
+                let is_native = config.protocol.is_native_quic();
+                let alpn_protocols = if (is_xhttp || is_native) && alpn_protocols.is_unspecified() {
                     vec!["h3".to_owned()]
                 } else {
                     alpn_protocols.into_vec()
@@ -253,7 +254,9 @@ impl SocketConnectorImpl {
                 );
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
-                    .max_concurrent_uni_streams(if is_xhttp { 16_u32 } else { 0 }.into())
+                    .max_concurrent_uni_streams(
+                        if is_xhttp || is_native { 16_u32 } else { 0 }.into(),
+                    )
                     .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
                     .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
                 if is_xhttp {
@@ -264,7 +267,11 @@ impl SocketConnectorImpl {
 
                 quinn_client_config.transport_config(Arc::new(transport_config));
 
-                let endpoints_len = std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS);
+                let endpoints_len = if is_native {
+                    1
+                } else {
+                    std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS)
+                };
                 let mut endpoints = Vec::with_capacity(endpoints_len);
 
                 for _ in 0..endpoints_len {
@@ -332,16 +339,20 @@ impl SocketConnectorImpl {
         if address.address().hostname().is_some() {
             addresses.sort_by_key(SocketAddr::is_ipv6);
         }
-        let domain = sni_hostname
-            .as_deref()
-            .unwrap_or_else(|| address.address().hostname().unwrap_or("example.com"));
+        let verification_name = address.address().to_string();
+        let domain = sni_hostname.as_deref().unwrap_or(&verification_name);
         let mut last_error = std::io::Error::other("no resolved addresses succeeded");
         for address in addresses {
             let index =
                 next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
             let endpoint = endpoints[index].clone();
             let result = match endpoint.connect(address, domain) {
-                Ok(connecting) => connecting.await.map_err(std::io::Error::other),
+                Ok(connecting) => {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+                        .await
+                        .map_err(std::io::Error::from)
+                        .and_then(|result| result.map_err(std::io::Error::other))
+                }
                 Err(error) => Err(std::io::Error::other(error)),
             };
             let result = match result {

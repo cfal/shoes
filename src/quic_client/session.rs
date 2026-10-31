@@ -1,0 +1,223 @@
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
+
+use tokio::sync::watch;
+use tokio_util::task::AbortOnDropHandle;
+
+use super::{Protocol, hysteria2, udp};
+use crate::tcp::carrier_dialer::{CarrierDialer, QuicCarrier, RouteKey};
+
+pub(super) const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Debug)]
+struct Failure(Arc<io::Error>);
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for Failure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+type Outcome = Option<Result<Arc<Generation>, Failure>>;
+
+struct Slot {
+    result: watch::Receiver<Outcome>,
+    _init: AbortOnDropHandle<()>,
+}
+
+#[derive(Default)]
+pub(super) struct Pool {
+    slots: parking_lot::Mutex<HashMap<RouteKey, Slot>>,
+}
+
+impl Pool {
+    pub async fn get(
+        &self,
+        dialer: Arc<dyn CarrierDialer>,
+        protocol: Protocol,
+        udp: bool,
+    ) -> io::Result<Arc<Generation>> {
+        let mut receiver = {
+            let mut slots = self.slots.lock();
+            slots.retain(|_, slot| match &*slot.result.borrow() {
+                Some(Ok(generation)) => {
+                    generation.connection().close_reason().is_none()
+                        && (!udp || !generation.registry.lock().exhausted())
+                }
+                Some(Err(_)) => false,
+                None => true,
+            });
+            let slot = slots.entry(dialer.route_key().clone()).or_insert_with(|| {
+                let (sender, result) = watch::channel(None);
+                let init = tokio::spawn(async move {
+                    let result =
+                        tokio::time::timeout(SETUP_TIMEOUT, Generation::open(dialer, protocol))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "QUIC client setup timed out",
+                                ))
+                            })
+                            .map(Arc::new)
+                            .map_err(|error| Failure(Arc::new(error)));
+                    let _ = sender.send(Some(result));
+                });
+                Slot {
+                    result,
+                    _init: AbortOnDropHandle::new(init),
+                }
+            });
+            slot.result.clone()
+        };
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return result.map_err(|error| io::Error::new(error.0.kind(), error));
+            }
+            receiver.changed().await.map_err(|_| {
+                io::Error::new(io::ErrorKind::ConnectionAborted, "QUIC client retired")
+            })?;
+        }
+    }
+}
+
+pub(super) struct Generation {
+    carrier: QuicCarrier,
+    pub protocol: Protocol,
+    pub udp_enabled: bool,
+    pub registry: Arc<parking_lot::Mutex<udp::Registry>>,
+    tasks: Vec<AbortOnDropHandle<()>>,
+    // Retains pointer-based route identities for the entire pooled lifetime.
+    _dialer: Arc<dyn CarrierDialer>,
+}
+
+impl Generation {
+    async fn open(dialer: Arc<dyn CarrierDialer>, protocol: Protocol) -> io::Result<Self> {
+        let carrier = dialer.open_quic().await?;
+        let mut generation = Self {
+            carrier,
+            protocol,
+            udp_enabled: false,
+            registry: Arc::new(parking_lot::Mutex::new(udp::Registry::new(u32::MAX as u64))),
+            tasks: Vec::new(),
+            _dialer: dialer,
+        };
+        match &generation.protocol {
+            Protocol::Hysteria2(config) => {
+                let (enabled, task) =
+                    hysteria2::authenticate(generation.connection(), config).await?;
+                generation.udp_enabled = config.udp_enabled && enabled;
+                generation.tasks.push(task);
+            }
+        }
+        generation
+            .tasks
+            .push(AbortOnDropHandle::new(tokio::spawn(udp::receive(
+                generation.connection().clone(),
+                generation.registry.clone(),
+                generation.protocol.clone(),
+            ))));
+        Ok(generation)
+    }
+
+    pub fn connection(&self) -> &quinn::Connection {
+        &self.carrier.connection
+    }
+}
+
+impl Drop for Generation {
+    fn drop(&mut self) {
+        self.registry.lock().close();
+        self.carrier
+            .connection
+            .close(0u32.into(), b"client retired");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        async_stream::AsyncStream,
+        config::quic_client::{Hysteria2ClientConfig, Secret},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct Stalled {
+        key: RouteKey,
+        started: AtomicUsize,
+        done: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl CarrierDialer for Stalled {
+        fn route_key(&self) -> &RouteKey {
+            &self.key
+        }
+        async fn open_stream(&self) -> io::Result<Box<dyn AsyncStream>> {
+            unreachable!()
+        }
+        async fn open_quic(&self) -> io::Result<QuicCarrier> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.done.notified().await;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "test auth rejected",
+            ))
+        }
+    }
+    fn protocol() -> Protocol {
+        Protocol::Hysteria2(Hysteria2ClientConfig {
+            password: Secret("test".into()),
+            udp_enabled: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_cancel_shared_initialization_and_failures_retry() {
+        let pool = Arc::new(Pool::default());
+        let dialer = Arc::new(Stalled {
+            key: RouteKey(vec![1]),
+            started: AtomicUsize::new(0),
+            done: tokio::sync::Notify::new(),
+        });
+        let mut first = Box::pin(pool.get(dialer.clone(), protocol(), false));
+        assert!(futures::poll!(&mut first).is_pending());
+        tokio::task::yield_now().await;
+        drop(first);
+        let mut second = Box::pin(pool.get(dialer.clone(), protocol(), false));
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(dialer.started.load(Ordering::SeqCst), 1);
+        dialer.done.notify_one();
+        assert_eq!(
+            second.await.err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let mut third = Box::pin(pool.get(dialer.clone(), protocol(), false));
+        assert!(futures::poll!(&mut third).is_pending());
+        tokio::task::yield_now().await;
+        assert_eq!(dialer.started.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialization_has_a_deadline_even_without_waiters() {
+        let pool = Pool::default();
+        let dialer = Arc::new(Stalled {
+            key: RouteKey(vec![1]),
+            started: AtomicUsize::new(0),
+            done: tokio::sync::Notify::new(),
+        });
+        assert_eq!(
+            pool.get(dialer, protocol(), false)
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+}
