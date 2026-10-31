@@ -1,22 +1,124 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
+
+#[derive(Clone, Default)]
+pub(crate) struct EventFilter {
+    stamps: Arc<Mutex<HashMap<PathBuf, Option<FileStamp>>>>,
+}
+
+impl EventFilter {
+    fn seed(&self, files: &HashSet<PathBuf>) -> Vec<PathBuf> {
+        let mut stamps = self.stamps.lock();
+        let mut added = Vec::new();
+        for path in files {
+            if let std::collections::hash_map::Entry::Vacant(entry) = stamps.entry(path.clone()) {
+                entry.insert(FileStamp::read(path));
+                added.push(path.clone());
+            }
+        }
+        added
+    }
+
+    fn registered(&self, files: &HashSet<PathBuf>, added: Vec<PathBuf>, succeeded: bool) {
+        let mut stamps = self.stamps.lock();
+        if succeeded {
+            stamps.retain(|path, _| files.contains(path));
+        } else {
+            for path in added {
+                stamps.remove(&path);
+            }
+        }
+    }
+
+    fn notify<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>, tx: &mpsc::Sender<()>) {
+        let mut stamps = self.stamps.lock();
+        let mut changed = false;
+        for path in paths {
+            let current = FileStamp::read(path);
+            if let Some(previous) = stamps.get_mut(path) {
+                changed |= current.is_none() || *previous != current;
+                *previous = current;
+            } else {
+                // Retired callbacks must not recreate pruned entries.
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = tx.try_send(());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl FileStamp {
+    #[cfg(unix)]
+    fn read(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let stamp = Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        stamp
+            .reliable((
+                i64::try_from(now.as_secs()).ok()?,
+                i64::from(now.subsec_nanos()),
+            ))
+            .then_some(stamp)
+    }
+
+    #[cfg(not(unix))]
+    fn read(_path: &Path) -> Option<Self> {
+        None
+    }
+
+    #[cfg(any(unix, test))]
+    fn reliable(&self, now: (i64, i64)) -> bool {
+        // Coarse or future timestamps cannot distinguish a replay from a real rewrite.
+        (self.modified.1 % 1_000_000 != 0 || self.changed.1 % 1_000_000 != 0)
+            && self.modified <= now
+            && self.changed <= now
+    }
+}
 
 pub(crate) fn watch<P: AsRef<Path>>(
     paths: &[P],
     tx: mpsc::Sender<()>,
 ) -> io::Result<RecommendedWatcher> {
-    watch_excluding(paths, tx, None)
+    watch_excluding(paths, tx, None, None)
 }
 
 pub(crate) fn watch_excluding<P: AsRef<Path>>(
     paths: &[P],
     tx: mpsc::Sender<()>,
     excluded: Option<&Path>,
+    filter: Option<&EventFilter>,
 ) -> io::Result<RecommendedWatcher> {
     let mut files = HashSet::new();
     let mut required_directories = HashSet::new();
@@ -64,59 +166,47 @@ pub(crate) fn watch_excluding<P: AsRef<Path>>(
         .filter(|path| path.is_file())
         .collect();
     files.extend(direct_files.iter().cloned());
-    #[cfg(target_os = "macos")]
-    let initial: std::collections::HashMap<_, _> = files
-        .iter()
-        .map(|path| (path.clone(), diagnostic_stamp(path)))
-        .collect();
+    let files = Arc::new(files);
+    let event_files = files.clone();
+    let event_filter = filter.cloned();
     let mut watcher =
         notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
             Ok(event)
                 if matches!(
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) && event.paths.iter().any(|path| files.contains(path)) =>
+                ) && event.paths.iter().any(|path| event_files.contains(path)) =>
             {
-                #[cfg(target_os = "macos")]
-                for path in event.paths.iter().filter(|path| files.contains(*path)) {
-                    eprintln!(
-                        "WATCH_DIAGNOSTIC kind={:?} path={} initial={:?} current={:?}",
-                        event.kind,
-                        path.display(),
-                        initial.get(path),
-                        diagnostic_stamp(path),
+                if let Some(filter) = &event_filter {
+                    filter.notify(
+                        event
+                            .paths
+                            .iter()
+                            .filter(|path| event_files.contains(*path)),
+                        &tx,
                     );
+                } else {
+                    let _ = tx.try_send(());
                 }
-                let _ = tx.try_send(());
             }
             Err(error) => log::warn!("File watcher failed: {error}"),
             _ => {}
         })
         .map_err(io::Error::other)?;
-    register_paths(
+    // Preserve prior observations across rebuilds, including edits during bootstrap.
+    // Registration and watcher destruction must run without the callback's lock.
+    let added = filter.map_or_else(Vec::new, |filter| filter.seed(&files));
+    let result = register_paths(
         |path| watcher.watch(path, RecursiveMode::NonRecursive),
         &directories,
         &required_directories,
         &direct_files,
-    )?;
+    );
+    if let Some(filter) = filter {
+        filter.registered(&files, added, result.is_ok());
+    }
+    result?;
     Ok(watcher)
-}
-
-#[cfg(target_os = "macos")]
-fn diagnostic_stamp(path: &Path) -> Option<(u64, u64, u32, u64, i64, i64, i64, i64)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::symlink_metadata(path).ok().map(|metadata| {
-        (
-            metadata.dev(),
-            metadata.ino(),
-            metadata.mode(),
-            metadata.len(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-        )
-    })
 }
 
 fn register_paths(
@@ -258,25 +348,144 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn diagnostic_late_creation_notifications() {
-        let mut late = 0;
+    async fn new_config_watches_ignore_delayed_creation_events() {
         for _ in 0..64 {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("config.yaml");
             std::fs::write(&path, "config").unwrap();
-            let before = diagnostic_stamp(&path);
+            let filter = EventFilter::default();
             let (tx, mut changes) = mpsc::channel(1);
-            let _watcher = watch(std::slice::from_ref(&path), tx).unwrap();
-            if tokio::time::timeout(Duration::from_millis(50), changes.recv())
+            let _watcher =
+                watch_excluding(std::slice::from_ref(&path), tx, None, Some(&filter)).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), changes.recv())
+                    .await
+                    .is_err()
+            );
+            std::fs::write(&path, "config").unwrap();
+            tokio::time::timeout(Duration::from_secs(2), changes.recv())
                 .await
-                .is_ok()
-            {
-                assert_eq!(before, diagnostic_stamp(&path));
-                late += 1;
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn event_filter_requires_precise_nonfuture_timestamps() {
+        let mut stamp = FileStamp {
+            device: 1,
+            inode: 2,
+            mode: 0o100600,
+            size: 6,
+            modified: (10, 123),
+            changed: (10, 456),
+        };
+        assert!(stamp.reliable((11, 0)));
+        assert!(!stamp.reliable((10, 200)));
+        assert!(!stamp.reliable((9, 0)));
+        stamp.modified.1 = 1_000_000;
+        stamp.changed.1 = 2_000_000;
+        assert!(!stamp.reliable((11, 0)));
+        stamp.changed.1 += 1;
+        assert!(stamp.reliable((11, 0)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_filter_preserves_changes_across_rebuilds_and_coalesces_all_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        for path in [&first, &second] {
+            std::fs::write(path, "before").unwrap();
+            assert!(FileStamp::read(path).is_some());
+        }
+        let files = HashSet::from([first.clone(), second.clone()]);
+        let filter = EventFilter::default();
+        let added = filter.seed(&files);
+        filter.registered(&files, added, true);
+        let (tx, mut changes) = mpsc::channel(1);
+        filter.notify(files.iter(), &tx);
+        assert!(changes.try_recv().is_err());
+
+        std::fs::write(&first, "after").unwrap();
+        std::fs::write(&second, "after").unwrap();
+        let added = filter.seed(&files);
+        assert!(added.is_empty());
+        filter.registered(&files, added, true);
+        tx.try_send(()).unwrap();
+        filter.notify(files.iter(), &tx);
+        changes.try_recv().unwrap();
+        filter.notify(files.iter(), &tx);
+        assert!(changes.try_recv().is_err());
+
+        std::fs::File::open(&first)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::new(10, 123))
+            .unwrap();
+        filter.notify(files.iter(), &tx);
+        changes.try_recv().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_filter_registration_failure_and_retired_callbacks_preserve_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        let filter = EventFilter::default();
+        let original = HashSet::from([first.clone()]);
+        filter.seed(&original);
+        let before = filter.stamps.lock()[&first];
+        let candidate = HashSet::from([second.clone()]);
+        let added = filter.seed(&candidate);
+        filter.registered(&candidate, added, false);
+        assert_eq!(filter.stamps.lock().len(), 1);
+        assert_eq!(filter.stamps.lock()[&first], before);
+
+        let added = filter.seed(&candidate);
+        filter.registered(&candidate, added, true);
+        let (tx, mut changes) = mpsc::channel(1);
+        filter.notify(original.iter(), &tx);
+        changes.try_recv().unwrap();
+        assert!(!filter.stamps.lock().contains_key(&first));
+        assert_eq!(filter.stamps.lock().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_filter_forwards_uncertain_paths_and_keeps_channels_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        let missing = directory.path().join("missing");
+        std::fs::write(&target, "before").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let files = HashSet::from([target.clone(), link.clone(), missing.clone()]);
+        let normal = EventFilter::default();
+        let recovery = EventFilter::default();
+        normal.seed(&files);
+        recovery.seed(&files);
+        let (tx, mut changes) = mpsc::channel(1);
+        for path in [&link, &missing] {
+            for _ in 0..2 {
+                normal.notify(std::iter::once(path), &tx);
+                changes.try_recv().unwrap();
             }
         }
-        eprintln!("WATCH_DIAGNOSTIC late unchanged creation notifications: {late}/64");
-        assert!(late > 0, "no delayed native events reproduced");
+        std::fs::write(&target, "after").unwrap();
+        recovery.notify(std::iter::once(&target), &tx);
+        changes.try_recv().unwrap();
+        normal.notify(std::iter::once(&target), &tx);
+        changes.try_recv().unwrap();
+        std::fs::remove_file(&target).unwrap();
+        normal.notify(std::iter::once(&target), &tx);
+        changes.try_recv().unwrap();
+        std::fs::write(&target, "after").unwrap();
+        normal.notify(std::iter::once(&target), &tx);
+        changes.try_recv().unwrap();
     }
 
     #[cfg(target_os = "macos")]
