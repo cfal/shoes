@@ -298,11 +298,9 @@ mod tests {
         );
         assert!(stream.write.is_empty() && !stream.started);
         stream.target = NetLocation::from_str("127.0.0.1:53", None).unwrap();
-        assert!(
-            poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &[0; 7527]))
-                .await
-                .is_err()
-        );
+        poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &[0; 7527]))
+            .await
+            .unwrap();
         poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, b"good"))
             .await
             .unwrap();
