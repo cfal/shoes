@@ -64,6 +64,11 @@ pub(crate) fn watch_excluding<P: AsRef<Path>>(
         .filter(|path| path.is_file())
         .collect();
     files.extend(direct_files.iter().cloned());
+    #[cfg(target_os = "macos")]
+    let initial: std::collections::HashMap<_, _> = files
+        .iter()
+        .map(|path| (path.clone(), diagnostic_stamp(path)))
+        .collect();
     let mut watcher =
         notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
             Ok(event)
@@ -72,6 +77,16 @@ pub(crate) fn watch_excluding<P: AsRef<Path>>(
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) && event.paths.iter().any(|path| files.contains(path)) =>
             {
+                #[cfg(target_os = "macos")]
+                for path in event.paths.iter().filter(|path| files.contains(*path)) {
+                    eprintln!(
+                        "WATCH_DIAGNOSTIC kind={:?} path={} initial={:?} current={:?}",
+                        event.kind,
+                        path.display(),
+                        initial.get(path),
+                        diagnostic_stamp(path),
+                    );
+                }
                 let _ = tx.try_send(());
             }
             Err(error) => log::warn!("File watcher failed: {error}"),
@@ -85,6 +100,23 @@ pub(crate) fn watch_excluding<P: AsRef<Path>>(
         &direct_files,
     )?;
     Ok(watcher)
+}
+
+#[cfg(target_os = "macos")]
+fn diagnostic_stamp(path: &Path) -> Option<(u64, u64, u32, u64, i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().map(|metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    })
 }
 
 fn register_paths(

@@ -1,0 +1,29 @@
+name: macOS reload diagnostic
+
+on:
+  push:
+    branches: [fix/macos-stale-reload-events]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/cache/restore@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-tun-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Trace original remote-rule regressions
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --test process_contract --features ffi
+        remote_rules:: -- --test-threads=1 --nocapture

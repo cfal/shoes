@@ -554,6 +554,9 @@ impl Process {
             let tx = tx.clone();
             std::thread::spawn(move || {
                 for line in io::BufReader::new(reader).lines().map_while(Result::ok) {
+                    if line.contains("WATCH_DIAGNOSTIC") {
+                        eprintln!("{line}");
+                    }
                     if tx.send(line).is_err() {
                         break;
                     }
