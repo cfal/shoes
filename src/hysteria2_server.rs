@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use log::{debug, error, warn};
+use log::{debug, error};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
@@ -25,7 +25,7 @@ const CLOSE_ERR_CODE_OK: u32 = 0x100; // HTTP3 ErrCodeNoError
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
@@ -249,7 +249,6 @@ async fn auth_connection(
 
 struct UdpSession {
     send_socket: Arc<UdpRelay>,
-    pinned_location: Option<NetLocation>,
     cancel_token: CancellationToken,
     task: tokio::task::AbortHandle,
 }
@@ -266,8 +265,6 @@ impl UdpSession {
         session_id: u32,
         connection: quinn::Connection,
         client_socket: Arc<UdpRelay>,
-        override_local_write_location: Option<NetLocation>,
-        pinned_location: Option<NetLocation>,
         parent_cancel_token: &CancellationToken,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
@@ -280,7 +277,6 @@ impl UdpSession {
                 session_id,
                 connection,
                 client_socket,
-                override_local_write_location,
                 session_cancel_token,
             )
             .await
@@ -292,7 +288,6 @@ impl UdpSession {
 
         Self {
             send_socket,
-            pinned_location,
             cancel_token,
             task,
         }
@@ -303,22 +298,11 @@ async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
     socket: Arc<UdpRelay>,
-    override_local_write_address: Option<NetLocation>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
         .max_datagram_size()
         .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
-
-    let original_address_bytes: Option<(Bytes, Bytes)> = match override_local_write_address {
-        Some(a) => {
-            let address_bytes: Bytes = wire_address(&a).into_bytes().into();
-            let address_len = address_bytes.len();
-            let address_len_bytes = encode_varint(address_len as u64)?;
-            Some((address_bytes, address_len_bytes.into()))
-        }
-        None => None,
-    };
 
     let mut next_packet_id: u16 = 0;
     let mut loop_count: u8 = 0;
@@ -340,15 +324,8 @@ async fn run_udp_remote_to_local_loop(
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
-        let (address_bytes, address_len_bytes) = match original_address_bytes {
-            Some((ref a, ref b)) => (a.clone(), b.clone()),
-            None => {
-                let address_bytes: Bytes = wire_address(&src_addr).into_bytes().into();
-                let address_len = address_bytes.len();
-                let address_len_bytes = encode_varint(address_len as u64)?.into();
-                (address_bytes, address_len_bytes)
-            }
-        };
+        let address_bytes: Bytes = wire_address(&src_addr).into_bytes().into();
+        let address_len_bytes = encode_varint(address_bytes.len() as u64)?;
 
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
@@ -497,37 +474,6 @@ async fn run_udp_local_to_remote_loop(
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
             Entry::Vacant(entry) => {
-                let pinned_location = if client_proxy_selector.fake_dns_enabled() {
-                    // The shared router prepares and routes each destination once.
-                    None
-                } else {
-                    let action = client_proxy_selector
-                        .judge(remote_location.clone().into(), &resolver)
-                        .await;
-
-                    let (_chain_group, updated_location) = match action {
-                        Ok(ConnectDecision::Allow {
-                            chain_group,
-                            remote_location,
-                        }) => (chain_group, remote_location),
-                        Ok(ConnectDecision::Block) => {
-                            warn!("Blocked UDP forward to {remote_location}");
-                            continue;
-                        }
-                        Err(e) => {
-                            error!("Failed to judge UDP forward to {remote_location}: {e}");
-                            continue;
-                        }
-                    };
-
-                    if remote_location.address().hostname().is_some()
-                        || updated_location.location() != &remote_location
-                    {
-                        Some(remote_location.clone())
-                    } else {
-                        None
-                    }
-                };
                 let Ok(client_socket) = UdpRelay::new(
                     client_proxy_selector.clone(),
                     resolver.clone(),
@@ -540,8 +486,6 @@ async fn run_udp_local_to_remote_loop(
                     session_id,
                     connection.clone(),
                     Arc::new(client_socket),
-                    pinned_location.clone(),
-                    pinned_location,
                     &cancel_token,
                 );
                 entry.insert(session)
@@ -549,8 +493,10 @@ async fn run_udp_local_to_remote_loop(
             Entry::Occupied(ref mut entry) => entry.get_mut(),
         };
 
-        let target = session.pinned_location.clone().unwrap_or(remote_location);
-        if let Err(e) = session.send_socket.send_to(complete_payload, target) {
+        if let Err(e) = session
+            .send_socket
+            .send_to(complete_payload, remote_location)
+        {
             error!("Failed to forward UDP payload for session {session_id}: {e}");
             sessions.remove(&session_id);
         }
@@ -1200,6 +1146,73 @@ mod tcp_tests {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hostname_first_association_routes_each_datagram_and_preserves_reply_sources() {
+        #[derive(Debug)]
+        struct LocalResolver;
+        impl Resolver for LocalResolver {
+            fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
+                let port = location.port();
+                Box::pin(
+                    async move { Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))]) },
+                )
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let resolver: Arc<dyn Resolver> = Arc::new(LocalResolver);
+            let rules = serde_yaml::from_str(&format!(
+                "- mask: blocked.test\n  action: block\n- mask: rewrite.test\n  action: allow\n  override_address: '{}'\n- mask: 0.0.0.0/0\n  action: allow\n",
+                second.local_addr().unwrap())).unwrap();
+            let selector = Arc::new(crate::tcp::tcp_client_handler_factory::create_test_selector(rules, resolver.clone()).unwrap());
+            let (server, client) = crate::quic_endpoint::test_endpoints();
+            let address = server.local_addr().unwrap();
+            let token = CancellationToken::new();
+            let cancel = token.clone();
+            let task = tokio::spawn(async move {
+                let connection = server.accept().await.unwrap().await.unwrap();
+                run_udp_local_to_remote_loop(connection, selector, resolver, cancel).await.unwrap();
+            });
+            let connection = client.connect(address, "localhost").unwrap().await.unwrap();
+            let targets = [
+                format!("first.test:{}", first.local_addr().unwrap().port()),
+                second.local_addr().unwrap().to_string(),
+                "rewrite.test:123".to_owned(),
+            ];
+            for id in [1u32, 2] {
+                for (index, target) in targets.iter().enumerate() {
+                    let mut packet = id.to_be_bytes().to_vec();
+                    packet.extend_from_slice(&[0, index as u8, 0, 1, target.len() as u8]);
+                    packet.extend_from_slice(target.as_bytes());
+                    packet.extend_from_slice(b"query");
+                    connection.send_datagram(packet.into()).unwrap();
+                    let socket = if index == 0 { &first } else { &second };
+                    let mut buf = [0; 64];
+                    let (count, source) = socket.recv_from(&mut buf).await.unwrap();
+                    assert_eq!(&buf[..count], b"query");
+                    socket.send_to(b"reply", source).await.unwrap();
+                    let reply = connection.read_datagram().await.unwrap();
+                    let reply = parse_udp_packet(&reply).unwrap();
+                    assert_eq!(reply.session_id, id);
+                    assert_eq!(reply.payload, b"reply");
+                    assert_eq!(reply.location.to_string(), socket.local_addr().unwrap().to_string());
+                }
+            }
+            let target = format!("blocked.test:{}", first.local_addr().unwrap().port());
+            let mut packet = vec![0, 0, 0, 1, 0, 99, 0, 1, target.len() as u8];
+            packet.extend_from_slice(target.as_bytes());
+            packet.extend_from_slice(b"blocked");
+            connection.send_datagram(packet.into()).unwrap();
+            let mut buf = [0; 32];
+            assert!(tokio::time::timeout(Duration::from_millis(100), first.recv(&mut buf)).await.is_err());
+            assert!(tokio::time::timeout(Duration::from_millis(100), second.recv(&mut buf)).await.is_err());
+            token.cancel();
+            task.await.unwrap();
+            connection.close(0u32.into(), b"done");
+        }).await.unwrap();
+    }
 
     fn auth_request(uri: &str, method: &str, auth: Option<&[u8]>) -> http::Request<()> {
         let mut request = http::Request::builder().uri(uri).method(method);
