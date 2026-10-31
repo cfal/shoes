@@ -274,6 +274,7 @@ pub(crate) fn configure_quic_with_limits(
 }
 
 /// Returns the per-connection allowance from the same limits used to configure the windows.
+#[cfg(test)]
 pub(crate) fn configure_quic_transport(transport: &mut quinn::TransportConfig) -> usize {
     configure_quic_transport_with_limits(transport, limits())
 }
