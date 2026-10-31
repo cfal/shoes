@@ -1,0 +1,19 @@
+{
+  "name": "shoes-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev --host 0.0.0.0",
+    "preview": "astro preview --host 0.0.0.0",
+    "build": "astro build",
+    "check": "npm run build && node scripts/check-site.mjs"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.8",
+    "astro": "7.4.4"
+  },
+  "devDependencies": {
+    "linkedom": "0.18.14",
+    "mdast-util-from-markdown": "2.1.0"
+  }
+}

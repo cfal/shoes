@@ -177,7 +177,10 @@ fn tcp_settings_reject_unknown_fields_for_servers_and_clients() {
 #[tokio::test]
 async fn representative_examples_pass_native_validation() {
     for example in [
+        "quickstart_socks.yaml",
         "socks_basic.yaml",
+        "snell.yaml",
+        "snell_forward_rules.yaml",
         "http_through_socks.yaml",
         "multi_hop_chain.yaml",
         "clash_api.yaml",

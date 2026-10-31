@@ -48,7 +48,7 @@
           - "client-ca"
         protocol:
           type: vmess
-          cipher: auto
+          cipher: any
           user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
       "test.example.com":
         cert: "self-signed-cert"    # Use different certificate for this SNI
