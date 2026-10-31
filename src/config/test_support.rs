@@ -61,21 +61,28 @@ impl Inline for ResolvedClientProxyConfig {
 impl Inline for ResolvedClientChain {
     type Source = ClientChain;
     fn inline(source: ClientChain) -> Self {
+        Self {
+            hops: one(source.hops, ResolvedClientHop::inline),
+        }
+    }
+}
+
+impl Inline for ResolvedClientHop {
+    type Source = ClientChainHop;
+    fn inline(source: ClientChainHop) -> Self {
         fn client(selection: ConfigSelection<ClientConfig>) -> ResolvedClientConfig {
             ResolvedClientConfig::inline(selection.unwrap_config())
         }
-        Self {
-            hops: one(source.hops, |hop| match hop {
-                ClientChainHop::Single(selection) => ResolvedClientHop::Single(client(selection)),
-                ClientChainHop::Pool(pool) => super::composition::pool_choice(
-                    pool.into_vec()
-                        .into_iter()
-                        .map(|selection| ResolvedClientChain {
-                            hops: OneOrSome::One(ResolvedClientHop::Single(client(selection))),
-                        })
-                        .collect(),
-                ),
-            }),
+        match source {
+            ClientChainHop::Single(selection) => Self::Single(client(selection)),
+            ClientChainHop::Pool(pool) => super::composition::pool_choice(
+                pool.into_vec()
+                    .into_iter()
+                    .map(|selection| ResolvedClientChain {
+                        hops: OneOrSome::One(Self::Single(client(selection))),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -370,10 +377,7 @@ impl Inline for ResolvedShadowTlsServerConfig {
                     ResolvedShadowTlsServerHandshakeConfig::Remote(
                         ResolvedShadowTlsRemoteHandshake {
                             address: remote.address,
-                            client_chain: ResolvedClientChain::inline(ClientChain {
-                                hops: remote.client_chain,
-                            })
-                            .hops,
+                            client_chain: one(remote.client_chain, ResolvedClientHop::inline),
                         },
                     )
                 }
@@ -398,14 +402,7 @@ impl Inline for ResolvedRealityServerConfig {
             cipher_suites: source.cipher_suites,
             vision: source.vision,
             protocol: ResolvedServerProxyConfig::inline(source.protocol),
-            dest_client_chain: source.dest_client_chain.map(|hop| {
-                ResolvedClientChain::inline(ClientChain {
-                    hops: OneOrSome::One(hop),
-                })
-                .hops
-                .into_vec()
-                .remove(0)
-            }),
+            dest_client_chain: source.dest_client_chain.map(ResolvedClientHop::inline),
             override_rules: rules(source.override_rules),
         }
     }
