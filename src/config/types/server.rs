@@ -671,6 +671,10 @@ pub struct WebsocketServerConfig {
     pub matching_path: Option<String>,
     #[serde(default)]
     pub matching_headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "crate::websocket::is_zero")]
+    pub max_early_data: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_data_header_name: Option<String>,
     pub protocol: ServerProxyConfig,
     #[serde(default)]
     pub ping_type: WebsocketPingType,

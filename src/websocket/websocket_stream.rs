@@ -89,7 +89,8 @@ impl WebsocketStream {
         ping_type: WebsocketPingType,
         unprocessed_data: &[u8],
     ) -> Self {
-        let mut unprocessed_buf = allocate_vec(16384).into_boxed_slice();
+        let mut unprocessed_buf =
+            allocate_vec(16384.max(unprocessed_data.len())).into_boxed_slice();
         let mut unprocessed_end_offset = 0;
         let write_frame = allocate_vec(32768).into_boxed_slice();
         let ping_data = allocate_vec(MAX_CONTROL_PAYLOAD_LEN).into_boxed_slice();
@@ -637,6 +638,10 @@ impl AsyncWrite for WebsocketStream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
 
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         if this.pending_write_pong {
             if this.pack_write_pong_frame() {
                 this.pending_write_pong = false;
@@ -750,6 +755,9 @@ impl AsyncPing for WebsocketStream {
 }
 
 impl AsyncStream for WebsocketStream {
+    fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
+        self.stream.flow()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.stream.peer_addr()
     }
@@ -818,6 +826,29 @@ mod tests {
     use crate::crypto::tls_deframer::TlsDeframer;
     use futures::task::noop_waker_ref;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn empty_write_returns_zero_without_emitting_a_frame() {
+        for masked in [false, true] {
+            let (io, mut peer) = tokio::io::duplex(1024);
+            let mut stream =
+                WebsocketStream::new(Box::new(io), masked, WebsocketPingType::Disabled, &[]);
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(matches!(
+                Pin::new(&mut stream).poll_write(&mut cx, &[]),
+                Poll::Ready(Ok(0))
+            ));
+            stream.flush().await.unwrap();
+            let mut bytes = [0; 1];
+            let mut buf = ReadBuf::new(&mut bytes);
+            assert!(
+                Pin::new(&mut peer)
+                    .poll_read(&mut cx, &mut buf)
+                    .is_pending()
+            );
+            assert!(buf.filled().is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn nonempty_ping_preserves_following_payload_and_pong() {

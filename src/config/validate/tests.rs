@@ -2,6 +2,121 @@ use super::*;
 use crate::config::pem::convert_cert_paths;
 use crate::dns::IpStrategy;
 
+#[test]
+fn websocket_early_data_validation_reaches_clients_and_every_server_target() {
+    use crate::tcp::{
+        tcp_client_handler_factory::create_tcp_client_handler,
+        tcp_server_handler_factory::create_tcp_server_handler,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let resolver: Arc<dyn crate::resolver::Resolver> =
+        Arc::new(crate::resolver::NativeResolver::new());
+    let selector = Arc::new(crate::client_proxy_selector::ClientProxySelector::new(
+        vec![],
+    ));
+    for server in [false, true] {
+        for (options, expected) in [
+            (json!({}), None),
+            (json!({"max_early_data": 0}), None),
+            (
+                json!({"max_early_data": 32, "matching_path": "/ws", "matching_headers": {"Host": "example.test"}}),
+                None,
+            ),
+            (
+                json!({"max_early_data": 32, "early_data_header_name": "X-Early", "matching_headers": {"Host": "example.test"}}),
+                None,
+            ),
+            (
+                json!({"early_data_header_name": "X-Early"}),
+                Some("early_data_header_name requires max_early_data > 0"),
+            ),
+            (
+                json!({"max_early_data": 32}),
+                Some(if server {
+                    "WebSocket path early data requires matching_path"
+                } else {
+                    "WebSocket early data requires matching_headers.Host"
+                }),
+            ),
+            (
+                json!({"max_early_data": 4096, "matching_path": "/ws"}),
+                Some("WebSocket early data limit exceeds HTTP line budget"),
+            ),
+            (
+                json!({"max_early_data": 32, "early_data_header_name": "Host"}),
+                Some("reserved WebSocket early data header"),
+            ),
+            (
+                json!({"max_early_data": 32, "early_data_header_name": "X-Early", "matching_headers": {"x-EARLY": "YQ"}}),
+                Some("duplicate or conflicting WebSocket header"),
+            ),
+            (
+                json!({"max_early_data": 32, "early_data_header_name": "X-Early", "matching_headers": {"Host": "example.test", "Connection": "Upgrade"}}),
+                if server {
+                    None
+                } else {
+                    Some("matching_headers conflicts with WebSocket handshake")
+                },
+            ),
+        ] {
+            let mut protocol = options.clone();
+            protocol["protocol"] = if server {
+                json!({"type": "forward", "targets": "127.0.0.1:80"})
+            } else {
+                json!({"type": "portforward"})
+            };
+            let (config, factory_result) = if server {
+                let protocol = json!({"type": "ws", "targets": [
+                    {"matching_path": "/other", "protocol": {"type": "forward", "targets": "127.0.0.1:81"}},
+                    protocol
+                ]});
+                let handler = create_tcp_server_handler(
+                    serde_json::from_value(protocol.clone()).unwrap(),
+                    &selector,
+                    &resolver,
+                    None,
+                );
+                (
+                    json!([{"address": "0.0.0.0:1080", "protocol": protocol}]),
+                    handler.map(|_| ()),
+                )
+            } else {
+                protocol["type"] = "ws".into();
+                let handler = create_tcp_client_handler(
+                    serde_json::from_value(protocol.clone()).unwrap(),
+                    None,
+                    resolver.clone(),
+                );
+                (
+                    json!([{"address": "0.0.0.0:1080", "protocol": {"type": "socks"}, "rules": [{
+                        "masks": "0.0.0.0/0", "action": "allow", "client_chain": {
+                            "address": "127.0.0.1:443", "protocol": {"type": "tls", "verify": false, "protocol": protocol}
+                        }
+                    }]}]),
+                    handler.map(|_| ()),
+                )
+            };
+            let yaml = serde_yaml::to_string(&config).unwrap();
+            let validated = create_server_configs(serde_yaml::from_str(&yaml).unwrap()).map(|_| ());
+            for (stage, result) in [("preparation", validated), ("factory", factory_result)] {
+                if let Some(expected) = expected {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        expected,
+                        "{stage}, server={server}, options={options}"
+                    );
+                } else {
+                    result.unwrap_or_else(|error| {
+                        panic!("{stage}, server={server}, options={options}: {error}")
+                    });
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn sudoku_mask_walkers_reach_certificates_rules_clients_and_fake_dns_targets() {
     use serde_json::json;

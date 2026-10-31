@@ -387,21 +387,33 @@ pub fn create_tcp_client_handler(
             }
         }
         ClientProxyConfig::Websocket(websocket_client_config) => {
+            crate::websocket::validate_early_data(
+                websocket_client_config.matching_path.as_deref(),
+                websocket_client_config.matching_headers.as_ref(),
+                websocket_client_config.max_early_data,
+                websocket_client_config.early_data_header_name.as_deref(),
+                false,
+            )?;
             let WebsocketClientConfig {
                 matching_path,
                 matching_headers,
+                max_early_data,
+                early_data_header_name,
                 ping_type,
                 protocol,
             } = websocket_client_config;
 
             let handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
 
-            Box::new(WebsocketTcpClientHandler::new(
-                matching_path,
-                matching_headers.map(|h| h.into_iter().collect()),
-                ping_type,
-                handler,
-            ))
+            Box::new(
+                WebsocketTcpClientHandler::new(
+                    matching_path,
+                    matching_headers.map(|h| h.into_iter().collect()),
+                    ping_type,
+                    handler,
+                )
+                .with_early_data(max_early_data, early_data_header_name.as_deref()),
+            )
         }
         ClientProxyConfig::PortForward => Box::new(PortForwardClientHandler),
         ClientProxyConfig::Anytls {

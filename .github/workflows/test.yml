@@ -215,6 +215,21 @@ jobs:
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --lib file_watcher:: -- --test-threads=1
 
+    - name: Run WebSocket unit and configuration tests
+      env:
+        CARGO_BUILD_JOBS: 1
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi --
+        websocket:: config::validate::tests::websocket_early_data_ --test-threads=1
+
+    - name: Run local WebSocket early-data interoperability tests
+      env:
+        CARGO_BUILD_JOBS: 1
+        RUST_LOG: warn
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --features ffi,integration-tests
+        --test ws_early_data -- --test-threads=1
+
   integration-tests:
     name: Integration (${{ matrix.name }})
     needs: unit-tests
@@ -424,6 +439,26 @@ jobs:
         echo "SHOES_TEST_MIHOMO_BIN=$HOME/.cache/shoes-mihomo/mihomo" >> "$GITHUB_ENV"
         "$HOME/.cache/shoes-xray/xray" version
         "$HOME/.cache/shoes-mihomo/mihomo" -v
+
+    - name: Run WebSocket early-data interoperability tests
+      if: matrix.target == 'optional_peer'
+      env:
+        CARGO_BUILD_JOBS: 1
+        RUST_LOG: warn
+        WS_SING_BOX_VERSION: 1.14.3
+        WS_SING_BOX_SHA256: e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee
+      run: |
+        # Older sing-box clients discard response bytes read ahead during the upgrade.
+        archive="$RUNNER_TEMP/ws-sing-box.tar.gz"
+        curl --fail --location --retry 3 \
+          --output "$archive" \
+          "https://github.com/SagerNet/sing-box/releases/download/v${WS_SING_BOX_VERSION}/sing-box-${WS_SING_BOX_VERSION}-linux-amd64.tar.gz"
+        echo "${WS_SING_BOX_SHA256}  ${archive}" | sha256sum --check --strict
+        tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+        export SHOES_TEST_SING_BOX_BIN="$RUNNER_TEMP/sing-box-${WS_SING_BOX_VERSION}-linux-amd64/sing-box"
+        "$SHOES_TEST_SING_BOX_BIN" version
+        .github/require-tests.sh cargo test -p shoes --locked --features optional-peer-tests \
+          --test ws_early_data -- --test-threads=1
 
     - name: Run integration tests
       env:
