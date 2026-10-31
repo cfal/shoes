@@ -95,6 +95,11 @@ path = "tests/xhttp_interop.rs"
 required-features = ["integration-tests"]
 
 [[test]]
+name = "ws_early_data"
+path = "tests/ws_early_data.rs"
+required-features = ["integration-tests"]
+
+[[test]]
 name = "reality_interop"
 path = "tests/reality_interop.rs"
 required-features = ["optional-peer-tests"]
