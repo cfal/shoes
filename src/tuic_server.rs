@@ -206,7 +206,7 @@ async fn auth_connection(
     connection: &quinn::Connection,
     uuid: &[u8],
     password: &str,
-) -> std::io::Result<Vec<(u8, quinn::RecvStream)>> {
+) -> std::io::Result<Vec<(u8, Vec<u8>)>> {
     let mut expected_token_bytes = [0u8; 32];
     connection
         .export_keying_material(
@@ -217,12 +217,14 @@ async fn auth_connection(
         .map_err(|e| std::io::Error::other(format!("Failed to export keying material: {e:?}")))?;
 
     let mut pending = Vec::new();
+    let mut pending_bytes = 0;
     let pending_limit = crate::resources::limits()
         .max_streams_per_connection
         .unwrap_or(32)
         .min(32);
     // Independent uni streams may reach the peer before the AUTH stream.
-    // Read only the command prefix, leaving packet bodies flow-controlled until auth.
+    // Complete bounded commands to return uni credit even when the peer has only
+    // one stream available. Nothing is dispatched before authentication.
     loop {
         let mut recv_stream = connection.accept_uni().await?;
         let mut header = [0; 2];
@@ -244,7 +246,12 @@ async fn auth_connection(
                     "invalid or excessive pre-auth TUIC commands",
                 ));
             }
-            pending.push((command_type, recv_stream));
+            let body = recv_stream
+                .read_to_end((MAX_HEADER_LEN + 65535).min((1 << 20) - pending_bytes))
+                .await
+                .map_err(std::io::Error::other)?;
+            pending_bytes += body.len();
+            pending.push((command_type, body));
             continue;
         }
 
@@ -330,7 +337,7 @@ async fn run_bidirectional_loop(
 }
 
 async fn read_address(
-    recv: &mut quinn::RecvStream,
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     stream_reader: &mut StreamReader,
 ) -> std::io::Result<Option<NetLocation>> {
     let address_type = stream_reader.read_u8(recv).await?;
@@ -803,7 +810,7 @@ async fn run_unidirectional_loop(
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
-    pending_commands: Vec<(u8, quinn::RecvStream)>,
+    pending_commands: Vec<(u8, Vec<u8>)>,
 ) -> std::io::Result<()> {
     let mut pending_commands = pending_commands.into_iter();
     let mut tasks = JoinSet::new();
@@ -835,16 +842,17 @@ async fn run_unidirectional_loop(
     });
 
     loop {
-        let (command, accepted) = match pending_commands.next() {
-            Some((command, stream)) => (Some(command), Ok(stream)),
-            None => (
-                None,
-                tokio::select! {
-                    result = connection.accept_uni() => result,
-                    _ = tasks.join_next(), if !tasks.is_empty() => continue,
-                },
-            ),
-        };
+        let (command, accepted): (_, Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>, _>) =
+            match pending_commands.next() {
+                Some((command, body)) => (Some(command), Ok(Box::new(std::io::Cursor::new(body)))),
+                None => (
+                    None,
+                    tokio::select! {
+                        result = connection.accept_uni() => result.map(|stream| Box::new(stream) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+                        _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                    },
+                ),
+            };
         let recv_stream = match accepted {
             Ok(recv_stream) => recv_stream,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
@@ -916,7 +924,7 @@ async fn process_uni_stream(
     connection: &quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    mut recv_stream: quinn::RecvStream,
+    mut recv_stream: impl tokio::io::AsyncRead + Unpin,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
     command: Option<u8>,
@@ -1512,7 +1520,8 @@ mod auth_tests {
     }
 
     async fn connect(selector: Arc<ClientProxySelector>) -> Peer {
-        let (server, client) = crate::quic_endpoint::test_endpoints();
+        // One uni stream exposes pre-auth credit retention deadlocks.
+        let (server, client) = crate::quic_endpoint::test_endpoints_with_uni_limit(1);
         let address = server.local_addr().unwrap();
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let accepting = server.clone();
