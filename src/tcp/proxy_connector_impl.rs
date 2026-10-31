@@ -1,7 +1,7 @@
 //! ProxyConnectorImpl - Implementation of ProxyConnector trait.
 //!
 //! Handles protocol setup for proxy connections on existing streams.
-//! Created from the protocol-related fields of a ClientConfig.
+//! Created from the protocol-related fields of a ResolvedClientConfig.
 
 use std::sync::Arc;
 
@@ -13,12 +13,12 @@ use super::proxy_connector::ProxyConnector;
 use super::tcp_client_handler_factory::create_tcp_client_handler;
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
-use crate::config::ClientConfig;
+use crate::config::ResolvedClientConfig;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::{ClientTransport, TcpClientHandler, TcpClientSetupResult};
 
 pub(crate) fn create_proxy_connector(
-    config: ClientConfig,
+    config: ResolvedClientConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Option<Box<dyn ProxyConnector>>> {
     if config.protocol.is_native_quic() {
@@ -30,7 +30,7 @@ pub(crate) fn create_proxy_connector(
 
 /// Implementation of ProxyConnector for proxy protocol setup.
 ///
-/// Created from the protocol-related fields of a ClientConfig:
+/// Created from the protocol-related fields of a ResolvedClientConfig:
 /// - `protocol`
 /// - `address`
 ///
@@ -58,14 +58,14 @@ impl ProxyConnectorImpl {
         }
     }
 
-    /// Create a ProxyConnector from a ClientConfig's protocol-related fields.
+    /// Create a ProxyConnector from a ResolvedClientConfig's protocol-related fields.
     ///
     /// Returns None for direct protocol (direct has no ProxyConnector).
     pub fn from_config(
-        config: ClientConfig,
+        config: ResolvedClientConfig,
         resolver: Arc<dyn Resolver>,
     ) -> std::io::Result<Option<Self>> {
-        crate::sudoku_mask::validate_client(&config.protocol, &config.transport)?;
+        crate::sudoku_mask::validate_resolved_client(&config.protocol, &config.transport)?;
         if config.protocol.is_direct() {
             return Ok(None);
         }
@@ -186,7 +186,7 @@ impl ProxyConnector for ProxyConnectorImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ClientProxyConfig;
+    use crate::config::ResolvedClientProxyConfig;
     use crate::resolver::NativeResolver;
     use crate::tcp::carrier_dialer::RouteKey;
     use std::net::{IpAddr, Ipv4Addr};
@@ -527,7 +527,7 @@ mod tests {
             proxy: Box::new(proxy),
         }];
         if mixed {
-            let config = serde_json::from_value(serde_json::json!({
+            let config = crate::config::test_support::from_json(serde_json::json!({
                 "address": "localhost:443",
                 "protocol": {"type": "xhttp", "mode": "stream-one", "protocol": {"type": "socks"}}
             }))
@@ -592,7 +592,7 @@ mod tests {
             serde_json::json!({"type": "shadowtls", "password": "test", "protocol": {"type": "direct"}}),
             serde_json::json!({"type": "websocket", "protocol": {"type": "direct"}}),
         ] {
-            let config = serde_json::from_value(serde_json::json!({
+            let config = crate::config::test_support::from_json(serde_json::json!({
                 "address": "127.0.0.1:443", "protocol": protocol
             }))
             .unwrap();
@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_from_direct_config_returns_none() {
-        let config = ClientConfig::default();
+        let config = ResolvedClientConfig::default();
         assert!(config.protocol.is_direct());
         assert!(
             ProxyConnectorImpl::from_config(config, mock_resolver())
@@ -613,9 +613,9 @@ mod tests {
 
     #[test]
     fn test_from_proxy_config_returns_some() {
-        let config = ClientConfig {
+        let config = ResolvedClientConfig {
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1080),
-            protocol: ClientProxyConfig::Socks {
+            protocol: ResolvedClientProxyConfig::Socks {
                 username: None,
                 password: None,
             },

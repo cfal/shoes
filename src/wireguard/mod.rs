@@ -28,7 +28,7 @@ use crate::{
     async_stream::{AsyncMessageStream, AsyncStream},
     client_proxy_selector::ClientProxySelector,
     config::{
-        ClientProxyConfig, ValidatedConfigs,
+        ResolvedClientProxyConfig, ValidatedConfigs,
         wireguard::{WireguardDeviceConfig, WireguardPeer},
     },
     dns::DnsRegistry,
@@ -273,7 +273,7 @@ impl Prepared {
             pending.push((peers, connector));
         }
         validated.visit_clients(&mut |client| {
-            if let ClientProxyConfig::Wireguard(reference) = &mut client.protocol {
+            if let ResolvedClientProxyConfig::Wireguard(reference) = &mut client.protocol {
                 reference.connector = Some(
                     connectors
                         .get(&reference.endpoint_id)
@@ -286,8 +286,10 @@ impl Prepared {
         if let Some(catalog) = &mut validated.catalog {
             for node in catalog.nodes.values_mut() {
                 if let crate::control::catalog::CatalogNode::Leaf(client) = node {
-                    crate::config::client_visit::visit_client(client, &mut |client| {
-                        if let ClientProxyConfig::Wireguard(reference) = &mut client.protocol {
+                    crate::config::resolved_visit::visit_client(client, &mut |client| {
+                        if let ResolvedClientProxyConfig::Wireguard(reference) =
+                            &mut client.protocol
+                        {
                             // Probe pools include unselected leaves; fail at dial, not construction.
                             reference.connector = Some(
                                 connectors
@@ -411,11 +413,7 @@ impl PreparedEndpoint {
         let config = &self.config;
         let inbound = if let Some(inbound) = &config.inbound {
             let resolver = dns.get_for_server(inbound.dns.as_ref());
-            let rules = inbound
-                .rules
-                .clone()
-                .map(crate::config::ConfigSelection::unwrap_config)
-                .into_vec();
+            let rules = inbound.rules.clone().into_vec();
             let selector = Arc::new(
                 crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
                     rules,

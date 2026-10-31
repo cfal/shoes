@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::address::NetLocation;
+use crate::config::ResolvedConfig;
 use crate::config::{self, BindLocation, Config, ValidatedConfigs};
 use crate::dns::{self, DnsRegistry};
 use crate::option_util::OneOrSome;
@@ -178,7 +179,7 @@ async fn prepare_tracking(
     .await?;
     network.validate(&validated.configs)?;
     for config in &mut validated.configs {
-        if let Config::TunServer(tun) = config
+        if let ResolvedConfig::TunServer(tun) = config
             && tun.auto_route
             && tun.dns_hijack.is_none()
         {
@@ -221,7 +222,7 @@ async fn prepare_tracking(
         crate::wireguard::Prepared::new(&mut validated).await?
     };
     for config in &mut validated.configs {
-        let Config::Server(server) = config else {
+        let ResolvedConfig::Server(server) = config else {
             continue;
         };
         let BindLocation::Address(addresses) = &server.bind_location else {
@@ -315,7 +316,7 @@ async fn prepare_tracking(
         .configs
         .iter()
         .filter_map(|config| {
-            let Config::TunServer(tun) = config else {
+            let ResolvedConfig::TunServer(tun) = config else {
                 return None;
             };
             let fd = tun.device_fd?;
@@ -440,13 +441,12 @@ impl RunningServers {
         }
         for config in &prepared.validated.configs {
             let dns_ref = match config {
-                Config::Server(server) => server.dns.as_ref(),
-                Config::TunServer(tun) => tun.dns.as_ref(),
-                _ => None,
+                ResolvedConfig::Server(server) => server.dns.as_ref(),
+                ResolvedConfig::TunServer(tun) => tun.dns.as_ref(),
             };
             let resolver = prepared.dns.get_for_server(dns_ref);
             #[cfg(unix)]
-            if let Config::TunServer(config) = config {
+            if let ResolvedConfig::TunServer(config) = config {
                 #[cfg(target_os = "linux")]
                 if config.auto_route {
                     let ingress = prepared

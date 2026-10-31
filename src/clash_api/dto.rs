@@ -2,7 +2,10 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io;
 
-use crate::config::{ClientChain, ClientChainHop, ClientConfig, ConfigSelection, GroupType};
+use crate::config::{
+    ClientChainHop, ClientConfig, ConfigSelection, GroupType, ResolvedClientChain,
+    ResolvedClientHop,
+};
 use crate::control::catalog::{Catalog, CatalogNode, api_group, protocol_type};
 use crate::control::runtime::Generation;
 use crate::control::selection::Choices;
@@ -15,10 +18,8 @@ pub fn leaf_udp_support(catalog: &Catalog) -> io::Result<HashMap<String, bool>> 
         let CatalogNode::Leaf(client) = node else {
             continue;
         };
-        let chain = ClientChain {
-            hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                (**client).clone(),
-            ))),
+        let chain = ResolvedClientChain {
+            hops: OneOrSome::One(ResolvedClientHop::Single((**client).clone())),
         };
         let udp = crate::tcp::chain_builder::supports_udp_offline(&chain)?;
         support.insert(name.clone(), udp);
@@ -108,9 +109,6 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str) -> bool 
                 {
                     ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
                     ClientChainHop::Pool(pool) => pool.iter(),
-                    ClientChainHop::Choice(_) => {
-                        unreachable!("catalog chains retain source references")
-                    }
                 };
                 pending.extend(selections.map(|selection| {
                     match selection {

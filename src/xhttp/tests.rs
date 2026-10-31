@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     client_proxy_chain::{ClientProxyChain, InitialHopEntry},
-    config::{ClientConfig, Config},
+    config::Config,
     resolver::{NativeResolver, Resolver},
     tcp::{proxy_connector_impl::ProxyConnectorImpl, socket_connector_impl::SocketConnectorImpl},
 };
@@ -110,7 +110,8 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
             let handles = crate::tcp::tcp_server::start_servers(server, resolver.clone())
                 .await
                 .unwrap();
-            let config: ClientConfig = serde_json::from_value(client_value.clone()).unwrap();
+            let config: crate::config::ResolvedClientConfig =
+                crate::config::test_support::from_json(client_value.clone()).unwrap();
             let socket = SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
             let proxy = ProxyConnectorImpl::from_config(config, resolver.clone())
                 .unwrap()
@@ -137,16 +138,18 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                 let handles = crate::tcp::tcp_server::start_servers(server, resolver.clone())
                     .await
                     .unwrap();
-                let upstream: ClientConfig = serde_json::from_value(
-                    json!({"address":format!("127.0.0.1:{port}"),"protocol":{"type":"socks"}}),
-                )
-                .unwrap();
+                let upstream: crate::config::ResolvedClientConfig =
+                    crate::config::test_support::from_json(
+                        json!({"address":format!("127.0.0.1:{port}"),"protocol":{"type":"socks"}}),
+                    )
+                    .unwrap();
                 let socket =
                     SocketConnectorImpl::from_config(&upstream, Some(&upstream.address)).unwrap();
                 let proxy = ProxyConnectorImpl::from_config(upstream, resolver.clone())
                     .unwrap()
                     .unwrap();
-                let config: ClientConfig = serde_json::from_value(client_value).unwrap();
+                let config: crate::config::ResolvedClientConfig =
+                    crate::config::test_support::from_json(client_value).unwrap();
                 let xhttp = ProxyConnectorImpl::from_config(config, resolver.clone())
                     .unwrap()
                     .unwrap();

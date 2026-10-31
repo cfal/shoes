@@ -85,6 +85,34 @@ fn contains_server(protocol: &ServerProxyConfig) -> bool {
     }
 }
 
+pub(crate) fn validate_resolved_client(
+    mut protocol: &crate::config::ResolvedClientProxyConfig,
+    transport: &Transport,
+) -> io::Result<()> {
+    check_transport(contains_resolved_client(protocol), transport)?;
+    while let crate::config::ResolvedClientProxyConfig::SudokuMask(config) = protocol {
+        protocol = &config.protocol;
+    }
+    if contains_resolved_client(protocol) {
+        return Err(invalid("sudoku_mask must be an outermost protocol layer"));
+    }
+    Ok(())
+}
+
+fn contains_resolved_client(protocol: &crate::config::ResolvedClientProxyConfig) -> bool {
+    use crate::config::ResolvedClientProxyConfig as P;
+    match protocol {
+        P::SudokuMask(_) => true,
+        P::Tls(c) => contains_resolved_client(&c.protocol),
+        P::Reality { protocol, .. } | P::ShadowTls { protocol, .. } => {
+            contains_resolved_client(protocol)
+        }
+        P::Websocket(c) => contains_resolved_client(&c.protocol),
+        P::Xhttp(c) => contains_resolved_client(&c.protocol),
+        _ => false,
+    }
+}
+
 fn check_transport(present: bool, transport: &Transport) -> io::Result<()> {
     if present && *transport != Transport::Tcp {
         return Err(invalid(

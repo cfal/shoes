@@ -10,7 +10,7 @@ use super::context::{DnsContext, FakeDnsResolver};
 use super::fake_ip::{FakeIpOptions, FakeIpPool};
 use super::real_only;
 use super::system::SystemResolver;
-use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
+use crate::config::{ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits, ResolvedDnsConfig};
 use crate::dns::composite_resolver::CompositeResolver;
 use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
@@ -22,7 +22,7 @@ use crate::resolver::{
 use crate::tcp::chain_builder::{build_client_chain_group_with_limits, build_direct_chain_group};
 
 pub(crate) async fn check_interception(
-    configs: &[crate::config::Config],
+    configs: &[crate::config::ResolvedConfig],
     groups: &[ExpandedDnsGroup],
 ) -> std::io::Result<()> {
     let mut forbidden: Vec<IpNetwork> = groups
@@ -36,13 +36,13 @@ pub(crate) async fn check_interception(
     );
     let forbidden: Arc<[IpNetwork]> = forbidden.into();
     for config in configs {
-        let crate::config::Config::TunServer(tun) = config else {
+        let crate::config::ResolvedConfig::TunServer(tun) = config else {
             continue;
         };
         if tun.dns_hijack != Some(true) {
             continue;
         }
-        let uses_system = match tun.dns.as_ref().and_then(DnsConfig::resolved_group) {
+        let uses_system = match tun.dns.as_ref().and_then(ResolvedDnsConfig::resolved_group) {
             None => true,
             Some(name) => groups
                 .iter()
@@ -219,9 +219,8 @@ impl DnsRegistry {
             .clone()
     }
 
-    /// Get resolver for a server config's dns field.
-    /// After validation, dns.servers should be a single group name or None.
-    pub fn get_for_server(&mut self, dns: Option<&DnsConfig>) -> Arc<dyn Resolver> {
+    /// Gets the resolver for a compiled listener binding, or the default resolver.
+    pub fn get_for_server(&mut self, dns: Option<&ResolvedDnsConfig>) -> Arc<dyn Resolver> {
         match dns.and_then(|c| c.resolved_group()) {
             Some(group_name) => self
                 .groups

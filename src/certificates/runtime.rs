@@ -7,8 +7,8 @@ use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use super::{ChallengeConfig, Input, Source, Spec, acme, challenge, visit};
-use crate::config::{BindLocation, Config, Transport, ValidatedConfigs};
+use super::{ChallengeConfig, Input, Source, Spec, acme, challenge, visit_resolved};
+use crate::config::{BindLocation, ResolvedConfig, Transport, ValidatedConfigs};
 
 #[derive(Default)]
 pub(crate) struct Registry {
@@ -60,7 +60,7 @@ impl Registry {
     pub(crate) async fn prepare_with_retiring(
         validated: &mut ValidatedConfigs,
         previous: Option<&Self>,
-        retiring: &[Config],
+        retiring: &[ResolvedConfig],
     ) -> io::Result<Self> {
         let mut registry = Self::default();
         let mut claimed_storage = std::collections::HashSet::new();
@@ -175,7 +175,7 @@ impl Registry {
             *source = worker.source.clone();
             registry.workers.push(worker);
         }
-        visit(&mut validated.configs, &mut |binding, _, _, _, _| {
+        visit_resolved(&mut validated.configs, &mut |binding, _, _, _, _| {
             if let Some(source) = binding {
                 *source = registry
                     .workers
@@ -310,9 +310,9 @@ fn http_bind_error(source: &Source, address: std::net::SocketAddr, error: io::Er
     )
 }
 
-fn retiring_proxy_covers(configs: &[Config], address: std::net::SocketAddr) -> bool {
+fn retiring_proxy_covers(configs: &[ResolvedConfig], address: std::net::SocketAddr) -> bool {
     configs.iter().any(|config| {
-        let Config::Server(server) = config else {
+        let ResolvedConfig::Server(server) = config else {
             return false;
         };
         if server.transport != Transport::Tcp {
@@ -413,7 +413,7 @@ mod tests {
             ("[::]:18443", "[::1]:18443", true),
             ("127.0.0.1:18443", "127.0.0.1:18444", false),
         ] {
-            let configs: Vec<Config> = serde_yaml::from_str(&format!(
+            let configs: Vec<ResolvedConfig> = crate::config::test_support::from_yaml(&format!(
                 "- address: '{bound}'\n  protocol: {{type: socks}}\n"
             ))
             .unwrap();
@@ -440,7 +440,7 @@ mod tests {
                 .contains(&format!("managed HTTP-01 bind at {address}"))
         );
 
-        let retiring: Vec<Config> = serde_yaml::from_str(&format!(
+        let retiring: Vec<ResolvedConfig> = crate::config::test_support::from_yaml(&format!(
             "- address: '{address}'\n  protocol: {{type: socks}}\n"
         ))
         .unwrap();

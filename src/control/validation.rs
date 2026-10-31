@@ -3,7 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 
 use super::store::{absolute_path, lock_path};
-use crate::config::{BindLocation, Config, Transport, ValidatedConfigs};
+use crate::config::{BindLocation, ResolvedConfig, Transport, ValidatedConfigs};
 
 pub fn validate_resources(validated: &ValidatedConfigs) -> io::Result<()> {
     let mut paths = HashSet::new();
@@ -74,7 +74,7 @@ pub fn validate_resources(validated: &ValidatedConfigs) -> io::Result<()> {
         ));
     }
     for config in &validated.configs {
-        if let Config::Server(server) = config {
+        if let ResolvedConfig::Server(server) = config {
             match &server.bind_location {
                 BindLocation::Path(path) if !paths.is_empty() => {
                     let parent = path

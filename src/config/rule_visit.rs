@@ -92,7 +92,6 @@ pub(crate) fn visit(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
     #[test]
@@ -103,12 +102,10 @@ mod tests {
             ))
             .unwrap();
             let validated = crate::config::create_server_configs(configs).unwrap();
-            let Config::Server(server) = &validated.configs[0] else {
+            let crate::config::ResolvedConfig::Server(server) = &validated.configs[0] else {
                 panic!("expected server")
             };
-            let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-                panic!("expected generated default rule")
-            };
+            let rule = server.rules.iter().next().unwrap();
             let predicate = rule
                 .criteria
                 .compiled
@@ -136,10 +133,8 @@ mod tests {
             .configs
             .iter()
             .filter_map(|config| {
-                if let Config::Server(server) = config {
-                    let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-                        panic!("unexpanded group")
-                    };
+                if let crate::config::ResolvedConfig::Server(server) = config {
+                    let rule = server.rules.iter().next().unwrap();
                     Some(rule.criteria.compiled.as_ref().unwrap().clone())
                 } else {
                     None

@@ -31,7 +31,7 @@ async fn listen(config: serde_json::Value) -> Tasks {
     let config = compiled_server(config);
     Tasks(
         crate::tcp::tcp_server::start_servers(
-            crate::config::Config::Server(config),
+            crate::config::ResolvedConfig::Server(config),
             Arc::new(NativeResolver::new()),
         )
         .await

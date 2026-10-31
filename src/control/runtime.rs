@@ -447,13 +447,10 @@ mod tests {
             let (id, rules) = service.runtime.prepare(&mut validated).await.unwrap();
             assert_eq!(rules.len(), 1, "{mode}");
             assert_eq!(rules[0]["proxy"], "outbound", "{mode}");
-            let crate::config::Config::Server(server) = &validated.configs[0] else {
+            let crate::config::ResolvedConfig::Server(server) = &validated.configs[0] else {
                 panic!("{mode}")
             };
-            let crate::config::ConfigSelection::Config(rule) = server.rules.iter().next().unwrap()
-            else {
-                panic!("{mode}")
-            };
+            let rule = server.rules.iter().next().unwrap();
             let description = rule.criteria.description.as_ref().unwrap();
             assert_eq!(description.proxy, "outbound", "{mode}");
             if mode == "listener" {

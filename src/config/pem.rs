@@ -450,13 +450,6 @@ fn gather_pem_file_paths_from_rule(
 
 fn gather_pem_file_paths_from_chain_hop(hop: &mut ClientChainHop, visitor: &mut PemVisitor<'_>) {
     match hop {
-        ClientChainHop::Choice(choice) => {
-            for member in &mut choice.members {
-                for hop in member.hops.iter_mut() {
-                    gather_pem_file_paths_from_chain_hop(hop, visitor);
-                }
-            }
-        }
         ClientChainHop::Single(selection) => {
             if let ConfigSelection::Config(client_config) = selection {
                 gather_pem_file_paths_from_client_config(client_config, visitor);

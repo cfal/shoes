@@ -1,5 +1,4 @@
 use super::*;
-use crate::config::{ClientChainHop, ClientConfig, ConfigSelection};
 use crate::control::catalog::CatalogNode;
 use crate::option_util::OneOrSome;
 use std::net::SocketAddr;
@@ -1020,7 +1019,7 @@ async fn probe_wrapped_errors(h2_proxy: bool) {
         let generation = automatic_generation(1, 1, Arc::new(Answers(Vec::new())));
         let socket = Arc::new(Socket(make_error));
         let entry = if h2_proxy {
-            let config = serde_json::from_value(json!({
+            let config = crate::config::test_support::from_json(json!({
                 "address":"proxy.invalid:80", "protocol":{"type":"http", "http_version":"h2"}
             }))
             .unwrap();
@@ -2090,7 +2089,7 @@ async fn trusted_https_probe_sends_head_and_checks_status_without_following_redi
         catalog.nodes.insert(
             "http".into(),
             CatalogNode::Leaf(Box::new(
-                serde_json::from_value(json!({
+                crate::config::test_support::from_json(json!({
                     "address":format!("127.0.0.1:{}", listener.local_addr().unwrap().port()),
                     "protocol":{"type":"http"}
                 }))
@@ -2171,7 +2170,7 @@ async fn https_probe_rejects_untrusted_certificates_through_proxy() {
         catalog.nodes.insert(
             "http".into(),
             CatalogNode::Leaf(Box::new(
-                serde_json::from_value(json!({
+                crate::config::test_support::from_json(json!({
                     "address": proxy,
                     "protocol": {"type": "http"},
                 }))
@@ -2201,7 +2200,7 @@ async fn review_forbidden_literals_do_not_construct_or_cache_probe_transports() 
     catalog.nodes.insert(
         "quic".into(),
         CatalogNode::Leaf(Box::new(
-            serde_json::from_value(json!({
+            crate::config::test_support::from_json(json!({
                 "address": "127.0.0.1:443", "transport": "quic",
                 "quic_settings": {"verify": false}, "protocol": {"type": "socks"}
             }))
@@ -2243,7 +2242,7 @@ async fn cached_connectors_reject_forbidden_hostname_candidates() {
     catalog.nodes.insert(
         "http".into(),
         CatalogNode::Leaf(Box::new(
-            serde_json::from_value(json!({
+            crate::config::test_support::from_json(json!({
                 "address":local.to_string(),
                 "protocol":{"type":"http","resolve_hostname":true},
             }))
@@ -2370,7 +2369,7 @@ async fn cached_http2_reuse_checks_each_requests_resolver() {
             let answers = Arc::new(Mutex::new(vec!["192.0.2.1:80".parse().unwrap()]));
             let mut catalog = catalog();
             // Cleartext transport isolates HTTP/2 reuse from the TLS handshake in this fixture.
-            catalog.nodes.insert("http".into(), CatalogNode::Leaf(Box::new(serde_json::from_value(json!({
+            catalog.nodes.insert("http".into(), CatalogNode::Leaf(Box::new(crate::config::test_support::from_json(json!({
                 "address":local.to_string(),
                 "protocol":{"type":"http","resolve_hostname":true,"http_version":"h2"},
             })).unwrap())));
@@ -2400,9 +2399,9 @@ async fn guarded_direct_resolution_keeps_fallback_candidates() {
         denied: |_| false,
     });
     let chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
-        OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-            ClientConfig::default(),
-        ))),
+        OneOrSome::One(crate::config::ResolvedClientHop::Single(
+            crate::config::ResolvedClientConfig::default(),
+        )),
         base,
     )
     .unwrap();

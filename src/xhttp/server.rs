@@ -24,7 +24,7 @@ use super::{
 use crate::{
     async_stream::AsyncStream,
     client_proxy_selector::ClientProxySelector,
-    config::xhttp::{XhttpServerConfig, XhttpVersion},
+    config::xhttp::{ResolvedXhttpServerConfig, XhttpVersion},
     resolver::Resolver,
     resources::{Budget, BudgetPermit},
     tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult},
@@ -39,7 +39,7 @@ pub struct XhttpServer {
 mod tests;
 
 struct State {
-    config: XhttpServerConfig,
+    config: ResolvedXhttpServerConfig,
     path: Path,
     inner: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
@@ -267,7 +267,7 @@ impl Drop for DownloadGuard {
 
 impl XhttpServer {
     pub fn new(
-        config: XhttpServerConfig,
+        config: ResolvedXhttpServerConfig,
         selector: &Arc<ClientProxySelector>,
         resolver: &Arc<dyn Resolver>,
         bind_ip: Option<IpAddr>,

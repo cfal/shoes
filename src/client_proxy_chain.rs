@@ -158,7 +158,7 @@ impl ClientProxyChain {
     }
 
     pub(crate) fn composed(
-        hops: crate::option_util::OneOrSome<crate::config::ClientChainHop>,
+        hops: crate::option_util::OneOrSome<crate::config::ResolvedClientHop>,
         resolver: Arc<dyn Resolver>,
         limits: crate::config::GlobalLimits,
     ) -> std::io::Result<Self> {

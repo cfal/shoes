@@ -39,13 +39,12 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
             crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
         assert!(validated.control.listeners.is_empty());
         let catalog = validated.catalog.take().unwrap();
-        let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+        let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
             panic!()
         };
-        let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-            panic!()
-        };
-        let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+        let rule = server.rules.into_vec().remove(0);
+        let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action
+        else {
             panic!()
         };
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
@@ -102,13 +101,11 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
         crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
             .unwrap();
     let catalog = validated.catalog.take().unwrap();
-    let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
     };
-    let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-        panic!()
-    };
-    let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+    let rule = server.rules.into_vec().remove(0);
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action else {
         panic!()
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
@@ -170,13 +167,11 @@ fn selectors_preserve_declared_branch_weights_and_duplicate_tickets() {
     let mut validated =
         crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
     let catalog = validated.catalog.take().unwrap();
-    let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
     };
-    let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-        panic!()
-    };
-    let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+    let rule = server.rules.into_vec().remove(0);
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action else {
         panic!()
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
@@ -218,13 +213,11 @@ fn udp_selection_rejects_ineligible_member_without_falling_back() {
     let mut validated =
         crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
     let catalog = validated.catalog.take().unwrap();
-    let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
     };
-    let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-        panic!()
-    };
-    let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+    let rule = server.rules.into_vec().remove(0);
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action else {
         panic!()
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());

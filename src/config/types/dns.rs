@@ -233,7 +233,7 @@ pub struct ExpandedDnsSpec {
     pub url: String,
     pub server_name: Option<String>,
     /// Client chains with all group refs resolved to configs.
-    pub client_chains: Vec<ClientChain>,
+    pub client_chains: Vec<crate::config::resolved::ResolvedClientChain>,
     /// Bootstrap resolver URL or group name. Groups are resolved at runtime.
     pub bootstrap_url: Option<String>,
     pub ip_strategy: IpStrategy,

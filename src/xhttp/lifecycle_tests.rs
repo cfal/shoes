@@ -64,7 +64,7 @@ fn configured_client(
 ) -> Arc<Client> {
     Arc::new(
         Client::new(
-            config,
+            crate::config::test_support::Inline::inline(config),
             NetLocation::from_str("localhost:80", None).unwrap(),
             "localhost".into(),
             version,
@@ -1645,7 +1645,7 @@ async fn url_test_pooled_h2_sessions_record_carrier_demand() {
         tokio::time::timeout(Duration::from_secs(60), async {
             let (address, _server) = echo_peer(XhttpVersion::H2, false).await;
             let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-            let config = serde_json::from_value(serde_json::json!({
+            let config = crate::config::test_support::from_json(serde_json::json!({
                 "address": address.to_string(),
                 "protocol": {
                     "type": "xhttp", "http_version": "h2", "mode": "stream-one",
@@ -2025,7 +2025,7 @@ async fn split_requests_share_service_across_listener_addresses() {
     let mut carriers = Vec::new();
     for ip in ["0.0.0.0", "::"] {
         let handler = create_tcp_server_handler_shared(
-            config.clone(),
+            crate::config::test_support::Inline::inline(config.clone()),
             &selector,
             &resolver,
             Some(ip.parse().unwrap()),
