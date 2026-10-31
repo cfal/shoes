@@ -155,7 +155,7 @@ fn normalize_client(client: &mut ResolvedClientConfig) -> io::Result<()> {
     }
     normalize_cidrs(&mut config.addresses, false)?;
     normalize_cidrs(&mut config.allowed_ips, true)?;
-    config.resource_limits = config.device(&client.address, None).limits();
+    config.resource_limits = super::types::wireguard::device_limits(&config.resource_limits);
     config.peer_client_chain = config.peer_client_chain.take().map(normalize_fixed_chain);
     Ok(())
 }
