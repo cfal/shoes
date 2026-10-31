@@ -483,7 +483,7 @@ fn connect_failure_response(kind: std::io::ErrorKind) -> Vec<u8> {
 fn build_udp_associate_response(bound_addr: SocketAddr) -> Vec<u8> {
     let mut response = vec![VER_SOCKS5, REPLY_SUCCESS, 0x00];
 
-    match bound_addr {
+    match SocketAddr::new(bound_addr.ip().to_canonical(), bound_addr.port()) {
         SocketAddr::V4(v4) => {
             response.push(ADDR_TYPE_IPV4);
             response.extend_from_slice(&v4.ip().octets());
@@ -846,9 +846,11 @@ mod tests {
     #[tokio::test]
     async fn wildcard_udp_replies_use_control_local_address_through_wrappers() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            for ipv6 in [false, true] {
+            for (ipv6, dual_stack) in [(false, false), (true, false), (false, true)] {
                 for wrapped in [false, true] {
-                    let wildcard: IpAddr = if ipv6 { "::" } else { "0.0.0.0" }.parse().unwrap();
+                    let wildcard: IpAddr = if ipv6 || dual_stack { "::" } else { "0.0.0.0" }
+                        .parse()
+                        .unwrap();
                     let loopback: IpAddr = if ipv6 { "::1" } else { "127.0.0.1" }.parse().unwrap();
                     let listener = tokio::net::TcpListener::bind((wildcard, 0)).await.unwrap();
                     let echo = tokio::net::UdpSocket::bind((loopback, 0)).await.unwrap();
