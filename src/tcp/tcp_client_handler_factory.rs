@@ -430,7 +430,7 @@ fn create_with_hop_context(
             )?;
             let authority = hop_location
                 .as_ref()
-                .map(ToString::to_string)
+                .map(crate::http2::client::format_authority)
                 .ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,

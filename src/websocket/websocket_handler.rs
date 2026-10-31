@@ -126,13 +126,19 @@ mod request_tests {
         for authority in ["example.com:80", "192.0.2.1:8080", "[2001:db8::1]:443"] {
             for override_host in [None, Some("front.example")] {
                 let (client, peer) = tokio::io::duplex(2048);
-                let handler = WebsocketTcpClientHandler::new(
-                    authority.into(),
-                    None,
-                    override_host.map(|host| FxHashMap::from_iter([("hOsT".into(), host.into())])),
-                    WebsocketPingType::Disabled,
-                    Box::new(crate::port_forward_handler::PortForwardClientHandler),
-                );
+                let headers = override_host
+                    .map(|host| format!("matching_headers: {{hOsT: '{host}'}}\n"))
+                    .unwrap_or_default();
+                let config = serde_yaml::from_str(&format!(
+                    "type: websocket\n{headers}protocol: {{type: noop}}\n"
+                ))
+                .unwrap();
+                let handler = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
+                    config,
+                    Some(crate::address::NetLocation::from_str(authority, None).unwrap()),
+                    Arc::new(NativeResolver::new()),
+                )
+                .unwrap();
                 let expected = override_host.unwrap_or(authority).to_owned();
                 let check = async {
                     let mut io: Box<dyn AsyncStream> = Box::new(peer);
@@ -142,8 +148,13 @@ mod request_tests {
                         .await
                         .unwrap();
                 };
-                let (result, _) =
-                    tokio::join!(handler.setup_client_stream_common(Box::new(client)), check);
+                let (result, _) = tokio::join!(
+                    handler.setup_client_tcp_stream(
+                        Box::new(client),
+                        crate::address::NetLocation::UNSPECIFIED.into()
+                    ),
+                    check
+                );
                 assert!(result.is_err());
             }
         }
