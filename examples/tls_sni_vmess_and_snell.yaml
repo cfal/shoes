@@ -18,7 +18,7 @@
         key: key.com
         protocol:
           type: snell
-          cipher: any
+          cipher: aes-128-gcm
           password: secretpass
   rules:
     # Allow connections to any IP.
