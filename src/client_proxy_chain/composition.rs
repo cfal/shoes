@@ -14,7 +14,7 @@ struct Leaf {
 }
 
 enum Node {
-    Client(Arc<Leaf>),
+    Client(Leaf),
     Sequence(Vec<Node>),
     Choice {
         name: String,
@@ -110,12 +110,12 @@ impl Composition {
 
 #[cfg(test)]
 impl Composition {
-    fn test_pools(&self) -> Vec<Vec<Arc<Leaf>>> {
-        fn collect(node: &Node, start: usize, pools: &mut Vec<Vec<Arc<Leaf>>>) -> usize {
+    fn test_pools(&self) -> Vec<Vec<&Leaf>> {
+        fn collect<'a>(node: &'a Node, start: usize, pools: &mut Vec<Vec<&'a Leaf>>) -> usize {
             match node {
                 Node::Client(leaf) => {
                     pools.resize_with(pools.len().max(start + 1), Vec::new);
-                    pools[start].push(leaf.clone());
+                    pools[start].push(leaf);
                     start + 1
                 }
                 Node::Sequence(nodes) => nodes
@@ -211,13 +211,13 @@ fn node(
                 let udp = proxy.supports_udp_over_tcp();
                 (None, Some(proxy), udp)
             };
-            Ok(Node::Client(Arc::new(Leaf {
+            Ok(Node::Client(Leaf {
                 origin,
                 direct,
                 initial,
                 proxy,
                 udp,
-            })))
+            }))
         }
         ClientChainHop::Pool(pool) => node(
             crate::config::composition::pool_choice(
@@ -261,7 +261,7 @@ fn node(
     }
 }
 
-fn pinned(leaves: &[Arc<Leaf>]) -> ClientProxyChain {
+fn pinned(leaves: &[&Leaf]) -> ClientProxyChain {
     let origins = leaves
         .iter()
         .map(|leaf| vec![leaf.origin.clone()])
@@ -398,18 +398,18 @@ impl Node {
             }
         }
     }
-    fn select(
-        &self,
+    fn select<'a>(
+        &'a self,
         udp: bool,
         selection: &Selection<'_>,
-        leaves: &mut Vec<Arc<Leaf>>,
+        leaves: &mut Vec<&'a Leaf>,
     ) -> io::Result<()> {
         match self {
             Self::Client(leaf) => {
                 if udp && !leaf.udp {
                     return Err(unsupported());
                 }
-                leaves.push(leaf.clone());
+                leaves.push(leaf);
             }
             Self::Sequence(nodes) => {
                 // Capability errors precede health failures, without enumerating paths.
@@ -574,6 +574,43 @@ mod tests {
                 "192.0.2.2:80"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pinned_chain_keeps_connectors_after_composition_is_dropped() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let (chain, _) = super::super::health_tests::build(
+                json!([{"client_group":"out", "type":"selector", "client_chains":[
+                    {"chain":[{"name":"local", "protocol":{"type":"direct"}}]},
+                    {"chain":["direct"]}
+                ]}]),
+                json!("out"),
+            );
+            let composition = chain.composition.as_ref().unwrap();
+            let weak = Arc::downgrade(composition);
+            let pinned = composition.select(false).unwrap();
+            drop(chain);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(pinned.origin(0, 0).unwrap().name.as_ref(), "local");
+
+            let target = crate::address::NetLocation::from_str(
+                &format!("127.0.0.1:{}", listener.local_addr().unwrap().port()),
+                None,
+            )
+            .unwrap();
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let mut connection = pinned.connect_tcp(target.into(), &resolver).await.unwrap();
+            connection.client_stream.write_all(b"pinned").await.unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut received = [0; 6];
+            peer.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"pinned");
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
