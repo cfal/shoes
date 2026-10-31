@@ -92,12 +92,58 @@ pub struct TcpClientSetupResult {
     pub early_data: Option<Vec<u8>>,
 }
 
+/// A selected route whose transport is acquired only on a pool miss. Wrappers
+/// transform the future, keeping warm reuse ahead of every transport handshake.
+pub struct ClientTransport<'a> {
+    pub route: Arc<dyn super::carrier_dialer::CarrierDialer>,
+    pub open: futures::future::BoxFuture<'a, std::io::Result<Box<dyn AsyncStream>>>,
+}
+
+impl<'a> ClientTransport<'a> {
+    pub fn wrap<F, Fut, S>(self, wrap: F) -> Self
+    where
+        F: FnOnce(Box<dyn AsyncStream>) -> Fut + Send + 'a,
+        Fut: Future<Output = std::io::Result<S>> + Send + 'a,
+        S: AsyncStream + 'static,
+    {
+        Self {
+            route: self.route,
+            open: Box::pin(async move {
+                let stream = wrap(self.open.await?).await?;
+                Ok(Box::new(stream) as Box<dyn AsyncStream>)
+            }),
+        }
+    }
+}
+
 #[async_trait]
 #[allow(
     clippy::double_must_use,
     reason = "async-trait adds must_use to boxed futures"
 )]
 pub trait TcpClientHandler: Send + Sync + Debug {
+    fn has_session_pool(&self) -> bool {
+        false
+    }
+
+    async fn connect_client_tcp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        self.setup_client_tcp_stream(transport.open.await?, target)
+            .await
+    }
+
+    async fn connect_client_udp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        self.setup_client_udp_bidirectional(transport.open.await?, target)
+            .await
+    }
+
     /// Resolve protocol-local targets with the current dial's resolver, including on reuse.
     async fn prepare_target(
         &self,

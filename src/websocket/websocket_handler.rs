@@ -22,7 +22,7 @@ use crate::config::WebsocketPingType;
 use crate::prepend_stream::PrependStream;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
+    ClientTransport, TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 
 #[derive(Debug)]
@@ -585,6 +585,28 @@ impl ClientHandshake {
 
 #[async_trait]
 impl TcpClientHandler for WebsocketTcpClientHandler {
+    fn has_session_pool(&self) -> bool {
+        self.handler.has_session_pool()
+    }
+
+    async fn connect_client_tcp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let transport = transport.wrap(|stream| self.setup_client_stream_common(stream));
+        self.handler.connect_client_tcp(transport, target).await
+    }
+
+    async fn connect_client_udp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        let transport = transport.wrap(|stream| self.setup_client_stream_common(stream));
+        self.handler.connect_client_udp(transport, target).await
+    }
+
     async fn prepare_target(
         &self,
         target: ResolvedLocation,

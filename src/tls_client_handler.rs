@@ -6,7 +6,7 @@ use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::crypto::{CryptoTlsStream, TlsConnection, TlsReadMode};
-use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::tcp::tcp_handler::{ClientTransport, TcpClientHandler, TcpClientSetupResult};
 
 #[derive(Debug)]
 pub struct TlsClientHandler {
@@ -23,6 +23,29 @@ pub enum TlsInnerClientHandler {
 }
 
 impl TlsClientHandler {
+    fn create_connection(&self) -> Result<rustls::ClientConnection, rustls::Error> {
+        let mut connection =
+            rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())?;
+        if let Some(size) = self.tls_buffer_size {
+            connection.set_buffer_limit(Some(size));
+        }
+        Ok(connection)
+    }
+
+    async fn wrap_pooled_transport(
+        &self,
+        stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<CryptoTlsStream<Box<dyn AsyncStream>>> {
+        let connection = self.create_connection().map_err(std::io::Error::other)?;
+        CryptoTlsStream::handshake(
+            stream,
+            TlsConnection::new(connection),
+            TlsReadMode::Stream,
+            &[],
+        )
+        .await
+    }
+
     pub fn new(
         client_config: Arc<rustls::ClientConfig>,
         tls_buffer_size: Option<usize>,
@@ -56,18 +79,12 @@ impl TlsClientHandler {
         &self,
         client_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<CryptoTlsStream<Box<dyn AsyncStream>>> {
-        let mut client_conn =
-            rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Failed to create client connection: {e}"),
-                    )
-                })?;
-
-        if let Some(size) = self.tls_buffer_size {
-            client_conn.set_buffer_limit(Some(size));
-        }
+        let client_conn = self.create_connection().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Failed to create client connection: {e}"),
+            )
+        })?;
 
         let connection = TlsConnection::new(client_conn);
         let mode = match self.handler {
@@ -80,6 +97,42 @@ impl TlsClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for TlsClientHandler {
+    fn has_session_pool(&self) -> bool {
+        matches!(&self.handler, TlsInnerClientHandler::Default(handler) if handler.has_session_pool())
+    }
+
+    async fn connect_client_tcp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        if let TlsInnerClientHandler::Default(handler) = &self.handler {
+            let transport = transport.wrap(|stream| async move {
+                let stream = self.wrap_pooled_transport(stream).await?;
+                handler.validate_alpn(stream.alpn_protocol())?;
+                Ok(stream)
+            });
+            handler.connect_client_tcp(transport, target).await
+        } else {
+            self.setup_client_tcp_stream(transport.open.await?, target)
+                .await
+        }
+    }
+
+    async fn connect_client_udp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        if let TlsInnerClientHandler::Default(handler) = &self.handler {
+            let transport = transport.wrap(|stream| self.wrap_pooled_transport(stream));
+            handler.connect_client_udp(transport, target).await
+        } else {
+            self.setup_client_udp_bidirectional(transport.open.await?, target)
+                .await
+        }
+    }
+
     async fn prepare_target(
         &self,
         target: ResolvedLocation,
@@ -480,6 +533,7 @@ mod tests {
             )),
         ];
         for handler in vision {
+            assert!(!handler.has_session_pool());
             assert_eq!(
                 handler
                     .prepare_target(target.clone(), &resolver)

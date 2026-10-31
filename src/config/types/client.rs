@@ -556,6 +556,16 @@ pub enum ClientProxyConfig {
         /// Each line is a key=value pair like "stop=8" or "0=30-30"
         #[serde(default, skip_serializing_if = "Option::is_none")]
         padding_scheme: Option<Vec<String>>,
+        /// Values <= 5 use the reference default of 30 seconds.
+        #[serde(default = "default_anytls_idle_secs")]
+        idle_session_check_interval_secs: u32,
+        #[serde(default = "default_anytls_idle_secs")]
+        idle_session_timeout_secs: u32,
+        /// Retention floor, not proactive dialing or a connection limit.
+        #[serde(default)]
+        min_idle_session: usize,
+        #[serde(default, skip_serializing_if = "is_false")]
+        disable_reuse: bool,
     },
     /// NaiveProxy client protocol (HTTP/2 CONNECT with padding)
     #[serde(alias = "naive")]
@@ -568,6 +578,10 @@ pub enum ClientProxyConfig {
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         padding: bool,
     },
+}
+
+fn default_anytls_idle_secs() -> u32 {
+    30
 }
 
 impl ClientProxyConfig {

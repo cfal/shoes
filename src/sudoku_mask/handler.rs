@@ -7,7 +7,8 @@ use crate::{
     async_stream::{AsyncMessageStream, AsyncStream},
     resolver::Resolver,
     tcp::tcp_handler::{
-        TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
+        ClientTransport, TcpClientHandler, TcpClientSetupResult, TcpServerHandler,
+        TcpServerSetupResult,
     },
 };
 
@@ -21,6 +22,32 @@ pub(crate) struct ClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for ClientHandler {
+    fn has_session_pool(&self) -> bool {
+        self.inner.has_session_pool()
+    }
+
+    async fn connect_client_tcp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> io::Result<TcpClientSetupResult> {
+        let transport = transport.wrap(|stream| async move {
+            Ok(SudokuStream::new(stream, self.config.clone(), Role::Client))
+        });
+        self.inner.connect_client_tcp(transport, target).await
+    }
+
+    async fn connect_client_udp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> io::Result<Box<dyn AsyncMessageStream>> {
+        let transport = transport.wrap(|stream| async move {
+            Ok(SudokuStream::new(stream, self.config.clone(), Role::Client))
+        });
+        self.inner.connect_client_udp(transport, target).await
+    }
+
     async fn prepare_target(
         &self,
         target: ResolvedLocation,
