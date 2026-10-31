@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
 use crate::config::{ResolvedClientConfig, ResolvedClientHop};
 use crate::resolver::Resolver;
-use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::create_proxy_connector;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::socket_connector_impl::SocketConnectorImpl;
@@ -100,8 +99,8 @@ pub(crate) fn build_client_proxy_chain_with_limits(
         if config.protocol.is_direct() {
             InitialHopEntry::Direct(socket)
         } else {
-            let proxy = create_proxy_connector(config.clone(), resolver.clone())?
-                .ok_or_else(|| {
+            let proxy =
+                create_proxy_connector(config.clone(), resolver.clone())?.ok_or_else(|| {
                     std::io::Error::other("Missing proxy connector for non-direct configuration")
                 })?;
             InitialHopEntry::Proxy { socket, proxy }

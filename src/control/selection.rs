@@ -21,7 +21,6 @@ pub struct SelectionView {
     definitions: SelectorDefinitions,
     choices: RwLock<Arc<Choices>>,
     pub automatic: super::url_test::AutomaticGroups,
-    pub(crate) health: super::health::HealthState,
 }
 
 impl SelectionView {

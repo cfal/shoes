@@ -42,8 +42,8 @@ pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
 pub use global::{GlobalLimits, GlobalSettings};
 pub use groups::{
-    ClientConfigGroup, ClientGroupMember, Config, GroupType,
-    NamedPem, PemSource, RuleSourceGroup, UrlTestConfig,
+    ClientConfigGroup, ClientGroupMember, Config, GroupType, NamedPem, PemSource, RuleSourceGroup,
+    UrlTestConfig,
 };
 pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;

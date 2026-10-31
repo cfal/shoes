@@ -470,7 +470,10 @@ pub(crate) fn local_failure(error: &io::Error) -> bool {
     }
     let mut error: &(dyn std::error::Error + 'static) = error;
     loop {
-        if error.is::<ProbePolicyDenied>() || error.is::<crate::dns::SyntheticDnsAnswer>() {
+        if error.is::<ProbePolicyDenied>()
+            || error.is::<crate::dns::SyntheticDnsAnswer>()
+            || error.is::<super::catalog::RouteCapacity>()
+        {
             return true;
         }
         let source = if let Some(error) = error.downcast_ref::<io::Error>() {

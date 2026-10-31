@@ -705,6 +705,8 @@ pub enum ResolvedClientProxyConfig {
     SudokuMask(crate::sudoku_mask::SudokuMaskConfig<ResolvedClientProxyConfig>),
     Direct,
     Wireguard(Box<crate::config::resolved::ResolvedWireguardClientConfig>),
+    Hysteria2(super::quic_client::Hysteria2ClientConfig),
+    Tuic(super::quic_client::TuicClientConfig),
     Http {
         #[serde(skip_serializing_if = "Option::is_none")]
         username: Option<String>,
@@ -792,6 +794,11 @@ pub enum ResolvedClientProxyConfig {
         udp_enabled: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         padding_scheme: Option<Vec<String>>,
+        idle_session_check_interval_secs: u32,
+        idle_session_timeout_secs: u32,
+        min_idle_session: usize,
+        #[serde(skip_serializing_if = "is_false")]
+        disable_reuse: bool,
     },
     Naiveproxy {
         username: String,
@@ -802,6 +809,10 @@ pub enum ResolvedClientProxyConfig {
 }
 
 impl ResolvedClientProxyConfig {
+    pub fn is_native_quic(&self) -> bool {
+        matches!(self, Self::Hysteria2(_) | Self::Tuic(_))
+    }
+
     pub fn is_wireguard(&self) -> bool {
         matches!(self, Self::Wireguard(_))
     }
@@ -816,6 +827,8 @@ impl ResolvedClientProxyConfig {
             ResolvedClientProxyConfig::SudokuMask(_) => "Sudoku mask",
             ResolvedClientProxyConfig::Direct => "Direct",
             ResolvedClientProxyConfig::Wireguard(_) => "WireGuard",
+            ResolvedClientProxyConfig::Hysteria2(_) => "Hysteria2",
+            ResolvedClientProxyConfig::Tuic(_) => "TUIC",
             ResolvedClientProxyConfig::Http { .. } => "HTTP",
             ResolvedClientProxyConfig::Socks { .. } => "SOCKS5",
             ResolvedClientProxyConfig::Shadowsocks { .. } => "Shadowsocks",

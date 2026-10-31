@@ -401,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn xhttp_pool_hits_do_not_open_the_transport() {
-        let config = serde_json::from_value(serde_json::json!({
+        let config = crate::config::test_support::from_json(serde_json::json!({
             "address": "localhost:443",
             "protocol": {"type": "xhttp", "mode": "stream-one", "protocol": {"type": "socks"}}
         }))

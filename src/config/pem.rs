@@ -646,12 +646,12 @@ mod tests {
             assert_eq!(loaded, 2);
             let validated = crate::config::compile_configs(configs).await.unwrap();
             let download = validated.remote_rules[0].download.as_ref().unwrap();
-            let ClientChainHop::Single(ConfigSelection::Config(client)) =
+            let crate::config::ResolvedClientHop::Single(client) =
                 download.client_chain.hops.iter().next().unwrap()
             else {
                 panic!("expected inline client")
             };
-            let ClientProxyConfig::Tls(tls) = &client.protocol else {
+            let crate::config::ResolvedClientProxyConfig::Tls(tls) = &client.protocol else {
                 panic!("expected TLS")
             };
             assert_eq!(tls.cert.as_deref(), Some(cert.as_str()));

@@ -36,13 +36,6 @@ struct Selection<'a> {
     view: Option<&'a SelectionView>,
 }
 
-fn unavailable() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::NotConnected,
-        "fallback has no healthy or unknown eligible member",
-    )
-}
-
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -51,6 +44,26 @@ fn unsupported() -> io::Error {
 }
 
 impl Composition {
+    #[cfg(unix)]
+    pub(super) fn tcp_selection_indices(&self) -> Vec<u32> {
+        let mut indices = Vec::new();
+        self.root.visit_tcp_counters(&mut |counter| {
+            indices.push(counter.load(Ordering::Relaxed));
+        });
+        indices
+    }
+
+    #[cfg(unix)]
+    pub(super) fn restore_tcp_selection_indices(&self, indices: &[u32]) {
+        let mut count = 0;
+        self.root.visit_tcp_counters(&mut |_| count += 1);
+        assert_eq!(indices.len(), count);
+        let mut indices = indices.iter();
+        self.root.visit_tcp_counters(&mut |counter| {
+            counter.store(*indices.next().unwrap(), Ordering::Relaxed);
+        });
+    }
+
     pub(super) fn selection(&self) -> Option<&Arc<SelectionView>> {
         self.selection.as_ref()
     }
@@ -205,7 +218,7 @@ fn node(
                     ProxyConnectorImpl::from_config(config, resolver.clone())?
                         .ok_or_else(unsupported)?,
                 );
-                let udp = proxy.supports_udp_over_tcp();
+                let udp = proxy.supports_udp();
                 (None, Some(proxy), udp)
             };
             Ok(Node::Client(Leaf {
@@ -274,6 +287,24 @@ fn pinned(leaves: &[&Leaf]) -> ClientProxyChain {
 }
 
 impl Node {
+    #[cfg(unix)]
+    fn visit_tcp_counters(&self, visitor: &mut impl FnMut(&AtomicU32)) {
+        match self {
+            Self::Client(_) => {}
+            Self::Sequence(nodes) => {
+                for node in nodes {
+                    node.visit_tcp_counters(visitor);
+                }
+            }
+            Self::Choice { next, members, .. } => {
+                visitor(&next[0]);
+                for member in members {
+                    member.visit_tcp_counters(visitor);
+                }
+            }
+        }
+    }
+
     fn num_hops(&self) -> usize {
         match self {
             Self::Client(_) => 1,
@@ -286,8 +317,7 @@ impl Node {
             Self::Client(_) => false,
             Self::Sequence(nodes) => nodes.iter().any(Self::has_dynamic_policy),
             Self::Choice { kind, members, .. } => {
-                matches!(kind, GroupType::Selector | GroupType::Fallback { .. })
-                    || members.iter().any(Self::has_dynamic_policy)
+                matches!(kind, GroupType::Selector) || members.iter().any(Self::has_dynamic_policy)
             }
         }
     }
@@ -331,35 +361,6 @@ impl Node {
             }),
         }
     }
-    fn available(&self, udp: bool, selection: &Selection<'_>) -> bool {
-        match self {
-            Self::Client(leaf) => !udp || leaf.udp,
-            Self::Sequence(nodes) => nodes
-                .iter()
-                .enumerate()
-                .all(|(index, node)| node.available(udp && index + 1 == nodes.len(), selection)),
-            Self::Choice {
-                name,
-                kind,
-                labels,
-                members,
-                ..
-            } => members.iter().enumerate().any(|(index, member)| {
-                (*kind != GroupType::Selector
-                    || selection.choices.get(name) == Some(&labels[index]))
-                    && (!matches!(kind, GroupType::Fallback { .. })
-                        || selection.view.is_some_and(|view| {
-                            matches!(
-                                view.health
-                                    .member_health(name, &labels[index], selection.choices),
-                                crate::control::health::Health::Healthy
-                                    | crate::control::health::Health::Unknown
-                            )
-                        }))
-                    && member.available(udp, selection)
-            }),
-        }
-    }
     fn record_demand(&self, selection: Option<&SelectionView>) {
         match self {
             Self::Client(leaf) => {
@@ -396,7 +397,6 @@ impl Node {
                 leaves.push(leaf);
             }
             Self::Sequence(nodes) => {
-                // Capability errors precede health failures, without enumerating paths.
                 if !self.eligible(udp, selection.choices) {
                     return Err(unsupported());
                 }
@@ -422,7 +422,7 @@ impl Node {
                         % eligible.len()];
                     return members[selected].select(udp, selection, leaves);
                 }
-                let mut eligible: Vec<_> = members
+                let eligible: Vec<_> = members
                     .iter()
                     .enumerate()
                     .filter_map(|(index, member)| {
@@ -435,27 +435,20 @@ impl Node {
                 if eligible.is_empty() {
                     return Err(unsupported());
                 }
-                eligible.retain(|index| members[*index].available(udp, selection));
-                if eligible.is_empty() {
-                    return Err(unavailable());
-                }
                 let selected = match kind {
-                    GroupType::UrlTest(_) | GroupType::Fallback { .. } => {
+                    GroupType::UrlTest(_) => {
                         let view = selection.view.ok_or_else(unsupported)?;
                         let names = eligible
                             .iter()
                             .map(|index| labels[*index].as_str())
                             .collect();
-                        let selected = if matches!(kind, GroupType::UrlTest(_)) {
-                            view.automatic
-                                .0
-                                .get(name)
-                                .ok_or_else(unsupported)?
-                                .choose(&names, udp)
-                        } else {
-                            view.health.choose(name, &names, selection.choices)
-                        }
-                        .ok_or_else(unavailable)?;
+                        let selected = view
+                            .automatic
+                            .0
+                            .get(name)
+                            .ok_or_else(unsupported)?
+                            .choose(&names, udp)
+                            .ok_or_else(unsupported)?;
                         eligible
                             .into_iter()
                             .find(|index| labels[*index] == selected)
@@ -478,8 +471,35 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn build(
+        mut config: serde_json::Value,
+        chain: serde_json::Value,
+    ) -> (ClientProxyChain, crate::control::catalog::Catalog) {
+        use crate::config::{ResolvedConfig, ResolvedRuleActionConfig};
+        config.as_array_mut().unwrap().push(json!({
+            "address":"127.0.0.1:0", "protocol":{"type":"socks"},
+            "rules":[{"mask":"0.0.0.0/0", "action":"allow", "client_chain":chain}]
+        }));
+        let mut validated =
+            crate::config::create_server_configs(serde_json::from_value(config).unwrap()).unwrap();
+        let ResolvedConfig::Server(server) = &validated.configs[0] else {
+            panic!()
+        };
+        let ResolvedRuleActionConfig::Allow { client_chains, .. } =
+            &server.rules.iter().next().unwrap().action
+        else {
+            panic!()
+        };
+        let chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
+            client_chains.iter().next().unwrap().hops.clone(),
+            Arc::new(crate::resolver::NativeResolver::new()),
+        )
+        .unwrap();
+        (chain, validated.catalog.take().unwrap())
+    }
+
     fn fixture() -> (ClientProxyChain, crate::control::catalog::Catalog) {
-        super::super::health_tests::build(
+        build(
             json!([
                 {"client_group":"entry","client_chains":[{"name":"entrance","address":"192.0.2.1:80","protocol":{"type":"http"}}]},
                 {"client_group":"exit","client_chains":[{"name":"exit-leaf","address":"192.0.2.2:80","protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}}]},
@@ -538,7 +558,7 @@ mod tests {
     #[test]
     fn same_length_alternatives_never_mix_their_hops() {
         for kind in ["selector", "round-robin"] {
-            let (chain, catalog) = super::super::health_tests::build(
+            let (chain, catalog) = build(
                 json!([
                     {"clash_api_address":"127.0.0.1:0","secret":"test"},
                     {"client_group":"out","type":kind,"client_chains":[
@@ -585,7 +605,7 @@ mod tests {
                 }]})
             })
             .collect();
-        let (chain, _) = super::super::health_tests::build(
+        let (chain, _) = build(
             json!([
                 {"clash_api_address":"127.0.0.1:0","secret":"test"},
                 {"client_group":"out","client_chains":members}
@@ -612,16 +632,12 @@ mod tests {
             }
         }
 
-        for kind in ["selector", "fallback", "url-test"] {
+        for kind in ["selector", "url-test"] {
             let mut dynamic = json!({"client_group":"dynamic","type":kind,"client_chain":"direct"});
-            match kind {
-                "fallback" => {
-                    dynamic["health_check"] = json!({"url":"http://192.0.2.1/","interval_secs":10})
-                }
-                "url-test" => dynamic["url"] = json!("http://192.0.2.1/"),
-                _ => {}
+            if kind == "url-test" {
+                dynamic["url"] = json!("http://192.0.2.1/");
             }
-            let (chain, _) = super::super::health_tests::build(
+            let (chain, _) = build(
                 json!([dynamic, {"client_group":"out","client_chains":[{"chain":["dynamic"]},{"chain":["direct"]}]}]),
                 json!("out"),
             );
@@ -633,13 +649,75 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn download_rotation_resumes_nested_and_repeated_choices() {
+        let config = json!([
+            {"clash_api_address":"127.0.0.1:0","secret":"test"},
+            {"client_group":"inner","client_chains":[
+                {"chain":[{"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}}]},
+                {"chain":[{"name":"b","address":"192.0.2.2:80","protocol":{"type":"http"}}]}
+            ]},
+            {"client_group":"out","client_chains":[
+                {"name":"short","chain":["inner"]},
+                {"name":"long","chain":["inner","inner"]}
+            ]}
+        ]);
+        let route = json!(["out", "out"]);
+        let (original, _) = build(config.clone(), route.clone());
+        for _ in 0..7 {
+            original.select_indices(false).unwrap();
+        }
+        let state = original.tcp_selection_indices();
+        assert_eq!(state.len(), 8);
+        let (mut resumed, _) = build(config, route);
+        resumed.restore_tcp_selection_indices(&state);
+        for _ in 0..32 {
+            assert_eq!(
+                original.select_indices(false).unwrap(),
+                resumed.select_indices(false).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn url_test_uses_group_samples_across_callers_without_overriding_round_robin() {
+        let (chain, catalog) = build(
+            json!([{"client_group":"out","type":"url-test","url":"http://192.0.2.1/","client_chains":[
+                {"chain":[{"name":"primary","address":"192.0.2.10:80","protocol":{"type":"http"}}]},
+                {"chain":[{"name":"backup","address":"192.0.2.11:80","protocol":{"type":"http"}}]}
+            ]}]),
+            json!([{"pool":[
+                {"address":"192.0.2.50:80","protocol":{"type":"http"}},
+                {"address":"192.0.2.51:80","protocol":{"type":"http"}}
+            ]}, "out", "out"]),
+        );
+        let other = crate::tcp::chain_builder::try_build_client_proxy_chain(
+            catalog.route("out").unwrap().hops,
+            Arc::new(crate::resolver::NativeResolver::new()),
+        )
+        .unwrap();
+        catalog
+            .selection
+            .automatic
+            .record("primary", "http://192.0.2.1/", Some(100));
+        catalog
+            .selection
+            .automatic
+            .record("backup", "http://192.0.2.1/", Some(1));
+        assert_eq!(chain.select_indices(false).unwrap(), [0, 1, 1]);
+        assert_eq!(chain.select_indices(false).unwrap(), [1, 1, 1]);
+        assert_eq!(other.select_indices(false).unwrap(), [1]);
+        assert_eq!(catalog.selection.automatic.0.len(), 1);
+    }
+
     #[tokio::test]
     async fn pinned_chain_keeps_connectors_after_composition_is_dropped() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-            let (chain, _) = super::super::health_tests::build(
+            let (chain, _) = build(
                 json!([{"client_group":"out", "type":"selector", "client_chains":[
                     {"chain":[{"name":"local", "protocol":{"type":"direct"}}]},
                     {"chain":["direct"]}
@@ -672,7 +750,7 @@ mod tests {
 
     #[test]
     fn probe_connectors_do_not_advance_forwarding_counters_or_reselect_pinned_flows() {
-        let (chain, catalog) = super::super::health_tests::build(
+        let (chain, catalog) = build(
             json!([
                 {"client_group":"pool","client_chains":[
                     {"chain": [{"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}}]},

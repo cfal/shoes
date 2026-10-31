@@ -140,6 +140,9 @@ impl std::fmt::Debug for ClientProxyChain {
 impl ClientProxyChain {
     #[cfg(unix)]
     pub(crate) fn tcp_selection_indices(&self) -> Vec<u32> {
+        if let Some(composition) = &self.composition {
+            return composition.tcp_selection_indices();
+        }
         std::iter::once(&self.initial_hop_next_index)
             .chain(&self.subsequent_next_indices)
             .map(|counter| counter.load(Ordering::Relaxed))
@@ -148,6 +151,10 @@ impl ClientProxyChain {
 
     #[cfg(unix)]
     pub(crate) fn restore_tcp_selection_indices(&mut self, indices: &[u32]) {
+        if let Some(composition) = &self.composition {
+            composition.restore_tcp_selection_indices(indices);
+            return;
+        }
         assert_eq!(indices.len(), self.num_hops());
         for (counter, index) in std::iter::once(&mut self.initial_hop_next_index)
             .chain(&mut self.subsequent_next_indices)
@@ -481,36 +488,44 @@ impl ClientProxyChain {
         target: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let indices = self.select_indices(false)?;
-        self.with_route_activity(&indices, async {
-            let mut route = self.selected_route(resolver, &indices);
-            let initial = match route.initial.as_deref() {
-                Some(InitialHopEntry::Proxy { proxy, .. }) => Some(proxy.as_ref()),
-                _ => None,
-            };
-            let mut pinned = std::collections::HashMap::new();
-            for proxy in initial
-                .into_iter()
-                .chain(route.subsequent.iter().map(AsRef::as_ref))
-                // The directly dialed proxy retains the socket connector's address fallback.
-                .skip(1)
-            {
-                let location = proxy.proxy_location();
-                if pinned.contains_key(location) {
-                    continue;
+        let pinned;
+        let (chain, indices) = if let Some(composition) = &self.composition {
+            pinned = composition.select(false)?;
+            let indices = vec![0; pinned.num_hops()];
+            (&pinned, indices)
+        } else {
+            (self, self.select_indices(false)?)
+        };
+        chain
+            .with_route_activity(&indices, async {
+                let mut route = chain.selected_route(resolver, &indices);
+                let initial = match route.initial.as_deref() {
+                    Some(InitialHopEntry::Proxy { proxy, .. }) => Some(proxy.as_ref()),
+                    _ => None,
+                };
+                let mut pinned = std::collections::HashMap::new();
+                for proxy in initial
+                    .into_iter()
+                    .chain(route.subsequent.iter().map(AsRef::as_ref))
+                    // The directly dialed proxy retains the socket connector's address fallback.
+                    .skip(1)
+                {
+                    let location = proxy.proxy_location();
+                    if pinned.contains_key(location) {
+                        continue;
+                    }
+                    let addresses = crate::resolver::resolve_addresses(resolver, location).await?;
+                    pinned.insert(location.clone(), addresses);
                 }
-                let addresses = crate::resolver::resolve_addresses(resolver, location).await?;
-                pinned.insert(location.clone(), addresses);
-            }
-            // Pin wire endpoints, not connector configurations: TLS still verifies the original name.
-            route.pinned_proxies = Some(Arc::new(PinnedProxies {
-                endpoints: pinned,
-                // Shared forks bound nested address races linearly in the selected route depth.
-                extra_attempts: tokio::sync::Semaphore::new(route.subsequent.len()),
-            }));
-            route.connect(target).await
-        })
-        .await
+                // Pin wire endpoints, not connector configurations: TLS still verifies the original name.
+                route.pinned_proxies = Some(Arc::new(PinnedProxies {
+                    endpoints: pinned,
+                    // Shared forks bound nested address races linearly in the selected route depth.
+                    extra_attempts: tokio::sync::Semaphore::new(route.subsequent.len()),
+                }));
+                route.connect(target).await
+            })
+            .await
     }
 
     async fn connect_tcp_observed(

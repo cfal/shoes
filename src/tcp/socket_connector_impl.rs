@@ -18,7 +18,7 @@ use tokio::net::UdpSocket;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
-use crate::config::{ResolvedClientConfig, ClientQuicConfig, Transport, quic_client::Obfuscation};
+use crate::config::{ClientQuicConfig, ResolvedClientConfig, Transport, quic_client::Obfuscation};
 use crate::quic_endpoint::QuicEndpoint;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
@@ -299,12 +299,15 @@ impl SocketConnectorImpl {
                 let is_xhttp = crate::xhttp::connector::contains(&config.protocol);
                 let is_native = config.protocol.is_native_quic();
                 let (obfs, hopping) = match &config.protocol {
-                    crate::config::ClientProxyConfig::Hysteria2(settings) => {
+                    crate::config::ResolvedClientProxyConfig::Hysteria2(settings) => {
                         (settings.obfs.clone(), settings.hopping.clone())
                     }
                     _ => (None, None),
                 };
-                let is_tuic = matches!(config.protocol, crate::config::ClientProxyConfig::Tuic(_));
+                let is_tuic = matches!(
+                    config.protocol,
+                    crate::config::ResolvedClientProxyConfig::Tuic(_)
+                );
                 let alpn_protocols = if (is_xhttp || is_native) && alpn_protocols.is_unspecified() {
                     vec!["h3".to_owned()]
                 } else {
@@ -841,7 +844,7 @@ mod tests {
             NoneOrOne::One(name) => format!("sni_hostname: '{name}', "),
         };
         for protocol in protocols {
-            let config: ClientConfig = serde_yaml::from_str(&format!(
+            let config: ResolvedClientConfig = crate::config::test_support::from_yaml(&format!(
                 "address: '{host}:{port}'\ntransport: quic\nquic_settings: {{verify: true, {sni_yaml}alpn_protocols: [h3]}}\nprotocol: {protocol}\n"
             ))
             .unwrap();

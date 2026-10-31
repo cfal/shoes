@@ -1,9 +1,9 @@
 use super::{Limits, MAX_BYTES};
 use crate::async_stream::AsyncStream;
-use crate::config::{ConfigSelection, GlobalLimits};
+use crate::config::GlobalLimits;
 use crate::crypto::{CryptoTlsStream, TlsConnection, TlsReadMode};
 use crate::dns::DnsRegistry;
-use crate::rule_set::{Download, RuleSource};
+use crate::rule_set::{ResolvedDownload as Download, ResolvedRuleSource as RuleSource};
 use crate::rules::invalid;
 use bytes::Bytes;
 use http::{Request, StatusCode, Uri, header};
@@ -67,10 +67,9 @@ pub(super) fn validate_literal_endpoints(
         ));
     }
     for hop in download.client_chain.hops.iter() {
-        for member in hop.selections() {
-            let ConfigSelection::Config(client) = member else {
-                return Err(invalid("unexpanded rule download chain"));
-            };
+        for client in crate::config::composition::clients(hop)
+            .flat_map(crate::config::resolved_visit::client_tree)
+        {
             if client
                 .address
                 .to_socket_addr_nonblocking()

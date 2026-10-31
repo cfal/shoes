@@ -197,7 +197,7 @@ fn system_bootstrap_dependencies_preserve_named_group_precedence() {
     group.specs[0] = make_spec("udp://127.0.0.1:53");
     assert!(!group_uses_system(group, &known).unwrap());
     group.specs[0].client_chains = vec![
-        serde_json::from_value(serde_json::json!({
+        crate::config::test_support::from_json(serde_json::json!({
             "address": "proxy.invalid:1080", "protocol": {"type": "socks"}
         }))
         .unwrap(),
@@ -218,7 +218,7 @@ async fn explicit_proxy_bootstrap_does_not_require_native_dns_preflight() {
     spec.url = "tcp://127.0.0.1:53".into();
     spec.bootstrap_url = Some("udp://127.0.0.1:54".into());
     spec.client_chains = vec![
-        serde_json::from_value(serde_json::json!({
+        crate::config::test_support::from_json(serde_json::json!({
             "address": "proxy.invalid:1080", "protocol": {"type": "socks"}
         }))
         .unwrap(),

@@ -60,7 +60,7 @@ mod tests {
 
     const NAIVE: &str = "NaiveProxy does not support multiple chain prefixes";
 
-    fn fallback(members: Value) -> Value {
+    fn selector(members: Value) -> Value {
         let members: Vec<_> = members
             .as_array()
             .unwrap()
@@ -73,8 +73,7 @@ mod tests {
                 }
             })
             .collect();
-        json!({"client_group":"out", "type":"fallback",
-            "health_check":{"url":"http://192.0.2.1/", "interval_secs":30},
+        json!({"client_group":"out", "type":"selector",
             "client_chains":members})
     }
 
@@ -94,7 +93,7 @@ mod tests {
     fn rejects(values: Value, message: &str) {
         let error = validate(values)
             .err()
-            .expect("unsupported fallback must be rejected");
+            .expect("unsupported chain must be rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{error}");
         assert_eq!(error.to_string(), message);
     }
@@ -193,18 +192,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn health_review5_dynamic_wireguard_allowed_in_unused_groups_and_all_policies() {
-        for kind in ["round-robin", "selector", "fallback", "url-test"] {
+        for kind in ["round-robin", "selector", "url-test"] {
             let mut carrier = json!({"client_group":"carrier", "type":kind,
                 "client_chains":[{"chain": ["direct"]}, {"chain": [proxy("tcp-only")]}]});
-            if kind == "fallback" {
-                carrier["health_check"] = json!({"url":"http://192.0.2.1/", "interval_secs":30});
-            } else if kind == "url-test" {
+            if kind == "url-test" {
                 carrier["url"] = json!("http://192.0.2.1/");
             }
             validate(json!([
                 wireguard(json!("carrier")),
                 carrier,
-                fallback(json!(["wg"]))
+                selector(json!(["wg"]))
             ]))
             .unwrap();
         }
@@ -234,7 +231,7 @@ mod tests {
             inner,
             carrier.clone(),
             outer,
-            fallback(json!(["wg"]))
+            selector(json!(["wg"]))
         ]))
         .unwrap();
 
@@ -248,14 +245,14 @@ mod tests {
             validate(json!([
                 wireguard(json!("carrier")),
                 carrier.clone(),
-                fallback(json!([proxy("end")])),
+                selector(json!([proxy("end")])),
                 consumer
             ]))
             .unwrap();
         }
-        // A group can combine a fallback branch and a dynamic WireGuard sibling.
+        // A group can combine a selector branch and a dynamic WireGuard sibling.
         validate(
-            json!([wireguard(json!("carrier")), carrier, fallback(json!(["direct"])),
+            json!([wireguard(json!("carrier")), carrier, selector(json!(["direct"])),
             {"client_group":"mixed", "client_chains":[{"chain": ["out"]}, {"chain": ["wg"]}]}]),
         )
         .unwrap();
@@ -276,20 +273,20 @@ mod tests {
             let hop = json!({"address":"192.0.2.20:443", "protocol":protocol});
             rejects(
                 json!([
-                    fallback(json!([proxy("a"), proxy("b")])),
+                    selector(json!([proxy("a"), proxy("b")])),
                     server(json!(["out", hop.clone()]))
                 ]),
                 NAIVE,
             );
             rejects(
                 json!([
-                    fallback(json!([hop.clone()])),
+                    selector(json!([hop.clone()])),
                     server(json!([{"pool":[proxy("a"), proxy("b")]}, "out"]))
                 ]),
                 NAIVE,
             );
             rejects(
-                json!([fallback(json!([proxy("a"), proxy("b")])),
+                json!([selector(json!([proxy("a"), proxy("b")])),
                 {"dns_group":"dns", "dns_servers":[{"url":"tcp://192.0.2.53", "client_chain":{"chain":["out", hop]}}]}]),
                 NAIVE,
             );
@@ -308,7 +305,7 @@ mod tests {
         outer["client_chains"][0]["protocol"]["mtu"] = json!(1280);
         let carrier = json!({"client_group":"carrier", "type":"selector", "client_chains":[{"chain": ["direct"]}, {"chain": [proxy("tcp-only")]}]});
         validate(json!([outer.clone(), carrier.clone(), {"client_group":"out", "client_chains":["direct"]}])).unwrap();
-        validate(json!([outer, carrier, fallback(json!(["direct"]))])).unwrap();
+        validate(json!([outer, carrier, selector(json!(["direct"]))])).unwrap();
     }
 
     #[cfg(unix)]
@@ -343,7 +340,7 @@ mod tests {
                 ordinary.push(json!({"client_group":"out", "client_chains":members}));
                 validate(json!(ordinary)).unwrap();
 
-                configs.push(fallback(members.clone()));
+                configs.push(selector(members.clone()));
                 validate(json!(configs)).unwrap();
             }
         }
@@ -354,17 +351,17 @@ mod tests {
         let naive = json!({"name":"naive", "address":"192.0.2.20:443",
             "protocol":{"type":"naive", "username":"user", "password":"secret"}});
         validate(json!([
-            fallback(json!([proxy("a")])),
+            selector(json!([proxy("a")])),
             server(json!(["out", naive.clone()]))
         ]))
         .unwrap();
         validate(json!([
-            fallback(json!([naive.clone(), proxy("a")])),
+            selector(json!([naive.clone(), proxy("a")])),
             server(json!("out"))
         ]))
         .unwrap();
         validate(json!([
-            fallback(json!([proxy("a"), proxy("b")])),
+            selector(json!([proxy("a"), proxy("b")])),
             server(json!([naive.clone(), "out"]))
         ]))
         .unwrap();
@@ -379,13 +376,13 @@ mod tests {
     fn health_review5_static_wireguard_and_resolver_only_dynamics_remain_supported() {
         validate(json!([
             wireguard(json!("direct")),
-            fallback(json!(["wg"])),
+            selector(json!(["wg"])),
             server(json!("out"))
         ]))
         .unwrap();
         let carrier = json!({"client_group":"carrier", "type":"selector", "client_chains":[{"chain": ["direct"]}, {"chain": [proxy("tcp-only")]}]});
         validate(
-            json!([wireguard(json!("carrier")), carrier, fallback(json!([proxy("a")])),
+            json!([wireguard(json!("carrier")), carrier, selector(json!([proxy("a")])),
             {"dns_group":"dns", "dns_servers":[{"url":"tcp://192.0.2.53", "client_chain":"wg"}]},
             {"address":"127.0.0.1:0", "protocol":{"type":"socks"}, "dns":{"servers":"dns"},
                 "rules":[{"mask":"0.0.0.0/0", "action":"allow", "client_chain":"out"}]}]),
@@ -394,9 +391,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_routes_do_not_enumerate_pool_products() {
+    fn selector_routes_do_not_enumerate_pool_products() {
         validate(json!([
-            fallback(json!([proxy("a"), proxy("b")])),
+            selector(json!([proxy("a"), proxy("b")])),
             server(json!(vec!["out"; 12]))
         ]))
         .unwrap();

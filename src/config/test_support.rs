@@ -357,6 +357,8 @@ impl Inline for ResolvedWebsocketServerConfig {
         Self {
             matching_path: source.matching_path,
             matching_headers: source.matching_headers,
+            max_early_data: source.max_early_data,
+            early_data_header_name: source.early_data_header_name,
             protocol: ResolvedServerProxyConfig::inline(source.protocol),
             ping_type: source.ping_type,
             override_rules: rules(source.override_rules),
