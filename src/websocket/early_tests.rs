@@ -1198,41 +1198,29 @@ async fn eager_client_rejects_bad_status_and_duplicate_response_headers() {
 
 #[tokio::test]
 async fn eager_and_early_clients_validate_upgrade_tokens_and_preserve_read_ahead() {
-    for max in [0, 32] {
+    let invalid_upgrade = Some("missing or invalid WebSocket Upgrade header");
+    let invalid_connection = Some("missing or invalid WebSocket Connection header");
+
+    for max_early_data in [0, 32] {
         for (headers, expected_error) in [
-            ("", Some("missing or invalid WebSocket Upgrade header")),
-            (
-                "Connection: Upgrade\r\n",
-                Some("missing or invalid WebSocket Upgrade header"),
-            ),
-            (
-                "Upgrade: h2c\r\nConnection: Upgrade\r\n",
-                Some("missing or invalid WebSocket Upgrade header"),
-            ),
+            ("", invalid_upgrade),
+            ("Connection: Upgrade\r\n", invalid_upgrade),
+            ("Upgrade: h2c\r\nConnection: Upgrade\r\n", invalid_upgrade),
             (
                 "Upgrade: websocket-extra\r\nConnection: Upgrade\r\n",
-                Some("missing or invalid WebSocket Upgrade header"),
+                invalid_upgrade,
             ),
-            (
-                "Upgrade: \r\nConnection: Upgrade\r\n",
-                Some("missing or invalid WebSocket Upgrade header"),
-            ),
-            (
-                "Upgrade: websocket\r\n",
-                Some("missing or invalid WebSocket Connection header"),
-            ),
+            ("Upgrade: \r\nConnection: Upgrade\r\n", invalid_upgrade),
+            ("Upgrade: websocket\r\n", invalid_connection),
             (
                 "Upgrade: websocket\r\nConnection: keep-alive\r\n",
-                Some("missing or invalid WebSocket Connection header"),
+                invalid_connection,
             ),
             (
                 "Upgrade: websocket\r\nConnection: not-upgrade\r\n",
-                Some("missing or invalid WebSocket Connection header"),
+                invalid_connection,
             ),
-            (
-                "Upgrade: websocket\r\nConnection: \r\n",
-                Some("missing or invalid WebSocket Connection header"),
-            ),
+            ("Upgrade: websocket\r\nConnection: \r\n", invalid_connection),
             ("Upgrade: websocket\r\nConnection: Upgrade\r\n", None),
             (
                 "uPgRaDe: h2c, WeBsOcKeT\r\ncOnNeCtIoN: keep-alive, UpGrAdE\r\n",
@@ -1246,15 +1234,15 @@ async fn eager_and_early_clients_validate_upgrade_tokens_and_preserve_read_ahead
             tokio::time::timeout(Duration::from_secs(3), async {
                 let (client, peer) = tokio::io::duplex(8192);
                 let handler = WebsocketTcpClientHandler {
-                    handshake: handshake_options(max, Some("Sec-WebSocket-Protocol")),
+                    handshake: handshake_options(max_early_data, Some("Sec-WebSocket-Protocol")),
                     handler: Box::new(crate::port_forward_handler::PortForwardClientHandler),
                 };
-                let task = async move {
+                let server_handshake = async move {
                     let mut peer: Box<dyn AsyncStream> = Box::new(peer);
                     let parsed = ParsedHttpData::parse(&mut peer).await.unwrap();
                     assert_eq!(
                         parsed.headers.get("sec-websocket-protocol").map(String::as_str),
-                        (max > 0).then_some("ZWFybHk")
+                        (max_early_data > 0).then_some("ZWFybHk")
                     );
                     let accept =
                         create_websocket_key_response(parsed.headers["sec-websocket-key"].clone());
@@ -1266,11 +1254,11 @@ async fn eager_and_early_clients_validate_upgrade_tokens_and_preserve_read_ahead
                     peer.write_all(&response).await.unwrap();
                     peer
                 };
-                let client = async {
+                let client_exchange = async {
                     let mut stream = handler
                         .setup_client_stream_common(Box::new(FlushGatedStream::new(client)))
                         .await?;
-                    if max > 0 {
+                    if max_early_data > 0 {
                         stream.write_all(b"early").await?;
                         stream.flush().await?;
                     }
@@ -1279,14 +1267,16 @@ async fn eager_and_early_clients_validate_upgrade_tokens_and_preserve_read_ahead
                     assert_eq!(&reply, b"reply");
                     Ok::<_, io::Error>(())
                 };
-                let (result, _peer) = tokio::join!(client, task);
+                let (result, _peer) = tokio::join!(client_exchange, server_handshake);
                 match expected_error {
                     Some(expected) => assert_eq!(result.unwrap_err().to_string(), expected),
                     None => result.unwrap(),
                 }
             })
             .await
-            .unwrap_or_else(|_| panic!("upgrade timed out: max={max}, headers={headers:?}"));
+            .unwrap_or_else(|_| {
+                panic!("upgrade timed out: max={max_early_data}, headers={headers:?}")
+            });
         }
     }
 }
