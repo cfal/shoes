@@ -219,7 +219,8 @@ jobs:
       env:
         CARGO_BUILD_JOBS: 1
       run: >-
-        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi websocket -- --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi --
+        websocket:: config::validate::tests::websocket_early_data_ --test-threads=1
 
     - name: Run local WebSocket early-data interoperability tests
       env:

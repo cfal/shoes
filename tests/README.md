@@ -85,9 +85,14 @@ for `ws_early_data`; the other suites retain their existing peer versions.
 Mihomo uses the optional-peer job's existing 1.19.31 pin: all three client
 carriers, standard-header server reception, and default Shoes server reception.
 
-Run `cargo test --locked --lib websocket` for the focused early-data, framing,
-configuration-validation, and factory tests. These cover parser boundaries,
-explicit limits above the automatic cap, routing before decoding, and independently
+Run the focused early-data, framing, configuration-validation, and factory tests with:
+
+```sh
+cargo test --locked --lib -- websocket:: config::validate::tests::websocket_early_data_
+```
+
+These cover parser boundaries, explicit limits above the automatic cap,
+routing before decoding, and independently
 scheduled reader/writer success, failure, cancellation, and timeout paths.
 Plaintext integration captures compare the exact Shoes VLESS first-flight prefix,
 including its configured split point. Peer captures allow different write batching.
