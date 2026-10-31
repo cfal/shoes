@@ -16,6 +16,17 @@ use crate::config::ClientConfig;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
+pub(crate) fn create_proxy_connector(
+    config: ClientConfig,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<Option<Box<dyn ProxyConnector>>> {
+    if config.protocol.is_native_quic() {
+        return Ok(Some(Box::new(crate::quic_client::Client::new(config)?)));
+    }
+    Ok(ProxyConnectorImpl::from_config(config, resolver)?
+        .map(|connector| Box::new(connector) as Box<dyn ProxyConnector>))
+}
+
 /// Implementation of ProxyConnector for proxy protocol setup.
 ///
 /// Created from the protocol-related fields of a ClientConfig:
@@ -114,7 +125,7 @@ impl ProxyConnector for ProxyConnectorImpl {
         &self.location
     }
 
-    fn supports_udp_over_tcp(&self) -> bool {
+    fn supports_udp(&self) -> bool {
         self.client_handler.supports_udp_over_tcp()
     }
 

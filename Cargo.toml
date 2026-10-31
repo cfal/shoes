@@ -22,8 +22,9 @@ resolver = "3"
 # REALITY patches on stable rustls: reality/0.23.46-f04804fa1334. Pins the patched commit, not the branch.
 rustls = { git = "https://github.com/cfal/rustls", rev = "f1a23c187330386e9e7f14a21dbae368034dc430" }
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "cd98c1c4112ed3b2cf2140e1844f266b3d665b53" }
-h3 = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
-h3-quinn = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
+# Bounds buffered H3 frames before payload reads and skips unknown frames incrementally.
+h3 = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
+h3-quinn = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
 # Backports hickory-dns/hickory-dns#3861 and preserves H3 connection-close failover.
 hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
 hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
@@ -118,6 +119,7 @@ aho-corasick = "1"
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
+blake2 = "0.10"
 blake3 = "*"
 bytes = "*"
 chrono = "*"
@@ -186,6 +188,7 @@ tokio = { version = "*", features = [
 tokio-util = { version = "*", features = ["time", "io", "rt"] }
 tun = { version = "*", features = ["async"] }
 url = "*"
+uuid = "1"
 webpki-roots = { version = "*" }
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
 zeroize = "*"

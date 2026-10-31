@@ -63,6 +63,7 @@ mod option_util;
 mod port_forward_handler;
 mod prepend_stream;
 mod process;
+mod quic_client;
 mod quic_endpoint;
 mod quic_server;
 mod quic_stream;

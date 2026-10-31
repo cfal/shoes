@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use log::{debug, error};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
+use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
 
 use crate::address::{Address, NetLocation};
@@ -33,6 +34,8 @@ const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
 // hostname case: type (1) + hostname length (1) + hostname bytes (255) + port (2)
 const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
 const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
+const MAX_PREAUTH_COMMANDS: usize = 32;
+const MAX_PREAUTH_BYTES: usize = 1 << 20;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -89,21 +92,22 @@ async fn process_connection(
 
     // Authentication with timeout - per sing-box reference, default 3 seconds.
     // This prevents malicious clients from holding connections open without authenticating.
-    match timeout(AUTH_TIMEOUT, auth_connection(&connection, &uuid, &password)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            connection.close(0u32.into(), b"auth failed");
-            return Err(e);
-        }
-        Err(_elapsed) => {
-            error!("Authentication timeout");
-            connection.close(0u32.into(), b"auth timeout");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "authentication timeout",
-            ));
-        }
-    }
+    let pending_commands =
+        match timeout(AUTH_TIMEOUT, auth_connection(&connection, &uuid, &password)).await {
+            Ok(Ok(pending)) => pending,
+            Ok(Err(e)) => {
+                connection.close(0u32.into(), b"auth failed");
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                error!("Authentication timeout");
+                connection.close(0u32.into(), b"auth timeout");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "authentication timeout",
+                ));
+            }
+        };
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions, cleanup task, heartbeat) will terminate gracefully.
@@ -145,6 +149,7 @@ async fn process_connection(
         uni_resolver,
         uni_udp_session_map,
         uni_cancel_token,
+        pending_commands,
     );
 
     let datagram_loop = run_datagram_loop(
@@ -204,7 +209,7 @@ async fn auth_connection(
     connection: &quinn::Connection,
     uuid: &[u8],
     password: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<Vec<(u8, Vec<u8>)>> {
     let mut expected_token_bytes = [0u8; 32];
     connection
         .export_keying_material(
@@ -214,28 +219,47 @@ async fn auth_connection(
         )
         .map_err(|e| std::io::Error::other(format!("Failed to export keying material: {e:?}")))?;
 
-    // Loop until we receive an AUTH command.
-    // Other commands (like DISSOCIATE) may arrive on uni streams before AUTH.
-    // We discard non-AUTH streams and wait for the next one.
-    // The outer timeout in process_connection ensures we don't wait forever.
+    let mut pending = Vec::new();
+    let mut pending_bytes = 0;
+    let pending_limit = crate::resources::limits()
+        .max_streams_per_connection
+        .unwrap_or(MAX_PREAUTH_COMMANDS)
+        .min(MAX_PREAUTH_COMMANDS);
+    // Independent uni streams may reach the peer before the AUTH stream.
+    // Complete bounded commands to return uni credit even when the peer has only
+    // one stream available. Nothing is dispatched before authentication.
     loop {
         let mut recv_stream = connection.accept_uni().await?;
-        let mut stream_reader = StreamReader::new_with_buffer_size(80);
-        let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
+        let mut header = [0; 2];
+        tokio::io::AsyncReadExt::read_exact(&mut recv_stream, &mut header).await?;
+        let tuic_version = header[0];
         if tuic_version != 5 {
             return Err(std::io::Error::other(format!(
                 "invalid tuic version: {tuic_version}"
             )));
         }
-        let command_type = stream_reader.read_u8(&mut recv_stream).await?;
+        let command_type = header[1];
 
         if command_type != COMMAND_TYPE_AUTHENTICATE {
-            // Not an AUTH command - discard this stream and wait for the next one.
-            debug!("Received command type {command_type} before auth, waiting for auth command");
+            if !matches!(command_type, COMMAND_TYPE_PACKET | COMMAND_TYPE_DISSOCIATE)
+                || pending.len() >= pending_limit
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid or excessive pre-auth TUIC commands",
+                ));
+            }
+            let body = recv_stream
+                .read_to_end((MAX_HEADER_LEN + 65535).min(MAX_PREAUTH_BYTES - pending_bytes))
+                .await
+                .map_err(std::io::Error::other)?;
+            pending_bytes += body.len();
+            pending.push((command_type, body));
             continue;
         }
 
-        let credentials = stream_reader.read_slice(&mut recv_stream, 48).await?;
+        let mut credentials = [0; 48];
+        tokio::io::AsyncReadExt::read_exact(&mut recv_stream, &mut credentials).await?;
         let authenticated =
             credentials[..16].ct_eq(uuid) & credentials[16..].ct_eq(&expected_token_bytes);
         if !bool::from(authenticated) {
@@ -245,7 +269,7 @@ async fn auth_connection(
             ));
         }
 
-        return Ok(());
+        return Ok(pending);
     }
 }
 
@@ -316,7 +340,7 @@ async fn run_bidirectional_loop(
 }
 
 async fn read_address(
-    recv: &mut quinn::RecvStream,
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     stream_reader: &mut StreamReader,
 ) -> std::io::Result<Option<NetLocation>> {
     let address_type = stream_reader.read_u8(recv).await?;
@@ -789,7 +813,9 @@ async fn run_unidirectional_loop(
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
+    pending_commands: Vec<(u8, Vec<u8>)>,
 ) -> std::io::Result<()> {
+    let mut pending_commands = pending_commands.into_iter();
     let mut tasks = JoinSet::new();
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
     let cleanup_session_map = udp_session_map.clone();
@@ -819,22 +845,23 @@ async fn run_unidirectional_loop(
     });
 
     loop {
-        let accepted = tokio::select! {
-            result = connection.accept_uni() => result,
-            _ = tasks.join_next(), if !tasks.is_empty() => continue,
-        };
-        let recv_stream = match accepted {
-            Ok(recv_stream) => recv_stream,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                break;
-            }
-            Err(quinn::ConnectionError::ConnectionClosed(_)) => {
-                break;
-            }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to accept unidirectional stream: {e}"
-                )));
+        let (command, recv_stream) = match pending_commands.next() {
+            Some((command, body)) => (Some(command), Either::Left(std::io::Cursor::new(body))),
+            None => {
+                let accepted = tokio::select! {
+                    result = connection.accept_uni() => result,
+                    _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                };
+                match accepted {
+                    Ok(stream) => (None, Either::Right(stream)),
+                    Err(quinn::ConnectionError::ApplicationClosed(_))
+                    | Err(quinn::ConnectionError::ConnectionClosed(_)) => break,
+                    Err(error) => {
+                        return Err(std::io::Error::other(format!(
+                            "failed to accept unidirectional stream: {error}"
+                        )));
+                    }
+                }
             }
         };
 
@@ -865,6 +892,7 @@ async fn run_unidirectional_loop(
                     recv_stream,
                     udp_session_map,
                     cancel_token,
+                    command,
                 ),
             )
             .await
@@ -893,19 +921,24 @@ async fn process_uni_stream(
     connection: &quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    mut recv_stream: quinn::RecvStream,
+    mut recv_stream: impl tokio::io::AsyncRead + Unpin,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
+    command: Option<u8>,
 ) -> std::io::Result<()> {
     let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
 
-    let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
-    if tuic_version != 5 {
-        return Err(std::io::Error::other(format!(
-            "invalid tuic version: {tuic_version}"
-        )));
-    }
-    let command_type = stream_reader.read_u8(&mut recv_stream).await?;
+    let command_type = if let Some(command) = command {
+        command
+    } else {
+        let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
+        if tuic_version != 5 {
+            return Err(std::io::Error::other(format!(
+                "invalid tuic version: {tuic_version}"
+            )));
+        }
+        stream_reader.read_u8(&mut recv_stream).await?
+    };
 
     if command_type == COMMAND_TYPE_DISSOCIATE {
         let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
@@ -1484,7 +1517,8 @@ mod auth_tests {
     }
 
     async fn connect(selector: Arc<ClientProxySelector>) -> Peer {
-        let (server, client) = crate::quic_endpoint::test_endpoints();
+        // One uni stream exposes pre-auth credit retention deadlocks.
+        let (server, client) = crate::quic_endpoint::test_endpoints_with_uni_limit(1);
         let address = server.local_addr().unwrap();
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let accepting = server.clone();
@@ -1543,7 +1577,7 @@ mod auth_tests {
             ))
             .await;
 
-            // Commands other than AUTHENTICATE may precede authentication and are ignored.
+            // Commands preceding authentication are dispatched only after it succeeds.
             send_uni(&peer.connection, &[5, COMMAND_TYPE_DISSOCIATE, 0, 1]).await;
             send_uni(
                 &peer.connection,
@@ -1560,6 +1594,48 @@ mod auth_tests {
             assert_eq!(recv.read_to_end(1024).await.unwrap(), b"hello");
             echo_task.await.unwrap();
             assert!(!peer.server.is_finished());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn packet_before_auth_is_retained_without_pre_auth_dispatch() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let echo = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let target = NetLocation::from_str(
+                &format!("127.0.0.1:{}", echo.local_addr().unwrap().port()),
+                None,
+            )
+            .unwrap();
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let peer = connect(Arc::new(
+                create_test_selector(vec![crate::config::RuleConfig::default()], resolver).unwrap(),
+            ))
+            .await;
+            let mut packet = vec![5, COMMAND_TYPE_PACKET, 0, 7, 0, 9, 1, 0, 0, 5];
+            packet.extend_from_slice(&serialize_address(&target));
+            packet.extend_from_slice(b"first");
+            send_uni(&peer.connection, &packet).await;
+            let mut buffer = [0; 64];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), echo.recv_from(&mut buffer))
+                    .await
+                    .is_err()
+            );
+            send_uni(
+                &peer.connection,
+                &authenticate_command(&peer.connection, PASSWORD),
+            )
+            .await;
+            let (length, remote) = echo.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(&buffer[..length], b"first");
+            echo.send_to(b"reply", remote).await.unwrap();
+            let mut receive = peer.connection.accept_uni().await.unwrap();
+            let response = receive.read_to_end(1024).await.unwrap();
+            assert!(response.ends_with(b"reply"));
+            peer.connection.close(0u32.into(), b"done");
+            let _ = peer.server.await;
         })
         .await
         .unwrap();

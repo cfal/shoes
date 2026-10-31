@@ -40,6 +40,11 @@ impl<K: Eq + Hash + Clone> UdpFragments<K> {
         self.bytes = self.packets.values().map(|packet| packet.bytes).sum();
     }
 
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        self.packets.retain(|key, _| keep(key));
+        self.bytes = self.packets.values().map(|packet| packet.bytes).sum();
+    }
+
     fn remove(&mut self, key: &K) -> Option<Packet> {
         let packet = self.packets.remove(key)?;
         self.bytes -= packet.bytes;

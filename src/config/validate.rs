@@ -1368,6 +1368,12 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
                 "direct cannot be used as an inner proxy protocol",
             ));
         }
+        if inner.is_native_quic() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native QUIC cannot be used as an inner proxy protocol",
+            ));
+        }
         if inner.is_wireguard() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1386,6 +1392,7 @@ fn validate_client_config(
 ) -> std::io::Result<()> {
     crate::sudoku_mask::validate_client(&client_config.protocol, &client_config.transport)?;
     client_config.validate_quic_key_exchange(true)?;
+    crate::quic_client::validate(client_config, true)?;
     if let ClientProxyConfig::Wireguard(config) = &mut client_config.protocol {
         if client_config.transport != Transport::Udp
             || client_config.tcp_settings.is_some()
@@ -2300,6 +2307,9 @@ fn validate_connector_positions(
             ));
         }
 
+        for client in super::health::clients(hop) {
+            crate::quic_client::validate(client, false)?;
+        }
         let unsupported_h3 = |selection: &ConfigSelection<ClientConfig>| {
             matches!(selection, ConfigSelection::Config(config)
                 if config.transport == Transport::Quic && crate::xhttp::connector::contains(&config.protocol))

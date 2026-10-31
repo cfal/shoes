@@ -10,6 +10,7 @@ pub struct QuicStream {
     send_stream: SendStream,
     recv_stream: RecvStream,
     peer: Option<std::net::SocketAddr>,
+    owner: Option<std::sync::Arc<dyn Send + Sync>>,
 }
 
 impl QuicStream {
@@ -18,11 +19,17 @@ impl QuicStream {
             send_stream,
             recv_stream,
             peer: None,
+            owner: None,
         }
     }
 
     pub fn with_peer(mut self, peer: std::net::SocketAddr) -> Self {
         self.peer = Some(peer);
+        self
+    }
+
+    pub(crate) fn with_owner(mut self, owner: std::sync::Arc<dyn Send + Sync>) -> Self {
+        self.owner = Some(owner);
         self
     }
 }

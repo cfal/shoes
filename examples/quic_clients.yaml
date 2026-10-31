@@ -1,0 +1,28 @@
+# Local mixed proxies using native QUIC outbounds. Replace peer names and credentials.
+- address: 0.0.0.0:1080
+  protocol:
+    type: mixed
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain:
+        address: hy2.example.com:443
+        protocol:
+          type: hysteria2
+          password: your-password
+          # obfs: {type: salamander, password: your-obfs-password}
+          # hopping: {ports: '443,20000-30000', interval_secs: 30}
+
+- address: 0.0.0.0:1081
+  protocol:
+    type: mixed
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain:
+        address: tuic.example.com:443
+        protocol:
+          type: tuic
+          uuid: 01234567-89ab-4def-8123-456789abcdef
+          password: your-password
+          udp_relay_mode: native
