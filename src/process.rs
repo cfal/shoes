@@ -590,6 +590,8 @@ struct ConfigWatches {
     recovery: Vec<PathBuf>,
     watcher: Option<RecommendedWatcher>,
     recovery_watcher: Option<RecommendedWatcher>,
+    events: crate::file_watcher::EventFilter,
+    recovery_events: crate::file_watcher::EventFilter,
     tx: mpsc::Sender<()>,
     recovery_tx: mpsc::Sender<()>,
     recovery_changes: mpsc::Receiver<()>,
@@ -607,6 +609,8 @@ impl ConfigWatches {
             recovery: Vec::new(),
             watcher: None,
             recovery_watcher: None,
+            events: crate::file_watcher::EventFilter::default(),
+            recovery_events: crate::file_watcher::EventFilter::default(),
             tx,
             recovery_tx,
             recovery_changes,
@@ -629,6 +633,7 @@ impl ConfigWatches {
                 &paths,
                 self.tx.clone(),
                 self.cache_dir.as_deref(),
+                cfg!(target_os = "macos").then_some(&self.events),
             )?);
             self.recovery_watcher = if self.recovery.is_empty() {
                 None
@@ -637,6 +642,7 @@ impl ConfigWatches {
                     &self.recovery,
                     self.recovery_tx.clone(),
                     self.cache_dir.as_deref(),
+                    cfg!(target_os = "macos").then_some(&self.recovery_events),
                 )?)
             };
         }
@@ -660,6 +666,7 @@ impl ConfigWatches {
         // Late callbacks and queued identity-only events belong to the candidate,
         // not the active generation. Preserve the separate config/reload queue.
         (self.recovery_tx, self.recovery_changes) = mpsc::channel(1);
+        self.recovery_events = crate::file_watcher::EventFilter::default();
         if let Err(error) = self.refresh() {
             log::warn!("Could not refresh config dependency watches: {error}");
         }
