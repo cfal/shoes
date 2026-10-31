@@ -10,6 +10,55 @@ use std::sync::Arc;
 
 pub(super) type SharedPadding = Arc<parking_lot::RwLock<Arc<PaddingFactory>>>;
 
+#[cfg(test)]
+pub(super) struct PaddingWriteCase {
+    pub sizes: &'static str,
+    pub payload: bytes::BytesMut,
+    pub writes: Vec<Vec<u8>>,
+}
+
+#[cfg(test)]
+pub(super) fn padding_write_cases() -> impl Iterator<Item = PaddingWriteCase> {
+    use super::anytls_types::{Command, Frame};
+    use bytes::{Bytes, BytesMut};
+
+    [
+        ("", 0, vec![], vec![]),
+        ("", 5, vec![], vec![5]),
+        ("c,20-20", 0, vec![], vec![]),
+        ("c,20-20", 5, vec![8], vec![20]),
+        ("5-5,c,20-20", 5, vec![], vec![5]),
+        ("10-10", 5, vec![], vec![5]),
+        ("12-12", 5, vec![], vec![5]),
+        ("13-13", 5, vec![1], vec![13]),
+        ("2-2,20-20", 5, vec![10], vec![2, 20]),
+        ("2-2", 5, vec![], vec![2, 3]),
+        ("20-20,2-2", 5, vec![8, 2], vec![20, 9]),
+        ("65555-65555", 5, vec![65535, 1], vec![65555]),
+        ("65536-65536", 0, vec![65535, 1], vec![65550]),
+    ]
+    .into_iter()
+    .map(|(sizes, payload_len, padding_lengths, write_lengths)| {
+        let payload = BytesMut::from(vec![42; payload_len].as_slice());
+        let mut wire = payload.clone();
+        for length in padding_lengths {
+            Frame::with_data(Command::Waste, 0, Bytes::from(vec![0; length]))
+                .encode_into(&mut wire)
+                .unwrap();
+        }
+        let writes = write_lengths
+            .into_iter()
+            .map(|length| wire.split_to(length).to_vec())
+            .collect();
+        assert!(wire.is_empty());
+        PaddingWriteCase {
+            sizes,
+            payload,
+            writes,
+        }
+    })
+}
+
 pub(super) fn append_padding(
     buf: &mut bytes::BytesMut,
     mut remaining: usize,

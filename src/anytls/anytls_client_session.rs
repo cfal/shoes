@@ -880,6 +880,7 @@ mod tests {
 
     #[derive(Default)]
     struct WriteLog {
+        writes: Vec<Vec<u8>>,
         pending: Vec<u8>,
         flushed: Vec<Vec<u8>>,
     }
@@ -892,7 +893,9 @@ mod tests {
             _: &mut Context<'_>,
             data: &[u8],
         ) -> Poll<io::Result<usize>> {
-            self.0.lock().pending.extend_from_slice(data);
+            let mut log = self.0.lock();
+            log.writes.push(data.to_vec());
+            log.pending.extend_from_slice(data);
             Poll::Ready(Ok(data.len()))
         }
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -924,6 +927,30 @@ mod tests {
             close_notify: CancellationToken::new(),
         });
         (state, rx)
+    }
+
+    #[tokio::test]
+    async fn padding_segments_preserve_write_boundaries_without_flushing() {
+        for case in crate::anytls::anytls_padding::padding_write_cases() {
+            let (state, _rx) = writer_state();
+            *state.padding.write() = Arc::new(
+                PaddingFactory::new(format!("stop=8\n1={}", case.sizes).as_bytes()).unwrap(),
+            );
+            state.send_padding.store(true, Ordering::Relaxed);
+            let log = Arc::new(Mutex::new(WriteLog::default()));
+            ClientSessionState::write_with_padding(
+                &state,
+                &mut RecordingWriter(log.clone()),
+                &case.payload,
+                &mut BytesMut::new(),
+            )
+            .await
+            .unwrap();
+            let log = log.lock();
+            assert_eq!(log.writes, case.writes, "sizes={}", case.sizes);
+            assert!(log.flushed.is_empty());
+            assert_eq!(state.pkt_counter.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[tokio::test]
@@ -1069,6 +1096,7 @@ mod tests {
                 state.close_notify.clone(),
             ));
             // A quota can yield before the barrier; repeated polls must eventually reach it.
+            let mut acknowledged = false;
             for _ in 0..4 {
                 assert!(
                     writer
@@ -1077,9 +1105,11 @@ mod tests {
                         .is_pending()
                 );
                 if barrier.try_recv().is_ok() {
+                    acknowledged = true;
                     break;
                 }
             }
+            assert!(acknowledged, "flush barrier was not acknowledged");
             let log = log.lock();
             assert!(log.pending.is_empty());
             assert_eq!(log.flushed.len(), expected_flushes);
