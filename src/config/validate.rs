@@ -1066,15 +1066,8 @@ fn expand_dns_specs(
         let client_chains_raw = spec.client_chains();
         let mut expanded_chains: Vec<ClientChain> = Vec::new();
 
-        for chain_selection in client_chains_raw.iter() {
-            let mut chain = match chain_selection {
-                ConfigSelection::Config(chain) => chain.clone(),
-                ConfigSelection::GroupName(name) => ClientChain {
-                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
-                        name.clone(),
-                    ))),
-                },
-            };
+        for chain in client_chains_raw.iter() {
+            let mut chain = chain.clone();
             validate_client_chain(&mut chain.hops, client_groups, named_pems, global_limits)?;
             expanded_chains.push(chain);
         }

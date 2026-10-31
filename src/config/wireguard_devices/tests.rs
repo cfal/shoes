@@ -619,7 +619,7 @@ fn simplification_round_robin_carrier_names_do_not_affect_device_identity() {
     let mut second = client();
     second["protocol"]["peer_client_chain"] = json!([{"pool":["direct", "direct"]}]);
     let configs = json!([
-        {"client_group":"relay", "client_chains":["direct", "direct"]},
+        {"client_group":"relay", "client_chains":[{"chain": ["direct"]}, {"chain": ["direct"]}]},
         {"address":"0.0.0.0:1080", "protocol":{"type":"socks"},
             "rules":[{"masks":"0.0.0.0/0", "action":"allow",
                 "client_chain":[{"pool":[first, second]}]}]}
@@ -627,7 +627,8 @@ fn simplification_round_robin_carrier_names_do_not_affect_device_identity() {
     let validated = validate(configs.clone()).unwrap();
     assert_eq!(validated.wireguard_endpoints.len(), 1);
     let mut different_weight = configs;
-    different_weight[0]["client_chains"] = json!(["direct", "direct", "direct"]);
+    different_weight[0]["client_chains"] =
+        json!([{"chain":["direct"]}, {"chain":["direct"]}, {"chain":["direct"]}]);
     assert!(
         validate(different_weight)
             .err()
@@ -750,8 +751,8 @@ fn selectors_share_wireguard_devices_without_activating_unused_nodes() {
     let mut configs = json!([
         {"clash_api_address":"127.0.0.1:9090","secret":"test"},
         {"client_group":"vpn","client_chains":[client()]},
-        {"client_group":"outbound","type":"selector","client_chains":["vpn","direct"]},
-        {"client_group":"another","type":"selector","client_chains":["outbound","vpn"]}
+        {"client_group":"outbound","type":"selector","client_chains":[{"chain": ["vpn"]},{"chain": ["direct"]}]},
+        {"client_group":"another","type":"selector","client_chains":[{"chain": ["outbound"]},{"chain": ["vpn"]}]}
     ]);
     assert!(
         validate(configs.clone())

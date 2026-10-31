@@ -317,8 +317,9 @@ impl<'de> Deserialize<'de> for RuleConfig {
                 // Convert client_proxies to client_chains if present
                 let client_chains: NoneOrSome<ClientChain> = if has_client_proxies {
                     log::warn!(
-                        "The 'client_proxies' field is deprecated and will be removed in a future version. \
-                         Please use 'client_chains' instead. Your config will continue to work, but consider updating it."
+                        "client_proxy/client_proxies is deprecated; use client_chain/client_chains. \
+                         Preserve a proxy list's alternatives with {{chain: [{{pool: [a, b]}}]}}; \
+                         a bare [a, b] specifies sequential hops."
                     );
 
                     // Convert to client_chains format:
@@ -638,8 +639,9 @@ impl<'de> Deserialize<'de> for RuleActionConfig {
                 // Convert client_proxies to client_chains if present
                 let client_chains: NoneOrSome<ClientChain> = if has_client_proxies {
                     log::warn!(
-                        "The 'client_proxies' field is deprecated and will be removed in a future version. \
-                         Please use 'client_chains' instead. Your config will continue to work, but consider updating it."
+                        "client_proxy/client_proxies is deprecated; use client_chain/client_chains. \
+                         Preserve a proxy list's alternatives with {{chain: [{{pool: [a, b]}}]}}; \
+                         a bare [a, b] specifies sequential hops."
                     );
 
                     // Convert to client_chains format:

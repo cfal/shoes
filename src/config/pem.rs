@@ -260,11 +260,9 @@ fn gather_dns_pem_paths(
 ) {
     for spec in specs.iter_mut() {
         if let super::DnsServerSpec::WithOptions { client_chain, .. } = spec {
-            for selection in client_chain.iter_mut() {
-                if let ConfigSelection::Config(chain) = selection {
-                    for hop in chain.hops.iter_mut() {
-                        gather_pem_file_paths_from_chain_hop(hop, visitor);
-                    }
+            for chain in client_chain.iter_mut() {
+                for hop in chain.hops.iter_mut() {
+                    gather_pem_file_paths_from_chain_hop(hop, visitor);
                 }
             }
         }

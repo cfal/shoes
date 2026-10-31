@@ -54,6 +54,43 @@ fn check_diagnostic_paths_accept_display_and_debug_formats() {
 }
 
 #[test]
+fn check_warns_for_legacy_proxy_aliases_without_changing_alternatives() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("legacy.yaml");
+    for field in ["client_proxy", "client_proxies"] {
+        for legacy in [
+            format!("- client_group: out\n  {field}: [direct, direct]\n"),
+            format!(
+                "- address: '127.0.0.1:0'\n  protocol: {{type: socks}}\n  rules:\n    - masks: '0.0.0.0/0'\n      {field}: [direct, direct]\n"
+            ),
+        ] {
+            std::fs::write(&path, legacy).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .env("RUST_LOG", "warn")
+                .args(["check", "-t", "1"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "{diagnostic}");
+            assert!(
+                diagnostic.contains("client_proxy/client_proxies is deprecated"),
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("client_chain/client_chains"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("sequential hops"), "{diagnostic}");
+        }
+    }
+}
+
+#[test]
 fn check_diagnostics_include_file_and_nested_context_without_credentials() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("nested.yaml");

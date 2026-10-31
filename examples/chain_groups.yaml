@@ -1,14 +1,16 @@
 - client_group: a1-selected
   type: selector
   client_chains:
-    - name: edge-a
-      address: edge-a.example.com:1080
-      protocol:
-        type: socks
-    - name: edge-b
-      address: edge-b.example.com:1080
-      protocol:
-        type: socks
+    - chain:
+        - name: edge-a
+          address: edge-a.example.com:1080
+          protocol:
+            type: socks
+    - chain:
+        - name: edge-b
+          address: edge-b.example.com:1080
+          protocol:
+            type: socks
 
 - client_group: nl-hop
   client_chains:
@@ -17,13 +19,12 @@
         type: socks
 
 - client_group: a1-selected-nl
-  client_chains:
-    - chain: [a1-selected, nl-hop]
+  client_chain: [a1-selected, nl-hop]
 
 - client_group: geo-reddit-selected
   type: selector
   default: a1-selected-nl
-  client_chains: [a1-selected, a1-selected-nl, direct]
+  client_chains: [{chain: [a1-selected]}, {chain: [a1-selected-nl]}, {chain: [direct]}]
 
 - address: 0.0.0.0:1080
   protocol:

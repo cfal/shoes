@@ -359,12 +359,14 @@ Opt into manual selection explicitly:
   type: selector
   default: east
   client_chains:
-    - name: east
-      address: "east.example.com:1080"
-      protocol: {type: socks}
-    - name: west
-      address: "west.example.com:1080"
-      protocol: {type: socks}
+    - chain:
+        - name: east
+          address: "east.example.com:1080"
+          protocol: {type: socks}
+    - chain:
+        - name: west
+          address: "west.example.com:1080"
+          protocol: {type: socks}
 ```
 
 Rules continue to use `client_chain: outbound`. A selector chooses an immediate
@@ -389,12 +391,14 @@ Automatic selection does not require a controller listener or a cache file:
   tolerance: 50       # milliseconds, 0..65535
   lazy: true
   client_chains:
-    - name: east
-      address: "east.example.com:1080"
-      protocol: {type: socks}
-    - name: west
-      address: "west.example.com:1080"
-      protocol: {type: socks}
+    - chain:
+        - name: east
+          address: "east.example.com:1080"
+          protocol: {type: socks}
+    - chain:
+        - name: west
+          address: "west.example.com:1080"
+          protocol: {type: socks}
 ```
 
 Only `url` is required for `url-test`; the values above are the other defaults.
@@ -1866,6 +1870,17 @@ rules:
 
 Client chains define how traffic is routed through upstream proxies. Each chain is a sequence of "hops" - proxies that traffic passes through in order.
 
+In rules, client groups, and DNS server options, `client_chain` and `client_chains`
+are exact aliases. The value, not the field's plurality, determines the structure:
+`[a, b]` and `{chain: [a, b]}` both mean sequential hops. For alternative paths,
+use `[{chain: [a]}, {chain: [b]}]`. Nested lists (`[[a], [b]]`) also specify
+alternative chains; explicit wrappers are recommended for clarity.
+
+DNS previously treated a bare list as alternatives. It now interprets `[a, b]`
+as a sequence, matching routing, without a compatibility mode or warning.
+DNS alternatives require explicit chain wrappers (or a named group).
+System DNS still rejects client chains; UDP/H3 DNS still requires direct-only paths.
+
 ```yaml
 # Single proxy (simplest form)
 client_chain: my-proxy-group           # Reference a named group
@@ -1882,7 +1897,7 @@ client_chain:
 
 # Multiple chains (round-robin selection)
 client_chains:
-  - us-proxy-group                     # Chain 1: single hop
+  - chain: [us-proxy-group]            # Chain 1: single hop
   - chain: [proxy1, proxy2]            # Chain 2: multi-hop
 
 # Load balancing at a hop (pool)
@@ -1892,7 +1907,33 @@ client_chain:
     - final-proxy
 ```
 
-**Migration note:** The `client_proxy` / `client_proxies` fields still work but are deprecated. Please migrate to `client_chain` / `client_chains`.
+### Legacy Proxy Fields
+
+`client_proxy` and `client_proxies` still work in rules, client groups, and
+ShadowTLS remote handshakes, with a deprecation warning. Existing behavior is
+preserved: a legacy list contains alternatives, not sequential hops.
+Use `RUST_LOG=warn` or a more verbose log level to display these warnings.
+
+A single `client_proxy: upstream` can become `client_chain: upstream`.
+For a list, changing only the field name changes behavior. Migrate as follows:
+
+```yaml
+# Old rule: client_proxies: [a, b]
+# Equivalent rule, retaining one-hop round-robin alternatives:
+client_chain:
+  chain:
+    - pool: [a, b]
+
+# Old group: client_proxies: [a, b]
+# Equivalent group, retaining separate policy members:
+client_group: outbound
+client_chains:
+  - chain: [a]
+  - chain: [b]
+```
+
+For ShadowTLS remote handshakes, use `client_chain: [{pool: [a, b]}]` to replace
+a legacy proxy list. Do not specify legacy and new fields together.
 
 ### Mask Syntax
 ```yaml
@@ -2138,12 +2179,14 @@ rules:
 
 ### Client Group
 
-`client_chains` declares nonempty alternatives. Each member is a group reference,
-an inline client, or an explicit `{name: ..., chain: [...]}` path. Group references
-inside a path contribute their entire selected path, so alternatives may have
-different hop counts. Bare nested lists and unknown chain-wrapper fields are rejected.
-Path stages are client objects or group references; use a named group for a pool.
-The old group fields `client_proxy` and `client_proxies` are not accepted.
+`client_chain` and `client_chains` accept the same sequence and alternative-path
+syntax as routing. A bare `[a, b]` defines one sequential path; a list of explicit
+chain wrappers defines separate alternatives selected by the group's policy.
+Group references inside a path contribute their entire selected path, so
+alternatives may have different hop counts. Stages accept group references,
+inline clients, and `{pool: [...]}`. Unknown group chain-wrapper fields are rejected.
+Legacy group `client_proxy` / `client_proxies` lists retain their alternative-member
+behavior with a deprecation warning; see [migration examples](#legacy-proxy-fields).
 
 ```yaml
 - client_group: a1-selected-nl
@@ -2154,14 +2197,15 @@ The old group fields `client_proxy` and `client_proxies` are not accepted.
   type: selector
   default: a1-selected-nl
   client_chains:
-    - a1-selected
-    - a1-selected-nl
+    - {chain: [a1-selected]}
+    - {chain: [a1-selected-nl]}
     - name: via-us
       chain: [a1-selected, us-hop]
-    - direct
+    - {chain: [direct]}
 ```
 
-Inline selector clients and paths require explicit names. Other policies generate
+An unnamed one-hop wrapper retains its referenced group or inline client's identity.
+Inline selector clients and multi-hop paths require explicit names. Other policies generate
 definition-site labels for unnamed paths; use explicit names for stable controller
 identities. Labels do not introduce another routing-reference namespace.
 The controller exposes named paths as `Relay` nodes, with whole-path delay probes
@@ -2186,12 +2230,14 @@ not the number of route combinations.
 ```yaml
 - client_group: my-upstream
   client_chains:              # Define proxies in this group
-    - address: "proxy1.example.com:1080"
-      protocol:
-        type: socks
-    - address: "proxy2.example.com:1080"
-      protocol:
-        type: socks
+    - chain:
+        - address: "proxy1.example.com:1080"
+          protocol:
+            type: socks
+    - chain:
+        - address: "proxy2.example.com:1080"
+          protocol:
+            type: socks
 
 # Reference in rules
 - address: "0.0.0.0:8080"

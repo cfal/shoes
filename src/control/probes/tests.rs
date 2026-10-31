@@ -192,7 +192,7 @@ fn url_test_remote_authentication_failures_are_not_local_policy_denials() {
 
 fn automatic_generation(id: u64, count: usize, resolver: Arc<dyn Resolver>) -> Arc<Generation> {
     let members: Vec<_> = (0..count)
-        .map(|index| json!({"name":format!("member-{index}"), "protocol":{"type":"direct"}}))
+        .map(|index| json!({"chain":[{"name":format!("member-{index}"), "protocol":{"type":"direct"}}]}))
         .collect();
     let configs = serde_json::from_value(json!([
         {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "interval":10,
@@ -243,9 +243,11 @@ fn scheduled_generation(
             let members: Vec<_> = (0..count)
                 .map(|index| {
                     json!({
-                        "name": format!("{name}-{index}"),
-                        "address": format!("{name}-{index}.invalid:80"),
-                        "protocol": {"type": "http"}
+                        "chain": [{
+                            "name": format!("{name}-{index}"),
+                            "address": format!("{name}-{index}.invalid:80"),
+                            "protocol": {"type": "http"}
+                        }]
                     })
                 })
                 .collect();
@@ -720,8 +722,8 @@ async fn url_test_waiting_checks_use_current_choices_and_fence_inflight_results(
     let catalog = crate::config::create_server_configs(
         serde_json::from_value(json!([
             {"client_group":"manual","type":"selector","client_chains":[
-                {"name":"a","address":"a.invalid:80","protocol":{"type":"http"}},
-                {"name":"b","address":"b.invalid:80","protocol":{"type":"http"}}
+                {"chain": [{"name":"a","address":"a.invalid:80","protocol":{"type":"http"}}]},
+                {"chain": [{"name":"b","address":"b.invalid:80","protocol":{"type":"http"}}]}
             ]},
             {"client_group":"auto","type":"url-test","url":"http://probe.invalid/",
              "timeout":1000,"client_chains":["manual"]}
@@ -1209,10 +1211,10 @@ async fn url_test_midround_invalidation_rechecks_only_after_the_active_round_fin
         serde_json::from_value(json!([
             {"client_group":"auto","type":"url-test","url":"http://probe.invalid/",
              "interval":10,"timeout":1000,"client_chains":[
-                {"name":"a","protocol":{"type":"direct"}},
-                {"name":"b","protocol":{"type":"direct"}}
+                {"chain": [{"name":"a","protocol":{"type":"direct"}}]},
+                {"chain": [{"name":"b","protocol":{"type":"direct"}}]}
              ]},
-        {"client_group":"manual","type":"selector","client_chains":["direct","auto"]}
+        {"client_group":"manual","type":"selector","client_chains":[{"chain": ["direct"]},{"chain": ["auto"]}]}
         ]))
         .unwrap(),
     )
@@ -1457,8 +1459,8 @@ async fn url_test_automatic_real_proxy_probes_select_fast_sticky_recovered_membe
                 "url": "http://probe.invalid/",
                 "tolerance": 100,
                 "client_chains": [
-                    {"name": "a", "address": a, "protocol": {"type": "http"}},
-                    {"name": "b", "address": b, "protocol": {"type": "http"}}
+                    {"chain": [{"name": "a", "address": a, "protocol": {"type": "http"}}]},
+                    {"chain": [{"name": "b", "address": b, "protocol": {"type": "http"}}]}
                 ]
             },
             {"client_group":"manual","type":"selector","client_chains":["auto"]},
@@ -1941,7 +1943,7 @@ async fn inactive_wireguard_member_only_fails_when_selected() {
         let config = json!([
             crate::wireguard::test_support::client(peer.local_addr().unwrap().port()),
             {"client_group":"outbound","type":"selector","default":"http","client_chains":[
-                "wg", {"name":"http","address":proxy,"protocol":{"type":"http"}}
+                {"chain": ["wg"]}, {"chain": [{"name":"http","address":proxy,"protocol":{"type":"http"}}]}
             ]},
             {"address":"127.0.0.1:0","protocol":{"type":"socks"},"rules":"allow-all-direct"}
         ]);
@@ -2285,8 +2287,8 @@ async fn carrier_probe_checks_http_hostname_before_connecting() {
     let local = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
     let config = json!([
         {"client_group":"outbound","type":"selector","default":"http","client_chains":[
-            {"name":"http","address":local.to_string(),"protocol":{"type":"http","resolve_hostname":true}},
-            {"name":"xhttp","address":local.to_string(),"protocol":{"type":"xhttp","protocol":{"type":"socks"}}}
+            {"chain": [{"name":"http","address":local.to_string(),"protocol":{"type":"http","resolve_hostname":true}}]},
+            {"chain": [{"name":"xhttp","address":local.to_string(),"protocol":{"type":"xhttp","protocol":{"type":"socks"}}}]}
         ]}
     ]);
     let mut validated =

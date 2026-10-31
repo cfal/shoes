@@ -499,7 +499,7 @@ mod tests {
             json!([
                 {"client_group":"entry","client_chains":[{"name":"entrance","address":"192.0.2.1:80","protocol":{"type":"http"}}]},
                 {"client_group":"exit","client_chains":[{"name":"exit-leaf","address":"192.0.2.2:80","protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}}]},
-                {"client_group":"out","type":"selector","client_chains":["entry",{"name":"via-exit","chain":["entry","exit"]},"direct"]}
+                {"client_group":"out","type":"selector","client_chains":[{"chain": ["entry"]},{"name":"via-exit","chain":["entry","exit"]},{"chain": ["direct"]}]}
             ]),
             json!("out"),
         )
@@ -581,11 +581,11 @@ mod tests {
         let (chain, catalog) = super::super::health_tests::build(
             json!([
                 {"client_group":"pool","client_chains":[
-                    {"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}},
-                    {"name":"b","address":"192.0.2.2:80","protocol":{"type":"http"}}
+                    {"chain": [{"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}}]},
+                    {"chain": [{"name":"b","address":"192.0.2.2:80","protocol":{"type":"http"}}]}
                 ]},
                 {"client_group":"auto","type":"url-test","url":"http://192.0.2.3/",
-                 "client_chains":["pool","direct"]}
+                 "client_chains":[{"chain": ["pool"]},{"chain": ["direct"]}]}
             ]),
             json!("auto"),
         );

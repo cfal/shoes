@@ -531,8 +531,9 @@ impl<'de> Deserialize<'de> for ShadowTlsRemoteHandshake {
         // Convert client_proxies to client_chain if present
         let client_chain: OneOrSome<ClientChainHop> = if has_client_proxies {
             log::warn!(
-                "The 'client_proxies' field in ShadowTLS remote handshake is deprecated and will be removed in a future version. \
-                 Please use 'client_chain' instead. Your config will continue to work, but consider updating it."
+                "client_proxy/client_proxies in ShadowTLS remote handshake is deprecated; use client_chain. \
+                 Preserve a proxy list's alternatives with [{{pool: [a, b]}}]; \
+                 a bare [a, b] specifies sequential hops."
             );
 
             // Convert to client_chain format:

@@ -356,6 +356,18 @@ shoes generate-shadowsocks-2022-password 2022-blake3-aes-256-gcm
 
 See [CONFIG.md](./CONFIG.md) for the complete YAML configuration reference.
 
+In rules, client groups, and DNS server options, `client_chain` and `client_chains`
+are aliases: `[a, b]` means sequential hops, not alternatives. Use
+`[{chain: [a]}, {chain: [b]}]` for alternative paths, or `{pool: [a, b]}` within a
+chain for alternatives at one hop. DNS now follows the same sequence semantics
+as routing.
+
+`client_proxy` / `client_proxies` remain supported in rules, client groups, and
+ShadowTLS remote handshakes, but log deprecation warnings (`RUST_LOG=warn`). A single proxy can
+move to `client_chain` directly. Do not simply rename a proxy-list field: preserve
+its alternatives with explicit chain wrappers in groups or a pool in routes.
+See [migration examples](CONFIG.md#legacy-proxy-fields).
+
 ## Examples
 
 See the [examples](./examples) directory for all examples.

@@ -153,11 +153,13 @@ async fn new_dns_sockets_follow_direct_selector_changes() {
   type: selector
   default: usable
   client_chains:
-    - name: unavailable
-      bind_interface: shoes-missing
-      protocol: {type: direct}
-    - name: usable
-      protocol: {type: direct}
+    - chain:
+        - name: unavailable
+          bind_interface: shoes-missing
+          protocol: {type: direct}
+    - chain:
+        - name: usable
+          protocol: {type: direct}
 - dns_group: upstream
   dns_servers:
     - url: udp://192.0.2.1

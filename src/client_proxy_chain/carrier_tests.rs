@@ -15,19 +15,21 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
   type: url-test
   url: http://inner.invalid/
   client_chains:
-    - name: http
-      address: 127.0.0.1:8000
-      protocol: {{type: http}}
-    - name: udp
-      address: 127.0.0.1:8001
-      protocol: {{type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}}
+    - chain:
+        - name: http
+          address: 127.0.0.1:8000
+          protocol: {{type: http}}
+    - chain:
+        - name: udp
+          address: 127.0.0.1:8001
+          protocol: {{type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}}
 - client_group: manual
   type: selector
-  client_chains: [inner, direct]
+  client_chains: [{{chain: [inner]}}, {{chain: [direct]}}]
 - client_group: outer
   type: url-test
   url: http://outer.invalid/
-  client_chains: [manual, direct]
+  client_chains: [{{chain: [manual]}}, {{chain: [direct]}}]
 - address: 127.0.0.1:1080
   protocol: {{type: socks}}
   rules: [{{mask: 0.0.0.0/0, action: allow, client_chain: {route}}}]
@@ -90,7 +92,7 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
         .collect();
     configs.push(json!({
         "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
-        "client_chains":["deep-0", {"name":"other", "protocol":{"type":"direct"}}]
+        "client_chains":[{"chain": ["deep-0"]}, {"chain": [{"name":"other", "protocol":{"type":"direct"}}]}]
     }));
     configs.push(json!({
         "address":"127.0.0.1:1080", "protocol":{"type":"socks"},
@@ -148,17 +150,19 @@ fn selectors_preserve_declared_branch_weights_and_duplicate_tickets() {
     let yaml = "
 - client_group: leaves
   client_chains:
-    - name: http
-      address: 127.0.0.1:8000
-      protocol: {type: http}
-    - name: udp
-      address: 127.0.0.1:8001
-      protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
+    - chain:
+        - name: http
+          address: 127.0.0.1:8000
+          protocol: {type: http}
+    - chain:
+        - name: udp
+          address: 127.0.0.1:8001
+          protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
 - client_group: weighted
-  client_chains: [leaves, leaves, direct]
+  client_chains: [{chain: [leaves]}, {chain: [leaves]}, {chain: [direct]}]
 - client_group: choose
   type: selector
-  client_chains: [weighted, direct]
+  client_chains: [{chain: [weighted]}, {chain: [direct]}]
 - address: 127.0.0.1:1080
   protocol: {type: socks}
   rules: [{mask: 0.0.0.0/0, action: allow, client_chain: choose}]
@@ -199,12 +203,14 @@ fn udp_selection_rejects_ineligible_member_without_falling_back() {
   type: selector
   default: http
   client_chains:
-    - name: http
-      address: 127.0.0.1:8000
-      protocol: {type: http}
-    - name: udp
-      address: 127.0.0.1:8001
-      protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
+    - chain:
+        - name: http
+          address: 127.0.0.1:8000
+          protocol: {type: http}
+    - chain:
+        - name: udp
+          address: 127.0.0.1:8001
+          protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
 - address: 127.0.0.1:1080
   protocol: {type: socks}
   rules: [{mask: 0.0.0.0/0, action: allow, client_chain: leaves}]

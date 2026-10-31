@@ -618,16 +618,18 @@ mod tests {
     const CONFIG: &str = "
 - client_group: child
   client_chains:
-    - name: east
-      address: east.example:1080
-      protocol: {type: socks}
-    - name: west
-      address: west.example:1080
-      protocol: {type: socks}
+    - chain:
+        - name: east
+          address: east.example:1080
+          protocol: {type: socks}
+    - chain:
+        - name: west
+          address: west.example:1080
+          protocol: {type: socks}
 - client_group: outbound
   type: selector
   default: child
-  client_chains: [child, direct]
+  client_chains: [{chain: [child]}, {chain: [direct]}]
 - address: 127.0.0.1:1080
   name: inbound
   protocol: {type: socks}
@@ -690,8 +692,8 @@ mod tests {
             (yaml.clone(), "DIRECT"),
             (
                 yaml.replace(
-                    "[child, direct]",
-                    "[child, {name: direct, protocol: {type: direct}}]",
+                    "[{chain: [child]}, {chain: [direct]}]",
+                    "[{chain: [child]}, {chain: [{name: direct, protocol: {type: direct}}]}]",
                 ),
                 "direct",
             ),
@@ -793,11 +795,17 @@ mod tests {
     fn rejects_ambiguous_selectors_and_reserved_or_duplicate_names() {
         for yaml in [
             CONFIG.replace("default: child", "default: missing"),
-            CONFIG.replace("[child, direct]", "[child, child]"),
+            CONFIG.replace(
+                "[{chain: [child]}, {chain: [direct]}]",
+                "[{chain: [child]}, {chain: [child]}]",
+            ),
             CONFIG.replace("name: west", "name: east"),
             CONFIG.replace("name: west", "name: GLOBAL"),
             CONFIG.replace("type: selector", "type: round-robin"),
-            CONFIG.replace("[child, direct]", "[{protocol: {type: direct}}]"),
+            CONFIG.replace(
+                "[{chain: [child]}, {chain: [direct]}]",
+                "[{protocol: {type: direct}}]",
+            ),
         ] {
             let configs = serde_yaml::from_str(&yaml);
             assert!(

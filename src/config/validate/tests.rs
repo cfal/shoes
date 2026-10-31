@@ -1785,7 +1785,7 @@ async fn test_dns_system_with_client_chain_rejected() {
         dns_group: "test-dns".to_string(),
         dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
             url: "system".to_string(),
-            client_chain: NoneOrSome::One(ConfigSelection::Config(ClientChain::default())),
+            client_chain: NoneOrSome::One(ClientChain::default()),
             bootstrap_url: None,
             server_name: None,
             ip_strategy: IpStrategy::default(),
@@ -1803,6 +1803,32 @@ async fn test_dns_system_with_client_chain_rejected() {
         err.contains("client_chain is not supported for system DNS"),
         "Expected system DNS client_chain error, got: {err}"
     );
+}
+
+#[test]
+fn dns_chain_aliases_expand_sequential_groups_in_order() {
+    use serde_json::json;
+    for field in ["client_chain", "client_chains"] {
+        let configs = serde_json::from_value(json!([
+            {"client_group":"a", "client_chain":{"address":"192.0.2.1:1080", "protocol":{"type":"socks"}}},
+            {"client_group":"b", "client_chain":{"address":"192.0.2.2:1080", "protocol":{"type":"socks"}}},
+            {"dns_group":"dns", "dns_servers":[{"url":"tcp://192.0.2.53", field:["a", "b"]}]}
+        ])).unwrap();
+        let validated = crate::config::create_server_configs(configs).unwrap();
+        let chains = &validated.dns_groups[0].specs[0].client_chains;
+        assert_eq!(chains.len(), 1);
+        let addresses: Vec<_> = chains[0]
+            .hops
+            .iter()
+            .map(|hop| {
+                let ClientChainHop::Single(ConfigSelection::Config(client)) = hop else {
+                    panic!("expected a fixed hop")
+                };
+                client.address.to_string()
+            })
+            .collect();
+        assert_eq!(addresses, ["192.0.2.1:1080", "192.0.2.2:1080"]);
+    }
 }
 
 #[test]
@@ -1871,7 +1897,11 @@ async fn test_dns_udp_with_proxy_chain_rejected() {
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "udp://8.8.8.8".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -1909,9 +1939,11 @@ async fn test_dns_udp_with_direct_chain_allowed() {
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "udp://8.8.8.8".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName(
-                    "direct-chain".to_string(),
-                )),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "direct-chain".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -1951,7 +1983,11 @@ async fn test_dns_h3_with_proxy_chain_rejected() {
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "h3://1.1.1.1/dns-query".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -1989,9 +2025,11 @@ async fn test_dns_h3_with_direct_chain_allowed() {
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "h3://1.1.1.1/dns-query".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName(
-                    "direct-chain".to_string(),
-                )),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "direct-chain".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -2022,7 +2060,11 @@ async fn test_dns_tcp_with_client_chain_allowed() {
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "tcp://8.8.8.8".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -2054,7 +2096,11 @@ async fn test_dns_tls_with_client_chain_allowed() {
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "tls://1.1.1.1".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -2086,7 +2132,11 @@ async fn test_dns_https_with_client_chain_allowed() {
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "https://1.1.1.1/dns-query".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),

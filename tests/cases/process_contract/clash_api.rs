@@ -292,8 +292,8 @@ impl Fixture {
             {"clash_api_path":directory.path().join("api.sock"), "secret":SECRET},
             {"cache_file_path":directory.path().join("cache.db")},
             {"client_group":"outbound", "type":"selector", "default":"east", "client_chains":[
-                {"name":"east", "address":east.to_string(), "protocol":{"type":"socks"}},
-                {"name":"west", "address":west.to_string(), "protocol":{"type":"socks"}}
+                {"chain": [{"name":"east", "address":east.to_string(), "protocol":{"type":"socks"}}]},
+                {"chain": [{"name":"west", "address":west.to_string(), "protocol":{"type":"socks"}}]}
             ]},
             {"name":"local-socks", "address":format!("0.0.0.0:{}", entry.port()), "protocol":{"type":"socks"}, "rules":[{"mask":"0.0.0.0/0", "action":"allow", "client_chain":"outbound"}]}
         ]);
@@ -379,7 +379,7 @@ async fn url_test_routes_without_controller_and_can_be_removed_on_reload() {
     group["url"] = json!("http://probe.invalid/");
     group["interval"] = json!(1);
     group["timeout"] = json!(500);
-    group["client_chains"][0]["address"] = json!(available_address().to_string());
+    group["client_chains"][0]["chain"][0]["address"] = json!(available_address().to_string());
     let mut process = fixture.start().await;
     timeout(Duration::from_secs(5), async {
         loop {
@@ -398,7 +398,7 @@ async fn url_test_routes_without_controller_and_can_be_removed_on_reload() {
     .await
     .unwrap();
     assert!(!fixture.directory.path().join("cache.db").exists());
-    let west = fixture.outbound_mut()["client_chains"][1].clone();
+    let west = fixture.outbound_mut()["client_chains"][1]["chain"][0].clone();
     *fixture.outbound_mut() = json!({
         "client_group":"outbound", "type":"round-robin", "client_chains":[west]
     });
@@ -606,7 +606,7 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
 async fn chain_choices_route_probe_and_restore_as_whole_paths() {
     let mut fixture = Fixture::new().await;
     let (reservation, prefix) = reserve_address();
-    let west = fixture.outbound_mut()["client_chains"][1].clone();
+    let west = fixture.outbound_mut()["client_chains"][1]["chain"][0].clone();
     fixture.outbound_mut()["client_chains"][1] = json!({"name":"via-west","chain":["prefix",west]});
     fixture.config.as_array_mut().unwrap().extend([
         json!({"client_group":"prefix","client_chains":[{"name":"prefix-client","address":prefix.to_string(),"protocol":{"type":"socks"}}]}),
@@ -1125,8 +1125,8 @@ async fn udp_payload_totals_and_destination_cancellation_are_isolated() {
     };
     let mut fixture = Fixture::new().await;
     fixture.outbound_mut()["client_chains"] = json!([
-        {"name":"east", "protocol":{"type":"direct"}},
-        {"name":"west", "protocol":{"type":"direct"}}
+        {"chain":[{"name":"east", "protocol":{"type":"direct"}}]},
+        {"chain":[{"name":"west", "protocol":{"type":"direct"}}]}
     ]);
     let mut process = fixture.start().await;
     let a = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"")

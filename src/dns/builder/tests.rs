@@ -1140,11 +1140,11 @@ async fn selector_identity_prevents_dns_pooling_of_identical_members() {
 - client_group: first
   type: selector
   default: east
-  client_chains: [east, west]
+  client_chains: [{chain: [east]}, {chain: [west]}]
 - client_group: second
   type: selector
   default: west
-  client_chains: [east, west]
+  client_chains: [{chain: [east]}, {chain: [west]}]
 - dns_group: selected
   dns_servers:
     - {url: 'udp://192.0.2.1', client_chain: first}
