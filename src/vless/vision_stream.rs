@@ -630,9 +630,6 @@ where
                     break;
                 }
                 Ok(DeframeResult::UnknownPrefix(prefix)) => {
-                    // TODO: check lengths and see if we need to split into multiple packets, see
-                    // https://github.com/XTLS/Xray-core/blob/9f5dcb15910aadc7ef450514747576827a389853/proxy/proxy.go#L390
-
                     processed_len += prefix.len();
 
                     self.filter.decrement_filter_count();
@@ -712,8 +709,6 @@ where
                     // Deframing failed, this error means we've already seen a valid TLS record on
                     // the write side and then invalid TLS data is encountered.
                     // Switch immediately to TLS mode and send the invalid data as a single packet.
-                    // TODO: check lengths and see if we need to split into multiple packets, see
-                    // https://github.com/XTLS/Xray-core/blob/9f5dcb15910aadc7ef450514747576827a389853/proxy/proxy.go#L390
                     //
                     log::error!(
                         "VISION WRITE: Deframing failed, invalid data after valid records - stopping filtering: {}",
@@ -803,7 +798,7 @@ impl<S: VisionTransport> AsyncWrite for VisionStream<S> {
         let this = self.get_mut();
         this.output_status()?;
         match this.write_mode {
-            VisionMode::PaddingTls => this.poll_write_padding_tls(cx, buf),
+            VisionMode::PaddingTls => this.poll_write_padding_tls(cx, &buf[..buf.len().min(16384)]),
             VisionMode::Tls | VisionMode::Direct => Pin::new(&mut this.tls).poll_write(cx, buf),
         }
     }
