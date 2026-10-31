@@ -1281,7 +1281,7 @@ fn resolve_server_config(
                 ref mut num_endpoints,
                 ..
             }) => {
-                validate_client_fingerprints(client_fingerprints)?;
+                normalize_fingerprints(client_fingerprints, "Client")?;
 
                 if *num_endpoints == 0 {
                     *num_endpoints = get_num_threads();
@@ -1361,19 +1361,18 @@ pub(super) fn source_contains_xhttp(protocol: &ClientProxyConfig) -> bool {
     }
 }
 
-fn validate_client_fingerprints(
-    client_fingerprints: &mut NoneOrSome<String>,
+fn normalize_fingerprints(
+    fingerprints: &mut NoneOrSome<String>,
+    peer: &str,
 ) -> std::io::Result<()> {
-    if !client_fingerprints.is_unspecified() && client_fingerprints.is_empty() {
-        println!("WARNING: Client fingerprints provided but empty, defaulting to 'any'");
+    if !fingerprints.is_unspecified() && fingerprints.is_empty() {
+        println!("WARNING: {peer} fingerprints provided but empty, defaulting to 'any'");
     }
 
-    if client_fingerprints.iter().any(|fp| fp == "any") {
-        let _ = std::mem::replace(client_fingerprints, NoneOrSome::Unspecified);
+    if fingerprints.iter().any(|fp| fp == "any") {
+        *fingerprints = NoneOrSome::Unspecified;
     } else {
-        let _ = crate::rustls_config_util::process_fingerprints(
-            &client_fingerprints.clone().into_vec(),
-        )?;
+        crate::rustls_config_util::process_fingerprints(&fingerprints.clone().into_vec())?;
     }
 
     Ok(())
@@ -1615,7 +1614,6 @@ pub(super) fn resolve_client_config(
         )?;
         if let Some(chain) = carrier {
             let chain = compiler::lower_chain(chain, named_pems, global_limits)?;
-            super::composition::validate(&chain.hops)?;
             if !crate::tcp::chain_builder::supports_udp_offline(&chain)? {
                 return Err(super::types::wireguard::invalid(
                     "WireGuard peer_client_chain does not support UDP",
@@ -1654,7 +1652,7 @@ pub(super) fn resolve_client_config(
                 "Both client cert and key have to be specified, or both have to be omitted",
             ));
         }
-        validate_server_fingerprints(server_fingerprints)?;
+        normalize_fingerprints(server_fingerprints, "Server")?;
         validate_client_certificates(cert.as_deref(), key.as_deref())?;
     }
 
@@ -1683,24 +1681,6 @@ pub(super) fn resolve_client_config(
     }
 
     Ok(client_config)
-}
-
-fn validate_server_fingerprints(
-    server_fingerprints: &mut NoneOrSome<String>,
-) -> std::io::Result<()> {
-    if !server_fingerprints.is_unspecified() && server_fingerprints.is_empty() {
-        println!("WARNING: Server fingerprints provided but empty, defaulting to 'any'");
-    }
-
-    if server_fingerprints.iter().any(|fp| fp == "any") {
-        let _ = std::mem::replace(server_fingerprints, NoneOrSome::Unspecified);
-    } else {
-        let _ = crate::rustls_config_util::process_fingerprints(
-            &server_fingerprints.clone().into_vec(),
-        )?;
-    }
-
-    Ok(())
 }
 
 fn validate_client_proxy_config(
@@ -1803,7 +1783,7 @@ fn validate_client_proxy_config(
                     "Both client cert and key have to be specified, or both have to be omitted",
                 ));
             }
-            validate_server_fingerprints(&mut tls_config.server_fingerprints)?;
+            normalize_fingerprints(&mut tls_config.server_fingerprints, "Server")?;
             validate_client_certificates(tls_config.cert.as_deref(), tls_config.key.as_deref())?;
 
             validate_client_proxy_config(&mut tls_config.protocol, named_pems, None)?;
@@ -2249,7 +2229,7 @@ fn resolve_server_proxy_config(
                             &local.client_ca_certs,
                             None,
                         )?;
-                        validate_client_fingerprints(&mut local.client_fingerprints)?;
+                        normalize_fingerprints(&mut local.client_fingerprints, "Client")?;
                         ResolvedShadowTlsServerHandshakeConfig::Local(local)
                     }
                     ShadowTlsServerHandshakeConfig::Remote(remote) => {
@@ -2497,7 +2477,7 @@ fn resolve_tls_server(
         &config.client_ca_certs,
         config.certificate_binding.as_ref(),
     )?;
-    validate_client_fingerprints(&mut config.client_fingerprints)?;
+    normalize_fingerprints(&mut config.client_fingerprints, "Client")?;
     let protocol = resolve_server_proxy_config(
         config.protocol,
         groups,

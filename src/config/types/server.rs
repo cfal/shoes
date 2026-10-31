@@ -954,141 +954,98 @@ pub enum ResolvedServerProxyConfig {
     #[serde(rename = "sudoku_mask")]
     SudokuMask(crate::sudoku_mask::SudokuMaskConfig<ResolvedServerProxyConfig>),
     Wireguard(Box<crate::config::resolved::ResolvedWireguardServerConfig>),
-    #[serde(alias = "splithttp")]
     Xhttp(crate::config::resolved::ResolvedXhttpServerConfig),
     Http {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         password: Option<String>,
     },
-    #[serde(alias = "socks5")]
     Socks {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         password: Option<String>,
-        #[serde(default = "default_true")]
         udp_enabled: bool,
     },
-    #[serde(
-        alias = "ss",
-        deserialize_with = "deserialize_shadowsocks_server",
-        serialize_with = "serialize_shadowsocks_server"
-    )]
+    #[serde(serialize_with = "serialize_shadowsocks_server")]
     Shadowsocks {
         config: ShadowsocksConfig,
-        #[serde(default = "default_true")]
         udp_enabled: bool,
     },
     Snell {
         cipher: String,
         password: String,
-        #[serde(default = "default_true")]
         udp_enabled: bool,
     },
     Vless {
         user_id: String,
-        #[serde(
-            default,
-            skip_serializing_if = "super::vless::VlessEncryptionSetting::is_disabled"
-        )]
+        #[serde(skip_serializing_if = "super::vless::VlessEncryptionSetting::is_disabled")]
         decryption: super::vless::VlessEncryptionSetting,
-        #[serde(
-            default,
-            rename = "encryption",
-            skip_serializing,
-            deserialize_with = "super::vless::reject_server_encryption"
-        )]
+        #[serde(rename = "encryption", skip_serializing)]
         _invalid_encryption: (),
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
         vision: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         encryption_limits: Option<super::vless::VlessEncryptionLimits>,
-        #[serde(default = "default_true")]
         udp_enabled: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         fallback: Option<NetLocation>,
     },
     Trojan {
         password: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
     },
     Tls {
-        #[serde(default, alias = "sni_targets", alias = "targets")]
         tls_targets: HashMap<String, crate::config::resolved::ResolvedTlsServerConfig>,
-        #[serde(
-            default,
-            alias = "default_target",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(skip_serializing_if = "Option::is_none")]
         default_tls_target: Option<Box<crate::config::resolved::ResolvedTlsServerConfig>>,
-        #[serde(default)]
         shadowtls_targets: HashMap<String, crate::config::resolved::ResolvedShadowTlsServerConfig>,
-        #[serde(default)]
         reality_targets: HashMap<String, crate::config::resolved::ResolvedRealityServerConfig>,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         tls_buffer_size: Option<usize>,
     },
-    #[serde(deserialize_with = "deserialize_vmess_server")]
     Vmess {
         cipher: String,
         user_id: String,
-        #[serde(default = "default_true")]
         udp_enabled: bool,
     },
     Anytls {
-        #[serde(alias = "user")]
         users: OneOrSome<AnyTlsUserConfig>,
-        #[serde(alias = "padding")]
         padding_scheme: Option<Vec<String>>,
-        #[serde(default = "default_true")]
         udp_enabled: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         fallback: Option<NetLocation>,
     },
-    #[serde(alias = "ws")]
     Websocket {
-        #[serde(alias = "target")]
         targets: Box<OneOrSome<crate::config::resolved::ResolvedWebsocketServerConfig>>,
     },
-    #[serde(alias = "forward")]
     PortForward {
-        #[serde(alias = "target")]
         targets: OneOrSome<NetLocation>,
     },
     Hysteria2 {
         password: String,
-        #[serde(default = "default_true")]
         udp_enabled: bool,
     },
-    #[serde(alias = "tuic")]
     TuicV5 {
         uuid: String,
         password: String,
-        #[serde(default)]
         zero_rtt_handshake: bool,
     },
-    #[serde(alias = "http+socks", alias = "socks+http")]
     Mixed {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         password: Option<String>,
-        #[serde(default = "default_true")]
         udp_enabled: bool,
     },
-    #[serde(alias = "naive")]
     Naiveproxy {
-        #[serde(alias = "user")]
         users: OneOrSome<NaiveUserConfig>,
-        #[serde(default = "default_true")]
         padding: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         fallback: Option<NaiveFallbackConfig>,
-        #[serde(default = "default_true")]
         udp_enabled: bool,
     },
 }

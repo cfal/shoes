@@ -387,13 +387,27 @@ impl Default for ClientConfig {
 
 impl ClientConfig {
     pub fn validate_quic_key_exchange(&self, initial_hop: bool) -> std::io::Result<()> {
+        self.validate_quic_key_exchange_settings(initial_hop, self.protocol.is_direct())
+    }
+}
+
+impl crate::config::resolved::ResolvedClientConfig {
+    pub fn validate_quic_key_exchange(&self, initial_hop: bool) -> std::io::Result<()> {
+        self.validate_quic_key_exchange_settings(initial_hop, self.protocol.is_direct())
+    }
+}
+
+impl<P> ClientRecord<P> {
+    fn validate_quic_key_exchange_settings(
+        &self,
+        initial_hop: bool,
+        direct: bool,
+    ) -> std::io::Result<()> {
         let explicit_groups = self
             .quic_settings
             .as_ref()
             .is_some_and(|settings| !settings.key_exchange_groups.is_default());
-        if explicit_groups
-            && (!initial_hop || self.protocol.is_direct() || self.transport != Transport::Quic)
-        {
+        if explicit_groups && (!initial_hop || direct || self.transport != Transport::Quic) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "QUIC key_exchange_groups requires a non-direct client at chain hop 0 with transport: quic",
@@ -692,129 +706,97 @@ pub enum ResolvedClientProxyConfig {
     Direct,
     Wireguard(Box<crate::config::resolved::ResolvedWireguardClientConfig>),
     Http {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         password: Option<String>,
-        #[serde(default, skip_serializing_if = "is_false")]
+        #[serde(skip_serializing_if = "is_false")]
         resolve_hostname: bool,
-        #[serde(default)]
         http_version: HttpVersion,
     },
-    #[serde(alias = "socks5")]
     Socks {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         password: Option<String>,
     },
-    #[serde(
-        alias = "ss",
-        deserialize_with = "deserialize_shadowsocks_client",
-        serialize_with = "serialize_shadowsocks_client"
-    )]
+    #[serde(serialize_with = "serialize_shadowsocks_client")]
     Shadowsocks {
         config: ShadowsocksConfig,
         udp_enabled: bool,
     },
-    #[serde(
-        deserialize_with = "deserialize_snell_client",
-        serialize_with = "serialize_snell_client"
-    )]
+    #[serde(serialize_with = "serialize_snell_client")]
     Snell {
         config: ShadowsocksConfig,
         udp_enabled: bool,
     },
     Vless {
         user_id: String,
-        #[serde(
-            default,
-            skip_serializing_if = "super::vless::VlessEncryptionSetting::is_disabled"
-        )]
+        #[serde(skip_serializing_if = "super::vless::VlessEncryptionSetting::is_disabled")]
         encryption: super::vless::VlessEncryptionSetting,
-        #[serde(
-            default,
-            rename = "decryption",
-            skip_serializing,
-            deserialize_with = "super::vless::reject_client_decryption"
-        )]
+        #[serde(rename = "decryption", skip_serializing)]
         _invalid_decryption: (),
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
         vision: bool,
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        #[serde(skip_serializing_if = "is_true")]
         udp_enabled: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         h2mux: Option<H2MuxConfig>,
     },
     Trojan {
         password: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         h2mux: Option<H2MuxConfig>,
     },
     Reality {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         mldsa65_verify: Option<String>,
         public_key: String,
-        #[serde(default = "default_reality_client_short_id")]
         short_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         sni_hostname: Option<String>,
 
-        #[serde(
-            alias = "cipher_suite",
-            default,
-            skip_serializing_if = "NoneOrSome::is_unspecified"
-        )]
+        #[serde(skip_serializing_if = "NoneOrSome::is_unspecified")]
         cipher_suites: NoneOrSome<crate::reality::CipherSuite>,
 
-        #[serde(default, skip_serializing_if = "is_false")]
+        #[serde(skip_serializing_if = "is_false")]
         vision: bool,
 
         protocol: Box<ResolvedClientProxyConfig>,
     },
-    #[serde(
-        alias = "shadowtls",
-        deserialize_with = "deserialize_shadowtls_variant"
-    )]
     ShadowTls {
         password: String,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         sni_hostname: Option<String>,
 
         protocol: Box<ResolvedClientProxyConfig>,
     },
-    #[serde(deserialize_with = "deserialize_tls_variant")]
     Tls(crate::config::resolved::ResolvedTlsClientConfig),
-    #[serde(deserialize_with = "deserialize_vmess_client")]
     Vmess {
         cipher: String,
         user_id: String,
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        #[serde(skip_serializing_if = "is_true")]
         udp_enabled: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         h2mux: Option<H2MuxConfig>,
     },
-    #[serde(alias = "ws")]
     Websocket(crate::config::resolved::ResolvedWebsocketClientConfig),
-    #[serde(alias = "splithttp")]
     Xhttp(crate::config::resolved::ResolvedXhttpClientConfig),
-    #[serde(alias = "noop")]
     PortForward,
     Anytls {
         password: String,
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        #[serde(skip_serializing_if = "is_true")]
         udp_enabled: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         padding_scheme: Option<Vec<String>>,
     },
-    #[serde(alias = "naive")]
     Naiveproxy {
         username: String,
         password: String,
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        #[serde(skip_serializing_if = "is_true")]
         padding: bool,
     },
 }

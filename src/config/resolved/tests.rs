@@ -31,6 +31,78 @@ fn resolved_routes_preserve_identity_serialization_shape() {
 }
 
 #[test]
+fn resolved_client_protocol_serialization_matches_source_bytes() {
+    use crate::config::test_support::Inline;
+
+    for protocol in [
+        json!({"type":"direct"}),
+        json!({"type":"http"}),
+        json!({"type":"socks5","username":"user","password":"secret"}),
+        json!({"type":"ss","cipher":"aes-128-gcm","password":"secret"}),
+        json!({"type":"snell","cipher":"aes-128-gcm","password":"secret","udp_enabled":false}),
+        json!({"type":"vless","user_id":"test","vision":true,"udp_enabled":false,"h2mux":{}}),
+        json!({"type":"trojan","password":"secret"}),
+        json!({"type":"reality","public_key":"test","protocol":{"type":"socks"}}),
+        json!({"type":"shadowtls","password":"secret","protocol":{"type":"socks"}}),
+        json!({"type":"tls","protocol":{"type":"socks"}}),
+        json!({"type":"vmess","cipher":"aes-128-gcm","user_id":"test"}),
+        json!({"type":"ws","protocol":{"type":"socks"}}),
+        json!({"type":"splithttp","protocol":{"type":"socks"}}),
+        json!({"type":"sudoku_mask","protocol":{"type":"socks"}}),
+        json!({"type":"noop"}),
+        json!({"type":"anytls","password":"secret","udp_enabled":false}),
+        json!({"type":"naive","username":"user","password":"secret","padding":false}),
+    ] {
+        let source: crate::config::ClientProxyConfig = serde_json::from_value(protocol).unwrap();
+        let resolved = ResolvedClientProxyConfig::inline(source.clone());
+        assert_eq!(
+            serde_yaml::to_string(&source).unwrap(),
+            serde_yaml::to_string(&resolved).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&source).unwrap(),
+            serde_json::to_string(&resolved).unwrap()
+        );
+    }
+}
+
+#[test]
+fn resolved_server_protocol_serialization_matches_source_bytes() {
+    use crate::config::test_support::Inline;
+
+    for protocol in [
+        json!({"type":"http"}),
+        json!({"type":"socks5","udp_enabled":false}),
+        json!({"type":"ss","cipher":"aes-128-gcm","password":"secret"}),
+        json!({"type":"snell","cipher":"aes-128-gcm","password":"secret"}),
+        json!({"type":"vless","user_id":"test","vision":true}),
+        json!({"type":"trojan","password":"secret"}),
+        json!({"type":"tls"}),
+        json!({"type":"vmess","cipher":"aes-128-gcm","user_id":"test"}),
+        json!({"type":"anytls","user":{"password":"secret"}}),
+        json!({"type":"ws","target":{"protocol":{"type":"socks"}}}),
+        json!({"type":"splithttp","protocol":{"type":"socks"}}),
+        json!({"type":"sudoku_mask","protocol":{"type":"socks"}}),
+        json!({"type":"forward","target":"127.0.0.1:443"}),
+        json!({"type":"hysteria2","password":"secret"}),
+        json!({"type":"tuic","uuid":"test","password":"secret"}),
+        json!({"type":"http+socks"}),
+        json!({"type":"naive","user":{"username":"user","password":"secret"}}),
+    ] {
+        let source: crate::config::ServerProxyConfig = serde_json::from_value(protocol).unwrap();
+        let resolved = ResolvedServerProxyConfig::inline(source.clone());
+        assert_eq!(
+            serde_yaml::to_string(&source).unwrap(),
+            serde_yaml::to_string(&resolved).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&source).unwrap(),
+            serde_json::to_string(&resolved).unwrap()
+        );
+    }
+}
+
+#[test]
 fn resolved_choice_payloads_are_not_source_syntax() {
     let choice = json!({"name":"out","group_type":"round-robin","labels":["direct"],
         "members":[{"chain":{"protocol":{"type":"direct"}}}]});
