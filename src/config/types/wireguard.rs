@@ -426,7 +426,7 @@ fn can_reach_endpoint(listen: Option<SocketAddr>, endpoint: SocketAddr) -> bool 
     })
 }
 
-fn device_limits(resource_limits: &TunResourceLimits) -> TunResourceLimits {
+pub(crate) fn device_limits(resource_limits: &TunResourceLimits) -> TunResourceLimits {
     let mut limits = resource_limits.clone();
     limits.tcp_memory_bytes.get_or_insert(32 * 1024 * 1024);
     limits.max_tcp_connections.get_or_insert(256);
