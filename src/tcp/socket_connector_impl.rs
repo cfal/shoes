@@ -429,7 +429,7 @@ impl SocketConnectorImpl {
         let domain = sni_hostname.as_deref().unwrap_or(if *native {
             &verification_name
         } else {
-            "example.com"
+            address.address().hostname().unwrap_or("example.com")
         });
         let mut last_error = std::io::Error::other("no resolved addresses succeeded");
         for address in addresses {
@@ -717,6 +717,104 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(stream);
+    }
+
+    #[tokio::test]
+    async fn quic_hostname_verification_survives_explicit_null_sni() {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.cert.der().clone()).unwrap();
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap(),
+            )),
+            "0.0.0.0:0".parse().unwrap(),
+        )
+        .unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(FixedResolver(vec![SocketAddr::from((
+            [127, 0, 0, 1],
+            server.local_addr().unwrap().port(),
+        ))]));
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        )
+        .build()
+        .unwrap();
+        for protocol in [
+            "{type: socks}",
+            "{type: xhttp, http_version: h3, protocol: {type: socks}}",
+        ] {
+            let config: ClientConfig = serde_yaml::from_str(&format!(
+                "address: localhost:443\ntransport: quic\nquic_settings: {{verify: true, sni_hostname: null, alpn_protocols: [h3]}}\nprotocol: {protocol}\n"
+            ))
+            .unwrap();
+            let mut connector =
+                SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
+            let TransportConfig::Quic {
+                endpoints,
+                sni_hostname,
+                ..
+            } = &mut connector.transport
+            else {
+                unreachable!()
+            };
+            assert!(sni_hostname.is_none());
+            let mut client_tls = try_create_client_config(
+                true,
+                vec![],
+                vec!["h3".into()],
+                sni_hostname.is_some(),
+                None,
+                false,
+                &Default::default(),
+            )
+            .unwrap();
+            // Trusts the local test certificate without bypassing name verification.
+            client_tls
+                .dangerous()
+                .set_certificate_verifier(verifier.clone());
+            let client_config = quinn::ClientConfig::new(Arc::new(
+                quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+            ));
+            for endpoint in endpoints {
+                Arc::get_mut(endpoint)
+                    .unwrap()
+                    .set_default_client_config(client_config.clone());
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let target = ResolvedLocation::new(config.address.clone());
+                let (client, peer) =
+                    tokio::join!(connector.connect_quic(&resolver, &target), async {
+                        server.accept().await.unwrap().await
+                    },);
+                let client = client.unwrap();
+                let peer = peer.unwrap();
+                let handshake = peer
+                    .handshake_data()
+                    .unwrap()
+                    .downcast::<quinn::crypto::rustls::HandshakeData>()
+                    .unwrap();
+                assert!(handshake.server_name.is_none());
+                client.connection.close(0u32.into(), b"done");
+            })
+            .await
+            .unwrap();
+        }
+        server.close(0u32.into(), b"done");
     }
 
     #[tokio::test]
