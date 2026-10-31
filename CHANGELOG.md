@@ -6,6 +6,7 @@
 - Added a TUIC v5 client with TCP, native and QUIC-stream UDP relay modes, session-exporter authentication, heartbeats, and bounded association teardown.
 - Added optional Salamander obfuscation for Hysteria2 clients, including coalesced UDP receive handling and transport MTU accounting.
 - Added connection-owned Hysteria2 port hopping with fixed or randomized intervals, protected sockets, and receive overlap across hops.
+- TUIC authentication now buffers bounded pre-auth commands without consuming the stream credit needed for AUTH. Native client connections release closed generations promptly and allow a bounded drain when the last retired flow closes.
 
 - Added the outermost `sudoku_mask` TCP client/server wrapper with Xray FinalMask interoperability, stacked outer masks, TLS/REALITY, WebSocket, native VLESS encryption/Vision, and XHTTP carriers. Masks inside other protocols are rejected. UDP forwarded inside TCP remains supported; native UDP/QUIC masking is not supported. Sudoku is obfuscation, not transport security; see [configuration and costs](CONFIG.md#sudoku-tcp-mask).
 - Raised the default `global_limits.quic_socket_buffer` request to 8 MiB and extended the setting from QUIC listeners to outbound QUIC proxies and DNS-over-HTTP/3. Buffer tuning remains best-effort; unsatisfied or unverifiable requests now warn at most once per receive/send direction per process, including SOCKS5 UDP's existing 2 MiB request.

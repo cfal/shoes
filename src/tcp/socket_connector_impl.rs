@@ -117,6 +117,7 @@ enum TransportConfig {
         endpoints: Vec<Arc<QuicEndpoint>>,
         next_endpoint_index: AtomicU8,
         hopping: Option<Box<HoppingEndpoint>>,
+        native: bool,
     },
 }
 
@@ -307,7 +308,7 @@ impl SocketConnectorImpl {
                     .max_concurrent_bidi_streams(0_u32.into())
                     .max_concurrent_uni_streams(
                         if is_tuic {
-                            limits.max_streams_per_connection.unwrap_or(64).min(64) as u32
+                            limits.max_streams_per_connection.unwrap_or(1024).min(1024) as u32
                         } else if is_xhttp || is_native {
                             16_u32
                         } else {
@@ -377,6 +378,7 @@ impl SocketConnectorImpl {
                             socket_buffer: limits.quic_socket_buffer,
                         })
                     }),
+                    native: is_native,
                 }
             }
         };
@@ -408,6 +410,7 @@ impl SocketConnectorImpl {
             next_endpoint_index,
             sni_hostname,
             hopping,
+            native,
         } = &self.transport
         else {
             return Err(std::io::Error::new(
@@ -423,23 +426,35 @@ impl SocketConnectorImpl {
             addresses.sort_by_key(SocketAddr::is_ipv6);
         }
         let verification_name = address.address().to_string();
-        let domain = sni_hostname.as_deref().unwrap_or(&verification_name);
+        let domain = sni_hostname.as_deref().unwrap_or(if *native {
+            &verification_name
+        } else {
+            "example.com"
+        });
         let mut last_error = std::io::Error::other("no resolved addresses succeeded");
         for address in addresses {
             let endpoint = if let Some(hopping) = hopping {
-                hopping.open(address, self.bind_interface.clone())?
+                match hopping.open(address, self.bind_interface.clone()) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        debug!("QUIC socket creation for {address} failed: {error}");
+                        last_error = error;
+                        continue;
+                    }
+                }
             } else {
                 let index =
                     next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
                 endpoints[index].clone()
             };
             let result = match endpoint.connect(address, domain) {
-                Ok(connecting) => {
+                Ok(connecting) if *native => {
                     tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
                         .await
                         .map_err(std::io::Error::from)
                         .and_then(|result| result.map_err(std::io::Error::other))
                 }
+                Ok(connecting) => connecting.await.map_err(std::io::Error::other),
                 Err(error) => Err(std::io::Error::other(error)),
             };
             let result = match result {

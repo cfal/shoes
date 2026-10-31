@@ -1279,6 +1279,10 @@ UDP associations share a bounded, connection-owned receiver. Association IDs
 are never reused within a connection; exhaustion creates a new connection while
 existing flows retain the old one. Explicit shutdown sends DISSOCIATE with a
 deadline; dropping an association queues a bounded best-effort notification.
+The default incoming uni-stream credit is 1024 (reduced by an explicit
+`max_streams_per_connection`), with at most 64 concurrent command readers.
+Very small stream limits can make external servers reject bursty stream-mode
+UDP replies; prefer native mode when strict stream limits are required.
 
 ### Direct
 ```yaml

@@ -231,3 +231,69 @@ async fn native_placement_is_checked_in_builder_and_mixed_pools() {
         }
     }
 }
+
+#[tokio::test]
+async fn closed_generations_are_evicted_without_another_dial() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (server, dialer) = endpoints();
+        let accepting = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let mut auth = connection.accept_uni().await.unwrap();
+            auth.read_to_end(50).await.unwrap();
+            connection.close(1u32.into(), b"test failure");
+            (server, connection)
+        });
+        let pool = Pool::default();
+        let generation = pool.get(dialer, protocol(), false).await.unwrap();
+        let weak = Arc::downgrade(&generation);
+        generation.connection().closed().await;
+        drop(generation);
+        while weak.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+        drop((pool, accepting.await.unwrap()));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn last_retired_tcp_lease_drains_fin_and_unacknowledged_tail() {
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let (server, dialer) = endpoints();
+        let (accepted, received) = tokio::sync::oneshot::channel();
+        let accepting = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            connection
+                .accept_uni()
+                .await
+                .unwrap()
+                .read_to_end(50)
+                .await
+                .unwrap();
+            accepted.send(connection.clone()).unwrap();
+            connection.closed().await;
+            drop(server);
+        });
+        let pool = Pool::default();
+        let generation = pool.get(dialer, protocol(), false).await.unwrap();
+        let connection = received.await.unwrap();
+        let target = crate::address::NetLocation::from_str("127.0.0.1:1234", None).unwrap();
+        let mut stream = super::tuic::connect(generation, &target.into())
+            .await
+            .unwrap()
+            .client_stream;
+        let data = vec![42; 32768];
+        stream.write_all(&data).await.unwrap();
+        drop((pool, stream));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        let bytes = recv.read_to_end(65536).await.unwrap();
+        assert_eq!(&bytes[9..], data);
+        connection.closed().await;
+        accepting.await.unwrap();
+    })
+    .await
+    .unwrap();
+}

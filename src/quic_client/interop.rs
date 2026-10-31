@@ -255,3 +255,40 @@ async fn sing_box_rejects_wrong_credentials_without_target_data() {
         );
     }
 }
+
+#[tokio::test]
+async fn tuic_quic_downlink_burst_preserves_the_server_association() {
+    let (chain, resolver, _peer, _config) = peer(
+        json!({"type":"tuic", "password":"test-password",
+        "uuid":"01234567-89ab-4def-8123-456789abcdef", "udp_relay_mode":"quic"}),
+        "tuic",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let echo = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let target = NetLocation::from_str(&format!("127.0.0.1:{}", echo.local_addr().unwrap().port()), None).unwrap();
+        let mut association = chain.connect_udp_bidirectional(&resolver, target.into()).await.unwrap();
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut *association).poll_write_message(cx, b"start")).await.unwrap();
+        let mut buffer = [0; 2048];
+        let (_, first) = echo.recv_from(&mut buffer).await.unwrap();
+        // More than the old 64-stream credit, without waiting for client replies.
+        for index in 0u16..256 { echo.send_to(&index.to_be_bytes(), first).await.unwrap(); }
+        let mut received = 0;
+        let deadline = tokio::time::sleep(Duration::from_millis(300));
+        tokio::pin!(deadline);
+        loop {
+            let mut data = ReadBuf::new(&mut buffer);
+            tokio::select! {
+                _ = &mut deadline => break,
+                result = std::future::poll_fn(|cx| std::pin::Pin::new(&mut *association).poll_read_message(cx, &mut data)) => {
+                    result.unwrap(); received += 1;
+                }
+            }
+        }
+        assert!(received > 64, "only {received} replies arrived");
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut *association).poll_write_message(cx, b"again")).await.unwrap();
+        let (_, second) = echo.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(first, second, "burst must not close the server's UDP association");
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut *association).poll_shutdown_message(cx)).await.unwrap();
+    }).await.unwrap();
+}

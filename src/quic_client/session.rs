@@ -31,7 +31,7 @@ struct Slot {
 
 #[derive(Default)]
 pub(super) struct Pool {
-    slots: parking_lot::Mutex<HashMap<RouteKey, Slot>>,
+    slots: Arc<parking_lot::Mutex<HashMap<RouteKey, Slot>>>,
 }
 
 impl Pool {
@@ -49,10 +49,12 @@ impl Pool {
                         && (!udp || !generation.registry.lock().exhausted())
                 }
                 Some(Err(_)) => false,
-                None => true,
+                None => !slot._init.is_finished(),
             });
             let slot = slots.entry(dialer.route_key().clone()).or_insert_with(|| {
                 let (sender, result) = watch::channel(None);
+                let slots = Arc::downgrade(&self.slots);
+                let key = dialer.route_key().clone();
                 let init = tokio::spawn(async move {
                     let result =
                         tokio::time::timeout(SETUP_TIMEOUT, Generation::open(dialer, protocol))
@@ -65,7 +67,19 @@ impl Pool {
                             })
                             .map(Arc::new)
                             .map_err(|error| Failure(Arc::new(error)));
+                    let closed = result.as_ref().ok().map(|generation| (generation.connection().clone(), Arc::downgrade(generation)));
                     let _ = sender.send(Some(result));
+                    drop(sender);
+                    if let Some((connection, generation)) = closed {
+                        connection.closed().await;
+                        if let Some(slots) = slots.upgrade() {
+                            let mut slots = slots.lock();
+                            let matches = slots.get(&key).is_some_and(|slot| {
+                                matches!(&*slot.result.borrow(), Some(Ok(current)) if Arc::downgrade(current).ptr_eq(&generation))
+                            });
+                            if matches { slots.remove(&key); }
+                        }
+                    }
                 });
                 Slot {
                     result,
@@ -92,6 +106,7 @@ pub(super) struct Generation {
     pub registry: Arc<parking_lot::Mutex<udp::Registry>>,
     pub dissociate: Option<tokio::sync::mpsc::Sender<tuic::Dissociate>>,
     tasks: Vec<AbortOnDropHandle<()>>,
+    initialized: bool,
     // Retains pointer-based route identities for the entire pooled lifetime.
     _dialer: Arc<dyn CarrierDialer>,
 }
@@ -110,6 +125,7 @@ impl Generation {
             registry: Arc::new(parking_lot::Mutex::new(udp::Registry::new(maximum))),
             dissociate: None,
             tasks: Vec::new(),
+            initialized: false,
             _dialer: dialer,
         };
         match &generation.protocol {
@@ -151,6 +167,7 @@ impl Generation {
                 generation.registry.clone(),
                 generation.protocol.clone(),
             ))));
+        generation.initialized = true;
         Ok(generation)
     }
 
@@ -162,6 +179,23 @@ impl Generation {
 impl Drop for Generation {
     fn drop(&mut self) {
         self.registry.lock().close();
+        if self.initialized
+            && self.connection().close_reason().is_none()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            // Retiring a route must not discard FIN/data already accepted by
+            // Quinn. One bounded drain task per generation retains its endpoint
+            // and protocol drivers, rather than spawning a task per stream.
+            let connection = self.connection().clone();
+            let endpoint = self.carrier._endpoint.clone();
+            let tasks = std::mem::take(&mut self.tasks);
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(3), connection.closed()).await;
+                connection.close(0u32.into(), b"client retired");
+                drop((tasks, endpoint));
+            });
+            return;
+        }
         self.carrier
             .connection
             .close(0u32.into(), b"client retired");
@@ -182,6 +216,39 @@ mod tests {
         key: RouteKey,
         started: AtomicUsize,
         done: tokio::sync::Notify,
+    }
+    #[derive(Debug)]
+    struct Panics(RouteKey);
+    #[async_trait::async_trait]
+    impl CarrierDialer for Panics {
+        fn route_key(&self) -> &RouteKey {
+            &self.0
+        }
+        async fn open_stream(&self) -> io::Result<Box<dyn AsyncStream>> {
+            unreachable!()
+        }
+        async fn open_quic(&self) -> io::Result<QuicCarrier> {
+            panic!("test initializer panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn panicked_initializers_do_not_poison_routes() {
+        let pool = Pool::default();
+        assert!(
+            pool.get(Arc::new(Panics(RouteKey(vec![1]))), protocol(), false)
+                .await
+                .is_err()
+        );
+        let dialer = Arc::new(Stalled {
+            key: RouteKey(vec![1]),
+            started: AtomicUsize::new(0),
+            done: tokio::sync::Notify::new(),
+        });
+        let mut retry = Box::pin(pool.get(dialer.clone(), protocol(), false));
+        assert!(futures::poll!(&mut retry).is_pending());
+        tokio::task::yield_now().await;
+        assert_eq!(dialer.started.load(Ordering::SeqCst), 1);
     }
     #[async_trait::async_trait]
     impl CarrierDialer for Stalled {

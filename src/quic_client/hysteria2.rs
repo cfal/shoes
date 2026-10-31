@@ -88,6 +88,7 @@ pub(super) async fn authenticate(
     request.finish().await.map_err(io::Error::other)?;
     let response = request.recv_response().await.map_err(io::Error::other)?;
     let enabled = auth_response(&response)?;
+    request.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
     Ok((enabled, task))
 }
 
