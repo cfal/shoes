@@ -65,9 +65,8 @@ async fn prefix(tag: u8, tls: bool) -> Prefix {
                         assert!(request.starts_with(b"CONNECT naive.invalid:443 HTTP/1.1\r\n"));
                         stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
                         if let Some(tls) = tls {
-                            match tokio_rustls::TlsAcceptor::from(tls).accept(stream).await {
-                                Ok(stream) => serve_h2(stream, requests, connection, tag).await,
-                                Err(_) => return,
+                            if let Ok(stream) = tokio_rustls::TlsAcceptor::from(tls).accept(stream).await {
+                                serve_h2(stream, requests, connection, tag).await;
                             }
                         } else {
                             // Wait for the client preface so H2 SETTINGS cannot be
