@@ -183,7 +183,9 @@ async fn representative_examples_pass_native_validation() {
         "snell_forward_rules.yaml",
         "http_through_socks.yaml",
         "multi_hop_chain.yaml",
+        "chain_groups.yaml",
         "clash_api.yaml",
+        "url_test.yaml",
         "rule_sources.yaml",
     ] {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
