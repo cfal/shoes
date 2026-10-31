@@ -15,6 +15,60 @@ use crate::xudp::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwor
 use crate::xudp::message_stream::MAX_XUDP_ROUTES;
 
 #[tokio::test]
+async fn oversized_xudp_packets_do_not_disable_the_router_destination() {
+    use tokio::io::AsyncReadExt;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let destination = NetLocation::from_str("127.0.0.1:443", None).unwrap();
+        let source = PacketSource::default();
+        let mut server = ServerStream::Targeted(Box::new(source.clone()));
+        let mut router = test_router(&mut server);
+        let (stream, mut peer) = tokio::io::duplex(16384);
+        router.sessions.insert(
+            0,
+            RoutingSession::new(
+                destination.clone(),
+                0,
+                destination.clone(),
+                LookupKey::Destination(destination.clone()),
+                Box::new(crate::xudp::client_stream::XudpClientStream::new(
+                    Box::new(stream),
+                    destination.clone(),
+                )),
+            ),
+        );
+        let SessionLookup::ByDestination(lookup) = &mut router.session_lookup else {
+            unreachable!()
+        };
+        lookup.insert(destination.clone(), KeyState::Active(0));
+        for (size, status) in [(7526, SessionStatus::New), (5, SessionStatus::Keep)] {
+            source.packets.lock().unwrap().extend([
+                (destination.clone(), vec![0; 7527]),
+                (destination.clone(), vec![42; size]),
+            ]);
+            router.poll_outbound(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                false,
+            );
+            assert!(!router.sessions.get(&0).unwrap().remote_write_eof);
+            let metadata_len = peer.read_u16().await.unwrap();
+            let mut wire = BytesMut::new();
+            wire.put_u16(metadata_len);
+            wire.resize(2 + metadata_len as usize + 2 + size, 0);
+            peer.read_exact(&mut wire[2..]).await.unwrap();
+            let (metadata, payload) = crate::xudp::frame::decode_frame(&mut wire)
+                .unwrap()
+                .unwrap();
+            assert_eq!(metadata.status, status);
+            assert_eq!(payload, vec![42; size]);
+            assert!(wire.is_empty());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn fake_unknown_and_blocked_routes_recover_without_poisoning_wire_cache() {
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
     use crate::dns::DnsContext;

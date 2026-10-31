@@ -62,10 +62,8 @@ impl AsyncWriteMessage for XudpClientStream {
         }
         // Xray's XUDP writer reserves space for metadata in an 8192-byte buffer.
         if data.len() > 7526 {
-            return Poll::Ready(Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "XUDP payload exceeds 7526 bytes",
-            )));
+            log::debug!("Dropping oversized XUDP datagram: {} bytes", data.len());
+            return Poll::Ready(Ok(()));
         }
         if data.is_empty() {
             return Poll::Ready(Ok(()));
