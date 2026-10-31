@@ -552,9 +552,11 @@ fn raw_flush_retains_prefix_until_transport_flush_completes() {
 fn key_update_response_precedes_the_next_application_write() {
     use std::io::Read;
 
-    for (session, mut peer) in [
-        completed_ordinary_connections(),
-        crate::reality::established_pair(),
+    for (drain_first, (session, mut peer)) in [
+        (false, completed_ordinary_connections()),
+        (false, crate::reality::established_pair()),
+        (true, completed_ordinary_connections()),
+        (true, crate::reality::established_pair()),
     ] {
         let state = Arc::new(Mutex::new(WriteReadiness {
             allowance: usize::MAX,
@@ -583,6 +585,17 @@ fn key_update_response_precedes_the_next_application_write() {
             assert_eq!((state.write_polls, state.flush_polls), (0, 0));
         }
 
+        if drain_first {
+            state.lock().unwrap().allowance = 0;
+            assert!(stream.poll_drain_tls(&mut cx).is_pending());
+            assert!(stream.session.wants_write());
+            state.lock().unwrap().allowance = usize::MAX;
+            assert!(matches!(
+                stream.poll_drain_tls(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+        }
+
         assert!(matches!(
             Pin::new(&mut stream).poll_write(&mut cx, b"reply"),
             Poll::Ready(Ok(5))
@@ -605,6 +618,74 @@ fn key_update_response_precedes_the_next_application_write() {
         peer.reader().read_exact(&mut reply).unwrap();
         assert_eq!(&reply, b"reply");
     }
+}
+
+#[tokio::test]
+async fn vision_prefix_stays_in_one_record_after_peer_key_update() {
+    use crate::address::NetLocation;
+    use crate::tcp::tcp_client_handler_factory::create_tcp_client_handler;
+    use futures::future::poll_fn;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const UUID: [u8; 16] = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0];
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for size in [32, 8, 21, 27, 28, 47, 48, 64] {
+            let hop = NetLocation::from_str("localhost:443", None).unwrap();
+            let handler = create_tcp_client_handler(
+                serde_json::from_value(serde_json::json!({
+                    "type": "tls", "verify": false, "vision": true,
+                    "tls_buffer_size": size,
+                    "protocol": {
+                        "type": "vless", "udp_enabled": true,
+                        "user_id": "00000000-0000-4000-8000-000000000000"
+                    }
+                }))
+                .unwrap(),
+                &hop,
+                Arc::new(crate::resolver::NativeResolver::new()),
+            )
+            .unwrap();
+            let (_, server) = ordinary_connections();
+            let (left, right) = tokio::io::duplex(65536);
+            let target = NetLocation::from_str("192.0.2.1:53", None).unwrap();
+            let (client, server) = tokio::join!(
+                handler.setup_client_udp_bidirectional(Box::new(left), target.into()),
+                CryptoTlsStream::handshake(right, server, TlsReadMode::PreserveRecords, &[]),
+            );
+            let mut client = client.unwrap();
+            let mut server = server.unwrap();
+            let mut request = [0; 37];
+            server.read_exact(&mut request).await.unwrap();
+            assert_eq!(request[0], 0);
+            assert_eq!(&request[1..17], &UUID);
+            assert_eq!(&request[17..], b"\x12\x0a\x10xtls-rprx-vision\x03");
+
+            server.session.refresh_traffic_keys().unwrap();
+            server.flush().await.unwrap();
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(
+                Pin::new(&mut *client)
+                    .poll_read_message(&mut cx, &mut ReadBuf::new(&mut [0; 1024]))
+                    .is_pending()
+            );
+
+            poll_fn(|cx| Pin::new(&mut *client).poll_write_message(cx, b"key-update-datagram"))
+                .await
+                .unwrap();
+            poll_fn(|cx| Pin::new(&mut *client).poll_flush_message(cx))
+                .await
+                .unwrap();
+            let mut record = [0; 8192];
+            let n = server.read(&mut record).await.unwrap();
+            assert!(n >= 21, "buffer {size}: first Vision record has {n} bytes");
+            assert!(n <= size.max(21));
+            assert_eq!(&record[..16], &UUID);
+            assert_eq!(record[16], 0);
+        }
+    })
+    .await
+    .unwrap();
 }
 
 struct PendingWriteIo;
@@ -879,11 +960,12 @@ fn completed_ordinary_connections() -> (TlsConnection, TlsConnection) {
 }
 
 #[tokio::test]
-async fn ordinary_tls_shutdown_drains_data_and_fatal_alert_after_backpressure() {
+async fn ordinary_tls_drain_and_shutdown_preserve_data_and_fatal_alert_after_backpressure() {
+    use futures::future::poll_fn;
     use std::io::Read;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    for fail_server in [false, true] {
+    for (fail_server, drain_first) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut client, mut server) = ordinary_connections();
         for _ in 0..8 {
             let mut wire = Vec::new();
@@ -919,6 +1001,9 @@ async fn ordinary_tls_shutdown_drains_data_and_fatal_alert_after_backpressure() 
         let (shutdown, read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(
                 async move {
+                    if drain_first {
+                        poll_fn(|cx| stream.poll_drain_tls(cx)).await.unwrap();
+                    }
                     let result = stream.shutdown().await;
                     drop(stream);
                     result
