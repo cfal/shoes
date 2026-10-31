@@ -1615,6 +1615,12 @@ HTTP/2 PING watchdog. Peer stream limits and timeouts still apply. In particular
 Caddy v2.11.7 defaults to a one-minute request-body idle timeout, which can end a
 quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
 
+Session reuse is scoped to the selected proxy prefix. Each NaiveProxy handler
+retains one reusable session; changing the prefix replaces it without closing
+active tunnels. Alternating prefixes therefore opens new sessions, while warm
+connections through the same prefix share a session. Concurrent cold connections
+may establish separate sessions.
+
 ## Native DNS Freshness
 
 Omitting a listener's `dns` or leaving `dns.servers` empty uses native OS/NSS

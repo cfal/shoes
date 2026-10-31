@@ -6,6 +6,8 @@ mod naive_client_session;
 mod naive_hyper_service;
 mod naive_padding_stream;
 mod naive_server_handler;
+#[cfg(test)]
+mod route_tests;
 mod user_lookup;
 
 pub use naive_client_handler::NaiveProxyTcpClientHandler;

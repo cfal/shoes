@@ -208,7 +208,7 @@ fn expand_with(
             hops.next().expect("single stage has one selection")
         })
     })?;
-    plan_ops::validate(&hops, client_nodes, validate_health, validate_position)?;
+    plan_ops::validate(&hops, client_nodes, validate_position)?;
     Ok(ChainPlan { hops })
 }
 
@@ -230,15 +230,6 @@ fn client_nodes(client: &DraftClient, depth: usize) -> io::Result<usize> {
                 return Err(invalid("client composition exceeds 16384 nodes"));
             }
             Ok(nodes)
-        }
-    }
-}
-
-fn validate_health(client: &DraftClient, multiple: bool) -> io::Result<()> {
-    match client {
-        DraftClient::Ready(client) => super::health::validate_client(client, multiple),
-        DraftClient::Pending { source, .. } => {
-            super::health::validate_source_client(source, multiple)
         }
     }
 }

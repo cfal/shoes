@@ -219,6 +219,7 @@ mod tests {
 
     impl PoolProbe {
         async fn probe(&self, transport: ClientTransport<'_>) -> std::io::Result<()> {
+            assert_eq!(transport.route.route_key(), &RouteKey(vec![1]));
             if self.open_transport {
                 let mut stream = transport.open.await?;
                 stream.write_all(PROBE_PAYLOAD).await?;

@@ -9,11 +9,8 @@
 //! internally uses `Arc<Mutex<...>>` for shared state. This follows the same pattern
 //! as the h2 crate's own examples and benchmarks.
 //!
-//! The handler maintains `Arc<Mutex<Option<NaiveClientSession>>>` only for:
-//! - Lazy initialization (session created on first request)
-//! - Reconnection (recreate session if connection dies)
-//!
-//! Once a session is obtained, it's cloned and used directly without holding locks.
+//! The handler caches a session together with its selected route. Once obtained,
+//! the session is cloned and used directly without holding cache locks.
 
 use std::io;
 use std::sync::Arc;
