@@ -138,7 +138,10 @@ fn parse_udp_packet(mut packet: PacketBuffer) -> Option<UdpMessage> {
 fn parse_ipv4_udp(packet: &[u8]) -> Option<(Range<usize>, SocketAddr, SocketAddr)> {
     let ip_packet = Ipv4Packet::new_checked(packet).ok()?;
 
-    if ip_packet.next_header() != IpProtocol::Udp {
+    if ip_packet.next_header() != IpProtocol::Udp
+        || ip_packet.more_frags()
+        || ip_packet.frag_offset() != 0
+    {
         return None;
     }
 
@@ -247,6 +250,24 @@ pub fn build_udp_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv4_udp_fragments_are_not_standalone_datagrams() {
+        for (more, offset, accepted) in [(false, 0, true), (true, 0, false), (false, 8, false)] {
+            let mut packet = build_udp_packet(
+                b"payload",
+                "192.0.2.1:1234".parse().unwrap(),
+                "198.51.100.1:53".parse().unwrap(),
+            )
+            .unwrap();
+            let mut ip = Ipv4Packet::new_unchecked(&mut *packet);
+            ip.set_dont_frag(false);
+            ip.set_more_frags(more);
+            ip.set_frag_offset(offset);
+            ip.fill_checksum();
+            assert_eq!(parse_udp_packet(packet).is_some(), accepted);
+        }
+    }
 
     #[test]
     fn udp_packets_allow_routed_internet_paths() {
