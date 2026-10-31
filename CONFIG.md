@@ -4,6 +4,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 
 ## Table of Contents
 - [Configuration Structure](#configuration-structure)
+- [Global Settings](#global-settings)
 - [Server Config](#server-config)
 - [Server Protocols](#server-protocols)
 - [TUN Config](#tun-config)
@@ -18,6 +19,31 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [Certificate Sources](#certificate-sources)
 - [Advanced Features](#advanced-features)
 - [Command Line](#command-line)
+
+## Global Settings
+
+Use one `global_settings` entry across all loaded configuration files for
+process-wide settings. Resource limits remain flat fields alongside the optional
+remote-rule cache directory:
+
+```yaml
+- global_settings:
+    max_connections: 10000
+    reload_grace_secs: 300
+    rule_cache_dir: ./rule-cache
+```
+
+Omitted or `null` admission caps are unlimited; transport buffer defaults are
+unchanged. Omit `rule_cache_dir` (or set it to `null`) to keep remote rules only in
+memory. A configured directory applies to all remote sources; per-source cache
+directories are not supported. See [remote rule sources](#remote-rule-sources)
+for cache permissions, relative paths, and restart requirements.
+
+`global_limits` remains an alias for `global_settings` and logs a warning that it
+will be deprecated in the next version; rename the entry to `global_settings`.
+Both names count toward the same single-entry limit, even for empty entries.
+Serialized configurations always use `global_settings`. Standalone
+`rule_cache_dir` entries are not supported; put the field inside `global_settings`.
 
 ## WireGuard
 
@@ -289,111 +315,6 @@ A configuration file is a YAML array containing one or more configuration entrie
   path: /path/to/cert.pem
 ```
 
-## Ordered Healthy Fallback
-
-The CLI supports opt-in ordered fallback without a Clash API listener:
-
-```yaml
-- client_group: outbound
-  type: fallback
-  health_check:
-    url: "https://probe.example.com/generate_204"
-    interval_secs: 30
-    timeout_ms: 5000
-    expected_status: 204
-  client_proxies:
-    - name: primary
-      address: "primary.example.com:1080"
-      protocol: {type: socks}
-    - name: backup
-      address: "backup.example.com:1080"
-      protocol: {type: socks}
-```
-
-Rules use `client_chain: outbound`. `health_check` is required only for fallback
-and rejected on other group types. The removed `strategy` field is not accepted.
-The URL must be HTTP(S), at most 2048 bytes,
-without credentials or fragments. `interval_secs` is required, 1..86400;
-`timeout_ms` defaults to 5000, 1..32767; `expected_status` defaults to 204,
-100..599. Unknown fields, empty groups, duplicate immediate members and
-selector-only `default` are rejected. Anonymous inline members are supported.
-
-For each new flow, explicit nested selector choices and final-hop UDP capability
-are applied first. Fallback chooses the first member with a healthy eligible
-concrete path. If none is healthy, never-sampled paths may be tried in order.
-Failed and stale paths are excluded; all-down returns an error, never implicit
-DIRECT. A sample becomes stale after three intervals plus the probe timeout.
-Probes skip paths excluded by manual selector choices, rechecking those choices
-after admission. Reselecting a skipped path schedules a check without waiting
-another interval, still subject to shared admission and transport deadlines.
-Previously sampled paths that became stale while unselected remain excluded
-until a new check succeeds; reselection does not make an old sample Unknown.
-New flows can therefore fail closed while rechecks are pending or locally blocked.
-Manual choices are never rewritten or persisted by health checking.
-Resolver-chain selector changes trigger rechecks without erasing
-existing samples: DNS caches and retained connections are not concrete-path
-identity. Relevant selector changes fence in-flight probe results, including
-A-to-B-to-A changes; unrelated selectors and inactive nested branches do not.
-Fixed outer path choices do not erase samples. DNS-chain checks use the same
-configured bootstrap resolver as forwarding.
-A fallback-checked chain cannot contain WireGuard whose `peer_client_chain` has
-more than one member at any hop, including recursively nested WireGuard carriers.
-All configured alternatives count, even branches that cannot carry UDP. It also
-cannot contain NaiveProxy (including wrapped NaiveProxy) after a hop with multiple
-members: its retained H2 session is not scoped to the selected prefix. These
-combinations are rejected, not probed approximately. Fixed WireGuard carriers,
-NaiveProxy at hop 0 or behind a single fixed prefix, and ordinary chains without
-fallback remain supported. The restrictions also cover DNS chains and unused
-groups available to controller/URL-test probes; resolver-only dependencies do
-not count as the fallback chain's transport path.
-A fallback containing a selector may choose its next member, but
-never another branch inside
-that selector. Fallback member and healthy-before-unknown priorities are resolved
-across complete eligible paths before URL-test latency and round-robin pool
-choices. Paths outside each fallback branch remain eligible, so an unrelated
-round-robin branch is not globally overridden by health.
-
-Checks send HEAD through the complete configured TCP chain, require the expected
-status, verify HTTPS certificates, and do not follow redirects. They share the
-controller and URL-test probe engine and its 16 concurrent permits. The total deadline includes
-admission, DNS, connect, TLS and response headers. Admission exhaustion or local
-resource shortages do not mark a path failed; expiry after queued admission
-preserves the previous sample without refreshing its timestamp. Successful and failed checks both
-wait the configured interval, jittered by +/-10%, before retrying. Unused groups
-do not start transports; checks start when a runtime chain is instantiated.
-Controller delay requests and URL-test targets can instantiate additional fallback
-chains. Their checks last while the cached probe connector lives (normally the
-generation) and obey that target's selectors, not selectors enclosing it in
-routing rules. They share the same check and concurrency limits.
-
-Health is generation-local and keyed by canonical full-path configuration, resolver
-identity, selector constraints and probe settings, not names or member positions.
-Equivalent checks share one sample; different prefixes/endpoints do not. Each
-chain is limited to 256 concrete paths and each generation to 1024 active checks. Large pool products are
-rejected instead of spawning unbounded probes. Due checks are admitted oldest-first
-so repeated checks cannot indefinitely overtake waiting paths. Saturation can make samples stale;
-choose intervals/timeouts that fit the shared budget. Reload cancels and joins old
-checks before starting the new generation. Draining sessions keep the old
-generation's health snapshot at cancellation, without further probes or aging;
-rollback/resume restores normal freshness checks. Samples are not persisted.
-Pause time counts toward sample age after resume, so a long rejected activation
-can require successful rechecks before the resumed fallback accepts new flows.
-
-Checks use the existing probe destination restrictions (including loopback,
-link-local and synthetic Fake-IP protection). Forbidden literal URLs, including
-configured or retained Fake-IP ranges, are rejected during validation.
-Proxy-side DNS remains subject to
-the remote proxy's policy. A TCP sample does not prove UDP reachability, nor does
-one probe endpoint measure all destinations. Application errors never update
-health, and application bytes are never replayed. Existing TCP streams, UDP
-associations and pooled transports keep their selected member until reopened.
-There is no latency scoring, passive cooldown, hysteresis, affinity, or all-down
-last-resort mode. FFI rejects fallback because it does not own this scheduler.
-
-Controller delay history remains separate from fallback samples. `Fallback`
-catalog entries expose members and capabilities; there is no single global `now`
-member because selection depends on the concrete chain and transport.
-
 ## Clash Controller
 
 The CLI can expose a documented subset of the Clash API. The controller is
@@ -449,7 +370,7 @@ Opt into manual selection explicitly:
 Rules continue to use `client_chain: outbound`. A selector chooses an immediate
 named member or referenced group; inline selector members require `name`.
 The group discriminant is `type`: `round-robin` (the default), `selector`,
-`url-test`, or `fallback`. The removed `strategy` field and unknown types are errors. Nested round-robin weights,
+or `url-test`. The removed `strategy` field and unknown types are errors. Nested round-robin weights,
 duplicate membership, and existing UDP filtering are preserved. A selected
 branch without UDP support fails new UDP flows instead of silently falling back.
 Selection changes affect new flows only; existing streams, UDP destinations,
@@ -619,7 +540,7 @@ are exempt from header idle expiry and have bounded queues/write deadlines.
 Responses are limited to 32 MiB. An oversized connection snapshot closes its
 WebSocket with code 1009 and reason `response exceeds 32 MiB`; tracking continues
 without truncating the connection list.
-Configuring a controller, `cache_file_path`, or any selector/url-test/fallback group enables the
+Configuring a controller, `cache_file_path`, or any selector/url-test group enables the
 catalog and its 16,384-node limit. Names must be nonempty, unique, at most 256
 bytes, and contain no control characters. `DIRECT`, `REJECT`, and
 `GLOBAL` are reserved. Configuration preparation rejects `/rules` or base
@@ -1807,6 +1728,11 @@ hostname lookups can otherwise re-enter the host's intercepted resolver.
 Fake-enabled system configurations fail startup if no usable endpoints can be
 discovered. Later upstream failures produce DNS failure, not a public-provider fallback.
 UDP and HTTP/3 upstreams remain direct-only; TCP/TLS/HTTPS can use client chains.
+DNS client chains use the configured bootstrap resolver. Downstream proxy
+hostnames remain unresolved when passed through a proxy that supports remote
+name resolution; Shoes cannot inspect addresses resolved by that remote proxy.
+Rule downloads instead pre-resolve downstream proxies through their guarded
+bootstrap resolver.
 UDP truncation retries TCP only when that transport is explicitly configured.
 Groups with mixed upstream settings try their remaining configured resolvers for
 a complete successful or negative reply before returning a truncated answer.
@@ -2003,8 +1929,9 @@ root dot and lowercases ASCII without changing the dial target.
 
 ### Local Rule Sources
 
-Declare an action-free `rule_group` containing file paths, or load a file inline
-under `masks`. Sources are read and compiled during validation, including `--dry-run`,
+Declare an action-free `rule_source_group` containing matching expressions and file
+paths, or load a file inline under `masks` or alongside `action`. Sources are read
+and compiled during validation, including `--dry-run`,
 before a reload stops existing listeners. Invalid sources reject the candidate.
 Automatic reload watches imported files as well as configs. A parseable rejected
 candidate keeps its source paths watched, so creating or repairing a missing file
@@ -2015,18 +1942,24 @@ Established connections retain their original rules until they drain. New routin
 caches belong to the new configuration; Fake DNS pools are preserved separately.
 
 ```yaml
-- rule_group: blocked
+- rule_source_group: blocked
   rules:
     - lists/domains.srs
     - path: lists/addresses.json
       format: singbox_json
+    - domain_suffix: [ads.example, tracking.example]
+    - all:
+        - domain_suffix: [restricted.example]
+        - destination_port: [443]
 
 - address: "0.0.0.0:1080"
   protocol: {type: socks}
   rules:
-    - masks: {rule_group: blocked}
+    - masks: {rule_source_group: blocked}
       action: block
     - masks: {path: lists/extra.srs}
+      action: block
+    - path: lists/another.srs
       action: block
     - masks:
         - "192.168.0.0/16"
@@ -2042,13 +1975,14 @@ Sources and groups also compose with typed predicates:
 rules:
   - masks:
       all:
-        - rule_group: blocked
+        - rule_source_group: blocked
         - destination_port: [443]
         - not: {path: lists/exceptions.srs}
     action: block
 ```
 
-File groups OR their sources together. A source is a path string inside a group's
+Source groups OR their entries together, including native predicates, `all`,
+`any`, `not`, source-group references, and file sources. A source is a path string inside a group's
 `rules`, or an object with `path` and optional `format`, `behavior`, `code`, and
 `attributes`. Inline sources under `masks` require the object form; a mask string
 is always an IP/CIDR/hostname. For example, `masks: blocked` matches that hostname,
@@ -2087,11 +2021,16 @@ retain their own case flags; only the bounded ASCII Rust regex subset is accepte
 Files are limited to 64 MiB, inflated payloads to 256 MiB, and compilation has a
 512 MiB conservative allocation budget. Each source is limited to 2 million
 entries. Temporary decode/build charges are released between sources; retained
-indexes count toward the generation budget. These are safety ceilings, not a mobile
+indexes count toward the generation budget, including remote indexes retained
+before cache, download, or local-source decoding. Refresh candidates exclude the
+replaced source's old index. The budget excludes old/new generation overlap and
+does not cap process RSS. Reference-expanded predicate visits also have a
+conservative 2 million compilation budget, counting repeated group
+references and caller compositions. These are safety ceilings, not a mobile
 memory guarantee. Runtime regex caches are separate per worker and generation;
 capture tracking is disabled and each lazy-DFA cache is capped at 256 KiB.
 Regex groups accept at most 512 KiB of pattern text, with syntax-proportional
-compilation reserves. Remote URLs and GeoIP `.db` (MMDB) files are not supported;
+compilation reserves. GeoIP `.db` (MMDB) files are not supported;
 use country SRS files from sing-geoip instead.
 
 Mihomo providers use `format: mihomo_yaml` (a `payload` string list),
@@ -2173,18 +2112,197 @@ rules:
       client_chain: my-upstream  # Reference by name
 ```
 
+### Remote Rule Sources
+
+Use `url` to load a remote source. Persistent caching is optional. The same
+source object works in `rule_source_group.rules`, under `masks` (including
+`all`/`any`/`not`), or flat alongside `action` in a policy group's rules, a server's
+`rules`, or supported `override_rules`. A flat source cannot also specify `masks`.
+
+```yaml
+- global_settings:
+    rule_cache_dir: ./cache
+
+- rule_source_group: regional
+  rules:
+    - url: https://example.net/geoip-cn.srs
+      update_interval: 7d
+      download:
+        client_chain: direct
+        bootstrap_url: system
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: {rule_source_group: regional}
+      action: block
+    - url: https://example.net/blocked.json
+      download:
+        client_chain:
+          address: "proxy.example.net:1080"
+          protocol: {type: socks}
+        bootstrap_url: system
+      action: block
+    - masks: {any_destination: true}
+      action: allow
+```
+
+Replace `proxy.example.net:1080` with your proxy address. `download.client_chain` accepts
+the existing chain, pool, inline-client, and group syntax. It is independent of
+the outer policy's `client_chain`, which routes matched traffic. Both
+`download.client_chain` and `download.bootstrap_url` are required. Bootstrap may
+be `system`, an IP-based DNS URL, or a named DNS group. Target and proxy hostnames
+use this resolver; failed refresh routing never falls back to direct. Automatic
+refresh uses the active generation's DNS, proxy clients, and selector choices.
+
+All runtime remote sources use compiled rules retained in memory, including when
+disk caching is enabled. Reloads reuse sources whose URL and decoding options
+are unchanged; runtime compilation never falls back to cache files.
+Omit `global_settings.rule_cache_dir` to disable persistence. Shoes downloads required sources
+before starting listeners. Periodic refresh still applies;
+failed downloads or rejected candidates leave the active rules unchanged. No
+cache, lock, staging, or temporary files are created. Download buffers are released
+after validation and optional cache saving; byte-identical refreshes do not recompile the rules.
+A cold start requires network access; a remote outage prevents startup when
+there is no persistent cache. `check` and `--dry-run` remain offline and cannot
+validate memory-only remote sources. Local file sources still require `path`.
+
+`global_settings.rule_cache_dir` enables best-effort persistence in one private managed directory
+across all config files. Valid downloads remain usable even when saving fails.
+Cache-save failures are logged; the next successful download retries saving,
+including byte-identical downloads. Until a save succeeds, a restart may restore
+older cached rules or require network access.
+Use persistent caching on routers that must restart while the origin is unavailable.
+Its value is relative to the declaring file and fixed for the process lifetime:
+adding, changing, or removing it requires a restart, even without remote sources.
+Remote `path` is optional: when omitted, Shoes generates a stable filename from
+the URL and decoding options. Explicit remote paths require `rule_cache_dir` and
+must be direct children of that directory. Configuration, local
+rule sources (including aliases), PEMs, sockets, and other state must be outside
+it. ACME state directories cannot contain or be contained by the cache directory.
+On Linux, `/run/shoes` is reserved for managed-TUN ownership and recovery files;
+use a separate cache directory, such as `/run/shoes/rule-cache`, instead.
+The directory must be owned by the running user and not group- or world-writable
+(for example, create it with `install -d -m 700 cache`). Cache files must be owned,
+regular, singly linked, not group- or world-writable, and have no setuid, setgid,
+or sticky mode bits. Symlinks in any path component
+and `..` traversal are rejected. `owner.lock`, `.shoes-update.lock`, and
+`.shoes-update.tmp` sidecars are reserved. The daemon holds an exclusive directory
+lease; another daemon cannot use the same directory concurrently.
+Replacing the directory or `owner.lock` invalidates the lease; subsequent runtime
+cache reads and writes are rejected until restart, without acquiring a replacement
+lease. Retained rules, downloads, and configuration reloads can continue in memory.
+Identical declarations sharing a cache are deduplicated;
+conflicting declarations are rejected. Local-only file sources are unchanged.
+
+`format` remains optional: explicit override, recognized SRS/MRS signature, URL
+pathname extension (ignoring query), then cache-path extension. All local decoders
+are supported; DAT still needs explicit format/code, and Mihomo YAML/text needs
+behavior. Invalid decoding never retries a different format.
+
+`update_interval` defaults to `24h`; use a positive integer with `s`, `m`, `h`, or
+`d`, from `1s` through `365d`. Daemon startup restores valid cached sources into
+memory. Missing, unreadable, invalid, or empty cached sources are fetched through
+their configured download routes before preparing candidate listeners. Unsafe
+files are never read or replaced; a fresh download may still run in memory.
+Initial directory creation and exclusive lease acquisition must succeed when
+`rule_cache_dir` is configured. Reloads prefer retained rules, so removing or editing
+a cache does not force a refetch. Changing a retained source's URL or decoding
+options fetches a new source instead of reusing its old cache.
+`check` and `--dry-run` stay strictly offline: no fetching, directory
+creation, leases, or installation. They fail for missing or invalid caches; run
+the daemon to populate missing files.
+
+Bootstrap downloads support built-in `direct`, inline TCP proxy chains and
+pools, and normal outbound TLS settings with inline, named, or file-backed PEMs.
+Its `bootstrap_url` must be `system` or a literal-IP `udp://`, `tcp://`, `tls://`,
+or `https://` DNS URL. Target and proxy hostnames use that resolver. Every pool
+member must be supported. User-defined named client groups (including ordinary
+round-robin groups), selectors, URL-test groups, named DNS groups, WireGuard,
+QUIC proxy transports, and H3 DNS are unsupported for bootstrap. A DNS group
+named `system` is still a named group, not the built-in resolver. No failed or
+unsupported route falls back to direct TCP or system DNS. Literal bootstrap DNS
+URLs keep their existing direct routing semantics; OS VPN/TUN routing still applies.
+
+These restrictions apply whenever a source must be downloaded during startup or
+reload, including every memory-only source on a cold start. With usable caches or
+retained in-memory sources, preparation accepts the normal refresh routes,
+including dynamic client and named DNS
+groups. Populate such caches externally, or bootstrap with a supported route
+before switching to a runtime-dependent route. Bootstrap must not depend on this
+instance's own listeners; indirect dependencies can fail at the download deadline.
+Candidate and retained Fake-IP ranges remain excluded from download destinations,
+proxy hops, and bootstrap DNS.
+
+When configured, startup creates the final cache directory if missing, then acquires its lease.
+The parent directory must already exist. Creation respects the process umask and
+never repairs permissions. If owner access is missing, create the directory with
+`install -d -m 700 cache` before starting. Reload reuses the lease and does not
+recreate a removed root.
+
+Declarations and all required bootstrap routes are preflighted before fetching.
+Sources are downloaded and decoder-validated serially, retained in memory, and
+optionally saved to disk, then the complete configuration is compiled normally.
+A failed startup exits before serving; a failed reload retains the active generation.
+Earlier completed saves remain if a later download, configuration check, or activation fails. This is a
+per-file repair, not a multi-file disk transaction or a promise of activation.
+
+The process refreshes due sources serially, with 10% jitter and capped exponential
+failure backoff. Downloaded sources pass Shoes' actual decoders, compilation budgets,
+and validation against the active configuration snapshot before replacing retained
+rules. Persistent and nonpersistent sources use this same validation path.
+The initial due time is based on a restored cache's mtime or the initial download
+time; future mtimes are treated as due.
+Successful check times are remembered only in memory. On a cold start, an explicit
+cache path does not record the URL it came from; use a new cache name when changing
+the URL between process lifetimes if immediate replacement is required.
+Download or validation failures retain the last-good rules and cache.
+Identical downloads reuse compiled rules and do not reload; identical cached bytes
+preserve inode/mtime. Each file replacement is atomic, not a multi-file transaction.
+A post-rename directory-sync failure reports uncertain durability without rejecting
+the update. New flows use the reloaded rules; existing flows retain
+their previous configuration. Reload/removal/shutdown cancels in-flight refreshes.
+`--no-reload` disables filesystem-triggered reloads, not configured remote refresh.
+Managed caches are excluded from generic filesystem watching. An automatic changed
+source requests one immediate reload; external cache edits are read only after restart,
+not on SIGHUP. Use local file sources for externally managed live rule updates.
+Reload reads the configuration files, including any unrelated edits. If activation
+fails, the validated replacement remains available in memory while old rules remain
+active. Correct the configuration and reload explicitly; a later byte-identical fetch does not retry
+activation. Atomic installation does not provide a disk/activation or power-loss
+transaction.
+Bulk file reads, writes, and synchronization run off the forwarding executor.
+Filesystem work already submitted may finish after cancellation, holding its
+update lock until cleanup; it cannot publish an abandoned pre-rename update.
+The final ownership check and atomic rename remain one synchronous publication step.
+
+HTTPS verifies certificates. An explicit `http://` URL permits cleartext. Redirects,
+URL credentials/fragments, HTTP content compression, and trailers are rejected.
+Chunked and close-delimited bodies are accepted within the same limits: 64 MiB
+download, 64 headers/32 KiB, 10-second connect/DNS/TLS and header/body-idle deadlines,
+and a 120-second total download deadline. Decoder-specific decompression limits
+still apply. A truncated close-delimited cleartext response can be indistinguishable
+from a shorter valid rule list; prefer HTTPS. Logs report
+actual updated/unchanged/failed results without URL query values or downloaded data.
+
+Remote refresh currently requires the Unix process runtime. FFI startup and
+WireGuard-dependent download/bootstrap routes reject it explicitly. It does not
+add proxy subscriptions, dynamic provider groups, or provider API endpoints.
+
 ### Rule Group
 
-A group contains either ordered policies or action-free file sources. Member shape
-determines its kind: objects with `masks` are policies, even when `action` is
-omitted; paths and `{path: ...}` objects are sources. Empty groups and mixed kinds
-are rejected. Both kinds share one namespace, including built-in names. `rule` is
+A `rule_group` contains ordered policies; omitted `action` still means `allow`.
+A `rule_source_group` contains action-free matching expressions and file sources.
+The declaration determines the kind, never the presence of an action. Empty
+groups are rejected. Both kinds share one namespace, including built-in names. `rule` is
 an alias for `rules`; either accepts one item directly or a nonempty list.
 
 Policy groups are referenced from `rules` or `override_rules`, preserving order,
 actions, and routing options. Source groups are referenced only with
-`masks: {rule_group: name}`, with the caller's action. Cross-kind references are
-errors: actions are never discarded or invented. Group nesting is not supported.
+`masks: {rule_source_group: name}`, with the caller's action. Cross-kind references are
+errors: actions are never discarded or invented. Source groups can reference
+other source groups; cycles and excessive nesting are rejected. Policy groups
+cannot reference other policy groups.
 
 ```yaml
 - rule_group: standard-rules
@@ -2518,7 +2636,7 @@ client_chain:
 
 ### QUIC Socket Buffers
 
-`global_limits.quic_socket_buffer` requests the UDP receive and send buffer size
+`global_settings.quic_socket_buffer` requests the UDP receive and send buffer size
 for each QUIC listener, outbound QUIC proxy endpoint and DNS-over-HTTP/3 socket.
 It defaults to **8388608 bytes (8 MiB)**; allowed values are 65536 through
 16777216 bytes. This is per socket, not per QUIC connection, and is separate
@@ -2526,7 +2644,7 @@ from QUIC flow-control windows and userspace buffer admission limits. Ordinary
 UDP forwarding sockets keep their existing buffer sizes.
 
 ```yaml
-- global_limits:
+- global_settings:
     quic_socket_buffer: 8388608
 ```
 
@@ -2579,7 +2697,7 @@ configuration, including control state, resource limits, DNS ownership, and
 certificate workers. A successful rollback keeps the process running; if rollback
 also fails, Shoes exits with status 1 rather than serving a partial generation.
 Existing TCP connections begin draining when their old listeners retire, for up
-to `global_limits.reload_grace_secs`. That deadline still applies after rollback.
+to `global_settings.reload_grace_secs`. That deadline still applies after rollback.
 TUN, WireGuard, and QUIC services are stopped and restarted; their existing
 sessions are not migrated or restored by rollback.
 
@@ -2589,7 +2707,7 @@ They rotate live without replacing listeners or closing QUIC connections; see
 
 QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. If the previous generation's sockets do not retire within the five-second socket-release guard, Shoes exits with an error rather than announcing a partially ready generation.
 
-Candidate QUIC buffer sizes are used during DNS preparation, but `global_limits` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.
+Candidate QUIC buffer sizes are used during DNS preparation, but `global_settings` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.
 
 On macOS, edit the configured file path or use SIGHUP when writing through a hard-link alias in another directory. Automatic detection of such alias writes is backend-dependent. System-volume directory symlinks are resolved without watching their immutable links.
 

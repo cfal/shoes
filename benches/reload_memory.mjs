@@ -151,14 +151,14 @@ async function main() {
   reservation.close();
   await once(reservation, 'close');
   const config = [
-    { global_limits: { reload_grace_secs: 60 } },
-    { rule_group: 'imported', rules: [
+    { global_settings: { reload_grace_secs: 60 } },
+    { rule_source_group: 'imported', rules: [
       { path: path.resolve(domains), format: 'mihomo_yaml', behavior: 'domain' },
       path.resolve(cn),
       path.resolve(us),
     ] },
     { address: `0.0.0.0:${port}`, protocol: { type: 'forward', target: `127.0.0.1:${echoes[0].address().port}` },
-      rules: [{ masks: { rule_group: 'imported' }, action: 'block' },
+      rules: [{ masks: { rule_source_group: 'imported' }, action: 'block' },
         { masks: { any_destination: true }, action: 'allow' }] },
   ];
   const configPath = path.join(directory, 'reload.json');

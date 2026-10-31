@@ -14,18 +14,34 @@ async fn nested_parse_errors_include_source_and_field_context_without_credential
 "#;
     for (entry, context) in [
         (
-            r#"- rule_group: imported
+            r#"- rule_source_group: imported
   rules:
     - path: [VALUE_SECRET_SENTINEL]
 "#,
             "rules[0]",
         ),
         (
-            r#"- rule_group: imported
+            r#"- rule_source_group: imported
   rules:
     - first.srs
     - path: second.srs
       unsupported_policy: VALUE_SECRET_SENTINEL
+"#,
+            "rules[1]",
+        ),
+        (
+            r#"- rule_source_group: imported
+  rules:
+    path: second.srs
+    unsupported_policy: VALUE_SECRET_SENTINEL
+"#,
+            "rules:",
+        ),
+        (
+            r#"- rule_group: policy
+  rules:
+    - masks: example.com
+    - action: [VALUE_SECRET_SENTINEL]
 "#,
             "rules[1]",
         ),
@@ -37,7 +53,7 @@ async fn nested_parse_errors_include_source_and_field_context_without_credential
             "rules:",
         ),
         (
-            r#"- global_limits:
+            r#"- global_settings:
     unsupported_policy: VALUE_SECRET_SENTINEL
 "#,
             "unknown field `unsupported_policy`",
@@ -60,7 +76,7 @@ async fn nested_parse_errors_include_source_and_field_context_without_credential
         ),
     ] {
         std::fs::write(&path, format!("{prefix}{entry}")).unwrap();
-        let Err(error) = load_configs(&vec![path.to_str().unwrap().into()]).await else {
+        let Err(error) = load_configs(&[path.to_str().unwrap().into()]).await else {
             panic!("invalid configuration must reject");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -82,8 +98,8 @@ protocol: {type: socks}"#,
 ---
 []"#,
         "- 42",
-        r#"- global_limits: {}
-  global_limits: {}"#,
+        r#"- global_settings: {}
+  global_settings: {}"#,
         r#"- pem: private
   data: SECRET_SENTINEL
   unsupported_policy: true"#,
@@ -105,8 +121,8 @@ fn loader_preserves_yaml_error_locations() {
     for prefix in ["# lead\n", "---\n", "\n", ""] {
         for invalid in [
             "- address: '127.0.0.1:1080'\n  tcp_settings: [\n",
-            "- global_limits: {}\n  global_limits: {}\n",
-            "- global_limits: {}\n- global_limits: {}\n  global_limits: {}\n",
+            "- global_settings: {}\n  global_settings: {}\n",
+            "- global_settings: {}\n- global_settings: {}\n  global_settings: {}\n",
         ] {
             let yaml = format!("{prefix}{invalid}");
             let Err(expected) = serde_yaml::from_str::<Vec<super::Config>>(&yaml) else {
@@ -126,9 +142,9 @@ fn loader_preserves_yaml_error_locations() {
 
 #[test]
 fn loader_reports_first_invalid_entry_before_decoding_later_entries() {
-    let yaml = r#"- global_limits: {unsupported_policy: true}
-- global_limits: {}
-  global_limits: {}
+    let yaml = r#"- global_settings: {unsupported_policy: true}
+- global_settings: {}
+  global_settings: {}
 "#;
     let Err(error) = parse_config_yaml(yaml) else {
         panic!("invalid configuration must reject");
@@ -170,7 +186,7 @@ async fn representative_examples_pass_native_validation() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples")
             .join(example);
-        let configs = load_configs(&vec![path.to_str().unwrap().into()])
+        let configs = load_configs(&[path.to_str().unwrap().into()])
             .await
             .unwrap_or_else(|error| panic!("{example}: {error}"));
         let (configs, _) = convert_cert_paths(configs)

@@ -15,7 +15,6 @@
 
 pub(crate) mod client_visit;
 mod fake_dns;
-pub(crate) mod health;
 mod pem;
 pub(crate) mod rule_visit;
 #[cfg(test)]
@@ -25,10 +24,12 @@ mod validate;
 #[cfg(unix)]
 mod wireguard_devices;
 
-pub(crate) use fake_dns::{tun_endpoint_ips, validate_tun_endpoints};
+pub(crate) use fake_dns::{protects_tun_endpoints, tun_endpoint_ips, validate_tun_endpoints};
 pub use pem::convert_cert_paths;
 pub(crate) use pem::{is_pem_file_path, pem_candidate_dependencies, pem_reload_dependencies};
 pub use types::*;
+#[cfg(unix)]
+pub(crate) use validate::validate_rule_bootstrap;
 pub use validate::{ValidatedConfigs, create_server_configs};
 pub(crate) use validate::{validate_client_vision_protocol, validate_server_vision};
 
@@ -63,7 +64,14 @@ fn parse_config_yaml(config_str: &str) -> Result<Vec<Config>, serde_yaml::Error>
 /// Loads configuration files from the provided paths.
 ///
 /// Reads each file, parses it as YAML, and returns the combined list of configs.
-pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
+pub async fn load_configs(args: &[String]) -> std::io::Result<Vec<Config>> {
+    let mut configs = load_config_files(args).await?;
+    let files: Vec<_> = args.iter().map(std::path::PathBuf::from).collect();
+    crate::rule_set::validate_remote_paths(&mut configs, &files)?;
+    Ok(configs)
+}
+
+pub(crate) async fn load_config_files(args: &[String]) -> std::io::Result<Vec<Config>> {
     let mut all_configs = vec![];
     for config_filename in args {
         let config_bytes = match tokio::fs::read(config_filename).await {
@@ -106,12 +114,25 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
 }
 
 pub async fn compile_configs(configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    compile_configs_with_memory(configs, None).await
+}
+
+pub(crate) async fn compile_configs_with_memory(
+    configs: Vec<Config>,
+    memory: Option<crate::rule_set::MemorySources>,
+) -> std::io::Result<ValidatedConfigs> {
+    blocking_compile(move || validate::create_server_configs_with_memory(configs, memory)).await
+}
+
+pub(crate) async fn blocking_compile<T: Send + 'static>(
+    compile: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
     static COMPILER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let permit = COMPILER.acquire().await.map_err(std::io::Error::other)?;
     tokio::task::spawn_blocking(move || {
         // A canceled caller cannot release the permit while its build is still running.
         let _permit = permit;
-        create_server_configs(configs)
+        compile()
     })
     .await
     .map_err(std::io::Error::other)?

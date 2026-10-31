@@ -6,6 +6,63 @@ use super::{Expression, MAX_DEPTH, invalid};
 use crate::rule_set::RuleSource;
 
 impl Expression {
+    pub(crate) fn check_source_group_depths(
+        groups: &std::collections::HashMap<String, Self>,
+    ) -> io::Result<std::collections::HashMap<String, usize>> {
+        fn height(
+            expression: &Expression,
+            groups: &std::collections::HashMap<String, Expression>,
+            memo: &mut std::collections::HashMap<String, usize>,
+            visiting: &mut std::collections::HashSet<String>,
+            depth: usize,
+        ) -> io::Result<usize> {
+            if depth > MAX_DEPTH {
+                return Err(invalid("rule nesting exceeds 100 levels"));
+            }
+            let height = match expression {
+                Expression::RuleSourceGroup(name) => {
+                    if let Some(height) = memo.get(name) {
+                        *height
+                    } else if let Some(expression) = groups.get(name) {
+                        if !visiting.insert(name.clone()) {
+                            return Err(invalid(format!("cyclic rule source group: {name}")));
+                        }
+                        let result = 1 + height(expression, groups, memo, visiting, depth + 1)?;
+                        visiting.remove(name);
+                        memo.insert(name.clone(), result);
+                        result
+                    } else {
+                        0
+                    }
+                }
+                Expression::All(children) | Expression::Any(children) => {
+                    let mut max = 0;
+                    for child in children {
+                        max = max.max(1 + height(child, groups, memo, visiting, depth + 1)?);
+                    }
+                    max
+                }
+                Expression::Not(child) => 1 + height(child, groups, memo, visiting, depth + 1)?,
+                _ => 0,
+            };
+            if depth + height > MAX_DEPTH {
+                return Err(invalid("rule nesting exceeds 100 levels"));
+            }
+            Ok(height)
+        }
+        let mut memo = std::collections::HashMap::new();
+        for name in groups.keys() {
+            height(
+                &Self::RuleSourceGroup(name.clone()),
+                groups,
+                &mut memo,
+                &mut std::collections::HashSet::new(),
+                0,
+            )?;
+        }
+        Ok(memo)
+    }
+
     pub(crate) fn from_config(value: Value) -> io::Result<Self> {
         Self::parse_config(value, 0)
     }
@@ -25,7 +82,7 @@ impl Expression {
                 }
                 Self::parse_children(values, depth).map(Self::Any)
             }
-            Value::Object(fields) if fields.contains_key("path") => {
+            Value::Object(fields) if fields.contains_key("path") || fields.contains_key("url") => {
                 decode(Value::Object(fields)).map(Self::Source)
             }
             Value::Object(fields) => {
@@ -46,7 +103,10 @@ impl Expression {
                     "ip_cidr" => decode(value).map(Self::IpCidr),
                     "destination_port" => decode(value).map(Self::DestinationPort),
                     "destination_port_range" => decode(value).map(Self::DestinationPortRange),
-                    "rule_group" => decode(value).map(Self::RuleGroup),
+                    "rule_source_group" => decode(value).map(Self::RuleSourceGroup),
+                    "rule_group" => Err(invalid(
+                        "masks rule_group was renamed; use masks: {rule_source_group: name} and declare the group with rule_source_group",
+                    )),
                     "all" => Self::parse_children(decode(value)?, depth).map(Self::All),
                     "any" => Self::parse_children(decode(value)?, depth).map(Self::Any),
                     "not" => Self::parse_config(value, depth + 1).map(|p| Self::Not(Box::new(p))),

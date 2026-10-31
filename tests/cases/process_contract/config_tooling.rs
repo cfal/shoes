@@ -9,6 +9,32 @@ fn diagnostic_contains_path(diagnostic: &str, path: &Path) -> bool {
 }
 
 #[test]
+fn legacy_global_limits_warns_but_canonical_settings_do_not() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("settings.yaml");
+    let warning =
+        "global_limits will be deprecated in the next version; rename it to global_settings";
+    for name in ["global_settings", "global_limits"] {
+        std::fs::write(&path, format!("- {name}: {{max_connections: 42}}\n")).unwrap();
+        for mode in ["check", "--dry-run"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .env("RUST_LOG", "warn")
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{diagnostic}");
+            assert_eq!(
+                diagnostic.contains(warning),
+                name == "global_limits",
+                "{diagnostic}"
+            );
+        }
+    }
+}
+
+#[test]
 fn check_diagnostic_paths_accept_display_and_debug_formats() {
     for path in [
         r"C:\tmp\nested.yaml",
@@ -40,7 +66,7 @@ fn check_diagnostics_include_file_and_nested_context_without_credentials() {
     );
     for (config, context) in [
         (
-            r#"- rule_group: imported
+            r#"- rule_source_group: imported
   rules:
     - first.srs
     - path: [VALUE_SECRET_SENTINEL]
@@ -48,7 +74,7 @@ fn check_diagnostics_include_file_and_nested_context_without_credentials() {
             "rules[1]",
         ),
         (
-            r#"- global_limits: {unsupported_policy: VALUE_SECRET_SENTINEL}
+            r#"- global_settings: {unsupported_policy: VALUE_SECRET_SENTINEL}
 "#,
             "unknown field `unsupported_policy`",
         ),
@@ -69,9 +95,9 @@ fn check_diagnostics_include_file_and_nested_context_without_credentials() {
         (
             r#"- clash_api_address: '127.0.0.1:9090'
   secret: CONTROLLER_SECRET_SENTINEL
-- global_limits: {max_connections: 0}
+- global_settings: {max_connections: 0}
 "#,
-            "global_limits.max_connections",
+            "global_settings.max_connections",
         ),
         (
             r#"- address: '127.0.0.1:1080'
@@ -107,6 +133,48 @@ fn check_diagnostics_include_file_and_nested_context_without_credentials() {
             assert!(diagnostic.contains(context), "{diagnostic}");
             assert!(!diagnostic.contains("SECRET_SENTINEL"), "{diagnostic}");
             assert!(!diagnostic.contains("Servers ready"), "{diagnostic}");
+        }
+    }
+}
+
+#[test]
+fn removed_fallback_groups_fail_before_runtime_side_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("removed.yaml");
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    upstream.set_nonblocking(true).unwrap();
+    let base = serde_json::json!([
+        {"cache_file_path": directory.path().join("selectors.db")},
+        {"address": occupied.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+        {"client_group": "removed", "type": "fallback", "client_proxies": ["direct"]}
+    ]);
+    for check in [
+        None,
+        Some(serde_json::json!({
+            "url": format!("http://{}/", upstream.local_addr().unwrap()),
+            "interval_secs": 1
+        })),
+    ] {
+        let mut config = base.clone();
+        let expected = if let Some(check) = check {
+            config[2]["health_check"] = check;
+            "unknown field `health_check`"
+        } else {
+            "unknown client group type: fallback"
+        };
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        for mode in ["check", "--dry-run", "--no-reload"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{mode}: {diagnostic}");
+            assert!(diagnostic.contains(expected), "{mode}: {diagnostic}");
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+            assert_eq!(upstream.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
         }
     }
 }

@@ -10,6 +10,14 @@ pub(crate) fn watch<P: AsRef<Path>>(
     paths: &[P],
     tx: mpsc::Sender<()>,
 ) -> io::Result<RecommendedWatcher> {
+    watch_excluding(paths, tx, None)
+}
+
+pub(crate) fn watch_excluding<P: AsRef<Path>>(
+    paths: &[P],
+    tx: mpsc::Sender<()>,
+    excluded: Option<&Path>,
+) -> io::Result<RecommendedWatcher> {
     let mut files = HashSet::new();
     let mut required_directories = HashSet::new();
     for path in paths {
@@ -31,6 +39,15 @@ pub(crate) fn watch<P: AsRef<Path>>(
             );
         }
     }
+    let excluded = excluded.map(std::path::absolute).transpose()?;
+    let resolved = excluded
+        .as_ref()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()));
+    let included = |path: &Path| {
+        !excluded.as_ref().is_some_and(|root| path.starts_with(root))
+            && !resolved.as_ref().is_some_and(|root| path.starts_with(root))
+    };
+    files.retain(|path| included(path));
     let required_directories: HashSet<_> = required_directories
         .iter()
         .map(|path| watch_directory(path))
@@ -43,6 +60,7 @@ pub(crate) fn watch<P: AsRef<Path>>(
     let direct_files: HashSet<_> = files
         .iter()
         .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| included(path))
         .filter(|path| path.is_file())
         .collect();
     files.extend(direct_files.iter().cloned());

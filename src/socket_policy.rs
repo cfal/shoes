@@ -11,6 +11,7 @@ struct Policy {
     mark_mask: u32,
     addresses: Vec<ipnetwork::IpNetwork>,
     bootstrap: Arc<dyn Resolver>,
+    bootstrap_endpoints: Vec<std::net::SocketAddr>,
 }
 
 #[cfg(target_os = "linux")]
@@ -27,6 +28,7 @@ impl SocketPolicy {
         mark_mask: u32,
         addresses: Vec<ipnetwork::IpNetwork>,
         bootstrap: Arc<dyn Resolver>,
+        bootstrap_endpoints: Vec<std::net::SocketAddr>,
     ) -> io::Result<Self> {
         let mut current = POLICY.write();
         if current.is_some() {
@@ -47,6 +49,7 @@ impl SocketPolicy {
             mark_mask,
             addresses,
             bootstrap,
+            bootstrap_endpoints,
         });
         Ok(Self(()))
     }
@@ -67,6 +70,16 @@ pub(crate) fn bootstrap() -> Option<Arc<dyn Resolver>> {
         .read()
         .as_ref()
         .map(|policy| policy.bootstrap.clone());
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+pub(crate) fn bootstrap_endpoints() -> Option<Vec<std::net::SocketAddr>> {
+    #[cfg(target_os = "linux")]
+    return POLICY
+        .read()
+        .as_ref()
+        .map(|policy| policy.bootstrap_endpoints.clone());
     #[cfg(not(target_os = "linux"))]
     None
 }
@@ -221,6 +234,7 @@ mod tests {
                 0x60000000,
                 vec!["10.233.0.1/30".parse().unwrap()],
                 Arc::new(Unavailable),
+                vec!["192.0.2.53:53".parse().unwrap()],
             )
         };
         let policy = install().unwrap();

@@ -21,6 +21,7 @@ use crate::config::ConfigSelection;
 pub async fn convert_cert_paths(
     mut all_configs: Vec<Config>,
 ) -> std::io::Result<(Vec<Config>, usize)> {
+    crate::rule_set::validate_remote_paths(&mut all_configs, &[])?;
     crate::certificates::configure(&mut all_configs)?;
     let mut path_pem_names: HashMap<String, String> = HashMap::new();
     let mut data_configs = vec![];
@@ -53,7 +54,7 @@ pub async fn convert_cert_paths(
                 data_configs.push(Config::NamedPem(loaded_config));
             }
             Config::Server(server_config) => {
-                server_configs.push(server_config);
+                server_configs.push(Config::Server(server_config));
             }
             Config::ClientConfigGroup(client_group_config) => {
                 client_group_configs.push(client_group_config);
@@ -72,7 +73,7 @@ pub async fn convert_cert_paths(
     // We do this as a separate step because we can't load the data in an async manner
     // right away due to recursion.
     for config in server_configs.iter_mut() {
-        gather_pem_file_paths_from_server_config(config, &mut collect)?;
+        visit_config_pems(config, &mut collect)?;
     }
 
     for config in client_group_configs.iter_mut() {
@@ -105,9 +106,7 @@ pub async fn convert_cert_paths(
         updated_configs.push(Config::ClientConfigGroup(client_group_config));
     }
 
-    for server_config in server_configs.into_iter() {
-        updated_configs.push(Config::Server(server_config));
-    }
+    updated_configs.append(&mut server_configs);
 
     Ok((updated_configs, load_count))
 }
@@ -189,6 +188,14 @@ fn pem_dependencies(
 }
 
 fn visit_config_pems(config: &mut Config, visitor: &mut PemVisitor<'_>) -> std::io::Result<()> {
+    crate::rule_set::visit_sources(std::slice::from_mut(config), &mut |source| {
+        if let Some(download) = &mut source.download {
+            for hop in download.client_chain.hops.iter_mut() {
+                gather_pem_file_paths_from_chain_hop(hop, visitor);
+            }
+        }
+        Ok(())
+    })?;
     match config {
         Config::Server(server) => gather_pem_file_paths_from_server_config(server, visitor)?,
         Config::ClientConfigGroup(group) => {
@@ -206,10 +213,7 @@ fn visit_config_pems(config: &mut Config, visitor: &mut PemVisitor<'_>) -> std::
             gather_dns_pem_paths(&mut group.dns_servers, visitor);
         }
         Config::RuleConfigGroup(group) => {
-            let super::RuleGroupRules::Policies(rules) = &mut group.rules else {
-                return Ok(());
-            };
-            for rule in rules.iter_mut() {
+            for rule in group.rules.iter_mut() {
                 if let RuleActionConfig::Allow { client_chains, .. } = &mut rule.action {
                     for chain in client_chains.iter_mut() {
                         for hop in chain.hops.iter_mut() {
@@ -587,6 +591,65 @@ mod tests {
             ("  -----BEGIN CERTIFICATE-----\nabc/def", false),
         ] {
             assert_eq!(is_pem_file_path(value), is_path, "{value:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_download_pem_paths_in_server_rules_and_overrides_are_embedded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = certificate.cert.pem();
+        let key = certificate.signing_key.serialize_pem();
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir(&cache_dir).unwrap();
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = cache_dir.join("rules.json");
+        std::fs::write(&cert_path, &cert).unwrap();
+        std::fs::write(&key_path, &key).unwrap();
+        std::fs::write(
+            &cache,
+            r#"{"version":1,"rules":[{"domain":["example.com"]}]}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let rule = json!({
+            "url": "https://remote.invalid/rules.json", "path": cache,
+            "download": {"bootstrap_url": "system", "client_chain": {
+                "address": "127.0.0.1:443", "protocol": {"type": "tls",
+                    "cert": cert_path, "key": key_path, "protocol": {"type": "socks"}}
+            }}, "action": "block"
+        });
+        for override_rule in [false, true] {
+            let server = if override_rule {
+                json!({"address": "127.0.0.1:0", "protocol": {"type": "websocket", "targets": [
+                    {"protocol": {"type": "socks"}, "override_rules": [rule.clone()]}
+                ]}})
+            } else {
+                json!({"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "rules": [rule.clone()]})
+            };
+            let configs = serde_json::from_value(
+                json!([{"global_settings": {"rule_cache_dir": cache_dir}}, server]),
+            )
+            .unwrap();
+            let (configs, loaded) = convert_cert_paths(configs).await.unwrap();
+            assert_eq!(loaded, 2);
+            let validated = crate::config::compile_configs(configs).await.unwrap();
+            let download = validated.remote_rules[0].download.as_ref().unwrap();
+            let ClientChainHop::Single(ConfigSelection::Config(client)) =
+                download.client_chain.hops.iter().next().unwrap()
+            else {
+                panic!("expected inline client")
+            };
+            let ClientProxyConfig::Tls(tls) = &client.protocol else {
+                panic!("expected TLS")
+            };
+            assert_eq!(tls.cert.as_deref(), Some(cert.as_str()));
+            assert_eq!(tls.key.as_deref(), Some(key.as_str()));
         }
     }
 

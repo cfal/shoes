@@ -45,7 +45,9 @@ fn make_spec(url: &str) -> ExpandedDnsSpec {
 }
 
 #[tokio::test]
-async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
+async fn dns_client_chain_resolves_proxy_through_configured_bootstrap() {
+    use hickory_resolver::net::runtime::RuntimeProvider;
+
     #[derive(Debug)]
     struct Bootstrap(tokio::sync::mpsc::UnboundedSender<String>);
     impl Resolver for Bootstrap {
@@ -60,8 +62,6 @@ async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
     let configs = serde_json::from_value(serde_json::json!([
         {
             "client_group": "out",
-            "type": "fallback",
-            "health_check": {"url": "http://192.0.2.1/", "interval_secs": 30},
             "client_proxies": [{
                 "address": "private-proxy.invalid:80",
                 "protocol": {"type": "http"}
@@ -74,15 +74,10 @@ async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
                 "bootstrap_url": "system",
                 "client_chain": "out"
             }]
-        },
-        {
-            "address": "127.0.0.1:0",
-            "protocol": {"type": "socks"},
-            "dns": {"servers": "dns"}
         }
     ]))
     .unwrap();
-    let mut validated = crate::config::create_server_configs(configs).unwrap();
+    let validated = crate::config::create_server_configs(configs).unwrap();
     let (sent, mut calls) = tokio::sync::mpsc::unbounded_channel();
     let mut registry = DnsRegistry::new();
     registry.register("system".into(), Arc::new(Bootstrap(sent)));
@@ -92,17 +87,23 @@ async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
         .find(|group| group.name == "dns")
         .unwrap()
         .specs[0];
-    let (_entry, _plan) = build_entry_and_plan(spec, &registry, &mut FxHashMap::default())
+    let (_, plan) = build_entry_and_plan(spec, &registry, &mut FxHashMap::default())
         .await
         .unwrap();
-    let service = crate::control::health::HealthService::start(
-        validated.catalog.take().unwrap().selection,
-        Arc::new(tokio::sync::Semaphore::new(16)),
-        Vec::new(),
+    let plan = plan.unwrap();
+    let provider = crate::dns::proxy_runtime::ProxyRuntimeProvider::with_bootstrap(
+        plan.chain_group,
+        plan.bootstrap_resolver,
+        Duration::from_secs(2),
     );
-    let result = tokio::time::timeout(Duration::from_millis(200), calls.recv()).await;
-    service.shutdown().await;
-    assert_eq!(result.unwrap().unwrap(), "private-proxy.invalid:80");
+    tokio::select! {
+        result = provider.connect_tcp("192.0.2.53:53".parse().unwrap(), None, None) => {
+            panic!("connection finished before using configured bootstrap: {:?}", result.err());
+        }
+        call = tokio::time::timeout(Duration::from_secs(5), calls.recv()) => {
+            assert_eq!(call.unwrap().unwrap(), "private-proxy.invalid:80");
+        }
+    }
 }
 
 fn fake_groups(enabled: bool) -> Vec<ExpandedDnsGroup> {
@@ -152,6 +153,80 @@ async fn native_cache_policy_distinguishes_implicit_and_explicit_system() {
             vec!["127.0.0.1:443".parse::<std::net::SocketAddr>().unwrap()]
         );
     }
+}
+
+#[tokio::test]
+async fn rule_system_bootstrap_checks_current_and_retained_forbidden_upstreams() {
+    let forbidden: Arc<[IpNetwork]> =
+        Arc::from(["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()]);
+    let guard = DnsRegistry {
+        forbidden: forbidden.clone(),
+        ..DnsRegistry::new()
+    };
+    assert!(
+        guard
+            .rule_bootstrap("system")
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("system DNS")
+    );
+    let mut cached = build_dns_registry(fake_groups(false)).await.unwrap();
+    cached.forbidden = forbidden;
+    for bootstrap in ["system", "fake"] {
+        let error = cached.rule_bootstrap(bootstrap).await.err().unwrap();
+        assert!(
+            error.to_string().contains("system DNS"),
+            "{bootstrap}: {error}"
+        );
+    }
+}
+
+#[test]
+fn system_bootstrap_dependencies_preserve_named_group_precedence() {
+    let mut groups = fake_groups(false);
+    let group = &mut groups[0];
+    let mut known = std::collections::HashMap::from([("system".into(), false)]);
+    group.specs[0] = make_spec("https://upstream.invalid/dns-query");
+    assert!(group_uses_system(group, &known).unwrap());
+    group.specs[0].bootstrap_url = Some("system".into());
+    assert!(!group_uses_system(group, &known).unwrap());
+    known.insert("system".into(), true);
+    assert!(group_uses_system(group, &known).unwrap());
+    group.specs[0] = make_spec("udp://127.0.0.1:53");
+    assert!(!group_uses_system(group, &known).unwrap());
+    group.specs[0].client_chains = vec![
+        serde_json::from_value(serde_json::json!({
+            "address": "proxy.invalid:1080", "protocol": {"type": "socks"}
+        }))
+        .unwrap(),
+    ];
+    assert!(group_uses_system(group, &known).unwrap());
+    group.specs[0].bootstrap_url = Some("udp://127.0.0.1:53".into());
+    assert!(!group_uses_system(group, &known).unwrap());
+    group.specs[0].bootstrap_url = Some("system".into());
+    assert!(group_uses_system(group, &known).unwrap());
+    known.insert("system".into(), false);
+    assert!(!group_uses_system(group, &known).unwrap());
+}
+
+#[tokio::test]
+async fn explicit_proxy_bootstrap_does_not_require_native_dns_preflight() {
+    let mut groups = fake_groups(false);
+    let spec = &mut groups[0].specs[0];
+    spec.url = "tcp://127.0.0.1:53".into();
+    spec.bootstrap_url = Some("udp://127.0.0.1:54".into());
+    spec.client_chains = vec![
+        serde_json::from_value(serde_json::json!({
+            "address": "proxy.invalid:1080", "protocol": {"type": "socks"}
+        }))
+        .unwrap(),
+    ];
+    let mut registry = build_dns_registry(groups).await.unwrap();
+    registry.forbidden = Arc::from(["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()]);
+    assert!(registry.rule_bootstrap("fake").await.is_ok());
+    assert!(registry.rule_bootstrap("system").await.is_err());
 }
 
 #[tokio::test]

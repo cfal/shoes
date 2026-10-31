@@ -29,18 +29,10 @@ impl MemberOrigin {
         self.path.iter().any(|(group, _)| self.manages(group))
     }
 
-    pub(crate) fn has_fallback(&self) -> bool {
-        self.path
-            .iter()
-            .any(|(group, _)| self.selection.health.definitions.contains_key(group))
-    }
-
     pub(crate) fn policy_path(&self) -> Vec<(String, String)> {
         self.path
             .iter()
-            .filter(|(group, _)| {
-                self.manages(group) || self.selection.health.definitions.contains_key(group)
-            })
+            .filter(|(group, _)| self.manages(group))
             .cloned()
             .collect()
     }
@@ -49,14 +41,6 @@ impl MemberOrigin {
         self.path
             .iter()
             .all(|(group, member)| choices.get(group).is_none_or(|selected| selected == member))
-    }
-
-    pub(crate) fn manual_selector_path(&self) -> Vec<(String, String)> {
-        self.path
-            .iter()
-            .filter(|(group, _)| self.selection.definitions().contains_key(group))
-            .cloned()
-            .collect()
     }
 
     pub fn chains(&self) -> impl Iterator<Item = String> + '_ {
@@ -184,11 +168,6 @@ impl Catalog {
             {
                 return Err(invalid("default is only valid for selector groups"));
             }
-            if let Config::ClientConfigGroup(group) = config
-                && let GroupType::Fallback { health_check } = &group.group_type
-            {
-                health_check.validate()?;
-            }
         }
         let enabled = configs.iter().any(|config| match config {
             Config::ClashApi(_) | Config::CacheFile(_) => true,
@@ -272,29 +251,10 @@ impl Catalog {
         }
         let mut definitions = SelectorDefinitions::new();
         let mut automatic = super::url_test::AutomaticGroups::default();
-        let mut fallbacks = std::collections::BTreeMap::new();
         for config in configs.iter() {
             if let Config::ClientConfigGroup(group) = config {
                 let members: Vec<_> = group.client_proxies.iter().map(member_name).collect();
                 match &group.group_type {
-                    GroupType::Fallback { health_check } => {
-                        if members.is_empty()
-                            || members
-                                .iter()
-                                .collect::<std::collections::HashSet<_>>()
-                                .len()
-                                != members.len()
-                        {
-                            return Err(invalid("fallback members must be nonempty and distinct"));
-                        }
-                        fallbacks.insert(
-                            group.client_group.clone(),
-                            super::health::FallbackDefinition {
-                                members: members.clone(),
-                                check: health_check.clone(),
-                            },
-                        );
-                    }
                     GroupType::Selector => {
                         let has_unnamed_member = group.client_proxies.iter().any(|member| {
                             matches!(member, ConfigSelection::Config(client) if client.name.is_none())
@@ -337,7 +297,6 @@ impl Catalog {
         let mut selection = SelectionOwner::new(None)?.prepare(definitions)?;
         let view = Arc::get_mut(&mut selection).unwrap();
         view.automatic = automatic;
-        view.health = super::health::HealthState::new(fallbacks);
         crate::config::client_visit::visit_configs(configs, &mut |client| {
             if let Some(origin) = &mut client.control {
                 origin.selection = selection.clone();
@@ -347,9 +306,15 @@ impl Catalog {
         crate::config::rule_visit::visit(
             configs,
             &mut |rule| {
-                let payload = bounded(
-                    serde_json::to_string(&rule.criteria.expression).map_err(io::Error::other)?,
-                );
+                let mut diagnostic = rule.criteria.expression.clone();
+                diagnostic.visit_sources(&mut |source| {
+                    // Delivery credentials are not part of a rule's diagnostic identity.
+                    source.url = None;
+                    source.download = None;
+                    Ok(())
+                })?;
+                let payload =
+                    bounded(serde_json::to_string(&diagnostic).map_err(io::Error::other)?);
                 rule.criteria.description = Some(Arc::new(RuleDescription {
                     payload,
                     proxy: rule_target(&rule.action),
@@ -572,6 +537,68 @@ mod tests {
                 validated.catalog.unwrap().selection.snapshot()["outbound"],
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn download_client_names_follow_lexical_tls_target_order() {
+        use serde_json::json;
+        let target = |name: &str| {
+            json!({
+                "protocol": {"type": "socks"},
+                "override_rules": [{
+                    "url": "https://remote.invalid/rules.json", "path": format!("/unused/{name}.json"),
+                    "download": {"bootstrap_url": "system", "client_chain": {
+                        "address": format!("{name}:1080"), "protocol": {"type": "socks"}
+                    }},
+                    "action": "block"
+                }]
+            })
+        };
+        let mut protocol = json!({"type": "tls", "default_tls_target": target("default")});
+        let mut ordered = Vec::new();
+        for category in ["tls", "shadowtls", "reality"] {
+            for letter in 'a'..='h' {
+                let name = format!("{category}-{letter}");
+                let mut config = target(&name);
+                if category == "shadowtls" {
+                    config["password"] = json!("test");
+                    config["handshake"] =
+                        json!({"address": "front.invalid:443", "client_chain": "direct"});
+                } else if category == "reality" {
+                    config["private_key"] = json!("test");
+                    config["dest"] = json!("front.invalid:443");
+                }
+                protocol[format!("{category}_targets")][letter.to_string()] = config;
+                ordered.push(format!("{name}:1080"));
+            }
+            if category == "tls" {
+                ordered.push("default:1080".into());
+            }
+        }
+        let config = json!([
+            {"clash_api_address": "127.0.0.1:0", "secret": "test"},
+            {"address": "127.0.0.1:0", "rules": [{"masks": "0.0.0.0/0", "action": "block"}], "protocol": protocol}
+        ]);
+        let expected: Vec<_> = ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| (format!("client-2-{}", index + 1), address))
+            .collect();
+        for _ in 0..16 {
+            let mut configs: Vec<Config> = serde_json::from_value(config.clone()).unwrap();
+            let catalog = Catalog::capture(&mut configs).unwrap().unwrap();
+            let actual: Vec<_> = catalog
+                .nodes
+                .into_iter()
+                .filter_map(|(name, node)| match node {
+                    CatalogNode::Leaf(client) if name != "DIRECT" => {
+                        Some((name, client.address.to_string()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(actual, expected);
         }
     }
 

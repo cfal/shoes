@@ -35,6 +35,8 @@ pub struct ValidatedConfigs {
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
     pub wireguard_endpoints: Vec<super::types::wireguard::WireguardDeviceConfig>,
+    pub(crate) remote_rules: Vec<crate::rule_set::RuleSource>,
+    pub(crate) rule_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl ValidatedConfigs {
@@ -51,16 +53,6 @@ impl ValidatedConfigs {
             ));
         }
         self.control.reject_ffi()?;
-        if self
-            .catalog
-            .as_ref()
-            .is_some_and(|catalog| !catalog.selection.health.definitions.is_empty())
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "fallback groups require the CLI generation lifecycle",
-            ));
-        }
         if self
             .catalog
             .as_ref()
@@ -84,30 +76,33 @@ impl ValidatedConfigs {
 /// - Expands DNS groups (composition, client chains) and validates them
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
-pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    create_server_configs_with_memory(all_configs, None)
+}
+
+pub(super) fn create_server_configs_with_memory(
+    mut all_configs: Vec<Config>,
+    memory: Option<crate::rule_set::MemorySources>,
+) -> std::io::Result<ValidatedConfigs> {
+    crate::rule_set::validate_remote_paths(&mut all_configs, &[])?;
+    let rule_cache_dir = crate::rule_set::cache_directory(&all_configs)?;
     let certificates = crate::certificates::configure(&mut all_configs)?;
     let catalog = crate::control::catalog::Catalog::capture(&mut all_configs)?;
     let mut control = super::ControlConfig::default();
     let mut compiler = crate::rules::Compiler::default();
+    compiler.memory = memory.or_else(|| rule_cache_dir.is_none().then(Default::default));
     let mut reload_files = crate::rule_set::dependencies(&mut all_configs)?;
     reload_files.extend(super::pem_reload_dependencies(&mut all_configs)?);
+    let mut remote_rules = crate::rule_set::normalize_sources(&mut all_configs, &mut compiler)?;
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
         HashMap::new();
-    let mut direct = ClientConfig::default();
-    if let Some(catalog) = &catalog {
-        direct.control = Some(crate::control::catalog::MemberOrigin {
-            name: std::sync::Arc::from("DIRECT"),
-            path: Vec::new(),
-            selection: catalog.selection.clone(),
-        });
-    }
     raw_client_groups.insert(
         String::from("direct"),
-        OneOrSome::One(ConfigSelection::Config(direct)),
+        OneOrSome::One(ConfigSelection::Config(direct_client(catalog.as_ref()))),
     );
 
     let mut rule_groups: HashMap<String, Vec<RuleConfig>> = HashMap::new();
@@ -149,12 +144,13 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
                     ));
                 }
             }
-            Config::CertificateSource(_) => {}
-            Config::GlobalLimits(limits) => {
+            Config::CertificateSource(_) | Config::RuleSourceGroup(_) => {}
+            Config::GlobalSettings(settings) => {
+                let limits = settings.limits;
                 if global_limits.replace(limits).is_some() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "global_limits may only be specified once across all config files",
+                        "global_settings may only be specified once across all config files",
                     ));
                 }
                 limits.validate()?;
@@ -171,11 +167,8 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
                 }
             }
             Config::RuleConfigGroup(group) => {
-                let super::RuleGroupRules::Policies(rules) = group.rules else {
-                    continue;
-                };
                 if rule_groups
-                    .insert(group.rule_group.clone(), rules.into_vec())
+                    .insert(group.rule_group.clone(), group.rules.into_vec())
                     .is_some()
                 {
                     return Err(std::io::Error::new(
@@ -227,8 +220,6 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
         for config in configs.iter_mut() {
             validate_client_config(config, &named_pems, global_limits)?;
         }
-        // Unused groups can still be instantiated by controller and URL-test probes.
-        super::health::validate_chain(std::iter::once(configs.iter()))?;
     }
 
     // Extract inline DNS configs from server/tun configs into dns_groups.
@@ -352,6 +343,14 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
         });
     }
 
+    validate_rule_downloads(
+        &mut remote_rules,
+        &client_groups,
+        &named_pems,
+        &group_names,
+        global_limits,
+    )?;
+
     // Validate server configs (DNS is now just a group reference).
     for config in server_configs.iter_mut() {
         validate_server_config(
@@ -403,6 +402,25 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
         }
     }
 
+    let mut evaluation_work = 0usize;
+    super::rule_visit::visit(
+        &mut result,
+        &mut |rule| {
+            let predicate =
+                rule.criteria.compiled.as_ref().ok_or_else(|| {
+                    crate::rules::invalid("rule is missing its compiled predicate")
+                })?;
+            evaluation_work = evaluation_work.saturating_add(predicate.evaluation_work);
+            if evaluation_work > crate::rules::MAX_ENTRIES {
+                return Err(crate::rules::invalid(
+                    "expanded rule evaluation budget exceeded",
+                ));
+            }
+            Ok(())
+        },
+        &mut |_| Ok(()),
+    )?;
+
     let mut validated = ValidatedConfigs {
         catalog,
         control,
@@ -412,6 +430,8 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
         configs: result,
         dns_groups: final_dns_groups,
         wireguard_endpoints: Vec::new(),
+        remote_rules,
+        rule_cache_dir,
     };
     validate_wireguard_dns(&validated)?;
     #[cfg(unix)]
@@ -428,6 +448,128 @@ pub fn create_server_configs(mut all_configs: Vec<Config>) -> std::io::Result<Va
         }
     }
     Ok(validated)
+}
+
+fn validate_rule_downloads(
+    sources: &mut [crate::rule_set::RuleSource],
+    clients: &HashMap<String, Vec<ClientConfig>>,
+    pems: &HashMap<String, String>,
+    dns_names: &HashSet<&str>,
+    limits: GlobalLimits,
+) -> std::io::Result<()> {
+    for source in sources {
+        let download = source.download.as_mut().expect("remote source checked");
+        validate_client_chain(&mut download.client_chain.hops, 0, clients, pems, limits)?;
+        if chain_uses_wireguard(&download.client_chain) {
+            return Err(crate::rules::invalid(
+                "rule downloads cannot bootstrap through WireGuard devices",
+            ));
+        }
+        if !dns_names.contains(download.bootstrap_url.as_str()) {
+            let parsed = ParsedDnsUrl::parse(&download.bootstrap_url)
+                .map_err(|_| crate::rules::invalid("invalid rule download bootstrap_url"))?;
+            if parsed.has_hostname() {
+                return Err(crate::rules::invalid(
+                    "rule download bootstrap_url requires an IP URL, system, or DNS group",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_rule_bootstrap(
+    configs: &[Config],
+    sources: &mut [crate::rule_set::RuleSource],
+) -> std::io::Result<GlobalLimits> {
+    use crate::rules::invalid;
+
+    let mut limits = None;
+    let mut pems = HashMap::new();
+    let mut dns_names = HashSet::new();
+    for config in configs {
+        match config {
+            Config::GlobalSettings(settings) => {
+                settings.limits.validate()?;
+                if limits.replace(settings.limits).is_some() {
+                    return Err(invalid("global_settings may only be specified once"));
+                }
+            }
+            Config::NamedPem(pem) => {
+                let PemSource::Data(data) = &pem.source else {
+                    return Err(invalid(
+                        "bootstrap PEM paths must be loaded before validation",
+                    ));
+                };
+                if pems.insert(pem.pem.clone(), data.clone()).is_some() {
+                    return Err(invalid("named pem already exists"));
+                }
+            }
+            Config::DnsConfigGroup(group) => {
+                dns_names.insert(group.dns_group.as_str());
+            }
+            Config::ClientConfigGroup(group) if group.client_group == "direct" => {
+                return Err(invalid("client group already exists: direct"));
+            }
+            _ => {}
+        }
+    }
+    let limits = limits.unwrap_or_default();
+    let clients = HashMap::from([("direct".into(), vec![direct_client(None)])]);
+    for source in sources {
+        let result = (|| {
+            let download = source.download.as_mut().expect("remote source checked");
+            if dns_names.contains(download.bootstrap_url.as_str()) {
+                return Err(invalid(
+                    "named DNS groups are not supported for missing-cache bootstrap",
+                ));
+            }
+            let dns = ParsedDnsUrl::parse(&download.bootstrap_url)
+                .map_err(|_| invalid("invalid rule bootstrap_url"))?;
+            if dns.has_hostname() || matches!(dns, ParsedDnsUrl::H3 { .. }) {
+                return Err(invalid(
+                    "missing-cache bootstrap requires system or an IP-based UDP/TCP/TLS/HTTPS DNS URL",
+                ));
+            }
+            for hop in download.client_chain.hops.iter() {
+                for member in hop.selections() {
+                    match member {
+                        ConfigSelection::GroupName(name) if name == "direct" => {}
+                        ConfigSelection::Config(client)
+                            if client.transport == Transport::Tcp
+                                && !client.protocol.is_wireguard()
+                                && client.control.is_none() => {}
+                        _ => {
+                            return Err(invalid(
+                                "missing-cache bootstrap supports only direct and inline TCP clients; named client groups, selectors, WireGuard and QUIC are unsupported",
+                            ));
+                        }
+                    }
+                }
+            }
+            validate_client_chain(&mut download.client_chain.hops, 0, &clients, &pems, limits)
+        })();
+        result.map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("rule bootstrap {}: {error}", source.path.display()),
+            )
+        })?;
+    }
+    Ok(limits)
+}
+
+fn direct_client(catalog: Option<&crate::control::catalog::Catalog>) -> ClientConfig {
+    let mut direct = ClientConfig::default();
+    if let Some(catalog) = catalog {
+        direct.control = Some(crate::control::catalog::MemberOrigin {
+            name: std::sync::Arc::from("DIRECT"),
+            path: Vec::new(),
+            selection: catalog.selection.clone(),
+        });
+    }
+    direct
 }
 
 pub(super) fn refresh_catalog_clients(
@@ -454,6 +596,16 @@ fn validate_wireguard_dns(validated: &ValidatedConfigs) -> std::io::Result<()> {
         })
         .map(|group| group.name.as_str())
         .collect();
+    if validated
+        .remote_rules
+        .iter()
+        .filter_map(|source| source.download.as_ref())
+        .any(|download| tunnel_dns.contains(download.bootstrap_url.as_str()))
+    {
+        return Err(crate::rules::invalid(
+            "rule download bootstrap cannot depend on WireGuard",
+        ));
+    }
     for group in &validated.dns_groups {
         for spec in &group.specs {
             if spec
@@ -2300,7 +2452,6 @@ fn validate_client_chain(
         validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
     }
     expand_client_chain(hops, client_groups)?;
-    super::health::validate_chain(hops.iter().map(super::health::clients))?;
     validate_connector_positions(hops, chain_index)
 }
 
@@ -2321,7 +2472,10 @@ fn validate_connector_positions(
             ));
         }
 
-        for client in super::health::clients(hop) {
+        for selection in hop.selections() {
+            let ConfigSelection::Config(client) = selection else {
+                unreachable!("groups have been expanded");
+            };
             crate::quic_client::validate(client, false)?;
         }
         let unsupported_h3 = |selection: &ConfigSelection<ClientConfig>| {
@@ -2446,33 +2600,6 @@ fn expand_client_chain(
         }
     }
 
-    let is_fallback = |selection: &ConfigSelection<ClientConfig>| match selection {
-        ConfigSelection::Config(client) => client
-            .control
-            .as_ref()
-            .is_some_and(crate::control::catalog::MemberOrigin::has_fallback),
-        ConfigSelection::GroupName(_) => false,
-    };
-    let mut has_fallback = false;
-    let mut path_count = Some(1usize);
-    for hop in &expanded_hops {
-        match hop {
-            ClientChainHop::Single(selection) => has_fallback |= is_fallback(selection),
-            ClientChainHop::Pool(pool) => {
-                path_count = path_count.and_then(|count| count.checked_mul(pool.iter().count()));
-                has_fallback |= pool.iter().any(is_fallback);
-            }
-        }
-    }
-    if has_fallback && path_count.is_none_or(|count| count > crate::control::health::MAX_PATHS) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "fallback exceeds {} concrete chain paths",
-                crate::control::health::MAX_PATHS
-            ),
-        ));
-    }
     *client_chain = if expanded_hops.len() == 1 {
         OneOrSome::One(expanded_hops.into_iter().next().unwrap())
     } else {

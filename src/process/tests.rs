@@ -1,11 +1,115 @@
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn network_reconciliation_does_not_cancel_inflight_refresh() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cache = root.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = cache.join("rules.json");
+        std::fs::write(&path, br#"{"version":1,"rules":[{"domain":["old.example"]}]}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(
+            std::time::SystemTime::UNIX_EPOCH
+        ).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = root.join("config.yaml");
+        std::fs::write(&config, serde_json::json!([
+            {"global_settings": {"rule_cache_dir": cache}},
+            {"address":"127.0.0.1:0", "protocol":{"type":"socks"}, "rules":[{
+                "masks":{"path":path, "url":format!("http://{}/rules.json", listener.local_addr().unwrap()),
+                    "download":{"client_chain":"direct", "bootstrap_url":"system"}, "update_interval":"7d"},
+                "action":"block"
+            }]}
+        ]).to_string()).unwrap();
+        let mut prepared = prepare(&[config.to_str().unwrap().into()], None).await.unwrap();
+        let (events, receiver) = mpsc::channel(1);
+        let (ack, mut reconciled) = mpsc::channel(1);
+        let mut network = crate::desktop::NetworkSession::with_test_events(receiver, ack);
+        let body = br#"{"version":1,"rules":[{"domain":["new.example"]}]}"#;
+        let fixture = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            for _ in 0..3 {
+                events.send(()).await.unwrap();
+                reconciled.recv().await.unwrap();
+            }
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            result = wait_with_reconciliation(remote_rule_change(&mut prepared), &mut network) => result.unwrap(),
+            _ = fixture => unreachable!(),
+        }
+        assert_eq!(std::fs::read(path).unwrap(), body);
+    }).await.unwrap();
+}
+
 async fn load_validated(
     paths: &[String],
-    discovered: &mut (dyn FnMut(&[PathBuf], &[PathBuf]) + Send),
+    discovered: &mut DiscoverDependencies<'_>,
 ) -> io::Result<ValidatedConfigs> {
-    let configs = config::load_configs(&paths.to_vec()).await?;
+    let configs = config::load_config_files(paths).await?;
     validate_configs(paths, configs, discovered).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_reload_retains_a_lost_lease_without_reacquiring_it() {
+    for replace_root in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cache = root.join("cache");
+        let config = root.join("config.yaml");
+        std::fs::write(
+            &config,
+            serde_json::json!([
+                {"global_settings": {"rule_cache_dir": cache}},
+                {"address":"127.0.0.1:0", "protocol":{"type":"socks"}}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let paths = [config.to_str().unwrap().to_owned()];
+        let previous = prepare(&paths, None).await.unwrap();
+        if replace_root {
+            std::fs::rename(&cache, root.join("moved")).unwrap();
+            crate::rule_updater::create_cache_directory(&cache).unwrap();
+        } else {
+            std::fs::remove_file(cache.join("owner.lock")).unwrap();
+        }
+        let _other = crate::rule_updater::cache_lease(&cache).unwrap();
+        let mut lease = previous.cache_lease.clone();
+        let configs = config::load_config_files(&paths).await.unwrap();
+        load_candidate(
+            &paths,
+            configs,
+            &mut |_, _, _| {},
+            true,
+            Some(&previous),
+            &mut lease,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            lease.as_ref().unwrap(),
+            previous.cache_lease.as_ref().unwrap()
+        ));
+        let error = lease.unwrap().check().unwrap_err();
+        assert!(error.to_string().contains("lease lost"), "{error}");
+        load_validated(&paths, &mut |_, _, _| {}).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -20,7 +124,7 @@ async fn validation_errors_preserve_io_kind_and_file_context() {
     std::fs::write(&path, yaml).unwrap();
     let paths = [path.to_str().unwrap().to_owned()];
 
-    let Err(error) = load_validated(&paths, &mut |_, _| {}).await else {
+    let Err(error) = load_validated(&paths, &mut |_, _, _| {}).await else {
         panic!("missing PEM file must reject");
     };
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
@@ -198,10 +302,10 @@ async fn activation_discards_candidate_identity_events_but_preserves_reload_even
         let paths = [config.to_str().unwrap().to_owned()];
         let (tx, mut changes) = mpsc::channel(1);
         let mut watches = ConfigWatches::new(&paths, tx, false).unwrap();
-        let validated = load_validated(&paths, &mut |reload, recovery| {
+        let validated = load_validated(&paths, &mut |reload, recovery, root| {
             assert!(!reload.contains(&cert) && !reload.contains(&key));
             assert!(recovery.contains(&cert) && recovery.contains(&key));
-            watches.discovered(reload, recovery);
+            watches.discovered(reload, recovery, root);
         })
         .await
         .unwrap();
@@ -233,7 +337,11 @@ async fn activation_discards_candidate_identity_events_but_preserves_reload_even
         );
 
         for changed in [&config, &trust] {
-            watches.discovered(std::slice::from_ref(&trust), &[cert.clone(), key.clone()]);
+            watches.discovered(
+                std::slice::from_ref(&trust),
+                &[cert.clone(), key.clone()],
+                None,
+            );
             let contents = std::fs::read(changed).unwrap();
             std::fs::write(changed, contents).unwrap();
             while changes.is_empty() {
@@ -248,6 +356,87 @@ async fn activation_discards_candidate_identity_events_but_preserves_reload_even
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn dependencies_are_discovered_before_the_candidate_reads_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("local.json");
+    let config = dir.path().join("config.yaml");
+    std::fs::write(
+        &source,
+        r#"{"version":1,"rules":[{"domain":["example.com"]}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &config,
+        serde_json::json!([{
+            "address": "127.0.0.1:0", "protocol": {"type": "socks"},
+            "rules": [{"path": source, "action": "block"}]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let paths = [config.to_str().unwrap().to_owned()];
+    let configs = config::load_config_files(&paths).await.unwrap();
+    let error = load_candidate(
+        &paths,
+        configs,
+        &mut |paths, _, _| {
+            assert!(paths.contains(&source));
+            std::fs::write(&source, "invalid").unwrap();
+        },
+        true,
+        None,
+        &mut None,
+        &[],
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("rule source"), "{error}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejected_candidate_and_recovery_watches_exclude_managed_caches() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("cache");
+    std::fs::create_dir(&root).unwrap();
+    let cache = root.join("rules.json");
+    let alias = directory.path().join("alias.json");
+    std::fs::write(&cache, "old").unwrap();
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+    let config = directory.path().join("config.yaml");
+    std::fs::write(&config, "config").unwrap();
+    let (tx, mut changes) = mpsc::channel(1);
+    let mut watches = ConfigWatches::new(&[config.to_str().unwrap().into()], tx, false).unwrap();
+    watches.discovered(
+        std::slice::from_ref(&alias),
+        std::slice::from_ref(&cache),
+        Some(&root),
+    );
+    // FSEvents can deliver fixture-creation events after watch registration.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        std::fs::write(&config, "ready").unwrap();
+        changes.recv().await.unwrap();
+        while tokio::time::timeout(Duration::from_millis(100), watches.changed(&mut changes))
+            .await
+            .is_ok()
+        {}
+    })
+    .await
+    .unwrap();
+    std::fs::write(&cache, "new").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), watches.changed(&mut changes))
+            .await
+            .is_err()
+    );
+    std::fs::write(&config, "changed").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), watches.changed(&mut changes))
+        .await
+        .unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -293,7 +482,7 @@ async fn fake_dns_rejected_reload_keeps_inherited_guards_without_freezing_live_p
         r#"[{"dns_group":"ordinary","dns_servers":"udp://198.18.0.5:53"}]"#,
     )
     .unwrap();
-    load_validated(&paths, &mut |_, _| {}).await.unwrap();
+    load_validated(&paths, &mut |_, _, _| {}).await.unwrap();
     let error = prepare(&paths, Some(&live.dns)).await.err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(
@@ -328,7 +517,7 @@ async fn fake_dns_removed_context_rejects_forwarding_and_override_reload_targets
         }]}),
     ] {
         std::fs::write(&path, json!([server]).to_string()).unwrap();
-        load_validated(&paths, &mut |_, _| {}).await.unwrap();
+        load_validated(&paths, &mut |_, _, _| {}).await.unwrap();
         let error = prepare(&paths, Some(&removed.dns)).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(
@@ -384,7 +573,7 @@ async fn fake_dns_retained_pools_reject_tun_endpoint_reload_collisions() {
                 let mut tun = json!({"device_name":"tun0", "device_fd":42});
                 tun[field] = endpoint.into();
                 std::fs::write(&path, json!([tun]).to_string()).unwrap();
-                load_validated(&paths, &mut |_, _| {}).await.unwrap();
+                load_validated(&paths, &mut |_, _, _| {}).await.unwrap();
                 let result = prepare(&paths, Some(&retained.dns)).await;
                 if allowed {
                     result.unwrap();

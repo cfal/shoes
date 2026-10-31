@@ -121,58 +121,99 @@ client_proxies:
 }
 
 #[test]
-fn rule_group_members_determine_kind_not_action_presence() {
+fn policy_and_source_groups_are_explicit_and_roundtrip() {
     for yaml in [
         "rule_group: policies\nrules: [{masks: example.com}]",
         "rule_group: policies\nrule: {mask: example.com, action: block}",
     ] {
         let group: RuleConfigGroup = serde_yaml::from_str(yaml).unwrap();
-        let RuleGroupRules::Policies(_) = group.rules else {
-            panic!("expected policies")
-        };
+        assert!(group.rules.iter().next().is_some());
         let encoded = serde_yaml::to_string(&group).unwrap();
         let group: RuleConfigGroup = serde_yaml::from_str(&encoded).unwrap();
-        assert!(matches!(group.rules, RuleGroupRules::Policies(_)));
+        assert!(group.rules.iter().next().is_some());
     }
     for yaml in [
-        "rule_group: files\nrules: [a.srs, {path: b, format: srs}]",
-        "rule_group: files\nrule: a.srs",
-        "rule_group: files\nrule: [a.srs, {path: b, format: srs}]",
-        "rule_group: files\nrules: {path: a.txt, behavior: domain}",
+        "rule_source_group: files\nrules: [a.srs, {path: b, format: srs}]",
+        "rule_source_group: files\nrule: a.srs",
+        "rule_source_group: files\nrule: [{domain: [example.com]}, {path: b, format: srs}]",
+        "rule_source_group: files\nrules: {all: [{domain_suffix: [example.com]}, {destination_port: [443]}]}",
     ] {
-        let group: RuleConfigGroup = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(group.rules, RuleGroupRules::Sources(_)));
+        let group: RuleSourceGroup = serde_yaml::from_str(yaml).unwrap();
+        assert!(!group.rules.is_empty());
         let encoded = serde_yaml::to_string(&group).unwrap();
-        let group: RuleConfigGroup = serde_yaml::from_str(&encoded).unwrap();
-        assert!(matches!(group.rules, RuleGroupRules::Sources(_)));
+        let group: RuleSourceGroup = serde_yaml::from_str(&encoded).unwrap();
+        assert!(!group.rules.is_empty());
     }
     for (rules, error) in [
         ("[]", "cannot be empty"),
-        ("[a.srs, {masks: example.com}]", "cannot mix"),
-        ("[{masks: example.com}, {path: a.srs}]", "cannot mix"),
+        ("[a.srs, {masks: example.com}]", "unknown masks field"),
+        (
+            "[{domain: [example.com], action: block}]",
+            "exactly one predicate",
+        ),
         ("[{path: a.srs, action: block}]", "unknown field `action`"),
         ("[{path: a.srs, fromat: srs}]", "unknown field `fromat`"),
-        ("[{rule_group: other}]", "unknown field `rule_group`"),
+        (
+            "[{rule_group: other}]",
+            "use masks: {rule_source_group: name}",
+        ),
     ] {
-        let result =
-            serde_yaml::from_str::<RuleConfigGroup>(&format!("rule_group: x\nrules: {rules}"));
+        let result = serde_yaml::from_str::<RuleSourceGroup>(&format!(
+            "rule_source_group: x\nrules: {rules}"
+        ));
         assert!(result.unwrap_err().to_string().contains(error), "{rules}");
     }
     let error = serde_yaml::from_str::<Config>("rule_set: old\npath: a.srs").unwrap_err();
-    assert!(error.to_string().contains("replaced by rule_group"));
+    assert!(error.to_string().contains("replaced by rule_source_group"));
+}
+
+#[test]
+fn policy_group_errors_preserve_element_details_and_migration_guidance() {
+    for (rules, expected) in [
+        (
+            "[{masks: example.com, acton: block}]",
+            "unknown field `acton`",
+        ),
+        (
+            "{masks: example.com, acton: block}",
+            "unknown field `acton`",
+        ),
+        ("[true]", "a policy rule requires a mapping"),
+        ("[]", "cannot be empty"),
+        (
+            "[a.srs]",
+            "action-free file sources moved to rule_source_group",
+        ),
+        (
+            "a.srs",
+            "action-free file sources moved to rule_source_group",
+        ),
+    ] {
+        let error =
+            serde_yaml::from_str::<Config>(&format!("rule_group: policies\nrules: {rules}"))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(expected), "{rules}: {error}");
+    }
+    let group: RuleConfigGroup =
+        serde_yaml::from_str("rule_group: policies\nrules: [{path: a.srs}]").unwrap();
+    assert!(matches!(
+        group.rules.iter().next().unwrap().action,
+        RuleActionConfig::Allow { .. }
+    ));
 }
 
 #[test]
 fn test_rule_config_group() {
     let original = vec![Config::RuleConfigGroup(RuleConfigGroup {
         rule_group: "test-rule-group".to_string(),
-        rules: RuleGroupRules::Policies(Box::new(OneOrSome::Some(vec![
+        rules: OneOrSome::Some(vec![
             create_test_rule_config(),
             RuleConfig {
                 criteria: Default::default(),
                 action: RuleActionConfig::Block,
             },
-        ]))),
+        ]),
     })];
 
     let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
@@ -183,10 +224,7 @@ fn test_rule_config_group() {
         panic!("Expected rule config group");
     };
     assert_eq!(group.rule_group, "test-rule-group");
-    let RuleGroupRules::Policies(rules) = &group.rules else {
-        panic!("Expected policies");
-    };
-    assert!(matches!(rules.as_ref(), OneOrSome::Some(values) if values.len() == 2));
+    assert!(matches!(&group.rules, OneOrSome::Some(values) if values.len() == 2));
 }
 
 #[test]

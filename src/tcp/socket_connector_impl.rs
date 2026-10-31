@@ -56,6 +56,17 @@ fn interleave_tcp_addresses(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
 
 pub(crate) async fn connect_tcp_candidates<T, F>(
     addresses: Vec<SocketAddr>,
+    connect: impl FnMut(SocketAddr) -> std::io::Result<F>,
+) -> std::io::Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    connect_tcp_candidates_bounded(addresses, None, connect).await
+}
+
+pub(crate) async fn connect_tcp_candidates_bounded<T, F>(
+    addresses: Vec<SocketAddr>,
+    extra_attempts: Option<&tokio::sync::Semaphore>,
     mut connect: impl FnMut(SocketAddr) -> std::io::Result<F>,
 ) -> std::io::Result<T>
 where
@@ -66,17 +77,24 @@ where
     }
 
     let mut candidates = interleave_tcp_addresses(addresses).into_iter().enumerate();
+    let mut fork_permit = None;
     let mut attempts = FuturesUnordered::new();
     let mut next_launch = tokio::time::Instant::now();
     let mut last_error: Option<(usize, std::io::Error)> = None;
 
     while candidates.len() != 0 || !attempts.is_empty() {
+        let has_active = !attempts.is_empty();
         tokio::select! {
             biased;
-            Some((index, address, result)) = attempts.next(), if !attempts.is_empty() => {
+            Some((index, address, result)) = attempts.next(), if has_active => {
                 match result {
-                    Ok(stream) => return Ok(stream),
+                    Ok(stream) => {
+                        drop(attempts);
+                        return Ok(stream);
+                    }
                     Err(error) => {
+                        // Either completed branch ends the two-attempt fork, freeing its permit.
+                        fork_permit.take();
                         debug!("TCP connect to {address} failed: {error}");
                         if last_error.as_ref().is_none_or(|(previous, _)| index > *previous) {
                             last_error = Some((index, error));
@@ -85,9 +103,18 @@ where
                     }
                 }
             }
-            _ = tokio::time::sleep_until(next_launch),
+            permit = async {
+                tokio::time::sleep_until(next_launch).await;
+                if has_active
+                    && let Some(budget) = extra_attempts
+                {
+                    return budget.acquire().await.map(Some).map_err(std::io::Error::other);
+                }
+                Ok(None)
+            },
                 if candidates.len() != 0 && attempts.len() < MAX_TCP_ATTEMPTS =>
             {
+                fork_permit = permit?;
                 let (index, address) = candidates.next().unwrap();
                 // Socket creation, binding and protection still fail closed.
                 let attempt = connect(address)?;
@@ -1073,6 +1100,82 @@ mod tests {
         assert_eq!(attempts.active.load(Ordering::Relaxed), 2);
         drop(connect);
         assert_eq!(attempts.active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_fallback_recycles_the_fork_when_the_primary_fails() {
+        let budget = tokio::sync::Semaphore::new(1);
+        let attempts = Arc::new(Attempts::default());
+        let start = Instant::now();
+        let winner = connect_tcp_candidates_bounded(addresses(3), Some(&budget), |address| {
+            let guard = attempts.start(address);
+            Ok(async move {
+                let _guard = guard;
+                match address.port() {
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Err(std::io::ErrorKind::ConnectionRefused.into())
+                    }
+                    2 => std::future::pending().await,
+                    _ => Ok(address),
+                }
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(winner.port(), 3);
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+        assert_eq!(attempts.peak.load(Ordering::Relaxed), 2);
+        assert_eq!(attempts.active.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_fallback_keeps_primary_progress_while_waiting_for_capacity() {
+        let budget = tokio::sync::Semaphore::new(1);
+        let held = budget.acquire().await.unwrap();
+        let attempts = Arc::new(Attempts::default());
+        let start = Instant::now();
+        let winner = connect_tcp_candidates_bounded(addresses(2), Some(&budget), |address| {
+            let guard = attempts.start(address);
+            Ok(async move {
+                let _guard = guard;
+                if address.port() == 1 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    return Err(std::io::ErrorKind::ConnectionRefused.into());
+                }
+                Ok(address)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(winner.port(), 2);
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+        assert_eq!(attempts.peak.load(Ordering::Relaxed), 1);
+        assert_eq!(attempts.active.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.available_permits(), 0);
+        drop(held);
+
+        let mut connect = Box::pin(connect_tcp_candidates_bounded(
+            addresses(2),
+            Some(&budget),
+            |address| {
+                let guard = attempts.start(address);
+                Ok(async move {
+                    let _guard = guard;
+                    std::future::pending::<std::io::Result<()>>().await
+                })
+            },
+        ));
+        let held = budget.acquire().await.unwrap();
+        assert!(futures::poll!(&mut connect).is_pending());
+        tokio::time::advance(TCP_FALLBACK_DELAY).await;
+        assert!(futures::poll!(&mut connect).is_pending());
+        assert_eq!(attempts.active.load(Ordering::Relaxed), 1);
+        drop(connect);
+        assert_eq!(attempts.active.load(Ordering::Relaxed), 0);
+        drop(held);
+        assert_eq!(budget.available_permits(), 1);
     }
 
     #[tokio::test(start_paused = true)]

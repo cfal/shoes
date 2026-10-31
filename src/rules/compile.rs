@@ -15,27 +15,40 @@ const MAX_REGEX_MATCHER_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Default)]
 pub struct Compiler {
     pub groups: HashMap<String, Arc<Predicate>>,
+    pub(crate) source_groups: HashMap<String, Expression>,
+    pub(crate) source_group_depths: HashMap<String, usize>,
+    resolving_groups: HashSet<String>,
     pub(crate) policy_groups: HashSet<String>,
     pub(crate) sources: HashMap<crate::rule_set::SourceKey, Arc<Predicate>>,
+    // Some(memory) is authoritative, even when empty: missing sources never fall back to disk.
+    pub(crate) memory: Option<crate::rule_set::MemorySources>,
+    pub(crate) remote_files: HashMap<std::path::PathBuf, Option<crate::rule_set::Format>>,
     bytes: usize,
     entries: usize,
+    evaluation_work: usize,
 }
 
 impl Compiler {
+    pub(crate) fn charged_bytes(&self) -> usize {
+        self.bytes
+    }
+
     // Temporary decode/build costs overlap only within one source. Other sources
     // retain their immutable indexes, not their parser buffers or entry counts.
     pub fn source(
         &mut self,
         decode: impl FnOnce(&mut Self) -> io::Result<Expression>,
     ) -> io::Result<Arc<Predicate>> {
-        let (bytes, entries) = (self.bytes, self.entries);
+        let (bytes, entries, work) = (self.bytes, self.entries, self.evaluation_work);
         self.entries = 0;
+        self.evaluation_work = 0;
         let result = decode(self).and_then(|expression| {
             self.entries = 0;
             self.compile(expression)
         });
         self.bytes = bytes;
         self.entries = entries;
+        self.evaluation_work = work;
         let predicate = result?;
         self.charge(predicate.retained_bytes(), 0)?;
         Ok(predicate)
@@ -57,7 +70,14 @@ impl Compiler {
     }
 
     pub fn compile(&mut self, expression: Expression) -> io::Result<Arc<Predicate>> {
-        self.visit(expression, 0)
+        let predicate = self.visit(expression, 0)?;
+        self.evaluation_work = self
+            .evaluation_work
+            .saturating_add(predicate.evaluation_work);
+        if self.evaluation_work > MAX_ENTRIES {
+            return Err(invalid("expanded rule evaluation budget exceeded"));
+        }
+        Ok(predicate)
     }
 
     fn strings(&mut self, values: &[String]) -> io::Result<()> {
@@ -153,17 +173,31 @@ impl Compiler {
             }
             Expression::Legacy(masks) => return self.legacy(masks.into_vec()),
             Expression::Source(source) => return crate::rule_set::load_source(&source, self),
-            Expression::RuleGroup(name) => {
+            Expression::RuleSourceGroup(name) => {
+                if depth + self.source_group_depths.get(&name).copied().unwrap_or(0) > MAX_DEPTH {
+                    return Err(invalid("rule nesting exceeds 100 levels"));
+                }
                 if self.policy_groups.contains(&name) {
                     return Err(invalid(format!(
                         "rule group '{name}' contains policies with actions; use it in rules, not masks"
                     )));
                 }
-                return self
-                    .groups
-                    .get(&name)
-                    .cloned()
-                    .ok_or_else(|| invalid(format!("unknown rule group: {name}")));
+                if let Some(predicate) = self.groups.get(&name) {
+                    return Ok(predicate.clone());
+                }
+                if !self.resolving_groups.insert(name.clone()) {
+                    return Err(invalid(format!("cyclic rule source group: {name}")));
+                }
+                let expression = self
+                    .source_groups
+                    .remove(&name)
+                    .ok_or_else(|| invalid(format!("unknown rule source group: {name}")))?;
+                let predicate = self.visit(expression, depth + 1).map_err(|error| {
+                    io::Error::new(error.kind(), format!("rule source group {name}: {error}"))
+                })?;
+                self.resolving_groups.remove(&name);
+                self.groups.insert(name, predicate.clone());
+                return Ok(predicate);
             }
             Expression::All(v) => {
                 if v.is_empty() {
@@ -660,7 +694,10 @@ mod tests {
             c.compile(Expression::DomainRegex(vec!["(?=a)".into()]))
                 .is_err()
         );
-        assert!(c.compile(Expression::RuleGroup("missing".into())).is_err());
+        assert!(
+            c.compile(Expression::RuleSourceGroup("missing".into()))
+                .is_err()
+        );
         assert!(c.compile(Expression::All(vec![])).is_err());
         let deep = (0..102).fold(Expression::AnyDestination(true), |e, _| {
             Expression::Not(Box::new(e))

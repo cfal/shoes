@@ -142,7 +142,7 @@ async fn exercise() {
     let occupied = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
     drop((forward_reservation, socks_reservation));
     let config = serde_json::json!([
-        {"global_limits": {"reload_grace_secs": 1, "max_connections": 4, "max_streams": 4}},
+        {"global_settings": {"reload_grace_secs": 1, "max_connections": 4, "max_streams": 4}},
         {"address": format!("0.0.0.0:{forward}"), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo_server.local_addr().port())}},
         {"address": format!("0.0.0.0:{socks}"), "protocol": {"type": "socks"}}
     ]);

@@ -1,4 +1,4 @@
-- rule_group: imported
+- rule_source_group: imported
   rules:
     - ../tests/fixtures/rule_sets/singbox-v2.srs
     - path: ../tests/fixtures/rule_sets/mihomo-domain.txt
@@ -6,7 +6,7 @@
 
 - rule_group: standard
   rules:
-    - masks: {rule_group: imported}
+    - masks: {rule_source_group: imported}
       action: block
     - masks: ["192.168.0.0/16", "internal.example"]
       action: allow

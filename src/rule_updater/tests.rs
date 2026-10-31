@@ -1,0 +1,3362 @@
+use super::install::{FAIL_RENAME, Outcome};
+use super::*;
+use std::fs::{File, Metadata};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+const STAGE_SUFFIX: &str = ".shoes-update.tmp";
+const MAX_HEADERS: usize = 32 * 1024;
+
+fn stamp(m: &Metadata) -> (u64, u64, u64, i64, i64) {
+    (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec())
+}
+
+fn c_name(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)
+}
+
+const VALID: &[u8] = include_bytes!("../../tests/fixtures/rule_sets/singbox.json");
+const OLD: &[u8] = br#"{"version":1,"rules":[{"domain":["old.example"]}]}"#;
+
+async fn bootstrap(
+    configs: Vec<Config>,
+    ranges: &[ipnetwork::IpNetwork],
+) -> io::Result<Vec<Config>> {
+    super::bootstrap(configs, ranges, Default::default(), None)
+        .await
+        .map(|(configs, _)| configs)
+}
+
+async fn refresh_once(
+    source: &RuleSource,
+    configs: &[Config],
+    memory: &mut MemorySources,
+    lease: Option<Arc<CacheLease>>,
+) -> io::Result<bool> {
+    refresh_source(
+        source,
+        configs,
+        memory,
+        &DnsRegistry::new(),
+        GlobalLimits::default(),
+        &mut http::DownloadState::default(),
+        lease,
+    )
+    .await
+}
+
+#[test]
+fn bootstrap_routes_are_inline_tcp_and_preserve_dns_name_precedence() {
+    let dir = directory();
+    let remote = source(
+        "https://example.com/rules.json",
+        &dir.path().join("cache.json"),
+    );
+    let proxy = serde_json::json!({"address": "127.0.0.1:1080", "protocol": {"type": "socks"}});
+    for chain in [
+        serde_json::json!("direct"),
+        proxy.clone(),
+        serde_json::json!([{"pool": ["direct", proxy.clone()]}]),
+    ] {
+        for dns in [
+            "system",
+            "udp://127.0.0.1",
+            "tcp://127.0.0.1",
+            "tls://127.0.0.1",
+            "https://127.0.0.1/dns-query",
+        ] {
+            let mut source = remote.clone();
+            source.download.as_mut().unwrap().client_chain =
+                serde_json::from_value(chain.clone()).unwrap();
+            source.download.as_mut().unwrap().bootstrap_url = dns.into();
+            crate::config::validate_rule_bootstrap(
+                &configs(&source),
+                std::slice::from_mut(&mut source),
+            )
+            .unwrap();
+        }
+    }
+    for chain in [
+        serde_json::json!("named"),
+        serde_json::json!([{"pool": [proxy.clone(), "named"]}]),
+        serde_json::json!({"address": "127.0.0.1:443", "transport": "quic", "protocol": {"type": "socks"}}),
+        serde_json::json!([proxy, "direct"]),
+    ] {
+        let mut source = remote.clone();
+        source.download.as_mut().unwrap().client_chain = serde_json::from_value(chain).unwrap();
+        assert!(
+            crate::config::validate_rule_bootstrap(
+                &configs(&source),
+                std::slice::from_mut(&mut source)
+            )
+            .is_err()
+        );
+    }
+    for dns in ["h3://127.0.0.1", "udp://dns.invalid", "named"] {
+        let mut source = remote.clone();
+        source.download.as_mut().unwrap().bootstrap_url = dns.into();
+        assert!(
+            crate::config::validate_rule_bootstrap(
+                &configs(&source),
+                std::slice::from_mut(&mut source)
+            )
+            .is_err()
+        );
+    }
+    let mut config = configs(&remote);
+    config.push(
+        serde_json::from_value(
+            serde_json::json!({"dns_group": "system", "dns_servers": "tcp://127.0.0.1"}),
+        )
+        .unwrap(),
+    );
+    let error = crate::config::validate_rule_bootstrap(&config, &mut [remote]).unwrap_err();
+    assert!(error.to_string().contains("named DNS"), "{error}");
+}
+
+#[tokio::test]
+async fn bootstrap_refetches_invalid_caches_and_preflights_all_required_routes() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let remote = source(&url, &path);
+    let config = bootstrap(configs(&remote), &[]).await.unwrap();
+    fixture.await.unwrap();
+    crate::config::compile_configs(config).await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
+
+    write_rule(&path, b"DOWNLOADED_SECRET invalid");
+    let mut unsupported = remote.clone();
+    unsupported.download.as_mut().unwrap().bootstrap_url = "named".into();
+    let error = bootstrap(configs(&unsupported), &[])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("invalid rule bootstrap_url"), "{error}");
+    assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"DOWNLOADED_SECRET invalid");
+
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let repaired = source(&url, &path);
+    let (_, memory) = super::bootstrap(configs(&repaired), &[], Default::default(), None)
+        .await
+        .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(memory[&path].digest, blake3::hash(VALID));
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
+
+    std::fs::remove_file(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = source(
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+        &path,
+    );
+    unsupported.url = remote.url.clone();
+    unsupported.path = dir.path().join("second.json");
+    let mut config = configs(&remote);
+    config.extend(configs(&unsupported).into_iter().skip(1));
+    assert!(
+        bootstrap(config, &[])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid rule bootstrap_url")
+    );
+    assert!(!path.exists());
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_budget_counts_retained_cached_and_downloaded_sources_before_saving() {
+    let dir = directory();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+    let cached = source(&url, &dir.path().join("cached.json"));
+    let first = source(&url, &dir.path().join("first.json"));
+    let mut second = source(&url, &dir.path().join("second.yaml"));
+    second.format = Some(crate::rule_set::Format::MihomoYaml);
+    second.behavior = Some(crate::rule_set::Behavior::Domain);
+    let domains: Vec<_> = (0..10_000)
+        .map(|index| format!("{index:05}.{}.example", "x".repeat(48)))
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "rules": [{"domain": domains}]
+    }))
+    .unwrap();
+    let loaded =
+        Arc::new(crate::rule_set::load_memory(&cached, &body, blake3::hash(&body), 0).unwrap());
+    let retained_bytes = loaded.retained_bytes();
+    assert!(retained_bytes > 0);
+    let mut budget = crate::rules::Compiler::default();
+    budget
+        .charge(crate::rule_set::YAML_PARSER_SCRATCH_BYTES, 0)
+        .unwrap();
+    let mut capacity = 0;
+    while budget.charge(retained_bytes, 0).is_ok() {
+        capacity += 1;
+    }
+    assert!((3..1024).contains(&capacity));
+    write_rule(&cached.path, &body);
+    let original = std::fs::metadata(&cached.path).unwrap();
+    let mut sources = vec![cached.clone(), first.clone(), second.clone()];
+    let mut previous = MemorySources::new();
+    // Shared predicates exercise the aggregate limit without allocating 512 MiB.
+    for index in 0..capacity - 1 {
+        let retained = source(&url, &dir.path().join(format!("retained-{index:04}.json")));
+        previous.insert(retained.path.clone(), loaded.clone());
+        sources.push(retained);
+    }
+    let config = vec![
+        cache_config(dir.path().to_path_buf()),
+        Config::RuleSourceGroup(crate::config::RuleSourceGroup {
+            rule_source_group: "remote".into(),
+            rules: sources
+                .into_iter()
+                .map(crate::rules::Expression::Source)
+                .collect(),
+        }),
+    ];
+    let fixture = tokio::spawn(async move {
+        for body in [body.as_slice(), b"payload: [new.example]\n"] {
+            let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            request(&mut stream).await;
+            stream.write_all(&response(200, "", body)).await.unwrap();
+        }
+    });
+    let error = super::bootstrap(config, &[], previous, None)
+        .await
+        .err()
+        .unwrap();
+    fixture.await.unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("download failed Shoes rule validation"),
+        "{error}"
+    );
+    assert_eq!(
+        blake3::hash(&std::fs::read(&first.path).unwrap()),
+        loaded.digest
+    );
+    assert_eq!(
+        stamp(&std::fs::metadata(&cached.path).unwrap()),
+        stamp(&original)
+    );
+    assert!(!second.path.exists());
+    assert!(!stage_path(&second.path).exists());
+    assert!(!dir.path().join("second.yaml.shoes-update.lock").exists());
+}
+
+fn retained_budget_source() -> (RuleSource, Arc<MemorySource>, usize) {
+    let domains: Vec<_> = (0..10_000)
+        .map(|index| format!("{index:05}.{}.example", "x".repeat(48)))
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "rules": [{"domain": domains}]
+    }))
+    .unwrap();
+    let retained = source(
+        "https://retained.invalid/rules.json",
+        Path::new("/unused.json"),
+    );
+    let loaded =
+        Arc::new(crate::rule_set::load_memory(&retained, &body, blake3::hash(&body), 0).unwrap());
+    let bytes = loaded.retained_bytes();
+    assert!((1..crate::rule_set::YAML_PARSER_SCRATCH_BYTES).contains(&bytes));
+    let mut budget = crate::rules::Compiler::default();
+    budget
+        .charge(crate::rule_set::YAML_PARSER_SCRATCH_BYTES, 0)
+        .unwrap();
+    let count = (1..1024)
+        .find(|_| budget.charge(bytes, 0).is_err())
+        .unwrap();
+    (retained, loaded, count)
+}
+
+#[tokio::test]
+async fn remote_decode_scratch_counts_retained_sources_before_cache_or_memory_changes() {
+    let (retained, loaded, count) = retained_budget_source();
+    for mode in ["download", "cache", "refresh"] {
+        let dir = directory();
+        let (url, fixture) = serve(response(200, "", b"payload: [new.example]\n")).await;
+        let mut remote = source(&url, &dir.path().join("a.yaml"));
+        remote.format = Some(crate::rule_set::Format::MihomoYaml);
+        remote.behavior = Some(crate::rule_set::Behavior::Domain);
+        let mut sources = vec![remote.clone()];
+        let mut memory = MemorySources::new();
+        for index in 0..count {
+            let mut source = retained.clone();
+            source.path = dir.path().join(format!("z-{index:04}.json"));
+            memory.insert(source.path.clone(), loaded.clone());
+            sources.push(source);
+        }
+        let configs = vec![
+            cache_config(dir.path().into()),
+            Config::RuleSourceGroup(crate::config::RuleSourceGroup {
+                rule_source_group: "remote".into(),
+                rules: sources
+                    .into_iter()
+                    .map(crate::rules::Expression::Source)
+                    .collect(),
+            }),
+        ];
+        if mode != "download" {
+            write_rule(&remote.path, b"payload: [old.example]\n");
+        }
+        let before = std::fs::metadata(&remote.path).ok().map(|m| stamp(&m));
+        let error = if mode == "refresh" {
+            let previous = load_cached(&remote, None, 0).unwrap();
+            memory.insert(remote.path.clone(), previous.clone());
+            let result = refresh_once(&remote, &configs, &mut memory, None).await;
+            assert!(Arc::ptr_eq(&previous, &memory[&remote.path]));
+            result.unwrap_err()
+        } else {
+            super::bootstrap(configs, &[], memory, None)
+                .await
+                .err()
+                .unwrap()
+        };
+        fixture.await.unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("download failed Shoes rule validation"),
+            "{mode}: {error}"
+        );
+        assert_eq!(
+            std::fs::metadata(&remote.path).ok().map(|m| stamp(&m)),
+            before
+        );
+        if mode != "download" {
+            assert_eq!(
+                std::fs::read(&remote.path).unwrap(),
+                b"payload: [old.example]\n"
+            );
+        }
+        assert!(!stage_path(&remote.path).exists());
+        assert!(!dir.path().join("a.yaml.shoes-update.lock").exists());
+    }
+}
+
+#[tokio::test]
+async fn local_decode_counts_remote_indexes_before_their_first_reference() {
+    let (retained, loaded, count) = retained_budget_source();
+    let dir = directory();
+    let local_dir = directory();
+    let local_path = local_dir.path().join("local.yaml");
+    write_rule(&local_path, b"payload: [local.example]\n");
+    let mut local = RuleSource::from_path(local_path);
+    local.behavior = Some(crate::rule_set::Behavior::Domain);
+
+    for retained_count in [count - 1, count] {
+        let mut memory = MemorySources::new();
+        let mut rules = vec![crate::rules::Expression::Source(local.clone())];
+        for index in 0..retained_count {
+            let mut source = retained.clone();
+            source.path = dir.path().join(format!("remote-{index:04}.json"));
+            memory.insert(source.path.clone(), loaded.clone());
+            // Repeated references must not charge the same source twice.
+            rules.push(crate::rules::Expression::Source(source.clone()));
+            rules.push(crate::rules::Expression::Source(source));
+        }
+        let config = vec![
+            cache_config(dir.path().into()),
+            Config::RuleSourceGroup(crate::config::RuleSourceGroup {
+                rule_source_group: "mixed".into(),
+                rules,
+            }),
+        ];
+        let result = crate::config::compile_configs_with_memory(config, Some(memory)).await;
+        if retained_count == count {
+            let error = result.err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("rule compilation budget exceeded"),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn refresh_decode_excludes_replaced_indexes_and_reuses_identical_bytes_near_budget() {
+    let (retained, loaded, count) = retained_budget_source();
+    let body = b"payload: [new.example]\n";
+    for identical in [false, true] {
+        let dir = directory();
+        let (url, fixture) = serve(response(200, "", body)).await;
+        let mut remote = source(&url, &dir.path().join("rules.yaml"));
+        remote.format = Some(crate::rule_set::Format::MihomoYaml);
+        remote.behavior = Some(crate::rule_set::Behavior::Domain);
+        let old_body = if identical {
+            body.to_vec()
+        } else {
+            let domains: Vec<_> = (0..30_000)
+                .map(|index| format!("{index:05}.{}.example", "x".repeat(48)))
+                .collect();
+            serde_yaml::to_string(&serde_json::json!({"payload": domains}))
+                .unwrap()
+                .into_bytes()
+        };
+        let previous = Arc::new(
+            crate::rule_set::load_memory(&remote, &old_body, blake3::hash(&old_body), 0).unwrap(),
+        );
+        let retained_count = if identical { count } else { count - 1 };
+        let seed = retained_count * loaded.retained_bytes();
+        if !identical {
+            assert!(previous.retained_bytes() > loaded.retained_bytes());
+            assert!(crate::rule_set::load_memory(&remote, body, blake3::hash(body), seed).is_ok());
+        }
+        assert!(
+            crate::rule_set::load_memory(
+                &remote,
+                body,
+                blake3::hash(body),
+                seed + previous.retained_bytes()
+            )
+            .is_err()
+        );
+        let mut memory = MemorySources::from([(remote.path.clone(), previous.clone())]);
+        let mut rules = vec![crate::rules::Expression::Source(remote.clone())];
+        for index in 0..retained_count {
+            let mut source = retained.clone();
+            source.path = dir.path().join(format!("retained-{index:04}.json"));
+            memory.insert(source.path.clone(), loaded.clone());
+            rules.push(crate::rules::Expression::Source(source));
+        }
+        let config = vec![
+            cache_config(dir.path().into()),
+            Config::RuleSourceGroup(crate::config::RuleSourceGroup {
+                rule_source_group: "remote".into(),
+                rules,
+            }),
+        ];
+        assert_eq!(
+            refresh_once(&remote, &config, &mut memory, None)
+                .await
+                .unwrap(),
+            !identical,
+        );
+        fixture.await.unwrap();
+        assert_eq!(Arc::ptr_eq(&previous, &memory[&remote.path]), identical);
+        assert_eq!(memory[&remote.path].digest, blake3::hash(body));
+        // Persistence is retried even when the predicate was reused without decoding.
+        assert_eq!(std::fs::read(&remote.path).unwrap(), body);
+        assert!(!stage_path(&remote.path).exists());
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_can_replace_a_safe_cache_created_while_downloading() {
+    let dir = directory();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+    let first = source(&url, &dir.path().join("first.json"));
+    let second = source(&url, &dir.path().join("second.json"));
+    let mut config = configs(&first);
+    config.extend(configs(&second).into_iter().skip(1));
+    let task = tokio::spawn(bootstrap(config, &[]));
+    let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    request(&mut stream).await;
+    write_rule(&second.path, OLD);
+    stream.write_all(&response(200, "", VALID)).await.unwrap();
+    let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    request(&mut stream).await;
+    stream.write_all(&response(200, "", VALID)).await.unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(std::fs::read(&first.path).unwrap(), VALID);
+    assert_eq!(std::fs::read(&second.path).unwrap(), VALID);
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(!stage_path(&second.path).exists());
+}
+
+#[tokio::test]
+async fn bootstrap_preserves_inline_tls_names_and_loads_local_pems() {
+    let dir = directory();
+    let cache = dir.path().join("cache");
+    install::create_cache_directory(&cache).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["proxy.invalid".into()]).unwrap();
+    let cert_path = dir.path().join("client.pem");
+    std::fs::write(&cert_path, certificate.cert.pem()).unwrap();
+    let mut remote = source(
+        "http://192.0.2.10:8080/rules.json",
+        &cache.join("rules.json"),
+    );
+    remote.download.as_mut().unwrap().client_chain = serde_json::from_value(serde_json::json!({
+        "address": listener.local_addr().unwrap().to_string(),
+        "protocol": {"type": "tls", "sni_hostname": "proxy.invalid", "verify": false,
+            "key": "client-key", "cert": cert_path,
+            "protocol": {"type": "socks"}}
+    }))
+    .unwrap();
+    let mut config = configs(&remote);
+    config.push(
+        serde_json::from_value(serde_json::json!({
+            "pem": "client-key", "data": certificate.signing_key.serialize_pem()
+        }))
+        .unwrap(),
+    );
+    let (config, _) = crate::config::convert_cert_paths(config).await.unwrap();
+    let tls = crate::rustls_config_util::try_create_server_config(
+        certificate.cert.pem().as_bytes(),
+        certificate.signing_key.serialize_pem().as_bytes(),
+        vec![],
+        &[],
+        &[],
+        &Default::default(),
+    )
+    .unwrap();
+    let fixture = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
+            .accept(stream)
+            .await
+            .unwrap();
+        assert_eq!(stream.get_ref().1.server_name(), Some("proxy.invalid"));
+        let connect = socks_connect(&mut stream).await;
+        assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, 10, 31, 144]);
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+        assert!(request(&mut stream).await.contains("host: 192.0.2.10:8080"));
+        stream.write_all(&response(200, "", VALID)).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+    let config = timeout(Duration::from_secs(5), bootstrap(config, &[]))
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.await.unwrap();
+    crate::config::compile_configs(config).await.unwrap();
+    assert_eq!(std::fs::read(&remote.path).unwrap(), VALID);
+}
+
+#[tokio::test]
+async fn bootstrap_preflights_later_synthetic_endpoints_before_any_download() {
+    for guard in ["fake-ip", "retained", "tun"] {
+        for endpoint in ["destination", "proxy", "DNS"] {
+            let dir = directory();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+            let mut first = source(&url, &dir.path().join("first.json"));
+            first.download.as_mut().unwrap().bootstrap_url = "tcp://127.0.0.1:1".into();
+            let mut second = first.clone();
+            second.path = dir.path().join("second.json");
+            match endpoint {
+                "destination" => second.url = Some("http://198.18.0.1/rules.json".into()),
+                "proxy" => {
+                    second.download.as_mut().unwrap().client_chain =
+                        serde_json::from_value(serde_json::json!([{"pool": ["direct", {
+                            "address": "198.18.0.1:1080", "protocol": {"type": "socks"}
+                        }]}]))
+                        .unwrap()
+                }
+                "DNS" => {
+                    second.download.as_mut().unwrap().bootstrap_url = "tcp://198.18.0.1".into()
+                }
+                _ => unreachable!(),
+            }
+            let mut config = configs(&first);
+            config.extend(configs(&second).into_iter().skip(1));
+            let ranges = if guard == "retained" {
+                vec!["198.18.0.0/15".parse().unwrap()]
+            } else {
+                config.push(
+                    serde_json::from_value(if guard == "tun" {
+                        serde_json::json!({
+                            "device_name": "tun-test", "address": "198.18.0.1", "dns_hijack": true
+                        })
+                    } else {
+                        serde_json::json!({
+                            "dns_group": "fake", "dns_servers": "system", "fake_ip": {}
+                        })
+                    })
+                    .unwrap(),
+                );
+                Vec::new()
+            };
+            let error = timeout(Duration::from_secs(3), bootstrap(config, &ranges))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("synthetic"),
+                "{endpoint}: {error}"
+            );
+            assert!(error.to_string().contains("second.json"), "{error}");
+            assert!(!first.path.exists());
+            assert!(!second.path.exists());
+            assert!(
+                timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bootstrap_preflights_managed_system_dns_before_any_download() {
+    const CHILD: &str = "SHOES_BOOTSTRAP_PREFLIGHT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rule_updater::tests::bootstrap_preflights_managed_system_dns_before_any_download",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let dir = directory();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut first = source(
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+        &dir.path().join("first.json"),
+    );
+    first.download.as_mut().unwrap().bootstrap_url = "tcp://192.0.2.53".into();
+    let mut second = first.clone();
+    second.path = dir.path().join("second.json");
+    second.download.as_mut().unwrap().bootstrap_url = "system".into();
+    let mut configs = configs(&first);
+    configs.extend(self::configs(&second).into_iter().skip(1));
+    let endpoints = vec!["198.18.0.53:53".parse().unwrap()];
+    let _policy = crate::socket_policy::SocketPolicy::install(
+        "tun-test".into(),
+        1,
+        1,
+        vec!["10.233.0.1/30".parse().unwrap()],
+        crate::dns::controlled_bootstrap(&endpoints).unwrap(),
+        endpoints,
+    )
+    .unwrap();
+    let error = timeout(
+        Duration::from_secs(3),
+        bootstrap(configs, &["198.18.0.0/15".parse().unwrap()]),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("system DNS endpoint overlaps"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("second.json"), "{error}");
+    assert!(!first.path.exists() && !second.path.exists());
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_retained_synthetic_addresses_before_connecting() {
+    let dir = directory();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source = source(
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+        &dir.path().join("cache.json"),
+    );
+    let error = bootstrap(configs(&source), &["127.0.0.0/8".parse().unwrap()])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("synthetic"), "{error}");
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(!source.path.exists());
+}
+
+#[tokio::test]
+async fn resolved_synthetic_targets_and_downstream_proxies_are_rejected_before_connecting() {
+    #[derive(Debug)]
+    struct Bootstrap {
+        address: std::net::SocketAddr,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::resolver::Resolver for Bootstrap {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.address().to_string(), "synthetic.invalid");
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let address = self.address;
+            Box::pin(async move { Ok(vec![address]) })
+        }
+    }
+    for downstream in [false, true] {
+        let dir = directory();
+        let path = dir.path().join("cache.json");
+        write_rule(&path, OLD);
+        let original = std::fs::metadata(&path).unwrap();
+        let forbidden = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = TcpListener::bind("[::1]:0").await.unwrap();
+        let resolver = Arc::new(Bootstrap {
+            address: forbidden.local_addr().unwrap(),
+            calls: Default::default(),
+        });
+        let url = if downstream {
+            format!("http://{}/rules", first.local_addr().unwrap())
+        } else {
+            format!("http://synthetic.invalid:{}/rules", resolver.address.port())
+        };
+        let mut source = source(&url, &path);
+        let download = source.download.as_mut().unwrap();
+        download.bootstrap_url = "bootstrap".into();
+        if downstream {
+            download.client_chain = serde_json::from_value(serde_json::json!([
+                {"address": first.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+                {"address": format!("synthetic.invalid:{}", resolver.address.port()), "protocol": {"type": "socks"}}
+            ])).unwrap();
+        }
+        let mut dns = DnsRegistry::for_rule_bootstrap(
+            &configs(&source),
+            &["127.0.0.1/32".parse().unwrap()],
+            GlobalLimits::default(),
+        )
+        .unwrap();
+        dns.register("bootstrap".into(), resolver.clone());
+        let error = download_source(
+            &source,
+            None,
+            &dns,
+            GlobalLimits::default(),
+            Limits {
+                connect: Duration::from_secs(1),
+                ..Limits::default()
+            },
+            &mut http::DownloadState::default(),
+            0,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            if downstream {
+                "configured rule download chain failed"
+            } else {
+                "rule download bootstrap lookup failed"
+            }
+        );
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        for listener in [&forbidden, &first] {
+            assert!(
+                timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+        assert_preserved(&path, &original);
+    }
+}
+
+fn directory() -> tempfile::TempDir {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
+fn write_rule(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn cached_sources(sources: &[RuleSource]) -> MemorySources {
+    sources
+        .iter()
+        .map(|source| (source.path.clone(), load_cached(source, None, 0).unwrap()))
+        .collect()
+}
+
+fn source(url: &str, path: &Path) -> RuleSource {
+    let mut source = RuleSource::from_path(path.into());
+    source.url = Some(url.into());
+    source.format = Some(crate::rule_set::Format::SingboxJson);
+    source.download = Some(Box::new(crate::rule_set::Download {
+        client_chain: crate::config::ClientChain::default(),
+        bootstrap_url: "system".into(),
+    }));
+    source
+}
+
+fn cache_config(path: PathBuf) -> Config {
+    Config::GlobalSettings(crate::config::GlobalSettings {
+        rule_cache_dir: Some(path),
+        ..Default::default()
+    })
+}
+
+fn configs(source: &RuleSource) -> Vec<Config> {
+    serde_json::from_value(
+        serde_json::json!([{"global_settings": {"rule_cache_dir": source.path.parent()}}, {
+            "address": "127.0.0.1:0", "protocol": {"type": "socks"},
+            "rules": [{"masks": source, "action": "block"}]
+        }]),
+    )
+    .unwrap()
+}
+
+fn memory_configs(source: &RuleSource) -> Vec<Config> {
+    serde_json::from_value(serde_json::json!([{
+        "address": "127.0.0.1:0", "protocol": {"type": "socks"},
+        "rules": [{"masks": source, "action": "block"}]
+    }]))
+    .unwrap()
+}
+
+fn predicates(validated: &ValidatedConfigs) -> Vec<Arc<crate::rules::Predicate>> {
+    let Config::Server(server) = &validated.configs[0] else {
+        panic!("expected server")
+    };
+    server
+        .rules
+        .iter()
+        .map(|rule| {
+            let crate::config::ConfigSelection::Config(rule) = rule else {
+                panic!("unexpanded rule")
+            };
+            rule.criteria.compiled.as_ref().unwrap().clone()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn memory_bootstrap_reuses_compiled_sources_and_invalidates_changed_urls() {
+    let (url, fixture) = serve(response(200, "", OLD)).await;
+    let remote = source(&url, Path::new(""));
+    let (config, memory) = super::bootstrap(memory_configs(&remote), &[], Default::default(), None)
+        .await
+        .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(memory.len(), 1);
+    let first = memory.values().next().unwrap().clone();
+    let (config, reused) = super::bootstrap(config, &[], memory, None).await.unwrap();
+    assert!(Arc::ptr_eq(&first, reused.values().next().unwrap()));
+    let validated = validate_memory(config.clone(), reused.clone())
+        .await
+        .unwrap();
+    let refresh = Refresh::new(
+        config.clone(),
+        &validated.remote_rules,
+        reused.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(refresh.scheduled[0].due > Instant::now() + Duration::from_secs(23 * 3600));
+
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let changed = source(&url, Path::new(""));
+    let (_, replaced) = super::bootstrap(memory_configs(&changed), &[], reused, None)
+        .await
+        .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(replaced.len(), 1);
+    assert!(!Arc::ptr_eq(&first, replaced.values().next().unwrap()));
+}
+
+#[tokio::test]
+async fn memory_refresh_validates_changed_candidates_without_replacing_on_failure() {
+    for (body, valid_config) in [(OLD, false), (VALID, false), (VALID, true)] {
+        let (url, fixture) = serve(response(200, "", body)).await;
+        let mut config = memory_configs(&source(&url, Path::new("")));
+        let source = crate::rule_set::remote_sources(&mut config)
+            .unwrap()
+            .remove(0);
+        let original =
+            Arc::new(crate::rule_set::load_memory(&source, OLD, blake3::hash(OLD), 0).unwrap());
+        let mut memory = MemorySources::from([(source.path.clone(), original.clone())]);
+        if !valid_config {
+            config.push(
+                serde_json::from_value(serde_json::json!({
+                    "rule_group": "invalid", "rules": [{"masks": {"ip_cidr": ["invalid"]}}]
+                }))
+                .unwrap(),
+            );
+        }
+        let result = refresh_once(&source, &config, &mut memory, None).await;
+        fixture.await.unwrap();
+        if body == OLD {
+            assert!(!result.unwrap());
+        } else if valid_config {
+            assert!(result.unwrap());
+            assert_eq!(
+                memory.get(&source.path).unwrap().digest,
+                blake3::hash(VALID)
+            );
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("whole configuration validation")
+            );
+        }
+        assert_eq!(
+            Arc::ptr_eq(&original, memory.get(&source.path).unwrap()),
+            body == OLD || !valid_config
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_sources_do_not_read_a_replaced_cache_namespace() {
+    let dir = directory();
+    let root = dir.path().join("cache");
+    create_cache_directory(&root).unwrap();
+    let first = source("https://unused.invalid/a.json", &root.join("a.json"));
+    let second = source("https://unused.invalid/b.json", &root.join("b.json"));
+    write_rule(&first.path, OLD);
+    write_rule(&second.path, OLD);
+    let lease = Arc::new(cache_lease(&root).unwrap());
+    let memory = MemorySources::from([
+        (
+            first.path.clone(),
+            load_cached(&first, Some(&lease), 0).unwrap(),
+        ),
+        (
+            second.path.clone(),
+            load_cached(&second, Some(&lease), 0).unwrap(),
+        ),
+    ]);
+    let mut config = configs(&first);
+    config.extend(configs(&second).into_iter().skip(1));
+    let original = validate_memory(config.clone(), memory.clone())
+        .await
+        .unwrap();
+    let moved = dir.path().join("moved");
+    std::fs::rename(&root, &moved).unwrap();
+    create_cache_directory(&root).unwrap();
+    write_rule(&first.path, VALID);
+    write_rule(&second.path, VALID);
+    let _other = cache_lease(&root).unwrap();
+    let (_, reused) = super::bootstrap(config.clone(), &[], memory.clone(), Some(lease.clone()))
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&reused[&second.path], &memory[&second.path]));
+    let validated = validate_memory(config.clone(), reused.clone())
+        .await
+        .unwrap();
+    Refresh::new(
+        config.clone(),
+        &[first.clone(), second.clone()],
+        reused,
+        None,
+        Some(lease.clone()),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(
+        &predicates(&validated)[0],
+        &predicates(&original)[0]
+    ));
+    let error = Install::save(&first.path, OLD.to_vec(), blake3::hash(OLD), Some(lease))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("lease lost"), "{error}");
+    assert_eq!(std::fs::read(&first.path).unwrap(), VALID);
+    assert_eq!(std::fs::read(&second.path).unwrap(), VALID);
+    // Offline checks remain independent of a daemon's runtime lease.
+    crate::config::compile_configs(config).await.unwrap();
+    assert!(!moved.join("a.json.shoes-update.tmp").exists());
+}
+
+#[tokio::test]
+async fn memory_refresh_validates_new_source_and_preserves_other_sources() {
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let first = source("https://unused.invalid/a.json", Path::new(""));
+    let second = source(&url, Path::new(""));
+    let mut config = memory_configs(&first);
+    config.extend(memory_configs(&second));
+    let sources = crate::rule_set::remote_sources(&mut config).unwrap();
+    let first = sources
+        .iter()
+        .find(|source| source.url == first.url)
+        .unwrap();
+    let second = sources
+        .iter()
+        .find(|source| source.url == second.url)
+        .unwrap();
+    let original =
+        Arc::new(crate::rule_set::load_memory(first, OLD, blake3::hash(OLD), 0).unwrap());
+    let mut memory = MemorySources::from([(first.path.clone(), original.clone())]);
+    assert!(
+        refresh_once(second, &config, &mut memory, None)
+            .await
+            .unwrap()
+    );
+    fixture.await.unwrap();
+    assert_eq!(memory.len(), 2);
+    assert!(Arc::ptr_eq(&original, &memory[&first.path]));
+    assert_eq!(memory[&second.path].digest, blake3::hash(VALID));
+}
+
+#[tokio::test]
+async fn pathless_cached_sources_get_stable_names_and_restart_offline() {
+    let dir = directory();
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let remote = source(&url, Path::new(""));
+    let mut config = memory_configs(&remote);
+    config.insert(0, cache_config(dir.path().to_path_buf()));
+    let (config, memory) = super::bootstrap(config, &[], Default::default(), None)
+        .await
+        .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(memory.len(), 1);
+    let mut copy = config.clone();
+    let sources = crate::rule_set::remote_sources(&mut copy).unwrap();
+    assert_eq!(sources[0].path.parent().unwrap(), dir.path());
+    assert_eq!(std::fs::read(&sources[0].path).unwrap(), VALID);
+    assert!(!sources[0].path.to_string_lossy().contains("http"));
+    let (restarted, memory) = super::bootstrap(config, &[], Default::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(memory.len(), 1);
+    crate::config::compile_configs(restarted).await.unwrap();
+}
+
+#[tokio::test]
+async fn cache_save_failure_keeps_validated_rules_and_identical_download_retries_saving() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = source(
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+        &path,
+    );
+    let config = configs(&remote);
+    let mut memory = cached_sources(std::slice::from_ref(&remote));
+    let lease = Arc::new(cache_lease(dir.path()).unwrap());
+    let trap = dir.path().join("untouched");
+    write_rule(&trap, b"untouched");
+    symlink(&trap, stage_path(&path)).unwrap();
+    let fixture = tokio::spawn(async move {
+        for body in [VALID, VALID, b"invalid data".as_slice()] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            request(&mut stream).await;
+            stream.write_all(&response(200, "", body)).await.unwrap();
+        }
+    });
+    assert!(
+        refresh_once(&remote, &config, &mut memory, Some(lease.clone()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(memory[&path].digest, blake3::hash(VALID));
+    assert_eq!(std::fs::read(&path).unwrap(), OLD);
+    assert_eq!(stamp(&std::fs::metadata(&path).unwrap()), stamp(&original));
+    assert_eq!(std::fs::read(&trap).unwrap(), b"untouched");
+    let loaded = memory[&path].clone();
+    std::fs::remove_file(stage_path(&path)).unwrap();
+    assert!(
+        !refresh_once(&remote, &config, &mut memory, Some(lease.clone()))
+            .await
+            .unwrap()
+    );
+    assert!(Arc::ptr_eq(&loaded, &memory[&path]));
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    assert!(
+        refresh_once(&remote, &config, &mut memory, Some(lease.clone()))
+            .await
+            .is_err()
+    );
+    fixture.await.unwrap();
+    assert!(Arc::ptr_eq(&loaded, &memory[&path]));
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    std::fs::remove_file(&path).unwrap();
+    let (_, retained) = super::bootstrap(config, &[], memory, Some(lease))
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&loaded, &retained[&path]));
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn bootstrap_can_use_downloaded_rules_when_the_cache_cannot_be_saved() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    let trap = dir.path().join("untouched");
+    write_rule(&trap, b"untouched");
+    symlink(&trap, stage_path(&path)).unwrap();
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let remote = source(&url, &path);
+    let lease = Arc::new(cache_lease(dir.path()).unwrap());
+    let (config, memory) = super::bootstrap(configs(&remote), &[], Default::default(), Some(lease))
+        .await
+        .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(memory[&path].digest, blake3::hash(VALID));
+    validate_memory(config.clone(), memory).await.unwrap();
+    assert!(crate::config::compile_configs(config).await.is_err());
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&trap).unwrap(), b"untouched");
+    assert!(stage_path(&path).is_symlink());
+}
+
+#[tokio::test]
+async fn refresh_after_lease_loss_updates_only_memory() {
+    for replace_root in [false, true] {
+        let dir = directory();
+        let root = dir.path().join("cache");
+        create_cache_directory(&root).unwrap();
+        let (url, fixture) = serve(response(200, "", VALID)).await;
+        let first = source(&url, &root.join("first.json"));
+        let second = source(
+            "https://unused.invalid/second.json",
+            &root.join("second.json"),
+        );
+        write_rule(&first.path, OLD);
+        write_rule(&second.path, OLD);
+        let mut config = configs(&first);
+        config.extend(configs(&second).into_iter().skip(1));
+        let lease = Arc::new(cache_lease(&root).unwrap());
+        let (_, mut memory) =
+            super::bootstrap(config.clone(), &[], Default::default(), Some(lease.clone()))
+                .await
+                .unwrap();
+        let other = memory[&second.path].clone();
+        if replace_root {
+            std::fs::rename(&root, dir.path().join("original")).unwrap();
+            create_cache_directory(&root).unwrap();
+        } else {
+            std::fs::remove_file(root.join("owner.lock")).unwrap();
+        }
+        let _replacement = cache_lease(&root).unwrap();
+        write_rule(&first.path, b"replacement namespace");
+        write_rule(&second.path, b"replacement namespace");
+        assert!(
+            refresh_once(&first, &config, &mut memory, Some(lease))
+                .await
+                .unwrap()
+        );
+        fixture.await.unwrap();
+        assert_eq!(memory[&first.path].digest, blake3::hash(VALID));
+        assert!(Arc::ptr_eq(&other, &memory[&second.path]));
+        assert_eq!(
+            std::fs::read(&first.path).unwrap(),
+            b"replacement namespace"
+        );
+        assert_eq!(
+            std::fs::read(&second.path).unwrap(),
+            b"replacement namespace"
+        );
+        assert!(!stage_path(&first.path).exists());
+    }
+}
+
+#[tokio::test]
+async fn memory_inputs_share_predicates_across_references_and_reloads_without_replacing_local_files()
+ {
+    let dir = directory();
+    let local = dir.path().join("local.json");
+    write_rule(&local, OLD);
+    let mut config = memory_configs(&source("https://example.com/rules.json", Path::new("")));
+    let remote = crate::rule_set::remote_sources(&mut config)
+        .unwrap()
+        .remove(0);
+    let loaded =
+        Arc::new(crate::rule_set::load_memory(&remote, OLD, blake3::hash(OLD), 0).unwrap());
+    let memory = MemorySources::from([(remote.path, loaded)]);
+    let Config::Server(server) = &mut config[0] else {
+        panic!("expected server")
+    };
+    let first = server.rules.iter().next().unwrap().clone();
+    let local_rule =
+        serde_json::from_value(serde_json::json!({"path": local, "action": "block"})).unwrap();
+    server.rules = crate::option_util::NoneOrSome::Some(vec![first.clone(), first, local_rule]);
+    let first = predicates(
+        &validate_memory(config.clone(), memory.clone())
+            .await
+            .unwrap(),
+    );
+    let second = predicates(
+        &validate_memory(config.clone(), memory.clone())
+            .await
+            .unwrap(),
+    );
+    assert!(Arc::ptr_eq(&first[0], &first[1]));
+    assert!(Arc::ptr_eq(&first[0], &second[0]));
+    assert!(!Arc::ptr_eq(&first[0], &first[2]));
+    std::fs::remove_file(local).unwrap();
+    assert!(validate_memory(config, memory).await.is_err());
+}
+
+async fn update(source: &RuleSource, limits: Limits) -> io::Result<Outcome> {
+    let downloaded = download_source(
+        source,
+        None,
+        &DnsRegistry::new(),
+        GlobalLimits::default(),
+        limits,
+        &mut http::DownloadState::default(),
+        0,
+    )
+    .await?;
+    validate_memory(
+        configs(source),
+        MemorySources::from([(source.path.clone(), downloaded.loaded.clone())]),
+    )
+    .await?;
+    Install::save(
+        &source.path,
+        downloaded.bytes,
+        downloaded.loaded.digest,
+        None,
+    )
+    .await
+}
+
+fn response(status: u16, headers: &str, body: &[u8]) -> Vec<u8> {
+    let mut result = format!(
+        "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\n{headers}\r\n",
+        body.len()
+    )
+    .into_bytes();
+    result.extend_from_slice(body);
+    result
+}
+
+async fn request(stream: &mut (impl AsyncRead + Unpin)) -> String {
+    let mut result = Vec::new();
+    while !result.ends_with(b"\r\n\r\n") {
+        result.push(stream.read_u8().await.unwrap());
+        assert!(result.len() < 16 * 1024);
+    }
+    String::from_utf8(result).unwrap()
+}
+
+async fn socks_connect(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> [u8; 10] {
+    let mut greeting = [0; 3];
+    stream.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [5, 1, 0]);
+    stream.write_all(&[5, 0]).await.unwrap();
+    let mut connect = [0; 10];
+    stream.read_exact(&mut connect).await.unwrap();
+    connect
+}
+
+async fn serve(bytes: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/rules?token=QUERY_SECRET",
+        listener.local_addr().unwrap()
+    );
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = request(&mut stream).await;
+        assert!(request.starts_with("GET /rules?token=QUERY_SECRET HTTP/1.1\r\n"));
+        assert!(request.contains("accept-encoding: identity"));
+        let _ = stream.write_all(&bytes).await;
+    });
+    (url, task)
+}
+
+fn stage_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(STAGE_SUFFIX);
+    name.into()
+}
+
+fn assert_preserved(path: &Path, original: &Metadata) {
+    assert_eq!(std::fs::read(path).unwrap(), OLD);
+    assert_eq!(stamp(&std::fs::metadata(path).unwrap()), stamp(original));
+    assert!(!stage_path(path).exists());
+}
+
+#[tokio::test]
+async fn validated_fixture_replaces_atomically_and_unchanged_does_not_rename() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let mut held_reader = File::open(&path).unwrap();
+    for expected in [Outcome::Updated, Outcome::Unchanged] {
+        let before = std::fs::metadata(&path).unwrap();
+        let (url, fixture) = serve(response(200, "", VALID)).await;
+        let report = update(&source(&url, &path), Limits::default())
+            .await
+            .unwrap();
+        fixture.await.unwrap();
+        assert_eq!(report, expected);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.ino() == after.ino(), expected == Outcome::Unchanged);
+        if expected == Outcome::Unchanged {
+            assert_eq!(stamp(&before), stamp(&after));
+        }
+        assert_eq!(after.mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read(&path).unwrap(), VALID);
+        assert!(!stage_path(&path).exists());
+    }
+    let mut old = Vec::new();
+    held_reader.read_to_end(&mut old).unwrap();
+    assert_eq!(old, OLD);
+}
+
+#[tokio::test]
+async fn rejects_http_and_parser_failures_without_touching_last_good() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    let mut compressed = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    for _ in 0..1024 {
+        compressed.write_all(&[b' '; 1024]).unwrap();
+    }
+    let bomb = compressed.finish().unwrap();
+    let cases = [
+        (response(404, "", VALID), "status 404"),
+        (response(500, "", VALID), "status 500"),
+        (
+            response(302, "Location: http://127.0.0.1/SECRET\r\n", VALID),
+            "status 302",
+        ),
+        (response(206, "", VALID), "status 206"),
+        (response(200, "", b"not JSON QUERY_SECRET"), "validation"),
+        (
+            response(200, "", br#"{"version":1,"rules":["#),
+            "validation",
+        ),
+        (
+            response(200, "", br#"{"version":6,"rules":[]}"#),
+            "validation",
+        ),
+        (
+            response(200, "", br#"{"version":1,"rules":[{"unknown":true}]}"#),
+            "validation",
+        ),
+        (
+            response(200, "", br#"{"version":1,"rules":[]}"#),
+            "validation",
+        ),
+        (
+            response(200, "Content-Encoding: gzip\r\n", &bomb),
+            "encoding unsupported",
+        ),
+        (response(200, "", &bomb), "validation"),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n".to_vec(),
+            "size",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{}".to_vec(),
+            "truncated",
+        ),
+        (b"HTTP/1.1 200 OK\r\n\r\n{}".to_vec(), "validation"),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n".to_vec(),
+            "validation",
+        ),
+        (
+            [
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Trailer\r\n\r\n{:x}\r\n",
+                    VALID.len()
+                )
+                .as_bytes(),
+                VALID,
+                b"\r\n0\r\nX-Trailer: SECRET\r\n\r\n",
+            ]
+            .concat(),
+            "trailers",
+        ),
+        (
+            response(
+                200,
+                &format!("X-Fill: {}\r\n", "a".repeat(MAX_HEADERS + 1)),
+                VALID,
+            ),
+            "headers",
+        ),
+        (response(200, &"X-Fill: a\r\n".repeat(65), VALID), "headers"),
+    ];
+    for (bytes, expected) in cases {
+        let (url, fixture) = serve(bytes).await;
+        let error = update(&source(&url, &path), Limits::default())
+            .await
+            .expect_err(expected);
+        fixture.await.unwrap();
+        let error = error.to_string();
+        assert!(error.contains(expected), "expected {expected}: {error}");
+        assert!(!error.contains("SECRET"), "{error}");
+        assert!(!error.contains(&url), "{error}");
+        assert_preserved(&path, &original);
+    }
+}
+
+#[tokio::test]
+async fn empty_download_keeps_the_validation_error_and_last_good_file() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    let (url, fixture) = serve(response(200, "", br#"{"version":1,"rules":[]}"#)).await;
+    let error = update(&source(&url, &path), Limits::default())
+        .await
+        .unwrap_err();
+    fixture.await.unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(error.to_string(), "download failed Shoes rule validation");
+    assert_preserved(&path, &original);
+}
+
+#[tokio::test]
+async fn future_mtime_is_not_freshness_and_offline_fetch_preserves_bytes() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(86400))
+        .unwrap();
+    let original = std::fs::metadata(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let offline = format!("http://{}/?QUERY_SECRET", listener.local_addr().unwrap());
+    drop(listener);
+    assert!(
+        update(&source(&offline, &path), Limits::default())
+            .await
+            .is_err()
+    );
+    assert_preserved(&path, &original);
+    let (url, fixture) = serve(response(200, "", OLD)).await;
+    let report = update(&source(&url, &path), Limits::default())
+        .await
+        .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(report, Outcome::Unchanged);
+    assert_preserved(&path, &original);
+}
+
+#[test]
+fn ownership_lock_stale_stage_and_unsafe_paths() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let first = Install::open(&path).unwrap();
+    assert_eq!(
+        Install::open(&path).err().unwrap().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(stage_path(&path).exists());
+    drop(first);
+    assert!(!stage_path(&path).exists());
+    std::fs::write(stage_path(&path), "interrupted download").unwrap();
+    std::fs::set_permissions(stage_path(&path), std::fs::Permissions::from_mode(0o600)).unwrap();
+    drop(Install::open(&path).unwrap());
+    assert!(!stage_path(&path).exists());
+    let alias = dir.path().join("alias");
+    symlink(&path, &alias).unwrap();
+    assert!(Install::open(&alias).is_err());
+    std::fs::remove_file(&alias).unwrap();
+    symlink(dir.path(), &alias).unwrap();
+    assert!(Install::open(&alias.join("rules.json")).is_err());
+    assert!(Install::open(&dir.path().join("../rules.json")).is_err());
+    drop(Install::open(&dir.path().join("missing.json")).unwrap());
+    let link = dir.path().join("hardlink");
+    std::fs::hard_link(&path, &link).unwrap();
+    assert!(Install::open(&path).is_err());
+    std::fs::remove_file(&link).unwrap();
+    symlink(&path, stage_path(&path)).unwrap();
+    assert!(Install::open(&path).is_err());
+    std::fs::remove_file(stage_path(&path)).unwrap();
+    let lock = dir.path().join("rules.json.shoes-update.lock");
+    std::fs::remove_file(&lock).unwrap();
+    symlink(&path, &lock).unwrap();
+    assert!(Install::open(&path).is_err());
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(Install::open(&path).is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(Install::open(&path).is_err());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let fifo = dir.path().join("fifo");
+    let fifo_name = c_name(fifo.as_os_str()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    assert!(Install::open(&fifo).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), OLD);
+}
+
+#[tokio::test]
+async fn cancelled_download_never_opens_a_stage_or_update_lock() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/rules", listener.local_addr().unwrap());
+    let options = source(&url, &path);
+    {
+        let future = update(&options, Limits::default());
+        tokio::pin!(future);
+        tokio::select! {
+            result = &mut future => panic!("unexpected completion: {result:?}"),
+            accepted = listener.accept() => {
+                let _stream = accepted.unwrap();
+                assert!(!stage_path(&path).exists());
+                assert!(!dir.path().join("rules.json.shoes-update.lock").exists());
+            }
+        }
+    }
+    assert_preserved(&path, &original);
+    drop(Install::open(&path).unwrap());
+}
+
+#[tokio::test]
+async fn idle_header_body_connect_and_overall_trickle_deadlines() {
+    for (mode, expected) in [
+        ("headers", "header deadline"),
+        ("idle", "body idle"),
+        ("trickle", "overall"),
+        ("tls", "connect/DNS/TLS"),
+    ] {
+        let dir = directory();
+        let path = dir.path().join("rules.json");
+        write_rule(&path, OLD);
+        let original = std::fs::metadata(&path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "{}://{}/rules?SECRET",
+            if mode == "tls" { "https" } else { "http" },
+            listener.local_addr().unwrap()
+        );
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            if mode != "tls" {
+                request(&mut stream).await;
+            }
+            if mode == "idle" || mode == "trickle" {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            if mode == "trickle" {
+                for _ in 0..20 {
+                    if stream.write_all(b" ").await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
+        let limits = Limits {
+            connect: Duration::from_millis(150),
+            idle: Duration::from_millis(150),
+            overall: Duration::from_millis(250),
+        };
+        let error = update(&source(&url, &path), limits).await.unwrap_err();
+        fixture.abort();
+        let _ = fixture.await;
+        assert!(error.to_string().contains(expected), "{mode}: {error}");
+        assert!(!error.to_string().contains("SECRET"));
+        assert_preserved(&path, &original);
+    }
+}
+
+#[tokio::test]
+async fn rejects_untrusted_tls_certificate() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let config = crate::rustls_config_util::try_create_server_config(
+        certificate.cert.pem().as_bytes(),
+        certificate.signing_key.serialize_pem().as_bytes(),
+        vec![],
+        &[],
+        &[],
+        &Default::default(),
+    )
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "https://localhost:{}/rules?QUERY_SECRET",
+        listener.local_addr().unwrap().port()
+    );
+    let fixture = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(acceptor.accept(stream).await.is_err());
+    });
+    let error = update(&source(&url, &path), Limits::default())
+        .await
+        .unwrap_err();
+    fixture.await.unwrap();
+    assert!(
+        error.to_string().contains("TLS certificate verification"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("SECRET"));
+    assert_preserved(&path, &original);
+}
+
+#[test]
+fn installation_failure_and_concurrent_replacement_preserve_current_file() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    let mut install = Install::open(&path).unwrap();
+    install.file.write_all(VALID).unwrap();
+    FAIL_RENAME.with(|flag| flag.set(true));
+    assert!(install.finish(blake3::hash(VALID)).is_err());
+    drop(install);
+    assert_preserved(&path, &original);
+    let mut install = Install::open(&path).unwrap();
+    install.file.write_all(VALID).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(install.finish(blake3::hash(VALID)).is_err());
+    assert!(!path.exists());
+    std::fs::write(&path, "operator replacement").unwrap();
+    assert!(install.finish(blake3::hash(VALID)).is_err());
+    drop(install);
+    assert_eq!(std::fs::read(&path).unwrap(), b"operator replacement");
+}
+
+#[test]
+fn post_rename_sync_failure_reports_replacement_not_retention() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let mut install = Install::open(&path).unwrap();
+    install.file.write_all(VALID).unwrap();
+    super::install::FAIL_AFTER_RENAME.with(|flag| flag.set(true));
+    let outcome = install.finish(blake3::hash(VALID)).unwrap();
+    assert_eq!(outcome, Outcome::DurabilityUncertain);
+    assert_eq!(std::fs::read(path).unwrap(), VALID);
+}
+
+#[test]
+fn replaced_sidecars_are_not_installed_or_removed_by_previous_owner() {
+    for replace_lock in [false, true] {
+        let dir = directory();
+        let path = dir.path().join("rules.json");
+        write_rule(&path, OLD);
+        let original = std::fs::metadata(&path).unwrap();
+        let mut install = Install::open(&path).unwrap();
+        install.file.write_all(VALID).unwrap();
+        let replaced = if replace_lock {
+            dir.path().join("rules.json.shoes-update.lock")
+        } else {
+            stage_path(&path)
+        };
+        std::fs::remove_file(&replaced).unwrap();
+        write_rule(&replaced, b"replacement must survive");
+        assert!(install.finish(blake3::hash(VALID)).is_err());
+        drop(install);
+        assert_eq!(
+            std::fs::read(&replaced).unwrap(),
+            b"replacement must survive"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), OLD);
+        assert_eq!(stamp(&std::fs::metadata(&path).unwrap()), stamp(&original));
+    }
+}
+
+#[test]
+fn directory_descriptor_survives_ancestor_rename_without_following_symlink() {
+    let dir = directory();
+    let parent = dir.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = parent.join("rules.json");
+    write_rule(&path, OLD);
+    let mut install = Install::open(&path).unwrap();
+    install.file.write_all(VALID).unwrap();
+    let moved = dir.path().join("moved");
+    std::fs::rename(&parent, &moved).unwrap();
+    let decoy = dir.path().join("decoy");
+    std::fs::create_dir(&decoy).unwrap();
+    std::fs::write(decoy.join("rules.json"), OLD).unwrap();
+    symlink(&decoy, &parent).unwrap();
+    install.finish(blake3::hash(VALID)).unwrap();
+    drop(install);
+    assert_eq!(std::fs::read(moved.join("rules.json")).unwrap(), VALID);
+    assert_eq!(std::fs::read(decoy.join("rules.json")).unwrap(), OLD);
+    assert!(!stage_path(&moved.join("rules.json")).exists());
+}
+
+#[test]
+fn remote_format_precedence_and_strict_metadata() {
+    use crate::rule_set::Format;
+    let dir = directory();
+    for (url, cache, prefix, expected) in [
+        (
+            "https://example.com/list.srs?name=x.json",
+            "cache.json",
+            b"".as_slice(),
+            Format::Srs,
+        ),
+        (
+            "https://example.com/list.JSON",
+            "cache.srs",
+            b"",
+            Format::SingboxJson,
+        ),
+        (
+            "https://example.com/download",
+            "cache.json",
+            b"",
+            Format::SingboxJson,
+        ),
+        (
+            "https://example.com/list.json",
+            "cache.json",
+            b"SRS\x02",
+            Format::Srs,
+        ),
+    ] {
+        let mut source = source(url, &dir.path().join(cache));
+        source.format = None;
+        assert_eq!(source.format(prefix).unwrap(), expected);
+        source.format = Some(Format::MihomoText);
+        assert_eq!(source.format(prefix).unwrap(), Format::MihomoText);
+    }
+    for url in [
+        "https://USER_SECRET:PASSWORD_SECRET@example.com/?QUERY_SECRET",
+        "bad:QUERY_SECRET",
+        "https://example.com/#SECRET",
+    ] {
+        let error = source(url, &dir.path().join("rules.json"))
+            .parsed_url()
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("SECRET"));
+    }
+    for interval in [
+        "0s",
+        "-1d",
+        "1",
+        "1ms",
+        "99999999999999999d",
+        "366d",
+        "",
+        "7D",
+    ] {
+        let mut source = source(
+            "https://example.com/list.json",
+            &dir.path().join("rules.json"),
+        );
+        source.update_interval = Some(interval.into());
+        assert!(source.parsed_url().is_err(), "{interval}");
+    }
+    let mut local = RuleSource::from_path(dir.path().join("local.json"));
+    local.update_interval = Some("7d".into());
+    assert!(local.parsed_url().is_err());
+}
+
+#[tokio::test]
+async fn every_existing_decoder_validates_downloads() {
+    use crate::rule_set::{Behavior, Format};
+    use prost::Message;
+    #[derive(Clone, PartialEq, Message)]
+    struct Record {
+        #[prost(string, tag = "1")]
+        code: String,
+        #[prost(bytes = "vec", tag = "2")]
+        entry: Vec<u8>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Data {
+        #[prost(message, repeated, tag = "1")]
+        records: Vec<Record>,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Domain {
+        #[prost(int32, tag = "1")]
+        kind: i32,
+        #[prost(string, tag = "2")]
+        name: String,
+    }
+    #[derive(Clone, PartialEq, Message)]
+    struct Cidr {
+        #[prost(bytes = "vec", tag = "1")]
+        ip: Vec<u8>,
+        #[prost(uint32, tag = "2")]
+        prefix: u32,
+    }
+    let dat = |entry| {
+        Data {
+            records: vec![Record {
+                code: "TEST".into(),
+                entry,
+            }],
+        }
+        .encode_to_vec()
+    };
+    for (format, behavior, code, bytes) in [
+        (Format::SingboxJson, None, None, VALID.to_vec()),
+        (
+            Format::Srs,
+            None,
+            None,
+            include_bytes!("../../tests/fixtures/rule_sets/singbox-v2.srs").to_vec(),
+        ),
+        (
+            Format::Mrs,
+            None,
+            None,
+            include_bytes!("../../tests/fixtures/rule_sets/mihomo-domain.mrs").to_vec(),
+        ),
+        (
+            Format::MihomoText,
+            Some(Behavior::Domain),
+            None,
+            b"example.com\n".to_vec(),
+        ),
+        (
+            Format::MihomoYaml,
+            Some(Behavior::Domain),
+            None,
+            b"payload:\n  - example.com\n".to_vec(),
+        ),
+        (
+            Format::GeositeDat,
+            None,
+            Some("test"),
+            dat(Domain {
+                kind: 3,
+                name: "example.com".into(),
+            }
+            .encode_to_vec()),
+        ),
+        (
+            Format::GeoipDat,
+            None,
+            Some("test"),
+            dat(Cidr {
+                ip: vec![192, 0, 2, 0],
+                prefix: 24,
+            }
+            .encode_to_vec()),
+        ),
+    ] {
+        let dir = directory();
+        let path = dir.path().join("cache");
+        let (url, fixture) = serve(response(200, "", &bytes)).await;
+        let mut source = source(&url, &path);
+        source.format = Some(format);
+        source.behavior = behavior;
+        source.code = code.map(str::to_owned);
+        crate::rule_set::load_memory(&source, &bytes, blake3::hash(&bytes), 0).unwrap();
+        assert_eq!(
+            update(&source, Limits::default()).await.unwrap(),
+            Outcome::Updated,
+            "{format:?}"
+        );
+        fixture.await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[tokio::test]
+async fn stalled_url_address_does_not_block_another_guarded_candidate() {
+    #[derive(Debug)]
+    struct Bootstrap;
+    impl crate::resolver::Resolver for Bootstrap {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.address().to_string(), "remote.invalid");
+            Box::pin(async {
+                Ok(vec![
+                    "192.0.2.1:8080".parse().unwrap(),
+                    "192.0.2.2:8080".parse().unwrap(),
+                ])
+            })
+        }
+    }
+    async fn socks(listener: &TcpListener, ip: u8) -> TcpStream {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let connect = socks_connect(&mut stream).await;
+        assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, ip, 31, 144]);
+        stream
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dir = directory();
+    let mut source = source(
+        "http://remote.invalid:8080/rules",
+        &dir.path().join("rules.json"),
+    );
+    let download = source.download.as_mut().unwrap();
+    download.bootstrap_url = "bootstrap".into();
+    download.client_chain = serde_json::from_value(serde_json::json!({
+        "address": listener.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}
+    }))
+    .unwrap();
+    let mut dns = DnsRegistry::new();
+    dns.register("bootstrap".into(), Arc::new(Bootstrap));
+    let fixture = tokio::spawn(async move {
+        let mut stalled = socks(&listener, 1).await;
+        let mut working = socks(&listener, 2).await;
+        working
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+        assert!(
+            request(&mut working)
+                .await
+                .contains("host: remote.invalid:8080")
+        );
+        working.write_all(&response(200, "", VALID)).await.unwrap();
+        assert!(stalled.read_u8().await.is_err());
+    });
+    drop(
+        timeout(
+            Duration::from_secs(2),
+            download_source(
+                &source,
+                None,
+                &dns,
+                GlobalLimits::default(),
+                Limits::default(),
+                &mut http::DownloadState::default(),
+                0,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    timeout(Duration::from_secs(2), fixture)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn dangling_sidecar_aliases_and_symlink_cycles_are_rejected() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    let source = source("https://example.invalid/rules.json", &path);
+    for suffix in [".shoes-update.lock", ".shoes-update.tmp"] {
+        let alias = dir.path().join(format!("alias{suffix}.json"));
+        symlink(format!("cache.json{suffix}"), &alias).unwrap();
+        let mut config = configs(&source);
+        config.push(
+            serde_json::from_value(
+                serde_json::json!({"rule_source_group": "alias", "rules": [{"path": alias}]}),
+            )
+            .unwrap(),
+        );
+        let error = crate::rule_set::validate_remote_paths(&mut config, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("overlaps rule_cache_dir"),
+            "{error}"
+        );
+    }
+    let cycle = dir.path().join("cycle.json");
+    symlink("./cycle.json", &cycle).unwrap();
+    assert!(
+        crate::rule_set::source_identity(&cycle)
+            .unwrap_err()
+            .to_string()
+            .contains("loop")
+    );
+}
+
+#[tokio::test]
+async fn ipv6_literal_download_reaches_the_exact_url_port() {
+    let listener = TcpListener::bind("[::1]:0").await.unwrap();
+    let url = format!("http://{}/rules", listener.local_addr().unwrap());
+    let fixture = tokio::spawn(async move {
+        let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        request(&mut stream).await;
+        stream.write_all(&response(200, "", VALID)).await.unwrap();
+    });
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    assert_eq!(
+        update(&source(&url, &path), Limits::default())
+            .await
+            .unwrap(),
+        Outcome::Updated
+    );
+    fixture.await.unwrap();
+}
+
+#[tokio::test]
+async fn named_download_chain_is_used_and_failure_never_falls_back_to_direct() {
+    use crate::control::selection::{SelectionOwner, SelectorDefinition};
+    for persisted in [false, true] {
+        let dir = directory();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = cache.join("cache.json");
+        write_rule(&path, OLD);
+        let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = proxy.accept().await.unwrap();
+            let connect = socks_connect(&mut stream).await;
+            assert_eq!(&connect[..4], &[5, 1, 0, 1]);
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+            request(&mut stream).await;
+            stream.write_all(&response(200, "", VALID)).await.unwrap();
+        });
+        let mut source = source(
+            &format!("http://{}/rules", trap.local_addr().unwrap()),
+            &path,
+        );
+        source.download.as_mut().unwrap().client_chain =
+            serde_json::from_value(serde_json::json!("fetch")).unwrap();
+        let mut config = configs(&source);
+        let store = dir.path().join("selections.json");
+        if persisted {
+            let mut owner = SelectionOwner::new(Some(&store)).unwrap();
+            let view = owner
+                .prepare(std::collections::BTreeMap::from([(
+                    "fetch".into(),
+                    SelectorDefinition {
+                        members: vec!["DIRECT".into(), "working".into()],
+                        default: Some("DIRECT".into()),
+                    },
+                )]))
+                .unwrap();
+            owner.activate(view).unwrap();
+            owner.select("fetch", "working").unwrap();
+            drop(owner);
+            config.insert(
+                0,
+                serde_json::from_value(serde_json::json!({"cache_file_path": store})).unwrap(),
+            );
+        }
+        config.insert(0, serde_json::from_value(serde_json::json!({"client_group": "fetch", "type": "selector", "default": if persisted { "DIRECT" } else { "working" }, "client_proxies": [
+        "direct",
+        {"name": "working", "address": proxy_address.to_string(), "protocol": {"type": "socks"}}
+    ]})).unwrap());
+        let mut validated = crate::config::compile_configs(config.clone())
+            .await
+            .unwrap();
+        let mut control =
+            crate::control::runtime::ControlService::new(validated.control.clone()).unwrap();
+        control.runtime.prepare(&mut validated).await.unwrap();
+        let remote = &validated.remote_rules[0];
+        let mut memory = cached_sources(std::slice::from_ref(remote));
+        assert!(
+            refresh_once(remote, &config, &mut memory, None)
+                .await
+                .unwrap()
+        );
+        fixture.await.unwrap();
+        assert!(
+            refresh_once(remote, &config, &mut memory, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_millis(50), trap.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), VALID);
+        control.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn url_test_downloads_stay_background_after_success_and_failure() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    write_rule(&path, OLD);
+    let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut source = source(
+        &format!("http://{}/rules", trap.local_addr().unwrap()),
+        &path,
+    );
+    source.download.as_mut().unwrap().client_chain =
+        serde_json::from_value(serde_json::json!("auto")).unwrap();
+    let mut config = configs(&source);
+    config.insert(
+        0,
+        serde_json::from_value(serde_json::json!({
+            "client_group": "auto", "type": "url-test", "lazy": true, "interval": 60,
+            "url": "http://probe.invalid/", "client_proxies": [{
+                "name": "working", "address": proxy.local_addr().unwrap().to_string(),
+                "protocol": {"type": "socks"}
+            }]
+        }))
+        .unwrap(),
+    );
+    let validated = crate::config::compile_configs(config.clone())
+        .await
+        .unwrap();
+    let automatic = &validated.catalog.as_ref().unwrap().selection.automatic;
+    let group = &automatic.0["auto"];
+    assert!(
+        group
+            .due_members(Instant::now() - Duration::from_secs(60))
+            .is_some()
+    );
+    assert!(group.due_members(Instant::now()).is_none());
+    let fixture = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await.unwrap();
+        assert_eq!(&socks_connect(&mut stream).await[..4], &[5, 1, 0, 1]);
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+        request(&mut stream).await;
+        stream.write_all(&response(200, "", VALID)).await.unwrap();
+        drop(stream);
+        let (failed, _) = proxy.accept().await.unwrap();
+        drop(failed);
+    });
+    let remote = &validated.remote_rules[0];
+    let mut memory = cached_sources(std::slice::from_ref(remote));
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            refresh_once(remote, &config, &mut memory, None)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    );
+    assert!(group.due_members(Instant::now()).is_none());
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            refresh_once(remote, &config, &mut memory, None)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert!(group.due_members(Instant::now()).is_none());
+    timeout(Duration::from_secs(5), fixture)
+        .await
+        .unwrap()
+        .unwrap();
+    automatic.touch("auto", false);
+    assert!(group.due_members(Instant::now()).is_some());
+    assert!(
+        timeout(Duration::from_millis(50), trap.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), VALID);
+}
+
+#[tokio::test]
+async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(86400))
+        .unwrap();
+    let (url, fixture) = serve(response(200, "", OLD)).await;
+    let mut source = source(&url, &path);
+    source.update_interval = Some("7d".into());
+    let mut refresh = Refresh::new(
+        configs(&source),
+        std::slice::from_ref(&source),
+        cached_sources(std::slice::from_ref(&source)),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(refresh.scheduled[0].due <= Instant::now());
+    assert!(
+        timeout(
+            Duration::from_secs(2),
+            refresh.changed(&DnsRegistry::new(), GlobalLimits::default())
+        )
+        .await
+        .is_err()
+    );
+    fixture.await.unwrap();
+    assert!(refresh.scheduled[0].due > Instant::now() + Duration::from_secs(3600));
+    let next = Refresh::new(
+        configs(&source),
+        &[source],
+        refresh.memory.clone(),
+        Some(&refresh),
+        None,
+    )
+    .unwrap();
+    assert_eq!(next.scheduled[0].due, refresh.scheduled[0].due);
+    assert!(
+        Refresh::new(Vec::new(), &[], Default::default(), Some(&next), None)
+            .unwrap()
+            .scheduled
+            .is_empty()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), OLD);
+}
+
+#[tokio::test]
+async fn refresh_pools_rotate_after_success_failure_and_generation_replacement() {
+    for first_result in ["success", "failure", "cancelled"] {
+        for replace_generation in [false, true] {
+            let dir = directory();
+            let path = dir.path().join("cache.json");
+            write_rule(&path, OLD);
+            let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut source = source(
+                &format!("http://{}/rules", trap.local_addr().unwrap()),
+                &path,
+            );
+            source.download.as_mut().unwrap().client_chain =
+                serde_json::from_value(serde_json::json!([{"pool": [
+                    {"address": a.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+                    {"address": b.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}}
+                ]}]))
+                .unwrap();
+            let fixture = tokio::spawn(async move {
+                let mut selected = Vec::new();
+                let mut stalled = None;
+                for attempt in 0..3 {
+                    let (index, mut stream) = timeout(Duration::from_secs(5), async {
+                        tokio::select! {
+                            result = a.accept() => (0, result.unwrap().0),
+                            result = b.accept() => (1, result.unwrap().0),
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    selected.push(index);
+                    if attempt == 0 {
+                        if first_result == "failure" {
+                            continue;
+                        }
+                        if first_result == "cancelled" {
+                            stalled = Some(stream);
+                            continue;
+                        }
+                    }
+                    socks_connect(&mut stream).await;
+                    stream
+                        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                        .await
+                        .unwrap();
+                    request(&mut stream).await;
+                    stream.write_all(&response(200, "", VALID)).await.unwrap();
+                }
+                drop(stalled);
+                selected
+            });
+            let config = configs(&source);
+            let sources = crate::config::compile_configs(config.clone())
+                .await
+                .unwrap()
+                .remote_rules;
+            let mut refresh = Refresh::new(
+                config.clone(),
+                &sources,
+                cached_sources(&sources),
+                None,
+                None,
+            )
+            .unwrap();
+            for attempt in 0..3 {
+                let item = &mut refresh.scheduled[0];
+                let dns = DnsRegistry::new();
+                let future = refresh_source(
+                    &item.source,
+                    &config,
+                    &mut refresh.memory,
+                    &dns,
+                    GlobalLimits::default(),
+                    &mut item.download,
+                    None,
+                );
+                if first_result == "cancelled" && attempt == 0 {
+                    assert!(timeout(Duration::from_millis(100), future).await.is_err());
+                    assert_eq!(std::fs::read(&path).unwrap(), OLD);
+                } else if first_result == "failure" && attempt == 0 {
+                    assert!(
+                        future
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("configured rule download chain failed")
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), OLD);
+                } else {
+                    future.await.unwrap();
+                }
+                if replace_generation {
+                    refresh = Refresh::new(
+                        config.clone(),
+                        &sources,
+                        refresh.memory.clone(),
+                        Some(&refresh),
+                        None,
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(fixture.await.unwrap(), [0, 1, 0]);
+            assert!(
+                timeout(Duration::from_millis(20), trap.accept())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), VALID);
+            assert!(!stage_path(&path).exists());
+        }
+    }
+}
+
+#[test]
+fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    write_rule(&path, OLD);
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let mut source = source("https://example.com/first.json", &path);
+    let mut previous = Refresh::new(
+        configs(&source),
+        std::slice::from_ref(&source),
+        cached_sources(std::slice::from_ref(&source)),
+        None,
+        None,
+    )
+    .unwrap();
+    previous.scheduled[0].due = Instant::now() + Duration::from_secs(3600);
+    previous.scheduled[0].failures = 3;
+
+    let next = Refresh::new(
+        configs(&source),
+        std::slice::from_ref(&source),
+        previous.memory.clone(),
+        Some(&previous),
+        None,
+    )
+    .unwrap();
+    assert_eq!(next.scheduled[0].due, previous.scheduled[0].due);
+    assert_eq!(next.scheduled[0].failures, 3);
+
+    source.url = Some("https://example.com/second.json".into());
+    let changed = Refresh::new(
+        configs(&source),
+        std::slice::from_ref(&source),
+        cached_sources(std::slice::from_ref(&source)),
+        Some(&previous),
+        None,
+    )
+    .unwrap();
+    assert!(changed.scheduled[0].due <= Instant::now());
+    assert_eq!(changed.scheduled[0].failures, 0);
+}
+
+#[test]
+fn cached_source_age_is_preserved_when_the_refresh_interval_changes() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    File::open(&path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    let mut source = source("https://unused.invalid/rules.json", &path);
+    source.update_interval = Some("1s".into());
+    let memory = cached_sources(std::slice::from_ref(&source));
+    source.update_interval = Some("2h".into());
+    let refresh = Refresh::new(configs(&source), &[source], memory, None, None).unwrap();
+    let remaining = refresh.scheduled[0].due.duration_since(Instant::now());
+    assert!(remaining > Duration::from_secs(3595));
+    assert!(remaining <= Duration::from_secs(3600));
+}
+
+#[tokio::test]
+async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let original = std::fs::metadata(&path).unwrap();
+    for body in [OLD, VALID] {
+        let (url, fixture) = serve(response(200, "", body)).await;
+        let source = source(&url, &path);
+        let mut config = configs(&source);
+        config.push(
+            serde_json::from_value(serde_json::json!({
+                "rule_group": "invalid", "rules": [{"masks": {"ip_cidr": ["not an IP"]}}]
+            }))
+            .unwrap(),
+        );
+        let result = refresh_once(
+            &source,
+            &config,
+            &mut cached_sources(std::slice::from_ref(&source)),
+            None,
+        )
+        .await;
+        fixture.await.unwrap();
+        if body == OLD {
+            assert!(!result.unwrap());
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.starts_with("download rejected by whole configuration validation:"),
+                "{error}"
+            );
+            assert!(error.contains("IP"), "{error}");
+            assert!(!error.contains("QUERY_SECRET"), "{error}");
+        }
+        assert_preserved(&path, &original);
+    }
+}
+
+#[tokio::test]
+async fn runtime_validation_uses_retained_sources_and_never_falls_back_to_disk() {
+    let dir = directory();
+    let mut first = source(
+        "https://example.com/first.json",
+        &dir.path().join("first.txt"),
+    );
+    first.format = None;
+    let second = source(
+        "https://example.com/second.json",
+        &dir.path().join("second.json"),
+    );
+    write_rule(&first.path, b"SRS invalid old cache");
+    write_rule(&second.path, OLD);
+    let memory = MemorySources::from([
+        (
+            first.path.clone(),
+            Arc::new(crate::rule_set::load_memory(&first, VALID, blake3::hash(VALID), 0).unwrap()),
+        ),
+        (second.path.clone(), load_cached(&second, None, 0).unwrap()),
+    ]);
+    let config: Vec<Config> = serde_json::from_value(serde_json::json!([
+        {"global_settings": {"rule_cache_dir": dir.path()}},
+        {"rule_source_group": "shared", "rules": [first]},
+        {"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "rules": [
+            {"masks": first, "action": "block"},
+            {"masks": {"rule_source_group": "shared"}, "action": "block"},
+            {"masks": second, "action": "block"}
+        ]}
+    ]))
+    .unwrap();
+    let validated = validate_memory(config.clone(), memory.clone())
+        .await
+        .unwrap();
+    let predicates = predicates(&validated);
+    assert!(Arc::ptr_eq(&predicates[0], &predicates[1]));
+    assert!(!Arc::ptr_eq(&predicates[0], &predicates[2]));
+    assert_eq!(
+        std::fs::read(&first.path).unwrap(),
+        b"SRS invalid old cache"
+    );
+
+    std::fs::remove_file(&second.path).unwrap();
+    validate_memory(config.clone(), memory.clone())
+        .await
+        .unwrap();
+    write_rule(&second.path, VALID);
+    let mut incomplete = memory;
+    incomplete.remove(&second.path);
+    for memory in [incomplete, MemorySources::new()] {
+        let error = validate_memory(config.clone(), memory).await.err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("remote rules unavailable in memory"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_bootstrap_resolves_target_without_system_dns() {
+    #[derive(Debug)]
+    struct Bootstrap {
+        port: u16,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::resolver::Resolver for Bootstrap {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.address().to_string(), "remote.invalid");
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
+            Box::pin(async move { Ok(vec![address]) })
+        }
+    }
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    let (url, fixture) = serve(response(200, "", VALID)).await;
+    let url = url::Url::parse(&url).unwrap();
+    let resolver = Arc::new(Bootstrap {
+        port: url.port().unwrap(),
+        calls: Default::default(),
+    });
+    let mut dns = DnsRegistry::new();
+    dns.register("bootstrap".into(), resolver.clone());
+    let mut source = source(
+        &format!(
+            "http://remote.invalid:{}/rules?token=QUERY_SECRET",
+            url.port().unwrap()
+        ),
+        &path,
+    );
+    source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
+    let downloaded = download_source(
+        &source,
+        None,
+        &dns,
+        GlobalLimits::default(),
+        Limits::default(),
+        &mut http::DownloadState::default(),
+        0,
+    )
+    .await
+    .unwrap();
+    Install::save(
+        &source.path,
+        downloaded.bytes,
+        downloaded.loaded.digest,
+        None,
+    )
+    .await
+    .unwrap();
+    fixture.await.unwrap();
+    assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names() {
+    #[derive(Debug)]
+    struct Bootstrap {
+        first: std::net::SocketAddr,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::resolver::Resolver for Bootstrap {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            let name = location.address().to_string();
+            let addresses = match name.as_str() {
+                "first.invalid" => vec![self.first],
+                "second.invalid" => vec![
+                    "127.0.0.3:1080".parse().unwrap(),
+                    "127.0.0.2:1080".parse().unwrap(),
+                ],
+                "remote.invalid" => vec!["192.0.2.10:8080".parse().unwrap()],
+                _ => panic!("unexpected bootstrap lookup: {location}"),
+            };
+            self.calls.lock().unwrap().push(name);
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+    async fn socks(stream: &mut (impl AsyncRead + AsyncWrite + Unpin), expected: [u8; 10]) {
+        let connect = socks_connect(stream).await;
+        assert_eq!(connect, expected);
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+    }
+    async fn serve_second(mut stream: impl AsyncRead + AsyncWrite + Unpin) {
+        socks(&mut stream, [5, 1, 0, 1, 192, 0, 2, 10, 31, 144]).await;
+        assert!(
+            request(&mut stream)
+                .await
+                .contains("host: remote.invalid:8080")
+        );
+        stream.write_all(&response(200, "", VALID)).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+    for tls in [false, true] {
+        let dir = directory();
+        let path = dir.path().join("cache.json");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let resolver = Arc::new(Bootstrap {
+            first: listener.local_addr().unwrap(),
+            calls: Default::default(),
+        });
+        let mut dns = DnsRegistry::new();
+        dns.register("bootstrap".into(), resolver.clone());
+        let mut source = source("http://remote.invalid:8080/rules", &path);
+        let second = if tls {
+            serde_json::json!({"type": "tls", "verify": false, "protocol": {"type": "socks"}})
+        } else {
+            serde_json::json!({"type": "socks"})
+        };
+        source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
+        source.download.as_mut().unwrap().client_chain = serde_json::from_value(serde_json::json!([
+            {"address": format!("first.invalid:{}", resolver.first.port()), "protocol": {"type": "socks"}},
+            {"address": "second.invalid:1080", "protocol": second}
+        ])).unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut rejected, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                socks_connect(&mut rejected).await,
+                [5, 1, 0, 1, 127, 0, 0, 3, 4, 56]
+            );
+            rejected
+                .write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            drop(rejected);
+            let (mut stream, _) = listener.accept().await.unwrap();
+            socks(&mut stream, [5, 1, 0, 1, 127, 0, 0, 2, 4, 56]).await;
+            if tls {
+                let certificate =
+                    rcgen::generate_simple_self_signed(vec!["second.invalid".into()]).unwrap();
+                let config = crate::rustls_config_util::try_create_server_config(
+                    certificate.cert.pem().as_bytes(),
+                    certificate.signing_key.serialize_pem().as_bytes(),
+                    vec![],
+                    &[],
+                    &[],
+                    &Default::default(),
+                )
+                .unwrap();
+                let stream = tokio_rustls::TlsAcceptor::from(Arc::new(config))
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                assert_eq!(stream.get_ref().1.server_name(), Some("second.invalid"));
+                serve_second(stream).await;
+            } else {
+                serve_second(stream).await;
+            }
+        });
+        let downloaded = download_source(
+            &source,
+            None,
+            &dns,
+            GlobalLimits::default(),
+            Limits::default(),
+            &mut http::DownloadState::default(),
+            0,
+        )
+        .await
+        .unwrap();
+        drop(downloaded);
+        timeout(Duration::from_secs(5), fixture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *resolver.calls.lock().unwrap(),
+            [
+                "remote.invalid",
+                "second.invalid",
+                "first.invalid",
+                "first.invalid"
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn streaming_body_limit_preserves_last_good_cache() {
+    timeout(Duration::from_secs(30), async {
+        for chunked in [false, true] {
+            let dir = directory();
+            let path = dir.path().join("rules.json");
+            write_rule(&path, OLD);
+            let original = std::fs::metadata(&path).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/rules.json", listener.local_addr().unwrap());
+            let fixture = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                request(&mut stream).await;
+                let header = if chunked {
+                    "Transfer-Encoding: chunked\r\n"
+                } else {
+                    ""
+                };
+                stream
+                    .write_all(format!("HTTP/1.1 200 OK\r\n{header}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                let block = [b' '; 16 * 1024];
+                for _ in 0..(MAX_BYTES / block.len() as u64 + 1) {
+                    if chunked {
+                        stream.write_all(b"4000\r\n").await.unwrap();
+                    }
+                    stream.write_all(&block).await.unwrap();
+                    if chunked {
+                        stream.write_all(b"\r\n").await.unwrap();
+                    }
+                }
+                if chunked {
+                    let _ = stream.write_all(b"0\r\n\r\n").await;
+                }
+            });
+            let error = update(&source(&url, &path), Limits::default())
+                .await
+                .unwrap_err();
+            fixture.await.unwrap();
+            assert_eq!(error.to_string(), "download exceeds byte limit");
+            assert_preserved(&path, &original);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn chunked_body_is_bounded_and_validated() {
+    for length in [
+        "",
+        "Content-Length: 0\r\n",
+        "Content-Length: 1\r\n",
+        "Content-Length: 67108865\r\n",
+    ] {
+        let dir = directory();
+        let path = dir.path().join("rules.json");
+        let mut bytes = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n{length}\r\n{:x}\r\n",
+            VALID.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(VALID);
+        bytes.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (url, fixture) = serve(bytes).await;
+        assert_eq!(
+            update(&source(&url, &path), Limits::default())
+                .await
+                .unwrap(),
+            Outcome::Updated
+        );
+        fixture.await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), VALID);
+    }
+}
+
+#[tokio::test]
+async fn first_download_proxy_retains_bootstrap_address_fallback() {
+    #[derive(Debug)]
+    struct Bootstrap(Vec<std::net::SocketAddr>);
+    impl crate::resolver::Resolver for Bootstrap {
+        fn resolve_location(
+            &self,
+            location: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.address().to_string(), "proxy.invalid");
+            let addresses = self.0.clone();
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+    for direct_first in [false, true] {
+        let dir = directory();
+        let path = dir.path().join("rules.json");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_address = refused.local_addr().unwrap();
+        drop(refused);
+        let mut dns = DnsRegistry::new();
+        dns.register(
+            "bootstrap".into(),
+            Arc::new(Bootstrap(vec![refused_address, address])),
+        );
+        let mut source = source("http://192.0.2.1:8080/rules", &path);
+        let proxy = serde_json::json!({"address": format!("proxy.invalid:{}", address.port()), "protocol": {"type": "socks"}});
+        let hops = if direct_first {
+            serde_json::json!([{"protocol": {"type": "direct"}}, proxy])
+        } else {
+            serde_json::json!([proxy])
+        };
+        source.download.as_mut().unwrap().client_chain = serde_json::from_value(hops).unwrap();
+        source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let connect = socks_connect(&mut stream).await;
+            assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, 1, 31, 144]);
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+            request(&mut stream).await;
+            stream.write_all(&response(200, "", VALID)).await.unwrap();
+        });
+        drop(
+            download_source(
+                &source,
+                None,
+                &dns,
+                GlobalLimits::default(),
+                Limits::default(),
+                &mut http::DownloadState::default(),
+                0,
+            )
+            .await
+            .unwrap(),
+        );
+        fixture.await.unwrap();
+    }
+}
+
+#[test]
+fn cache_conflicts_and_unknown_download_routes_are_rejected_offline() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, VALID);
+    let first = source("https://example.com/a.json", &path);
+    let second = source("https://example.com/b.json", &path);
+    let mut conflicting = configs(&first);
+    conflicting.extend(configs(&second).into_iter().skip(1));
+    assert!(
+        crate::config::create_server_configs(conflicting)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("conflicting remote")
+    );
+    let mut missing = first.clone();
+    missing.download.as_mut().unwrap().client_chain =
+        serde_json::from_value(serde_json::json!("missing")).unwrap();
+    assert!(crate::config::create_server_configs(configs(&missing)).is_err());
+    missing = first;
+    missing.download.as_mut().unwrap().bootstrap_url = "missing".into();
+    assert!(crate::config::create_server_configs(configs(&missing)).is_err());
+}
+
+#[test]
+fn remote_bootstrap_literals_reject_active_and_retained_synthetic_ranges() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, VALID);
+    let ranges = [
+        "100.64.0.0/10".parse().unwrap(),
+        "fd00::/64".parse().unwrap(),
+    ];
+    for scheme in ["udp", "tcp", "tls", "https", "h3"] {
+        for host in ["100.64.0.2", "[::ffff:100.64.0.2]", "[fd00::2]"] {
+            let mut source = source("https://remote.invalid/rules.json", &path);
+            source.download.as_mut().unwrap().bootstrap_url = format!("{scheme}://{host}");
+            let mut config = configs(&source);
+            config.push(
+                serde_json::from_value(serde_json::json!({
+                    "dns_group": "fake", "dns_servers": "system",
+                    "fake_ip": {"ipv4_range": "100.64.0.0/10", "ipv6_range": "fd00::/64"}
+                }))
+                .unwrap(),
+            );
+            let error = crate::config::create_server_configs(config)
+                .err()
+                .expect("active synthetic bootstrap endpoint accepted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("rule download/bootstrap endpoint"),
+                "{scheme}://{host}: {error}"
+            );
+
+            let mut validated = crate::config::create_server_configs(configs(&source)).unwrap();
+            let error = validated.validate_network_endpoints(&ranges).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("rule download/bootstrap endpoint"),
+                "{scheme}://{host}: {error}"
+            );
+            validated
+                .validate_network_endpoints(&["192.0.2.0/24".parse().unwrap()])
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_bootstrap_group_names_take_precedence_over_url_syntax() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, VALID);
+    for name in ["udp://100.64.0.2", "https://100.64.0.2"] {
+        let mut source = source("https://remote.invalid/rules.json", &path);
+        source.download.as_mut().unwrap().bootstrap_url = name.into();
+        let mut config = configs(&source);
+        config.push(
+            serde_json::from_value(serde_json::json!({
+                "dns_group": name, "dns_servers": "udp://127.0.0.1:9",
+                "fake_ip": {"ipv4_range": "100.64.0.0/10"}
+            }))
+            .unwrap(),
+        );
+        let mut validated = crate::config::create_server_configs(config.clone()).unwrap();
+        validated
+            .validate_network_endpoints(&["100.64.0.0/10".parse().unwrap()])
+            .unwrap();
+        let dns = crate::dns::build_dns_registry(validated.dns_groups)
+            .await
+            .unwrap();
+        dns.rule_bootstrap(name).await.unwrap();
+    }
+}
+
+#[test]
+fn remote_sources_work_in_source_groups_policies_and_flat_overrides() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, VALID);
+    let remote = source("https://example.com/rules.json", &path);
+    let mut flat = serde_json::to_value(&remote).unwrap();
+    flat["action"] = "block".into();
+    let config = serde_json::from_value(serde_json::json!([
+        {"global_settings": {"rule_cache_dir": dir.path()}},
+        {"rule_source_group": "sources", "rules": [remote, {"domain": ["inline.example"]}]},
+        {"rule_group": "policies", "rules": [flat]},
+        {"address": "127.0.0.1:0", "rules": ["policies", {
+            "masks": {"rule_source_group": "sources"}, "action": "block"
+        }], "protocol": {"type": "websocket", "targets": [{
+            "protocol": {"type": "socks"}, "override_rules": [flat]
+        }]}}
+    ]))
+    .unwrap();
+    let mut validated = crate::config::create_server_configs(config).unwrap();
+    assert_eq!(validated.remote_rules.len(), 1);
+    let mut count = 0;
+    crate::config::rule_visit::visit(
+        &mut validated.configs,
+        &mut |rule| {
+            assert!(matches!(
+                rule.action,
+                crate::config::RuleActionConfig::Block
+            ));
+            assert!(rule.criteria.compiled.is_some());
+            count += 1;
+            Ok(())
+        },
+        &mut |_| panic!("unexpanded policy group"),
+    )
+    .unwrap();
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn local_source_reuse_does_not_accept_an_empty_remote_cache() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, br#"{"version":1,"rules":[]}"#);
+    let remote = source("https://example.com/rules.json", &path);
+    let local = RuleSource::from_path(path);
+    let mut compiler = crate::rules::Compiler::default();
+    crate::rule_set::load_source(&local, &mut compiler).unwrap();
+    assert!(
+        crate::rule_set::load_source(&remote, &mut compiler)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("empty remote")
+    );
+}
+
+#[tokio::test]
+async fn existing_remote_cache_errors_and_local_aliases_redact_payloads() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    let source = source("http://127.0.0.1:1/rules?QUERY_SECRET", &path);
+    write_rule(
+        &path,
+        br#"{"version":1,"rules":[{"DOWNLOADED_SECRET":true}]}"#,
+    );
+    let error = crate::config::compile_configs(configs(&source))
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("remote rule data failed validation"),
+        "{error}"
+    );
+    assert!(error.contains(path.to_str().unwrap()), "{error}");
+    assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
+    assert!(!error.contains("QUERY_SECRET"), "{error}");
+
+    write_rule(
+        &path,
+        br#"{"version":1,"rules":[{"domain_regex":["DOWNLOADED_SECRET"]}]}"#,
+    );
+    let alias = dir.path().join("alias.json");
+    symlink(&path, &alias).unwrap();
+    let mut config = configs(&source);
+    config.insert(
+        0,
+        serde_json::from_value(serde_json::json!({
+            "rule_source_group": "alias", "rules": [{
+                "path": alias, "format": "mihomo_text", "behavior": "ipcidr"
+            }]
+        }))
+        .unwrap(),
+    );
+    let error = crate::config::compile_configs(config)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("local rule source overlaps rule_cache_dir"),
+        "{error}"
+    );
+    assert!(!error.contains("DOWNLOADED_SECRET"), "{error}");
+}
+
+#[test]
+fn source_identity_resolves_existing_paths_and_missing_leaf_parents() {
+    use crate::rule_set::source_identity;
+
+    let dir = directory();
+    let parent = dir.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    let alias = dir.path().join("alias");
+    symlink(&parent, &alias).unwrap();
+    let canonical_parent = parent.canonicalize().unwrap();
+
+    write_rule(&parent.join("existing.json"), VALID);
+    for name in ["existing.json", "missing.json"] {
+        assert_eq!(
+            source_identity(&alias.join(name)).unwrap(),
+            canonical_parent.join(name)
+        );
+    }
+    let missing_parent = alias.join("missing/rules.json");
+    assert_eq!(
+        source_identity(&missing_parent).unwrap(),
+        canonical_parent.join("missing/rules.json")
+    );
+    assert_eq!(
+        source_identity(&parent.join("../parent/existing.json")).unwrap(),
+        canonical_parent.join("existing.json")
+    );
+}
+
+#[tokio::test]
+async fn namespace_preflight_rejects_unresolved_parent_traversal_before_creating_resources() {
+    let dir = directory();
+    let cache = dir.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    let missing = dir.path().join("missing");
+    let alias = missing.join("../cache");
+    let path = dir.path().join("config.json");
+    for extra in [
+        serde_json::json!({"certificate_source": "acme", "type": "acme", "domains": ["example.com"],
+            "directory_url": "https://ca.invalid/directory", "state_dir": alias.join("acme"),
+            "challenge": {"type": "tls_alpn01"}}),
+        serde_json::json!({"cache_file_path": alias.join("state")}),
+        serde_json::json!({"dns_group": "dns", "dns_servers": "system", "fake_ip": {"state_file": alias.join("fake")}}),
+        serde_json::json!({"path": alias.join("socket"), "protocol": {"type": "socks"}}),
+    ] {
+        std::fs::write(
+            &path,
+            serde_json::json!([
+                {"global_settings": {"rule_cache_dir": cache}}, extra
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let error = crate::config::load_configs(&[path.to_string_lossy().into_owned()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unresolved parent"), "{error}");
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn managed_tun_state_cannot_be_used_as_a_rule_cache() {
+    let dir = directory();
+    let root = Path::new("/run/shoes");
+    let alias = dir.path().join("managed-state");
+    symlink(root, &alias).unwrap();
+    let namespace = std::fs::metadata("/proc/self/ns/net").unwrap();
+    for extension in ["lock", "json", "pending"] {
+        let name = format!("netns-{}-{}.{extension}", namespace.dev(), namespace.ino());
+        let path = root.join(&name);
+        let before = std::fs::symlink_metadata(&path).ok().map(|m| stamp(&m));
+        let contents = std::fs::read(&path).ok();
+        for directory in [root, alias.as_path()] {
+            let remote = source("https://example.invalid/rules.json", &directory.join(&name));
+            let error =
+                crate::rule_set::validate_remote_paths(&mut configs(&remote), &[]).unwrap_err();
+            assert!(error.to_string().contains("managed TUN state"), "{error}");
+        }
+        assert_eq!(
+            std::fs::symlink_metadata(&path).ok().map(|m| stamp(&m)),
+            before
+        );
+        assert_eq!(std::fs::read(&path).ok(), contents);
+    }
+    let mut empty = vec![cache_config(root.into())];
+    assert!(crate::rule_set::validate_remote_paths(&mut empty, &[]).is_err());
+    let mut separate = vec![cache_config(root.join("rule-cache"))];
+    crate::rule_set::validate_remote_paths(&mut separate, &[]).unwrap();
+}
+
+#[test]
+fn cache_namespace_is_reserved_even_without_remote_sources() {
+    let dir = directory();
+    let cache = dir.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    for extra in [
+        serde_json::json!({"cache_file_path": cache.join("state")}),
+        serde_json::json!({"dns_group": "dns", "dns_servers": "system", "fake_ip": {"state_file": cache.join("fake")}}),
+        serde_json::json!({"pem": "key", "path": cache.join("key.pem")}),
+        serde_json::json!({"path": cache.join("socket"), "protocol": {"type": "socks"}}),
+        serde_json::json!({"rule_source_group": "local", "rules": [{"path": cache.join("missing.json")}]}),
+    ] {
+        let mut configs: Vec<Config> = serde_json::from_value(serde_json::json!([
+            {"global_settings": {"rule_cache_dir": cache}}, extra
+        ]))
+        .unwrap();
+        let error = crate::rule_set::validate_remote_paths(&mut configs, &[]).unwrap_err();
+        assert!(error.to_string().contains("overlap"), "{error}");
+    }
+    let mut configs = vec![cache_config(cache.clone())];
+    assert!(
+        crate::rule_set::validate_remote_paths(&mut configs, &[cache.join("config.yaml")]).is_err()
+    );
+    let alias = cache.join("outside.json");
+    symlink(dir.path().join("outside.json"), &alias).unwrap();
+    configs.push(
+        serde_json::from_value(serde_json::json!({
+            "rule_source_group": "alias", "rules": [{"path": alias}]
+        }))
+        .unwrap(),
+    );
+    assert!(crate::rule_set::validate_remote_paths(&mut configs, &[]).is_err());
+    let outside_alias = dir.path().join("alias");
+    symlink(&cache, &outside_alias).unwrap();
+    let mut configs: Vec<Config> = serde_json::from_value(serde_json::json!([
+        {"global_settings": {"rule_cache_dir": cache}},
+        {"cache_file_path": outside_alias.join("not-created/state")}
+    ]))
+    .unwrap();
+    assert!(crate::rule_set::validate_remote_paths(&mut configs, &[]).is_err());
+}
+
+#[test]
+fn remote_declarations_require_one_root_and_direct_unreserved_children() {
+    let dir = directory();
+    let root = dir.path().join("cache");
+    for name in [
+        "../outside.json",
+        "nested/rules.json",
+        "owner.lock",
+        "OWNER.LOCK",
+        "Owner.Lock",
+        "rules.json.shoes-update.lock",
+        "rules.json.SHOES-UPDATE.LOCK",
+        "rules.json.shoes-update.tmp",
+        "rules.json.Shoes-Update.Tmp",
+    ] {
+        let remote = source("https://example.com/rules.json", &root.join(name));
+        let mut config = configs(&remote);
+        config[0] = cache_config(root.clone());
+        assert!(
+            crate::rule_set::validate_remote_paths(&mut config, &[]).is_err(),
+            "{name}"
+        );
+    }
+    let remote = source("https://example.com/rules.json", &root.join("rules.json"));
+    let mut config = configs(&remote);
+    crate::rule_set::validate_remote_paths(&mut config, &[]).unwrap();
+    let mut duplicate = config.clone();
+    duplicate.push(cache_config(root));
+    assert!(crate::rule_set::validate_remote_paths(&mut duplicate, &[]).is_err());
+    config.remove(0);
+    assert!(
+        crate::rule_set::validate_remote_paths(&mut config, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("omit path")
+    );
+    crate::rule_set::visit_sources(&mut config, &mut |source| {
+        source.path.clear();
+        Ok(())
+    })
+    .unwrap();
+    crate::rule_set::validate_remote_paths(&mut config, &[]).unwrap();
+}
+
+#[test]
+fn managed_root_cannot_intersect_acme_state_in_either_direction() {
+    let dir = directory();
+    let root = dir.path().join("cache");
+    for state in [dir.path().to_path_buf(), root.clone(), root.join("acme")] {
+        let mut configs: Vec<Config> = serde_json::from_value(serde_json::json!([
+            {"global_settings": {"rule_cache_dir": root}},
+            {"certificate_source": "acme", "type": "acme", "domains": ["example.com"],
+             "directory_url": "https://ca.invalid/directory", "state_dir": state,
+             "challenge": {"type": "tls_alpn01"}}
+        ]))
+        .unwrap();
+        let error = crate::rule_set::validate_remote_paths(&mut configs, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("ACME state directory"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn normalized_sources_preserve_url_format_hints_without_retaining_delivery_secrets() {
+    let dir = directory();
+    let path = dir.path().join("cache.txt");
+    write_rule(&path, VALID);
+    let mut remote = source("https://example.com/rules.json?SECRET", &path);
+    remote.format = None;
+    let mut validated = crate::config::compile_configs(configs(&remote))
+        .await
+        .unwrap();
+    assert_eq!(validated.remote_rules.len(), 1);
+    crate::rule_set::visit_sources(&mut validated.configs, &mut |source| {
+        assert!(source.url.is_none());
+        assert!(source.download.is_none());
+        assert!(source.update_interval.is_none());
+        Ok(())
+    })
+    .unwrap();
+    assert!(validated.reload_files.is_empty());
+}
+
+#[test]
+fn bootstrap_guards_include_declared_and_retained_ranges_without_runtime_state() {
+    let configs: Vec<Config> = serde_json::from_value(serde_json::json!([
+        {"dns_group": "unavailable", "dns_servers": "system", "fake_ip": {"state_file": "/unavailable/state"}},
+        {"address": "10.12.0.1", "netmask": "255.255.255.0", "device_name": "tun0", "rules": "allow-all-direct"}
+    ])).unwrap();
+    let dns = DnsRegistry::for_rule_bootstrap(
+        &configs,
+        &["203.0.113.0/24".parse().unwrap()],
+        GlobalLimits::default(),
+    )
+    .unwrap();
+    assert!(
+        dns.forbidden_ranges()
+            .iter()
+            .any(|range| range.contains("198.18.0.53".parse::<std::net::IpAddr>().unwrap()))
+    );
+    assert!(dns.get_by_name("unavailable").is_none());
+    assert!(
+        dns.forbidden_ranges()
+            .iter()
+            .any(|range| range.contains("203.0.113.1".parse().unwrap()))
+    );
+}
+
+#[tokio::test]
+async fn caches_cannot_overwrite_config_pem_state_or_other_source_files() {
+    let dir = directory();
+    let path = dir.path().join("cache.json");
+    write_rule(&path, VALID);
+    let source = source("https://example.com/rules.json", &path);
+    for extra in [
+        serde_json::json!({"cache_file_path": path}),
+        serde_json::json!({"dns_group": "dns", "dns_servers": "system", "fake_ip": {"state_file": path}}),
+        serde_json::json!({"path": path, "protocol": {"type": "socks"}}),
+        serde_json::json!({"rule_source_group": "other", "rules": [{"path": stage_path(&path)}]}),
+    ] {
+        let mut config = configs(&source);
+        config.push(serde_json::from_value(extra).unwrap());
+        assert!(
+            crate::config::compile_configs(config)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("overlap")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    }
+    let mut config = configs(&source);
+    config.push(serde_json::from_value(serde_json::json!({"pem": "pem", "path": path})).unwrap());
+    assert!(
+        crate::config::convert_cert_paths(config)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("overlap")
+    );
+    // Declaring-file protection runs before any rule decoding or networking.
+    std::fs::write(&path, serde_json::to_vec(&configs(&source)).unwrap()).unwrap();
+    assert!(
+        crate::config::load_configs(&[path.to_str().unwrap().into()])
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("overlap")
+    );
+}

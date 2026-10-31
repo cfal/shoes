@@ -6,7 +6,7 @@ use crate::option_util::OneOrSome;
 
 use super::client::ClientConfig;
 use super::dns::DnsConfigGroup;
-use super::global::GlobalLimits;
+use super::global::GlobalSettings;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;
 use super::server::ServerConfig;
@@ -34,28 +34,6 @@ pub enum GroupType {
     RoundRobin,
     Selector,
     UrlTest(UrlTestConfig),
-    Fallback {
-        health_check: HealthCheckConfig,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HealthCheckConfig {
-    pub url: String,
-    pub interval_secs: u64,
-    #[serde(default = "health_timeout")]
-    pub timeout_ms: u64,
-    #[serde(default = "health_status")]
-    pub expected_status: u16,
-}
-
-fn health_timeout() -> u64 {
-    5000
-}
-
-fn health_status() -> u16 {
-    204
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -81,14 +59,6 @@ struct RawClientGroup {
     timeout: Option<u64>,
     tolerance: Option<u16>,
     lazy: Option<bool>,
-    #[serde(default, deserialize_with = "health_check_if_present")]
-    health_check: Option<HealthCheckConfig>,
-}
-
-fn health_check_if_present<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<HealthCheckConfig>, D::Error> {
-    HealthCheckConfig::deserialize(deserializer).map(Some)
 }
 
 fn default_group_type() -> String {
@@ -103,9 +73,6 @@ impl TryFrom<RawClientGroup> for ClientConfigGroup {
         if kind != "selector" && raw.default.is_some() {
             return Err("default is only valid for selector groups".into());
         }
-        if kind != "fallback" && raw.health_check.is_some() {
-            return Err("health_check requires type: fallback".into());
-        }
         if kind != "url-test"
             && (raw.url.is_some()
                 || raw.interval.is_some()
@@ -118,11 +85,6 @@ impl TryFrom<RawClientGroup> for ClientConfigGroup {
         let group_type = match kind {
             "round-robin" => GroupType::RoundRobin,
             "selector" => GroupType::Selector,
-            "fallback" => {
-                let health_check = raw.health_check.ok_or("fallback requires health_check")?;
-                health_check.validate().map_err(|error| error.to_string())?;
-                GroupType::Fallback { health_check }
-            }
             "url-test" => {
                 let config = UrlTestConfig {
                     url: raw.url.ok_or("url-test requires url")?,
@@ -163,7 +125,7 @@ impl UrlTestConfig {
             ]),
             true,
         )?
-        .validate_automatic_target("url-test URL")
+        .validate_automatic_target()
     }
 }
 
@@ -173,7 +135,7 @@ mod group_type_tests {
     use serde_json::json;
 
     #[test]
-    fn review_automatic_policy_errors_keep_group_specific_labels() {
+    fn automatic_policy_errors_name_url_test() {
         let automatic = UrlTestConfig {
             url: "http://127.0.0.1/".into(),
             interval: 30,
@@ -187,132 +149,48 @@ mod group_type_tests {
             error.to_string(),
             "url-test URL is denied by probe destination policy"
         );
-        let fallback = HealthCheckConfig {
-            url: automatic.url,
-            interval_secs: 30,
-            timeout_ms: 1000,
-            expected_status: 204,
-        };
-        let error = fallback.validate().unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(
-            error.to_string(),
-            "fallback URL is denied by probe destination policy"
+    }
+
+    #[test]
+    fn removed_fallback_type_and_health_check_are_rejected() {
+        let base = json!({"client_group":"out", "type":"fallback", "client_proxies":["direct"]});
+        let error = serde_json::from_value::<ClientConfigGroup>(base.clone()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown client group type: fallback")
         );
-    }
-
-    #[test]
-    fn health_review9_invalid_probe_settings_name_health_check_fields() {
-        for (url, timeout_ms) in [
-            ("ftp://probe.invalid/", 1000),
-            ("http://probe.invalid/", 32768),
-        ] {
-            let check = HealthCheckConfig {
-                url: url.into(),
-                interval_secs: 30,
-                timeout_ms,
-                expected_status: 204,
-            };
-            let error = check.validate().unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-            assert_eq!(
-                error.to_string(),
-                "health_check url must be HTTP(S), at most 2048 bytes, without credentials or fragments; timeout_ms must be 1..32767"
-            );
-        }
-    }
-
-    #[test]
-    fn fallback_round_trips_with_type_and_rejects_legacy_or_incompatible_fields() {
-        let raw = json!({"client_group":"out", "type":"fallback",
-            "health_check":{"url":"https://probe.invalid/", "interval_secs":30},
-            "client_proxies":["direct"]});
-        let group: ClientConfigGroup = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(
-            group.group_type,
-            GroupType::Fallback {
-                health_check: HealthCheckConfig {
-                    url: "https://probe.invalid/".into(),
-                    interval_secs: 30,
-                    timeout_ms: 5000,
-                    expected_status: 204,
+        for kind in ["fallback", "round-robin", "selector", "url-test"] {
+            for check in [
+                None,
+                Some(json!(null)),
+                Some(json!({
+                    "url":"https://probe.invalid/", "interval_secs":30
+                })),
+            ] {
+                let mut raw = base.clone();
+                raw["type"] = json!(kind);
+                if kind == "url-test" {
+                    raw["url"] = json!("https://probe.invalid/");
                 }
-            }
-        );
-        let encoded = serde_json::to_value(&group).unwrap();
-        assert_eq!(encoded["type"], "fallback");
-        assert!(encoded.get("strategy").is_none());
-        assert_eq!(
-            serde_json::from_value::<ClientConfigGroup>(encoded)
-                .unwrap()
-                .group_type,
-            group.group_type
-        );
-        let yaml = serde_yaml::to_string(&group).unwrap();
-        assert!(yaml.contains("type: fallback"));
-        assert_eq!(
-            serde_yaml::from_str::<ClientConfigGroup>(&yaml)
-                .unwrap()
-                .group_type,
-            group.group_type
-        );
-        for (field, value) in [
-            ("strategy", json!("fallback")),
-            ("default", json!("DIRECT")),
-            ("url", json!("https://probe.invalid/")),
-            ("interval", json!(30)),
-            ("timeout", json!(5000)),
-            ("tolerance", json!(50)),
-            ("lazy", json!(false)),
-            ("health_check", json!(null)),
-            ("all_down", json!("direct")),
-        ] {
-            let mut invalid = raw.clone();
-            invalid[field] = value;
-            assert!(
-                serde_json::from_value::<ClientConfigGroup>(invalid.clone()).is_err(),
-                "{invalid}"
-            );
-        }
-        let mut legacy = raw.clone();
-        legacy.as_object_mut().unwrap().remove("type");
-        legacy["strategy"] = json!("fallback");
-        assert!(serde_json::from_value::<ClientConfigGroup>(legacy).is_err());
-        for kind in ["round-robin", "selector", "url-test"] {
-            let mut invalid = raw.clone();
-            invalid["type"] = json!(kind);
-            if kind == "url-test" {
-                invalid["url"] = json!("https://probe.invalid/");
-            }
-            assert!(
-                serde_json::from_value::<ClientConfigGroup>(invalid).is_err(),
-                "{kind}"
-            );
-        }
-    }
-
-    #[test]
-    fn health_review3_null_checks_are_rejected_for_every_group_type() {
-        for kind in ["round-robin", "selector", "url-test", "fallback"] {
-            let mut raw = json!({"client_group":"out", "type":kind,
-                "client_proxies":["direct"], "health_check":null});
-            if kind == "url-test" {
-                raw["url"] = json!("http://probe.invalid/");
-            }
-            assert!(
-                serde_json::from_value::<ClientConfigGroup>(raw.clone()).is_err(),
-                "JSON {kind}"
-            );
-            assert!(
-                serde_yaml::from_str::<ClientConfigGroup>(&serde_yaml::to_string(&raw).unwrap())
+                let rejected = kind == "fallback" || check.is_some();
+                if let Some(check) = check {
+                    raw["health_check"] = check;
+                }
+                assert_eq!(
+                    serde_json::from_value::<ClientConfigGroup>(raw.clone()).is_err(),
+                    rejected,
+                    "JSON {raw}"
+                );
+                assert_eq!(
+                    serde_yaml::from_str::<ClientConfigGroup>(
+                        &serde_yaml::to_string(&raw).unwrap()
+                    )
                     .is_err(),
-                "YAML {kind}"
-            );
-            raw.as_object_mut().unwrap().remove("health_check");
-            assert_eq!(
-                serde_json::from_value::<ClientConfigGroup>(raw).is_ok(),
-                kind != "fallback"
-            );
+                    rejected,
+                    "YAML {raw}"
+                );
+            }
         }
     }
 
@@ -431,70 +309,101 @@ mod group_type_tests {
 #[serde(deny_unknown_fields)]
 pub struct RuleConfigGroup {
     pub rule_group: String,
-    #[serde(alias = "rule")]
-    pub rules: RuleGroupRules,
+    #[serde(alias = "rule", deserialize_with = "policy_rules")]
+    pub rules: OneOrSome<RuleConfig>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum RuleGroupRules {
-    Policies(Box<OneOrSome<RuleConfig>>),
-    Sources(OneOrSome<crate::rule_set::RuleSource>),
-}
+fn policy_rules<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<OneOrSome<RuleConfig>, D::Error> {
+    use serde::de::Error;
+    use serde_yaml::Value;
 
-impl<'de> Deserialize<'de> for RuleGroupRules {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        use serde_yaml::Value;
-
-        let value = Value::deserialize(deserializer)?;
-        let is_list = value.is_sequence();
-        let values = match value {
-            Value::Sequence(values) => values,
-            value => vec![value],
-        };
-        if values.is_empty() {
-            return Err(Error::custom("rule group cannot be empty"));
-        }
-        let mut policies = Vec::new();
-        let mut sources = Vec::new();
-        for (index, value) in values.into_iter().enumerate() {
-            let context = |error| {
-                if is_list {
-                    D::Error::custom(format!("rules[{index}]: {error}"))
-                } else {
-                    D::Error::custom(format!("rules: {error}"))
-                }
-            };
-            match value {
-                Value::String(path) => {
-                    sources.push(crate::rule_set::RuleSource::from_path(path.into()))
-                }
-                Value::Mapping(ref fields) if fields.contains_key("path") => {
-                    sources.push(serde_yaml::from_value(value).map_err(context)?);
-                }
-                value => policies.push(serde_yaml::from_value(value).map_err(context)?),
-            }
-        }
-        if !policies.is_empty() && !sources.is_empty() {
-            return Err(Error::custom(
-                "rule group cannot mix policies with file sources",
-            ));
-        }
-        if sources.is_empty() {
-            Ok(Self::Policies(Box::new(if is_list {
-                OneOrSome::Some(policies)
-            } else {
-                OneOrSome::One(policies.pop().unwrap())
-            })))
-        } else {
-            Ok(Self::Sources(if is_list {
-                OneOrSome::Some(sources)
-            } else {
-                OneOrSome::One(sources.pop().unwrap())
-            }))
-        }
+    let value = Value::deserialize(deserializer)?;
+    let is_list = value.is_sequence();
+    let values = match value {
+        Value::Sequence(values) => values,
+        value => vec![value],
+    };
+    if values.is_empty() {
+        return Err(Error::custom("rule group cannot be empty"));
     }
+    let mut policies = Vec::new();
+    for (index, value) in values.into_iter().enumerate() {
+        let context = |error| {
+            if is_list {
+                D::Error::custom(format!("rules[{index}]: {error}"))
+            } else {
+                D::Error::custom(format!("rules: {error}"))
+            }
+        };
+        let policy = if value.is_string() {
+            Err(serde_yaml::Error::custom(
+                "action-free file sources moved to rule_source_group; rule_group requires policy objects",
+            ))
+        } else {
+            serde_yaml::from_value(value)
+        };
+        policies.push(policy.map_err(context)?);
+    }
+    Ok(if is_list {
+        OneOrSome::Some(policies)
+    } else {
+        OneOrSome::One(policies.pop().unwrap())
+    })
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleSourceGroup {
+    pub rule_source_group: String,
+    #[serde(
+        alias = "rule",
+        deserialize_with = "source_rules",
+        serialize_with = "serialize_source_rules"
+    )]
+    pub rules: Vec<crate::rules::Expression>,
+}
+
+fn source_rules<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<crate::rules::Expression>, D::Error> {
+    use serde::de::Error;
+    use serde_json::Value;
+    let value = Value::deserialize(deserializer)?;
+    let is_list = value.is_array();
+    let values = match value {
+        Value::Array(values) => values,
+        value => vec![value],
+    };
+    if values.is_empty() {
+        return Err(Error::custom("rule source group cannot be empty"));
+    }
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| match value {
+            Value::String(path) => Ok(crate::rules::Expression::Source(
+                crate::rule_set::RuleSource::from_path(path.into()),
+            )),
+            value => crate::rules::Expression::from_config(value).map_err(|error| {
+                if is_list {
+                    Error::custom(format!("rules[{index}]: {error}"))
+                } else {
+                    Error::custom(format!("rules: {error}"))
+                }
+            }),
+        })
+        .collect()
+}
+
+fn serialize_source_rules<S: serde::Serializer>(
+    rules: &[crate::rules::Expression],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde_json::to_value(rules)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
 }
 
 #[derive(Debug, Clone)]
@@ -617,13 +526,14 @@ pub enum Config {
     ClashApi(super::ClashApiConfig),
     CacheFile(super::CacheFileConfig),
     CertificateSource(crate::certificates::NamedSource),
-    GlobalLimits(GlobalLimits),
+    GlobalSettings(GlobalSettings),
     Server(ServerConfig),
     /// TUN device server - accepts IP packets from a TUN device.
     /// This is separate from Server because TUN doesn't use bind_location or transport.
     TunServer(TunConfig),
     ClientConfigGroup(ClientConfigGroup),
     RuleConfigGroup(RuleConfigGroup),
+    RuleSourceGroup(RuleSourceGroup),
     DnsConfigGroup(DnsConfigGroup),
     NamedPem(NamedPem),
 }
@@ -644,6 +554,30 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             Error::custom("Expected a YAML mapping for Config, but found a different type")
         })?;
 
+        if map.contains_key("rule_cache_dir") {
+            return Err(Error::custom(
+                "rule_cache_dir must be inside global_settings",
+            ));
+        }
+        if map.contains_key("global_settings") || map.contains_key("global_limits") {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct GlobalSettingsEntry {
+                #[serde(alias = "global_limits")]
+                global_settings: Option<GlobalSettings>,
+            }
+            let legacy = map.contains_key("global_limits");
+            let entry = serde_yaml::from_value::<GlobalSettingsEntry>(value)
+                .map_err(|e| Error::custom(format!("invalid global settings: {e}")))?;
+            if legacy {
+                log::warn!(
+                    "global_limits will be deprecated in the next version; rename it to global_settings"
+                );
+            }
+            return Ok(Config::GlobalSettings(
+                entry.global_settings.unwrap_or_default(),
+            ));
+        }
         if map.contains_key("clash_api_address") || map.contains_key("clash_api_path") {
             return serde_yaml::from_value(value)
                 .map(Config::ClashApi)
@@ -674,17 +608,8 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         // Try to determine which variant based on fields
         if map.contains_key(Value::String("rule_set".to_string())) {
             Err(Error::custom(
-                "rule_set was replaced by rule_group with file paths in rules",
+                "rule_set was replaced by rule_source_group with file paths in rules",
             ))
-        } else if map.contains_key(Value::String("global_limits".to_string())) {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct GlobalLimitsEntry {
-                global_limits: Option<GlobalLimits>,
-            }
-            serde_yaml::from_value::<GlobalLimitsEntry>(value)
-                .map(|entry| Config::GlobalLimits(entry.global_limits.unwrap_or_default()))
-                .map_err(|e| Error::custom(format!("invalid global limits: {e}")))
         } else if map.contains_key("certificate_source") {
             serde_yaml::from_value(value)
                 .map(Config::CertificateSource)
@@ -701,6 +626,10 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             serde_yaml::from_value(value)
                 .map(Config::ClientConfigGroup)
                 .map_err(|e| Error::custom(format!("invalid client config group: {e}")))
+        } else if map.contains_key("rule_source_group") {
+            serde_yaml::from_value(value)
+                .map(Config::RuleSourceGroup)
+                .map_err(|e| Error::custom(format!("invalid rule source group: {e}")))
         } else if has_rule_group {
             // RuleConfigGroup
             serde_yaml::from_value(value)
@@ -734,7 +663,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                 - Client config group: must have 'client_group' field\n\
                 - Rule config group: must have 'rule_group' field\n\
                 - DNS config group: must have 'dns_group' field\n\
-                - Global limits: must have 'global_limits' field"
+                - Global settings: must have 'global_settings' field"
             )))
         }
     }
@@ -749,16 +678,17 @@ impl serde::ser::Serialize for Config {
             Config::ClashApi(config) => config.serialize(serializer),
             Config::CacheFile(config) => config.serialize(serializer),
             Config::CertificateSource(source) => source.serialize(serializer),
-            Config::GlobalLimits(limits) => {
+            Config::GlobalSettings(settings) => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("global_limits", limits)?;
+                map.serialize_entry("global_settings", settings)?;
                 map.end()
             }
             Config::Server(server) => server.serialize(serializer),
             Config::TunServer(tun) => tun.serialize(serializer),
             Config::ClientConfigGroup(group) => group.serialize(serializer),
             Config::RuleConfigGroup(group) => group.serialize(serializer),
+            Config::RuleSourceGroup(group) => group.serialize(serializer),
             Config::DnsConfigGroup(group) => group.serialize(serializer),
             Config::NamedPem(pem) => pem.serialize(serializer),
         }

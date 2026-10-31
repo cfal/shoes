@@ -30,6 +30,10 @@ mod fake_dns;
 mod rule_sets;
 
 #[cfg(unix)]
+#[path = "cases/process_contract/remote_rules.rs"]
+mod remote_rules;
+
+#[cfg(unix)]
 #[path = "cases/process_contract/clash_api.rs"]
 mod clash_api;
 
@@ -39,9 +43,6 @@ mod config_tooling;
 #[cfg(unix)]
 #[path = "cases/process_contract/certificates.rs"]
 mod certificates;
-#[cfg(unix)]
-#[path = "cases/process_contract/health.rs"]
-mod health;
 
 #[cfg(unix)]
 #[path = "cases/process_contract/file_logging.rs"]
@@ -563,8 +564,12 @@ impl Process {
     }
 
     async fn wait_for(&mut self, marker: &str) {
+        self.wait_for_timeout(marker, Duration::from_secs(8)).await;
+    }
+
+    async fn wait_for_timeout(&mut self, marker: &str, duration: Duration) {
         let mut seen = String::new();
-        let result = timeout(Duration::from_secs(8), async {
+        let result = timeout(duration, async {
             while let Some(line) = self.lines.recv().await {
                 seen.push_str(&line);
                 seen.push('\n');
@@ -702,7 +707,7 @@ async fn tun_worker_failure_exits_nonzero_and_releases_other_listeners() {
 
 fn forward(address: SocketAddr, target: SocketAddr) -> String {
     format!(
-        "- global_limits: {{reload_grace_secs: 2}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{target}'\n"
+        "- global_settings: {{reload_grace_secs: 2}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{target}'\n"
     )
 }
 
@@ -1189,7 +1194,7 @@ async fn connection_budget_changes_only_with_accepted_reloads_and_counts_drainin
     let address = available_address();
     let config = |max_connections: usize| {
         format!(
-            "- global_limits: {{max_connections: {max_connections}, reload_grace_secs: 60}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{}'\n",
+            "- global_settings: {{max_connections: {max_connections}, reload_grace_secs: 60}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{}'\n",
             echo.local_addr()
         )
     };

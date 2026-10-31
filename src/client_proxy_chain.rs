@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use log::debug;
 
-use crate::address::ResolvedLocation;
+use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::control::catalog::{MemberOrigin, RuleDescription};
 use crate::control::connection_notes::{self, Phase};
@@ -34,9 +34,6 @@ use crate::tcp::carrier_dialer::{CarrierDialer, QuicCarrier, RouteKey};
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
-
-#[cfg(test)]
-mod health_tests;
 
 /// Entry in the initial hop (hop 0) pool.
 ///
@@ -95,7 +92,6 @@ pub struct ClientProxyChain {
     origins: Vec<Vec<Option<MemberOrigin>>>,
     selection: Option<Arc<crate::control::selection::SelectionView>>,
     selector_hops: Vec<bool>,
-    health_paths: Vec<HealthPath>,
     /// Initial hop pool: each entry is either Direct or Proxy.
     /// Socket and proxy are paired and selected together.
     initial_hop: Vec<Arc<InitialHopEntry>>,
@@ -120,11 +116,6 @@ pub struct ClientProxyChain {
     udp_uses_initial_hop: bool,
 }
 
-struct HealthPath {
-    indices: Vec<usize>,
-    checks: Vec<Arc<crate::control::health::ProbeJob>>,
-}
-
 impl std::fmt::Debug for ClientProxyChain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientProxyChain")
@@ -144,6 +135,25 @@ impl std::fmt::Debug for ClientProxyChain {
 }
 
 impl ClientProxyChain {
+    #[cfg(unix)]
+    pub(crate) fn tcp_selection_indices(&self) -> Vec<u32> {
+        std::iter::once(&self.initial_hop_next_index)
+            .chain(&self.subsequent_next_indices)
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn restore_tcp_selection_indices(&mut self, indices: &[u32]) {
+        assert_eq!(indices.len(), self.num_hops());
+        for (counter, index) in std::iter::once(&mut self.initial_hop_next_index)
+            .chain(&mut self.subsequent_next_indices)
+            .zip(indices)
+        {
+            *counter.get_mut() = *index;
+        }
+    }
+
     fn needs_carrier_dialer(&self) -> bool {
         self.initial_hop.iter().any(|entry| matches!(entry.as_ref(), InitialHopEntry::Proxy { proxy, .. } if proxy.needs_carrier_dialer()))
             || self.subsequent_hops.iter().flatten().any(|proxy| proxy.needs_carrier_dialer())
@@ -162,6 +172,7 @@ impl ClientProxyChain {
             initial: Some(self.initial_hop[initial_index].clone()),
             subsequent,
             resolver: resolver.clone(),
+            pinned_proxies: None,
         }
     }
 
@@ -174,7 +185,7 @@ impl ClientProxyChain {
             .iter()
             .flatten()
             .flatten()
-            .find(|origin| origin.has_selector() || origin.has_fallback())
+            .find(|origin| origin.has_selector())
             .map(|origin| origin.selection.clone());
         self.origins = origins;
         self
@@ -185,9 +196,6 @@ impl ClientProxyChain {
             .selection
             .as_ref()
             .map(|selection| selection.snapshot());
-        if !self.health_paths.is_empty() {
-            return self.select_healthy(udp, choices.as_deref().unwrap());
-        }
         (0..self.num_hops())
             .map(|hop| {
                 let final_udp = udp && hop + 1 == self.num_hops();
@@ -313,266 +321,6 @@ impl ClientProxyChain {
         }
     }
 
-    pub(crate) fn with_health(
-        mut self,
-        hops: &[Vec<crate::config::ClientConfig>],
-        size: usize,
-        resolver: Arc<dyn Resolver>,
-    ) -> std::io::Result<Self> {
-        let selection = self.selection.as_ref().unwrap().clone();
-        let identities: Vec<Vec<_>> = hops
-            .iter()
-            .map(|pool| {
-                pool.iter()
-                    .map(|client| {
-                        let mut nested_origins = Vec::new();
-                        crate::config::client_visit::visit_client(
-                            &mut client.clone(),
-                            &mut |nested| {
-                                nested_origins.push(nested.control.clone());
-                                Ok(())
-                            },
-                        )?;
-                        // visit_client is post-order: exclude the root, retain nested carrier paths.
-                        nested_origins.pop();
-                        let nested_paths: Vec<_> = nested_origins
-                            .iter()
-                            .map(|origin| {
-                                origin
-                                    .as_ref()
-                                    .map(MemberOrigin::policy_path)
-                                    .unwrap_or_default()
-                            })
-                            .collect();
-                        let dynamic_selectors: Vec<_> = nested_origins
-                            .iter()
-                            .flatten()
-                            .map(MemberOrigin::manual_selector_path)
-                            .filter(|path| !path.is_empty())
-                            .collect();
-                        let mut value = serde_json::to_value((client, nested_paths))
-                            .map_err(std::io::Error::other)?;
-                        value.sort_all_objects();
-                        Ok((value, dynamic_selectors))
-                    })
-                    .collect()
-            })
-            .collect::<std::io::Result<_>>()?;
-        // Enumerate configured path order, with the last hop varying fastest.
-        for ordinal in 0..size {
-            let mut remaining = ordinal;
-            let mut indices = vec![0; hops.len()];
-            for hop in (0..hops.len()).rev() {
-                indices[hop] = remaining % hops[hop].len();
-                remaining /= hops[hop].len();
-            }
-            let path_identities: Vec<_> = indices
-                .iter()
-                .enumerate()
-                .map(|(hop, index)| &identities[hop][*index].0)
-                .collect();
-            let mut dynamic_selectors: Vec<_> = indices
-                .iter()
-                .enumerate()
-                .flat_map(|(hop, index)| identities[hop][*index].1.iter().cloned())
-                .collect();
-            dynamic_selectors.sort_unstable();
-            dynamic_selectors.dedup();
-            let fingerprint = *blake3::hash(
-                &serde_json::to_vec(&path_identities).map_err(std::io::Error::other)?,
-            )
-            .as_bytes();
-            let mut checks = Vec::new();
-            let origins: Vec<_> = indices
-                .iter()
-                .enumerate()
-                .filter_map(|(hop, index)| self.origin(hop, *index))
-                .collect();
-            let selectors = origins
-                .iter()
-                .flat_map(|origin| origin.manual_selector_path())
-                .collect::<Vec<_>>();
-            let definitions = origins
-                .iter()
-                .flat_map(|origin| &origin.path)
-                .filter_map(|(group, _)| selection.health.definitions.get(group));
-            for definition in definitions {
-                let job = selection.health.register(
-                    fingerprint,
-                    &definition.check,
-                    resolver.clone(),
-                    selectors.clone(),
-                    dynamic_selectors.clone(),
-                    || self.pinned(&indices),
-                )?;
-                if !checks.iter().any(|existing| Arc::ptr_eq(existing, &job)) {
-                    checks.push(job);
-                }
-            }
-            self.health_paths.push(HealthPath { indices, checks });
-        }
-        Ok(self)
-    }
-
-    fn pinned(&self, indices: &[usize]) -> Self {
-        // Probe chains are TCP-only and already selected; no policy or UDP metadata is needed.
-        Self {
-            origins: Vec::new(),
-            selection: None,
-            selector_hops: Vec::new(),
-            health_paths: Vec::new(),
-            initial_hop: vec![self.initial_hop[indices[0]].clone()],
-            initial_hop_next_index: AtomicU32::new(0),
-            subsequent_hops: self
-                .subsequent_hops
-                .iter()
-                .enumerate()
-                .map(|(hop, pool)| vec![pool[indices[hop + 1]].clone()])
-                .collect(),
-            subsequent_next_indices: self
-                .subsequent_hops
-                .iter()
-                .map(|_| AtomicU32::new(0))
-                .collect(),
-            udp_final_hop_indices: Vec::new(),
-            udp_final_hop_next_index: AtomicU32::new(0),
-            udp_uses_initial_hop: self.udp_uses_initial_hop,
-        }
-    }
-
-    fn select_healthy(
-        &self,
-        udp: bool,
-        choices: &crate::control::selection::Choices,
-    ) -> std::io::Result<Vec<usize>> {
-        use crate::control::health::Health;
-        let selection = self.selection.as_ref().unwrap();
-        let now = selection.health.sample_time();
-        let mut samples = std::collections::HashMap::new();
-        let mut has_compatible_path = false;
-        // One health/selection snapshot for the entire flow, including every prefix.
-        let mut candidates: Vec<_> = self
-            .health_paths
-            .iter()
-            .filter_map(|path| {
-                if udp
-                    && !self
-                        .udp_final_hop_indices
-                        .contains(path.indices.last().unwrap())
-                {
-                    return None;
-                }
-                if !path.indices.iter().enumerate().all(|(hop, index)| {
-                    self.origin(hop, *index)
-                        .is_none_or(|origin| origin.allowed(choices))
-                }) {
-                    return None;
-                }
-                has_compatible_path = true;
-                let mut fully_healthy = true;
-                for check in &path.checks {
-                    match *samples
-                        .entry(Arc::as_ptr(check))
-                        .or_insert_with(|| check.health(choices, now))
-                    {
-                        Health::Healthy => {}
-                        Health::Unknown => fully_healthy = false,
-                        Health::Failed | Health::Stale => return None,
-                    }
-                }
-                Some((path, fully_healthy))
-            })
-            .collect();
-        if !has_compatible_path {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "selected branch cannot carry this flow",
-            ));
-        }
-        if candidates.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "fallback has no healthy or unknown eligible path",
-            ));
-        }
-        let definitions = &selection.health.definitions;
-        // Resolve fallback priorities across complete paths before latency or pool choices
-        // can discard a healthy candidate. Paths outside each fallback branch remain eligible.
-        for hop in 0..self.num_hops() {
-            let mut branches = Vec::new();
-            for origin in self.origins[hop].iter().flatten() {
-                for (depth, (group, _)) in origin.path.iter().enumerate() {
-                    if definitions.contains_key(group) {
-                        let branch = (&origin.path[..depth], group);
-                        if !branches.contains(&branch) {
-                            branches.push(branch);
-                        }
-                    }
-                }
-            }
-            for (prefix, group) in branches {
-                let member = |path: &HealthPath| {
-                    let origin = self.origin(hop, path.indices[hop])?;
-                    let (name, member) = origin.path.get(prefix.len())?;
-                    (origin.path.starts_with(prefix) && name == group).then_some(member.as_str())
-                };
-                let definition = &definitions[group];
-                let first_member = |require_healthy| {
-                    definition.members.iter().find(|name| {
-                        candidates.iter().any(|(path, fully_healthy)| {
-                            *fully_healthy == require_healthy && member(path) == Some(name.as_str())
-                        })
-                    })
-                };
-                let preferred = first_member(true)
-                    .map(|member| (member, true))
-                    .or_else(|| first_member(false).map(|member| (member, false)));
-                if let Some((preferred, require_healthy)) = preferred {
-                    candidates.retain(|(path, fully_healthy)| {
-                        let Some(name) = member(path) else {
-                            return true;
-                        };
-                        name == preferred && (!require_healthy || *fully_healthy)
-                    });
-                }
-            }
-        }
-        let mut result = Vec::with_capacity(self.num_hops());
-        for hop in 0..self.num_hops() {
-            if !selection.automatic.0.is_empty() {
-                let mut indices: Vec<_> = candidates
-                    .iter()
-                    .map(|(path, _)| path.indices[hop])
-                    .collect();
-                indices.sort_unstable();
-                indices.dedup();
-                selection.automatic.filter(
-                    &self.origins[hop],
-                    &mut indices,
-                    udp && hop + 1 == self.num_hops(),
-                );
-                candidates.retain(|(path, _)| indices.contains(&path.indices[hop]));
-            }
-            let mut indices: Vec<_> = candidates
-                .iter()
-                .map(|(path, _)| path.indices[hop])
-                .collect();
-            indices.sort_unstable();
-            indices.dedup();
-            let counter = if udp && hop + 1 == self.num_hops() {
-                &self.udp_final_hop_next_index
-            } else if hop == 0 {
-                &self.initial_hop_next_index
-            } else {
-                &self.subsequent_next_indices[hop - 1]
-            };
-            let index = indices[counter.fetch_add(1, Ordering::Relaxed) as usize % indices.len()];
-            candidates.retain(|(path, _)| path.indices[hop] == index);
-            result.push(index);
-        }
-        Ok(result)
-    }
-
     fn route_names(&self, indices: &[usize]) -> Vec<String> {
         indices
             .iter()
@@ -634,7 +382,6 @@ impl ClientProxyChain {
             origins: Vec::new(),
             selection: None,
             selector_hops: Vec::new(),
-            health_paths: Vec::new(),
             initial_hop: initial_hop.into_iter().map(Arc::new).collect(),
             initial_hop_next_index: AtomicU32::new(0),
             subsequent_hops: subsequent_hops
@@ -686,6 +433,43 @@ impl ClientProxyChain {
     ) -> std::io::Result<TcpClientSetupResult> {
         self.connect_tcp_observed(remote_location, resolver, None)
             .await
+    }
+
+    pub(crate) async fn connect_tcp_pinned(
+        &self,
+        target: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let indices = self.select_indices(false)?;
+        self.with_route_activity(&indices, async {
+            let mut route = self.selected_route(resolver, &indices);
+            let initial = match route.initial.as_deref() {
+                Some(InitialHopEntry::Proxy { proxy, .. }) => Some(proxy.as_ref()),
+                _ => None,
+            };
+            let mut pinned = std::collections::HashMap::new();
+            for proxy in initial
+                .into_iter()
+                .chain(route.subsequent.iter().map(AsRef::as_ref))
+                // The directly dialed proxy retains the socket connector's address fallback.
+                .skip(1)
+            {
+                let location = proxy.proxy_location();
+                if pinned.contains_key(location) {
+                    continue;
+                }
+                let addresses = crate::resolver::resolve_addresses(resolver, location).await?;
+                pinned.insert(location.clone(), addresses);
+            }
+            // Pin wire endpoints, not connector configurations: TLS still verifies the original name.
+            route.pinned_proxies = Some(Arc::new(PinnedProxies {
+                endpoints: pinned,
+                // Shared forks bound nested address races linearly in the selected route depth.
+                extra_attempts: tokio::sync::Semaphore::new(route.subsequent.len()),
+            }));
+            route.connect(target).await
+        })
+        .await
     }
 
     async fn connect_tcp_observed(
@@ -980,12 +764,19 @@ impl ClientProxyChain {
     }
 }
 
+#[derive(Debug)]
+struct PinnedProxies {
+    endpoints: std::collections::HashMap<NetLocation, Vec<std::net::SocketAddr>>,
+    extra_attempts: tokio::sync::Semaphore,
+}
+
 #[derive(Clone, Debug)]
 struct SelectedRoute {
     socket: Arc<dyn SocketConnector>,
     initial: Option<Arc<InitialHopEntry>>,
     subsequent: Vec<Arc<dyn ProxyConnector>>,
     resolver: Arc<dyn Resolver>,
+    pinned_proxies: Option<Arc<PinnedProxies>>,
 }
 
 impl SelectedRoute {
@@ -1065,7 +856,27 @@ impl CarrierDialer for PrefixDialer {
     }
 
     async fn open_stream(&self) -> std::io::Result<Box<dyn crate::async_stream::AsyncStream>> {
-        let result = self.route.connect(self.target.clone()).await?;
+        let pinned = self
+            .route
+            .pinned_proxies
+            .as_ref()
+            .filter(|_| self.route.last_proxy().is_some());
+        let result = if let Some(pinned) = pinned
+            && let Some(addresses) = pinned.endpoints.get(self.target.location())
+        {
+            crate::tcp::socket_connector_impl::connect_tcp_candidates_bounded(
+                addresses.clone(),
+                Some(&pinned.extra_attempts),
+                |address| {
+                    Ok(self
+                        .route
+                        .connect(NetLocation::from_ip_addr(address.ip(), address.port()).into()))
+                },
+            )
+            .await?
+        } else {
+            self.route.connect(self.target.clone()).await?
+        };
         if result
             .early_data
             .as_ref()

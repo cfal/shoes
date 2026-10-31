@@ -247,7 +247,36 @@ impl<'de> Deserialize<'de> for RuleConfig {
             client_chains: NoneOrSome<ClientChain>,
         }
 
-        let temp = RuleConfigTemp::deserialize(deserializer)?;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let Some(fields) = value.as_object_mut() else {
+            return Err(D::Error::custom(
+                "a policy rule requires a mapping with masks or a source",
+            ));
+        };
+        if fields.contains_key("path") || fields.contains_key("url") {
+            if fields.contains_key("masks") || fields.contains_key("mask") {
+                return Err(D::Error::custom(
+                    "a flat rule source cannot also specify masks",
+                ));
+            }
+            let mut source = serde_json::Map::new();
+            for key in [
+                "path",
+                "url",
+                "format",
+                "behavior",
+                "code",
+                "attributes",
+                "download",
+                "update_interval",
+            ] {
+                if let Some(value) = fields.remove(key) {
+                    source.insert(key.into(), value);
+                }
+            }
+            fields.insert("masks".into(), serde_json::Value::Object(source));
+        }
+        let temp: RuleConfigTemp = serde_json::from_value(value).map_err(D::Error::custom)?;
 
         let expression = Expression::from_config(temp.masks).map_err(D::Error::custom)?;
         let criteria = RuleCriteria {
@@ -414,6 +443,17 @@ pub enum ClientChainHop {
     /// Can mix inline configs and group references.
     /// Group references are expanded, and all configs are combined into one pool.
     Pool(OneOrSome<ConfigSelection<ClientConfig>>),
+}
+
+impl ClientChainHop {
+    pub(crate) fn selections(&self) -> &[ConfigSelection<ClientConfig>] {
+        match self {
+            Self::Single(member) | Self::Pool(OneOrSome::One(member)) => {
+                std::slice::from_ref(member)
+            }
+            Self::Pool(OneOrSome::Some(members)) => members.as_slice(),
+        }
+    }
 }
 
 impl<'de> serde::de::Deserialize<'de> for ClientChainHop {

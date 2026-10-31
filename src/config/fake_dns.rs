@@ -10,6 +10,12 @@ use super::{
 use crate::address::NetLocation;
 use crate::option_util::NoneOrSome;
 
+pub(crate) fn protects_tun_endpoints(configs: &[Config]) -> bool {
+    configs.iter().any(|config| {
+        matches!(config, Config::TunServer(tun) if tun.auto_route || tun.dns_hijack == Some(true))
+    })
+}
+
 pub(crate) fn tun_endpoint_ips(configs: &[Config]) -> impl Iterator<Item = IpAddr> + '_ {
     configs
         .iter()
@@ -173,22 +179,39 @@ pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
 
 impl ValidatedConfigs {
     pub(crate) fn validate_network_endpoints(&mut self, ranges: &[IpNetwork]) -> io::Result<()> {
+        for source in &self.remote_rules {
+            let bootstrap = source
+                .download
+                .as_ref()
+                .map(|download| &download.bootstrap_url)
+                .filter(|name| {
+                    !self
+                        .dns_groups
+                        .iter()
+                        .any(|group| group.name == name.as_str())
+                });
+            for value in source.url.iter().chain(bootstrap) {
+                if let Ok(url) = url::Url::parse(value) {
+                    let ip = match url.host() {
+                        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+                        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+                        Some(url::Host::Domain(host)) => host.parse::<IpAddr>().ok(),
+                        _ => None,
+                    };
+                    if let Some(ip) = ip {
+                        reject(ranges, ip, "rule download/bootstrap endpoint")?;
+                    }
+                }
+            }
+        }
         if let Some(catalog) = &self.catalog {
             let urls = catalog
                 .selection
                 .automatic
                 .0
                 .values()
-                .map(|group| (group.config.url.as_str(), "url-test URL"))
-                .chain(
-                    catalog
-                        .selection
-                        .health
-                        .definitions
-                        .values()
-                        .map(|group| (group.check.url.as_str(), "fallback URL")),
-                );
-            for (url, label) in urls {
+                .map(|group| group.config.url.as_str());
+            for url in urls {
                 let url = url::Url::parse(url).map_err(io::Error::other)?;
                 let ip = match url.host() {
                     Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
@@ -196,7 +219,7 @@ impl ValidatedConfigs {
                     _ => None,
                 };
                 if let Some(ip) = ip {
-                    reject(ranges, ip, label)?;
+                    reject(ranges, ip, "url-test URL")?;
                 }
             }
         }
@@ -294,38 +317,31 @@ mod tests {
     fn automatic_probe_literals_reject_active_and_retained_custom_fake_ranges() {
         use serde_json::json;
 
-        for kind in ["url-test", "fallback"] {
-            for url in [
-                "http://100.64.0.2/",
-                "http://[::ffff:100.64.0.2]/",
-                "http://[fd00::2]/",
-            ] {
-                let mut configs = json!([
-                    {"dns_group":"fake", "dns_servers":"system", "fake_ip":{"ipv4_range":"100.64.0.0/10", "ipv6_range":"fd00::/64"}},
-                    {"client_group":"auto", "type":"url-test", "url":url, "client_proxies":["direct"]}
-                ]);
-                if kind == "fallback" {
-                    configs[1] = json!({"client_group":"auto", "type":"fallback",
-                    "health_check":{"url":url, "interval_secs":30}, "client_proxies":["direct"]});
-                }
-                let label = format!("{kind} URL");
-                let error = validate_yaml(&configs.to_string())
-                    .err()
-                    .expect("active probe range must be rejected");
-                assert!(error.to_string().contains(&label), "{error}");
-                configs[0]["fake_ip"] = false.into();
-                let mut validated = validate_yaml(&configs.to_string()).unwrap();
-                let error = validated
-                    .validate_network_endpoints(&[
-                        "100.64.0.0/10".parse().unwrap(),
-                        "fd00::/64".parse().unwrap(),
-                    ])
-                    .unwrap_err();
-                assert!(error.to_string().contains(&label), "{error}");
-                validated
-                    .validate_network_endpoints(&["192.0.2.0/24".parse().unwrap()])
-                    .unwrap();
-            }
+        for url in [
+            "http://100.64.0.2/",
+            "http://[::ffff:100.64.0.2]/",
+            "http://[fd00::2]/",
+        ] {
+            let mut configs = json!([
+                {"dns_group":"fake", "dns_servers":"system", "fake_ip":{"ipv4_range":"100.64.0.0/10", "ipv6_range":"fd00::/64"}},
+                {"client_group":"auto", "type":"url-test", "url":url, "client_proxies":["direct"]}
+            ]);
+            let error = validate_yaml(&configs.to_string())
+                .err()
+                .expect("active probe range must be rejected");
+            assert!(error.to_string().contains("url-test URL"), "{error}");
+            configs[0]["fake_ip"] = false.into();
+            let mut validated = validate_yaml(&configs.to_string()).unwrap();
+            let error = validated
+                .validate_network_endpoints(&[
+                    "100.64.0.0/10".parse().unwrap(),
+                    "fd00::/64".parse().unwrap(),
+                ])
+                .unwrap_err();
+            assert!(error.to_string().contains("url-test URL"), "{error}");
+            validated
+                .validate_network_endpoints(&["192.0.2.0/24".parse().unwrap()])
+                .unwrap();
         }
     }
 

@@ -1,0 +1,823 @@
+use super::MAX_BYTES;
+use crate::rule_set::{CACHE_LOCK_SUFFIX, CACHE_OWNER_LOCK, CACHE_STAGE_SUFFIX};
+use crate::rules::invalid;
+use std::ffi::{CString, OsStr};
+use std::fs::{File, Metadata};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const DIRECTORY_SEARCH: i32 = libc::O_PATH;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const DIRECTORY_SEARCH: i32 = libc::O_RDONLY;
+
+pub(crate) fn cache_file(path: &Path, lease: Option<&CacheLease>) -> io::Result<File> {
+    let (directory, name) = cache_path(path, lease)?;
+    let file = open_at(&directory, &c_name(&name)?, libc::O_RDONLY)?;
+    check_file(&file.metadata()?, false)?;
+    Ok(file)
+}
+
+pub(crate) fn create_cache_directory(directory: &Path) -> io::Result<()> {
+    (|| {
+        match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+            Ok(()) => {
+                let metadata = directory.symlink_metadata()?;
+                if !metadata.is_dir() || metadata.mode() & 0o700 != 0o700 {
+                    return Err(invalid(
+                        "new directory lacks owner access or was replaced; create it with install -d -m 700 before starting Shoes",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    })()
+    .map_err(|error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("rule_cache_dir {}: {error}", directory.display()),
+        )
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct CacheLease {
+    path: PathBuf,
+    directory: File,
+    lock: File,
+}
+
+impl CacheLease {
+    pub(crate) fn check(&self) -> io::Result<()> {
+        self.check_identity().map_err(|error| {
+            invalid(format!(
+                "rule_cache_dir {} lease lost; restart required: {error}",
+                self.path.display()
+            ))
+        })
+    }
+
+    fn check_identity(&self) -> io::Result<()> {
+        let (current, _) = checked_path(&self.path.join(CACHE_OWNER_LOCK))?;
+        let owned = self.directory.metadata()?;
+        let current = current.metadata()?;
+        check_directory(&owned)?;
+        if (owned.dev(), owned.ino()) != (current.dev(), current.ino()) {
+            return Err(invalid("rule_cache_dir replaced; restart required"));
+        }
+        let lock = open_at(
+            &self.directory,
+            &c_name(OsStr::new(CACHE_OWNER_LOCK))?,
+            libc::O_RDONLY,
+        )?
+        .metadata()?;
+        check_file(&lock, true)?;
+        let owned = self.lock.metadata()?;
+        if (owned.dev(), owned.ino()) != (lock.dev(), lock.ino()) {
+            return Err(invalid(
+                "rule_cache_dir owner.lock replaced; restart required",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn cache_path(path: &Path, lease: Option<&CacheLease>) -> io::Result<(File, std::ffi::OsString)> {
+    let Some(lease) = lease else {
+        return checked_path(path);
+    };
+    let path = cache_destination(path)?;
+    if path.parent() != Some(lease.path.as_path()) {
+        return Err(invalid("remote cache is outside the leased rule_cache_dir"));
+    }
+    lease.check()?;
+    let name = path.file_name().unwrap();
+    if name
+        .as_bytes()
+        .eq_ignore_ascii_case(CACHE_OWNER_LOCK.as_bytes())
+    {
+        return Err(invalid("rule_cache_dir owner.lock is reserved"));
+    }
+    Ok((lease.directory.try_clone()?, name.to_owned()))
+}
+
+pub(crate) fn cache_lease(directory: &Path) -> io::Result<CacheLease> {
+    (|| {
+        let path = std::path::absolute(directory)?;
+        let (directory, name) = checked_path(&directory.join(CACHE_OWNER_LOCK))?;
+        let name = c_name(&name)?;
+        let file = open_lock_file(&directory, &name)?;
+        file.try_lock()
+            .map_err(|_| invalid("already owned by another Shoes process"))?;
+        let lease = CacheLease {
+            path,
+            directory,
+            lock: file,
+        };
+        lease.check()?;
+        Ok(lease)
+    })()
+    .map_err(|error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("rule_cache_dir {}: {error}", directory.display()),
+        )
+    })
+}
+
+pub(super) struct Install {
+    lease: Option<Arc<CacheLease>>,
+    directory: File,
+    destination: CString,
+    stage: CString,
+    pub(super) file: File,
+    lock: File,
+    lock_name: CString,
+    original: Option<Metadata>,
+    old_digest: Option<blake3::Hash>,
+    // Must drop after the lease and lock to preserve the test's completion barrier.
+    #[cfg(test)]
+    preparation_gate: Option<PreparationGate>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    Unchanged,
+    Updated,
+    DurabilityUncertain,
+}
+
+impl Install {
+    pub(super) async fn save(
+        path: &Path,
+        bytes: Vec<u8>,
+        digest: blake3::Hash,
+        lease: Option<Arc<CacheLease>>,
+    ) -> io::Result<Outcome> {
+        let path = path.to_owned();
+        let install = blocking(move || {
+            let mut install = Self::open_with_lease(&path, lease)?;
+            install.file.write_all(&bytes)?;
+            Ok(install)
+        })
+        .await?;
+        install.finish_async(digest).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn open_async(
+        path: &Path,
+        lease: Option<Arc<CacheLease>>,
+    ) -> io::Result<Self> {
+        let path = path.to_owned();
+        blocking(move || Self::open_with_lease(&path, lease)).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_lease(path, None)
+    }
+
+    fn open_with_lease(path: &Path, lease: Option<Arc<CacheLease>>) -> io::Result<Self> {
+        let (directory, name) = cache_path(path, lease.as_deref())?;
+        let mut lock_name = name.clone();
+        lock_name.push(CACHE_LOCK_SUFFIX);
+        let lock_name = c_name(&lock_name)?;
+        let lock = open_lock_file(&directory, &lock_name)?;
+        lock.try_lock().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "destination update already owned",
+            )
+        })?;
+        let destination = c_name(&name)?;
+        let (original, old_digest) = match open_at(&directory, &destination, libc::O_RDONLY) {
+            Ok(mut old) => {
+                let original = old.metadata()?;
+                check_file(&original, false)?;
+                let digest = if original.len() <= MAX_BYTES {
+                    Some(hash(&mut old)?)
+                } else {
+                    None
+                };
+                if stamp(&original) != stamp(&old.metadata()?) {
+                    return Err(invalid("destination changed while reading"));
+                }
+                (Some(original), digest)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (None, None),
+            Err(error) => return Err(error),
+        };
+        let mut stage_name = name;
+        stage_name.push(CACHE_STAGE_SUFFIX);
+        let stage = c_name(&stage_name)?;
+        match open_at(&directory, &stage, libc::O_RDONLY) {
+            Ok(file) => {
+                let metadata = file.metadata()?;
+                check_file(&metadata, false)?;
+                let destination_mode = original.as_ref().map_or(0o600, MetadataExt::mode);
+                let excess_permissions = metadata.mode() & 0o077 & !destination_mode;
+                if excess_permissions != 0 {
+                    return Err(invalid(
+                        "stale staging permissions exceed destination permissions",
+                    ));
+                }
+                // Reserved sidecar, left by an uncatchable termination. Lock is held.
+                unlink_at(&directory, &stage)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let file = open_at(
+            &directory,
+            &stage,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        )?;
+        let install = Self {
+            lease,
+            directory,
+            destination,
+            stage,
+            file,
+            lock,
+            lock_name,
+            original,
+            old_digest,
+            #[cfg(test)]
+            preparation_gate: None,
+        };
+        check_file(&install.file.metadata()?, true)?;
+        install
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(install)
+    }
+
+    pub(super) async fn finish_async(self, digest: blake3::Hash) -> io::Result<Outcome> {
+        let (install, unchanged) = blocking(move || {
+            let unchanged = self.prepare_finish(digest)?;
+            Ok((self, unchanged))
+        })
+        .await?;
+        if unchanged {
+            return Ok(Outcome::Unchanged);
+        }
+        // Only the owning future can publish. A cancelled blocking preparation
+        // drops Install without renaming, even if its filesystem work finishes later.
+        install.publish()?;
+        blocking(move || Ok(install.sync_published())).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish(&mut self, digest: blake3::Hash) -> io::Result<Outcome> {
+        if self.prepare_finish(digest)? {
+            return Ok(Outcome::Unchanged);
+        }
+        self.publish()?;
+        Ok(self.sync_published())
+    }
+
+    fn prepare_finish(&self, digest: blake3::Hash) -> io::Result<bool> {
+        if self.unchanged(digest)? {
+            return Ok(true);
+        }
+        self.file.set_permissions(std::fs::Permissions::from_mode(
+            self.original.as_ref().map_or(0o600, MetadataExt::mode) & 0o777,
+        ))?;
+        self.file.sync_all()?;
+        self.directory.sync_all()?;
+        #[cfg(test)]
+        if let Some(gate) = &self.preparation_gate {
+            gate.entered.notify_one();
+            gate.release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        Ok(false)
+    }
+
+    fn publish(&self) -> io::Result<()> {
+        self.check_ownership()?;
+        #[cfg(test)]
+        self.fail_before_rename()?;
+        let fd = self.directory.as_raw_fd();
+        if unsafe { libc::renameat(fd, self.stage.as_ptr(), fd, self.destination.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn sync_published(&self) -> Outcome {
+        let sync = self.directory.sync_all();
+        #[cfg(test)]
+        let sync = if FAIL_AFTER_RENAME.with(|flag| flag.replace(false)) {
+            Err(io::Error::other("injected directory sync failure"))
+        } else {
+            sync
+        };
+        if sync.is_err() {
+            log::warn!(
+                "Validated rule file replaced, but directory sync failed; durability uncertain"
+            );
+            return Outcome::DurabilityUncertain;
+        }
+        Outcome::Updated
+    }
+
+    fn unchanged(&self, digest: blake3::Hash) -> io::Result<bool> {
+        self.check_ownership()?;
+        Ok(Some(digest) == self.old_digest)
+    }
+
+    fn check_ownership(&self) -> io::Result<()> {
+        if let Some(lease) = &self.lease {
+            lease.check()?;
+        }
+        check_directory(&self.directory.metadata()?)?;
+        match open_at(&self.directory, &self.destination, libc::O_RDONLY) {
+            Ok(file) => {
+                let current = file.metadata()?;
+                check_file(&current, false)?;
+                if Some(stamp(&current)) != self.original.as_ref().map(stamp) {
+                    return Err(invalid(
+                        "destination changed during update; not replacing it",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && self.original.is_none() => {}
+            Err(error) => return Err(error),
+        }
+        for (name, file) in [(&self.lock_name, &self.lock), (&self.stage, &self.file)] {
+            let current = open_at(&self.directory, name, libc::O_RDONLY)?.metadata()?;
+            check_file(&current, false)?;
+            if stamp(&current) != stamp(&file.metadata()?) {
+                return Err(invalid("update sidecar replaced during update"));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_before_rename(&self) -> io::Result<()> {
+        if FAIL_RENAME.with(|flag| flag.replace(false)) {
+            return Err(io::Error::other("injected rename failure"));
+        }
+        Ok(())
+    }
+}
+
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(io::Error::other)?
+}
+
+impl Drop for Install {
+    fn drop(&mut self) {
+        if let Ok(current) = open_at(&self.directory, &self.stage, libc::O_RDONLY)
+            && let (Ok(current), Ok(owned)) = (current.metadata(), self.file.metadata())
+            && (current.dev(), current.ino()) == (owned.dev(), owned.ino())
+        {
+            let _ = unlink_at(&self.directory, &self.stage);
+        }
+    }
+}
+
+fn c_name(name: &OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes()).map_err(|_| invalid("path contains NUL"))
+}
+
+fn open_at(directory: &File, name: &CString, flags: i32) -> io::Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_lock_file(directory: &File, name: &CString) -> io::Result<File> {
+    let file = match open_at(directory, name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) {
+        Ok(file) => {
+            check_file(&file.metadata()?, true)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_at(directory, name, libc::O_RDWR)?
+        }
+        Err(error) => return Err(error),
+    };
+    check_file(&file.metadata()?, true)?;
+    Ok(file)
+}
+
+fn unlink_at(directory: &File, name: &CString) -> io::Result<()> {
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn check_file(metadata: &Metadata, private: bool) -> io::Result<()> {
+    let forbidden_mode = if private { 0o7077 } else { 0o7022 };
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & forbidden_mode != 0
+    {
+        return Err(invalid(
+            "file must be owned, regular, singly linked, not group- or world-writable, and have no special mode bits; sidecars must be private",
+        ));
+    }
+    Ok(())
+}
+
+fn cache_destination(path: &Path) -> io::Result<PathBuf> {
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(invalid("parent traversal is not allowed"));
+    }
+    let path = std::path::absolute(path)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("destination must name a file"))?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if name.ends_with(CACHE_LOCK_SUFFIX) || name.ends_with(CACHE_STAGE_SUFFIX) {
+        return Err(invalid("updater sidecar suffixes are reserved"));
+    }
+    Ok(path)
+}
+
+fn checked_path(path: &Path) -> io::Result<(File, std::ffi::OsString)> {
+    let path = cache_destination(path)?;
+    let parent = path.parent().unwrap();
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            libc::O_DIRECTORY
+                | if parent == Path::new("/") {
+                    libc::O_RDONLY
+                } else {
+                    DIRECTORY_SEARCH
+                },
+        )
+        .open("/")?;
+    let mut components = parent
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .peekable();
+    while let Some(name) = components.next() {
+        let flags = if components.peek().is_some() {
+            DIRECTORY_SEARCH
+        } else {
+            libc::O_RDONLY
+        };
+        directory = open_at(&directory, &c_name(name)?, flags | libc::O_DIRECTORY)?;
+    }
+    check_directory(&directory.metadata()?)?;
+    Ok((directory, path.file_name().unwrap().to_os_string()))
+}
+
+fn check_directory(metadata: &Metadata) -> io::Result<()> {
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        return Err(invalid(
+            "destination directory must be owned by current user and not group- or world-writable",
+        ));
+    }
+    Ok(())
+}
+
+fn stamp(metadata: &Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+fn hash(file: &mut File) -> io::Result<blake3::Hash> {
+    if file.metadata()?.len() > MAX_BYTES {
+        return Err(invalid("existing rule file exceeds 64 MiB"));
+    }
+    let mut digest = blake3::Hasher::new();
+    let mut reader = file.take(MAX_BYTES + 1);
+    let mut bytes = 0;
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        if bytes > MAX_BYTES {
+            return Err(invalid("existing rule file exceeds 64 MiB"));
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest.finalize())
+}
+
+#[cfg(test)]
+thread_local! { pub(super) static FAIL_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+thread_local! { pub(super) static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+struct PreparationGate {
+    entered: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    dropped: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl Drop for PreparationGate {
+    fn drop(&mut self) {
+        self.dropped.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn cache_directory_creation_preserves_existing_modes_and_contextualizes_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let missing = root.join("missing/cache");
+        let error = create_cache_directory(&missing).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("rule_cache_dir"), "{error}");
+        assert!(
+            error.to_string().contains(missing.to_str().unwrap()),
+            "{error}"
+        );
+
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o500)).unwrap();
+        create_cache_directory(&target).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        create_cache_directory(&alias).unwrap();
+        assert!(cache_lease(&alias).is_err());
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o500);
+    }
+
+    #[test]
+    fn cache_lease_errors_identify_the_root_and_owner_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("cache");
+        let error = cache_lease(&root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("rule_cache_dir"), "{error}");
+        assert!(
+            error.to_string().contains(root.to_str().unwrap()),
+            "{error}"
+        );
+
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _lease = cache_lease(&root).unwrap();
+        let error = cache_lease(&root).unwrap_err();
+        assert!(
+            error.to_string().contains(root.to_str().unwrap()),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("already owned by another Shoes process"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn sidecar_names_are_reserved_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["rules.SHOES-UPDATE.LOCK", "rules.Shoes-Update.Tmp"] {
+            let path = root.join(name);
+            let error = Install::open(&path).err().unwrap();
+            assert!(error.to_string().contains("reserved"), "{error}");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn execute_only_ancestors_allow_cache_reads_and_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ancestor = dir.path().join("search-only");
+        let parent = ancestor.join("private");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(
+                File::open(&ancestor).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        let path = parent.join("rules.json");
+        let result = (|| -> io::Result<()> {
+            for bytes in [b"first".as_slice(), b"second"] {
+                let mut install = Install::open(&path)?;
+                install.file.write_all(bytes)?;
+                assert_eq!(install.finish(blake3::hash(bytes))?, Outcome::Updated);
+                let mut contents = Vec::new();
+                cache_file(&path, None)?.read_to_end(&mut contents)?;
+                assert_eq!(contents, bytes);
+            }
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&ancestor, &alias)?;
+            assert!(cache_file(&alias.join("private/rules.json"), None).is_err());
+            Ok(())
+        })();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn new_sidecars_are_private_and_usable_under_restrictive_umasks() {
+        const CHILD: &str = "SHOES_RULE_UMASK_TEST";
+        let Some(mask) = std::env::var_os(CHILD) else {
+            for mask in ["200", "400", "600", "777"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "rule_updater::install::tests::new_sidecars_are_private_and_usable_under_restrictive_umasks", "--nocapture"])
+                    .env(CHILD, mask).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "umask {mask}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        unsafe {
+            libc::umask(libc::mode_t::from_str_radix(mask.to_str().unwrap(), 8).unwrap());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = dir.path().canonicalize().unwrap();
+        let lease = cache_lease(&directory).unwrap();
+        assert_eq!(lease.lock.metadata().unwrap().mode() & 0o777, 0o600);
+        let path = directory.join("rules.json");
+        for bytes in [b"first".as_slice(), b"second"] {
+            let mut install = Install::open(&path).unwrap();
+            assert_eq!(install.lock.metadata().unwrap().mode() & 0o777, 0o600);
+            assert_eq!(install.file.metadata().unwrap().mode() & 0o777, 0o600);
+            install.file.write_all(bytes).unwrap();
+            assert_eq!(
+                install.finish(blake3::hash(bytes)).unwrap(),
+                Outcome::Updated
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_blocking_preparation_cannot_publish_or_stall_the_runtime() {
+        const CHILD: &str = "SHOES_RULE_CANCELLED_PREPARATION_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolation prevents concurrent test subprocesses from inheriting flock descriptors.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rule_updater::install::tests::cancelled_blocking_preparation_cannot_publish_or_stall_the_runtime",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "{stdout} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("rules.json");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let lease = Arc::new(cache_lease(dir.path()).unwrap());
+        let mut install = Install::open_async(&path, Some(lease.clone()))
+            .await
+            .unwrap();
+        install.file.write_all(b"new").unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let (release, receiver) = std::sync::mpsc::channel();
+        install.preparation_gate = Some(PreparationGate {
+            entered: entered.clone(),
+            release: std::sync::Mutex::new(receiver),
+            dropped: dropped.clone(),
+        });
+        let task = tokio::spawn(install.finish_async(blake3::hash(b"new")));
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        // The current-thread executor must remain usable while the worker is blocked.
+        assert_eq!(tokio::spawn(async { 42 }).await.unwrap(), 42);
+        assert_eq!(
+            Install::open(&path).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(lease);
+        assert!(cache_lease(dir.path()).is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!dir.path().join("rules.json.shoes-update.tmp").exists());
+        drop(Install::open(&path).unwrap());
+        cache_lease(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn replaced_root_or_lease_rejects_reads_and_installs_without_touching_replacement() {
+        for replace_root in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().canonicalize().unwrap();
+            let root = parent.join("cache");
+            create_cache_directory(&root).unwrap();
+            let path = root.join("rules.json");
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let lease = Arc::new(cache_lease(&root).unwrap());
+            let mut install = Install::open_with_lease(&path, Some(lease.clone())).unwrap();
+            install.file.write_all(b"new").unwrap();
+            let old_root = if replace_root {
+                let moved = parent.join("moved");
+                std::fs::rename(&root, &moved).unwrap();
+                create_cache_directory(&root).unwrap();
+                std::fs::write(&path, b"replacement").unwrap();
+                std::fs::write(root.join("rules.json.shoes-update.tmp"), b"other stage").unwrap();
+                moved
+            } else {
+                std::fs::remove_file(root.join("owner.lock")).unwrap();
+                root.clone()
+            };
+            let _other = cache_lease(&root).unwrap();
+            assert!(
+                lease
+                    .check()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("lease lost")
+            );
+            assert!(cache_file(&path, Some(&lease)).is_err());
+            assert!(Install::open_with_lease(&path, Some(lease)).is_err());
+            assert!(install.unchanged(blake3::hash(b"old")).is_err());
+            assert!(install.finish(blake3::hash(b"new")).is_err());
+            drop(install);
+            assert_eq!(std::fs::read(old_root.join("rules.json")).unwrap(), b"old");
+            assert!(!old_root.join("rules.json.shoes-update.tmp").exists());
+            if replace_root {
+                assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+                assert_eq!(
+                    std::fs::read(root.join("rules.json.shoes-update.tmp")).unwrap(),
+                    b"other stage"
+                );
+            }
+        }
+    }
+}

@@ -34,7 +34,7 @@ pub enum Expression {
     IpCidr(Vec<String>),
     DestinationPort(Vec<u16>),
     DestinationPortRange(Vec<String>),
-    RuleGroup(String),
+    RuleSourceGroup(String),
     All(Vec<Expression>),
     Any(Vec<Expression>),
     Not(Box<Expression>),
@@ -125,6 +125,7 @@ pub struct Dependencies {
 pub struct Predicate {
     pub dependencies: Dependencies,
     pub(crate) kind: Kind,
+    pub(crate) evaluation_work: usize,
 }
 
 #[derive(Debug)]
@@ -179,6 +180,17 @@ impl Predicate {
         }
     }
     pub(crate) fn new(kind: Kind) -> Arc<Self> {
+        // Count repeated references, not unique allocations: matching traverses the DAG.
+        let evaluation_work = match &kind {
+            Kind::Any(ps) | Kind::All(ps) => ps
+                .iter()
+                .fold(1usize, |work, p| work.saturating_add(p.evaluation_work)),
+            Kind::ByPort(ps) => ps.iter().fold(1usize, |work, (_, p)| {
+                work.saturating_add(p.evaluation_work)
+            }),
+            Kind::Not(p) => p.evaluation_work.saturating_add(1),
+            _ => 1,
+        };
         let dependencies = match &kind {
             Kind::Domains(..) | Kind::Keywords(..) | Kind::Regex(..) => Dependencies {
                 hostname: true,
@@ -193,7 +205,11 @@ impl Predicate {
             Kind::ByPort(ps) => Self::union(ps.iter().map(|(_, p)| p.dependencies)),
             _ => Dependencies::default(),
         };
-        Arc::new(Self { kind, dependencies })
+        Arc::new(Self {
+            kind,
+            dependencies,
+            evaluation_work,
+        })
     }
 
     fn union(values: impl Iterator<Item = Dependencies>) -> Dependencies {

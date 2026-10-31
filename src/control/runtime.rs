@@ -224,12 +224,6 @@ async fn stop_automatic(task: Option<AbortOnDropHandle<()>>) {
     }
 }
 
-async fn stop_health(service: Option<super::health::HealthService>) {
-    if let Some(service) = service {
-        service.shutdown().await;
-    }
-}
-
 async fn run_owner(
     mut owner: SelectionOwner,
     mut receiver: mpsc::Receiver<Command>,
@@ -237,7 +231,6 @@ async fn run_owner(
     shutdown: CancellationToken,
 ) {
     let mut paused = false;
-    let mut health: Option<super::health::HealthService> = None;
     let mut pending: VecDeque<SelectionCommand> = VecDeque::new();
     let mut automatic: Option<AbortOnDropHandle<()>> = None;
     loop {
@@ -275,7 +268,6 @@ async fn run_owner(
             Command::Begin(view, reply) => {
                 let result = owner.reconcile(&view);
                 if result.is_ok() {
-                    stop_health(health.take()).await;
                     paused = true;
                     if let Some(runtime) = runtime.upgrade() {
                         let _active = runtime.active.write();
@@ -287,7 +279,6 @@ async fn run_owner(
                 let _ = reply.send(result);
             }
             Command::Publish(generation, reply) => {
-                stop_health(health.take()).await;
                 let result = owner.activate(generation.catalog.selection.clone());
                 if result.is_ok()
                     && let Some(runtime) = runtime.upgrade()
@@ -303,16 +294,6 @@ async fn run_owner(
                 stop_automatic(automatic.take()).await;
                 if let Some(runtime) = runtime.upgrade() {
                     let generation = runtime.generation();
-                    if health.is_none()
-                        && let Ok(generation) = &generation
-                        && !generation.catalog.selection.health.definitions.is_empty()
-                    {
-                        health = Some(super::health::HealthService::start(
-                            generation.catalog.selection.clone(),
-                            runtime.probes.clone(),
-                            generation.probes.forbidden_ranges(),
-                        ));
-                    }
                     runtime.activating.store(false, Ordering::Release);
                     if let Ok(generation) = generation
                         && !generation.catalog.selection.automatic.0.is_empty()
@@ -364,7 +345,6 @@ async fn run_owner(
         }
     }
     stop_automatic(automatic).await;
-    stop_health(health).await;
 }
 
 #[cfg(test)]

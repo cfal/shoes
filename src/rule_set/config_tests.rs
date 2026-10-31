@@ -28,9 +28,9 @@ fn source_unions_inline_references_and_policy_order() {
     write_domains(&dir.path().join("b.json"), "b.example");
     let validated = compile(
         json!([
-            {"rule_group": "files", "rules": ["a.json", {"path": "b.json"}]},
+            {"rule_source_group": "files", "rules": ["a.json", {"path": "b.json"}]},
             {"rule_group": "policies", "rules": [
-                {"masks": {"rule_group": "files"}, "action": "block"},
+                {"masks": {"rule_source_group": "files"}, "action": "block"},
                 {"masks": "0.0.0.0/0"}
             ]},
             server([json!("policies"), json!({"masks": {"all": [
@@ -77,13 +77,239 @@ fn source_unions_inline_references_and_policy_order() {
 }
 
 #[test]
+fn native_source_groups_compose_and_forward_reference_without_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let validated = compile(
+        json!([
+            {"rule_source_group": "outer", "rules": [
+                {"rule_source_group": "inner"}, {"domain": ["other.example"]}
+            ]},
+            {"rule_source_group": "inner", "rules": [{"all": [
+                {"domain_suffix": ["example.com"]},
+                {"destination_port": [443]},
+                {"not": {"domain": ["except.example.com"]}}
+            ]}]},
+            server(json!([{"masks": {"rule_source_group": "outer"}, "action": "block"}]))
+        ]),
+        &dir.path().join("config.yaml"),
+    )
+    .unwrap();
+    let Config::Server(server) = &validated.configs[0] else {
+        panic!()
+    };
+    let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
+        panic!()
+    };
+    let predicate = rule.criteria.compiled.as_ref().unwrap();
+    for (name, port, expected) in [
+        ("example.com", 443, Outcome::Match),
+        ("sub.example.com", 80, Outcome::Miss),
+        ("except.example.com", 443, Outcome::Miss),
+        ("other.example", 80, Outcome::Match),
+    ] {
+        assert_eq!(predicate.evaluate(Some(name), None, port), expected);
+    }
+    for rules in [
+        json!([{"rule_source_group": "cycle"}]),
+        json!([{"not": {"rule_source_group": "cycle"}}]),
+    ] {
+        assert!(
+            compile(
+                json!([{"rule_source_group": "cycle", "rules": rules}]),
+                &dir.path().join("config.yaml")
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("cyclic")
+        );
+    }
+}
+
+#[test]
+fn flat_sources_are_policy_shorthand_not_source_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    write_domains(&dir.path().join("list.json"), "example.com");
+    compile(
+        json!([
+            {"rule_group": "policy", "rules": [{"path": "list.json", "action": "block"}]},
+            server(json!("policy"))
+        ]),
+        &dir.path().join("config.yaml"),
+    )
+    .unwrap();
+    for value in [
+        json!({"path": "list.json", "masks": {"domain": ["example.com"]}}),
+        json!({"path": "list.json", "mask": "example.com"}),
+        json!({"path": "list.json", "typo": true}),
+    ] {
+        assert!(serde_json::from_value::<RuleConfig>(value).is_err());
+    }
+    assert!(
+        serde_json::from_value::<Vec<Config>>(json!([
+            {"rule_group": "old", "rules": ["list.json"]}
+        ]))
+        .is_err()
+    );
+}
+
+#[test]
+fn source_group_depth_is_order_independent_and_includes_callers() {
+    for reversed in [false, true] {
+        let mut groups: Vec<_> = (0..101)
+            .map(|i| {
+                json!({"rule_source_group": format!("g{i}"), "rules": [
+                    if i == 100 { json!({"domain": ["example.com"]}) }
+                    else { json!({"rule_source_group": format!("g{}", i+1)}) }
+                ]})
+            })
+            .collect();
+        if reversed {
+            groups.reverse();
+        }
+        assert!(
+            create_server_configs(serde_json::from_value(json!(groups)).unwrap())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("100 levels")
+        );
+    }
+    let nested = (0..100).fold(
+        json!({"rule_source_group": "group"}),
+        |child, _| json!({"not": child}),
+    );
+    let configs = serde_json::from_value(json!([
+        {"rule_source_group": "group", "rules": [{"domain": ["example.com"]}]},
+        server(json!([{"masks": nested}]))
+    ]))
+    .unwrap();
+    assert!(
+        create_server_configs(configs)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("100 levels")
+    );
+}
+
+#[test]
+fn source_group_work_budget_counts_repeated_references_and_caller_compositions() {
+    let groups = |levels: usize| {
+        let mut configs =
+            vec![json!({"rule_source_group": "g0", "rules": [{"ip_cidr": ["192.0.2.0/24"]}]})];
+        for level in 1..=levels {
+            let child = json!({"rule_source_group": format!("g{}", level - 1)});
+            configs.push(
+                json!({"rule_source_group": format!("g{level}"), "rules": [child.clone(), child]}),
+            );
+        }
+        configs
+    };
+    for reversed in [false, true] {
+        let mut configs = groups(40);
+        if reversed {
+            configs.reverse();
+        }
+        configs.push(server(
+            json!([{"masks": {"rule_source_group": "g40"}, "action": "block"}]),
+        ));
+        let error = create_server_configs(serde_json::from_value(json!(configs)).unwrap())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("expanded rule evaluation budget"),
+            "{error}"
+        );
+    }
+    for copies in [1, 32] {
+        let mut configs = groups(16);
+        configs.push(server(json!([{"masks": {"any": vec![json!({"rule_source_group": "g16"}); copies]}, "action": "block"}])));
+        let result = create_server_configs(serde_json::from_value(json!(configs)).unwrap());
+        if copies == 1 {
+            let validated = result.unwrap();
+            let Config::Server(server) = &validated.configs[0] else {
+                panic!()
+            };
+            let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
+                panic!()
+            };
+            let predicate = rule.criteria.compiled.as_ref().unwrap();
+            assert!(!predicate.has_no_resolve_ip());
+            assert_eq!(
+                predicate.evaluate(None, Some("198.51.100.1".parse().unwrap()), 80),
+                Outcome::Miss
+            );
+        } else {
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("expanded rule evaluation budget")
+            );
+        }
+    }
+    for copies in [1, 32] {
+        let references = json!(vec!["p"; copies]);
+        let mut websocket = server(json!([]));
+        websocket["protocol"] = json!({"type": "websocket", "targets": [{
+            "protocol": {"type": "socks"}, "override_rules": references
+        }]});
+        for destination in [
+            server(references.clone()),
+            json!({"device_name": "tun-test", "address": "10.0.0.1", "netmask": "255.255.255.0", "rules": references}),
+            websocket,
+        ] {
+            let mut configs = groups(16);
+            configs.push(json!({"rule_group": "p", "rules": [{
+                "masks": {"rule_source_group": "g16"}, "action": "block"
+            }]}));
+            configs.push(destination);
+            let result = create_server_configs(serde_json::from_value(json!(configs)).unwrap());
+            if copies == 1 {
+                assert!(result.is_ok(), "{}", result.err().unwrap());
+            } else {
+                let error = result.err().unwrap();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("expanded rule evaluation budget"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_cache_namespace_rejects_dangling_local_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir(&cache_dir).unwrap();
+    let path = cache_dir.join("cache.json");
+    let alias = dir.path().join("alias.json");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    let mut configs: Vec<Config> = serde_json::from_value(json!([
+        {"global_settings": {"rule_cache_dir": cache_dir}},
+        {"rule_source_group": "local", "rules": [{"path": alias}]}
+    ]))
+    .unwrap();
+    let error = validate_remote_paths(&mut configs, &[]).unwrap_err();
+    assert!(error.to_string().contains("local aliases"), "{error}");
+}
+
+#[test]
 fn inline_and_named_sources_share_the_same_predicate() {
     let dir = tempfile::tempdir().unwrap();
     write_domains(&dir.path().join("a.json"), "a.example");
     let mut configs: Vec<Config> = serde_json::from_value(json!([
-        {"rule_group": "files", "rules": ["a.json"]},
+        {"rule_source_group": "files", "rules": ["a.json"]},
         server(json!([
-            {"masks": {"rule_group": "files"}},
+            {"masks": {"rule_source_group": "files"}},
             {"masks": {"path": "a.json", "format": "singbox_json"}},
         ])),
     ]))
@@ -114,39 +340,41 @@ fn group_names_are_unique_and_cross_kind_references_fail() {
     for (value, message) in [
         (
             json!([
-                {"rule_group": "files", "rules": ["a.json"]}, server(json!("files"))
+                {"rule_source_group": "files", "rules": ["a.json"]}, server(json!("files"))
             ]),
-            "contains file sources",
+            "is a rule source group",
         ),
         (
             json!([
                 {"rule_group": "policies", "rules": [{"masks": "example.com"}]},
-                server(json!([{"masks": {"not": {"rule_group": "policies"}}}]))
+                server(json!([{"masks": {"not": {"rule_source_group": "policies"}}}]))
             ]),
             "contains policies with actions",
         ),
         (
-            json!([server(json!([{"masks": {"rule_group": "block-all"}}]))]),
+            json!([server(
+                json!([{"masks": {"rule_source_group": "block-all"}}])
+            )]),
             "contains policies with actions",
         ),
         (
-            json!([server(json!([{"masks": {"rule_group": "a.json"}}]))]),
-            "unknown rule group",
+            json!([server(json!([{"masks": {"rule_source_group": "a.json"}}]))]),
+            "unknown rule source group",
         ),
         (json!([server(json!("missing"))]), "unknown rule group"),
         (
             json!([
-                {"rule_group": "same", "rules": ["a.json"]},
+                {"rule_source_group": "same", "rules": ["a.json"]},
                 {"rule_group": "same", "rules": [{"masks": "example.com"}]}
             ]),
             "duplicate or empty rule group name",
         ),
         (
-            json!([{"rule_group": "block-all", "rules": ["a.json"]}]),
+            json!([{"rule_source_group": "block-all", "rules": ["a.json"]}]),
             "duplicate or empty rule group name",
         ),
         (
-            json!([{"rule_group": "", "rules": ["a.json"]}]),
+            json!([{"rule_source_group": "", "rules": ["a.json"]}]),
             "duplicate or empty rule group name",
         ),
     ] {
@@ -175,7 +403,7 @@ fn every_rule_location_anchors_discovers_and_compiles_inline_sources() {
         })
     };
     let mut configs: Vec<Config> = serde_json::from_value(json!([
-        {"rule_group": "files", "rules": ["group.json"]},
+        {"rule_source_group": "files", "rules": ["group.json"]},
         {"rule_group": "policies", "rules": [rule("policy")]},
         {"device_name": "tun-test", "address": "10.0.0.1", "netmask": "255.255.255.0", "rules": [rule("tun")]},
         {"address": "127.0.0.1:1080", "rules": [rule("server")], "protocol": {
@@ -257,8 +485,8 @@ async fn each_config_file_anchors_its_own_inline_and_group_sources() {
         write_domains(&dir.path().join("list.json"), name);
         let config = if index == 0 {
             json!([
-                {"rule_group": "files", "rules": ["list.json"]},
-                server(json!([{"masks": {"rule_group": "files"}}]))
+                {"rule_source_group": "files", "rules": ["list.json"]},
+                server(json!([{"masks": {"rule_source_group": "files"}}]))
             ])
         } else {
             let mut config = server(json!([{"masks": {"path": "list.json"}}]));

@@ -11,7 +11,6 @@ use super::fake_ip::{FakeIpOptions, FakeIpPool};
 use super::real_only;
 use super::system::SystemResolver;
 use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
-use crate::control::selection::ManualSelectorPath;
 use crate::dns::composite_resolver::CompositeResolver;
 use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
@@ -89,6 +88,7 @@ impl PoolState {
 pub struct DnsRegistry {
     limits: GlobalLimits,
     groups: FxHashMap<String, Arc<dyn Resolver>>,
+    system_groups: std::collections::HashMap<String, bool>,
     /// Default resolver, created lazily only if needed.
     default_resolver: Option<Arc<dyn Resolver>>,
     forbidden: Arc<[IpNetwork]>,
@@ -96,11 +96,91 @@ pub struct DnsRegistry {
 }
 
 impl DnsRegistry {
+    #[cfg(unix)]
+    pub(crate) fn for_rule_bootstrap(
+        configs: &[crate::config::Config],
+        retained_ranges: &[IpNetwork],
+        limits: GlobalLimits,
+    ) -> std::io::Result<Self> {
+        let mut forbidden = retained_ranges.to_vec();
+        for config in configs {
+            let policy = match config {
+                crate::config::Config::DnsConfigGroup(group) => group.fake_ip.as_ref(),
+                crate::config::Config::Server(server) => {
+                    server.dns.as_ref().and_then(|dns| dns.fake_ip.as_ref())
+                }
+                crate::config::Config::TunServer(tun) => {
+                    tun.dns.as_ref().and_then(|dns| dns.fake_ip.as_ref())
+                }
+                _ => None,
+            };
+            if let Some(options) = policy.and_then(|policy| policy.options()) {
+                options.validate()?;
+                for range in options.ipv4_range.iter().chain(options.ipv6_range.iter()) {
+                    forbidden.push(range.parse::<IpNetwork>().map_err(std::io::Error::other)?);
+                }
+            }
+        }
+        let protect_tun_endpoints = crate::config::protects_tun_endpoints(configs);
+        if !forbidden.is_empty() || protect_tun_endpoints {
+            forbidden.extend(
+                crate::config::tun_endpoint_ips(configs)
+                    .map(|ip| IpNetwork::from(ip.to_canonical())),
+            );
+        }
+        Ok(Self {
+            limits,
+            forbidden: forbidden.into(),
+            ..Self::new()
+        })
+    }
+
+    pub(crate) async fn rule_bootstrap(&self, url: &str) -> std::io::Result<Arc<dyn Resolver>> {
+        if let Some(resolver) = self.get_by_name(url) {
+            if self.system_groups.get(url) == Some(&true) {
+                SystemResolver::check_native_configuration(self.forbidden.clone()).await?;
+            }
+            return Ok(real_only(resolver, self.forbidden.clone()));
+        }
+        let parsed = ParsedDnsUrl::parse(url)
+            .map_err(|_| crate::rules::invalid("invalid rule bootstrap_url"))?;
+        if parsed.has_hostname() {
+            return Err(crate::rules::invalid(
+                "rule bootstrap URL must use an IP address",
+            ));
+        }
+        let server = parsed
+            .to_parsed_server(None)
+            .map_err(std::io::Error::other)?;
+        let endpoint = match &server {
+            ParsedDnsServer::System => {
+                SystemResolver::check_native_configuration(self.forbidden.clone()).await?;
+                None
+            }
+            ParsedDnsServer::Udp { addr }
+            | ParsedDnsServer::Tcp { addr }
+            | ParsedDnsServer::Tls { addr, .. }
+            | ParsedDnsServer::Https { addr, .. }
+            | ParsedDnsServer::H3 { addr, .. } => Some(addr.ip()),
+        };
+        if endpoint.is_some_and(|ip| {
+            self.forbidden
+                .iter()
+                .any(|range| range.contains(ip) || range.contains(ip.to_canonical()))
+        }) {
+            return Err(crate::rules::invalid(
+                "rule bootstrap endpoint overlaps a synthetic endpoint",
+            ));
+        }
+        build_native_bootstrap(server, self.limits, &self.forbidden)
+    }
+
     /// Creates a new empty registry.
     pub fn new() -> Self {
         Self {
             limits: crate::resources::limits(),
             groups: FxHashMap::default(),
+            system_groups: Default::default(),
             default_resolver: None,
             forbidden: Arc::from([]),
             pools: FxHashMap::default(),
@@ -202,6 +282,61 @@ impl DnsRegistry {
             }
         })))
     }
+}
+
+fn build_native_bootstrap(
+    server: ParsedDnsServer,
+    limits: GlobalLimits,
+    forbidden: &Arc<[IpNetwork]>,
+) -> std::io::Result<Arc<dyn Resolver>> {
+    let native = real_only(Arc::new(NativeResolver::new()), forbidden.clone());
+    let entry = ParsedDnsServerEntry::new(
+        server,
+        Arc::new(build_direct_chain_group(native.clone())),
+        native,
+        super::IpStrategy::default(),
+        10, // Default timeout for bootstrap
+        5,  // Default connect timeout for bootstrap
+        2,  // Default attempts for bootstrap
+    );
+    Ok(real_only(
+        build_resolver_with_limits(vec![entry], limits, forbidden.clone())?,
+        forbidden.clone(),
+    ))
+}
+
+fn group_uses_system(
+    group: &mut ExpandedDnsGroup,
+    system_groups: &std::collections::HashMap<String, bool>,
+) -> std::io::Result<bool> {
+    if group.use_default_resolver {
+        return Ok(true);
+    }
+    for spec in &mut group.specs {
+        if spec.url == "system" {
+            return Ok(true);
+        }
+        let mut proxy_hostname = false;
+        for chain in &mut spec.client_chains {
+            for hop in chain.hops.iter_mut() {
+                crate::config::client_visit::visit_hop(hop, &mut |client| {
+                    proxy_hostname |= client.address.address().hostname().is_some();
+                    Ok(())
+                })?;
+            }
+        }
+        if (proxy_hostname || ParsedDnsUrl::parse(&spec.url).is_ok_and(|url| url.has_hostname()))
+            && spec.bootstrap_url.as_ref().is_none_or(|bootstrap| {
+                system_groups
+                    .get(bootstrap)
+                    .copied()
+                    .unwrap_or(bootstrap == "system")
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn checkpoint_pools(pools: Vec<Arc<FakeIpPool>>) -> std::io::Result<()> {
@@ -744,7 +879,9 @@ pub async fn build_dns_registry_for_runtime(
     };
 
     let mut bootstraps = FxHashMap::default();
-    for group in groups {
+    for mut group in groups {
+        let system = group_uses_system(&mut group, &registry.system_groups)?;
+        registry.system_groups.insert(group.name.clone(), system);
         for spec in &group.specs {
             for endpoint in std::iter::once(spec.url.as_str()).chain(spec.bootstrap_url.as_deref())
             {
@@ -825,69 +962,6 @@ pub async fn build_dns_registry_for_runtime(
     Ok(registry)
 }
 
-#[derive(Debug)]
-struct SelectionDependentResolver {
-    inner: Arc<dyn Resolver>,
-    paths: Vec<ManualSelectorPath>,
-}
-
-impl Resolver for SelectionDependentResolver {
-    fn manual_selector_paths(&self) -> Vec<ManualSelectorPath> {
-        self.paths.clone()
-    }
-
-    fn resolve_location(
-        &self,
-        location: &crate::address::NetLocation,
-    ) -> crate::resolver::ResolveFuture {
-        self.inner.resolve_location(location)
-    }
-
-    fn exchange(&self, request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
-        self.inner.exchange(request)
-    }
-
-    fn exchange_with_deadline(
-        &self,
-        request: Vec<u8>,
-        deadline: tokio::time::Instant,
-    ) -> crate::resolver::DnsExchangeFuture {
-        self.inner.exchange_with_deadline(request, deadline)
-    }
-}
-
-fn collect_selector_paths(
-    chain: &crate::config::ClientChain,
-    enclosing: &[(String, String)],
-    paths: &mut Vec<ManualSelectorPath>,
-) {
-    use crate::config::{ClientChainHop, ClientProxyConfig, ConfigSelection};
-    for hop in chain.hops.iter() {
-        let selections: Box<dyn Iterator<Item = &ConfigSelection<crate::config::ClientConfig>>> =
-            match hop {
-                ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
-                ClientChainHop::Pool(pool) => pool.iter(),
-            };
-        for selection in selections {
-            let ConfigSelection::Config(client) = selection else {
-                continue;
-            };
-            let mut path = enclosing.to_vec();
-            if let Some(origin) = &client.control {
-                path.extend(origin.manual_selector_path());
-            }
-            if !path.is_empty() {
-                paths.push(path.clone());
-            }
-            if let ClientProxyConfig::Wireguard(config) = &client.protocol
-                && let Some(carrier) = &config.peer_client_chain
-            {
-                collect_selector_paths(carrier, &path, paths);
-            }
-        }
-    }
-}
-
 /// Build a resolver from expanded DNS specs, wrapping hickory-backed groups
 /// in RefreshingResolver for stale connection mitigation.
 async fn build_resolver_from_specs(
@@ -903,14 +977,9 @@ async fn build_resolver_from_specs(
     let mut entries: Vec<ParsedDnsServerEntry> = Vec::with_capacity(specs.len());
     let mut plans: Vec<HickoryResolverPlan> = Vec::new();
     let mut has_system = false;
-    let mut paths = Vec::new();
 
     for spec in specs {
         let (entry, plan) = build_entry_and_plan(spec, registry, bootstraps).await?;
-        paths.extend(entry.bootstrap_resolver.manual_selector_paths());
-        for chain in &spec.client_chains {
-            collect_selector_paths(chain, &[], &mut paths);
-        }
         if matches!(entry.server, ParsedDnsServer::System) {
             has_system = true;
         }
@@ -940,17 +1009,7 @@ async fn build_resolver_from_specs(
     } else {
         build_resolver_with_limits(entries, registry.limits, registry.forbidden.clone())?
     };
-    if paths.is_empty() {
-        Ok(resolver)
-    } else {
-        paths.sort_unstable();
-        paths.dedup();
-        // Keep configuration dependencies outside refreshable transports and DNS caches.
-        Ok(Arc::new(SelectionDependentResolver {
-            inner: resolver,
-            paths,
-        }))
-    }
+    Ok(resolver)
 }
 
 /// Build a ParsedDnsServerEntry and optionally a HickoryResolverPlan from an expanded spec.
@@ -964,7 +1023,7 @@ async fn build_entry_and_plan(
     let parsed_url = ParsedDnsUrl::parse_with_server_name(&spec.url, spec.server_name.as_deref())
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    // One resolver identity per bootstrap policy lets equivalent DNS paths share checks.
+    // Reuses bootstrap transports across DNS servers with the same policy.
     let bootstrap_resolver = if let Some(resolver) = spec
         .bootstrap_url
         .as_deref()
@@ -988,26 +1047,7 @@ async fn build_entry_and_plan(
                     .to_parsed_server(None)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-                let native = real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone());
-                let direct_chain = Arc::new(build_direct_chain_group(native.clone()));
-                // Bootstrap resolvers use default timeout (10s) and 2 attempts
-                let bootstrap_entry = ParsedDnsServerEntry::new(
-                    bootstrap_server,
-                    direct_chain,
-                    native,
-                    super::IpStrategy::default(),
-                    10, // Default timeout for bootstrap
-                    5,  // Default connect timeout for bootstrap
-                    2,  // Default attempts for bootstrap
-                );
-                real_only(
-                    build_resolver_with_limits(
-                        vec![bootstrap_entry],
-                        registry.limits,
-                        registry.forbidden.clone(),
-                    )?,
-                    registry.forbidden.clone(),
-                )
+                build_native_bootstrap(bootstrap_server, registry.limits, &registry.forbidden)?
             }
             None => real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone()),
         };
@@ -1015,7 +1055,6 @@ async fn build_entry_and_plan(
         resolver
     };
 
-    // Construction-time health checks and forwarding must use the same DNS policy.
     let chain_group = if spec.client_chains.is_empty() {
         Arc::new(build_direct_chain_group(bootstrap_resolver.clone()))
     } else {
