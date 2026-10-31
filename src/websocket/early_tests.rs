@@ -1104,6 +1104,8 @@ async fn client_rejects_bad_status_accept_and_subprotocol_but_accepts_absent_or_
             let mut response = format!(
                 concat!(
                     "{version} {status} Switching Protocols\r\n",
+                    "Upgrade: websocket\r\n",
+                    "Connection: Upgrade\r\n",
                     "{accept_header}",
                     "{extra}\r\n",
                 ),
@@ -1174,7 +1176,7 @@ async fn eager_client_rejects_bad_status_and_duplicate_response_headers() {
                 _ => String::new(),
             };
             let response = format!(
-                "HTTP/1.1 {status} Switching Protocols\r\nSec-WebSocket-Accept: {accept}\r\n{extra}\r\n"
+                "HTTP/1.1 {status} Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n{extra}\r\n"
             );
             peer.write_all(response.as_bytes()).await.unwrap();
             peer
@@ -1191,6 +1193,101 @@ async fn eager_client_rejects_bad_status_and_duplicate_response_headers() {
             assert_eq!(result.err().unwrap().to_string(), expected);
         }
         task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn eager_and_early_clients_validate_upgrade_tokens_and_preserve_read_ahead() {
+    for max in [0, 32] {
+        for (headers, expected_error) in [
+            ("", Some("missing or invalid WebSocket Upgrade header")),
+            (
+                "Connection: Upgrade\r\n",
+                Some("missing or invalid WebSocket Upgrade header"),
+            ),
+            (
+                "Upgrade: h2c\r\nConnection: Upgrade\r\n",
+                Some("missing or invalid WebSocket Upgrade header"),
+            ),
+            (
+                "Upgrade: websocket-extra\r\nConnection: Upgrade\r\n",
+                Some("missing or invalid WebSocket Upgrade header"),
+            ),
+            (
+                "Upgrade: \r\nConnection: Upgrade\r\n",
+                Some("missing or invalid WebSocket Upgrade header"),
+            ),
+            (
+                "Upgrade: websocket\r\n",
+                Some("missing or invalid WebSocket Connection header"),
+            ),
+            (
+                "Upgrade: websocket\r\nConnection: keep-alive\r\n",
+                Some("missing or invalid WebSocket Connection header"),
+            ),
+            (
+                "Upgrade: websocket\r\nConnection: not-upgrade\r\n",
+                Some("missing or invalid WebSocket Connection header"),
+            ),
+            (
+                "Upgrade: websocket\r\nConnection: \r\n",
+                Some("missing or invalid WebSocket Connection header"),
+            ),
+            ("Upgrade: websocket\r\nConnection: Upgrade\r\n", None),
+            (
+                "uPgRaDe: h2c, WeBsOcKeT\r\ncOnNeCtIoN: keep-alive, UpGrAdE\r\n",
+                None,
+            ),
+            (
+                "Upgrade: h2c\r\nupgrade: websocket\r\nConnection: keep-alive\r\nconnection: Upgrade\r\n",
+                None,
+            ),
+        ] {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let (client, peer) = tokio::io::duplex(8192);
+                let handler = WebsocketTcpClientHandler {
+                    handshake: handshake_options(max, Some("Sec-WebSocket-Protocol")),
+                    handler: Box::new(crate::port_forward_handler::PortForwardClientHandler),
+                };
+                let task = async move {
+                    let mut peer: Box<dyn AsyncStream> = Box::new(peer);
+                    let parsed = ParsedHttpData::parse(&mut peer).await.unwrap();
+                    assert_eq!(
+                        parsed.headers.get("sec-websocket-protocol").map(String::as_str),
+                        (max > 0).then_some("ZWFybHk")
+                    );
+                    let accept =
+                        create_websocket_key_response(parsed.headers["sec-websocket-key"].clone());
+                    let mut response = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: {accept}\r\n{headers}\r\n"
+                    )
+                    .into_bytes();
+                    response.extend(frame(b"reply"));
+                    peer.write_all(&response).await.unwrap();
+                    peer
+                };
+                let client = async {
+                    let mut stream = handler
+                        .setup_client_stream_common(Box::new(FlushGatedStream::new(client)))
+                        .await?;
+                    if max > 0 {
+                        stream.write_all(b"early").await?;
+                        stream.flush().await?;
+                    }
+                    let mut reply = [0; 5];
+                    stream.read_exact(&mut reply).await?;
+                    assert_eq!(&reply, b"reply");
+                    Ok::<_, io::Error>(())
+                };
+                let (result, _peer) = tokio::join!(client, task);
+                match expected_error {
+                    Some(expected) => assert_eq!(result.unwrap_err().to_string(), expected),
+                    None => result.unwrap(),
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("upgrade timed out: max={max}, headers={headers:?}"));
+        }
     }
 }
 
