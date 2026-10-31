@@ -551,6 +551,16 @@ impl ClientHandshake {
         if !matches!(status.next(), Some("HTTP/1.1" | "HTTP/1.0")) || status.next() != Some("101") {
             return Err(std::io::Error::other("Bad websocket response status"));
         }
+        if !has_token(&response_headers, "upgrade", "websocket") {
+            return Err(std::io::Error::other(
+                "missing or invalid WebSocket Upgrade header",
+            ));
+        }
+        if !has_token(&response_headers, "connection", "upgrade") {
+            return Err(std::io::Error::other(
+                "missing or invalid WebSocket Connection header",
+            ));
+        }
         if duplicates.contains("sec-websocket-accept")
             || duplicates.contains("sec-websocket-protocol")
         {
