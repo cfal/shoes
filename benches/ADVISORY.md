@@ -33,17 +33,17 @@ node benches/run_advisory.mjs SELECTOR_TEST_BINARY SHOES_BINARY NEW_OUTPUT_DIREC
 ```
 
 Use `debug` and the actual debug build commands for a tooling smoke only. Do not
-compare debug and release runs. In the recommendation batch VM, wrap **all**
-builds, tests and collection in the foreground flock from `EXECUTION_RULES.md`,
-with its shared target and `CARGO_BUILD_JOBS=1`. Do not follow the older baseline
-patch/staging instructions in `README.md` for this workstream.
+compare debug and release runs. On shared hosts, serialize builds and measurements
+with an exclusive foreground `flock` and use one Cargo build job. The full selector
+matrix and its baseline-helper instructions in [README.md](README.md) are separate
+from this collector.
 
 The bounded matrix is six selector processes (16 members and 128 policies with
 12,800 members, three repeats each) plus three reload processes. Selector runs
 verify 4,096 queries before collecting 15 batch averages. Each reload process
 retains four live connections through three SIGHUPs and checks exact echoes.
 The collector fixes `BENCH_GENERATIONS=4`, irrespective of the parent environment.
-Upstream's harness is unchanged: alternating upstream targets verify committed
+Alternating upstream targets verify committed
 routing, and warmup/drain phases check return to the initial FD count. Initial
 startup timing is separate from the three reload-readiness timings; the first
 pinned generation has no additional readiness timing.
@@ -102,6 +102,6 @@ The following remain separately opt-in follow-ups, not implied by a passing smok
 | Mobile/platform memory | Real device VPN lifecycles and platform-specific RSS/heap instrumentation |
 
 Do not add a shared-runner hard gate before establishing repeatability, noise
-budgets and clean baseline/candidate artifact provenance. Reload correctness and
-generation lifetime expansion belong to the lifecycle workstream; extend the
-measurement matrix after those contracts settle rather than duplicating them.
+budgets and clean baseline/candidate artifact provenance. Keep reload correctness
+and generation lifetime assertions in the existing lifecycle tests rather than
+duplicating them in the measurement matrix.

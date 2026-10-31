@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 test('manifest records supplied commands and embeds a portable baseline helper', t => {
-  const scratch = path.join(os.homedir(), 'tmp');
+  const scratch = process.env.TMPDIR || path.join(os.homedir(), 'tmp');
   fs.mkdirSync(scratch, { recursive: true });
   const root = fs.mkdtempSync(path.join(scratch, 'selector-manifest-test-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

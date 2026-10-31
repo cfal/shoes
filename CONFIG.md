@@ -1019,8 +1019,12 @@ selects kernel TCP REDIRECT. The system `nft` executable runs only for control-p
 changes and reconciliation, not per packet or connection.
 
 See [the desktop example](examples/tun_desktop.yaml) and
-[the systemd unit](dist/shoes-desktop.service). The example forwards DIRECT;
-replace its `rules` with the desired proxy policy before using it as a proxy.
+[the systemd unit](examples/shoes-desktop.service). These are manual deployment
+examples, not files installed by the release archive. The unit expects the binary
+at `/usr/local/bin/shoes` and the configuration at `/etc/shoes/desktop.yaml`;
+install it as `/etc/systemd/system/shoes-desktop.service` to run under systemd.
+The configuration example forwards DIRECT; replace its `rules` with the desired
+proxy policy before using it as a proxy.
 
 ```yaml
 - device_name: shoes0

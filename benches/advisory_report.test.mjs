@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
@@ -89,7 +90,9 @@ test('legacy reload reports are rejected rather than relabelled as upstream life
 });
 
 function fixture(t) {
-  const directory = fs.mkdtempSync(path.resolve('.workstream-evidence/advisory-test-'));
+  const scratch = process.env.TMPDIR || path.join(os.homedir(), 'tmp');
+  fs.mkdirSync(scratch, { recursive: true });
+  const directory = fs.mkdtempSync(path.join(scratch, 'advisory-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   fs.writeFileSync(path.join(directory, 'source.diff'), '');
   const measurement = {
@@ -118,7 +121,6 @@ function fixture(t) {
   save();
   return { directory, measurement, save };
 }
-fs.mkdirSync('.workstream-evidence', { recursive: true });
 
 test('reload metrics separate initial startup from the three reload readiness timings', t => {
   const { directory } = fixture(t);
