@@ -1,5 +1,6 @@
 use super::*;
-use crate::anytls::anytls_types::{Command, Frame, FrameCodec};
+use crate::anytls::anytls_stream::STREAM_CHANNEL_BUFFER;
+use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec};
 use crate::tcp::carrier_dialer::{CarrierDialer, RouteKey};
 use bytes::BytesMut;
 use std::{
@@ -206,6 +207,83 @@ async fn stale_checkout_propagates_fresh_dial_failure_without_retrying_again() {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
             assert_eq!(error.to_string(), "fresh dial");
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pooled_open_error_after_syn_admission_never_dials_fresh() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        for udp in [false, true] {
+            let handler = AnyTlsClientHandler::with_options(
+                "test".into(),
+                Arc::new(PaddingFactory::new(b"stop=1\n0=0-0").unwrap()),
+                true,
+                PoolOptions::default(),
+            );
+            let (io, peer) = tokio::io::duplex(4096);
+            let session = AnyTlsClientSession::new(Box::new(io), "test", handler.padding.clone())
+                .await
+                .unwrap();
+            let mut stream = session.open_stream(target().into_location()).await.unwrap();
+            stream.flush().await.unwrap();
+            let mut peer = Peer::new(peer).await;
+            peer.opened(target().location()).await;
+            assert!(peer.buffer.is_empty());
+
+            // Reading only the header leaves the writer blocked on this oversized body.
+            stream.write_all(&[7; 32000]).await.unwrap();
+            peer.io
+                .read_exact(&mut [0; FRAME_HEADER_SIZE])
+                .await
+                .unwrap();
+            for _ in 0..STREAM_CHANNEL_BUFFER - 1 {
+                stream.write_all(b"queued").await.unwrap();
+            }
+            peer.io
+                .write_all(&Frame::control(Command::Fin, 1).encode())
+                .await
+                .unwrap();
+            assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+            let route = Arc::new(Route(RouteKey(vec![1])));
+            handler.pool.release(session.clone(), route.clone());
+
+            let fresh_dials = AtomicUsize::new(0);
+            let transport = ClientTransport {
+                route: route.clone(),
+                open: Box::pin(async {
+                    fresh_dials.fetch_add(1, Ordering::SeqCst);
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "unexpected fresh dial",
+                    ))
+                }),
+            };
+            let mut opening = Box::pin(async {
+                if udp {
+                    handler
+                        .connect_client_udp(transport, target())
+                        .await
+                        .map(|_| ())
+                } else {
+                    handler
+                        .connect_client_tcp(transport, target())
+                        .await
+                        .map(|_| ())
+                }
+            });
+            // The sole free queue slot admits SYN; the destination PSH must wait.
+            assert!(futures::poll!(&mut opening).is_pending());
+            peer.io.shutdown().await.unwrap();
+            let error = opening.await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(error.to_string(), "Session writer closed");
+            assert_eq!(fresh_dials.load(Ordering::SeqCst), 0);
+            assert!(!session.is_reusable());
+            assert!(handler.pool.take(route.route_key()).is_none());
+            drop(stream);
         }
     })
     .await
