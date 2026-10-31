@@ -644,7 +644,7 @@ fn validate_wireguard_dns(validated: &ValidatedConfigs) -> std::io::Result<()> {
 /// 2. Detects cycles
 /// 3. Resolves groups in topological order
 fn resolve_client_groups_topologically(
-    raw_groups: HashMap<String, (super::GroupType, OneOrSome<super::ClientGroupMember>)>,
+    mut raw_groups: HashMap<String, (super::GroupType, OneOrSome<super::ClientGroupMember>)>,
 ) -> std::io::Result<super::composition::Groups> {
     let mut dependencies = HashMap::new();
     for (name, (_, members)) in &raw_groups {
@@ -672,14 +672,14 @@ fn resolve_client_groups_topologically(
     }
     let mut resolved = super::composition::Groups::new();
     for name in topological_sort(&dependencies)? {
-        let (kind, raw_members) = &raw_groups[&name];
+        let (kind, raw_members) = raw_groups.remove(&name).expect("sorted group exists");
         let mut labels = Vec::new();
         let mut members = Vec::new();
         let mut nodes = 0usize;
-        for (index, member) in raw_members.iter().enumerate() {
-            let label = crate::control::catalog::group_member_name(member)
+        for (index, member) in raw_members.into_vec().into_iter().enumerate() {
+            let label = crate::control::catalog::group_member_name(&member)
                 .unwrap_or_else(|| format!("{name}-chain-{}", index + 1));
-            let mut chain = member.chain();
+            let mut chain = member.into_chain();
             for hop in chain.hops.iter_mut() {
                 super::client_visit::visit_hop(hop, &mut |client| {
                     expand_peer_chains(client, &resolved)
@@ -698,7 +698,7 @@ fn resolve_client_groups_topologically(
             labels.push(label);
             members.push(chain);
         }
-        let hop = if *kind == super::GroupType::RoundRobin
+        let hop = if kind == super::GroupType::RoundRobin
             && members.len() == 1
             && members[0].hops.iter().count() == 1
         {
@@ -706,7 +706,7 @@ fn resolve_client_groups_topologically(
         } else {
             ClientChainHop::Choice(Box::new(super::ClientChoice {
                 name: name.clone(),
-                group_type: kind.clone(),
+                group_type: kind,
                 labels,
                 members,
             }))

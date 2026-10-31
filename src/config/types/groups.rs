@@ -60,12 +60,12 @@ impl ClientGroupMember {
         Self::Chain { name, chain }
     }
 
-    pub(crate) fn chain(&self) -> ClientChain {
+    pub(crate) fn into_chain(self) -> ClientChain {
         match self {
             Self::Client(client) => ClientChain {
-                hops: OneOrSome::One(ClientChainHop::Single(client.clone())),
+                hops: OneOrSome::One(ClientChainHop::Single(client)),
             },
-            Self::Chain { chain, .. } => chain.clone(),
+            Self::Chain { chain, .. } => chain,
         }
     }
 
@@ -158,13 +158,13 @@ struct RawClientGroup {
     #[serde(
         default,
         alias = "client_chain",
-        deserialize_with = "members_if_present"
+        deserialize_with = "deserialize_present"
     )]
     client_chains: Option<OneOrSome<ClientGroupMember>>,
     #[serde(
         default,
         alias = "client_proxy",
-        deserialize_with = "members_if_present"
+        deserialize_with = "deserialize_present"
     )]
     client_proxies: Option<OneOrSome<ConfigSelection<ClientConfig>>>,
     url: Option<String>,
@@ -174,12 +174,12 @@ struct RawClientGroup {
     lazy: Option<bool>,
 }
 
-fn members_if_present<'de, D, T>(deserializer: D) -> Result<Option<OneOrSome<T>>, D::Error>
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    OneOrSome::deserialize(deserializer).map(Some)
+    T::deserialize(deserializer).map(Some)
 }
 
 fn default_group_type() -> String {

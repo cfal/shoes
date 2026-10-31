@@ -57,9 +57,11 @@ pub(crate) fn expand(hops: &mut OneOrSome<ClientChainHop>, groups: &Groups) -> i
     // Charge referenced trees before cloning them into this occurrence.
     let mut nodes = 0usize;
     for hop in hops.iter() {
-        let selections: Vec<_> = match hop {
-            ClientChainHop::Single(selection) => vec![selection],
-            ClientChainHop::Pool(pool) => pool.iter().collect(),
+        let selections = match hop {
+            ClientChainHop::Single(selection) | ClientChainHop::Pool(OneOrSome::One(selection)) => {
+                std::slice::from_ref(selection)
+            }
+            ClientChainHop::Pool(OneOrSome::Some(pool)) => pool.as_slice(),
             ClientChainHop::Choice(_) => {
                 nodes = nodes.saturating_add(measure(hop, 0)?.0);
                 if nodes > MAX_NODES {
