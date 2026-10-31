@@ -193,60 +193,9 @@ impl XudpMessageStream {
                 self.read_buffer.len()
             );
 
-            // First, peek at the buffer to determine total frame size WITHOUT consuming anything.
-            // We need to check: metadata_len (2 bytes) + metadata + data_len (2 bytes) + data
-
-            // Need at least 2 bytes for metadata length
-            if self.read_buffer.len() < 2 {
-                log::debug!("[XUDP READ] Buffer too short for metadata length field");
+            let Some((metadata, data)) = super::frame::decode_frame(&mut self.read_buffer)? else {
                 return Ok(None);
-            }
-
-            let metadata_len =
-                u16::from_be_bytes([self.read_buffer[0], self.read_buffer[1]]) as usize;
-            if !(4..=512).contains(&metadata_len) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "XUDP metadata length outside 4..=512",
-                ));
-            }
-
-            // Check if we have complete metadata
-            if self.read_buffer.len() < 2 + metadata_len {
-                log::debug!("[XUDP READ] Buffer too short for complete metadata");
-                return Ok(None);
-            }
-
-            // Peek at metadata to check if frame has data
-            let option_byte = self.read_buffer[2 + 3];
-            let has_data = option_byte & FrameOption::DATA != 0;
-            let data_len_offset = 2 + metadata_len;
-            if has_data && self.read_buffer.len() < data_len_offset + 2 {
-                log::debug!("[XUDP READ] Buffer too short for data length field");
-                return Ok(None);
-            }
-
-            let data_len = if has_data {
-                u16::from_be_bytes([
-                    self.read_buffer[data_len_offset],
-                    self.read_buffer[data_len_offset + 1],
-                ]) as usize
-            } else {
-                0
             };
-
-            let total_frame_len = data_len_offset + usize::from(has_data) * (2 + data_len);
-            if self.read_buffer.len() < total_frame_len {
-                log::debug!(
-                    "[XUDP READ] Buffer too short for complete frame: have {}, need {}",
-                    self.read_buffer.len(),
-                    total_frame_len
-                );
-                return Ok(None);
-            }
-
-            let metadata = FrameMetadata::decode(&mut self.read_buffer)?
-                .expect("metadata decode should succeed after length check");
 
             log::debug!(
                 "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
@@ -257,10 +206,7 @@ impl XudpMessageStream {
                 metadata.network
             );
 
-            if has_data {
-                self.read_buffer.advance(2);
-            }
-            let data = self.read_buffer.split_to(data_len).to_vec();
+            let data = data.to_vec();
 
             if metadata.status == SessionStatus::End {
                 self.close_wire_session(metadata.session_id);
@@ -316,7 +262,7 @@ impl XudpMessageStream {
                 SessionStatus::End | SessionStatus::KeepAlive => unreachable!(),
             };
 
-            if !has_data || data.is_empty() {
+            if data.is_empty() {
                 continue;
             }
 
@@ -729,6 +675,38 @@ mod tests {
             *output.lock().unwrap(),
             [0, 12, 0, 10, 2, 1, 2, 0, 53, 1, 127, 0, 0, 1, 0, 1, b'x']
         );
+    }
+
+    #[test]
+    fn whole_frame_parser_enforces_metadata_before_payload() {
+        let mut stream = XudpMessageStream::new(Box::new(PendingOnceWriter {
+            output: Arc::new(Mutex::new(Vec::new())),
+            pending: false,
+        }));
+        for length in [0u16, 3, 513, u16::MAX] {
+            stream.read_buffer = BytesMut::from(length.to_be_bytes().as_slice());
+            assert_eq!(
+                stream.try_decode_one_frame().unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        let valid = [0, 12, 0, 1, 1, 1, 2, 0, 53, 1, 127, 0, 0, 1, 0, 1, b'x'];
+        for split in 0..valid.len() {
+            stream.read_buffer = BytesMut::from(&valid[..split]);
+            let original = stream.read_buffer.clone();
+            assert!(stream.try_decode_one_frame().unwrap().is_none());
+            assert_eq!(stream.read_buffer, original);
+        }
+        for malformed in [
+            &[0, 5, 0, 1, 1, 0, 2][..],
+            &[0, 9, 0, 1, 1, 0, 2, 0, 53, 2, 255][..],
+        ] {
+            stream.read_buffer = BytesMut::from(malformed);
+            stream.read_buffer.extend_from_slice(&valid);
+            assert!(stream.try_decode_one_frame().is_err());
+            assert_eq!(&stream.read_buffer[..], &valid);
+            assert_eq!(stream.try_decode_one_frame().unwrap().unwrap().0, b"x");
+        }
     }
 
     #[test]

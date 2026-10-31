@@ -258,6 +258,42 @@ impl FrameMetadata {
     }
 }
 
+pub(crate) fn decode_frame(
+    buf: &mut BytesMut,
+) -> std::io::Result<Option<(FrameMetadata, BytesMut)>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let metadata_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    if !(4..=512).contains(&metadata_len) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "XUDP metadata length outside 4..=512",
+        ));
+    }
+    let data_offset = 2 + metadata_len;
+    if buf.len() < data_offset {
+        return Ok(None);
+    }
+    let has_data = buf[5] & FrameOption::DATA != 0;
+    if has_data && buf.len() < data_offset + 2 {
+        return Ok(None);
+    }
+    let data_len = if has_data {
+        u16::from_be_bytes([buf[data_offset], buf[data_offset + 1]]) as usize
+    } else {
+        0
+    };
+    if buf.len() < data_offset + usize::from(has_data) * (2 + data_len) {
+        return Ok(None);
+    }
+    let metadata = FrameMetadata::decode(buf)?.expect("complete metadata");
+    if has_data {
+        buf.advance(2);
+    }
+    Ok(Some((metadata, buf.split_to(data_len))))
+}
+
 /// Encode address to buffer (VLESS address format)
 fn encode_address(buf: &mut BytesMut, address: &Address) -> std::io::Result<()> {
     match address {
