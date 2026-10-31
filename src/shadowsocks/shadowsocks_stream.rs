@@ -94,6 +94,30 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn assert_message_capacity(
+        writer: &mut ShadowsocksStream,
+        reader: &mut ShadowsocksStream,
+        capacity: usize,
+        payload_byte: u8,
+    ) {
+        let oversized = vec![1; capacity + 1];
+        let error = futures::future::poll_fn(|cx| {
+            Pin::new(&mut *writer).poll_write_message(cx, &oversized)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let payload = vec![payload_byte; capacity];
+        futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write_message(cx, &payload))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut received = vec![0; capacity];
+        reader.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+    }
+
     #[tokio::test]
     async fn aead2022_message_limits_include_initial_headers() {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
@@ -115,45 +139,9 @@ mod tests {
         let mut server = make(right, ShadowsocksStreamType::AEAD2022Server);
         let cap = ShadowsocksStreamType::AEAD2022Client.max_payload_len();
         let first_cap = cap + METADATA_SIZE - 16 - 11 - 2 * TAG_LEN;
-        for (writer, reader, capacity) in [(&mut client, &mut server, first_cap)] {
-            assert_eq!(
-                futures::future::poll_fn(
-                    |cx| Pin::new(&mut *writer).poll_write_message(cx, &vec![1; capacity + 1])
-                )
-                .await
-                .unwrap_err()
-                .kind(),
-                std::io::ErrorKind::InvalidInput
-            );
-            let data = vec![2; capacity];
-            futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write_message(cx, &data))
-                .await
-                .unwrap();
-            writer.flush().await.unwrap();
-            let mut received = vec![0; capacity];
-            reader.read_exact(&mut received).await.unwrap();
-            assert_eq!(received, data);
-        }
-        for (writer, reader) in [(&mut server, &mut client)] {
-            for _ in 0..2 {
-                assert_eq!(
-                    futures::future::poll_fn(
-                        |cx| Pin::new(&mut *writer).poll_write_message(cx, &vec![1; cap + 1])
-                    )
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                    std::io::ErrorKind::InvalidInput
-                );
-                let data = vec![3; cap];
-                futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write_message(cx, &data))
-                    .await
-                    .unwrap();
-                writer.flush().await.unwrap();
-                let mut received = vec![0; cap];
-                reader.read_exact(&mut received).await.unwrap();
-                assert_eq!(received, data);
-            }
+        assert_message_capacity(&mut client, &mut server, first_cap, 2).await;
+        for _ in 0..2 {
+            assert_message_capacity(&mut server, &mut client, cap, 3).await;
         }
     }
 
@@ -177,20 +165,7 @@ mod tests {
         let mut reader = make(right);
         let cap = ShadowsocksStreamType::Aead.max_payload_len();
         for _ in 0..2 {
-            let error = futures::future::poll_fn(|cx| {
-                Pin::new(&mut writer).poll_write_message(cx, &vec![1; cap + 1])
-            })
-            .await
-            .unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-            let payload = vec![2; cap];
-            futures::future::poll_fn(|cx| Pin::new(&mut writer).poll_write_message(cx, &payload))
-                .await
-                .unwrap();
-            writer.flush().await.unwrap();
-            let mut received = vec![0; cap];
-            reader.read_exact(&mut received).await.unwrap();
-            assert_eq!(received, payload);
+            assert_message_capacity(&mut writer, &mut reader, cap, 2).await;
         }
     }
 
