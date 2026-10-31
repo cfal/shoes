@@ -37,16 +37,7 @@ pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<V
             let all: Vec<_> = chain
                 .hops
                 .iter()
-                .filter_map(|hop| match hop {
-                    ClientChainHop::Single(ConfigSelection::GroupName(name)) => {
-                        Some(crate::control::catalog::api_group(name).to_owned())
-                    }
-                    ClientChainHop::Single(ConfigSelection::Config(client)) => client
-                        .control
-                        .as_ref()
-                        .map(|origin| origin.name.to_string()),
-                    _ => None,
-                })
+                .map(crate::control::catalog::hop_target)
                 .collect();
             json!({"name":name,"type":"Relay","all":all,"udp":udp})
         }
@@ -204,23 +195,16 @@ mod tests {
                     {"name":"inline-udp", "address":"192.0.2.3:443", "protocol":{
                         "type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"
                     }}
-                ]}
+                ]},
+                {"name":"pooled", "chain":[{"pool":["manual", "direct"]}]},
+                {"name":"pooled-prefix", "chain":[{"pool":["prefix", "prefix"]}, "manual"]}
             ]}
         ]))
         .unwrap();
-        let mut catalog = crate::config::create_server_configs(configs)
+        let catalog = crate::config::create_server_configs(configs)
             .unwrap()
             .catalog
             .unwrap();
-        catalog.nodes.insert(
-            "pooled".into(),
-            CatalogNode::Chain(Box::new(ClientChain {
-                hops: OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
-                    ConfigSelection::GroupName("manual".into()),
-                    ConfigSelection::GroupName("direct".into()),
-                ]))),
-            })),
-        );
         let generation = Generation {
             id: 1,
             leaf_udp_support: leaf_udp_support(&catalog).unwrap(),
@@ -244,6 +228,18 @@ mod tests {
             );
             assert_eq!(proxy(&generation, &choices, "inline").unwrap()["udp"], true);
             assert_eq!(proxy(&generation, &choices, "pooled").unwrap()["udp"], true);
+            assert_eq!(
+                proxy(&generation, &choices, "pooled-prefix").unwrap()["udp"],
+                expected
+            );
+            for (name, expected) in [
+                ("via-manual", json!(["prefix", "manual"])),
+                ("inline", json!(["prefix", "inline-udp"])),
+                ("pooled", json!(["pool[manual | DIRECT]"])),
+                ("pooled-prefix", json!(["pool[prefix | prefix]", "manual"])),
+            ] {
+                assert_eq!(proxy(&generation, &choices, name).unwrap()["all"], expected);
+            }
         }
     }
 

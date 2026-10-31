@@ -113,6 +113,21 @@ fn member_name(member: &ConfigSelection<ClientConfig>) -> String {
     }
 }
 
+pub(crate) fn hop_target(hop: &ClientChainHop) -> String {
+    match hop {
+        ClientChainHop::Choice(choice) => choice.name.clone(),
+        ClientChainHop::Single(member) => member_name(member),
+        ClientChainHop::Pool(members) => format!(
+            "pool[{}]",
+            members
+                .iter()
+                .map(member_name)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ),
+    }
+}
+
 pub(crate) fn group_member_name(member: &ClientGroupMember) -> Option<String> {
     match member {
         ClientGroupMember::Client(ConfigSelection::GroupName(name)) => {
@@ -145,22 +160,7 @@ fn rule_target(action: &RuleActionConfig) -> String {
     let chains: Vec<_> = client_chains
         .iter()
         .map(|chain| {
-            let hops: Vec<_> = chain
-                .hops
-                .iter()
-                .map(|hop| match hop {
-                    ClientChainHop::Choice(choice) => choice.name.clone(),
-                    ClientChainHop::Single(member) => member_name(member),
-                    ClientChainHop::Pool(members) => format!(
-                        "pool[{}]",
-                        members
-                            .iter()
-                            .map(member_name)
-                            .collect::<Vec<_>>()
-                            .join(" | ")
-                    ),
-                })
-                .collect();
+            let hops: Vec<_> = chain.hops.iter().map(hop_target).collect();
             if hops.len() == 1 {
                 hops[0].clone()
             } else {
