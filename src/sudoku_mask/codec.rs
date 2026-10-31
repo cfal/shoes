@@ -49,8 +49,8 @@ fn next_layout(index: usize, count: usize) -> usize {
     if index + 1 == count { 0 } else { index + 1 }
 }
 
-fn pad(rng: &mut impl rand::Rng, padding: u64, pool: &[u8], output: &mut [u8]) -> usize {
-    if padding == 0 || (padding < (1u64 << 32) && u64::from(rng.random::<u32>()) >= padding) {
+fn pad(rng: &mut impl rand::Rng, threshold: u64, pool: &[u8], output: &mut [u8]) -> usize {
+    if threshold == 0 || (threshold < (1u64 << 32) && u64::from(rng.random::<u32>()) >= threshold) {
         return 0;
     }
     output[0] = pool[rng.random_range(0..pool.len() as u32) as usize];
@@ -100,15 +100,15 @@ pub(super) struct Encoder {
     mode: Mode,
     layout: usize,
     // Includes 2^32 so 100% padding needs no probability draw.
-    padding: u64,
+    padding_threshold: u64,
     rng: StdRng,
 }
 
 impl Encoder {
     pub fn new(config: Arc<Prepared>, role: Role) -> Self {
         let mut rng = rand::make_rng::<StdRng>();
-        let padding = rng.random_range(config.padding_min..=config.padding_max);
-        let padding = (u64::from(padding) << 32) / 100;
+        let percent = rng.random_range(config.padding_min..=config.padding_max);
+        let padding_threshold = (u64::from(percent) << 32) / 100;
         Self {
             config,
             mode: match role {
@@ -116,13 +116,13 @@ impl Encoder {
                 Role::Server => Mode::Packed,
             },
             layout: 0,
-            padding,
+            padding_threshold,
             rng,
         }
     }
 
     pub fn max_input(&self, capacity: usize) -> usize {
-        match (self.mode, self.padding) {
+        match (self.mode, self.padding_threshold) {
             (Mode::Classic, 0) => capacity / 4,
             (Mode::Classic, _) => capacity.saturating_sub(1) / 9,
             (Mode::Packed, 0) => capacity / 4 * 3,
@@ -140,7 +140,7 @@ impl Encoder {
         }
     }
 
-    // Keep classic/cache control flow out of the packed encoder's register allocation.
+    // Keeps classic/cache control flow out of the packed encoder's register allocation.
     #[inline(never)]
     fn encode_classic(&mut self, input: &[u8], output: &mut [u8]) -> usize {
         if let Some(alphabet) = self.config.classic_alphabet {
@@ -153,7 +153,7 @@ impl Encoder {
     fn encode_uncached_classic(&mut self, input: &[u8], output: &mut [u8]) -> usize {
         let mut offset = 0;
         let layouts = &self.config.layouts;
-        let padding = self.padding;
+        let threshold = self.padding_threshold;
         let rng = &mut self.rng;
         let core = core();
         for byte in input {
@@ -166,13 +166,13 @@ impl Encoder {
             let layout = &layouts[self.layout];
             let encoded = PERMUTATIONS[(choice % 24) as usize]
                 .map(|index| layout.encode[hints[index] as usize]);
-            if padding == 0 {
+            if threshold == 0 {
                 output[offset..offset + 4].copy_from_slice(&encoded);
                 offset += 4;
             } else {
-                offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
+                offset += pad(rng, threshold, &layout.padding, &mut output[offset..]);
                 for byte in encoded {
-                    offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
+                    offset += pad(rng, threshold, &layout.padding, &mut output[offset..]);
                     output[offset] = byte;
                     offset += 1;
                 }
@@ -182,7 +182,7 @@ impl Encoder {
         offset
             + pad(
                 rng,
-                padding,
+                threshold,
                 &layouts[self.layout].padding,
                 &mut output[offset..],
             )
@@ -197,7 +197,7 @@ impl Encoder {
     ) -> usize {
         let core = core();
         let layout = &self.config.layouts[0];
-        let padding = self.padding;
+        let threshold = self.padding_threshold;
         let rng = &mut self.rng;
         let mut offset = 0;
         for byte in input {
@@ -207,29 +207,29 @@ impl Encoder {
             let choice = rng.random_range(0..count * 24);
             let tuple = tuples[(start + choice / 24) as usize];
             let encoded = PERMUTATIONS[(choice % 24) as usize].map(|index| tuple[index]);
-            if padding == 0 {
+            if threshold == 0 {
                 output[offset..offset + 4].copy_from_slice(&encoded);
                 offset += 4;
             } else {
-                offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
+                offset += pad(rng, threshold, &layout.padding, &mut output[offset..]);
                 for byte in encoded {
-                    offset += pad(rng, padding, &layout.padding, &mut output[offset..]);
+                    offset += pad(rng, threshold, &layout.padding, &mut output[offset..]);
                     output[offset] = byte;
                     offset += 1;
                 }
             }
         }
-        offset + pad(rng, padding, &layout.padding, &mut output[offset..])
+        offset + pad(rng, threshold, &layout.padding, &mut output[offset..])
     }
 
     #[inline(never)]
     fn encode_packed(&mut self, input: &[u8], output: &mut [u8]) -> usize {
         let mut offset = 0;
         let layouts = &self.config.layouts;
-        let padding = self.padding;
+        let threshold = self.padding_threshold;
         let rng = &mut self.rng;
         let (chunks, remainder) = input.as_chunks::<3>();
-        if padding == 0 {
+        if threshold == 0 {
             offset = encode_unpadded_chunks(layouts, &mut self.layout, chunks, output);
         } else {
             for &[a, b, c] in chunks {
@@ -240,7 +240,12 @@ impl Encoder {
                     c & 63,
                 ] {
                     let layout = &layouts[self.layout];
-                    offset += pad(rng, padding, &layout.packed_padding, &mut output[offset..]);
+                    offset += pad(
+                        rng,
+                        threshold,
+                        &layout.packed_padding,
+                        &mut output[offset..],
+                    );
                     output[offset] = layout.encode[group as usize];
                     offset += 1;
                     self.layout = next_layout(self.layout, layouts.len());
@@ -255,7 +260,12 @@ impl Encoder {
             while count >= 6 {
                 count -= 6;
                 let layout = &layouts[self.layout];
-                offset += pad(rng, padding, &layout.packed_padding, &mut output[offset..]);
+                offset += pad(
+                    rng,
+                    threshold,
+                    &layout.packed_padding,
+                    &mut output[offset..],
+                );
                 output[offset] = layout.encode[((bits >> count) & 63) as usize];
                 offset += 1;
                 self.layout = next_layout(self.layout, layouts.len());
@@ -264,7 +274,12 @@ impl Encoder {
         }
         if count != 0 {
             let layout = &layouts[self.layout];
-            offset += pad(rng, padding, &layout.packed_padding, &mut output[offset..]);
+            offset += pad(
+                rng,
+                threshold,
+                &layout.packed_padding,
+                &mut output[offset..],
+            );
             output[offset] = layout.encode[(bits << (6 - count)) as usize];
             offset += 1;
             self.layout = next_layout(self.layout, layouts.len());
@@ -274,7 +289,7 @@ impl Encoder {
         offset
             + pad(
                 rng,
-                padding,
+                threshold,
                 &layouts[self.layout].packed_padding,
                 &mut output[offset..],
             )
@@ -438,7 +453,7 @@ impl Decoder {
             let initial = self.count;
             hints[..initial].copy_from_slice(&self.hints[..initial]);
             // Bounds raw lookahead so output saturation cannot consume a trailing byte.
-            let limit = ((output.len() - result.written).min(64) * 4 - initial)
+            let limit = ((output.len() - result.written).min(hints.len() / 4) * 4 - initial)
                 .min(input.len() - result.consumed);
             let start = result.consumed;
             let mut count = initial;
@@ -861,7 +876,7 @@ mod tests {
             let config = super::super::tests::config(json!({
                 "padding_min":percent, "padding_max":percent,
             }));
-            let threshold = Encoder::new(config, Role::Client).padding;
+            let threshold = Encoder::new(config, Role::Client).padding_threshold;
             let numerator = percent * (u64::from(u32::MAX) + 1);
             assert!(threshold * 100 <= numerator);
             assert!(numerator - threshold * 100 < 100);

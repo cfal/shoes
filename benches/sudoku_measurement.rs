@@ -106,6 +106,7 @@ fn measure(name: &str, bytes: usize, mut operation: impl FnMut()) {
 fn sudoku_measurement() {
     assert!(!cfg!(debug_assertions), "use --release");
     let length = variable("SUDOKU_BENCH_BYTES", 3072);
+    // Padded classic stream writes accept at most (32768 - 1) / 9 bytes per call.
     assert!(length > 0 && length <= 3640);
     let plain: Vec<_> = (0..length).map(|i| (i * 37 + i / 256) as u8).collect();
     for layout in ["entropy", "ascii", "custom", "rotating"] {
