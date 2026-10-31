@@ -462,6 +462,25 @@ mod tests {
         stream.write_all(&auth).await.unwrap();
     }
 
+    fn spawn_collect(
+        server: quinn::Connection,
+        settings: Settings,
+        budget: &Arc<Budget>,
+    ) -> tokio::task::JoinHandle<io::Result<Pending>> {
+        let budget = budget.clone();
+        tokio::spawn(async move {
+            collect(
+                &server,
+                &UUID,
+                PASSWORD,
+                settings,
+                budget,
+                Arc::new(Mutex::new(Readers::default())),
+            )
+            .await
+        })
+    }
+
     #[test]
     fn length_scanner_bounds_every_partial_address_prefix() {
         for payload in [0u16, 65535] {
@@ -541,20 +560,7 @@ mod tests {
             let settings = Settings::new(limits);
             let (client, server, _endpoints) = pair(limits).await;
             let budget = Arc::new(Budget::new(Some(settings.bytes)));
-            let task = tokio::spawn({
-                let budget = budget.clone();
-                async move {
-                    collect(
-                        &server,
-                        &UUID,
-                        PASSWORD,
-                        settings,
-                        budget,
-                        Arc::new(Mutex::new(Readers::default())),
-                    )
-                    .await
-                }
-            });
+            let task = spawn_collect(server, settings, &budget);
             let mut packet = vec![5, 2, 0, 1, 0, 1, 1, 0];
             packet.extend_from_slice(&40000u16.to_be_bytes());
             packet.extend_from_slice(&[1, 127, 0, 0, 1, 0, 53]);
@@ -657,20 +663,7 @@ mod tests {
             let settings = Settings::new(limits);
             let (client, server, _endpoints) = pair(limits).await;
             let budget = Arc::new(Budget::new(Some(settings.bytes)));
-            let task = tokio::spawn({
-                let budget = budget.clone();
-                async move {
-                    collect(
-                        &server,
-                        &UUID,
-                        PASSWORD,
-                        settings,
-                        budget,
-                        Arc::new(Mutex::new(Readers::default())),
-                    )
-                    .await
-                }
-            });
+            let task = spawn_collect(server, settings, &budget);
             let mut packet = vec![5, 2, 0, 1, 0, 1, 1, 0, 64, 0, 0xff];
             packet.extend((0..16384).map(|index| (index % 251) as u8));
             let mut stream = client.open_uni().await.unwrap();
@@ -703,20 +696,7 @@ mod tests {
             let settings = Settings::new(limits);
             let (client, server, _endpoints) = pair(limits).await;
             let budget = Arc::new(Budget::new(Some(settings.bytes)));
-            let task = tokio::spawn({
-                let budget = budget.clone();
-                async move {
-                    collect(
-                        &server,
-                        &UUID,
-                        PASSWORD,
-                        settings,
-                        budget,
-                        Arc::new(Mutex::new(Readers::default())),
-                    )
-                    .await
-                }
-            });
+            let task = spawn_collect(server, settings, &budget);
             let mut stream = client.open_uni().await.unwrap();
             stream
                 .write_all(&[5, 2, 0, 1, 0, 1, 1, 0, 255, 255, 0xff])

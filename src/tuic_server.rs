@@ -1216,6 +1216,100 @@ mod lifecycle_tests {
     use super::*;
 
     #[tokio::test]
+    async fn udp_session_keeps_first_reply_mode_and_releases_real_tasks() {
+        timeout(Duration::from_secs(10), async {
+            for initial_stream_mode in [false, true] {
+                let (server, client) = crate::quic_endpoint::test_endpoints_with_config(|config| {
+                    configure_transport(config, crate::config::GlobalLimits::default());
+                });
+                let (peer, connection) = tokio::join!(
+                    client
+                        .connect(server.local_addr().unwrap(), "localhost")
+                        .unwrap(),
+                    async { server.accept().await.unwrap().await },
+                );
+                let peer = peer.unwrap();
+                let connection = connection.unwrap();
+                let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+                let selector = Arc::new(
+                    crate::tcp::tcp_client_handler_factory::create_test_selector(
+                        vec![crate::config::RuleConfig::default()],
+                        resolver.clone(),
+                    )
+                    .unwrap(),
+                );
+                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let target = socket.local_addr().unwrap();
+                let destination = NetLocation::from_ip_addr(target.ip(), target.port());
+                let map = Arc::new(UdpState::new());
+                let parent = CancellationToken::new();
+                for generation in 0..2 {
+                    let first_mode = initial_stream_mode ^ (generation != 0);
+                    for (index, receive_mode) in [first_mode, !first_mode].into_iter().enumerate() {
+                        let payload = [generation, index as u8, 42];
+                        process_udp_packet(
+                            &connection,
+                            &selector,
+                            &resolver,
+                            &map,
+                            UdpPacket {
+                                assoc_id: 7,
+                                packet_id: index as u16,
+                                frag_total: 1,
+                                frag_id: 0,
+                                remote_location: Some(destination.clone()),
+                                payload_fragment: &payload,
+                            },
+                            receive_mode,
+                            &parent,
+                        )
+                        .await
+                        .unwrap();
+                        let mut request = [0; 64];
+                        let (length, source) = socket.recv_from(&mut request).await.unwrap();
+                        assert_eq!(&request[..length], &payload);
+                        socket.send_to(&payload, source).await.unwrap();
+                        let (stream_mode, wire) = tokio::select! {
+                            stream = peer.accept_uni() => (true, stream.unwrap().read_to_end(1024).await.unwrap()),
+                            data = peer.read_datagram() => (false, data.unwrap().to_vec()),
+                        };
+                        assert_eq!(stream_mode, first_mode);
+                        let reply = parse_udp_packet(&wire).unwrap();
+                        assert_eq!(reply.assoc_id, 7);
+                        assert_eq!(reply.remote_location, Some(destination.clone()));
+                        assert_eq!(reply.payload_fragment, payload);
+                        assert_eq!(map.sessions.len(), 1);
+                        assert_eq!(map.slots.snapshot().active, 1);
+                    }
+                    let (relay, task, child) = {
+                        let entry = map.sessions.get(&7).unwrap();
+                        (
+                            Arc::downgrade(&entry.send_socket),
+                            entry.task.clone().unwrap(),
+                            entry.cancel_token.clone(),
+                        )
+                    };
+                    if generation == 1 {
+                        parent.cancel();
+                        while !task.is_finished() {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    map.sessions.remove(&7);
+                    while relay.upgrade().is_some() || !task.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(child.is_cancelled());
+                    assert_eq!(map.slots.snapshot().active, 0);
+                }
+                connection.close(0u32.into(), b"done");
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn fake_dns_adapter_contract() {
         use crate::tcp::ingress::tests::FakeTcpCase;
         use tokio::io::AsyncReadExt;
@@ -1601,7 +1695,7 @@ mod auth_tests {
     #[tokio::test]
     async fn early_tcp_returns_credit_and_rejects_whole_streams_on_overflow() {
         timeout(Duration::from_secs(15), async {
-            for overflow in [false, true] {
+            for (overflow, finish_early) in [(false, false), (false, true), (true, false)] {
                 let peer = direct_peer(crate::config::GlobalLimits {
                     max_streams_per_connection: Some(1),
                     quic_receive_window: 65536,
@@ -1625,6 +1719,9 @@ mod auth_tests {
                     assert_eq!(send.stopped().await.unwrap(), Some(0u32.into()));
                 } else {
                     write.unwrap();
+                    if finish_early {
+                        send.finish().unwrap();
+                    }
                 }
                 assert!(
                     timeout(Duration::from_millis(20), listener.accept())
@@ -1650,7 +1747,9 @@ mod auth_tests {
                     );
                 } else {
                     let (mut socket, _) = listener.accept().await.unwrap();
-                    send.finish().unwrap();
+                    if !finish_early {
+                        send.finish().unwrap();
+                    }
                     let echo = tokio::spawn(async move {
                         let mut data = Vec::new();
                         socket.read_to_end(&mut data).await.unwrap();
@@ -1912,6 +2011,7 @@ mod auth_tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"));
             return;
         }
         crate::resources::configure(crate::config::GlobalLimits {
