@@ -537,26 +537,99 @@ mod tests {
 
     #[test]
     fn same_length_alternatives_never_mix_their_hops() {
+        for kind in ["selector", "round-robin"] {
+            let (chain, catalog) = super::super::health_tests::build(
+                json!([
+                    {"clash_api_address":"127.0.0.1:0","secret":"test"},
+                    {"client_group":"out","type":kind,"client_chains":[
+                        {"name":"left","chain":[{"address":"192.0.2.1:80","protocol":{"type":"http"}},{"address":"192.0.2.2:80","protocol":{"type":"http"}}]},
+                        {"name":"right","chain":[{"address":"192.0.2.3:80","protocol":{"type":"http"}},{"address":"192.0.2.4:80","protocol":{"type":"http"}}]}
+                    ]}
+                ]),
+                json!("out"),
+            );
+            let tree = chain.composition.as_ref().unwrap();
+            let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+            owner.activate(catalog.selection.clone()).unwrap();
+            for index in 0..20 {
+                let left = index % 2 == 0;
+                if kind == "selector" {
+                    owner
+                        .select("out", if left { "left" } else { "right" })
+                        .unwrap();
+                }
+                let pinned = tree.select(false).unwrap();
+                let InitialHopEntry::Proxy { proxy, .. } = pinned.initial_hop[0].as_ref() else {
+                    panic!()
+                };
+                assert_eq!(
+                    proxy.proxy_location().to_string(),
+                    if left { "192.0.2.1:80" } else { "192.0.2.3:80" }
+                );
+                assert_eq!(
+                    pinned.subsequent_hops[0][0].proxy_location().to_string(),
+                    if left { "192.0.2.2:80" } else { "192.0.2.4:80" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_round_robin_precomputes_transport_indices() {
+        const MEMBERS: usize = 2048;
+        let members: Vec<_> = (0..MEMBERS)
+            .map(|index| {
+                json!({"chain":[{
+                    "name":format!("member-{index}"),"address":"192.0.2.1:80",
+                    "protocol":{"type":if index % 2 == 0 { "http" } else { "direct" }}
+                }]})
+            })
+            .collect();
         let (chain, _) = super::super::health_tests::build(
             json!([
-                {"client_group":"out","type":"selector","client_chains":[
-                    {"name":"left","chain":[{"address":"192.0.2.1:80","protocol":{"type":"http"}},{"address":"192.0.2.2:80","protocol":{"type":"http"}}]},
-                    {"name":"right","chain":[{"address":"192.0.2.3:80","protocol":{"type":"http"}},{"address":"192.0.2.4:80","protocol":{"type":"http"}}]}
-                ]}
+                {"clash_api_address":"127.0.0.1:0","secret":"test"},
+                {"client_group":"out","client_chains":members}
             ]),
             json!("out"),
         );
         let tree = chain.composition.as_ref().unwrap();
-        for _ in 0..20 {
-            let pinned = tree.select(false).unwrap();
-            let InitialHopEntry::Proxy { proxy, .. } = pinned.initial_hop[0].as_ref() else {
+        let Node::Choice {
+            static_members: Some(indices),
+            ..
+        } = &tree.root
+        else {
+            panic!("policy-free round-robin must use precomputed indices")
+        };
+        assert_eq!(indices[0], (0..MEMBERS).collect::<Vec<_>>());
+        assert_eq!(indices[1], (1..MEMBERS).step_by(2).collect::<Vec<_>>());
+        for index in 0..MEMBERS + 2 {
+            for (udp, expected) in [(false, index % MEMBERS), (true, (2 * index + 1) % MEMBERS)] {
+                let pinned = tree.select(udp).unwrap();
+                assert_eq!(
+                    pinned.origin(0, 0).unwrap().name.as_ref(),
+                    format!("member-{expected}")
+                );
+            }
+        }
+
+        for kind in ["selector", "fallback", "url-test"] {
+            let mut dynamic = json!({"client_group":"dynamic","type":kind,"client_chain":"direct"});
+            match kind {
+                "fallback" => {
+                    dynamic["health_check"] = json!({"url":"http://192.0.2.1/","interval_secs":10})
+                }
+                "url-test" => dynamic["url"] = json!("http://192.0.2.1/"),
+                _ => {}
+            }
+            let (chain, _) = super::super::health_tests::build(
+                json!([dynamic, {"client_group":"out","client_chains":[{"chain":["dynamic"]},{"chain":["direct"]}]}]),
+                json!("out"),
+            );
+            let Node::Choice { static_members, .. } = &chain.composition.as_ref().unwrap().root
+            else {
                 panic!()
             };
-            assert_eq!(proxy.proxy_location().to_string(), "192.0.2.1:80");
-            assert_eq!(
-                pinned.subsequent_hops[0][0].proxy_location().to_string(),
-                "192.0.2.2:80"
-            );
+            assert_eq!(static_members.is_some(), kind == "url-test", "{kind}");
         }
     }
 
