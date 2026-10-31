@@ -443,6 +443,7 @@ pub enum ClientChainHop {
     Pool(OneOrSome<ConfigSelection<ClientConfig>>),
 
     /// Resolved alternatives retain their policy boundary and complete paths.
+    /// Produced during validation; not accepted as input to `create_server_configs`.
     Choice(Box<super::groups::ClientChoice>),
 }
 
