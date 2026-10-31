@@ -1834,25 +1834,31 @@ async fn test_dns_system_with_client_chain_rejected() {
 fn dns_chain_aliases_expand_sequential_groups_in_order() {
     use serde_json::json;
     for field in ["client_chain", "client_chains"] {
-        let configs = serde_json::from_value(json!([
+        for chain in [
+            json!(["a", "b"]),
+            json!({"chain": ["a", "b"]}),
+            json!([{"chain": ["a", "b"]}]),
+        ] {
+            let configs = serde_json::from_value(json!([
             {"client_group":"a", "client_chain":{"address":"192.0.2.1:1080", "protocol":{"type":"socks"}}},
             {"client_group":"b", "client_chain":{"address":"192.0.2.2:1080", "protocol":{"type":"socks"}}},
-            {"dns_group":"dns", "dns_servers":[{"url":"tcp://192.0.2.53", field:["a", "b"]}]}
+            {"dns_group":"dns", "dns_servers":[{"url":"tcp://192.0.2.53", field:chain}]}
         ])).unwrap();
-        let validated = crate::config::create_server_configs(configs).unwrap();
-        let chains = &validated.dns_groups[0].specs[0].client_chains;
-        assert_eq!(chains.len(), 1);
-        let addresses: Vec<_> = chains[0]
-            .hops
-            .iter()
-            .map(|hop| {
-                let ResolvedClientHop::Single(client) = hop else {
-                    panic!("expected a fixed hop")
-                };
-                client.address.to_string()
-            })
-            .collect();
-        assert_eq!(addresses, ["192.0.2.1:1080", "192.0.2.2:1080"]);
+            let validated = crate::config::create_server_configs(configs).unwrap();
+            let chains = &validated.dns_groups[0].specs[0].client_chains;
+            assert_eq!(chains.len(), 1);
+            let addresses: Vec<_> = chains[0]
+                .hops
+                .iter()
+                .map(|hop| {
+                    let ResolvedClientHop::Single(client) = hop else {
+                        panic!("expected a fixed hop")
+                    };
+                    client.address.to_string()
+                })
+                .collect();
+            assert_eq!(addresses, ["192.0.2.1:1080", "192.0.2.2:1080"]);
+        }
     }
 }
 
