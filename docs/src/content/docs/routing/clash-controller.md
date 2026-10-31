@@ -56,12 +56,13 @@ Opt into manual selection explicitly:
 ```
 
 Rules continue to use `client_chain: outbound`. A selector chooses an immediate
-named member or referenced group; inline selector clients and multi-hop paths
-require `name`. See [whole-path groups](/routing/groups/#client-group) for naming,
+named member or referenced group; inline clients, pool wrappers, and multi-hop
+members require `name`. See [whole-path groups](/routing/groups/#client-group) for naming,
 `Relay` nodes, and alternatives with different hop counts.
 The group discriminant is `type`: `round-robin` (the default), `selector`,
-or `url-test`. The removed `strategy` field and unknown types are errors. Nested round-robin weights,
-duplicate membership, and existing UDP filtering are preserved. A selected
+or `url-test`. The removed `strategy` field and unknown types are errors.
+Round-robin weights immediate alternatives rather than flattened leaves;
+duplicate membership and existing UDP filtering are preserved. A selected
 branch without UDP support fails new UDP flows instead of silently falling back.
 Selection changes affect new flows only; existing streams, UDP destinations,
 DNS connections, and WireGuard associations remain pinned until reopened.

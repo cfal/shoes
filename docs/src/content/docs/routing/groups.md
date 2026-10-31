@@ -37,7 +37,8 @@ The following fragments reference groups defined elsewhere:
 ```
 
 An unnamed one-hop wrapper retains its referenced group or inline client's identity.
-Inline selector clients and multi-hop paths require explicit names. Other policies generate
+Selector members that are inline clients, pool wrappers, or multi-hop paths require
+explicit names. Other policies generate
 definition-site labels for unnamed paths; use explicit names for stable controller
 identities. Labels do not introduce another routing-reference namespace.
 The controller exposes named paths as `Relay` nodes, with whole-path delay probes
