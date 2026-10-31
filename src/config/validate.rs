@@ -459,8 +459,7 @@ pub(super) fn create_server_configs_with_memory(
     validated.catalog = catalog
         .map(|catalog| {
             catalog.finish(|client| {
-                let draft = compiler::draft_client(client, &client_groups)?;
-                compiler::lower_client(draft, &named_pems, global_limits)
+                compiler::compile_client(client, &client_groups, &named_pems, global_limits)
             })
         })
         .transpose()?;
@@ -685,20 +684,14 @@ fn resolve_client_groups_topologically(
         let (kind, raw_members) = raw_groups.remove(&name).expect("sorted group exists");
         let mut labels = Vec::new();
         let mut members = Vec::new();
-        let mut nodes = 0usize;
+        let mut budget = compiler::NodeBudget::default();
         for (index, member) in raw_members.into_vec().into_iter().enumerate() {
             let label = crate::control::catalog::group_member_name(&member)
                 .unwrap_or_else(|| format!("{name}-chain-{}", index + 1));
             let chain = member.into_chain();
-            let mut chain = compiler::expand(chain.hops, &resolved)?;
+            let mut chain = compiler::expand(chain.hops, &resolved, &mut budget)?;
             for hop in chain.hops.iter_mut() {
                 prepend_origin(hop, &name, &label)?;
-                nodes = nodes.saturating_add(compiler::measure(hop, 0)?.0);
-                if nodes > super::composition::MAX_NODES {
-                    return Err(super::composition::invalid(
-                        "client composition exceeds 16384 nodes",
-                    ));
-                }
             }
             labels.push(label);
             members.push(chain);
@@ -709,6 +702,7 @@ fn resolve_client_groups_topologically(
         {
             members.remove(0).hops.into_vec().remove(0)
         } else {
+            budget.charge(1)?;
             HopPlan::Choice(Box::new(ChoicePlan {
                 name: name.clone(),
                 group_type: kind,

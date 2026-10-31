@@ -829,6 +829,31 @@ fn unused_wireguard_dns_groups_validate_without_starting_devices() {
 }
 
 #[test]
+fn discarded_dns_groups_keep_normalized_catalog_leaves() {
+    let mut client = client();
+    client["name"] = json!("dns-vpn");
+    client["protocol"]["peer_client_chain"] = json!("direct");
+    let validated = validate(json!([
+        {"clash_api_address":"127.0.0.1:0","secret":"test"},
+        {"dns_group":"unused","dns_servers":[{"url":"tcp://192.0.2.53","client_chain":client}]}
+    ]))
+    .unwrap();
+    assert!(validated.dns_groups.is_empty());
+    assert!(validated.wireguard_endpoints.is_empty());
+    let catalog = validated.catalog.unwrap();
+    let crate::control::catalog::CatalogNode::Leaf(client) = &catalog.nodes["dns-vpn"] else {
+        panic!()
+    };
+    let ResolvedClientProxyConfig::Wireguard(config) = &client.protocol else {
+        panic!()
+    };
+    assert!(!config.endpoint_id.is_empty());
+    assert!(config.peer_client_chain.is_some());
+    assert!(config.connector.is_none());
+    assert_eq!(config.resource_limits.max_tcp_connections, Some(256));
+}
+
+#[test]
 fn old_endpoint_forms_and_client_peer_lists_are_rejected() {
     for value in [
         json!([{"wireguard": "old", "private_key": key(42), "addresses": ["10.77.0.2/32"], "peers": []}]),

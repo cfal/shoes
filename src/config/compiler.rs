@@ -20,6 +20,21 @@ pub(super) enum DraftClient {
 
 pub(super) type Groups = HashMap<String, HopPlan<DraftClient>>;
 
+#[derive(Default)]
+pub(super) struct NodeBudget {
+    nodes: usize,
+}
+
+impl NodeBudget {
+    pub(super) fn charge(&mut self, nodes: usize) -> io::Result<()> {
+        self.nodes = self.nodes.saturating_add(nodes);
+        if self.nodes > MAX_NODES {
+            return Err(invalid("client composition exceeds 16384 nodes"));
+        }
+        Ok(())
+    }
+}
+
 impl DraftClient {
     pub(super) fn resolved(&self) -> &ResolvedClientConfig {
         match self {
@@ -43,12 +58,17 @@ impl DraftClient {
     }
 }
 
-pub(super) fn draft_client(source: ClientConfig, groups: &Groups) -> io::Result<DraftClient> {
+fn draft_client(
+    source: ClientConfig,
+    groups: &Groups,
+    budget: &mut NodeBudget,
+) -> io::Result<DraftClient> {
+    budget.charge(1)?;
     let carrier = match &source.protocol {
         ClientProxyConfig::Wireguard(config) => config
             .peer_client_chain
             .as_ref()
-            .map(|chain| expand(chain.hops.clone(), groups).map(Box::new))
+            .map(|chain| expand(chain.hops.clone(), groups, budget).map(Box::new))
             .transpose()?,
         _ => None,
     };
@@ -58,8 +78,27 @@ pub(super) fn draft_client(source: ClientConfig, groups: &Groups) -> io::Result<
 pub(super) fn expand(
     hops: OneOrSome<ClientChainHop>,
     groups: &Groups,
+    budget: &mut NodeBudget,
 ) -> io::Result<ChainPlan<DraftClient>> {
-    expand_with(hops, groups, &mut Ok)
+    expand_with(hops, groups, budget, &mut Ok)
+}
+
+pub(super) fn compile_client(
+    client: ClientConfig,
+    groups: &Groups,
+    pems: &HashMap<String, String>,
+    limits: GlobalLimits,
+) -> io::Result<ResolvedClientConfig> {
+    let chain = compile_chain(
+        OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(client))),
+        groups,
+        pems,
+        limits,
+    )?;
+    match chain.hops {
+        OneOrSome::One(HopPlan::Single(client)) => Ok(client),
+        _ => unreachable!("an inline client compiles to a single hop"),
+    }
 }
 
 pub(super) fn compile_chain(
@@ -68,7 +107,7 @@ pub(super) fn compile_chain(
     pems: &HashMap<String, String>,
     limits: GlobalLimits,
 ) -> io::Result<ResolvedClientChain> {
-    let draft = expand_with(hops, groups, &mut |client| {
+    let draft = expand_with(hops, groups, &mut NodeBudget::default(), &mut |client| {
         lower_client(client, pems, limits).map(DraftClient::Ready)
     })?;
     lower_chain(draft, pems, limits)
@@ -77,26 +116,33 @@ pub(super) fn compile_chain(
 fn expand_with(
     hops: OneOrSome<ClientChainHop>,
     groups: &Groups,
+    budget: &mut NodeBudget,
     inline: &mut impl FnMut(DraftClient) -> io::Result<DraftClient>,
 ) -> io::Result<ChainPlan<DraftClient>> {
     fn selection(
         value: ConfigSelection<ClientConfig>,
         groups: &Groups,
+        budget: &mut NodeBudget,
     ) -> io::Result<ConfigSelection<DraftClient>> {
         Ok(match value {
             ConfigSelection::Config(client) => {
-                ConfigSelection::Config(draft_client(client, groups)?)
+                ConfigSelection::Config(draft_client(client, groups, budget)?)
             }
             ConfigSelection::GroupName(name) => ConfigSelection::GroupName(name),
         })
     }
     let pending = plan_ops::map_one(hops, &mut |hop| {
         let (pool, values) = match hop {
-            ClientChainHop::Single(value) => (false, OneOrSome::One(selection(value, groups)?)),
-            ClientChainHop::Pool(values) => (
-                true,
-                plan_ops::map_one(values, &mut |value| selection(value, groups))?,
-            ),
+            ClientChainHop::Single(value) => {
+                (false, OneOrSome::One(selection(value, groups, budget)?))
+            }
+            ClientChainHop::Pool(values) => {
+                budget.charge(1)?;
+                (
+                    true,
+                    plan_ops::map_one(values, &mut |value| selection(value, groups, budget))?,
+                )
+            }
         };
         // Carrier expansion for the whole stage precedes inline settings validation.
         let values = plan_ops::map_one(values, &mut |value| {
@@ -105,9 +151,16 @@ fn expand_with(
                 ConfigSelection::GroupName(name) => ConfigSelection::GroupName(name),
             })
         })?;
+        for value in values.iter() {
+            if let ConfigSelection::GroupName(name) = value
+                && !groups.contains_key(name)
+            {
+                return Err(invalid(format!("Unknown client group: {name}")));
+            }
+        }
         Ok::<_, io::Error>((pool, values))
     })?;
-    // Count complete referenced subtrees, including carriers, before cloning occurrences.
+    // Inline nodes and carriers share the budget; referenced subtrees are charged before cloning.
     let mut nodes = 0usize;
     let mut length = 0usize;
     for (pool, values) in pending.iter() {
@@ -116,12 +169,11 @@ fn expand_with(
         for value in values.iter() {
             let (count, hops) = match value {
                 ConfigSelection::Config(client) => (client_nodes(client, usize::from(*pool))?, 1),
-                ConfigSelection::GroupName(name) => measure(
-                    groups
-                        .get(name)
-                        .ok_or_else(|| invalid(format!("Unknown client group: {name}")))?,
-                    usize::from(*pool),
-                )?,
+                ConfigSelection::GroupName(name) => {
+                    let size = measure(&groups[name], usize::from(*pool))?;
+                    budget.charge(size.0)?;
+                    size
+                }
             };
             nodes = nodes.saturating_add(count);
             longest = longest.max(hops);
@@ -137,7 +189,13 @@ fn expand_with(
     let hops = plan_ops::map_one(pending, &mut |(pool, values)| {
         let mut hops = values.into_vec().into_iter().map(|value| match value {
             ConfigSelection::Config(client) => HopPlan::Single(client),
-            ConfigSelection::GroupName(name) => groups[&name].clone(),
+            ConfigSelection::GroupName(name) => {
+                #[cfg(test)]
+                tests::CLONED_NODES.with(|count| {
+                    count.set(count.get() + measure(&groups[&name], 0).unwrap().0);
+                });
+                groups[&name].clone()
+            }
         });
         Ok::<_, io::Error>(if pool {
             plan_ops::pool_choice(
@@ -222,5 +280,53 @@ pub(super) fn lower_client(
             pems,
             limits,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    thread_local! {
+        pub(super) static CLONED_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn inline_carriers_share_the_containing_materialization_budget() {
+        let leaf = DraftClient::Pending {
+            source: ClientConfig::default(),
+            carrier: None,
+        };
+        let group = plan_ops::pool_choice(vec![
+            ChainPlan {
+                hops: OneOrSome::One(HopPlan::Single(leaf))
+            };
+            MAX_NODES / 2 - 2
+        ]);
+        assert_eq!(measure(&group, 0).unwrap().0, 8191);
+        let groups = Groups::from([("large".into(), group)]);
+        let client = serde_json::from_value(serde_json::json!({
+            "address":"192.0.2.1:51820","protocol":{
+                "type":"wireguard","private_key":"KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+                "public_key":"CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "addresses":["10.77.0.2/32"],"peer_client_chain":"large"
+            }
+        }))
+        .unwrap();
+        CLONED_NODES.set(0);
+        let error = expand(
+            OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
+                ConfigSelection::Config(client); 3
+            ]))),
+            &groups,
+            &mut NodeBudget::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("16384 nodes"), "{error}");
+        assert!(
+            CLONED_NODES.get() <= MAX_NODES,
+            "cloned {} nodes before rejecting the enclosing pool",
+            CLONED_NODES.get()
+        );
     }
 }
