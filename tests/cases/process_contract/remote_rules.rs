@@ -758,8 +758,8 @@ async fn reload_bootstrap_failure_retains_active_traffic_and_success_activates_o
     std::fs::remove_file(&cache).unwrap();
     let cache = dir.path().join("cache/next.json");
     value[1]["rules"][0]["path"] = serde_json::json!("cache/next.json");
+    // SIGHUP here would race the watched edit's delayed FSEvents notification.
     std::fs::write(&path, value.to_string()).unwrap();
-    child.signal(libc::SIGHUP);
     let pending = request(&listener).await;
     roundtrip(&mut retained).await;
     roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
