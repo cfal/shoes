@@ -215,6 +215,20 @@ jobs:
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --lib file_watcher:: -- --test-threads=1
 
+    - name: Run WebSocket unit and configuration tests
+      env:
+        CARGO_BUILD_JOBS: 1
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi websocket -- --test-threads=1
+
+    - name: Run local WebSocket early-data interoperability tests
+      env:
+        CARGO_BUILD_JOBS: 1
+        RUST_LOG: warn
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --features ffi,integration-tests
+        --test ws_early_data -- --test-threads=1
+
   integration-tests:
     name: Integration (${{ matrix.name }})
     needs: unit-tests
