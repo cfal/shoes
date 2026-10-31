@@ -86,6 +86,7 @@ pub(super) fn create_server_configs_with_memory(
 ) -> std::io::Result<ValidatedConfigs> {
     crate::rule_set::validate_remote_paths(&mut all_configs, &[])?;
     let rule_cache_dir = crate::rule_set::cache_directory(&all_configs)?;
+    super::client_visit::validate_source_configs(&mut all_configs)?;
     let certificates = crate::certificates::configure(&mut all_configs)?;
     let catalog = crate::control::catalog::Catalog::capture(&mut all_configs)?;
     let mut control = super::ControlConfig::default();
