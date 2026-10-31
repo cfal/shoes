@@ -323,10 +323,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("16384 nodes"), "{error}");
-        assert!(
-            CLONED_NODES.get() <= MAX_NODES,
-            "cloned {} nodes before rejecting the enclosing pool",
-            CLONED_NODES.get()
+        assert_eq!(
+            CLONED_NODES.get(),
+            8191,
+            "only the first carrier subtree may be cloned"
         );
     }
 }
