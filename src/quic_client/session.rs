@@ -8,6 +8,7 @@ use crate::tcp::carrier_dialer::{CarrierDialer, QuicCarrier, RouteKey};
 
 pub(super) const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
+// Exposes the inner io::Error to resource-exhaustion checks; Arc's Error impl skips it.
 #[derive(Clone, Debug)]
 struct Failure(Arc<io::Error>);
 
@@ -26,7 +27,7 @@ type Outcome = Option<Result<Arc<Generation>, Failure>>;
 
 struct Slot {
     result: watch::Receiver<Outcome>,
-    _init: AbortOnDropHandle<()>,
+    task: AbortOnDropHandle<()>,
 }
 
 #[derive(Default)]
@@ -38,7 +39,7 @@ impl Pool {
     pub async fn get(
         &self,
         dialer: Arc<dyn CarrierDialer>,
-        protocol: Protocol,
+        protocol: &Protocol,
         udp: bool,
     ) -> io::Result<Arc<Generation>> {
         let mut receiver = {
@@ -49,43 +50,11 @@ impl Pool {
                         && (!udp || !generation.registry.lock().exhausted())
                 }
                 Some(Err(_)) => false,
-                None => !slot._init.is_finished(),
+                None => !slot.task.is_finished(),
             });
-            let slot = slots.entry(dialer.route_key().clone()).or_insert_with(|| {
-                let (sender, result) = watch::channel(None);
-                let slots = Arc::downgrade(&self.slots);
-                let key = dialer.route_key().clone();
-                let init = tokio::spawn(async move {
-                    let result =
-                        tokio::time::timeout(SETUP_TIMEOUT, Generation::open(dialer, protocol))
-                            .await
-                            .unwrap_or_else(|_| {
-                                Err(io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    "QUIC client setup timed out",
-                                ))
-                            })
-                            .map(Arc::new)
-                            .map_err(|error| Failure(Arc::new(error)));
-                    let closed = result.as_ref().ok().map(|generation| (generation.connection().clone(), Arc::downgrade(generation)));
-                    let _ = sender.send(Some(result));
-                    drop(sender);
-                    if let Some((connection, generation)) = closed {
-                        connection.closed().await;
-                        if let Some(slots) = slots.upgrade() {
-                            let mut slots = slots.lock();
-                            let matches = slots.get(&key).is_some_and(|slot| {
-                                matches!(&*slot.result.borrow(), Some(Ok(current)) if Arc::downgrade(current).ptr_eq(&generation))
-                            });
-                            if matches { slots.remove(&key); }
-                        }
-                    }
-                });
-                Slot {
-                    result,
-                    _init: AbortOnDropHandle::new(init),
-                }
-            });
+            let slot = slots
+                .entry(dialer.route_key().clone())
+                .or_insert_with(|| self.spawn_slot(dialer, protocol.clone()));
             slot.result.clone()
         };
         loop {
@@ -97,6 +66,50 @@ impl Pool {
             })?;
         }
     }
+
+    fn spawn_slot(&self, dialer: Arc<dyn CarrierDialer>, protocol: Protocol) -> Slot {
+        let (sender, result) = watch::channel(None);
+        let slots = Arc::downgrade(&self.slots);
+        let key = dialer.route_key().clone();
+        let task = tokio::spawn(async move {
+            let result = tokio::time::timeout(SETUP_TIMEOUT, Generation::open(dialer, protocol))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "QUIC client setup timed out",
+                    ))
+                })
+                .map(Arc::new)
+                .map_err(|error| Failure(Arc::new(error)));
+            let watcher = result
+                .as_ref()
+                .ok()
+                .map(|generation| (generation.connection().clone(), Arc::downgrade(generation)));
+            let _ = sender.send(Some(result));
+            drop(sender);
+
+            let Some((connection, generation)) = watcher else {
+                return;
+            };
+            connection.closed().await;
+            let Some(slots) = slots.upgrade() else {
+                return;
+            };
+            let mut slots = slots.lock();
+            let is_current = slots.get(&key).is_some_and(|slot| {
+                matches!(&*slot.result.borrow(), Some(Ok(current))
+                    if Arc::downgrade(current).ptr_eq(&generation))
+            });
+            if is_current {
+                slots.remove(&key);
+            }
+        });
+        Slot {
+            result,
+            task: AbortOnDropHandle::new(task),
+        }
+    }
 }
 
 pub(super) struct Generation {
@@ -105,6 +118,7 @@ pub(super) struct Generation {
     pub udp_enabled: bool,
     pub registry: Arc<parking_lot::Mutex<udp::Registry>>,
     pub dissociate: Option<tokio::sync::mpsc::Sender<tuic::Dissociate>>,
+    pub commands: Option<tuic::CommandWriter>,
     tasks: Vec<AbortOnDropHandle<()>>,
     initialized: bool,
     // Retains pointer-based route identities for the entire pooled lifetime.
@@ -124,6 +138,7 @@ impl Generation {
             udp_enabled: false,
             registry: Arc::new(parking_lot::Mutex::new(udp::Registry::new(maximum))),
             dissociate: None,
+            commands: None,
             tasks: Vec::new(),
             initialized: false,
             _dialer: dialer,
@@ -136,7 +151,8 @@ impl Generation {
                 generation.tasks.push(task);
             }
             Protocol::Tuic(config) => {
-                tuic::authenticate(generation.connection(), config).await?;
+                let commands = tuic::CommandWriter::new(generation.connection().clone());
+                tuic::authenticate(&commands, config).await?;
                 if generation.connection().max_datagram_size().is_none() {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -155,9 +171,10 @@ impl Generation {
                 generation
                     .tasks
                     .push(AbortOnDropHandle::new(tokio::spawn(tuic::dissociate_loop(
-                        generation.connection().clone(),
+                        commands.clone(),
                         receiver,
                     ))));
+                generation.commands = Some(commands);
             }
         }
         generation
@@ -165,7 +182,7 @@ impl Generation {
             .push(AbortOnDropHandle::new(tokio::spawn(udp::receive(
                 generation.connection().clone(),
                 generation.registry.clone(),
-                generation.protocol.clone(),
+                matches!(generation.protocol, Protocol::Tuic(_)),
             ))));
         generation.initialized = true;
         Ok(generation)
@@ -232,24 +249,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn panicked_initializers_do_not_poison_routes() {
-        let pool = Pool::default();
-        assert!(
-            pool.get(Arc::new(Panics(RouteKey(vec![1]))), protocol(), false)
-                .await
-                .is_err()
-        );
-        let dialer = Arc::new(Stalled {
-            key: RouteKey(vec![1]),
-            started: AtomicUsize::new(0),
-            done: tokio::sync::Notify::new(),
-        });
-        let mut retry = Box::pin(pool.get(dialer.clone(), protocol(), false));
-        assert!(futures::poll!(&mut retry).is_pending());
-        tokio::task::yield_now().await;
-        assert_eq!(dialer.started.load(Ordering::SeqCst), 1);
-    }
     #[async_trait::async_trait]
     impl CarrierDialer for Stalled {
         fn route_key(&self) -> &RouteKey {
@@ -276,19 +275,40 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn cancellation_does_not_cancel_shared_initialization_and_failures_retry() {
-        let pool = Arc::new(Pool::default());
-        let dialer = Arc::new(Stalled {
+    fn stalled() -> Arc<Stalled> {
+        Arc::new(Stalled {
             key: RouteKey(vec![1]),
             started: AtomicUsize::new(0),
             done: tokio::sync::Notify::new(),
-        });
-        let mut first = Box::pin(pool.get(dialer.clone(), protocol(), false));
+        })
+    }
+
+    #[tokio::test]
+    async fn panicked_initializers_do_not_poison_routes() {
+        let pool = Pool::default();
+        let protocol = protocol();
+        assert!(
+            pool.get(Arc::new(Panics(RouteKey(vec![1]))), &protocol, false)
+                .await
+                .is_err()
+        );
+        let dialer = stalled();
+        let mut retry = Box::pin(pool.get(dialer.clone(), &protocol, false));
+        assert!(futures::poll!(&mut retry).is_pending());
+        tokio::task::yield_now().await;
+        assert_eq!(dialer.started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_cancel_shared_initialization_and_failures_retry() {
+        let pool = Pool::default();
+        let protocol = protocol();
+        let dialer = stalled();
+        let mut first = Box::pin(pool.get(dialer.clone(), &protocol, false));
         assert!(futures::poll!(&mut first).is_pending());
         tokio::task::yield_now().await;
         drop(first);
-        let mut second = Box::pin(pool.get(dialer.clone(), protocol(), false));
+        let mut second = Box::pin(pool.get(dialer.clone(), &protocol, false));
         assert!(futures::poll!(&mut second).is_pending());
         assert_eq!(dialer.started.load(Ordering::SeqCst), 1);
         dialer.done.notify_one();
@@ -296,7 +316,7 @@ mod tests {
             second.await.err().unwrap().kind(),
             io::ErrorKind::PermissionDenied
         );
-        let mut third = Box::pin(pool.get(dialer.clone(), protocol(), false));
+        let mut third = Box::pin(pool.get(dialer.clone(), &protocol, false));
         assert!(futures::poll!(&mut third).is_pending());
         tokio::task::yield_now().await;
         assert_eq!(dialer.started.load(Ordering::SeqCst), 2);
@@ -305,13 +325,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn initialization_has_a_deadline_even_without_waiters() {
         let pool = Pool::default();
-        let dialer = Arc::new(Stalled {
-            key: RouteKey(vec![1]),
-            started: AtomicUsize::new(0),
-            done: tokio::sync::Notify::new(),
-        });
+        let dialer = stalled();
         assert_eq!(
-            pool.get(dialer, protocol(), false)
+            pool.get(dialer, &protocol(), false)
                 .await
                 .err()
                 .unwrap()

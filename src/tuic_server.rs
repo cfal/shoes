@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use log::{debug, error};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
+use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
 
 use crate::address::{Address, NetLocation};
@@ -33,6 +34,8 @@ const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
 // hostname case: type (1) + hostname length (1) + hostname bytes (255) + port (2)
 const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
 const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
+const MAX_PREAUTH_COMMANDS: usize = 32;
+const MAX_PREAUTH_BYTES: usize = 1 << 20;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -220,8 +223,8 @@ async fn auth_connection(
     let mut pending_bytes = 0;
     let pending_limit = crate::resources::limits()
         .max_streams_per_connection
-        .unwrap_or(32)
-        .min(32);
+        .unwrap_or(MAX_PREAUTH_COMMANDS)
+        .min(MAX_PREAUTH_COMMANDS);
     // Independent uni streams may reach the peer before the AUTH stream.
     // Complete bounded commands to return uni credit even when the peer has only
     // one stream available. Nothing is dispatched before authentication.
@@ -247,7 +250,7 @@ async fn auth_connection(
                 ));
             }
             let body = recv_stream
-                .read_to_end((MAX_HEADER_LEN + 65535).min((1 << 20) - pending_bytes))
+                .read_to_end((MAX_HEADER_LEN + 65535).min(MAX_PREAUTH_BYTES - pending_bytes))
                 .await
                 .map_err(std::io::Error::other)?;
             pending_bytes += body.len();
@@ -842,29 +845,23 @@ async fn run_unidirectional_loop(
     });
 
     loop {
-        let (command, accepted): (_, Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>, _>) =
-            match pending_commands.next() {
-                Some((command, body)) => (Some(command), Ok(Box::new(std::io::Cursor::new(body)))),
-                None => (
-                    None,
-                    tokio::select! {
-                        result = connection.accept_uni() => result.map(|stream| Box::new(stream) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
-                        _ = tasks.join_next(), if !tasks.is_empty() => continue,
-                    },
-                ),
-            };
-        let recv_stream = match accepted {
-            Ok(recv_stream) => recv_stream,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                break;
-            }
-            Err(quinn::ConnectionError::ConnectionClosed(_)) => {
-                break;
-            }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to accept unidirectional stream: {e}"
-                )));
+        let (command, recv_stream) = match pending_commands.next() {
+            Some((command, body)) => (Some(command), Either::Left(std::io::Cursor::new(body))),
+            None => {
+                let accepted = tokio::select! {
+                    result = connection.accept_uni() => result,
+                    _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                };
+                match accepted {
+                    Ok(stream) => (None, Either::Right(stream)),
+                    Err(quinn::ConnectionError::ApplicationClosed(_))
+                    | Err(quinn::ConnectionError::ConnectionClosed(_)) => break,
+                    Err(error) => {
+                        return Err(std::io::Error::other(format!(
+                            "failed to accept unidirectional stream: {error}"
+                        )));
+                    }
+                }
             }
         };
 

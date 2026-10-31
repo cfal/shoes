@@ -1,7 +1,7 @@
 use std::{io, sync::Arc, time::Duration};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use super::{
     session::{Generation, SETUP_TIMEOUT},
@@ -15,30 +15,62 @@ use crate::{
 };
 
 pub(super) const MAX_PACKET: usize = 10 + 259 + 65535;
+const MAX_COMMAND_WRITERS: usize = 64;
+
+#[derive(Clone)]
+pub(super) struct CommandWriter {
+    connection: quinn::Connection,
+    slots: Arc<Semaphore>,
+}
+
+impl CommandWriter {
+    pub fn new(connection: quinn::Connection) -> Self {
+        Self {
+            connection,
+            slots: Arc::new(Semaphore::new(MAX_COMMAND_WRITERS)),
+        }
+    }
+
+    pub async fn send(&self, bytes: Bytes) -> io::Result<()> {
+        let (permit, mut stream) = tokio::time::timeout(Duration::from_secs(5), async {
+            let permit = self
+                .slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(io::Error::other)?;
+            let stream = self.connection.open_uni().await?;
+            Ok::<_, io::Error>((permit, stream))
+        })
+        .await??;
+        // Dropping a partial command sends FIN, which peers treat as a fatal
+        // protocol error. Once admitted, finish independently of caller cancellation.
+        // The permit bounds detached writers; connection closure releases them.
+        tokio::spawn(async move {
+            let _permit = permit;
+            stream.write_all(&bytes).await?;
+            stream.finish()?;
+            Ok::<_, io::Error>(())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+}
 
 pub(super) async fn authenticate(
-    connection: &quinn::Connection,
+    commands: &CommandWriter,
     config: &TuicClientConfig,
 ) -> io::Result<()> {
     let uuid = config.uuid_bytes()?;
     let mut token = [0; 32];
-    connection
+    commands
+        .connection
         .export_keying_material(&mut token, &uuid, config.password.0.as_bytes())
         .map_err(|_| io::Error::other("TUIC TLS exporter failed"))?;
     let mut request = BytesMut::from(&[5, 0][..]);
     request.extend_from_slice(&uuid);
     request.extend_from_slice(&token);
-    send_command(connection, &request).await
-}
-
-pub(super) async fn send_command(connection: &quinn::Connection, bytes: &[u8]) -> io::Result<()> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut stream = connection.open_uni().await?;
-        stream.write_all(bytes).await?;
-        stream.finish()?;
-        Ok::<_, io::Error>(())
-    })
-    .await?
+    commands.send(request.freeze()).await
 }
 
 pub(super) struct Dissociate {
@@ -46,17 +78,40 @@ pub(super) struct Dissociate {
     pub completed: Option<oneshot::Sender<io::Result<()>>>,
 }
 
+pub(super) async fn request_dissociate(
+    sender: mpsc::Sender<Dissociate>,
+    id: u16,
+) -> io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async move {
+        let (completed, result) = oneshot::channel();
+        sender
+            .send(Dissociate {
+                id,
+                completed: Some(completed),
+            })
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
+        result
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?
+    })
+    .await?
+}
+
 pub(super) async fn dissociate_loop(
-    connection: quinn::Connection,
+    writer: CommandWriter,
     mut commands: mpsc::Receiver<Dissociate>,
 ) {
     loop {
         let command = tokio::select! {
-            _ = connection.closed() => return,
-            command = commands.recv() => match command { Some(command) => command, None => return },
+            _ = writer.connection.closed() => return,
+            command = commands.recv() => command,
         };
+        let Some(command) = command else { return };
         let id = command.id.to_be_bytes();
-        let result = send_command(&connection, &[5, 3, id[0], id[1]]).await;
+        let result = writer
+            .send(Bytes::copy_from_slice(&[5, 3, id[0], id[1]]))
+            .await;
         if let Some(completed) = command.completed {
             let _ = completed.send(result);
         }
@@ -83,7 +138,7 @@ pub(super) async fn connect(
     target: &ResolvedLocation,
 ) -> io::Result<TcpClientSetupResult> {
     let mut request = BytesMut::from(&[5, 1][..]);
-    encode_address(&mut request, Some(target.location()))?;
+    encode_address(&mut request, target.location())?;
     let (mut send, recv) =
         tokio::time::timeout(SETUP_TIMEOUT, generation.connection().open_bi()).await??;
     tokio::time::timeout(SETUP_TIMEOUT, send.write_all(&request)).await??;
@@ -93,11 +148,7 @@ pub(super) async fn connect(
     })
 }
 
-fn encode_address(out: &mut BytesMut, address: Option<&NetLocation>) -> io::Result<()> {
-    let Some(location) = address else {
-        out.put_u8(0xff);
-        return Ok(());
-    };
+fn encode_address(out: &mut BytesMut, location: &NetLocation) -> io::Result<()> {
     match location.address() {
         Address::Hostname(name) => {
             let length: u8 = name.len().try_into().map_err(|_| {
@@ -200,7 +251,7 @@ pub(super) fn encode(
     mtu: usize,
 ) -> io::Result<Vec<Bytes>> {
     let mut address = BytesMut::new();
-    encode_address(&mut address, Some(target))?;
+    encode_address(&mut address, target)?;
     let chunk = mtu
         .checked_sub(10 + address.len())
         .filter(|n| *n > 0)
@@ -237,7 +288,50 @@ pub(super) fn encode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::udp_fragments::UdpFragments;
+    use crate::{quic_client::test_connection_pair, udp_fragments::UdpFragments};
+
+    #[tokio::test]
+    async fn cancelled_command_finishes_without_truncating_the_stream() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (server, client) = crate::quic_endpoint::test_endpoints();
+            let (client, peer) = test_connection_pair(&server, &client).await;
+            client.set_send_window(32);
+            let commands = CommandWriter::new(client.clone());
+            let payload = Bytes::from(vec![42; 1024]);
+            let mut write = Box::pin(commands.send(payload.clone()));
+            assert!(futures::poll!(&mut write).is_pending());
+            drop(write);
+            let mut stream = peer.accept_uni().await.unwrap();
+            assert_eq!(stream.read_to_end(payload.len()).await.unwrap(), payload);
+            assert!(peer.close_reason().is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_commands_keep_their_slots_until_connection_close() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (server, endpoint) = crate::quic_endpoint::test_endpoints();
+            let (client, _peer) = test_connection_pair(&server, &endpoint).await;
+            client.set_send_window(0);
+            let commands = CommandWriter::new(client.clone());
+            for _ in 0..MAX_COMMAND_WRITERS {
+                let mut write = Box::pin(commands.send(Bytes::from_static(b"pending")));
+                assert!(futures::poll!(&mut write).is_pending());
+            }
+            assert_eq!(commands.slots.available_permits(), 0);
+            let mut blocked = Box::pin(commands.send(Bytes::from_static(b"not admitted")));
+            assert!(futures::poll!(&mut blocked).is_pending());
+            drop(blocked);
+            client.close(0u32.into(), b"done");
+            while commands.slots.available_permits() != MAX_COMMAND_WRITERS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn packets_reassemble_out_of_order_with_empty_and_full_payloads() {
@@ -282,7 +376,7 @@ mod tests {
         assert!(
             encode_address(
                 &mut BytesMut::new(),
-                Some(&NetLocation::new(Address::Hostname("x".repeat(256)), 1))
+                &NetLocation::new(Address::Hostname("x".repeat(256)), 1)
             )
             .is_err()
         );

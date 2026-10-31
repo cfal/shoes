@@ -105,7 +105,7 @@ impl HoppingSocket {
         Ok(())
     }
 
-    fn canonicalise(&self, meta: &mut [RecvMeta], count: usize) {
+    fn canonicalize(&self, meta: &mut [RecvMeta], count: usize) {
         for meta in &mut meta[..count] {
             meta.addr = self.canonical;
         }
@@ -137,11 +137,11 @@ impl AsyncUdpSocket for HoppingSocket {
         if let Some(previous) = &state.previous
             && let Poll::Ready(Ok(count)) = previous.poll_recv(cx, bufs, meta)
         {
-            self.canonicalise(meta, count);
+            self.canonicalize(meta, count);
             return Poll::Ready(Ok(count));
         }
         let count = std::task::ready!(state.current.poll_recv(cx, bufs, meta))?;
-        self.canonicalise(meta, count);
+        self.canonicalize(meta, count);
         Poll::Ready(Ok(count))
     }
     fn local_addr(&self) -> io::Result<SocketAddr> {

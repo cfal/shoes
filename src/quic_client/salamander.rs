@@ -16,6 +16,7 @@ use rand::Rng;
 use crate::config::quic_client::Secret;
 
 pub(crate) const OVERHEAD: u16 = 8;
+const SALT_LEN: usize = OVERHEAD as usize;
 
 #[derive(Debug)]
 pub(crate) struct Salamander {
@@ -39,12 +40,9 @@ fn xor(data: &mut [u8], key: &[u8; 32]) {
 }
 
 fn decode(password: &str, data: &mut [u8]) -> Option<usize> {
-    let size = data
-        .len()
-        .checked_sub(OVERHEAD as usize)
-        .filter(|size| *size > 0)?;
-    let key = key(password, &data[..8]);
-    data.copy_within(8.., 0);
+    let size = data.len().checked_sub(SALT_LEN).filter(|size| *size > 0)?;
+    let key = key(password, &data[..SALT_LEN]);
+    data.copy_within(SALT_LEN.., 0);
     xor(&mut data[..size], &key);
     Some(size)
 }
@@ -55,7 +53,7 @@ fn decode_segments(password: &str, data: &mut [u8], stride: usize) -> Option<(us
         let length = decode(password, data)?;
         return Some((length, length));
     }
-    let decoded_stride = stride.checked_sub(8).filter(|size| *size > 0)?;
+    let decoded_stride = stride.checked_sub(SALT_LEN).filter(|size| *size > 0)?;
     let mut out = 0;
     for start in (0..data.len()).step_by(stride) {
         let end = (start + stride).min(data.len());
@@ -116,11 +114,11 @@ impl AsyncUdpSocket for Salamander {
                 "Salamander transmit segmentation disabled",
             ));
         }
-        let mut data = vec![0; transmit.contents.len() + 8];
-        rand::rng().fill_bytes(&mut data[..8]);
-        let key = key(&self.password.0, &data[..8]);
-        data[8..].copy_from_slice(transmit.contents);
-        xor(&mut data[8..], &key);
+        let mut data = vec![0; transmit.contents.len() + SALT_LEN];
+        rand::rng().fill_bytes(&mut data[..SALT_LEN]);
+        let key = key(&self.password.0, &data[..SALT_LEN]);
+        data[SALT_LEN..].copy_from_slice(transmit.contents);
+        xor(&mut data[SALT_LEN..], &key);
         self.inner.try_send(&Transmit {
             contents: &data,
             segment_size: None,

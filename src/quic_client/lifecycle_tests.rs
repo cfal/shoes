@@ -85,6 +85,75 @@ fn protocol() -> Protocol {
 }
 
 #[tokio::test]
+async fn exhausted_udp_ids_replace_the_connection_without_migrating_live_associations() {
+    use crate::tcp::proxy_connector::ProxyConnector;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (server, dialer) = endpoints();
+        let (accepted, mut connections) = tokio::sync::mpsc::channel(2);
+        let peer = AbortOnDropHandle::new(tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let connection = incoming.await.unwrap();
+                let mut auth = connection.accept_uni().await.unwrap();
+                assert_eq!(auth.read_to_end(50).await.unwrap().len(), 50);
+                accepted.send(connection).await.unwrap();
+            }
+        }));
+        let target = crate::address::NetLocation::from_str("127.0.0.1:53", None).unwrap();
+        let client = super::Client {
+            location: target.clone(),
+            protocol: protocol(),
+            sessions: Pool::default(),
+        };
+        let first = client
+            .sessions
+            .get(dialer.clone(), &client.protocol, true)
+            .await
+            .unwrap();
+        *first.registry.lock() = super::udp::Registry::new(0);
+        let mut old_udp = client
+            .connect_udp_with_dialer(dialer.clone(), target.clone().into())
+            .await
+            .unwrap();
+        let old_peer = connections.recv().await.unwrap();
+        assert!(first.registry.lock().exhausted());
+        // Check eviction directly before entering the allocation retry loop.
+        let second = client
+            .sessions
+            .get(dialer.clone(), &client.protocol, true)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        let mut new_udp = client
+            .connect_udp_with_dialer(dialer.clone(), target.clone().into())
+            .await
+            .unwrap();
+        let new_peer = connections.recv().await.unwrap();
+        assert_eq!(dialer.attempts.load(Ordering::SeqCst), 2);
+        drop((first, second, client));
+        assert!(old_peer.close_reason().is_none());
+        assert!(new_peer.close_reason().is_none());
+        for (peer, association, data) in [
+            (&old_peer, &mut old_udp, b"old"),
+            (&new_peer, &mut new_udp, b"new"),
+        ] {
+            let packet = super::tuic::encode(0, 0, &target, data, 1200).unwrap();
+            peer.send_datagram(packet[0].clone()).unwrap();
+            let mut buffer = [0; 8];
+            let mut read = tokio::io::ReadBuf::new(&mut buffer);
+            std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut **association).poll_read_message(cx, &mut read)
+            })
+            .await
+            .unwrap();
+            assert_eq!(read.filled(), data);
+        }
+        drop(peer);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn generations_singleflight_reauthenticate_and_drain_after_retirement() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (server, dialer) = endpoints();
@@ -104,9 +173,10 @@ async fn generations_singleflight_reauthenticate_and_drain_after_retirement() {
             }
         }));
         let pool = Pool::default();
+        let protocol = protocol();
         let (first, same) = tokio::join!(
-            pool.get(dialer.clone(), protocol(), false),
-            pool.get(dialer.clone(), protocol(), true)
+            pool.get(dialer.clone(), &protocol, false),
+            pool.get(dialer.clone(), &protocol, true)
         );
         let first = first.unwrap();
         let same = same.unwrap();
@@ -120,7 +190,7 @@ async fn generations_singleflight_reauthenticate_and_drain_after_retirement() {
             .unwrap();
         old_peer.close(1u32.into(), b"reconnect");
         first.connection().closed().await;
-        let second = pool.get(dialer.clone(), protocol(), false).await.unwrap();
+        let second = pool.get(dialer.clone(), &protocol, false).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(dialer.attempts.load(Ordering::SeqCst), 2);
         let new_peer = connections.recv().await.unwrap();
@@ -177,7 +247,7 @@ async fn abandoned_h3_auth_is_closed_when_its_connector_retires() {
             waiter_pool
                 .get(
                     dialer,
-                    Protocol::Hysteria2(crate::config::quic_client::Hysteria2ClientConfig {
+                    &Protocol::Hysteria2(crate::config::quic_client::Hysteria2ClientConfig {
                         password: Secret("password".into()),
                         udp_enabled: true,
                         obfs: None,
@@ -244,7 +314,7 @@ async fn closed_generations_are_evicted_without_another_dial() {
             (server, connection)
         });
         let pool = Pool::default();
-        let generation = pool.get(dialer, protocol(), false).await.unwrap();
+        let generation = pool.get(dialer, &protocol(), false).await.unwrap();
         let weak = Arc::downgrade(&generation);
         generation.connection().closed().await;
         drop(generation);
@@ -277,7 +347,7 @@ async fn last_retired_tcp_lease_drains_fin_and_unacknowledged_tail() {
             drop(server);
         });
         let pool = Pool::default();
-        let generation = pool.get(dialer, protocol(), false).await.unwrap();
+        let generation = pool.get(dialer, &protocol(), false).await.unwrap();
         let connection = received.await.unwrap();
         let target = crate::address::NetLocation::from_str("127.0.0.1:1234", None).unwrap();
         let mut stream = super::tuic::connect(generation, &target.into())

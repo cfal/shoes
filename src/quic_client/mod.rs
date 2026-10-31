@@ -107,10 +107,7 @@ impl ProxyConnector for Client {
         dialer: Arc<dyn CarrierDialer>,
         target: &ResolvedLocation,
     ) -> io::Result<TcpClientSetupResult> {
-        let generation = self
-            .sessions
-            .get(dialer, self.protocol.clone(), false)
-            .await?;
+        let generation = self.sessions.get(dialer, &self.protocol, false).await?;
         match &self.protocol {
             Protocol::Hysteria2(_) => hysteria2::connect(generation, target).await,
             Protocol::Tuic(_) => tuic::connect(generation, target).await,
@@ -129,7 +126,7 @@ impl ProxyConnector for Client {
         loop {
             let generation = self
                 .sessions
-                .get(dialer.clone(), self.protocol.clone(), true)
+                .get(dialer.clone(), &self.protocol, true)
                 .await?;
             if !generation.udp_enabled {
                 return Err(io::Error::new(
@@ -170,4 +167,18 @@ impl ProxyConnector for Client {
             "native QUIC requires a carrier dialer",
         ))
     }
+}
+
+#[cfg(test)]
+async fn test_connection_pair(
+    server: &quinn::Endpoint,
+    client: &quinn::Endpoint,
+) -> (quinn::Connection, quinn::Connection) {
+    let (client, peer) = tokio::join!(
+        client
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { server.accept().await.unwrap().await.unwrap() },
+    );
+    (client.unwrap(), peer)
 }

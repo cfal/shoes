@@ -1279,6 +1279,9 @@ UDP associations share a bounded, connection-owned receiver. Association IDs
 are never reused within a connection; exhaustion creates a new connection while
 existing flows retain the old one. Explicit shutdown sends DISSOCIATE with a
 deadline; dropping an association queues a bounded best-effort notification.
+Up to 64 command writers run concurrently. Admission has a five-second deadline;
+once admitted, a write completes even if its caller is cancelled, or fails when
+the connection closes. This prevents partial commands from disrupting other flows.
 The default incoming uni-stream credit is 1024 (reduced by an explicit
 `max_streams_per_connection`), with at most 64 concurrent command readers.
 Very small stream limits can make external servers reject bursty stream-mode
