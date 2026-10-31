@@ -401,8 +401,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 "{}",
                 "\r\n"
             ),
-            websocket_key_response,
-            protocol_response,
+            websocket_key_response, protocol_response,
         );
 
         server_stream.write_all(http_response.as_bytes()).await?;

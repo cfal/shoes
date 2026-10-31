@@ -86,7 +86,7 @@ fn websocket_early_data_validation_reaches_clients_and_every_server_target() {
                 protocol["type"] = "ws".into();
                 let handler = create_tcp_client_handler(
                     serde_json::from_value(protocol.clone()).unwrap(),
-                    None,
+                    &crate::address::NetLocation::from_str("127.0.0.1:443", None).unwrap(),
                     resolver.clone(),
                 );
                 (
