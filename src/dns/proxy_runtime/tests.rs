@@ -7,7 +7,7 @@ use crate::tcp::socket_connector::SocketConnector;
 use async_trait::async_trait;
 
 #[tokio::test]
-async fn downstream_dns_proxy_names_remain_remote_for_forwarding_and_health_probes() {
+async fn downstream_dns_proxy_names_remain_remote_for_forwarding() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Debug)]
@@ -22,48 +22,33 @@ async fn downstream_dns_proxy_names_remain_remote_for_forwarding_and_health_prob
     let first = listener.local_addr().unwrap();
     let fixture = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(5), async {
-            for probe in [false, true] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                for downstream in [true, false] {
-                    let mut greeting = [0; 3];
-                    stream.read_exact(&mut greeting).await.unwrap();
-                    assert_eq!(greeting, [5, 1, 0]);
-                    stream.write_all(&[5, 0]).await.unwrap();
-                    let mut header = [0; 4];
-                    stream.read_exact(&mut header).await.unwrap();
-                    assert_eq!(header, [5, 1, 0, if downstream { 3 } else { 1 }]);
-                    if downstream {
-                        let length = stream.read_u8().await.unwrap();
-                        let mut name = vec![0; length as usize];
-                        stream.read_exact(&mut name).await.unwrap();
-                        assert_eq!(name, b"second.invalid");
-                        assert_eq!(stream.read_u16().await.unwrap(), 1080);
-                    } else {
-                        let mut address = [0; 4];
-                        stream.read_exact(&mut address).await.unwrap();
-                        assert_eq!(address, [192, 0, 2, 53]);
-                        assert_eq!(stream.read_u16().await.unwrap(), 80);
-                    }
-                    stream
-                        .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
-                        .await
-                        .unwrap();
-                }
-                if probe {
-                    let mut request = Vec::new();
-                    while !request.ends_with(b"\r\n\r\n") {
-                        request.push(stream.read_u8().await.unwrap());
-                        assert!(request.len() < 4096);
-                    }
-                    assert!(request.starts_with(b"HEAD / HTTP/1.1\r\n"));
-                    stream
-                        .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
-                        .await
-                        .unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for downstream in [true, false] {
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                stream.write_all(&[5, 0]).await.unwrap();
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).await.unwrap();
+                assert_eq!(header, [5, 1, 0, if downstream { 3 } else { 1 }]);
+                if downstream {
+                    let length = stream.read_u8().await.unwrap();
+                    let mut name = vec![0; length as usize];
+                    stream.read_exact(&mut name).await.unwrap();
+                    assert_eq!(name, b"second.invalid");
+                    assert_eq!(stream.read_u16().await.unwrap(), 1080);
                 } else {
-                    assert!(stream.read_u8().await.is_err());
+                    let mut address = [0; 4];
+                    stream.read_exact(&mut address).await.unwrap();
+                    assert_eq!(address, [192, 0, 2, 53]);
+                    assert_eq!(stream.read_u16().await.unwrap(), 80);
                 }
+                stream
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                    .await
+                    .unwrap();
             }
+            assert!(stream.read_u8().await.is_err());
         })
         .await
         .unwrap();
@@ -82,36 +67,13 @@ async fn downstream_dns_proxy_names_remain_remote_for_forwarding_and_health_prob
         )
         .unwrap(),
     );
-    let provider = ProxyRuntimeProvider::with_bootstrap(
-        chains.clone(),
-        resolver.clone(),
-        Duration::from_secs(2),
-    );
+    let provider = ProxyRuntimeProvider::with_bootstrap(chains, resolver, Duration::from_secs(2));
     drop(
         provider
             .connect_tcp("192.0.2.53:80".parse().unwrap(), None, None)
             .await
             .unwrap(),
     );
-    let query = crate::control::probes::ProbeQuery::parse(
-        &std::collections::HashMap::from([
-            ("url".into(), "http://192.0.2.53/".into()),
-            ("timeout".into(), "2000".into()),
-            ("expected".into(), "204".into()),
-        ]),
-        false,
-    )
-    .unwrap();
-    let (_, matched) = crate::control::probes::request_via(
-        &chains,
-        resolver,
-        &[],
-        &query,
-        crate::rustls_config_util::create_dns_client_config,
-    )
-    .await
-    .unwrap();
-    assert!(matched);
     fixture.await.unwrap();
 }
 

@@ -396,6 +396,41 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[tokio::test]
+    async fn removed_fallback_configuration_is_rejected_before_resources_open() {
+        let (_wire, tun) = UnixDatagram::pair().unwrap();
+        let flags = unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) };
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = serde_json::json!([
+            {"device_fd": tun.as_raw_fd()},
+            {"address": occupied.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+            {"client_group": "removed", "type": "fallback", "client_proxies": ["direct"]}
+        ]);
+        for check in [
+            None,
+            Some(serde_json::json!({
+                "url": "http://probe.invalid/", "interval_secs": 30
+            })),
+        ] {
+            let expected = if let Some(check) = check {
+                config[2]["health_check"] = check;
+                "unknown field `health_check`"
+            } else {
+                "unknown client group type: fallback"
+            };
+            let (_shutdown, shutdown) = oneshot::channel();
+            let error = start_from_config(&config.to_string(), shutdown)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) },
+                flags
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn url_test_configuration_is_rejected_without_a_process_supervisor() {
         let config = r#"
 - client_group: automatic

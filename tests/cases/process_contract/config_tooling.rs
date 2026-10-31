@@ -112,6 +112,48 @@ fn check_diagnostics_include_file_and_nested_context_without_credentials() {
 }
 
 #[test]
+fn removed_fallback_groups_fail_before_runtime_side_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("removed.yaml");
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    upstream.set_nonblocking(true).unwrap();
+    let base = serde_json::json!([
+        {"cache_file_path": directory.path().join("selectors.db")},
+        {"address": occupied.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+        {"client_group": "removed", "type": "fallback", "client_proxies": ["direct"]}
+    ]);
+    for check in [
+        None,
+        Some(serde_json::json!({
+            "url": format!("http://{}/", upstream.local_addr().unwrap()),
+            "interval_secs": 1
+        })),
+    ] {
+        let mut config = base.clone();
+        let expected = if let Some(check) = check {
+            config[2]["health_check"] = check;
+            "unknown field `health_check`"
+        } else {
+            "unknown client group type: fallback"
+        };
+        std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        for mode in ["check", "--dry-run", "--no-reload"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{mode}: {diagnostic}");
+            assert!(diagnostic.contains(expected), "{mode}: {diagnostic}");
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+            assert_eq!(upstream.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        }
+    }
+}
+
+#[test]
 fn check_dry_run_validates_all_files_without_forwarding_or_state_writes() {
     let directory = tempfile::Builder::new()
         .prefix("config'OConnor-")

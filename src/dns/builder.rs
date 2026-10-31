@@ -11,7 +11,6 @@ use super::fake_ip::{FakeIpOptions, FakeIpPool};
 use super::real_only;
 use super::system::SystemResolver;
 use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
-use crate::control::selection::ManualSelectorPath;
 use crate::dns::composite_resolver::CompositeResolver;
 use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
@@ -955,69 +954,6 @@ pub async fn build_dns_registry_for_runtime(
     Ok(registry)
 }
 
-#[derive(Debug)]
-struct SelectionDependentResolver {
-    inner: Arc<dyn Resolver>,
-    paths: Vec<ManualSelectorPath>,
-}
-
-impl Resolver for SelectionDependentResolver {
-    fn manual_selector_paths(&self) -> Vec<ManualSelectorPath> {
-        self.paths.clone()
-    }
-
-    fn resolve_location(
-        &self,
-        location: &crate::address::NetLocation,
-    ) -> crate::resolver::ResolveFuture {
-        self.inner.resolve_location(location)
-    }
-
-    fn exchange(&self, request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
-        self.inner.exchange(request)
-    }
-
-    fn exchange_with_deadline(
-        &self,
-        request: Vec<u8>,
-        deadline: tokio::time::Instant,
-    ) -> crate::resolver::DnsExchangeFuture {
-        self.inner.exchange_with_deadline(request, deadline)
-    }
-}
-
-fn collect_selector_paths(
-    chain: &crate::config::ClientChain,
-    enclosing: &[(String, String)],
-    paths: &mut Vec<ManualSelectorPath>,
-) {
-    use crate::config::{ClientChainHop, ClientProxyConfig, ConfigSelection};
-    for hop in chain.hops.iter() {
-        let selections: Box<dyn Iterator<Item = &ConfigSelection<crate::config::ClientConfig>>> =
-            match hop {
-                ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
-                ClientChainHop::Pool(pool) => pool.iter(),
-            };
-        for selection in selections {
-            let ConfigSelection::Config(client) = selection else {
-                continue;
-            };
-            let mut path = enclosing.to_vec();
-            if let Some(origin) = &client.control {
-                path.extend(origin.manual_selector_path());
-            }
-            if !path.is_empty() {
-                paths.push(path.clone());
-            }
-            if let ClientProxyConfig::Wireguard(config) = &client.protocol
-                && let Some(carrier) = &config.peer_client_chain
-            {
-                collect_selector_paths(carrier, &path, paths);
-            }
-        }
-    }
-}
-
 /// Build a resolver from expanded DNS specs, wrapping hickory-backed groups
 /// in RefreshingResolver for stale connection mitigation.
 async fn build_resolver_from_specs(
@@ -1033,14 +969,9 @@ async fn build_resolver_from_specs(
     let mut entries: Vec<ParsedDnsServerEntry> = Vec::with_capacity(specs.len());
     let mut plans: Vec<HickoryResolverPlan> = Vec::new();
     let mut has_system = false;
-    let mut paths = Vec::new();
 
     for spec in specs {
         let (entry, plan) = build_entry_and_plan(spec, registry, bootstraps).await?;
-        paths.extend(entry.bootstrap_resolver.manual_selector_paths());
-        for chain in &spec.client_chains {
-            collect_selector_paths(chain, &[], &mut paths);
-        }
         if matches!(entry.server, ParsedDnsServer::System) {
             has_system = true;
         }
@@ -1070,17 +1001,7 @@ async fn build_resolver_from_specs(
     } else {
         build_resolver_with_limits(entries, registry.limits, registry.forbidden.clone())?
     };
-    if paths.is_empty() {
-        Ok(resolver)
-    } else {
-        paths.sort_unstable();
-        paths.dedup();
-        // Keep configuration dependencies outside refreshable transports and DNS caches.
-        Ok(Arc::new(SelectionDependentResolver {
-            inner: resolver,
-            paths,
-        }))
-    }
+    Ok(resolver)
 }
 
 /// Build a ParsedDnsServerEntry and optionally a HickoryResolverPlan from an expanded spec.
@@ -1094,7 +1015,7 @@ async fn build_entry_and_plan(
     let parsed_url = ParsedDnsUrl::parse_with_server_name(&spec.url, spec.server_name.as_deref())
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    // One resolver identity per bootstrap policy lets equivalent DNS paths share checks.
+    // Reuses bootstrap transports across DNS servers with the same policy.
     let bootstrap_resolver = if let Some(resolver) = spec
         .bootstrap_url
         .as_deref()
@@ -1145,7 +1066,6 @@ async fn build_entry_and_plan(
         resolver
     };
 
-    // Construction-time health checks and forwarding must use the same DNS policy.
     let chain_group = if spec.client_chains.is_empty() {
         Arc::new(build_direct_chain_group(bootstrap_resolver.clone()))
     } else {

@@ -45,7 +45,9 @@ fn make_spec(url: &str) -> ExpandedDnsSpec {
 }
 
 #[tokio::test]
-async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
+async fn dns_client_chain_resolves_proxy_through_configured_bootstrap() {
+    use hickory_resolver::net::runtime::RuntimeProvider;
+
     #[derive(Debug)]
     struct Bootstrap(tokio::sync::mpsc::UnboundedSender<String>);
     impl Resolver for Bootstrap {
@@ -60,8 +62,6 @@ async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
     let configs = serde_json::from_value(serde_json::json!([
         {
             "client_group": "out",
-            "type": "fallback",
-            "health_check": {"url": "http://192.0.2.1/", "interval_secs": 30},
             "client_proxies": [{
                 "address": "private-proxy.invalid:80",
                 "protocol": {"type": "http"}
@@ -74,15 +74,10 @@ async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
                 "bootstrap_url": "system",
                 "client_chain": "out"
             }]
-        },
-        {
-            "address": "127.0.0.1:0",
-            "protocol": {"type": "socks"},
-            "dns": {"servers": "dns"}
         }
     ]))
     .unwrap();
-    let mut validated = crate::config::create_server_configs(configs).unwrap();
+    let validated = crate::config::create_server_configs(configs).unwrap();
     let (sent, mut calls) = tokio::sync::mpsc::unbounded_channel();
     let mut registry = DnsRegistry::new();
     registry.register("system".into(), Arc::new(Bootstrap(sent)));
@@ -92,17 +87,23 @@ async fn health_review_dns_fallback_probes_use_the_forwarding_bootstrap() {
         .find(|group| group.name == "dns")
         .unwrap()
         .specs[0];
-    let (_entry, _plan) = build_entry_and_plan(spec, &registry, &mut FxHashMap::default())
+    let (_, plan) = build_entry_and_plan(spec, &registry, &mut FxHashMap::default())
         .await
         .unwrap();
-    let service = crate::control::health::HealthService::start(
-        validated.catalog.take().unwrap().selection,
-        Arc::new(tokio::sync::Semaphore::new(16)),
-        Vec::new(),
+    let plan = plan.unwrap();
+    let provider = crate::dns::proxy_runtime::ProxyRuntimeProvider::with_bootstrap(
+        plan.chain_group,
+        plan.bootstrap_resolver,
+        Duration::from_secs(2),
     );
-    let result = tokio::time::timeout(Duration::from_millis(200), calls.recv()).await;
-    service.shutdown().await;
-    assert_eq!(result.unwrap().unwrap(), "private-proxy.invalid:80");
+    tokio::select! {
+        result = provider.connect_tcp("192.0.2.53:53".parse().unwrap(), None, None) => {
+            panic!("connection finished before using configured bootstrap: {:?}", result.err());
+        }
+        call = tokio::time::timeout(Duration::from_secs(5), calls.recv()) => {
+            assert_eq!(call.unwrap().unwrap(), "private-proxy.invalid:80");
+        }
+    }
 }
 
 fn fake_groups(enabled: bool) -> Vec<ExpandedDnsGroup> {

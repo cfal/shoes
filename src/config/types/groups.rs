@@ -34,28 +34,6 @@ pub enum GroupType {
     RoundRobin,
     Selector,
     UrlTest(UrlTestConfig),
-    Fallback {
-        health_check: HealthCheckConfig,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HealthCheckConfig {
-    pub url: String,
-    pub interval_secs: u64,
-    #[serde(default = "health_timeout")]
-    pub timeout_ms: u64,
-    #[serde(default = "health_status")]
-    pub expected_status: u16,
-}
-
-fn health_timeout() -> u64 {
-    5000
-}
-
-fn health_status() -> u16 {
-    204
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -81,14 +59,6 @@ struct RawClientGroup {
     timeout: Option<u64>,
     tolerance: Option<u16>,
     lazy: Option<bool>,
-    #[serde(default, deserialize_with = "health_check_if_present")]
-    health_check: Option<HealthCheckConfig>,
-}
-
-fn health_check_if_present<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<HealthCheckConfig>, D::Error> {
-    HealthCheckConfig::deserialize(deserializer).map(Some)
 }
 
 fn default_group_type() -> String {
@@ -103,9 +73,6 @@ impl TryFrom<RawClientGroup> for ClientConfigGroup {
         if kind != "selector" && raw.default.is_some() {
             return Err("default is only valid for selector groups".into());
         }
-        if kind != "fallback" && raw.health_check.is_some() {
-            return Err("health_check requires type: fallback".into());
-        }
         if kind != "url-test"
             && (raw.url.is_some()
                 || raw.interval.is_some()
@@ -118,11 +85,6 @@ impl TryFrom<RawClientGroup> for ClientConfigGroup {
         let group_type = match kind {
             "round-robin" => GroupType::RoundRobin,
             "selector" => GroupType::Selector,
-            "fallback" => {
-                let health_check = raw.health_check.ok_or("fallback requires health_check")?;
-                health_check.validate().map_err(|error| error.to_string())?;
-                GroupType::Fallback { health_check }
-            }
             "url-test" => {
                 let config = UrlTestConfig {
                     url: raw.url.ok_or("url-test requires url")?,
@@ -163,7 +125,7 @@ impl UrlTestConfig {
             ]),
             true,
         )?
-        .validate_automatic_target("url-test URL")
+        .validate_automatic_target()
     }
 }
 
@@ -173,7 +135,7 @@ mod group_type_tests {
     use serde_json::json;
 
     #[test]
-    fn review_automatic_policy_errors_keep_group_specific_labels() {
+    fn automatic_policy_errors_name_url_test() {
         let automatic = UrlTestConfig {
             url: "http://127.0.0.1/".into(),
             interval: 30,
@@ -187,132 +149,48 @@ mod group_type_tests {
             error.to_string(),
             "url-test URL is denied by probe destination policy"
         );
-        let fallback = HealthCheckConfig {
-            url: automatic.url,
-            interval_secs: 30,
-            timeout_ms: 1000,
-            expected_status: 204,
-        };
-        let error = fallback.validate().unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(
-            error.to_string(),
-            "fallback URL is denied by probe destination policy"
+    }
+
+    #[test]
+    fn removed_fallback_type_and_health_check_are_rejected() {
+        let base = json!({"client_group":"out", "type":"fallback", "client_proxies":["direct"]});
+        let error = serde_json::from_value::<ClientConfigGroup>(base.clone()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown client group type: fallback")
         );
-    }
-
-    #[test]
-    fn health_review9_invalid_probe_settings_name_health_check_fields() {
-        for (url, timeout_ms) in [
-            ("ftp://probe.invalid/", 1000),
-            ("http://probe.invalid/", 32768),
-        ] {
-            let check = HealthCheckConfig {
-                url: url.into(),
-                interval_secs: 30,
-                timeout_ms,
-                expected_status: 204,
-            };
-            let error = check.validate().unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-            assert_eq!(
-                error.to_string(),
-                "health_check url must be HTTP(S), at most 2048 bytes, without credentials or fragments; timeout_ms must be 1..32767"
-            );
-        }
-    }
-
-    #[test]
-    fn fallback_round_trips_with_type_and_rejects_legacy_or_incompatible_fields() {
-        let raw = json!({"client_group":"out", "type":"fallback",
-            "health_check":{"url":"https://probe.invalid/", "interval_secs":30},
-            "client_proxies":["direct"]});
-        let group: ClientConfigGroup = serde_json::from_value(raw.clone()).unwrap();
-        assert_eq!(
-            group.group_type,
-            GroupType::Fallback {
-                health_check: HealthCheckConfig {
-                    url: "https://probe.invalid/".into(),
-                    interval_secs: 30,
-                    timeout_ms: 5000,
-                    expected_status: 204,
+        for kind in ["fallback", "round-robin", "selector", "url-test"] {
+            for check in [
+                None,
+                Some(json!(null)),
+                Some(json!({
+                    "url":"https://probe.invalid/", "interval_secs":30
+                })),
+            ] {
+                let mut raw = base.clone();
+                raw["type"] = json!(kind);
+                if kind == "url-test" {
+                    raw["url"] = json!("https://probe.invalid/");
                 }
-            }
-        );
-        let encoded = serde_json::to_value(&group).unwrap();
-        assert_eq!(encoded["type"], "fallback");
-        assert!(encoded.get("strategy").is_none());
-        assert_eq!(
-            serde_json::from_value::<ClientConfigGroup>(encoded)
-                .unwrap()
-                .group_type,
-            group.group_type
-        );
-        let yaml = serde_yaml::to_string(&group).unwrap();
-        assert!(yaml.contains("type: fallback"));
-        assert_eq!(
-            serde_yaml::from_str::<ClientConfigGroup>(&yaml)
-                .unwrap()
-                .group_type,
-            group.group_type
-        );
-        for (field, value) in [
-            ("strategy", json!("fallback")),
-            ("default", json!("DIRECT")),
-            ("url", json!("https://probe.invalid/")),
-            ("interval", json!(30)),
-            ("timeout", json!(5000)),
-            ("tolerance", json!(50)),
-            ("lazy", json!(false)),
-            ("health_check", json!(null)),
-            ("all_down", json!("direct")),
-        ] {
-            let mut invalid = raw.clone();
-            invalid[field] = value;
-            assert!(
-                serde_json::from_value::<ClientConfigGroup>(invalid.clone()).is_err(),
-                "{invalid}"
-            );
-        }
-        let mut legacy = raw.clone();
-        legacy.as_object_mut().unwrap().remove("type");
-        legacy["strategy"] = json!("fallback");
-        assert!(serde_json::from_value::<ClientConfigGroup>(legacy).is_err());
-        for kind in ["round-robin", "selector", "url-test"] {
-            let mut invalid = raw.clone();
-            invalid["type"] = json!(kind);
-            if kind == "url-test" {
-                invalid["url"] = json!("https://probe.invalid/");
-            }
-            assert!(
-                serde_json::from_value::<ClientConfigGroup>(invalid).is_err(),
-                "{kind}"
-            );
-        }
-    }
-
-    #[test]
-    fn health_review3_null_checks_are_rejected_for_every_group_type() {
-        for kind in ["round-robin", "selector", "url-test", "fallback"] {
-            let mut raw = json!({"client_group":"out", "type":kind,
-                "client_proxies":["direct"], "health_check":null});
-            if kind == "url-test" {
-                raw["url"] = json!("http://probe.invalid/");
-            }
-            assert!(
-                serde_json::from_value::<ClientConfigGroup>(raw.clone()).is_err(),
-                "JSON {kind}"
-            );
-            assert!(
-                serde_yaml::from_str::<ClientConfigGroup>(&serde_yaml::to_string(&raw).unwrap())
+                let rejected = kind == "fallback" || check.is_some();
+                if let Some(check) = check {
+                    raw["health_check"] = check;
+                }
+                assert_eq!(
+                    serde_json::from_value::<ClientConfigGroup>(raw.clone()).is_err(),
+                    rejected,
+                    "JSON {raw}"
+                );
+                assert_eq!(
+                    serde_yaml::from_str::<ClientConfigGroup>(
+                        &serde_yaml::to_string(&raw).unwrap()
+                    )
                     .is_err(),
-                "YAML {kind}"
-            );
-            raw.as_object_mut().unwrap().remove("health_check");
-            assert_eq!(
-                serde_json::from_value::<ClientConfigGroup>(raw).is_ok(),
-                kind != "fallback"
-            );
+                    rejected,
+                    "YAML {raw}"
+                );
+            }
         }
     }
 

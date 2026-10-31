@@ -56,16 +56,6 @@ impl ValidatedConfigs {
         if self
             .catalog
             .as_ref()
-            .is_some_and(|catalog| !catalog.selection.health.definitions.is_empty())
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "fallback groups require the CLI generation lifecycle",
-            ));
-        }
-        if self
-            .catalog
-            .as_ref()
             .is_some_and(|catalog| !catalog.selection.automatic.0.is_empty())
         {
             return Err(std::io::Error::new(
@@ -232,8 +222,6 @@ pub(super) fn create_server_configs_with_memory(
         for config in configs.iter_mut() {
             validate_client_config(config, &named_pems, global_limits)?;
         }
-        // Unused groups can still be instantiated by controller and URL-test probes.
-        super::health::validate_chain(std::iter::once(configs.iter()))?;
     }
 
     // Extract inline DNS configs from server/tun configs into dns_groups.
@@ -2466,7 +2454,6 @@ fn validate_client_chain(
         validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
     }
     expand_client_chain(hops, client_groups)?;
-    super::health::validate_chain(hops.iter().map(super::health::clients))?;
     validate_connector_positions(hops, chain_index)
 }
 
@@ -2612,33 +2599,6 @@ fn expand_client_chain(
         }
     }
 
-    let is_fallback = |selection: &ConfigSelection<ClientConfig>| match selection {
-        ConfigSelection::Config(client) => client
-            .control
-            .as_ref()
-            .is_some_and(crate::control::catalog::MemberOrigin::has_fallback),
-        ConfigSelection::GroupName(_) => false,
-    };
-    let mut has_fallback = false;
-    let mut path_count = Some(1usize);
-    for hop in &expanded_hops {
-        match hop {
-            ClientChainHop::Single(selection) => has_fallback |= is_fallback(selection),
-            ClientChainHop::Pool(pool) => {
-                path_count = path_count.and_then(|count| count.checked_mul(pool.iter().count()));
-                has_fallback |= pool.iter().any(is_fallback);
-            }
-        }
-    }
-    if has_fallback && path_count.is_none_or(|count| count > crate::control::health::MAX_PATHS) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "fallback exceeds {} concrete chain paths",
-                crate::control::health::MAX_PATHS
-            ),
-        ));
-    }
     *client_chain = if expanded_hops.len() == 1 {
         OneOrSome::One(expanded_hops.into_iter().next().unwrap())
     } else {

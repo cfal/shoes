@@ -99,29 +99,6 @@ pub(crate) fn build_client_proxy_chain_with_limits(
             crate::quic_client::validate(config, index == 0)?;
         }
     }
-    crate::config::health::validate_chain(hops.iter().map(|hop| hop.iter()))?;
-    let health_hops = if hops.iter().flatten().any(|client| {
-        client
-            .control
-            .as_ref()
-            .is_some_and(crate::control::catalog::MemberOrigin::has_fallback)
-    }) {
-        use crate::control::health::MAX_PATHS;
-        // Administrative targets can bypass config-time chain expansion limits.
-        let size = hops
-            .iter()
-            .try_fold(1usize, |size, pool| size.checked_mul(pool.len()))
-            .filter(|size| *size <= MAX_PATHS)
-            .ok_or_else(|| {
-                crate::control::health::capacity_error(format!(
-                    "fallback exceeds {MAX_PATHS} concrete chain paths"
-                ))
-            })?;
-        Some((hops.clone(), size))
-    } else {
-        None
-    };
-
     // Build initial hop entries from hop 0.
     // Each entry pairs socket + optional proxy together to ensure atomic selection.
     let initial_hop: Vec<InitialHopEntry> = hops[0]
@@ -194,11 +171,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
         })
         .collect::<std::io::Result<_>>()?;
 
-    let chain = ClientProxyChain::new(initial_hop, subsequent_hops).with_origins(origins);
-    match health_hops {
-        Some((hops, size)) => chain.with_health(&hops, size, resolver),
-        None => Ok(chain),
-    }
+    Ok(ClientProxyChain::new(initial_hop, subsequent_hops).with_origins(origins))
 }
 
 /// Find the first proxy address in the chain (for socket connector target).

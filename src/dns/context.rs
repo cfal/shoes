@@ -198,10 +198,6 @@ impl FakeDnsResolver {
 }
 
 impl Resolver for FakeDnsResolver {
-    fn manual_selector_paths(&self) -> Vec<crate::control::selection::ManualSelectorPath> {
-        self.real.manual_selector_paths()
-    }
-
     fn resolve_location(
         &self,
         location: &crate::address::NetLocation,

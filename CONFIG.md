@@ -289,114 +289,6 @@ A configuration file is a YAML array containing one or more configuration entrie
   path: /path/to/cert.pem
 ```
 
-## Ordered Healthy Fallback
-
-The CLI supports opt-in ordered fallback without a Clash API listener:
-
-```yaml
-- client_group: outbound
-  type: fallback
-  health_check:
-    url: "https://probe.example.com/generate_204"
-    interval_secs: 30
-    timeout_ms: 5000
-    expected_status: 204
-  client_proxies:
-    - name: primary
-      address: "primary.example.com:1080"
-      protocol: {type: socks}
-    - name: backup
-      address: "backup.example.com:1080"
-      protocol: {type: socks}
-```
-
-Rules use `client_chain: outbound`. `health_check` is required only for fallback
-and rejected on other group types. The removed `strategy` field is not accepted.
-The URL must be HTTP(S), at most 2048 bytes,
-without credentials or fragments. `interval_secs` is required, 1..86400;
-`timeout_ms` defaults to 5000, 1..32767; `expected_status` defaults to 204,
-100..599. Unknown fields, empty groups, duplicate immediate members and
-selector-only `default` are rejected. Anonymous inline members are supported.
-
-For each new flow, explicit nested selector choices and final-hop UDP capability
-are applied first. Fallback chooses the first member with a healthy eligible
-concrete path. If none is healthy, never-sampled paths may be tried in order.
-Failed and stale paths are excluded; all-down returns an error, never implicit
-DIRECT. A sample becomes stale after three intervals plus the probe timeout.
-Probes skip paths excluded by manual selector choices, rechecking those choices
-after admission. Reselecting a skipped path schedules a check without waiting
-another interval, still subject to shared admission and transport deadlines.
-Previously sampled paths that became stale while unselected remain excluded
-until a new check succeeds; reselection does not make an old sample Unknown.
-New flows can therefore fail closed while rechecks are pending or locally blocked.
-Manual choices are never rewritten or persisted by health checking.
-Resolver-chain selector changes trigger rechecks without erasing
-existing samples: DNS caches and retained connections are not concrete-path
-identity. Relevant selector changes fence in-flight probe results, including
-A-to-B-to-A changes; unrelated selectors and inactive nested branches do not.
-Fixed outer path choices do not erase samples. DNS-chain checks use the same
-configured bootstrap resolver as forwarding. Downstream proxy hostnames remain
-unresolved when passed through a proxy that supports remote name resolution;
-Shoes cannot inspect addresses resolved by that remote proxy. Rule downloads
-instead pre-resolve downstream proxies through their guarded bootstrap resolver.
-A fallback-checked chain cannot contain WireGuard whose `peer_client_chain` has
-more than one member at any hop, including recursively nested WireGuard carriers.
-All configured alternatives count, even branches that cannot carry UDP. It also
-cannot contain NaiveProxy (including wrapped NaiveProxy) after a hop with multiple
-members: its retained H2 session is not scoped to the selected prefix. These
-combinations are rejected, not probed approximately. Fixed WireGuard carriers,
-NaiveProxy at hop 0 or behind a single fixed prefix, and ordinary chains without
-fallback remain supported. The restrictions also cover DNS chains and unused
-groups available to controller/URL-test probes; resolver-only dependencies do
-not count as the fallback chain's transport path.
-A fallback containing a selector may choose its next member, but
-never another branch inside
-that selector. Fallback member and healthy-before-unknown priorities are resolved
-across complete eligible paths before URL-test latency and round-robin pool
-choices. Paths outside each fallback branch remain eligible, so an unrelated
-round-robin branch is not globally overridden by health.
-
-Checks send HEAD through the complete configured TCP chain, require the expected
-status, verify HTTPS certificates, and do not follow redirects. They share the
-controller and URL-test probe engine and its 16 concurrent permits. The total deadline includes
-admission, DNS, connect, TLS and response headers. Admission exhaustion or local
-resource shortages do not mark a path failed; expiry after queued admission
-preserves the previous sample without refreshing its timestamp. Successful and failed checks both
-wait the configured interval, jittered by +/-10%, before retrying. Unused groups
-do not start transports; checks start when a runtime chain is instantiated.
-Controller delay requests and URL-test targets can instantiate additional fallback
-chains. Their checks last while the cached probe connector lives (normally the
-generation) and obey that target's selectors, not selectors enclosing it in
-routing rules. They share the same check and concurrency limits.
-
-Health is generation-local and keyed by canonical full-path configuration, resolver
-identity, selector constraints and probe settings, not names or member positions.
-Equivalent checks share one sample; different prefixes/endpoints do not. Each
-chain is limited to 256 concrete paths and each generation to 1024 active checks. Large pool products are
-rejected instead of spawning unbounded probes. Due checks are admitted oldest-first
-so repeated checks cannot indefinitely overtake waiting paths. Saturation can make samples stale;
-choose intervals/timeouts that fit the shared budget. Reload cancels and joins old
-checks before starting the new generation. Draining sessions keep the old
-generation's health snapshot at cancellation, without further probes or aging;
-rollback/resume restores normal freshness checks. Samples are not persisted.
-Pause time counts toward sample age after resume, so a long rejected activation
-can require successful rechecks before the resumed fallback accepts new flows.
-
-Checks use the existing probe destination restrictions (including loopback,
-link-local and synthetic Fake-IP protection). Forbidden literal URLs, including
-configured or retained Fake-IP ranges, are rejected during validation.
-Proxy-side DNS remains subject to
-the remote proxy's policy. A TCP sample does not prove UDP reachability, nor does
-one probe endpoint measure all destinations. Application errors never update
-health, and application bytes are never replayed. Existing TCP streams, UDP
-associations and pooled transports keep their selected member until reopened.
-There is no latency scoring, passive cooldown, hysteresis, affinity, or all-down
-last-resort mode. FFI rejects fallback because it does not own this scheduler.
-
-Controller delay history remains separate from fallback samples. `Fallback`
-catalog entries expose members and capabilities; there is no single global `now`
-member because selection depends on the concrete chain and transport.
-
 ## Clash Controller
 
 The CLI can expose a documented subset of the Clash API. The controller is
@@ -452,7 +344,7 @@ Opt into manual selection explicitly:
 Rules continue to use `client_chain: outbound`. A selector chooses an immediate
 named member or referenced group; inline selector members require `name`.
 The group discriminant is `type`: `round-robin` (the default), `selector`,
-`url-test`, or `fallback`. The removed `strategy` field and unknown types are errors. Nested round-robin weights,
+or `url-test`. The removed `strategy` field and unknown types are errors. Nested round-robin weights,
 duplicate membership, and existing UDP filtering are preserved. A selected
 branch without UDP support fails new UDP flows instead of silently falling back.
 Selection changes affect new flows only; existing streams, UDP destinations,
@@ -622,7 +514,7 @@ are exempt from header idle expiry and have bounded queues/write deadlines.
 Responses are limited to 32 MiB. An oversized connection snapshot closes its
 WebSocket with code 1009 and reason `response exceeds 32 MiB`; tracking continues
 without truncating the connection list.
-Configuring a controller, `cache_file_path`, or any selector/url-test/fallback group enables the
+Configuring a controller, `cache_file_path`, or any selector/url-test group enables the
 catalog and its 16,384-node limit. Names must be nonempty, unique, at most 256
 bytes, and contain no control characters. `DIRECT`, `REJECT`, and
 `GLOBAL` are reserved. Configuration preparation rejects `/rules` or base
@@ -1810,6 +1702,11 @@ hostname lookups can otherwise re-enter the host's intercepted resolver.
 Fake-enabled system configurations fail startup if no usable endpoints can be
 discovered. Later upstream failures produce DNS failure, not a public-provider fallback.
 UDP and HTTP/3 upstreams remain direct-only; TCP/TLS/HTTPS can use client chains.
+DNS client chains use the configured bootstrap resolver. Downstream proxy
+hostnames remain unresolved when passed through a proxy that supports remote
+name resolution; Shoes cannot inspect addresses resolved by that remote proxy.
+Rule downloads instead pre-resolve downstream proxies through their guarded
+bootstrap resolver.
 UDP truncation retries TCP only when that transport is explicitly configured.
 Groups with mixed upstream settings try their remaining configured resolvers for
 a complete successful or negative reply before returning a truncated answer.

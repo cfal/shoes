@@ -1,4 +1,4 @@
-//! Shared bounded HTTP probes; controller history is independent of fallback health.
+//! Bounded HTTP probes for controller requests and URL-test groups.
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
@@ -51,10 +51,6 @@ pub struct ProbeState {
 }
 
 impl ProbeState {
-    pub(crate) fn forbidden_ranges(&self) -> Vec<ipnetwork::IpNetwork> {
-        self.forbidden.clone()
-    }
-
     pub fn url_history(&self, name: &str, url: &str) -> Value {
         self.history
             .lock()
@@ -246,7 +242,7 @@ pub struct ProbeQuery {
 }
 
 impl ProbeQuery {
-    pub(crate) fn validate_automatic_target(&self, label: &str) -> io::Result<()> {
+    pub(crate) fn validate_automatic_target(&self) -> io::Result<()> {
         let denied = match self.url.host() {
             Some(url::Host::Ipv4(ip)) => forbidden(ip.into()),
             Some(url::Host::Ipv6(ip)) => forbidden(ip.into()),
@@ -255,7 +251,7 @@ impl ProbeQuery {
         if denied {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{label} is denied by probe destination policy"),
+                "url-test URL is denied by probe destination policy",
             ));
         }
         Ok(())
@@ -511,10 +507,7 @@ pub(crate) fn local_failure(error: &io::Error) -> bool {
     }
     let mut error: &(dyn std::error::Error + 'static) = error;
     loop {
-        if error.is::<ProbePolicyDenied>()
-            || error.is::<crate::dns::SyntheticDnsAnswer>()
-            || error.is::<super::health::HealthCapacity>()
-        {
+        if error.is::<ProbePolicyDenied>() || error.is::<crate::dns::SyntheticDnsAnswer>() {
             return true;
         }
         let source = if let Some(error) = error.downcast_ref::<io::Error>() {
@@ -725,26 +718,6 @@ async fn request_with_tls_config(
         query,
     )?;
     let chain = generation.probes.connector(&generation.catalog, name)?;
-    request_with_resolver(&chain, resolver, query, tls_config).await
-}
-
-pub(crate) async fn request_via(
-    chain: &ClientChainGroup,
-    resolver: Arc<dyn Resolver>,
-    forbidden_ranges: &[ipnetwork::IpNetwork],
-    query: &ProbeQuery,
-    tls_config: impl FnOnce() -> rustls::ClientConfig,
-) -> io::Result<(u16, bool)> {
-    let resolver = ProbeResolver::for_query(resolver, forbidden_ranges, query)?;
-    request_with_resolver(chain, resolver, query, tls_config).await
-}
-
-async fn request_with_resolver(
-    chain: &ClientChainGroup,
-    resolver: ProbeResolver,
-    query: &ProbeQuery,
-    tls_config: impl FnOnce() -> rustls::ClientConfig,
-) -> io::Result<(u16, bool)> {
     let started = Instant::now();
     let host = query
         .url
