@@ -12,6 +12,9 @@ use crate::async_stream::{
     AsyncStream, AsyncWriteMessage,
 };
 
+// Xray reserves 666 bytes for metadata in its 8192-byte outbound buffer.
+const MAX_OUTBOUND_PAYLOAD: usize = 8192 - 666;
+
 /// One XUDP association on an owned carrier; session IDs never cross carriers.
 pub(crate) struct XudpClientStream {
     inner: Box<dyn AsyncStream>,
@@ -60,8 +63,7 @@ impl AsyncWriteMessage for XudpClientStream {
         if this.closing || this.read_ended {
             return Poll::Ready(Err(ErrorKind::BrokenPipe.into()));
         }
-        // Xray's XUDP writer reserves space for metadata in an 8192-byte buffer.
-        if data.len() > 7526 {
+        if data.len() > MAX_OUTBOUND_PAYLOAD {
             log::debug!("Dropping oversized XUDP datagram: {} bytes", data.len());
             return Poll::Ready(Ok(()));
         }

@@ -173,22 +173,13 @@ impl FrameMetadata {
 
     /// Decode frame metadata from bytes
     pub fn decode(buf: &mut BytesMut) -> std::io::Result<Option<Self>> {
-        // Need at least length field
-        if buf.len() < 2 {
+        let Some(metadata_len) = decode_metadata_len(buf)? else {
             log::debug!(
                 "[XUDP DECODE] Buffer too short for length field: {} bytes",
                 buf.len()
             );
             return Ok(None);
-        }
-
-        let metadata_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        if !(4..=512).contains(&metadata_len) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "XUDP metadata length outside 4..=512",
-            ));
-        }
+        };
         log::debug!(
             "[XUDP DECODE] metadata_len={}, buf.len()={}, need={}",
             metadata_len,
@@ -215,12 +206,8 @@ impl FrameMetadata {
         let mut network = None;
         let mut target = None;
 
-        // Calculate remaining metadata bytes (after session_id, status, option = 4 bytes)
-        let remaining_metadata = metadata_len.saturating_sub(4);
-
         // Parse destination for New or Keep+UDP
-        // Check remaining_metadata > 0 to know if there's address data
-        if remaining_metadata > 0
+        if !metadata.is_empty()
             && (status == SessionStatus::New
                 || (status == SessionStatus::Keep && metadata[0] == 0x02))
         {
@@ -239,7 +226,6 @@ impl FrameMetadata {
             target = Some(NetLocation::new(address, port));
         }
 
-        // Consume any remaining metadata bytes we didn't parse
         let unconsumed = metadata.len();
         if unconsumed > 0 {
             log::debug!(
@@ -258,9 +244,7 @@ impl FrameMetadata {
     }
 }
 
-pub(crate) fn decode_frame(
-    buf: &mut BytesMut,
-) -> std::io::Result<Option<(FrameMetadata, BytesMut)>> {
+fn decode_metadata_len(buf: &[u8]) -> std::io::Result<Option<usize>> {
     if buf.len() < 2 {
         return Ok(None);
     }
@@ -271,22 +255,34 @@ pub(crate) fn decode_frame(
             "XUDP metadata length outside 4..=512",
         ));
     }
-    let data_offset = 2 + metadata_len;
-    if buf.len() < data_offset {
+    Ok(Some(metadata_len))
+}
+
+pub(crate) fn decode_frame(
+    buf: &mut BytesMut,
+) -> std::io::Result<Option<(FrameMetadata, BytesMut)>> {
+    let Some(metadata_len) = decode_metadata_len(buf)? else {
+        return Ok(None);
+    };
+    let metadata_end = 2 + metadata_len;
+    if buf.len() < metadata_end {
         return Ok(None);
     }
+    // The option byte follows the length, session ID, and status fields.
     let has_data = buf[5] & FrameOption::DATA != 0;
-    if has_data && buf.len() < data_offset + 2 {
-        return Ok(None);
-    }
     let data_len = if has_data {
-        u16::from_be_bytes([buf[data_offset], buf[data_offset + 1]]) as usize
+        let payload_start = metadata_end + 2;
+        if buf.len() < payload_start {
+            return Ok(None);
+        }
+        let length = u16::from_be_bytes([buf[metadata_end], buf[metadata_end + 1]]) as usize;
+        if buf.len() < payload_start + length {
+            return Ok(None);
+        }
+        length
     } else {
         0
     };
-    if buf.len() < data_offset + usize::from(has_data) * (2 + data_len) {
-        return Ok(None);
-    }
     let metadata = FrameMetadata::decode(buf)?.expect("complete metadata");
     if has_data {
         buf.advance(2);
