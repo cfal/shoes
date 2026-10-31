@@ -17,6 +17,7 @@ pub(crate) mod client_visit;
 pub(crate) mod composition;
 mod fake_dns;
 mod pem;
+pub mod resolved;
 pub(crate) mod rule_visit;
 #[cfg(test)]
 mod tests;
