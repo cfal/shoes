@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use shoes_test_support::{
     certs::generate_test_cert_files,
     port_helper::PortHelper,
-    process::{ProcessGuard, start_singbox_server},
+    process::{ProcessGuard, start_mihomo_server_with_env, start_singbox_server},
     socks5::Socks5UdpAssociation,
     test_fixture::start_shoes_server,
     test_servers::{start_tcp_stream_echo_server, start_udp_echo_server_with_suffix},
@@ -19,12 +19,16 @@ use tokio::{
 };
 
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
+const CARRIERS: [Option<&str>; 3] = [None, Some("X-Early-Data"), Some("Sec-WebSocket-Protocol")];
+const LIMIT_TLS_CASES: [(usize, bool); 3] = [(8, false), (2048, false), (2048, true)];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
     Shoes,
     #[cfg_attr(not(feature = "optional-peer-tests"), expect(dead_code))]
     SingBox,
+    #[cfg_attr(not(feature = "optional-peer-tests"), expect(dead_code))]
+    Mihomo,
     Xray,
 }
 
@@ -39,15 +43,22 @@ enum Running {
 }
 
 async fn start(kind: Kind, config: Value) -> io::Result<Running> {
-    if kind == Kind::Xray {
-        return Ok(Running::Xray {
-            _peer: xray::start(config).await?,
-        });
-    }
-    let (process, config) = if kind == Kind::Shoes {
-        start_shoes_server(&config.to_string())?
-    } else {
-        start_singbox_server(&config.to_string())?
+    let (process, config) = match kind {
+        Kind::Shoes => start_shoes_server(&config.to_string())?,
+        Kind::SingBox => start_singbox_server(&config.to_string())?,
+        Kind::Mihomo => {
+            // Independent loopback connections can reuse source ports across destinations.
+            start_mihomo_server_with_env(
+                &serde_yaml::to_string(&config).map_err(io::Error::other)?,
+                &[("DISABLE_LOOPBACK_DETECTOR", "true")],
+            )
+            .await?
+        }
+        Kind::Xray => {
+            return Ok(Running::Xray {
+                _peer: xray::start(config).await?,
+            });
+        }
     };
     Ok(Running::Other {
         _process: process,
@@ -167,6 +178,39 @@ fn config(kind: Kind, server: bool, port: u16, remote: u16, ws: Ws<'_>) -> Value
                 })
             }
         }
+        Kind::Mihomo => {
+            if server {
+                // Mihomo servers accept only the standard early-data header, automatically.
+                assert_eq!(header, Some("Sec-WebSocket-Protocol"));
+                let mut listener = json!({
+                    "name": "vless-in", "type": "vless", "listen": "0.0.0.0", "port": port,
+                    "users": [{"username": "test", "uuid": UUID}],
+                    "ws-path": "/ws", "allow-insecure": !tls
+                });
+                if tls {
+                    listener["certificate"] = std::fs::read_to_string(cert).unwrap().into();
+                    listener["private-key"] = std::fs::read_to_string(key).unwrap().into();
+                }
+                json!({
+                    "log-level": "warning", "mode": "rule", "rules": ["MATCH,DIRECT"],
+                    "listeners": [listener]
+                })
+            } else {
+                let mut options = json!({"path": "/ws", "max-early-data": max});
+                if let Some(header) = header {
+                    options["early-data-header-name"] = header.into();
+                }
+                json!({
+                    "socks-port": port, "allow-lan": true, "bind-address": "0.0.0.0",
+                    "log-level": "warning", "mode": "rule", "rules": ["MATCH,vless-out"],
+                    "proxies": [{
+                        "name": "vless-out", "type": "vless", "server": "127.0.0.1", "port": remote,
+                        "uuid": UUID, "udp": true, "network": "ws", "ws-opts": options,
+                        "tls": tls, "servername": "localhost", "skip-cert-verify": true
+                    }]
+                })
+            }
+        }
         Kind::Xray => {
             let path = if server || max == 0 {
                 "/ws".into()
@@ -256,7 +300,10 @@ async fn capture(
                     let (mut client, _) = accepted.unwrap();
                     let sender = sender.clone();
                     connections.spawn(async move {
-                        let mut server = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, remote)).await.unwrap();
+                        let mut server =
+                            TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, remote))
+                                .await
+                                .unwrap();
                         if !tls {
                             let mut header = Vec::new();
                             while !header.ends_with(b"\r\n\r\n") {
@@ -270,14 +317,23 @@ async fn capture(
                         let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
                     });
                 }
-                result = connections.join_next(), if !connections.is_empty() => { result.unwrap().unwrap(); }
+                result = connections.join_next(), if !connections.is_empty() => {
+                    result.unwrap().unwrap();
+                }
             }
         }
     });
     Ok((port, receiver, tasks))
 }
 
-fn check_capture(request: &str, header: Option<&str>, expected_max: usize, fallback: bool) {
+fn check_capture(
+    request: &str,
+    header: Option<&str>,
+    expected_max: usize,
+    client: Kind,
+    command: u8,
+    target: SocketAddr,
+) {
     let first = request.lines().next().unwrap();
     let encoded = if let Some(header) = header {
         assert_eq!(first, "GET /ws HTTP/1.1");
@@ -295,19 +351,33 @@ fn check_capture(request: &str, header: Option<&str>, expected_max: usize, fallb
             .unwrap()
     };
     let decoded = URL_SAFE_NO_PAD.decode(encoded).unwrap();
-    if fallback {
+    // Xray sends no early data unless the complete 26-byte IPv4 VLESS header fits.
+    if expected_max == 0 || (client == Kind::Xray && expected_max < 26) {
         assert!(decoded.is_empty());
-    } else {
-        assert!(
-            !decoded.is_empty(),
-            "early data missing from captured request"
-        );
-        assert!(decoded.len() <= expected_max);
-        assert_eq!(decoded[0], 0); // VLESS version.
-        assert_eq!(
-            &decoded[1..decoded.len().min(5)],
-            &vec![0x11; decoded.len().min(5) - 1]
-        );
+        return;
+    }
+    // Independent VLESS version + UUID + empty addons, not the production encoder.
+    let mut expected = vec![
+        0, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x41, 0x11, 0x81, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0x11, 0x11, 0,
+    ];
+    let common = expected.len().min(expected_max);
+    assert!(
+        decoded.len() >= common,
+        "truncated early prefix: {decoded:?}"
+    );
+    assert!(decoded.len() <= expected_max);
+    assert_eq!(&decoded[..common], &expected[..common]);
+    if client == Kind::Shoes {
+        let SocketAddr::V4(target) = target else {
+            panic!("expected IPv4 fixture")
+        };
+        expected.push(command);
+        expected.extend(target.port().to_be_bytes());
+        expected.push(1);
+        expected.extend(target.ip().octets());
+        expected.truncate(expected_max);
+        assert_eq!(decoded, expected, "wrong Shoes first-flight prefix");
     }
 }
 
@@ -321,7 +391,8 @@ async fn run_case(
 ) -> io::Result<()> {
     tokio::time::timeout(Duration::from_secs(45), async {
         eprintln!(
-            "WS peer={peer:?}, shoes_client={shoes_client}, header={header:?}, max={max}, server_max={server_max}, tls={tls}"
+            "WS peer={peer:?}, shoes_client={shoes_client}, header={header:?}, \
+             max={max}, server_max={server_max}, tls={tls}"
         );
         let mut ports = PortHelper::new();
         let (_, server_port) = ports.get_localhost_listener_port();
@@ -335,14 +406,16 @@ async fn run_case(
         };
         let server_kind = if shoes_client { peer } else { Kind::Shoes };
         let client_kind = if shoes_client { Kind::Shoes } else { peer };
-        // Xray sends no early data unless the complete 26-byte IPv4 VLESS header fits.
-        let fallback = max == 0 || (client_kind == Kind::Xray && max < 26);
         let server_ws = Ws {
             max: server_max,
             header: header.filter(|_| server_max > 0),
             ..ws
         };
-        let _server = start(server_kind, config(server_kind, true, server_port, 0, server_ws)).await?;
+        let _server = start(
+            server_kind,
+            config(server_kind, true, server_port, 0, server_ws),
+        )
+        .await?;
         // Bind the server before the capture listener can reuse its released reservation.
         ports.wait_for_all_ports().await?;
         let (carrier, mut captures, mut tasks) = capture(server_port, tls).await?;
@@ -374,8 +447,11 @@ async fn run_case(
         tokio::try_join!(exchange(), exchange())?;
         if !tls {
             for _ in 0..2 {
-                let captured = captures.recv().await.unwrap();
-                check_capture(&captured, header, max, fallback);
+                let captured = captures
+                    .recv()
+                    .await
+                    .expect("capture proxy stopped before recording a TCP upgrade");
+                check_capture(&captured, header, max, client_kind, 1, target);
             }
         }
         let udp = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"").await?;
@@ -389,8 +465,11 @@ async fn run_case(
             assert_eq!(response, data);
         }
         if !tls {
-            let captured = captures.recv().await.unwrap();
-            check_capture(&captured, header, max, fallback);
+            let captured = captures
+                .recv()
+                .await
+                .expect("capture proxy stopped before recording a UDP upgrade");
+            check_capture(&captured, header, max, client_kind, 2, target);
         }
         tasks.shutdown().await;
         Ok(())
@@ -400,11 +479,10 @@ async fn run_case(
 
 #[tokio::test]
 async fn shoes_ws_wss_tcp_udp_and_split_first_flight() -> io::Result<()> {
-    for header in [None, Some("X-Early-Data"), Some("Sec-WebSocket-Protocol")] {
-        for max in [8, 2048] {
-            run_case(Kind::Shoes, true, header, max, max, false).await?;
+    for header in CARRIERS {
+        for (max, tls) in LIMIT_TLS_CASES {
+            run_case(Kind::Shoes, true, header, max, max, tls).await?;
         }
-        run_case(Kind::Shoes, true, header, 2048, 2048, true).await?;
     }
     run_case(Kind::Shoes, true, None, 0, 0, false).await
 }
@@ -429,8 +507,11 @@ async fn shoes_standard_header_to_default_server_ws_wss_tcp_udp() -> io::Result<
 async fn vless_mixed_configuration_accepts_plain_and_automatic_but_rejects_other_mismatches()
 -> io::Result<()> {
     for tls in [false, true] {
-        for header in [None, Some("X-Early-Data"), Some("Sec-WebSocket-Protocol")] {
+        for header in CARRIERS {
             for client_enabled in [false, true] {
+                eprintln!(
+                    "WS mixed configuration: tls={tls}, header={header:?}, client_enabled={client_enabled}"
+                );
                 tokio::time::timeout(Duration::from_secs(15), async {
                     let mut ports = PortHelper::new();
                     let (_, server_port) = ports.get_localhost_listener_port();
@@ -492,12 +573,10 @@ async fn vless_mixed_configuration_accepts_plain_and_automatic_but_rejects_other
                         "client_enabled={client_enabled}, header={header:?}, tls={tls}: {result:?}"
                     );
                     if !tls {
-                        check_capture(
-                            &captures.recv().await.unwrap(),
-                            header,
-                            client_ws.max,
-                            !client_enabled,
+                        let captured = captures.recv().await.expect(
+                            "capture proxy stopped before recording a mixed-configuration upgrade",
                         );
+                        check_capture(&captured, header, client_ws.max, Kind::Shoes, 1, target);
                     }
                     tasks.shutdown().await;
                     io::Result::Ok(())
@@ -583,11 +662,10 @@ async fn shoes_websocket_after_socks_hop_supports_server_first_noop() -> io::Res
 #[tokio::test]
 async fn sing_box_both_directions_all_carriers_ws_wss_tcp_udp() -> io::Result<()> {
     for shoes_client in [false, true] {
-        for header in [None, Some("X-Early-Data"), Some("Sec-WebSocket-Protocol")] {
-            for max in [8, 2048] {
-                run_case(Kind::SingBox, shoes_client, header, max, max, false).await?;
+        for header in CARRIERS {
+            for (max, tls) in LIMIT_TLS_CASES {
+                run_case(Kind::SingBox, shoes_client, header, max, max, tls).await?;
             }
-            run_case(Kind::SingBox, shoes_client, header, 2048, 2048, true).await?;
         }
     }
     Ok(())
@@ -595,26 +673,20 @@ async fn sing_box_both_directions_all_carriers_ws_wss_tcp_udp() -> io::Result<()
 
 #[cfg(feature = "optional-peer-tests")]
 #[tokio::test]
-async fn xray_both_directions_ws_wss_tcp_udp_and_oversize_fallback() -> io::Result<()> {
-    for shoes_client in [true, false] {
-        for max in [8, 2048] {
-            run_case(
-                Kind::Xray,
-                shoes_client,
-                Some("Sec-WebSocket-Protocol"),
-                max,
-                max,
-                false,
-            )
-            .await?;
+async fn mihomo_client_all_carriers_and_server_standard_header_ws_wss_tcp_udp() -> io::Result<()> {
+    for header in CARRIERS {
+        for (max, tls) in LIMIT_TLS_CASES {
+            run_case(Kind::Mihomo, false, header, max, max, tls).await?;
         }
+    }
+    for (max, tls) in LIMIT_TLS_CASES {
         run_case(
-            Kind::Xray,
-            shoes_client,
-            Some("Sec-WebSocket-Protocol"),
-            2048,
-            2048,
+            Kind::Mihomo,
             true,
+            Some("Sec-WebSocket-Protocol"),
+            max,
+            max,
+            tls,
         )
         .await?;
     }
@@ -623,8 +695,27 @@ async fn xray_both_directions_ws_wss_tcp_udp_and_oversize_fallback() -> io::Resu
 
 #[cfg(feature = "optional-peer-tests")]
 #[tokio::test]
+async fn xray_both_directions_ws_wss_tcp_udp_and_oversize_fallback() -> io::Result<()> {
+    for shoes_client in [true, false] {
+        for (max, tls) in LIMIT_TLS_CASES {
+            run_case(
+                Kind::Xray,
+                shoes_client,
+                Some("Sec-WebSocket-Protocol"),
+                max,
+                max,
+                tls,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "optional-peer-tests")]
+#[tokio::test]
 async fn reference_standard_header_clients_to_default_server_ws_wss_tcp_udp() -> io::Result<()> {
-    for peer in [Kind::SingBox, Kind::Xray] {
+    for peer in [Kind::SingBox, Kind::Xray, Kind::Mihomo] {
         for tls in [false, true] {
             run_case(peer, false, Some("Sec-WebSocket-Protocol"), 2048, 0, tls).await?;
         }
