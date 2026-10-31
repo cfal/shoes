@@ -73,7 +73,9 @@ pub(super) fn validate_position_flags(
             )));
         }
         if wireguard {
-            return Err(invalid("WireGuard is only supported at hop 0"));
+            return Err(invalid(
+                "WireGuard is only supported at hop 0; configure peer_client_chain in the protocol for preceding proxies",
+            ));
         }
         if xhttp_h3 {
             return Err(invalid("XHTTP H3 is only supported at hop 0"));
@@ -411,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_automatic_occurrences_do_not_allocate_health_contexts() {
+    fn repeated_url_test_references_validate_within_the_node_budget() {
         let members = vec![json!({"chain":["auto"]}); 2048];
         validate(json!([
             {"client_group":"auto","type":"url-test","url":"http://probe.invalid/","client_chains":["direct"]},
