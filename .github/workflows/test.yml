@@ -363,6 +363,12 @@ jobs:
         .github/require-tests.sh cargo test -p shoes --locked --lib --features integration-tests
         h2mux::h2mux_server_session::singbox_interop_tests:: -- --test-threads=1
 
+    - name: Run native QUIC client interoperability tests
+      if: matrix.target == 'optional_peer'
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features optional-peer-tests
+        quic_client::interop:: -- --test-threads=1
+
     - name: Restore pinned XHTTP peers
       if: matrix.target == 'xhttp_interop'
       id: xhttp-peers
