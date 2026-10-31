@@ -13,6 +13,68 @@ use crate::async_stream::{
 };
 use crate::util::allocate_vec;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_datagrams_are_dropped_without_poisoning_the_relay() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let mut client = SnellUdpClientStream::new(Box::new(socket), 16383);
+        for (target, header_len) in [
+            (NetLocation::from_str("127.0.0.1:53", None).unwrap(), 9),
+            (NetLocation::from_str("[::1]:53", None).unwrap(), 21),
+            (
+                NetLocation::new(Address::Hostname("a".repeat(255)), 53),
+                259,
+            ),
+        ] {
+            for size in [65535, 16384 - header_len, 16383 - header_len] {
+                futures::future::poll_fn(|cx| {
+                    Pin::new(&mut client).poll_write_targeted_message(cx, &vec![1; size], &target)
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    client.write_buf_end_offset,
+                    if size + header_len > 16383 { 0 } else { 16383 }
+                );
+            }
+            futures::future::poll_fn(|cx| Pin::new(&mut client).poll_flush_message(cx))
+                .await
+                .unwrap();
+            let mut received = vec![0; 16384];
+            assert_eq!(peer.recv(&mut received).await.unwrap(), 16383);
+        }
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let mut server = SnellUdpStream::new(Box::new(socket), 16383);
+        for (source, header_len) in [
+            (NetLocation::from_str("127.0.0.1:53", None).unwrap(), 7),
+            (NetLocation::from_str("[::1]:53", None).unwrap(), 19),
+        ] {
+            for size in [65535, 16384 - header_len, 16383 - header_len] {
+                futures::future::poll_fn(|cx| {
+                    Pin::new(&mut server).poll_write_sourced_message(cx, &vec![1; size], &source)
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    server.write_buf_end_offset,
+                    if size + header_len > 16383 { 0 } else { 16383 }
+                );
+            }
+            futures::future::poll_fn(|cx| Pin::new(&mut server).poll_flush_message(cx))
+                .await
+                .unwrap();
+            let mut received = vec![0; 16384];
+            assert_eq!(peer.recv(&mut received).await.unwrap(), 16383);
+        }
+    }
+}
+
 pub struct SnellUdpStream {
     stream: Box<dyn AsyncMessageStream>,
     peer: Option<SocketAddr>,
@@ -160,11 +222,6 @@ impl AsyncWriteSourcedMessage for SnellUdpStream {
         }
 
         let buf_len = buf.len();
-        if buf_len + 19 > this.write_buf.len() {
-            // TODO: if it's too big, we need to split up the message into this.max_payload_size chunks.
-            panic!("single message is larger than our write buf: {buf_len}");
-        }
-
         let source = source.to_socket_addr_nonblocking().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -186,6 +243,14 @@ impl AsyncWriteSourcedMessage for SnellUdpStream {
             }
         };
 
+        if buf_len
+            > this
+                .max_payload_size
+                .min(this.write_buf.len())
+                .saturating_sub(offset)
+        {
+            return Poll::Ready(Ok(()));
+        }
         this.write_buf[offset..offset + buf_len].copy_from_slice(buf);
         this.write_buf_end_offset = offset + buf_len;
 
@@ -356,11 +421,6 @@ impl AsyncWriteTargetedMessage for SnellUdpClientStream {
         }
 
         let buf_len = buf.len();
-        // Max header: cmd(1) + addr_len(1) + ip_version(1) + ipv6(16) + port(2) = 21
-        if buf_len + 21 > this.write_buf.len() {
-            panic!("single message is larger than our write buf: {buf_len}");
-        }
-
         this.write_buf[0] = 1; // cmd = data
 
         let offset = match target.address() {
@@ -394,6 +454,14 @@ impl AsyncWriteTargetedMessage for SnellUdpClientStream {
             }
         };
 
+        if buf_len
+            > this
+                .max_payload_size
+                .min(this.write_buf.len())
+                .saturating_sub(offset)
+        {
+            return Poll::Ready(Ok(()));
+        }
         this.write_buf[offset..offset + buf_len].copy_from_slice(buf);
         this.write_buf_end_offset = offset + buf_len;
 

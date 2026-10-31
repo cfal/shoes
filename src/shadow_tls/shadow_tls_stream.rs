@@ -233,7 +233,11 @@ impl ShadowTlsStream {
             self.unprocessed_end_offset = 0;
         }
 
-        Ok(DeframeState::Success)
+        Ok(if payload_len == 0 {
+            DeframeState::EmptyApplicationFrame
+        } else {
+            DeframeState::Success
+        })
     }
 
     fn poll_drain_write_buf(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -260,6 +264,7 @@ enum DeframeState {
     Success,
     ReceivedAlert,
     HandshakeFrame,
+    EmptyApplicationFrame,
 }
 
 impl AsyncRead for ShadowTlsStream {
@@ -270,6 +275,9 @@ impl AsyncRead for ShadowTlsStream {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if this.processed_end_offset > 0 {
             this.read_processed(buf);
             return Poll::Ready(Ok(()));
@@ -277,6 +285,7 @@ impl AsyncRead for ShadowTlsStream {
         if this.is_eof {
             return Poll::Ready(Ok(()));
         }
+        let mut skipped = 0;
 
         if this.unprocessed_end_offset > 0 {
             loop {
@@ -287,7 +296,13 @@ impl AsyncRead for ShadowTlsStream {
                     }
                     DeframeState::NeedData => break,
                     DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
-                    DeframeState::HandshakeFrame => {}
+                    DeframeState::HandshakeFrame | DeframeState::EmptyApplicationFrame => {
+                        skipped += 1;
+                        if skipped == 64 {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                    }
                 }
             }
 
@@ -316,7 +331,13 @@ impl AsyncRead for ShadowTlsStream {
                             }
                             DeframeState::NeedData => break,
                             DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
-                            DeframeState::HandshakeFrame => {}
+                            DeframeState::HandshakeFrame | DeframeState::EmptyApplicationFrame => {
+                                skipped += 1;
+                                if skipped == 64 {
+                                    cx.waker().wake_by_ref();
+                                    return Poll::Pending;
+                                }
+                            }
                         }
                     }
                 }
@@ -333,7 +354,6 @@ impl AsyncWrite for ShadowTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // A record without payload would be sent at once, and readers panic on it.
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -433,6 +453,55 @@ mod tests {
     fn stream_pair(pipe_capacity: usize) -> (ShadowTlsStream, ShadowTlsStream) {
         let (client_io, server_io) = tokio::io::duplex(pipe_capacity);
         (client_stream(client_io), server_stream(server_io))
+    }
+
+    #[tokio::test]
+    async fn authenticated_empty_records_preserve_the_mac_chain() {
+        for coalesced in [false, true] {
+            let (mut io, peer) = tokio::io::duplex(1024);
+            let mut reader = server_stream(peer);
+            let mut mac = hmac(b"C");
+            let mut wire = Vec::new();
+            for payload in [&b""[..], &b""[..], &b"hello"[..]] {
+                mac.update(payload);
+                let tag = mac.digest();
+                mac.update(&tag);
+                wire.extend_from_slice(&[0x17, 3, 3]);
+                wire.extend_from_slice(&((payload.len() + 4) as u16).to_be_bytes());
+                wire.extend_from_slice(&tag);
+                wire.extend_from_slice(payload);
+            }
+            if coalesced {
+                reader.feed_initial_read_data(&wire).unwrap();
+            } else {
+                io.write_all(&wire[..18]).await.unwrap();
+                let mut buf = [0; 5];
+                let mut read = ReadBuf::new(&mut buf);
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                assert!(
+                    Pin::new(&mut reader)
+                        .poll_read(&mut cx, &mut read)
+                        .is_pending()
+                );
+                io.write_all(&wire[18..]).await.unwrap();
+            }
+            let mut buf = [0; 5];
+            reader.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello");
+            drop(io);
+            assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_empty_record_tag_is_rejected() {
+        let (mut io, peer) = tokio::io::duplex(32);
+        let mut reader = server_stream(peer);
+        let mut tag = hmac(b"C").digest();
+        tag[0] ^= 1;
+        io.write_all(&[0x17, 3, 3, 0, 4]).await.unwrap();
+        io.write_all(&tag).await.unwrap();
+        assert!(reader.read(&mut [0; 1]).await.is_err());
     }
 
     #[tokio::test]

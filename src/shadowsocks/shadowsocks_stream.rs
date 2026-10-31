@@ -95,6 +95,106 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn aead2022_message_limits_include_initial_headers() {
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
+            vec![42; 16].into_boxed_slice(),
+            16,
+        )));
+        let (left, right) = tokio::io::duplex(150000);
+        let make = |io, role| {
+            ShadowsocksStream::new(
+                Box::new(io),
+                role,
+                &aws_lc_rs::aead::AES_128_GCM,
+                16,
+                key.clone(),
+                None,
+            )
+        };
+        let mut client = make(left, ShadowsocksStreamType::AEAD2022Client);
+        let mut server = make(right, ShadowsocksStreamType::AEAD2022Server);
+        let cap = ShadowsocksStreamType::AEAD2022Client.max_payload_len();
+        let first_cap = cap + METADATA_SIZE - 16 - 11 - 2 * TAG_LEN;
+        for (writer, reader, capacity) in [(&mut client, &mut server, first_cap)] {
+            assert_eq!(
+                futures::future::poll_fn(
+                    |cx| Pin::new(&mut *writer).poll_write_message(cx, &vec![1; capacity + 1])
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            let data = vec![2; capacity];
+            futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write_message(cx, &data))
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let mut received = vec![0; capacity];
+            reader.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, data);
+        }
+        for (writer, reader) in [(&mut server, &mut client)] {
+            for _ in 0..2 {
+                assert_eq!(
+                    futures::future::poll_fn(
+                        |cx| Pin::new(&mut *writer).poll_write_message(cx, &vec![1; cap + 1])
+                    )
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                    std::io::ErrorKind::InvalidInput
+                );
+                let data = vec![3; cap];
+                futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write_message(cx, &data))
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+                let mut received = vec![0; cap];
+                reader.read_exact(&mut received).await.unwrap();
+                assert_eq!(received, data);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn message_limits_preserve_initial_and_subsequent_frames() {
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(
+            super::super::default_key::DefaultKey::new("test", 16),
+        ));
+        let (left, right) = tokio::io::duplex(65536);
+        let make = |io| {
+            ShadowsocksStream::new(
+                Box::new(io),
+                ShadowsocksStreamType::Aead,
+                &aws_lc_rs::aead::AES_128_GCM,
+                16,
+                key.clone(),
+                None,
+            )
+        };
+        let mut writer = make(left);
+        let mut reader = make(right);
+        let cap = ShadowsocksStreamType::Aead.max_payload_len();
+        for _ in 0..2 {
+            let error = futures::future::poll_fn(|cx| {
+                Pin::new(&mut writer).poll_write_message(cx, &vec![1; cap + 1])
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            let payload = vec![2; cap];
+            futures::future::poll_fn(|cx| Pin::new(&mut writer).poll_write_message(cx, &payload))
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let mut received = vec![0; cap];
+            reader.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, payload);
+        }
+    }
+
+    #[tokio::test]
     async fn client_identity_headers_survive_backpressure_and_preserve_responses() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             for algorithm in [&aws_lc_rs::aead::AES_128_GCM, &aws_lc_rs::aead::AES_256_GCM] {
@@ -1112,7 +1212,38 @@ impl AsyncWriteMessage for ShadowsocksStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        if buf.len() > this.stream_type.max_payload_len() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Shadowsocks message exceeds the frame payload limit",
+            )));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
         if this.is_initial_write {
+            if matches!(this.stream_type, ShadowsocksStreamType::AEAD2022Server)
+                && this.is_initial_read
+            {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Shadowsocks response requires a request header",
+                )));
+            }
+            // Initial salt/header bytes share the cache with a whole message.
+            let required = match this.stream_type {
+                ShadowsocksStreamType::Aead => buf.len() + this.salt_len + METADATA_SIZE,
+                ShadowsocksStreamType::AEAD2022Server => {
+                    buf.len() + 2 * this.salt_len + 11 + 2 * TAG_LEN
+                }
+                ShadowsocksStreamType::AEAD2022Client => this.write_cache.len(),
+            };
+            if required > this.write_cache.len() {
+                let mut cache = std::mem::take(&mut this.write_cache).into_vec();
+                cache.resize(required, 0);
+                this.write_cache = cache.into_boxed_slice();
+            }
             let handled_len = this.process_write_header(buf)?;
             assert!(handled_len == buf.len());
             this.is_initial_write = false;
