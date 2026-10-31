@@ -24,6 +24,7 @@ pub use mihomo::Behavior;
 pub const YAML_PARSER_SCRATCH_BYTES: usize = 64 * 1024 * 1024;
 
 const MAX_INPUT: usize = 64 * 1024 * 1024;
+pub(crate) const CACHE_OWNER_LOCK: &str = "owner.lock";
 pub(crate) const CACHE_LOCK_SUFFIX: &str = ".shoes-update.lock";
 pub(crate) const CACHE_STAGE_SUFFIX: &str = ".shoes-update.tmp";
 
@@ -383,7 +384,6 @@ pub(crate) fn source_identity(path: &Path) -> io::Result<PathBuf> {
 }
 
 pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -> io::Result<()> {
-    use source_identity as identity;
     let remotes = remote_sources(configs)?;
     let Some(directory) = cache_directory(configs)? else {
         return Ok(());
@@ -394,9 +394,13 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
             "rule_cache_dir requires Unix",
         ));
     }
-    let directory_identity = identity(&directory)?;
+    let directory_identity = source_identity(&directory)?;
+    let overlaps_cache = |path: &Path| -> io::Result<bool> {
+        Ok(std::path::absolute(path)?.starts_with(&directory)
+            || source_identity(path)?.starts_with(&directory_identity))
+    };
     #[cfg(target_os = "linux")]
-    if directory_identity == identity(Path::new(crate::desktop::MANAGED_STATE_DIRECTORY))? {
+    if directory_identity == source_identity(Path::new(crate::desktop::MANAGED_STATE_DIRECTORY))? {
         return Err(invalid(
             "rule_cache_dir overlaps the managed TUN state directory",
         ));
@@ -413,7 +417,7 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
                 let name = name.to_ascii_lowercase();
-                name == "owner.lock"
+                name == CACHE_OWNER_LOCK
                     || name.ends_with(CACHE_LOCK_SUFFIX)
                     || name.ends_with(CACHE_STAGE_SUFFIX)
             })
@@ -424,10 +428,7 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
         }
     }
     visit_sources(configs, &mut |source| {
-        if source.url.is_none()
-            && (std::path::absolute(&source.path)?.starts_with(&directory)
-                || identity(&source.path)?.starts_with(&directory_identity))
-        {
+        if source.url.is_none() && overlaps_cache(&source.path)? {
             return Err(invalid(
                 "local rule source overlaps rule_cache_dir; managed caches cannot have local aliases",
             ));
@@ -474,7 +475,7 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
                         reserve_state(key)?;
                     }
                     crate::certificates::SourceConfig::Acme(acme) => {
-                        state_dirs.push(identity(&acme.state_dir)?);
+                        state_dirs.push(source_identity(&acme.state_dir)?);
                         if let Some(path) = &acme.ca_cert {
                             reserve_state(path)?;
                         }
@@ -492,9 +493,7 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
         }
     }
     for path in reserved {
-        if std::path::absolute(&path)?.starts_with(&directory)
-            || identity(&path)?.starts_with(&directory_identity)
-        {
+        if overlaps_cache(&path)? {
             return Err(invalid(
                 "rule_cache_dir overlaps a configuration, PEM, socket, or state path",
             ));

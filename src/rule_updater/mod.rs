@@ -267,8 +267,8 @@ impl Refresh {
                     interval
                 }
                 Err(_) => {
-                    item.failures = (item.failures + 1).min(12);
-                    Duration::from_secs(5 * (1u64 << item.failures.min(10)))
+                    item.failures = (item.failures + 1).min(10);
+                    Duration::from_secs(5 * (1u64 << item.failures))
                         .min(interval)
                         .min(Duration::from_secs(3600))
                 }

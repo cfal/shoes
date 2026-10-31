@@ -30,7 +30,7 @@ fn cached(path: &Path, body: &[u8]) {
         .unwrap();
 }
 
-fn config(
+fn write_config(
     path: &Path,
     address: std::net::SocketAddr,
     target: std::net::SocketAddr,
@@ -113,14 +113,14 @@ async fn quiet(child: &mut Process) {
     );
 }
 
-fn memory_config(
+fn write_memory_config(
     path: &Path,
     address: std::net::SocketAddr,
     target: std::net::SocketAddr,
     url: &str,
     interval: &str,
 ) -> serde_json::Value {
-    let mut value = config(path, address, target, url, interval);
+    let mut value = write_config(path, address, target, url, interval);
     value.as_array_mut().unwrap().remove(0);
     value[0]["rules"][0].as_object_mut().unwrap().remove("path");
     std::fs::write(path, value.to_string()).unwrap();
@@ -137,7 +137,7 @@ async fn memory_sources_bootstrap_once_reuse_on_reload_and_require_network_after
         .await
         .unwrap();
     let address = available_address();
-    let mut value = memory_config(
+    let mut value = write_memory_config(
         &path,
         address,
         echo.local_addr(),
@@ -195,7 +195,7 @@ async fn memory_refresh_replaces_rules_and_retains_them_on_unchanged_or_invalid_
         .await
         .unwrap();
     let address = available_address();
-    memory_config(
+    write_memory_config(
         &path,
         address,
         echo.local_addr(),
@@ -232,7 +232,7 @@ async fn memory_refresh_survives_activation_failure_and_recovers_without_downloa
         .await
         .unwrap();
     let address = available_address();
-    let mut value = memory_config(
+    let mut value = write_memory_config(
         &path,
         address,
         echo.local_addr(),
@@ -274,7 +274,7 @@ async fn generated_cache_paths_allow_restart_during_an_origin_outage() {
     let path = dir.path().join("config.yaml");
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = available_address();
-    let mut value = memory_config(
+    let mut value = write_memory_config(
         &path,
         address,
         address,
@@ -327,7 +327,7 @@ async fn cache_save_failures_do_not_block_startup_refresh_or_reload() {
             .await
             .unwrap();
         let address = available_address();
-        config(
+        write_config(
             &path,
             address,
             echo.local_addr(),
@@ -388,7 +388,7 @@ async fn lost_cache_lease_does_not_block_memory_updates_or_touch_replacement_fil
             .await
             .unwrap();
         let address = available_address();
-        config(
+        write_config(
             &path,
             address,
             echo.local_addr(),
@@ -429,7 +429,7 @@ async fn offline_checks_never_download_and_runtime_refetches_invalid_caches() {
     std::fs::remove_dir(&root).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = available_address();
-    config(
+    write_config(
         &path,
         address,
         address,
@@ -496,7 +496,7 @@ async fn startup_bootstraps_before_listeners_and_respects_root_ownership() {
     std::fs::remove_dir(&root).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = available_address();
-    config(
+    write_config(
         &path,
         address,
         address,
@@ -529,7 +529,7 @@ async fn restrictive_umasks_require_explicit_cache_directory_setup() {
         let path = dir.path().join("config.yaml");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = available_address();
-        config(
+        write_config(
             &path,
             address,
             address,
@@ -579,7 +579,7 @@ async fn bootstrap_keeps_completed_files_without_activating_a_failed_candidate()
         let path = dir.path().join("config.yaml");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = available_address();
-        let mut value = config(
+        let mut value = write_config(
             &path,
             address,
             address,
@@ -620,7 +620,7 @@ async fn bootstrap_uses_inline_proxy_and_never_falls_back_to_direct() {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = available_address();
-    let mut value = config(
+    let mut value = write_config(
         &path,
         address,
         address,
@@ -679,7 +679,7 @@ async fn unsupported_bootstrap_routes_only_fail_when_caches_are_missing() {
         let path = dir.path().join("config.yaml");
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = available_address();
-        let mut value = config(
+        let mut value = write_config(
             &path,
             address,
             address,
@@ -742,7 +742,7 @@ async fn reload_bootstrap_failure_retains_active_traffic_and_success_activates_o
         .await
         .unwrap();
     let address = available_address();
-    let mut value = config(
+    let mut value = write_config(
         &path,
         address,
         echo.local_addr(),
@@ -808,7 +808,7 @@ async fn refresh_owns_reload_and_retains_noops_failures_and_existing_flows() {
             .await
             .unwrap();
         let address = available_address();
-        config(
+        write_config(
             &path,
             address,
             echo.local_addr(),
@@ -861,7 +861,7 @@ async fn cache_edits_do_not_replace_retained_rules_but_yaml_remains_watched() {
         .await
         .unwrap();
     let address = available_address();
-    let mut value = config(
+    let mut value = write_config(
         &path,
         address,
         echo.local_addr(),
@@ -892,7 +892,7 @@ async fn config_edits_cancel_inflight_refresh_without_publishing() {
     cached(&cache, MISS);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = available_address();
-    let mut value = config(
+    let mut value = write_config(
         &path,
         address,
         address,
@@ -930,7 +930,7 @@ async fn cancelled_bootstrap_releases_lease_and_recovers_staging() {
         let path = dir.path().join("config.yaml");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = available_address();
-        config(
+        write_config(
             &path,
             address,
             address,
@@ -967,7 +967,7 @@ async fn startup_bind_failure_keeps_installed_cache_for_restart() {
     let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = occupied.local_addr().unwrap();
-    config(
+    write_config(
         &path,
         address,
         address,
@@ -1002,7 +1002,7 @@ async fn post_install_activation_failure_restores_traffic_and_retry_uses_cache()
             .await
             .unwrap();
         let (reservation, address) = crate::reserve_address();
-        let mut value = config(
+        let mut value = write_config(
             &path,
             address,
             echo.local_addr(),

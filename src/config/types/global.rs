@@ -15,12 +15,10 @@ impl<'de> Deserialize<'de> for GlobalSettings {
 
         // Splitting the map preserves strict limit validation without flatten + deny_unknown_fields.
         let mut fields = Mapping::deserialize(deserializer)?;
-        let rule_cache_dir = fields
-            .remove("rule_cache_dir")
-            .map(serde_yaml::from_value)
-            .transpose()
-            .map_err(Error::custom)?
-            .flatten();
+        let rule_cache_dir = match fields.remove("rule_cache_dir") {
+            Some(value) => serde_yaml::from_value(value).map_err(Error::custom)?,
+            None => None,
+        };
         let limits = serde_yaml::from_value(Value::Mapping(fields)).map_err(Error::custom)?;
         Ok(Self {
             limits,

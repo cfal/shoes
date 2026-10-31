@@ -1,5 +1,5 @@
 use super::MAX_BYTES;
-use crate::rule_set::{CACHE_LOCK_SUFFIX, CACHE_STAGE_SUFFIX};
+use crate::rule_set::{CACHE_LOCK_SUFFIX, CACHE_OWNER_LOCK, CACHE_STAGE_SUFFIX};
 use crate::rules::invalid;
 use std::ffi::{CString, OsStr};
 use std::fs::{File, Metadata};
@@ -64,7 +64,7 @@ impl CacheLease {
     }
 
     fn check_identity(&self) -> io::Result<()> {
-        let (current, _) = checked_path(&self.path.join("owner.lock"))?;
+        let (current, _) = checked_path(&self.path.join(CACHE_OWNER_LOCK))?;
         let owned = self.directory.metadata()?;
         let current = current.metadata()?;
         check_directory(&owned)?;
@@ -73,7 +73,7 @@ impl CacheLease {
         }
         let lock = open_at(
             &self.directory,
-            &c_name(OsStr::new("owner.lock"))?,
+            &c_name(OsStr::new(CACHE_OWNER_LOCK))?,
             libc::O_RDONLY,
         )?
         .metadata()?;
@@ -98,7 +98,10 @@ fn cache_path(path: &Path, lease: Option<&CacheLease>) -> io::Result<(File, std:
     }
     lease.check()?;
     let name = path.file_name().unwrap();
-    if name.as_bytes().eq_ignore_ascii_case(b"owner.lock") {
+    if name
+        .as_bytes()
+        .eq_ignore_ascii_case(CACHE_OWNER_LOCK.as_bytes())
+    {
         return Err(invalid("rule_cache_dir owner.lock is reserved"));
     }
     Ok((lease.directory.try_clone()?, name.to_owned()))
@@ -107,7 +110,7 @@ fn cache_path(path: &Path, lease: Option<&CacheLease>) -> io::Result<(File, std:
 pub(crate) fn cache_lease(directory: &Path) -> io::Result<CacheLease> {
     (|| {
         let path = std::path::absolute(directory)?;
-        let (directory, name) = checked_path(&directory.join("owner.lock"))?;
+        let (directory, name) = checked_path(&directory.join(CACHE_OWNER_LOCK))?;
         let name = c_name(&name)?;
         let file = open_lock_file(&directory, &name)?;
         file.try_lock()

@@ -2256,9 +2256,8 @@ time; future mtimes are treated as due.
 Successful check times are remembered only in memory. On a cold start, an explicit
 cache path does not record the URL it came from; use a new cache name when changing
 the URL between process lifetimes if immediate replacement is required.
-Download or validation failures retain the last-good rules and cache. Cache-save
-failures do not reject validated rules. Identical downloads reuse compiled rules
-and do not reload, but still retry saving if necessary; identical cached bytes
+Download or validation failures retain the last-good rules and cache.
+Identical downloads reuse compiled rules and do not reload; identical cached bytes
 preserve inode/mtime. Each file replacement is atomic, not a multi-file transaction.
 A post-rename directory-sync failure reports uncertain durability without rejecting
 the update. New flows use the reloaded rules; existing flows retain
