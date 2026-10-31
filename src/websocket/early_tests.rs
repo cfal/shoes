@@ -12,8 +12,12 @@ use crate::async_stream::AsyncPing;
 use crate::async_stream::test_streams::FlushGatedStream;
 use crate::client_proxy_selector::ClientProxySelector;
 
+const BAD_REQUEST_RESPONSE: &str =
+    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
 fn handshake_options(max: usize, header: Option<&str>) -> Arc<ClientHandshake> {
     Arc::new(ClientHandshake {
+        authority: "example.test:80".into(),
         matching_path: Some("/ws".into()),
         matching_headers: Some(FxHashMap::from_iter([(
             "Host".into(),
@@ -59,7 +63,7 @@ async fn parsed_headers_preserve_first_colon_and_case_insensitive_duplicates() {
     .unwrap();
     let mut server: Box<dyn AsyncStream> = Box::new(server);
     let parsed = ParsedHttpData::parse(&mut server).await.unwrap();
-    assert_eq!(parsed.headers["x-value"], "final:value");
+    assert_eq!(parsed.headers["x-value"], "first:value, final:value");
     assert_eq!(parsed.duplicates, HashSet::from(["x-value".into()]));
 
     peer.write_all(&request("/ws", "missing separator\r\n"))
@@ -197,6 +201,7 @@ impl TcpServerHandler for PassThrough {
             ),
             need_initial_flush: false,
             connection_success_response: None,
+            connection_failure_response: None,
             initial_remote_data: None,
             proxy_selector: Arc::new(ClientProxySelector::new(vec![])),
         })
@@ -382,22 +387,38 @@ async fn malformed_early_data_is_rejected_before_upgrade_without_fallback() {
                 handler.setup_server_stream(Box::new(server)).await.is_err(),
                 "{encoded}"
             );
-            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+            let mut response = String::new();
+            peer.read_to_string(&mut response).await.unwrap();
+            assert_eq!(
+                response,
+                if header.is_none() && encoded == "Y Q" {
+                    BAD_REQUEST_RESPONSE
+                } else {
+                    ""
+                }
+            );
         }
     }
-    for (header, extra) in [
-        ("X-Early-Data", "X-Early-Data: YQ\r\nx-early-data: Yg\r\n"),
+    for (header, extra, expected_response) in [
+        (
+            "X-Early-Data",
+            "X-Early-Data: YQ\r\nx-early-data: Yg\r\n",
+            "",
+        ),
         (
             "Sec-WebSocket-Protocol",
             "Sec-WebSocket-Protocol: YQ\r\nsec-websocket-protocol: Yg\r\n",
+            "",
         ),
         (
             "Sec-WebSocket-Protocol",
             "Sec-WebSocket-Protocol: YQ\r\nHost: other.test\r\n",
+            BAD_REQUEST_RESPONSE,
         ),
         (
             "Sec-WebSocket-Protocol",
             "Sec-WebSocket-Protocol: YQ\r\nSec-WebSocket-Key: duplicate\r\n",
+            BAD_REQUEST_RESPONSE,
         ),
     ] {
         let (mut peer, server) = tokio::io::duplex(8192);
@@ -408,7 +429,43 @@ async fn malformed_early_data_is_rejected_before_upgrade_without_fallback() {
                 .await
                 .is_err()
         );
-        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        let mut response = String::new();
+        peer.read_to_string(&mut response).await.unwrap();
+        assert_eq!(response, expected_response);
+    }
+}
+
+#[tokio::test]
+async fn early_data_does_not_bypass_upgrade_validation() {
+    let valid = String::from_utf8(request("/ws", "Sec-WebSocket-Protocol: YQ\r\n")).unwrap();
+    for max in [0, 32] {
+        for invalid in [
+            valid.replace("HTTP/1.1", "HTTP/1.0"),
+            valid.replace("Host: example.test\r\n", ""),
+            valid.replace(
+                "Host: example.test",
+                "Host: example.test\r\nHost: other.test",
+            ),
+            valid.replace("Connection: Upgrade\r\n", ""),
+            valid.replace("dGhlIHNhbXBsZSBub25jZQ==", "invalid"),
+        ] {
+            let (mut peer, server) = tokio::io::duplex(8192);
+            peer.write_all(invalid.as_bytes()).await.unwrap();
+            let error = WebsocketTcpServerHandler::new(vec![target(
+                "/ws",
+                max,
+                (max > 0).then_some("Sec-WebSocket-Protocol"),
+            )])
+            .setup_server_stream(Box::new(FlushGatedStream::new(server)))
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "400 Bad Request");
+            let mut response = String::new();
+            peer.read_to_string(&mut response).await.unwrap();
+            assert_eq!(response, BAD_REQUEST_RESPONSE);
+        }
     }
 }
 
@@ -563,7 +620,7 @@ async fn duplicate_matching_header_is_rejected_before_upgrade() {
         let mut selected = target("/ws", max, None);
         selected.matching_headers = Some(FxHashMap::from_iter([(
             "x-match".into(),
-            "selected".into(),
+            "other, selected".into(),
         )]));
         let error = WebsocketTcpServerHandler::new(vec![selected])
             .setup_server_stream(Box::new(server))
@@ -582,26 +639,33 @@ async fn automatic_early_data_rejects_invalid_oversized_and_duplicate_headers_be
         "a", "YQ=", "YQ==", "+w", "/w", "YR", "binary", "a, b", "Y Q", &oversized,
     ]
     .into_iter()
-    .map(|value| format!("Sec-WebSocket-Protocol: {value}\r\n"))
+    .map(|value| (format!("Sec-WebSocket-Protocol: {value}\r\n"), ""))
     .collect();
     for (first, last) in [("YQ", "Yg"), ("YQ", ""), ("", "YQ"), ("", "")] {
-        extras.push(format!(
-            "Sec-WebSocket-Protocol: {first}\r\nsEc-WeBsOcKeT-pRoToCoL: {last}\r\n"
+        extras.push((
+            format!("Sec-WebSocket-Protocol: {first}\r\nsEc-WeBsOcKeT-pRoToCoL: {last}\r\n"),
+            "",
         ));
     }
-    for duplicate in [
-        "Host: other.test",
-        "Sec-WebSocket-Key: duplicate",
-        "Connection: Upgrade",
-        "Upgrade: websocket",
-        "Sec-WebSocket-Version: 13",
-        "Content-Length: 0\r\ncontent-length: 0",
-        "Transfer-Encoding: chunked\r\ntransfer-encoding: chunked",
+    for (duplicate, expected_response) in [
+        ("Host: other.test", BAD_REQUEST_RESPONSE),
+        ("Sec-WebSocket-Key: duplicate", BAD_REQUEST_RESPONSE),
+        ("Connection: Upgrade", ""),
+        ("Upgrade: websocket", ""),
+        ("Sec-WebSocket-Version: 13", BAD_REQUEST_RESPONSE),
+        ("Content-Length: 0\r\ncontent-length: 0", ""),
+        (
+            "Transfer-Encoding: chunked\r\ntransfer-encoding: chunked",
+            "",
+        ),
     ] {
-        extras.push(format!("Sec-WebSocket-Protocol: YQ\r\n{duplicate}\r\n"));
+        extras.push((
+            format!("Sec-WebSocket-Protocol: YQ\r\n{duplicate}\r\n"),
+            expected_response,
+        ));
     }
     for catch_all in [false, true] {
-        for extra in &extras {
+        for (extra, expected_response) in &extras {
             let (mut peer, server) = tokio::io::duplex(8192);
             peer.write_all(&request("/ws", extra)).await.unwrap();
             let mut selected = target("/ws", 0, None);
@@ -615,7 +679,9 @@ async fn automatic_early_data_rejects_invalid_oversized_and_duplicate_headers_be
                     .is_err(),
                 "{extra}"
             );
-            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+            let mut response = String::new();
+            peer.read_to_string(&mut response).await.unwrap();
+            assert_eq!(response, *expected_response);
         }
     }
 }
@@ -1181,7 +1247,7 @@ async fn read_first_inner_setup_and_destination_early_data_are_preserved() {
 }
 
 #[tokio::test]
-async fn automatic_and_explicit_servers_only_prepend_nonempty_data() {
+async fn automatic_and_explicit_servers_prepend_data_only_after_valid_upgrade() {
     for (max, extra) in [
         (32, ""),
         (32, "Sec-WebSocket-Protocol: \r\n"),
@@ -1201,9 +1267,17 @@ async fn automatic_and_explicit_servers_only_prepend_nonempty_data() {
             max,
             (max > 0).then_some("Sec-WebSocket-Protocol"),
         )]);
-        let TcpServerSetupResult::TcpForward { mut stream, .. } =
-            handler.setup_server_stream(Box::new(server)).await.unwrap()
-        else {
+        let result = handler.setup_server_stream(Box::new(server)).await;
+        if extra.contains("Host:") {
+            let error = result.err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "400 Bad Request");
+            let mut response = String::new();
+            peer.read_to_string(&mut response).await.unwrap();
+            assert_eq!(response, BAD_REQUEST_RESPONSE);
+            continue;
+        }
+        let TcpServerSetupResult::TcpForward { mut stream, .. } = result.unwrap() else {
             panic!()
         };
         let has_prefix = extra.contains("YQ");
@@ -1375,6 +1449,10 @@ impl AsyncPing for TaggedStream {
     }
 }
 impl AsyncStream for TaggedStream {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        Some("127.0.0.1:4321".parse().unwrap())
+    }
+
     fn flow(&self) -> Option<&Arc<crate::control::flows::FlowEntry>> {
         Some(&self.flow)
     }
@@ -1406,6 +1484,7 @@ async fn transport_metadata_survives_upgrade_and_prefix_wrapping() {
         handshake_options(32, None),
     );
     let check = |stream: &dyn AsyncStream| {
+        assert_eq!(stream.local_addr(), Some("127.0.0.1:4321".parse().unwrap()));
         assert_eq!(stream.peer_addr(), Some("127.0.0.1:1234".parse().unwrap()));
         assert!(Arc::ptr_eq(stream.flow().unwrap(), &flow));
         #[cfg(target_os = "linux")]

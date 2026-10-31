@@ -300,7 +300,7 @@ impl UdpPoller for MemoryPoller {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{test_endpoints, test_endpoints_with_uni_limit};
+pub(crate) use tests::{test_endpoints, test_endpoints_with_config};
 
 #[cfg(test)]
 mod tests;

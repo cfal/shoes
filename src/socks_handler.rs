@@ -31,6 +31,7 @@ pub const ADDR_TYPE_DOMAIN_NAME: u8 = 0x03;
 pub const ADDR_TYPE_IPV6: u8 = 0x04;
 
 pub const RESULT_SUCCESS: u8 = 0x0;
+const RESULT_FAILURE: u8 = 0x01;
 
 pub const CMD_CONNECT: u8 = 0x01;
 pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
@@ -103,6 +104,11 @@ impl TcpServerHandler for SocksTcpServerHandler {
     }
 }
 
+async fn send_rejection(stream: &mut Box<dyn AsyncStream>, response: &[u8]) -> std::io::Result<()> {
+    stream.write_all(response).await?;
+    stream.flush().await
+}
+
 /// Core SOCKS5 server setup logic.
 /// Can be called from SocksTcpServerHandler or MixedTcpServerHandler.
 ///
@@ -133,6 +139,7 @@ pub async fn setup_socks_server_stream_inner(
 
     let method_len = stream_reader.read_u8(&mut server_stream).await? as usize;
     if method_len < 1 {
+        send_rejection(&mut server_stream, &[VER_SOCKS5, METHOD_INVALID]).await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Invalid method length: {method_len}"),
@@ -150,7 +157,7 @@ pub async fn setup_socks_server_stream_inner(
     };
 
     if !methods.contains(&supported_method) {
-        // TODO: consider writing response: [VER_SOCKS5, METHOD_INVALID]
+        send_rejection(&mut server_stream, &[VER_SOCKS5, METHOD_INVALID]).await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Supported SOCKS method not found",
@@ -165,6 +172,7 @@ pub async fn setup_socks_server_stream_inner(
     if let Some((target_username, target_password)) = auth_info {
         let auth_version = stream_reader.read_u8(&mut server_stream).await?;
         if auth_version != VER_AUTH {
+            send_rejection(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported SOCKS auth version",
@@ -173,6 +181,7 @@ pub async fn setup_socks_server_stream_inner(
 
         let username_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if username_len == 0 {
+            send_rejection(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported SOCKS username length",
@@ -187,6 +196,7 @@ pub async fn setup_socks_server_stream_inner(
 
         let password_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if password_len == 0 {
+            send_rejection(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unsupported SOCKS password length",
@@ -204,6 +214,7 @@ pub async fn setup_socks_server_stream_inner(
         let password_match = target_password.as_bytes().ct_eq(password);
 
         if username_match.unwrap_u8() == 0 || password_match.unwrap_u8() == 0 {
+            send_rejection(&mut server_stream, &[VER_AUTH, RESULT_FAILURE]).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "SOCKS authentication failed",
@@ -246,9 +257,15 @@ pub async fn setup_socks_server_stream_inner(
     }
 
     if connection_request[1] != CMD_CONNECT {
+        let command = connection_request[1];
+        send_rejection(
+            &mut server_stream,
+            &build_error_response(REPLY_COMMAND_NOT_SUPPORTED),
+        )
+        .await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("Invalid command code: {}", connection_request[1]),
+            format!("Invalid command code: {command}"),
         ));
     }
 
@@ -266,7 +283,8 @@ pub async fn setup_socks_server_stream_inner(
         let mut location_vec = write_location_to_vec(&NetLocation::new(
             Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
             65535,
-        ));
+        ))
+        .expect("fixed IP address");
         response_bytes.append(&mut location_vec);
         response_bytes.into_boxed_slice()
     });
@@ -363,6 +381,7 @@ pub async fn setup_socks_server_stream_inner(
         stream: server_stream,
         need_initial_flush: true,
         connection_success_response: Some(connection_success_response.to_vec().into_boxed_slice()),
+        connection_failure_response: Some(connect_failure_response),
         initial_remote_data: stream_reader.unparsed_data_owned(),
         proxy_selector: proxy_selector.clone(),
     })
@@ -383,7 +402,18 @@ async fn handle_udp_associate(
 
     // Uses 2MB buffer to prevent packet drops during bursts.
     const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-    let udp_bind_addr = SocketAddr::new(bind_ip, 0);
+    let udp_bind_addr = if bind_ip.is_unspecified() {
+        server_stream
+            .local_addr()
+            .filter(|address| address.is_ipv6() == bind_ip.is_ipv6())
+            .map(|mut address| {
+                address.set_port(0);
+                address
+            })
+            .unwrap_or_else(|| SocketAddr::new(bind_ip, 0))
+    } else {
+        SocketAddr::new(bind_ip, 0)
+    };
     let udp_socket: std::net::UdpSocket =
         match crate::socket_util::new_socket2_udp_socket_with_buffer_size(
             bind_ip.is_ipv6(),
@@ -439,11 +469,22 @@ fn build_error_response(reply_code: u8) -> Vec<u8> {
     ]
 }
 
+fn connect_failure_response(kind: std::io::ErrorKind) -> Vec<u8> {
+    use std::io::ErrorKind;
+    build_error_response(match kind {
+        ErrorKind::PermissionDenied => 2,
+        ErrorKind::NetworkUnreachable => 3,
+        ErrorKind::HostUnreachable | ErrorKind::NotFound | ErrorKind::AddrNotAvailable => 4,
+        ErrorKind::ConnectionRefused => 5,
+        _ => REPLY_GENERAL_FAILURE,
+    })
+}
+
 /// Build a SOCKS5 UDP ASSOCIATE success response.
 fn build_udp_associate_response(bound_addr: SocketAddr) -> Vec<u8> {
     let mut response = vec![VER_SOCKS5, REPLY_SUCCESS, 0x00];
 
-    match bound_addr {
+    match SocketAddr::new(bound_addr.ip().to_canonical(), bound_addr.port()) {
         SocketAddr::V4(v4) => {
             response.push(ADDR_TYPE_IPV4);
             response.extend_from_slice(&v4.ip().octets());
@@ -592,7 +633,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
             CMD_CONNECT,
             0x0, // reserved
         ];
-        connect_request.extend(write_location_to_vec(remote_location.location()));
+        connect_request.extend(write_location_to_vec(remote_location.location())?);
         write_all(&mut client_stream, &connect_request).await?;
         client_stream.flush().await?;
 
@@ -763,7 +804,7 @@ pub async fn read_location_direct<T: AsyncReadExt + Unpin>(
     }
 }
 
-pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
+pub fn write_location_to_vec(location: &NetLocation) -> std::io::Result<Vec<u8>> {
     let (address, port) = location.components();
     let mut vec = match address {
         Address::Ipv4(v4addr) => {
@@ -780,9 +821,15 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
         }
         Address::Hostname(domain_name) => {
             let domain_name_bytes = domain_name.as_bytes();
+            let length = u8::try_from(domain_name_bytes.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SOCKS hostname exceeds 255 bytes",
+                )
+            })?;
             let mut vec = Vec::with_capacity(4 + domain_name_bytes.len());
             vec.push(ADDR_TYPE_DOMAIN_NAME);
-            vec.push(domain_name_bytes.len() as u8);
+            vec.push(length);
             vec.extend_from_slice(domain_name_bytes);
             vec
         }
@@ -790,7 +837,7 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
 
     vec.push((port >> 8) as u8);
     vec.push((port & 0xff) as u8);
-    vec
+    Ok(vec)
 }
 
 #[cfg(test)]
@@ -801,6 +848,101 @@ mod tests {
     use std::io;
     use std::time::Duration;
     use tokio::io::DuplexStream;
+
+    #[tokio::test]
+    async fn wildcard_udp_replies_use_control_local_address_through_wrappers() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for (ipv6, dual_stack) in [(false, false), (true, false), (false, true)] {
+                for wrapped in [false, true] {
+                    let wildcard: IpAddr = if ipv6 || dual_stack { "::" } else { "0.0.0.0" }
+                        .parse()
+                        .unwrap();
+                    let loopback: IpAddr = if ipv6 { "::1" } else { "127.0.0.1" }.parse().unwrap();
+                    let listener = tokio::net::TcpListener::bind((wildcard, 0)).await.unwrap();
+                    let echo = tokio::net::UdpSocket::bind((loopback, 0)).await.unwrap();
+                    let target = echo.local_addr().unwrap();
+                    let resolver: Arc<dyn Resolver> =
+                        Arc::new(crate::resolver::NativeResolver::new());
+                    let selector = Arc::new(
+                        crate::tcp::tcp_client_handler_factory::create_test_selector(
+                            vec![crate::config::RuleConfig::default()],
+                            resolver.clone(),
+                        )
+                        .unwrap(),
+                    );
+                    let handler =
+                        SocksTcpServerHandler::new(None, true, wildcard, selector, resolver);
+                    let mut control = tokio::net::TcpStream::connect((
+                        loopback,
+                        listener.local_addr().unwrap().port(),
+                    ))
+                    .await
+                    .unwrap();
+                    let (server, _) = listener.accept().await.unwrap();
+                    let stream: Box<dyn AsyncStream> = if wrapped {
+                        Box::new(crate::prepend_stream::PrependStream::new(server, None))
+                    } else {
+                        Box::new(server)
+                    };
+                    let task = tokio::spawn(async move {
+                        let TcpServerSetupResult::Session(session) =
+                            handler.setup_server_stream(stream).await.unwrap()
+                        else {
+                            panic!("expected UDP session")
+                        };
+                        session.await;
+                    });
+                    control
+                        .write_all(&[5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    let mut method = [0; 2];
+                    control.read_exact(&mut method).await.unwrap();
+                    assert_eq!(method, [5, 0]);
+                    let mut reply = vec![0; if ipv6 { 22 } else { 10 }];
+                    control.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply[..3], &[5, 0, 0]);
+                    let address = if ipv6 {
+                        IpAddr::V6(std::net::Ipv6Addr::from(
+                            <[u8; 16]>::try_from(&reply[4..20]).unwrap(),
+                        ))
+                    } else {
+                        IpAddr::V4(std::net::Ipv4Addr::new(
+                            reply[4], reply[5], reply[6], reply[7],
+                        ))
+                    };
+                    assert_eq!(address, loopback);
+                    let relay = SocketAddr::new(
+                        address,
+                        u16::from_be_bytes(reply[reply.len() - 2..].try_into().unwrap()),
+                    );
+                    let udp = tokio::net::UdpSocket::bind((loopback, 0)).await.unwrap();
+                    let mut packet = vec![0, 0, 0];
+                    packet.extend_from_slice(
+                        &write_location_to_vec(&NetLocation::from_ip_addr(
+                            target.ip(),
+                            target.port(),
+                        ))
+                        .unwrap(),
+                    );
+                    packet.extend_from_slice(b"relay");
+                    udp.send_to(&packet, relay).await.unwrap();
+                    let mut payload = [0; 64];
+                    let (count, from) = echo.recv_from(&mut payload).await.unwrap();
+                    assert_eq!(&payload[..count], b"relay");
+                    echo.send_to(&payload[..count], from).await.unwrap();
+                    let (count, _) = udp.recv_from(&mut payload).await.unwrap();
+                    assert_eq!(&payload[..count], &packet);
+                    drop(control);
+                    task.await.unwrap();
+                    let rebound = tokio::net::UdpSocket::bind(relay).await.unwrap();
+                    drop(rebound);
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     /// RFC 1929 request carrying `credentials()`.
     const AUTH_REQUEST: &[u8] = b"\x01\x04user\x04pass";
@@ -838,6 +980,69 @@ mod tests {
         let mut bytes = vec![0; len];
         bounded(stream.read_exact(&mut bytes)).await.unwrap();
         bytes
+    }
+
+    #[tokio::test]
+    async fn negative_negotiation_replies_are_flushed_before_close() {
+        for (auth, request, expected) in [
+            (None, vec![5, 1, 2], vec![5, 255]),
+            (None, vec![5, 0], vec![5, 255]),
+            (credentials(), vec![5, 1, 0], vec![5, 255]),
+            (
+                credentials(),
+                b"\x05\x01\x02\x02\x04user\x04pass".to_vec(),
+                vec![5, 2, 1, 1],
+            ),
+            (
+                credentials(),
+                b"\x05\x01\x02\x01\x00".to_vec(),
+                vec![5, 2, 1, 1],
+            ),
+            (
+                credentials(),
+                b"\x05\x01\x02\x01\x04user\x00".to_vec(),
+                vec![5, 2, 1, 1],
+            ),
+            (
+                credentials(),
+                b"\x05\x01\x02\x01\x04user\x04fail".to_vec(),
+                vec![5, 2, 1, 1],
+            ),
+            (
+                None,
+                b"\x05\x01\x00\x05\x02\x00".to_vec(),
+                [vec![5, 0], build_error_response(7)].concat(),
+            ),
+        ] {
+            let (mut client, stream) = tokio::io::duplex(1024);
+            client.write_all(&request).await.unwrap();
+            client.shutdown().await.unwrap();
+            assert_eq!(
+                bounded(
+                    server_handler(auth)
+                        .setup_server_stream(Box::new(FlushGatedStream::new(stream)))
+                )
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            let mut received = Vec::new();
+            bounded(client.read_to_end(&mut received)).await.unwrap();
+            assert_eq!(received, expected);
+        }
+    }
+
+    #[test]
+    fn hostname_lengths_do_not_wrap() {
+        let valid = NetLocation::new(Address::Hostname("a".repeat(255)), 53);
+        let invalid = NetLocation::new(Address::Hostname("a".repeat(256)), 53);
+        assert_eq!(write_location_to_vec(&valid).unwrap()[1], 255);
+        assert_eq!(
+            write_location_to_vec(&invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[tokio::test]

@@ -758,6 +758,9 @@ impl AsyncStream for WebsocketStream {
     fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
         self.stream.flow()
     }
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.stream.peer_addr()
     }

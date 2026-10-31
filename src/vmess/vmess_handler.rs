@@ -603,6 +603,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     // Wait until there is data to send the response header.
                     need_initial_flush: false,
                     connection_success_response: None,
+                    connection_failure_response: None,
                     initial_remote_data: None,
                     proxy_selector: self.proxy_selector.clone(),
                 })

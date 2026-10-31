@@ -12,6 +12,7 @@ use crate::util::allocate_vec;
 // TODO: remove duplicated consts
 const TLS_HEADER_LEN: usize = 5;
 const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
+const MAX_SKIPPED_RECORDS_PER_POLL: usize = 64;
 
 // the max size allowed for a payload ie. `buf` in poll_write.
 // 2^14 - 4 (HMAC) = 16380
@@ -233,7 +234,11 @@ impl ShadowTlsStream {
             self.unprocessed_end_offset = 0;
         }
 
-        Ok(DeframeState::Success)
+        Ok(if payload_len == 0 {
+            DeframeState::EmptyApplicationFrame
+        } else {
+            DeframeState::Success
+        })
     }
 
     fn poll_drain_write_buf(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -260,6 +265,7 @@ enum DeframeState {
     Success,
     ReceivedAlert,
     HandshakeFrame,
+    EmptyApplicationFrame,
 }
 
 impl AsyncRead for ShadowTlsStream {
@@ -270,6 +276,9 @@ impl AsyncRead for ShadowTlsStream {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if this.processed_end_offset > 0 {
             this.read_processed(buf);
             return Poll::Ready(Ok(()));
@@ -277,52 +286,39 @@ impl AsyncRead for ShadowTlsStream {
         if this.is_eof {
             return Poll::Ready(Ok(()));
         }
+        let mut skipped = 0;
 
-        if this.unprocessed_end_offset > 0 {
-            loop {
-                match this.try_deframe()? {
-                    DeframeState::Success => {
-                        this.read_processed(buf);
-                        return Poll::Ready(Ok(()));
+        loop {
+            match this.try_deframe()? {
+                DeframeState::Success => {
+                    this.read_processed(buf);
+                    return Poll::Ready(Ok(()));
+                }
+                DeframeState::NeedData => {}
+                DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
+                DeframeState::HandshakeFrame | DeframeState::EmptyApplicationFrame => {
+                    skipped += 1;
+                    if skipped == MAX_SKIPPED_RECORDS_PER_POLL {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
                     }
-                    DeframeState::NeedData => break,
-                    DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
-                    DeframeState::HandshakeFrame => {}
+                    continue;
                 }
             }
 
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
                 return Poll::Ready(Err(std::io::Error::other("Unprocessed buffer full")));
             }
-        }
 
-        loop {
             let mut read_buf =
                 ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
-            match Pin::new(&mut this.stream).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => {
-                    let n = read_buf.filled().len();
-                    if n == 0 {
-                        this.is_eof = true;
-                        return Poll::Ready(Ok(()));
-                    }
-                    this.unprocessed_end_offset += n;
-
-                    loop {
-                        match this.try_deframe()? {
-                            DeframeState::Success => {
-                                this.read_processed(buf);
-                                return Poll::Ready(Ok(()));
-                            }
-                            DeframeState::NeedData => break,
-                            DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
-                            DeframeState::HandshakeFrame => {}
-                        }
-                    }
-                }
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
+            let n = read_buf.filled().len();
+            if n == 0 {
+                this.is_eof = true;
+                return Poll::Ready(Ok(()));
             }
+            this.unprocessed_end_offset += n;
         }
     }
 }
@@ -333,7 +329,6 @@ impl AsyncWrite for ShadowTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // A record without payload would be sent at once, and readers panic on it.
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -400,6 +395,9 @@ impl AsyncPing for ShadowTlsStream {
 }
 
 impl AsyncStream for ShadowTlsStream {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.stream.peer_addr()
     }
@@ -430,6 +428,146 @@ mod tests {
     fn stream_pair(pipe_capacity: usize) -> (ShadowTlsStream, ShadowTlsStream) {
         let (client_io, server_io) = tokio::io::duplex(pipe_capacity);
         (client_stream(client_io), server_stream(server_io))
+    }
+
+    fn authenticated_records(payloads: &[&[u8]]) -> Vec<u8> {
+        let mut mac = hmac(b"C");
+        let mut wire = Vec::new();
+        for payload in payloads {
+            mac.update(payload);
+            let tag = mac.digest();
+            mac.update(&tag);
+            wire.extend_from_slice(&[0x17, 3, 3]);
+            wire.extend_from_slice(&((payload.len() + 4) as u16).to_be_bytes());
+            wire.extend_from_slice(&tag);
+            wire.extend_from_slice(payload);
+        }
+        wire
+    }
+
+    #[tokio::test]
+    async fn authenticated_empty_records_preserve_the_mac_chain() {
+        for coalesced in [false, true] {
+            let (mut io, peer) = tokio::io::duplex(1024);
+            let mut reader = server_stream(peer);
+            let wire = authenticated_records(&[b"", b"", b"hello"]);
+            if coalesced {
+                reader.feed_initial_read_data(&wire).unwrap();
+            } else {
+                io.write_all(&wire[..18]).await.unwrap();
+                let mut buf = [0; 5];
+                let mut read = ReadBuf::new(&mut buf);
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                assert!(
+                    Pin::new(&mut reader)
+                        .poll_read(&mut cx, &mut read)
+                        .is_pending()
+                );
+                io.write_all(&wire[18..]).await.unwrap();
+            }
+            let mut buf = [0; 5];
+            reader.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello");
+            drop(io);
+            assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_record_budget_spans_buffered_and_transport_reads() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        #[derive(Default)]
+        struct WakeCount(AtomicUsize);
+
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for empty_records in [63, 64, 65] {
+            let mut payloads = vec![b"".as_slice(); empty_records];
+            payloads.push(b"hello");
+            let wire = authenticated_records(&payloads);
+            for split in [0, 32 * 9, wire.len()] {
+                let (mut io, peer) = tokio::io::duplex(1024);
+                let mut reader = server_stream(peer);
+                reader.feed_initial_read_data(&wire[..split]).unwrap();
+                io.write_all(&wire[split..]).await.unwrap();
+                let wakes = Arc::new(WakeCount::default());
+                let waker = Waker::from(wakes.clone());
+                let mut cx = Context::from_waker(&waker);
+                let mut empty = ReadBuf::new(&mut []);
+                assert!(matches!(
+                    Pin::new(&mut reader).poll_read(&mut cx, &mut empty),
+                    Poll::Ready(Ok(()))
+                ));
+                assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+
+                let mut storage = [0; 5];
+                let mut output = ReadBuf::new(&mut storage);
+                let result = Pin::new(&mut reader).poll_read(&mut cx, &mut output);
+                if empty_records >= 64 {
+                    assert!(result.is_pending());
+                    assert!(output.filled().is_empty());
+                    assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+                    assert!(matches!(
+                        Pin::new(&mut reader).poll_read(&mut cx, &mut output),
+                        Poll::Ready(Ok(()))
+                    ));
+                } else {
+                    assert!(matches!(result, Poll::Ready(Ok(()))));
+                    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+                }
+                assert_eq!(output.filled(), b"hello");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_payload_is_drained_before_alert_or_eof() {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for alert in [false, true] {
+                for preread in [false, true] {
+                    let (mut io, peer) = tokio::io::duplex(1024);
+                    let mut reader = server_stream(peer);
+                    let mut wire = authenticated_records(&[b"", b"hello"]);
+                    if alert {
+                        wire.extend_from_slice(&[0x15, 3, 3, 0, 0]);
+                    }
+                    if preread {
+                        reader.feed_initial_read_data(&wire).unwrap();
+                    } else {
+                        io.write_all(&wire).await.unwrap();
+                    }
+                    if !alert {
+                        io.shutdown().await.unwrap();
+                    }
+                    let mut prefix = [0; 2];
+                    reader.read_exact(&mut prefix).await.unwrap();
+                    assert_eq!(&prefix, b"he");
+                    let mut tail = Vec::new();
+                    reader.read_to_end(&mut tail).await.unwrap();
+                    assert_eq!(tail, b"llo");
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_empty_record_tag_is_rejected() {
+        let (mut io, peer) = tokio::io::duplex(32);
+        let mut reader = server_stream(peer);
+        let mut tag = hmac(b"C").digest();
+        tag[0] ^= 1;
+        io.write_all(&[0x17, 3, 3, 0, 4]).await.unwrap();
+        io.write_all(&tag).await.unwrap();
+        assert!(reader.read(&mut [0; 1]).await.is_err());
     }
 
     #[tokio::test]

@@ -294,6 +294,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             // Lets the IV be written when data actually arrives rather than flushing here.
             need_initial_flush: false,
             connection_success_response: None,
+            connection_failure_response: None,
             initial_remote_data: stream_reader.unparsed_data_owned(),
             proxy_selector: self
                 .proxy_selector
@@ -325,7 +326,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
             self.salt_checker.clone(),
         ));
 
-        let mut location_vec = write_location_to_vec(remote_location.location());
+        let mut location_vec = write_location_to_vec(remote_location.location())?;
 
         if self.aead2022 {
             let location_len = location_vec.len();
@@ -378,7 +379,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         // UoT V2 connect mode: Single destination. Writes magic address first.
         let magic_location =
             NetLocation::new(Address::Hostname(UOT_V2_MAGIC_ADDRESS.to_string()), 0);
-        let mut location_vec = write_location_to_vec(&magic_location);
+        let mut location_vec = write_location_to_vec(&magic_location)?;
 
         if self.aead2022 {
             let location_len = location_vec.len();
@@ -395,7 +396,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         // Writes UoT V2 request header: isConnect(1) + SOCKS address
         let mut uot_header = Vec::with_capacity(64);
         uot_header.push(1u8); // isConnect = 1 (connect mode)
-        let target_bytes = write_location_to_vec(target.location());
+        let target_bytes = write_location_to_vec(target.location())?;
         uot_header.extend_from_slice(&target_bytes);
         write_all(&mut client_stream, &uot_header).await?;
         client_stream.flush().await?;

@@ -251,6 +251,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 let unparsed_data = stream_reader.unparsed_data();
 
                 Ok(TcpServerSetupResult::TcpForward {
+                    connection_failure_response: None,
                     remote_location,
                     stream: server_stream,
                     need_initial_flush: self.encryption.is_some(),
@@ -429,6 +430,7 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
                 .with_write_error_policy(policy);
 
             Ok(TcpServerSetupResult::TcpForward {
+                connection_failure_response: None,
                 remote_location,
                 stream: Box::new(vision_stream),
                 need_initial_flush: false,
@@ -486,8 +488,9 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
                 debug!("Creating VISION+XUDP stream (Custom TLS) with session-based UDP sockets");
 
                 // Create VISION stream (will send VLESS response automatically on first write)
-                let vision_stream = VisionStream::new_server(tls_stream, user_uuid, unparsed_data)?
-                    .with_write_error_policy(policy);
+                let vision_stream =
+                    VisionStream::new_xudp_server(tls_stream, user_uuid, unparsed_data)?
+                        .with_write_error_policy(policy);
 
                 // Wrap VISION stream in XUDP stream
                 let xudp_stream = XudpMessageStream::new(Box::new(vision_stream))

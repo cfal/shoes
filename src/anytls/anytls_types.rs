@@ -96,13 +96,19 @@ impl Frame {
     #[cfg(test)]
     pub fn encode(&self) -> BytesMut {
         let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + self.data.len());
-        self.encode_into(&mut buf);
+        self.encode_into(&mut buf).unwrap();
         buf
     }
 
     /// Encode frame into an existing buffer (zero allocation)
     #[inline]
-    pub fn encode_into(&self, buf: &mut BytesMut) {
+    pub fn encode_into(&self, buf: &mut BytesMut) -> io::Result<()> {
+        if self.data.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AnyTLS frame exceeds 65535 bytes",
+            ));
+        }
         buf.reserve(FRAME_HEADER_SIZE + self.data.len());
         buf.put_u8(self.cmd as u8);
         buf.put_u32(self.stream_id);
@@ -110,6 +116,7 @@ impl Frame {
         if !self.data.is_empty() {
             buf.extend_from_slice(&self.data);
         }
+        Ok(())
     }
 
     /// Decode frame header
@@ -199,6 +206,36 @@ impl FrameCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_limits_preserve_output_on_rejection() {
+        let mut wire = BytesMut::new();
+        let data = Bytes::from(vec![42; 65535]);
+        Frame::data(7, data.clone()).encode_into(&mut wire).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(frame) = FrameCodec::decode(&mut wire).unwrap() {
+            assert_eq!(frame.stream_id, 7);
+            decoded.extend_from_slice(&frame.data);
+        }
+        assert_eq!(decoded, data);
+        let before = wire.clone();
+        for command in [Command::Psh, Command::Waste, Command::UpdatePaddingScheme] {
+            assert!(
+                Frame::with_data(command, 0, Bytes::from(vec![0; 65536]))
+                    .encode_into(&mut wire)
+                    .is_err()
+            );
+            assert_eq!(wire, before);
+        }
+        Frame::data(7, Bytes::from_static(b"next"))
+            .encode_into(&mut wire)
+            .unwrap();
+        assert_eq!(
+            FrameCodec::decode(&mut wire).unwrap().unwrap().data,
+            b"next"[..]
+        );
+        assert!(wire.is_empty());
+    }
 
     #[test]
     fn test_command_conversion() {

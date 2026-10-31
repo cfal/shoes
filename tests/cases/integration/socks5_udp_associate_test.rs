@@ -630,7 +630,9 @@ async fn test_udp_associate_wrong_auth() -> Result<(), Box<dyn std::error::Error
     auth_request.extend_from_slice(password);
     control.write_all(&auth_request).await?;
 
-    let mut response = [0; 1];
+    let mut response = [0; 2];
+    timeout(Duration::from_secs(5), control.read_exact(&mut response)).await??;
+    assert_eq!(response, [1, 1]);
     match timeout(Duration::from_secs(5), control.read(&mut response))
         .await
         .expect("server did not close the connection after rejecting credentials")
@@ -638,7 +640,7 @@ async fn test_udp_associate_wrong_auth() -> Result<(), Box<dyn std::error::Error
         Ok(0) => {}
         Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
         Ok(length) => panic!(
-            "server leaked an authentication response: {:02x?}",
+            "server sent bytes after authentication rejection: {:02x?}",
             &response[..length]
         ),
         Err(error) => panic!("unexpected authentication rejection error: {error}"),

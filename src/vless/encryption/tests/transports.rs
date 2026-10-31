@@ -573,6 +573,42 @@ async fn encrypted_xudp_control_empty_and_multiple_sessions_and_udp_flow_rejecti
                 }
             }
         }
+        use crate::tcp::tcp_handler::TcpClientHandler;
+        use std::{future::poll_fn, pin::Pin};
+        let vision = crate::vless::vless_client_handler::VlessTcpClientHandler::new(
+            UUID,
+            true,
+            Some(ClientEncryption::new(&encryption).unwrap()),
+            true,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let mut stream = vision
+                .setup_client_udp_bidirectional(
+                    Box::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap()),
+                    crate::address::NetLocation::from_ip_addr(destination.ip(), destination.port())
+                        .into(),
+                )
+                .await
+                .unwrap();
+            for payload in [b"native\x16".as_slice(), b"native\x16\x03\x03"] {
+                poll_fn(|cx| Pin::new(&mut *stream).poll_write_message(cx, payload))
+                    .await
+                    .unwrap();
+                poll_fn(|cx| Pin::new(&mut *stream).poll_flush_message(cx))
+                    .await
+                    .unwrap();
+                let mut bytes = [0; 1024];
+                let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+                poll_fn(|cx| Pin::new(&mut *stream).poll_read_message(cx, &mut buf))
+                    .await
+                    .unwrap();
+                assert_eq!(buf.filled(), [payload, b"reply"].concat());
+            }
+            poll_fn(|cx| Pin::new(&mut *stream).poll_shutdown_message(cx))
+                .await
+                .unwrap();
+        }
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
         let mut stream = client
             .handshake(TcpStream::connect(("127.0.0.1", port)).await.unwrap())

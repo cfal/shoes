@@ -40,6 +40,7 @@ pub(super) struct EarlyWebsocketStream {
     state: State,
     handshake: Arc<ClientHandshake>,
     wake: Arc<UpgradeWake>,
+    local: Option<SocketAddr>,
     peer: Option<SocketAddr>,
     flow: Option<Arc<FlowEntry>>,
 }
@@ -47,6 +48,7 @@ pub(super) struct EarlyWebsocketStream {
 impl EarlyWebsocketStream {
     pub fn new(stream: Box<dyn AsyncStream>, handshake: Arc<ClientHandshake>) -> Self {
         Self {
+            local: stream.local_addr(),
             peer: stream.peer_addr(),
             flow: stream.flow().cloned(),
             state: State::Idle(stream),
@@ -169,6 +171,10 @@ impl AsyncPing for EarlyWebsocketStream {
 }
 
 impl AsyncStream for EarlyWebsocketStream {
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.local
+    }
+
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer
     }

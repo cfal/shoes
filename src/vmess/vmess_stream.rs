@@ -924,6 +924,9 @@ impl AsyncPing for VmessStream {
 }
 
 impl AsyncStream for VmessStream {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.stream.peer_addr()
     }
@@ -1067,6 +1070,25 @@ impl AsyncWriteMessage for VmessStream {
         // the write cache is not used in message mode.
         assert!(this.write_cache_size == 0);
 
+        let padding_reserve = if this
+            .write_length_mask
+            .as_ref()
+            .is_some_and(|mask| mask.enable_padding)
+        {
+            MAX_PADDING_LEN - 1
+        } else {
+            0
+        };
+        let max_payload = (u16::MAX as usize)
+            .min(this.write_packet.len().saturating_sub(2))
+            .saturating_sub(this.tag_len + padding_reserve);
+        if buf.len() > max_payload {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "VMess message exceeds the frame payload limit",
+            )));
+        }
+
         if let Some(prefix) = this.pending_prefix_write.take() {
             // we need to handle this here because we do not call create_write_packet
             // for UDP streams
@@ -1119,6 +1141,10 @@ impl AsyncWriteMessage for VmessStream {
             end_index += this.tag_len;
         }
 
+        if padding_len > 0 {
+            rand::rng().fill_bytes(&mut this.write_packet[end_index..end_index + padding_len]);
+            end_index += padding_len;
+        }
         this.write_packet_end_offset = end_index;
 
         Poll::Ready(Ok(()))

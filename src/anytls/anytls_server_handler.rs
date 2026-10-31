@@ -147,13 +147,13 @@ impl TcpServerHandler for AnyTlsServerHandler {
             }
         };
 
-        let padding_len = reader.read_u16_be(&mut server_stream).await?;
+        let mut padding_len = reader.read_u16_be(&mut server_stream).await? as usize;
 
         // Skip padding bytes (consume them from the reader)
-        if padding_len > 0 {
-            let _ = reader
-                .read_slice(&mut *server_stream, padding_len as usize)
-                .await?;
+        while padding_len > 0 {
+            let chunk = padding_len.min(8192);
+            reader.read_slice(&mut *server_stream, chunk).await?;
+            padding_len -= chunk;
         }
 
         // Get any remaining unparsed data that may have been buffered
@@ -374,5 +374,30 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[tokio::test]
+    async fn authentication_accepts_full_u16_padding_with_fragmented_input() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (io, mut peer) = tokio::io::duplex(127);
+            let sending = tokio::spawn(async move {
+                peer.write_all(&compute_password_hash("secret123"))
+                    .await
+                    .unwrap();
+                peer.write_all(&u16::MAX.to_be_bytes()).await.unwrap();
+                peer.write_all(&vec![0; u16::MAX as usize]).await.unwrap();
+                peer
+            });
+            let result = handler(None)
+                .setup_server_stream(Box::new(io))
+                .await
+                .unwrap();
+            assert!(matches!(result, TcpServerSetupResult::Session(_)));
+            drop(result);
+            let mut peer = sending.await.unwrap();
+            assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+        })
+        .await
+        .unwrap();
     }
 }

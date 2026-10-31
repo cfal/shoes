@@ -10,6 +10,7 @@ const UUID: &str = "b85798ef-e9dc-46a4-9a87-8da4499d36d0";
 
 async fn check_proxy_routing(
     protocol: &str,
+    stream_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ports = PortHelper::new();
     let (_, quic_port) = ports.get_quic_listener_port();
@@ -71,6 +72,7 @@ async fn check_proxy_routing(
     });
     if protocol == "tuic" {
         outbound["uuid"] = UUID.into();
+        outbound["udp_relay_mode"] = if stream_mode { "quic" } else { "native" }.into();
     }
     let singbox = serde_json::json!({
         "log": { "level": "warn" },
@@ -96,11 +98,17 @@ async fn check_proxy_routing(
 #[tokio::test]
 async fn hysteria2_udp_obeys_selected_proxy_chain()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    check_proxy_routing("hysteria2").await
+    check_proxy_routing("hysteria2", false).await
 }
 
 #[tokio::test]
 async fn tuic_udp_obeys_selected_proxy_chain()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    check_proxy_routing("tuic").await
+    check_proxy_routing("tuic", false).await
+}
+
+#[tokio::test]
+async fn tuic_udp_stream_mode_obeys_selected_proxy_chain()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    check_proxy_routing("tuic", true).await
 }

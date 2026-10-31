@@ -65,16 +65,12 @@ impl ProxyConnectorImpl {
             }));
         }
 
-        let default_sni_hostname = config.address.address().hostname().map(ToString::to_string);
+        let client_handler = create_tcp_client_handler(config.protocol, &config.address, resolver)?;
 
         Ok(Some(Self {
             xhttp: None,
             location: config.address,
-            client_handler: create_tcp_client_handler(
-                config.protocol,
-                default_sni_hostname,
-                resolver,
-            )?,
+            client_handler,
         }))
     }
 }

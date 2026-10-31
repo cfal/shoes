@@ -1,5 +1,121 @@
 use super::*;
 
+#[test]
+fn data_frame_preflight_preserves_incomplete_and_malformed_bodies() {
+    let next = [0, 4, 0, 9, 3, 0];
+    for status in [1, 2] {
+        for destination in [
+            &[2][..],
+            &[2, 0],
+            &[2, 0, 53, 1, 127, 0, 0],
+            &[2, 0, 53, 3, 0, 0],
+            &[2, 0, 53, 2, 4, b'a'],
+        ] {
+            let mut frame = BytesMut::new();
+            frame.put_u16((4 + destination.len()) as u16);
+            frame.extend_from_slice(&[0, 1, status, FrameOption::DATA]);
+            frame.extend_from_slice(destination);
+            let metadata_end = frame.len();
+            frame.extend_from_slice(&[0, 3, b'x', b'y', b'z']);
+            for split in 0..frame.len() {
+                let mut partial = BytesMut::from(&frame[..split]);
+                let original = partial.clone();
+                assert!(decode_frame(&mut partial).unwrap().is_none());
+                assert_eq!(partial, original, "status={status}, split={split}");
+            }
+            frame.extend_from_slice(&next);
+            let remainder = frame[metadata_end..].to_vec();
+            assert_eq!(
+                decode_frame(&mut frame).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(frame.as_ref(), remainder);
+        }
+    }
+}
+
+#[test]
+fn whole_frames_accept_metadata_and_payload_boundaries() {
+    let next = [0, 4, 0, 9, 3, 0];
+    for metadata_len in [4, 512] {
+        for payload_len in [None, Some(0), Some(u16::MAX)] {
+            let mut frame = BytesMut::new();
+            frame.put_u16(metadata_len);
+            frame.extend_from_slice(&[
+                0,
+                1,
+                2,
+                if payload_len.is_some() {
+                    FrameOption::DATA
+                } else {
+                    0
+                },
+            ]);
+            frame.resize(2 + metadata_len as usize, 0);
+            let payload = vec![42; payload_len.unwrap_or(0) as usize];
+            if let Some(length) = payload_len {
+                frame.put_u16(length);
+                frame.extend_from_slice(&payload);
+            }
+            for split in [0, 1, 5, frame.len() - 1] {
+                let mut partial = BytesMut::from(&frame[..split]);
+                let original = partial.clone();
+                assert!(decode_frame(&mut partial).unwrap().is_none());
+                assert_eq!(partial, original);
+            }
+            frame.extend_from_slice(&next);
+            let (metadata, decoded) = decode_frame(&mut frame).unwrap().unwrap();
+            assert_eq!(metadata.session_id, 1);
+            assert_eq!(decoded.as_ref(), payload);
+            assert_eq!(frame.as_ref(), next);
+            assert!(decode_frame(&mut frame).unwrap().is_some());
+            assert!(frame.is_empty());
+        }
+    }
+}
+
+#[test]
+fn metadata_destination_cannot_consume_following_bytes() {
+    for destination in [
+        vec![2],
+        vec![2, 0],
+        vec![2, 0, 53, 1, 127, 0, 0],
+        vec![2, 0, 53, 3, 0, 0],
+        vec![2, 0, 53, 2, 4, b'a'],
+    ] {
+        let mut wire = BytesMut::new();
+        wire.put_u16((4 + destination.len()) as u16);
+        wire.extend_from_slice(&[0, 1, 1, 1]);
+        wire.extend_from_slice(&destination);
+        let next = b"\x00\x04\x00\x09\x04\x00payload";
+        wire.extend_from_slice(next);
+        assert_eq!(
+            FrameMetadata::decode(&mut wire).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(&wire[..], next);
+    }
+}
+
+#[test]
+fn metadata_limits_and_partial_frames_preserve_boundaries() {
+    for len in [0u16, 3, 513, u16::MAX] {
+        let mut wire = BytesMut::from(len.to_be_bytes().as_slice());
+        assert_eq!(
+            FrameMetadata::decode(&mut wire).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+    let mut wire = BytesMut::from(&b"\x02\x00\x00\x01\x04\x00"[..]);
+    let original = wire.clone();
+    assert!(FrameMetadata::decode(&mut wire).unwrap().is_none());
+    assert_eq!(wire, original);
+    wire.resize(514, 0);
+    wire.extend_from_slice(b"tail");
+    assert!(FrameMetadata::decode(&mut wire).unwrap().is_some());
+    assert_eq!(&wire[..], b"tail");
+}
+
 // ==========================================================================
 // Basic encode/decode tests
 // ==========================================================================

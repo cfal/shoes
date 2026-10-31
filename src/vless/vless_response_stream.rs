@@ -146,6 +146,9 @@ where
 }
 
 impl<IO: AsyncStream> AsyncStream for VlessResponseStream<IO> {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.inner.peer_addr()
     }

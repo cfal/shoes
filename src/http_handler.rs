@@ -22,6 +22,23 @@ const PROXY_AUTH_HEADER_PREFIX: &str = "proxy-authorization: basic ";
 const CONNECTION_HEADER_PREFIX: &str = "connection: ";
 const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 
+async fn authentication_challenge(
+    stream: &mut Box<dyn AsyncStream>,
+    version: &str,
+) -> std::io::Result<()> {
+    let response = format!(
+        concat!(
+            "{} 407 Proxy Authentication Required\r\n",
+            "Proxy-Authenticate: Basic realm=\"proxy\"\r\n",
+            "Content-Length: 0\r\n",
+            "Connection: close\r\n\r\n",
+        ),
+        version,
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
 #[cfg(test)]
 #[path = "http2/client_proxy_tests.rs"]
 mod h2_tests;
@@ -45,7 +62,14 @@ mod request_tests {
             Arc::new(ClientProxySelector::new(vec![])),
             Arc::new(crate::resolver::NativeResolver::new()),
         );
-        (handler.setup_server_stream(Box::new(server)).await, client)
+        (
+            handler
+                .setup_server_stream(Box::new(
+                    crate::async_stream::test_streams::FlushGatedStream::new(server),
+                ))
+                .await,
+            client,
+        )
     }
 
     #[tokio::test]
@@ -91,17 +115,19 @@ mod request_tests {
     }
 
     #[tokio::test]
-    async fn missing_credentials_return_proxy_authentication_challenge() {
+    async fn missing_or_wrong_credentials_return_proxy_authentication_challenge() {
         for request in ["CONNECT example.com:443", "GET http://example.com/"] {
-            let (result, mut client) =
-                server_request(format!("{request} HTTP/1.1\r\n\r\n").as_bytes()).await;
-            assert_eq!(
-                result.err().unwrap().kind(),
-                std::io::ErrorKind::InvalidInput
-            );
-            let mut response = Vec::new();
-            client.read_to_end(&mut response).await.unwrap();
-            assert_eq!(response, b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            for auth in ["", "Proxy-Authorization: Basic wrong\r\n"] {
+                let (result, mut client) =
+                    server_request(format!("{request} HTTP/1.1\r\n{auth}\r\n").as_bytes()).await;
+                assert_eq!(
+                    result.err().unwrap().kind(),
+                    std::io::ErrorKind::InvalidInput
+                );
+                let mut response = Vec::new();
+                client.read_to_end(&mut response).await.unwrap();
+                assert_eq!(response, b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
         }
     }
 
@@ -371,6 +397,7 @@ pub async fn setup_http_server_stream_inner(
                             .ct_eq(auth_token.unwrap().as_bytes()),
                     ) {
                         debug!("Received incorrect HTTP CONNECT authentication");
+                        authentication_challenge(&mut server_stream, &http_version).await?;
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "Incorrect HTTP CONNECT authentication",
@@ -383,11 +410,7 @@ pub async fn setup_http_server_stream_inner(
             }
 
             if need_auth {
-                // FoxyProxy and similar clients require Proxy-Authenticate header to send credentials
-                server_stream.write_all(
-                &format!("{http_version} 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
-            ).await?;
-                server_stream.flush().await?;
+                authentication_challenge(&mut server_stream, &http_version).await?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Missing HTTP CONNECT authentication",
@@ -465,6 +488,7 @@ pub async fn setup_http_server_stream_inner(
                                 .ct_eq(auth_token.unwrap().as_bytes()),
                         ) {
                             debug!("Received incorrect HTTP GET authentication");
+                            authentication_challenge(&mut server_stream, &http_version).await?;
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 "Incorrect HTTP GET authentication",
@@ -498,11 +522,7 @@ pub async fn setup_http_server_stream_inner(
             }
 
             if need_auth {
-                // FoxyProxy and similar clients require Proxy-Authenticate header to send credentials
-                server_stream.write_all(
-                &format!("{http_version} 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
-            ).await?;
-                server_stream.flush().await?;
+                authentication_challenge(&mut server_stream, &http_version).await?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Missing HTTP GET authentication",
@@ -538,6 +558,7 @@ pub async fn setup_http_server_stream_inner(
         need_initial_flush,
         connection_success_response,
         initial_remote_data,
+        connection_failure_response: None,
         proxy_selector,
     })
 }

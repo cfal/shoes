@@ -269,10 +269,14 @@ async fn fake_dns_sniff_case(
         if let Err(error) = result {
             assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
         }
-        assert!(
-            reply.is_empty(),
-            "unknown fake address received an optimistic reply"
-        );
+        if protocol == "socks" {
+            assert_eq!(reply, [5, 4, 0, 1, 0, 0, 0, 0, 0, 0]);
+        } else {
+            assert!(
+                reply.is_empty(),
+                "unknown fake address received an optimistic reply"
+            );
+        }
     }
 
     // The same unknown address at port 53 must dispatch locally before restoration or rules.
@@ -459,10 +463,10 @@ async fn listener_config_case(
     )
     .await;
     if sniff != Some(true) {
-        assert!(
-            result.is_err(),
-            "disabled sniff unexpectedly matched a hostname rule"
-        );
+        let error = result.expect_err("disabled sniff unexpectedly matched a hostname rule");
+        if protocol == "socks" {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
         assert!(
             timeout(Duration::from_millis(20), target.accept())
                 .await

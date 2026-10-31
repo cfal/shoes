@@ -10,6 +10,12 @@ mod snell_mihomo;
 #[path = "cases/optional_peer/tls_hybrid.rs"]
 mod tls_hybrid;
 
+#[path = "cases/optional_peer/vision_udp.rs"]
+mod vision_udp;
+
+#[path = "cases/optional_peer/anytls_padding.rs"]
+mod anytls_padding;
+
 #[path = "cases/optional_peer/http2_proxy.rs"]
 mod http2_proxy;
 

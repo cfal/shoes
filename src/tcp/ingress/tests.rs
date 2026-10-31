@@ -215,7 +215,7 @@ async fn connection_notes_saturated_ingress_does_not_retry_at_dial() {
 }
 
 #[derive(Debug)]
-struct FailedConnector;
+struct FailedConnector(io::ErrorKind);
 
 #[async_trait::async_trait]
 impl SocketConnector for FailedConnector {
@@ -224,10 +224,7 @@ impl SocketConnector for FailedConnector {
         _: &Arc<dyn Resolver>,
         _: &ResolvedLocation,
     ) -> io::Result<Box<dyn AsyncStream>> {
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "test dial failure",
-        ))
+        Err(io::Error::new(self.0, "test dial failure"))
     }
 
     async fn connect_udp_bidirectional(
@@ -244,13 +241,21 @@ impl SocketConnector for FailedConnector {
 }
 
 pub(crate) fn failure_selector(sniff: bool, blocked: bool) -> Arc<ClientProxySelector> {
+    failure_selector_with_error(sniff, blocked, io::ErrorKind::ConnectionRefused)
+}
+
+pub(crate) fn failure_selector_with_error(
+    sniff: bool,
+    blocked: bool,
+    kind: io::ErrorKind,
+) -> Arc<ClientProxySelector> {
     let action = if blocked {
         ConnectAction::Block
     } else {
         ConnectAction::new_allow(
             None,
             ClientChainGroup::new(vec![ClientProxyChain::new(
-                vec![InitialHopEntry::Direct(Arc::new(FailedConnector))],
+                vec![InitialHopEntry::Direct(Arc::new(FailedConnector(kind)))],
                 vec![],
             )]),
         )

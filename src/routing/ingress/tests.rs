@@ -20,7 +20,7 @@ impl PacketMode {
     fn address(self, target: &NetLocation) -> Vec<u8> {
         match self {
             Self::Fixed => Vec::new(),
-            Self::Socks => crate::socks_handler::write_location_to_vec(target),
+            Self::Socks => crate::socks_handler::write_location_to_vec(target).unwrap(),
             Self::Uot => {
                 let mut bytes = vec![0; 260];
                 let len = crate::uot::uot_common::write_uot_address(&mut bytes, target).unwrap();
@@ -142,7 +142,7 @@ impl UdpFixture {
 
     pub(crate) fn uot_header(&self, fixed: bool) -> Vec<u8> {
         let mut bytes = vec![u8::from(fixed)];
-        bytes.extend(crate::socks_handler::write_location_to_vec(&self.target));
+        bytes.extend(crate::socks_handler::write_location_to_vec(&self.target).unwrap());
         bytes
     }
 

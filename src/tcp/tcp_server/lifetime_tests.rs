@@ -140,7 +140,7 @@ async fn fake_dns_udp_modes() {
                 let magic =
                     NetLocation::from_str(crate::uot::UOT_V2_MAGIC_ADDRESS, Some(0)).unwrap();
                 let mut request = vec![5, 1, 0];
-                request.extend(crate::socks_handler::write_location_to_vec(&magic));
+                request.extend(crate::socks_handler::write_location_to_vec(&magic).unwrap());
                 peer.write_all(&request).await.unwrap();
                 let mut status = [0; 3];
                 peer.read_exact(&mut status).await.unwrap();
@@ -175,6 +175,7 @@ impl TcpServerHandler for Handler {
             need_initial_flush: true,
             proxy_selector: self.0.clone(),
             connection_success_response: Some(b"response".to_vec().into_boxed_slice()),
+            connection_failure_response: None,
             initial_remote_data: Some(b"request".to_vec().into_boxed_slice()),
         })
     }
@@ -198,6 +199,7 @@ impl TcpServerHandler for FlushOnlyHandler {
             need_initial_flush: true,
             proxy_selector: self.0.clone(),
             connection_success_response: None,
+            connection_failure_response: None,
             initial_remote_data: None,
         })
     }
@@ -779,6 +781,210 @@ async fn sniff_failures_close_socks_and_connect_without_a_second_reply() {
             .await
             .unwrap();
         }
+    }
+}
+
+#[tokio::test]
+async fn socks_dial_failures_flush_exact_reply_before_eof() {
+    use super::super::ingress::tests::failure_selector_with_error;
+    use tokio::io::AsyncReadExt;
+    timeout(Duration::from_secs(5), async {
+        for (blocked, kind, expected) in [
+            (true, io::ErrorKind::Other, 2),
+            (false, io::ErrorKind::PermissionDenied, 2),
+            (false, io::ErrorKind::NetworkUnreachable, 3),
+            (false, io::ErrorKind::HostUnreachable, 4),
+            (false, io::ErrorKind::ConnectionRefused, 5),
+            (false, io::ErrorKind::TimedOut, 1),
+            (false, io::ErrorKind::Other, 1),
+        ] {
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let handler = Arc::new(crate::socks_handler::SocksTcpServerHandler::new(
+                None,
+                false,
+                "0.0.0.0".parse().unwrap(),
+                failure_selector_with_error(false, blocked, kind),
+                resolver.clone(),
+            ));
+            let (inner, mut peer) = tokio::io::duplex(1024);
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let stream = FlushStream {
+                inner,
+                stalled: false,
+                flushes: flushes.clone(),
+            };
+            let task = tokio::spawn(process_stream(stream, handler, resolver));
+            peer.write_all(&[5, 1, 0, 5, 1, 0, 1, 203, 0, 113, 1, 1, 187, 42])
+                .await
+                .unwrap();
+            let mut reply = Vec::new();
+            peer.read_to_end(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, 0, 5, expected, 0, 1, 0, 0, 0, 0, 0, 0]);
+            assert!(flushes.load(Ordering::Relaxed) >= 2);
+            let result = task.await.unwrap();
+            if blocked {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().kind(), kind);
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn failure_reply_write_and_flush_stalls_are_bounded() {
+    for capacity in [8, 1024] {
+        let (inner, _peer) = tokio::io::duplex(capacity);
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut stream: Box<dyn AsyncStream> = Box::new(FlushStream {
+            inner,
+            stalled: true,
+            flushes: flushes.clone(),
+        });
+        let start = tokio::time::Instant::now();
+        timeout(
+            crate::util::SHUTDOWN_TIMEOUT * 2,
+            send_connect_failure(&mut stream, Some(|_| vec![0; 64]), io::ErrorKind::TimedOut),
+        )
+        .await
+        .expect("failure reply stalled beyond its cleanup deadline");
+        assert_eq!(start.elapsed(), crate::util::SHUTDOWN_TIMEOUT);
+        assert_eq!(flushes.load(Ordering::Relaxed) > 0, capacity >= 64);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn failure_reply_and_shutdown_share_the_cleanup_deadline() {
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut stream: Box<dyn AsyncStream> = Box::new(CleanupStream {
+        events: events.clone(),
+        failure: Some(CleanupFailure::PendingShutdown),
+        accepted: 0,
+        flush_delay: Some(Box::pin(tokio::time::sleep(Duration::from_secs(2)))),
+    });
+    let start = tokio::time::Instant::now();
+    timeout(
+        crate::util::SHUTDOWN_TIMEOUT * 2,
+        send_connect_failure(&mut stream, Some(|_| vec![0; 64]), io::ErrorKind::TimedOut),
+    )
+    .await
+    .expect("shutdown stalled beyond the shared cleanup deadline");
+    assert_eq!(start.elapsed(), crate::util::SHUTDOWN_TIMEOUT);
+    let events = events.lock().unwrap();
+    assert_eq!(&events[..2], &["write", "flush"]);
+    assert!(events[2..].iter().all(|event| *event == "shutdown"));
+    assert!(events.len() > 2, "shutdown was never reached");
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupFailure {
+    PartialWrite,
+    WriteZero,
+    Flush,
+    Shutdown,
+    PendingShutdown,
+}
+
+struct CleanupStream {
+    events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    failure: Option<CleanupFailure>,
+    accepted: usize,
+    flush_delay: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl tokio::io::AsyncRead for CleanupStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        unreachable!("cleanup must not read")
+    }
+}
+
+impl tokio::io::AsyncWrite for CleanupStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.events.lock().unwrap().push("write");
+        if self.failure == Some(CleanupFailure::PartialWrite) && self.accepted > 0 {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if self.failure == Some(CleanupFailure::WriteZero) {
+            return Poll::Ready(Ok(0));
+        }
+        let length = if self.failure == Some(CleanupFailure::PartialWrite) {
+            buf.len().min(2)
+        } else {
+            buf.len()
+        };
+        self.accepted += length;
+        Poll::Ready(Ok(length))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        use std::future::Future;
+        if let Some(delay) = &mut self.flush_delay {
+            std::task::ready!(delay.as_mut().poll(cx));
+        }
+        self.events.lock().unwrap().push("flush");
+        Poll::Ready(if self.failure == Some(CleanupFailure::Flush) {
+            Err(io::ErrorKind::ConnectionReset.into())
+        } else {
+            Ok(())
+        })
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.events.lock().unwrap().push("shutdown");
+        match self.failure {
+            Some(CleanupFailure::Shutdown) => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
+            Some(CleanupFailure::PendingShutdown) => Poll::Pending,
+            _ => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+impl AsyncPing for CleanupStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        unreachable!("cleanup must not ping")
+    }
+}
+
+impl AsyncStream for CleanupStream {}
+
+#[tokio::test]
+async fn failure_reply_errors_preserve_cleanup_order() {
+    use CleanupFailure::*;
+    for (failure, respond, expected) in [
+        (None, true, vec!["write", "flush", "shutdown"]),
+        (Some(PartialWrite), true, vec!["write", "write", "shutdown"]),
+        (Some(WriteZero), true, vec!["write", "shutdown"]),
+        (Some(Flush), true, vec!["write", "flush", "shutdown"]),
+        (Some(Shutdown), true, vec!["write", "flush", "shutdown"]),
+        (None, false, vec!["shutdown"]),
+    ] {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut stream: Box<dyn AsyncStream> = Box::new(CleanupStream {
+            events: events.clone(),
+            failure,
+            accepted: 0,
+            flush_delay: None,
+        });
+        let response = respond.then_some((|_| vec![42; 8]) as fn(io::ErrorKind) -> Vec<u8>);
+        send_connect_failure(&mut stream, response, io::ErrorKind::ConnectionRefused).await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            expected,
+            "failure={failure:?}, respond={respond}"
+        );
     }
 }
 

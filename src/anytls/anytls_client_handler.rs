@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::anytls::anytls_client_session::AnyTlsClientSession;
-use crate::anytls::anytls_padding::PaddingFactory;
+use crate::anytls::anytls_padding::{PaddingFactory, SharedPadding};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
@@ -31,7 +31,7 @@ pub struct AnyTlsClientHandler {
     /// Authentication password
     password: String,
     /// Padding factory for traffic obfuscation
-    padding: Arc<PaddingFactory>,
+    padding: SharedPadding,
     /// UDP enabled
     udp_enabled: bool,
 }
@@ -49,7 +49,7 @@ impl AnyTlsClientHandler {
     pub fn new(password: String, padding: Arc<PaddingFactory>, udp_enabled: bool) -> Self {
         Self {
             password,
-            padding,
+            padding: Arc::new(parking_lot::RwLock::new(padding)),
             udp_enabled,
         }
     }

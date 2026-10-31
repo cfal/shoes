@@ -592,6 +592,114 @@ async fn vision_target_plain_udp_preserves_preread_and_following_records() {
 }
 
 #[tokio::test]
+async fn xudp_preread_is_opaque_before_tls_detection() {
+    for backend in BACKENDS {
+        let (_, server) = connection_pair(backend);
+        let (_, io) = tokio::io::duplex(1024);
+        let data = b"prefix\x16\x03\x03\x00\x01\x01";
+        let padded = crate::vless::vision_pad::pad_with_uuid_and_command(data, &[7; 16], 0, false);
+        let mut stream = VisionStream::new_xudp_server(
+            CryptoTlsStream::new(io, server, Some(TlsDeframer::new())),
+            [7; 16],
+            &padded,
+        )
+        .unwrap();
+        assert_eq!(&stream.pending_read[..], data);
+        assert!(!stream.filter.is_tls());
+        for _ in 0..6 {
+            stream.filter.decrement_filter_count();
+        }
+        assert!(stream.filter.is_filtering());
+        stream.filter.decrement_filter_count();
+        assert!(!stream.filter.is_filtering());
+    }
+}
+
+#[tokio::test]
+async fn vision_udp_client_uses_mux_and_exchanges_arbitrary_datagrams() {
+    use crate::client_proxy_selector::ClientProxySelector;
+    use crate::resolver::{NativeResolver, Resolver};
+    use crate::tcp::tcp_handler::TcpServerSetupResult;
+    use crate::vless::vless_client_handler::setup_vision_vless_udp_bidirectional;
+    use crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream;
+    use futures::future::poll_fn;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for backend in BACKENDS {
+            for target in ["127.0.0.1:443", "[::1]:53", "localhost:123"] {
+                let (client, server) = connection_pair(backend);
+                let (left, right) = tokio::io::duplex(65536);
+                let target = NetLocation::from_str(target, None).unwrap();
+                let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+                let (client, server) = tokio::join!(
+                    setup_vision_vless_udp_bidirectional(
+                        CryptoTlsStream::new(left, client, Some(TlsDeframer::new())),
+                        &[7; 16],
+                        target.clone(),
+                        VisionWriteErrorPolicy::Legacy
+                    ),
+                    setup_custom_tls_vision_vless_server_stream(
+                        CryptoTlsStream::new(right, server, Some(TlsDeframer::new())),
+                        &[7; 16],
+                        true,
+                        Arc::new(ClientProxySelector::new(Vec::new())),
+                        &resolver,
+                        None
+                    ),
+                );
+                let mut client = client.unwrap();
+                let TcpServerSetupResult::SessionBasedUdp { mut stream, .. } = server.unwrap()
+                else {
+                    panic!("Vision UDP must use MUX/XUDP, not command 2");
+                };
+                for payload in [
+                    b"one\x16".as_slice(),
+                    b"two\x16\x03\x03",
+                    b"prefix\x16\x03\x01\x00\xff\x01tail",
+                ]
+                .into_iter()
+                .cycle()
+                .take(10)
+                {
+                    poll_fn(|cx| Pin::new(&mut *client).poll_write_message(cx, payload))
+                        .await
+                        .unwrap();
+                    poll_fn(|cx| Pin::new(&mut *client).poll_flush_message(cx))
+                        .await
+                        .unwrap();
+                    let mut storage = [0; 1024];
+                    let mut buf = ReadBuf::new(&mut storage);
+                    let (id, received_target) = poll_fn(|cx| {
+                        Pin::new(&mut *stream).poll_read_session_message(cx, &mut buf)
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(received_target.port(), target.port());
+                    assert_eq!(buf.filled(), payload);
+                    poll_fn(|cx| {
+                        Pin::new(&mut *stream).poll_write_session_message(cx, id, payload, &target)
+                    })
+                    .await
+                    .unwrap();
+                    poll_fn(|cx| Pin::new(&mut *stream).poll_flush_message(cx))
+                        .await
+                        .unwrap();
+                    buf.clear();
+                    poll_fn(|cx| Pin::new(&mut *client).poll_read_message(cx, &mut buf))
+                        .await
+                        .unwrap();
+                    assert_eq!(buf.filled(), payload);
+                }
+                poll_fn(|cx| Pin::new(&mut *client).poll_shutdown_message(cx))
+                    .await
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn vision_target_auth_fallback_preserves_all_plaintext() {
     use crate::client_proxy_selector::ClientProxySelector;
     use crate::resolver::{NativeResolver, Resolver};

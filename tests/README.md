@@ -98,6 +98,12 @@ Plaintext integration captures compare the exact Shoes VLESS first-flight prefix
 including its configured split point. Peer captures allow different write batching.
 WSS cases verify end-to-end delivery, not decrypted carrier contents.
 
+The oversized AnyTLS padding test pins sing-box 1.15.0-alpha.13 through
+`SHOES_TEST_ANYTLS_SING_BOX_BIN`; locally it falls back to the normal sing-box
+selection. The 1.14 releases require authentication padding to fit in their first
+read and cannot handle this fixture's 40,000-byte auth padding. Other sing-box
+peer tests retain their existing pins.
+
 The SS2022 identity tests use Xray 26.10.29, shadowsocks-rust `ssserver` 1.25.0,
 and sing-box 1.14.1 with multi-user Shadowsocks and SagerNet UoT. They cover
 both AES key sizes, concurrent users, ordered relays, wrong/missing/reordered

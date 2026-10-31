@@ -53,6 +53,7 @@ impl std::fmt::Display for VisionMode {
 }
 
 pub struct VisionStream<S> {
+    is_xudp: bool,
     tls: S,
     write_error_policy: VisionWriteErrorPolicy,
     write_error: Option<(io::ErrorKind, String)>,
@@ -144,8 +145,23 @@ where
         Ok(Self::new_common(tls, user_uuid, true, false))
     }
 
+    pub(crate) fn new_xudp_server(
+        tls: S,
+        user_uuid: [u8; 16],
+        initial_read_data: &[u8],
+    ) -> io::Result<Self> {
+        let mut stream = Self::new_server(tls, user_uuid, &[])?.with_xudp();
+        stream.feed_initial_read_data(initial_read_data)?;
+        Ok(stream)
+    }
+
     pub(crate) fn with_write_error_policy(mut self, policy: VisionWriteErrorPolicy) -> Self {
         self.write_error_policy = policy;
+        self
+    }
+
+    pub(crate) fn with_xudp(mut self) -> Self {
+        self.is_xudp = true;
         self
     }
 
@@ -176,6 +192,7 @@ where
         vless_response_to_send: bool,
     ) -> Self {
         Self {
+            is_xudp: false,
             tls,
             write_error_policy: VisionWriteErrorPolicy::Legacy,
             write_error: None,
@@ -396,7 +413,9 @@ where
 
         log::debug!("VISION READ: Unpadded to {} bytes", unpadded.len());
 
-        if !unpadded.is_empty() && self.filter.is_filtering() {
+        if !unpadded.is_empty() && self.is_xudp {
+            self.filter.decrement_filter_count();
+        } else if !unpadded.is_empty() && self.filter.is_filtering() {
             // Feed to deframer
             self.inner_read_deframer.feed(&unpadded);
 
@@ -485,6 +504,27 @@ where
             self.pending_tls_mode_switch = false;
             self.switch_write_to_tls_mode()?;
             return Pin::new(&mut self.tls).poll_write(cx, buf);
+        }
+
+        if self.is_xudp {
+            self.filter.decrement_filter_count();
+            let command = if self.filter.is_filtering() {
+                COMMAND_CONTINUE
+            } else {
+                COMMAND_END
+            };
+            let packet = if self.write_first_packet {
+                super::vision_pad::pad_with_uuid_and_command(buf, &self.user_uuid, command, false)
+            } else {
+                super::vision_pad::pad_with_command(buf, command, false)
+            };
+            self.write_first_packet = false;
+            self.pending_tls_mode_switch = command == COMMAND_END;
+            self.queue_padded_write(&packet);
+            if let Poll::Ready(Err(error)) = self.drain_all_writes_padding(cx) {
+                return self.fail_padded_write(error, buf.len());
+            }
+            return Poll::Ready(Ok(buf.len()));
         }
 
         // Feed write buffer to inner deframer and check for ApplicationData
@@ -630,9 +670,6 @@ where
                     break;
                 }
                 Ok(DeframeResult::UnknownPrefix(prefix)) => {
-                    // TODO: check lengths and see if we need to split into multiple packets, see
-                    // https://github.com/XTLS/Xray-core/blob/9f5dcb15910aadc7ef450514747576827a389853/proxy/proxy.go#L390
-
                     processed_len += prefix.len();
 
                     self.filter.decrement_filter_count();
@@ -712,8 +749,6 @@ where
                     // Deframing failed, this error means we've already seen a valid TLS record on
                     // the write side and then invalid TLS data is encountered.
                     // Switch immediately to TLS mode and send the invalid data as a single packet.
-                    // TODO: check lengths and see if we need to split into multiple packets, see
-                    // https://github.com/XTLS/Xray-core/blob/9f5dcb15910aadc7ef450514747576827a389853/proxy/proxy.go#L390
                     //
                     log::error!(
                         "VISION WRITE: Deframing failed, invalid data after valid records - stopping filtering: {}",
@@ -803,7 +838,7 @@ impl<S: VisionTransport> AsyncWrite for VisionStream<S> {
         let this = self.get_mut();
         this.output_status()?;
         match this.write_mode {
-            VisionMode::PaddingTls => this.poll_write_padding_tls(cx, buf),
+            VisionMode::PaddingTls => this.poll_write_padding_tls(cx, &buf[..buf.len().min(16384)]),
             VisionMode::Tls | VisionMode::Direct => Pin::new(&mut this.tls).poll_write(cx, buf),
         }
     }
@@ -836,6 +871,9 @@ impl<S: VisionTransport> crate::async_stream::AsyncPing for VisionStream<S> {
 }
 
 impl<S: VisionTransport> AsyncStream for VisionStream<S> {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.tls.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.tls.peer_addr()
     }

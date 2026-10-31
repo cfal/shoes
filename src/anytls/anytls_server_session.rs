@@ -4,7 +4,7 @@
 //! handling framing, multiplexing, padding, and stream routing.
 
 use crate::address::{Address, NetLocation};
-use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
+use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory, append_padding};
 use crate::anytls::anytls_stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
 use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec, StringMap};
 use crate::async_stream::AsyncTargetedMessageStream;
@@ -16,7 +16,7 @@ use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream};
 use crate::vless::VlessMessageStream;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use std::collections::HashMap;
 use std::io;
@@ -506,7 +506,8 @@ impl AnyTlsSession {
                 // Check padding-md5
                 if settings
                     .get("padding-md5")
-                    .is_some_and(|client_md5| client_md5 != self.padding.md5())
+                    .is_none_or(|client_md5| client_md5 != self.padding.md5())
+                    && self.padding.raw_scheme().len() <= u16::MAX as usize
                 {
                     // Send updated padding scheme
                     let update_frame = Frame::with_data(
@@ -585,7 +586,7 @@ impl AnyTlsSession {
         // Use reusable write buffer to avoid allocation
         let mut write_buf = self.write_buf.lock().await;
         write_buf.clear();
-        frame.encode_into(&mut write_buf);
+        frame.encode_into(&mut write_buf)?;
 
         // Handle buffering
         if self.buffering.load(Ordering::Relaxed) {
@@ -632,20 +633,11 @@ impl AnyTlsSession {
     async fn write_with_padding(&self, mut data: BytesMut, pkt: u32) -> io::Result<()> {
         let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
 
-        if pkt_sizes.is_empty() {
-            let mut writer = self.writer.lock().await;
-            writer.write_all(&data).await?;
-            return writer.flush().await;
-        }
-
         let mut writer = self.writer.lock().await;
 
         for size in pkt_sizes {
-            let remain_payload_len = data.len();
-
             if size == CHECK_MARK {
-                // Check mark: stop if no more data
-                if remain_payload_len == 0 {
+                if data.is_empty() {
                     break;
                 }
                 continue;
@@ -653,50 +645,21 @@ impl AnyTlsSession {
 
             let size = size as usize;
 
-            if remain_payload_len > size {
-                // This packet is all payload - send exactly `size` bytes
+            if data.len() > size {
                 writer.write_all(&data[..size]).await?;
                 data = data.split_off(size);
-            } else if remain_payload_len > 0 {
-                // This packet contains payload + padding
-                let padding_len = size.saturating_sub(remain_payload_len + FRAME_HEADER_SIZE);
-
-                if padding_len > 0 {
-                    // Append padding frame directly to data buffer (no intermediate allocation)
-                    data.reserve(FRAME_HEADER_SIZE + padding_len);
-                    data.put_u8(Command::Waste as u8);
-                    data.put_u32(0); // stream_id = 0
-                    data.put_u16(padding_len as u16);
-                    data.put_bytes(0, padding_len); // Zero-fill without allocation
+            } else {
+                let payload_len = data.len();
+                if data.is_empty() {
+                    append_padding(&mut data, size, false);
+                } else {
+                    append_padding(&mut data, size - payload_len, true);
                 }
-
                 writer.write_all(&data).await?;
                 data.clear();
-            } else {
-                // This packet is all padding - write directly without intermediate buffer
-                // Use a small stack buffer for the header
-                let header = [
-                    Command::Waste as u8,
-                    0,
-                    0,
-                    0,
-                    0, // stream_id = 0
-                    (size >> 8) as u8,
-                    size as u8,
-                ];
-                writer.write_all(&header).await?;
-                // Write zeros for padding body - use a static buffer for small sizes
-                const ZERO_BUF: [u8; 1024] = [0u8; 1024];
-                let mut remaining = size;
-                while remaining > 0 {
-                    let chunk = remaining.min(ZERO_BUF.len());
-                    writer.write_all(&ZERO_BUF[..chunk]).await?;
-                    remaining -= chunk;
-                }
             }
         }
 
-        // Write any remaining payload
         if !data.is_empty() {
             writer.write_all(&data).await?;
         }

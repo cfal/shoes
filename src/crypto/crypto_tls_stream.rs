@@ -538,6 +538,9 @@ impl<IO: AsyncStream> AsyncPing for CryptoTlsStream<IO> {
 }
 
 impl<IO: AsyncStream> AsyncStream for CryptoTlsStream<IO> {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.io.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.io.peer_addr()
     }

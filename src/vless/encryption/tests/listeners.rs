@@ -217,6 +217,7 @@ async fn native_tickets_are_shared_across_bind_ips_but_isolated_by_sni_and_webso
                     ))
                 } else {
                     Box::new(WebsocketTcpClientHandler::new(
+                        "localhost:443".into(),
                         Some(format!("/{scope}")),
                         None,
                         Default::default(),

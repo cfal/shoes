@@ -86,7 +86,7 @@ fn websocket_early_data_validation_reaches_clients_and_every_server_target() {
                 protocol["type"] = "ws".into();
                 let handler = create_tcp_client_handler(
                     serde_json::from_value(protocol.clone()).unwrap(),
-                    None,
+                    &crate::address::NetLocation::from_str("127.0.0.1:443", None).unwrap(),
                     resolver.clone(),
                 );
                 (
@@ -281,7 +281,7 @@ fn sudoku_mask_preserves_sni_and_existing_immediate_child_constraints() {
     let resolver = std::sync::Arc::new(crate::resolver::NativeResolver::new());
     crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
         reality,
-        Some("origin.example".into()),
+        &crate::address::NetLocation::from_str("origin.example:443", None).unwrap(),
         resolver,
     )
     .unwrap();

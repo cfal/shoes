@@ -2,6 +2,81 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::time::{Duration, timeout};
 
+async fn read_frame(stream: &mut tokio::io::DuplexStream) -> Frame {
+    timeout(Duration::from_secs(5), async {
+        let mut header = [0; FRAME_HEADER_SIZE];
+        stream.read_exact(&mut header).await.unwrap();
+        let length = u16::from_be_bytes([header[5], header[6]]) as usize;
+        let mut wire = BytesMut::from(header.as_slice());
+        wire.resize(FRAME_HEADER_SIZE + length, 0);
+        stream
+            .read_exact(&mut wire[FRAME_HEADER_SIZE..])
+            .await
+            .unwrap();
+        FrameCodec::decode(&mut wire).unwrap().unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn padding_segments_preserve_empty_mixed_and_payload_only_writes() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    #[derive(Debug, PartialEq)]
+    enum WriteEvent {
+        Data(Vec<u8>),
+        Flush,
+    }
+
+    struct RecordingWriter(Arc<SyncMutex<Vec<WriteEvent>>>);
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.lock().push(WriteEvent::Data(data.to_vec()));
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.lock().push(WriteEvent::Flush);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    timeout(Duration::from_secs(5), async {
+        for case in crate::anytls::anytls_padding::padding_write_cases() {
+            let sizes = case.sizes;
+            let payload_len = case.payload.len();
+            let padding =
+                Arc::new(PaddingFactory::new(format!("stop=8\n1={sizes}").as_bytes()).unwrap());
+            let (transport, _peer) = duplex(1);
+            let session = AnyTlsSession::new_server_test(transport, padding);
+            let events = Arc::new(SyncMutex::new(Vec::new()));
+            *session.writer.lock().await = Box::new(RecordingWriter(events.clone()));
+            let mut expected_events: Vec<_> =
+                case.writes.into_iter().map(WriteEvent::Data).collect();
+            expected_events.push(WriteEvent::Flush);
+            session.write_with_padding(case.payload, 1).await.unwrap();
+            assert_eq!(
+                *events.lock(),
+                expected_events,
+                "sizes={sizes}, payload_len={payload_len}"
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn fake_dns_udp_modes() {
     use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
@@ -38,7 +113,7 @@ async fn fake_dns_udp_modes() {
                         .await
                         .unwrap();
                     let magic = NetLocation::from_str(UOT_V2_MAGIC_ADDRESS, Some(0)).unwrap();
-                    let mut header = crate::socks_handler::write_location_to_vec(&magic);
+                    let mut header = crate::socks_handler::write_location_to_vec(&magic).unwrap();
                     header.extend(fixture.uot_header(fixed));
                     peer.write_all(&Frame::data(id, Bytes::from(header)).encode())
                         .await
@@ -135,7 +210,7 @@ async fn fake_dns_adapter_contract() {
                 peer.write_all(
                     &Frame::data(
                         2,
-                        Bytes::from(crate::socks_handler::write_location_to_vec(&target)),
+                        Bytes::from(crate::socks_handler::write_location_to_vec(&target).unwrap()),
                     )
                     .encode(),
                 )
@@ -1016,26 +1091,26 @@ async fn test_session_rejects_syn_without_settings() {
     let session = AnyTlsSession::new_server_test(client, padding);
 
     let session_clone = Arc::clone(&session);
-    let run_task = tokio::spawn(async move {
-        let _ = session_clone.run().await;
-    });
+    let run_task =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move { session_clone.run().await },
+        ));
 
     // Send SYN without Settings first
     let syn_frame = Frame::control(Command::Syn, 1);
     server.write_all(&syn_frame.encode()).await.unwrap();
 
-    // Should receive Alert
-    let mut buf = vec![0u8; 256];
-    let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
-
-    if let Ok(Ok(n)) = result
-        && n > 0
-    {
-        assert_eq!(buf[0], Command::Alert as u8);
-    }
-
-    session.close().await;
-    run_task.abort();
+    let frame = read_frame(&mut server).await;
+    assert_eq!(frame.cmd, Command::Alert);
+    assert_eq!(frame.stream_id, 0);
+    assert_eq!(frame.data.as_ref(), b"client did not send its settings");
+    let error = timeout(Duration::from_secs(5), run_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(session.is_closed());
 }
 
 #[tokio::test]
@@ -1045,9 +1120,10 @@ async fn test_heartbeat_response() {
     let session = AnyTlsSession::new_server_test(client, padding);
 
     let session_clone = Arc::clone(&session);
-    let run_task = tokio::spawn(async move {
-        let _ = session_clone.run().await;
-    });
+    let run_task =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move { session_clone.run().await },
+        ));
 
     // Send settings first
     let mut settings = StringMap::new();
@@ -1056,26 +1132,31 @@ async fn test_heartbeat_response() {
     let settings_frame = Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
     server.write_all(&settings_frame.encode()).await.unwrap();
 
-    // Wait for and consume the ServerSettings response
-    let mut buf = vec![0u8; 128];
-    let _ = timeout(Duration::from_millis(200), server.read(&mut buf)).await;
+    let settings = read_frame(&mut server).await;
+    assert_eq!(settings.cmd, Command::ServerSettings);
+    assert_eq!(settings.stream_id, 0);
+    assert_eq!(
+        StringMap::from_bytes(&settings.data)
+            .get("v")
+            .map(String::as_str),
+        Some("2")
+    );
 
     // Send heartbeat request
     let heart_request = Frame::control(Command::HeartRequest, 0);
     server.write_all(&heart_request.encode()).await.unwrap();
 
-    // Should receive heartbeat response
-    let mut response_buf = vec![0u8; 16];
-    let result = timeout(Duration::from_millis(500), server.read(&mut response_buf)).await;
-
-    if let Ok(Ok(n)) = result
-        && n >= 7
-    {
-        assert_eq!(response_buf[0], Command::HeartResponse as u8);
-    }
+    let response = read_frame(&mut server).await;
+    assert_eq!(response.cmd, Command::HeartResponse);
+    assert_eq!(response.stream_id, 0);
+    assert!(response.data.is_empty());
 
     session.close().await;
-    run_task.abort();
+    timeout(Duration::from_secs(5), run_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 // ===== Frame parsing edge case tests =====
@@ -1289,9 +1370,10 @@ async fn test_session_update_padding_scheme() {
     let session = AnyTlsSession::new_server_test(client, padding);
 
     let session_clone = Arc::clone(&session);
-    let run_task = tokio::spawn(async move {
-        let _ = session_clone.run().await;
-    });
+    let run_task =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move { session_clone.run().await },
+        ));
 
     // Send settings with mismatched padding MD5
     let mut settings = StringMap::new();
@@ -1300,21 +1382,18 @@ async fn test_session_update_padding_scheme() {
     let settings_frame = Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
     server.write_all(&settings_frame.encode()).await.unwrap();
 
-    // Should receive UpdatePaddingScheme frame
-    let mut buf = vec![0u8; 256];
-    let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
-
-    if let Ok(Ok(n)) = result
-        && n >= 7
-    {
-        // Could be ServerSettings or UpdatePaddingScheme
-        // Either is valid response
-        let cmd = buf[0];
-        assert!(cmd == Command::UpdatePaddingScheme as u8 || cmd == Command::ServerSettings as u8);
-    }
+    let update = read_frame(&mut server).await;
+    assert_eq!(update.cmd, Command::UpdatePaddingScheme);
+    assert_eq!(update.stream_id, 0);
+    assert_eq!(update.data.as_ref(), session.padding.raw_scheme());
+    assert_eq!(read_frame(&mut server).await.cmd, Command::ServerSettings);
 
     session.close().await;
-    run_task.abort();
+    timeout(Duration::from_secs(5), run_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

@@ -1,29 +1,29 @@
+use futures::FutureExt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
-use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use dashmap::DashMap;
 use log::{debug, error};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
-use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
-use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::udp_relay::UdpRelay;
 use crate::stream_reader::StreamReader;
 use crate::tcp::ingress::PreparedTcp;
 use crate::udp_fragments::UdpFragments;
 use crate::util::write_all;
+
+mod pre_auth;
 
 const COMMAND_TYPE_AUTHENTICATE: u8 = 0x00;
 const COMMAND_TYPE_CONNECT: u8 = 0x01;
@@ -33,15 +33,14 @@ const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
 
 // hostname case: type (1) + hostname length (1) + hostname bytes (255) + port (2)
 const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
-const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
-const MAX_PREAUTH_COMMANDS: usize = 32;
-const MAX_PREAUTH_BYTES: usize = 1 << 20;
+const MAX_HEADER_LEN: usize = 2 + 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
+const UNI_STREAM_WINDOW: u32 = 4096;
 
 /// Heartbeat interval - server sends heartbeat datagrams to client at this interval.
 /// Default is 10 seconds per sing-box reference implementation.
@@ -74,6 +73,7 @@ async fn process_connection(
     password: Arc<str>,
     conn: quinn::Connecting,
     zero_rtt_handshake: bool,
+    pre_auth_settings: pre_auth::Settings,
 ) -> std::io::Result<()> {
     // Accept the incoming connection. When 0-RTT is enabled, use into_0rtt() to
     // allow 0.5-RTT data transmission before the handshake fully completes.
@@ -92,22 +92,26 @@ async fn process_connection(
 
     // Authentication with timeout - per sing-box reference, default 3 seconds.
     // This prevents malicious clients from holding connections open without authenticating.
-    let pending_commands =
-        match timeout(AUTH_TIMEOUT, auth_connection(&connection, &uuid, &password)).await {
-            Ok(Ok(pending)) => pending,
-            Ok(Err(e)) => {
-                connection.close(0u32.into(), b"auth failed");
-                return Err(e);
-            }
-            Err(_elapsed) => {
-                error!("Authentication timeout");
-                connection.close(0u32.into(), b"auth timeout");
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "authentication timeout",
-                ));
-            }
-        };
+    let pending_commands = match timeout(
+        AUTH_TIMEOUT,
+        pre_auth::authenticate(&connection, &uuid, &password, pre_auth_settings),
+    )
+    .await
+    {
+        Ok(Ok(pending)) => pending,
+        Ok(Err(e)) => {
+            connection.close(0u32.into(), b"auth failed");
+            return Err(e);
+        }
+        Err(_elapsed) => {
+            error!("Authentication timeout");
+            connection.close(0u32.into(), b"auth timeout");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "authentication timeout",
+            ));
+        }
+    };
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions, cleanup task, heartbeat) will terminate gracefully.
@@ -141,7 +145,12 @@ async fn process_connection(
     // This reduces task count and avoids spawning separate tasks for the main loops.
     let heartbeat_loop = run_heartbeat_loop(heartbeat_connection, heartbeat_cancel_token);
 
-    let bi_loop = run_bidirectional_loop(bi_connection, bi_client_proxy_selector, bi_resolver);
+    let bi_loop = run_bidirectional_loop(
+        bi_connection,
+        bi_client_proxy_selector,
+        bi_resolver,
+        pending_commands.bi,
+    );
 
     let uni_loop = run_unidirectional_loop(
         uni_connection,
@@ -149,7 +158,7 @@ async fn process_connection(
         uni_resolver,
         uni_udp_session_map,
         uni_cancel_token,
-        pending_commands,
+        pending_commands.uni,
     );
 
     let datagram_loop = run_datagram_loop(
@@ -205,98 +214,40 @@ async fn run_heartbeat_loop(
     }
 }
 
-async fn auth_connection(
-    connection: &quinn::Connection,
-    uuid: &[u8],
-    password: &str,
-) -> std::io::Result<Vec<(u8, Vec<u8>)>> {
-    let mut expected_token_bytes = [0u8; 32];
-    connection
-        .export_keying_material(
-            &mut expected_token_bytes,
-            uuid.as_ref(),
-            password.as_bytes(),
-        )
-        .map_err(|e| std::io::Error::other(format!("Failed to export keying material: {e:?}")))?;
-
-    let mut pending = Vec::new();
-    let mut pending_bytes = 0;
-    let pending_limit = crate::resources::limits()
-        .max_streams_per_connection
-        .unwrap_or(MAX_PREAUTH_COMMANDS)
-        .min(MAX_PREAUTH_COMMANDS);
-    // Independent uni streams may reach the peer before the AUTH stream.
-    // Complete bounded commands to return uni credit even when the peer has only
-    // one stream available. Nothing is dispatched before authentication.
-    loop {
-        let mut recv_stream = connection.accept_uni().await?;
-        let mut header = [0; 2];
-        tokio::io::AsyncReadExt::read_exact(&mut recv_stream, &mut header).await?;
-        let tuic_version = header[0];
-        if tuic_version != 5 {
-            return Err(std::io::Error::other(format!(
-                "invalid tuic version: {tuic_version}"
-            )));
-        }
-        let command_type = header[1];
-
-        if command_type != COMMAND_TYPE_AUTHENTICATE {
-            if !matches!(command_type, COMMAND_TYPE_PACKET | COMMAND_TYPE_DISSOCIATE)
-                || pending.len() >= pending_limit
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid or excessive pre-auth TUIC commands",
-                ));
-            }
-            let body = recv_stream
-                .read_to_end((MAX_HEADER_LEN + 65535).min(MAX_PREAUTH_BYTES - pending_bytes))
-                .await
-                .map_err(std::io::Error::other)?;
-            pending_bytes += body.len();
-            pending.push((command_type, body));
-            continue;
-        }
-
-        let mut credentials = [0; 48];
-        tokio::io::AsyncReadExt::read_exact(&mut recv_stream, &mut credentials).await?;
-        let authenticated =
-            credentials[..16].ct_eq(uuid) & credentials[16..].ct_eq(&expected_token_bytes);
-        if !bool::from(authenticated) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "incorrect credentials",
-            ));
-        }
-
-        return Ok(pending);
-    }
-}
-
 async fn run_bidirectional_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    pending: Vec<pre_auth::BiReader>,
 ) -> std::io::Result<()> {
     let mut tasks = JoinSet::new();
+    let mut pending = pending.into_iter();
     loop {
-        let accepted = tokio::select! {
-            result = connection.accept_bi() => result,
-            _ = tasks.join_next(), if !tasks.is_empty() => continue,
-        };
-        let (send_stream, recv_stream) = match accepted {
-            Ok(s) => s,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                break;
-            }
-            Err(quinn::ConnectionError::ConnectionClosed(_)) => {
-                break;
-            }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to accept bidirectional stream: {e}"
-                )));
-            }
+        let reader = if let Some(reader) = pending.next() {
+            reader
+        } else {
+            let accepted = tokio::select! {
+                result = connection.accept_bi() => result,
+                _ = tasks.join_next(), if !tasks.is_empty() => continue,
+            };
+            let (send_stream, recv_stream) = match accepted {
+                Ok(s) => s,
+                Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                    break;
+                }
+                Err(quinn::ConnectionError::ConnectionClosed(_)) => {
+                    break;
+                }
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "failed to accept bidirectional stream: {e}"
+                    )));
+                }
+            };
+
+            let stream =
+                pre_auth::BufferedBi::new(send_stream, recv_stream, connection.remote_address());
+            futures::future::ready(Ok(Some(stream))).boxed()
         };
 
         let conn = connection.clone();
@@ -313,15 +264,14 @@ async fn run_bidirectional_loop(
         let resolver = resolver.clone();
         tasks.spawn(async move {
             let _permit = permit;
-            match process_tcp_stream(
-                client_proxy_selector,
-                resolver,
-                send_stream,
-                recv_stream,
-                conn.remote_address(),
-            )
-            .await
-            {
+            let result = async {
+                let Some(stream) = reader.await? else {
+                    return Ok(());
+                };
+                process_tcp_stream(client_proxy_selector, resolver, stream.into_stream()).await
+            }
+            .await;
+            match result {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     // Per official TUIC reference (handle_stream.rs:127-135),
@@ -339,8 +289,8 @@ async fn run_bidirectional_loop(
     Ok(())
 }
 
-async fn read_address(
-    recv: &mut (impl tokio::io::AsyncRead + Unpin),
+async fn read_address<R: tokio::io::AsyncRead + Unpin>(
+    recv: &mut R,
     stream_reader: &mut StreamReader,
 ) -> std::io::Result<Option<NetLocation>> {
     let address_type = stream_reader.read_u8(recv).await?;
@@ -420,19 +370,17 @@ fn serialize_address(location: &NetLocation) -> Vec<u8> {
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-    peer: std::net::SocketAddr,
+    mut stream: Box<dyn AsyncStream>,
 ) -> std::io::Result<()> {
     let mut stream_reader = StreamReader::new_with_buffer_size(1024);
-    let tuic_version = stream_reader.read_u8(&mut recv).await?;
+    let tuic_version = stream_reader.read_u8(&mut stream).await?;
     if tuic_version != 5 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid tuic version: {tuic_version}"),
         ));
     }
-    let command_type = stream_reader.read_u8(&mut recv).await?;
+    let command_type = stream_reader.read_u8(&mut stream).await?;
     if command_type != COMMAND_TYPE_CONNECT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -440,12 +388,12 @@ async fn process_tcp_stream(
         ));
     }
 
-    let remote_location = read_address(&mut recv, &mut stream_reader)
+    let remote_location = read_address(&mut stream, &mut stream_reader)
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
     relay_tcp_stream(
-        Box::new(QuicStream::from(send, recv).with_peer(peer)),
+        stream,
         remote_location,
         stream_reader.into_unparsed_data(),
         client_proxy_selector,
@@ -545,7 +493,6 @@ async fn relay_tcp_stream(
 
 struct UdpSession {
     send_socket: Arc<UdpRelay>,
-    pinned_location: Option<NetLocation>,
     // Cancellation token for this session's background task
     cancel_token: CancellationToken,
     task: Option<tokio::task::AbortHandle>,
@@ -562,13 +509,11 @@ impl Drop for UdpSession {
 }
 
 impl UdpSession {
-    #[allow(clippy::too_many_arguments)]
-    fn start_with_send_stream(
+    fn start(
         assoc_id: u16,
         connection: quinn::Connection,
         client_socket: Arc<UdpRelay>,
-        override_local_write_location: Option<NetLocation>,
-        pinned_location: Option<NetLocation>,
+        is_uni_stream: bool,
         parent_cancel_token: &CancellationToken,
         permit: crate::resources::BudgetPermit,
     ) -> Self {
@@ -577,7 +522,6 @@ impl UdpSession {
 
         let mut session = UdpSession {
             send_socket: client_socket.clone(),
-            pinned_location,
             cancel_token: session_cancel_token.clone(),
             task: None,
             _permit: Some(permit),
@@ -585,56 +529,24 @@ impl UdpSession {
 
         session.task = Some(
             tokio::spawn(async move {
-                if let Err(e) = run_udp_remote_to_local_stream_loop(
-                    assoc_id,
-                    connection,
-                    client_socket,
-                    override_local_write_location,
-                    session_cancel_token,
-                )
-                .await
-                {
-                    error!("UDP remote-to-local write loop ended with error: {e}");
-                }
-            })
-            .abort_handle(),
-        );
-
-        session
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_with_datagram(
-        assoc_id: u16,
-        connection: quinn::Connection,
-        client_socket: Arc<UdpRelay>,
-        override_local_write_location: Option<NetLocation>,
-        pinned_location: Option<NetLocation>,
-        parent_cancel_token: &CancellationToken,
-        permit: crate::resources::BudgetPermit,
-    ) -> Self {
-        // Create a child token so this session is cancelled when the parent (connection) is cancelled
-        let session_cancel_token = parent_cancel_token.child_token();
-
-        let mut session = UdpSession {
-            send_socket: client_socket.clone(),
-            pinned_location,
-            cancel_token: session_cancel_token.clone(),
-            task: None,
-            _permit: Some(permit),
-        };
-
-        session.task = Some(
-            tokio::spawn(async move {
-                if let Err(e) = run_udp_remote_to_local_datagram_loop(
-                    assoc_id,
-                    connection,
-                    client_socket,
-                    override_local_write_location,
-                    session_cancel_token,
-                )
-                .await
-                {
+                let result = if is_uni_stream {
+                    run_udp_remote_to_local_stream_loop(
+                        assoc_id,
+                        connection,
+                        client_socket,
+                        session_cancel_token,
+                    )
+                    .await
+                } else {
+                    run_udp_remote_to_local_datagram_loop(
+                        assoc_id,
+                        connection,
+                        client_socket,
+                        session_cancel_token,
+                    )
+                    .await
+                };
+                if let Err(e) = result {
                     error!("UDP remote-to-local write loop ended with error: {e}");
                 }
             })
@@ -649,12 +561,8 @@ async fn run_udp_remote_to_local_stream_loop(
     assoc_id: u16,
     connection: quinn::Connection,
     socket: Arc<UdpRelay>,
-    override_local_write_address: Option<NetLocation>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    let original_address_bytes: Option<Bytes> =
-        override_local_write_address.map(|a| serialize_address(&a).into());
-
     let mut next_packet_id: u16 = 0;
     let mut loop_count: u8 = 0;
 
@@ -674,10 +582,7 @@ async fn run_udp_remote_to_local_stream_loop(
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
-        let address_bytes = match original_address_bytes {
-            Some(ref a) => a.clone(),
-            None => serialize_address(&src_addr).into(),
-        };
+        let address_bytes = serialize_address(&src_addr);
 
         let mut frame = BytesMut::with_capacity(MAX_HEADER_LEN + payload_len);
         frame.extend_from_slice(&[5, COMMAND_TYPE_PACKET]);
@@ -697,7 +602,6 @@ async fn run_udp_remote_to_local_datagram_loop(
     assoc_id: u16,
     connection: quinn::Connection,
     client_socket: Arc<UdpRelay>,
-    override_local_write_location: Option<NetLocation>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     use bytes::BufMut;
@@ -705,9 +609,6 @@ async fn run_udp_remote_to_local_datagram_loop(
     let max_datagram_size = connection
         .max_datagram_size()
         .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
-
-    let original_address_bytes: Option<Bytes> =
-        override_local_write_location.map(|a| serialize_address(&a).into());
 
     let mut next_packet_id: u16 = 0;
     let mut loop_count: u8 = 0;
@@ -728,10 +629,7 @@ async fn run_udp_remote_to_local_datagram_loop(
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
-        let address_bytes: Bytes = match &original_address_bytes {
-            Some(a) => a.clone(),
-            None => serialize_address(&src_addr).into(),
-        };
+        let address_bytes = serialize_address(&src_addr);
         let address_bytes_len = address_bytes.len();
 
         // Header format:
@@ -813,9 +711,8 @@ async fn run_unidirectional_loop(
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
-    pending_commands: Vec<(u8, Vec<u8>)>,
+    pending_commands: Vec<pre_auth::UniReader>,
 ) -> std::io::Result<()> {
-    let mut pending_commands = pending_commands.into_iter();
     let mut tasks = JoinSet::new();
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
     let cleanup_session_map = udp_session_map.clone();
@@ -844,27 +741,32 @@ async fn run_unidirectional_loop(
         }
     });
 
+    let mut pending_commands = pending_commands.into_iter();
     loop {
-        let (command, recv_stream) = match pending_commands.next() {
-            Some((command, body)) => (Some(command), Either::Left(std::io::Cursor::new(body))),
-            None => {
-                let accepted = tokio::select! {
-                    result = connection.accept_uni() => result,
-                    _ = tasks.join_next(), if !tasks.is_empty() => continue,
-                };
-                match accepted {
-                    Ok(stream) => (None, Either::Right(stream)),
-                    Err(quinn::ConnectionError::ApplicationClosed(_))
-                    | Err(quinn::ConnectionError::ConnectionClosed(_)) => break,
-                    Err(error) => {
-                        return Err(std::io::Error::other(format!(
-                            "failed to accept unidirectional stream: {error}"
-                        )));
-                    }
+        let reader = if let Some(pending) = pending_commands.next() {
+            pending
+        } else {
+            let accepted = tokio::select! {
+                result = connection.accept_uni() => result,
+                _ = tasks.join_next(), if !tasks.is_empty() => continue,
+            };
+            let recv_stream = match accepted {
+                Ok(recv_stream) => recv_stream,
+                Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                    break;
                 }
-            }
-        };
+                Err(quinn::ConnectionError::ConnectionClosed(_)) => {
+                    break;
+                }
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "failed to accept unidirectional stream: {e}"
+                    )));
+                }
+            };
 
+            pre_auth::read_uni_stream(recv_stream).boxed()
+        };
         if crate::resources::limits()
             .max_streams_per_connection
             .is_some_and(|limit| tasks.len() > limit)
@@ -889,10 +791,9 @@ async fn run_unidirectional_loop(
                     &connection,
                     client_proxy_selector,
                     resolver,
-                    recv_stream,
+                    reader,
                     udp_session_map,
                     cancel_token,
-                    command,
                 ),
             )
             .await
@@ -921,27 +822,23 @@ async fn process_uni_stream(
     connection: &quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    mut recv_stream: impl tokio::io::AsyncRead + Unpin,
+    reader: pre_auth::UniReader,
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
-    command: Option<u8>,
 ) -> std::io::Result<()> {
-    let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
-
-    let command_type = if let Some(command) = command {
-        command
-    } else {
-        let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
-        if tuic_version != 5 {
-            return Err(std::io::Error::other(format!(
-                "invalid tuic version: {tuic_version}"
-            )));
-        }
-        stream_reader.read_u8(&mut recv_stream).await?
+    let Some(command) = reader.await? else {
+        return Ok(());
     };
+    let pre_auth::UniCommand::Data(data) = command else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "duplicate TUIC authentication",
+        ));
+    };
+    let command_type = data[1];
 
     if command_type == COMMAND_TYPE_DISSOCIATE {
-        let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
+        let assoc_id = u16::from_be_bytes([data[2], data[3]]);
         // Remove and cancel the session's background task.
         // Per official TUIC Rust reference (handle_task.rs:154-165).
         if let Some((_, session)) = udp_session_map.sessions.remove(&assoc_id) {
@@ -957,52 +854,38 @@ async fn process_uni_stream(
         )));
     }
 
-    // PACKET command - read the packet data
-    let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
-    let packet_id = stream_reader.read_u16_be(&mut recv_stream).await?;
-    let frag_total = stream_reader.read_u8(&mut recv_stream).await?;
-    let frag_id = stream_reader.read_u8(&mut recv_stream).await?;
-    let payload_size = stream_reader.read_u16_be(&mut recv_stream).await?;
-    let remote_location = read_address(&mut recv_stream, &mut stream_reader).await?;
-
-    let payload_fragment = stream_reader
-        .read_slice(&mut recv_stream, payload_size as usize)
-        .await?;
+    let packet = parse_udp_packet(&data)?;
 
     process_udp_packet(
         connection,
         &client_proxy_selector,
         &resolver,
         &udp_session_map,
-        assoc_id,
-        packet_id,
-        frag_total,
-        frag_id,
-        remote_location,
-        payload_fragment,
+        packet,
         true,
         &cancel_token,
     )
     .await
 }
 
-// TODO: fix too many arguments warning
-#[allow(clippy::too_many_arguments)]
 #[inline]
 async fn process_udp_packet(
     connection: &quinn::Connection,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     udp_session_map: &UdpSessionMap,
-    assoc_id: u16,
-    packet_id: u16,
-    frag_total: u8,
-    frag_id: u8,
-    remote_location: Option<NetLocation>,
-    payload_fragment: &[u8],
+    packet: UdpPacket<'_>,
     is_uni_stream: bool,
     cancel_token: &CancellationToken,
 ) -> std::io::Result<()> {
+    let UdpPacket {
+        assoc_id,
+        packet_id,
+        frag_total,
+        frag_id,
+        remote_location,
+        payload_fragment,
+    } = packet;
     let Some((remote_location, payload)) = udp_session_map.fragments.lock().push(
         (assoc_id, packet_id),
         frag_total,
@@ -1035,66 +918,20 @@ async fn process_udp_packet(
                         "TUIC UDP session limit reached",
                     )
                 })?;
-                let pinned_location = if client_proxy_selector.fake_dns_enabled() {
-                    // The shared router prepares and routes each destination once.
-                    None
-                } else {
-                    let action = client_proxy_selector
-                        .judge(remote_location.clone().into(), resolver)
-                        .await;
-
-                    let (_chain_group, updated_location) = match action {
-                        Ok(ConnectDecision::Allow {
-                            chain_group,
-                            remote_location,
-                        }) => (chain_group, remote_location),
-                        Ok(ConnectDecision::Block) => {
-                            return Err(std::io::Error::other(format!(
-                                "Blocked UDP forward to {remote_location}"
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(std::io::Error::other(format!(
-                                "Failed to judge UDP forward to {remote_location}: {e}"
-                            )));
-                        }
-                    };
-
-                    if remote_location.address().hostname().is_some()
-                        || updated_location.location() != &remote_location
-                    {
-                        Some(remote_location.clone())
-                    } else {
-                        None
-                    }
-                };
                 let client_socket = UdpRelay::new(
                     client_proxy_selector.clone(),
                     resolver.clone(),
                     Some(connection.remote_address()),
                 )?;
 
-                let session = if is_uni_stream {
-                    UdpSession::start_with_send_stream(
-                        assoc_id,
-                        connection.clone(),
-                        Arc::new(client_socket),
-                        pinned_location.clone(),
-                        pinned_location,
-                        cancel_token,
-                        permit,
-                    )
-                } else {
-                    UdpSession::start_with_datagram(
-                        assoc_id,
-                        connection.clone(),
-                        Arc::new(client_socket),
-                        pinned_location.clone(),
-                        pinned_location,
-                        cancel_token,
-                        permit,
-                    )
-                };
+                let session = UdpSession::start(
+                    assoc_id,
+                    connection.clone(),
+                    Arc::new(client_socket),
+                    is_uni_stream,
+                    cancel_token,
+                    permit,
+                );
 
                 // it's possible that the session is already on the map since we last checked.
                 // TODO: why is there no way to get a Ref<_> from an Entry<_>? see if we can
@@ -1111,8 +948,7 @@ async fn process_udp_packet(
         }
     };
 
-    let target = session.pinned_location.clone().unwrap_or(remote_location);
-    if let Err(e) = session.send_socket.send_to(payload, target) {
+    if let Err(e) = session.send_socket.send_to(payload, remote_location) {
         error!("Failed to forward UDP payload for session {assoc_id}: {e}");
         udp_session_map
             .sessions
@@ -1252,26 +1088,14 @@ async fn run_datagram_loop(
             )));
         }
 
-        let UdpPacket {
-            assoc_id,
-            packet_id,
-            frag_total,
-            frag_id,
-            remote_location,
-            payload_fragment,
-        } = parse_udp_packet(&data)?;
+        let packet = parse_udp_packet(&data)?;
 
         if let Err(e) = process_udp_packet(
             &connection,
             &client_proxy_selector,
             &resolver,
             &udp_session_map,
-            assoc_id,
-            packet_id,
-            frag_total,
-            frag_id,
-            remote_location,
-            payload_fragment,
+            packet,
             false,
             &cancel_token,
         )
@@ -1280,6 +1104,35 @@ async fn run_datagram_loop(
             error!("Failed to process datagram UDP packet: {e}");
         }
     }
+}
+
+fn configure_transport(
+    server_config: &mut quinn::ServerConfig,
+    limits: crate::config::GlobalLimits,
+) -> (usize, pre_auth::Settings) {
+    let settings = pre_auth::Settings::new(limits);
+    let memory_bytes = crate::resources::configure_quic_with_limits(
+        server_config,
+        4096,
+        UNI_STREAM_WINDOW,
+        limits,
+    );
+    Arc::get_mut(&mut server_config.transport)
+        .unwrap()
+        // AUTH has its own transport slot, even when application admission is one stream.
+        .max_concurrent_uni_streams(((settings.uni_streams + 1) as u32).into())
+        .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
+        .keep_alive_interval(Some(Duration::from_secs(15)))
+        // MTU settings per official TUIC reference
+        .initial_mtu(1200)
+        .min_mtu(1200)
+        // Enable MTU discovery for larger packets on capable networks
+        .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
+        // Enable GSO (Generic Segmentation Offload) for better throughput
+        .enable_segmentation_offload(true)
+        // Lower initial RTT estimate for faster initial window growth
+        .initial_rtt(Duration::from_millis(100));
+    (memory_bytes, settings)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1296,20 +1149,8 @@ pub async fn start_tuic_server(
     let mut join_handles = vec![];
     let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
-    let memory_bytes = crate::resources::configure_quic(&mut server_config, 4096, 4096);
-    Arc::get_mut(&mut server_config.transport)
-        .unwrap()
-        .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
-        .keep_alive_interval(Some(Duration::from_secs(15)))
-        // MTU settings per official TUIC reference
-        .initial_mtu(1200)
-        .min_mtu(1200)
-        // Enable MTU discovery for larger packets on capable networks
-        .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-        // Enable GSO (Generic Segmentation Offload) for better throughput
-        .enable_segmentation_offload(true)
-        // Lower initial RTT estimate for faster initial window growth
-        .initial_rtt(Duration::from_millis(100));
+    let (memory_bytes, pre_auth_settings) =
+        configure_transport(&mut server_config, crate::resources::limits());
 
     for endpoint in crate::listener_tasks::QuicListener::bind_all(
         bind_address,
@@ -1355,6 +1196,7 @@ pub async fn start_tuic_server(
                         password,
                         conn,
                         zero_rtt_handshake,
+                        pre_auth_settings,
                     )
                     .await
                     {
@@ -1372,6 +1214,100 @@ pub async fn start_tuic_server(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn udp_session_keeps_first_reply_mode_and_releases_real_tasks() {
+        timeout(Duration::from_secs(10), async {
+            for initial_stream_mode in [false, true] {
+                let (server, client) = crate::quic_endpoint::test_endpoints_with_config(|config| {
+                    configure_transport(config, crate::config::GlobalLimits::default());
+                });
+                let (peer, connection) = tokio::join!(
+                    client
+                        .connect(server.local_addr().unwrap(), "localhost")
+                        .unwrap(),
+                    async { server.accept().await.unwrap().await },
+                );
+                let peer = peer.unwrap();
+                let connection = connection.unwrap();
+                let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+                let selector = Arc::new(
+                    crate::tcp::tcp_client_handler_factory::create_test_selector(
+                        vec![crate::config::RuleConfig::default()],
+                        resolver.clone(),
+                    )
+                    .unwrap(),
+                );
+                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let target = socket.local_addr().unwrap();
+                let destination = NetLocation::from_ip_addr(target.ip(), target.port());
+                let map = Arc::new(UdpState::new());
+                let parent = CancellationToken::new();
+                for generation in 0..2 {
+                    let first_mode = initial_stream_mode ^ (generation != 0);
+                    for (index, receive_mode) in [first_mode, !first_mode].into_iter().enumerate() {
+                        let payload = [generation, index as u8, 42];
+                        process_udp_packet(
+                            &connection,
+                            &selector,
+                            &resolver,
+                            &map,
+                            UdpPacket {
+                                assoc_id: 7,
+                                packet_id: index as u16,
+                                frag_total: 1,
+                                frag_id: 0,
+                                remote_location: Some(destination.clone()),
+                                payload_fragment: &payload,
+                            },
+                            receive_mode,
+                            &parent,
+                        )
+                        .await
+                        .unwrap();
+                        let mut request = [0; 64];
+                        let (length, source) = socket.recv_from(&mut request).await.unwrap();
+                        assert_eq!(&request[..length], &payload);
+                        socket.send_to(&payload, source).await.unwrap();
+                        let (stream_mode, wire) = tokio::select! {
+                            stream = peer.accept_uni() => (true, stream.unwrap().read_to_end(1024).await.unwrap()),
+                            data = peer.read_datagram() => (false, data.unwrap().to_vec()),
+                        };
+                        assert_eq!(stream_mode, first_mode);
+                        let reply = parse_udp_packet(&wire).unwrap();
+                        assert_eq!(reply.assoc_id, 7);
+                        assert_eq!(reply.remote_location, Some(destination.clone()));
+                        assert_eq!(reply.payload_fragment, payload);
+                        assert_eq!(map.sessions.len(), 1);
+                        assert_eq!(map.slots.snapshot().active, 1);
+                    }
+                    let (relay, task, child) = {
+                        let entry = map.sessions.get(&7).unwrap();
+                        (
+                            Arc::downgrade(&entry.send_socket),
+                            entry.task.clone().unwrap(),
+                            entry.cancel_token.clone(),
+                        )
+                    };
+                    if generation == 1 {
+                        parent.cancel();
+                        while !task.is_finished() {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    map.sessions.remove(&7);
+                    while relay.upgrade().is_some() || !task.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(child.is_cancelled());
+                    assert_eq!(map.slots.snapshot().active, 0);
+                }
+                connection.close(0u32.into(), b"done");
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn fake_dns_adapter_contract() {
@@ -1480,7 +1416,6 @@ mod lifecycle_tests {
         });
         let session = Arc::new(UdpSession {
             send_socket: socket,
-            pinned_location: None,
             cancel_token: token.clone(),
             task: Some(task.abort_handle()),
             _permit: None,
@@ -1517,10 +1452,26 @@ mod auth_tests {
     }
 
     async fn connect(selector: Arc<ClientProxySelector>) -> Peer {
-        // One uni stream exposes pre-auth credit retention deadlocks.
-        let (server, client) = crate::quic_endpoint::test_endpoints_with_uni_limit(1);
+        connect_with_resolver(selector, Arc::new(crate::resolver::NativeResolver::new())).await
+    }
+
+    async fn connect_with_resolver(
+        selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Peer {
+        connect_with_limits(selector, resolver, crate::resources::limits()).await
+    }
+
+    async fn connect_with_limits(
+        selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+        limits: crate::config::GlobalLimits,
+    ) -> Peer {
+        let mut settings = pre_auth::Settings::new(limits);
+        let (server, client) = crate::quic_endpoint::test_endpoints_with_config(|config| {
+            settings = configure_transport(config, limits).1;
+        });
         let address = server.local_addr().unwrap();
-        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let accepting = server.clone();
         let server_task = tokio::spawn(async move {
             let incoming = accepting.accept().await.unwrap();
@@ -1531,6 +1482,7 @@ mod auth_tests {
                 PASSWORD.into(),
                 incoming.accept().unwrap(),
                 false,
+                settings,
             )
             .await
         });
@@ -1559,6 +1511,370 @@ mod auth_tests {
         command
     }
 
+    fn packet(target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![5, COMMAND_TYPE_PACKET, 0, 1, 0, 1, 1, 0];
+        bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&serialize_address(&NetLocation::from_ip_addr(
+            target.ip(),
+            target.port(),
+        )));
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    async fn direct_peer(limits: crate::config::GlobalLimits) -> Peer {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let selector = Arc::new(
+            create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone())
+                .unwrap(),
+        );
+        connect_with_limits(selector, resolver, limits).await
+    }
+
+    async fn tcp_roundtrip(peer: &Peer) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut send, mut recv) = peer.connection.open_bi().await.unwrap();
+        let mut request = vec![5, COMMAND_TYPE_CONNECT];
+        let address = listener.local_addr().unwrap();
+        request.extend_from_slice(&serialize_address(&NetLocation::from_ip_addr(
+            address.ip(),
+            address.port(),
+        )));
+        request.extend_from_slice(b"hello");
+        send.write_all(&request).await.unwrap();
+        send.finish().unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut data = Vec::new();
+        socket.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, b"hello");
+        socket.write_all(&data).await.unwrap();
+        socket.shutdown().await.unwrap();
+        assert_eq!(recv.read_to_end(1024).await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn largest_early_packets_release_receive_credit_without_fin() {
+        timeout(Duration::from_secs(20), async {
+            for stream_window in [16384, 65536] {
+                for limit in [Some(1), Some(4), None] {
+                    for bind in ["127.0.0.1:0", "[::1]:0"] {
+                        let socket = tokio::net::UdpSocket::bind(bind).await.unwrap();
+                        let peer = direct_peer(crate::config::GlobalLimits {
+                            max_streams_per_connection: limit,
+                            quic_receive_window: 65536,
+                            quic_stream_window: stream_window,
+                            ..Default::default()
+                        })
+                        .await;
+                        let payload = vec![0x71; 65507];
+                        let command = packet(socket.local_addr().unwrap(), &payload);
+                        let mut early = peer.connection.open_uni().await.unwrap();
+                        early.write_all(&command).await.unwrap();
+                        // Complete framed commands release credit without requiring a FIN.
+                        assert_eq!(early.stopped().await.unwrap(), Some(0u32.into()));
+                        let mut received = vec![0; 65535];
+                        assert!(
+                            timeout(Duration::from_millis(20), socket.recv(&mut received))
+                                .await
+                                .is_err()
+                        );
+                        let mut auth = peer.connection.open_uni().await.unwrap();
+                        auth.write_all(&authenticate_command(&peer.connection, PASSWORD))
+                            .await
+                            .unwrap();
+                        let len = socket.recv(&mut received).await.unwrap();
+                        assert_eq!(&received[..len], &payload);
+                        tcp_roundtrip(&peer).await;
+                        peer.connection.close(0u32.into(), b"done");
+                        let _ = peer.server.await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_auth_is_not_evicted_by_higher_stream_ids() {
+        timeout(Duration::from_secs(10), async {
+            for limit in [1, 2] {
+                for prefix_len in [0, 1] {
+                    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let peer = direct_peer(crate::config::GlobalLimits {
+                        max_streams_per_connection: Some(limit),
+                        quic_receive_window: 65536,
+                        quic_stream_window: 16384,
+                        ..Default::default()
+                    })
+                    .await;
+                    let command = authenticate_command(&peer.connection, PASSWORD);
+                    let mut auth = peer.connection.open_uni().await.unwrap();
+                    auth.write_all(&command[..prefix_len]).await.unwrap();
+                    let mut partials = Vec::new();
+                    for _ in 1..limit {
+                        partials.push(peer.connection.open_uni().await.unwrap());
+                    }
+                    let mut data = peer.connection.open_uni().await.unwrap();
+                    data.write_all(&packet(socket.local_addr().unwrap(), b"reordered"))
+                        .await
+                        .unwrap();
+                    // A higher stream ID implicitly opens earlier streams before their bytes arrive.
+                    assert_eq!(data.stopped().await.unwrap(), Some(0u32.into()));
+                    auth.write_all(&command[prefix_len..]).await.unwrap();
+                    let mut response = [0; 32];
+                    let len = socket.recv(&mut response).await.unwrap();
+                    assert_eq!(&response[..len], b"reordered");
+                    tcp_roundtrip(&peer).await;
+                    peer.connection.close(0u32.into(), b"done");
+                    let _ = peer.server.await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_headers_and_split_auth_keep_a_control_slot() {
+        timeout(Duration::from_secs(15), async {
+            for limit in [1, 4] {
+                for auth_first in [false, true] {
+                    let peer = direct_peer(crate::config::GlobalLimits {
+                        max_streams_per_connection: Some(limit),
+                        quic_receive_window: 65536,
+                        quic_stream_window: 16384,
+                        ..Default::default()
+                    })
+                    .await;
+                    let mut auth = if auth_first {
+                        let mut auth = peer.connection.open_uni().await.unwrap();
+                        auth.write_all(&[5, COMMAND_TYPE_AUTHENTICATE])
+                            .await
+                            .unwrap();
+                        Some(auth)
+                    } else {
+                        None
+                    };
+                    let mut stalled = if !auth_first || limit > 1 {
+                        let mut stream = peer.connection.open_uni().await.unwrap();
+                        stream.write_all(&[5]).await.unwrap();
+                        Some(stream)
+                    } else {
+                        None
+                    };
+                    if auth_first {
+                        for id in 0..8 {
+                            send_uni(&peer.connection, &[5, COMMAND_TYPE_DISSOCIATE, 0, id]).await;
+                        }
+                        auth.as_mut()
+                            .unwrap()
+                            .write_all(&authenticate_command(&peer.connection, PASSWORD)[2..])
+                            .await
+                            .unwrap();
+                    } else {
+                        send_uni(
+                            &peer.connection,
+                            &authenticate_command(&peer.connection, PASSWORD),
+                        )
+                        .await;
+                    }
+                    tcp_roundtrip(&peer).await;
+                    if let Some(stream) = &mut stalled {
+                        let _ = stream.reset(0u32.into());
+                    }
+                    peer.connection.close(0u32.into(), b"done");
+                    let _ = peer.server.await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn early_tcp_returns_credit_and_rejects_whole_streams_on_overflow() {
+        timeout(Duration::from_secs(15), async {
+            for (overflow, finish_early) in [(false, false), (false, true), (true, false)] {
+                let peer = direct_peer(crate::config::GlobalLimits {
+                    max_streams_per_connection: Some(1),
+                    quic_receive_window: 65536,
+                    quic_stream_window: 16384,
+                    ..Default::default()
+                })
+                .await;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let target = listener.local_addr().unwrap();
+                let (mut send, mut recv) = peer.connection.open_bi().await.unwrap();
+                let payload = vec![42; if overflow { 100000 } else { 65536 }];
+                let mut request = vec![5, COMMAND_TYPE_CONNECT];
+                request.extend_from_slice(&serialize_address(&NetLocation::from_ip_addr(
+                    target.ip(),
+                    target.port(),
+                )));
+                request.extend_from_slice(&payload);
+                let write = send.write_all(&request).await;
+                if overflow {
+                    let _ = write;
+                    assert_eq!(send.stopped().await.unwrap(), Some(0u32.into()));
+                } else {
+                    write.unwrap();
+                    if finish_early {
+                        send.finish().unwrap();
+                    }
+                }
+                assert!(
+                    timeout(Duration::from_millis(20), listener.accept())
+                        .await
+                        .is_err()
+                );
+                send_uni(
+                    &peer.connection,
+                    &authenticate_command(&peer.connection, PASSWORD),
+                )
+                .await;
+                if overflow {
+                    assert!(
+                        timeout(Duration::from_secs(1), recv.read_to_end(100))
+                            .await
+                            .expect("overflow stream must reset")
+                            .is_err()
+                    );
+                    assert!(
+                        timeout(Duration::from_millis(20), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    if !finish_early {
+                        send.finish().unwrap();
+                    }
+                    let echo = tokio::spawn(async move {
+                        let mut data = Vec::new();
+                        socket.read_to_end(&mut data).await.unwrap();
+                        assert_eq!(data, payload);
+                        socket.write_all(&data).await.unwrap();
+                        socket.shutdown().await.unwrap();
+                    });
+                    assert_eq!(recv.read_to_end(100000).await.unwrap(), vec![42; 65536]);
+                    echo.await.unwrap();
+                }
+                // STOP_SENDING returns data credit; the sender must reset to release its slot.
+                drop(send);
+                timeout(Duration::from_secs(2), tcp_roundtrip(&peer))
+                    .await
+                    .expect("subsequent TCP stream must work");
+                peer.connection.close(0u32.into(), b"done");
+                let _ = peer.server.await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn early_udp_streams_wait_for_auth_and_keep_each_destination() {
+        #[derive(Debug)]
+        struct LocalResolver;
+        impl Resolver for LocalResolver {
+            fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
+                let port = location.port();
+                Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for stream_mode in [true, false] {
+                let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let resolver: Arc<dyn Resolver> = Arc::new(LocalResolver);
+                let peer = connect_with_resolver(
+                    Arc::new(
+                        create_test_selector(
+                            vec![crate::config::RuleConfig::default()],
+                            resolver.clone(),
+                        )
+                        .unwrap(),
+                    ),
+                    resolver,
+                )
+                .await;
+                let packet = |target: &NetLocation, id: u16| {
+                    let mut bytes = vec![5, COMMAND_TYPE_PACKET, 0, 1];
+                    bytes.extend_from_slice(&id.to_be_bytes());
+                    bytes.extend_from_slice(&[1, 0, 0, 5]);
+                    bytes.extend_from_slice(&serialize_address(target));
+                    bytes.extend_from_slice(b"hello");
+                    bytes
+                };
+                let first_target = NetLocation::new(
+                    Address::Hostname("localhost".into()),
+                    first.local_addr().unwrap().port(),
+                );
+                let bytes = packet(&first_target, 1);
+                if stream_mode {
+                    send_uni(&peer.connection, &bytes).await;
+                } else {
+                    peer.connection.send_datagram(bytes.into()).unwrap();
+                }
+                let mut buf = [0; 32];
+                assert!(
+                    timeout(Duration::from_millis(50), first.recv_from(&mut buf))
+                        .await
+                        .is_err()
+                );
+                send_uni(
+                    &peer.connection,
+                    &authenticate_command(&peer.connection, PASSWORD),
+                )
+                .await;
+                for (index, socket) in [&first, &second].into_iter().enumerate() {
+                    if index == 1 {
+                        let target = NetLocation::from_ip_addr(
+                            socket.local_addr().unwrap().ip(),
+                            socket.local_addr().unwrap().port(),
+                        );
+                        let bytes = packet(&target, 2);
+                        if stream_mode {
+                            send_uni(&peer.connection, &bytes).await;
+                        } else {
+                            peer.connection.send_datagram(bytes.into()).unwrap();
+                        }
+                    }
+                    let (count, from) = socket.recv_from(&mut buf).await.unwrap();
+                    assert_eq!(&buf[..count], b"hello");
+                    socket.send_to(b"reply", from).await.unwrap();
+                    let response = if stream_mode {
+                        peer.connection
+                            .accept_uni()
+                            .await
+                            .unwrap()
+                            .read_to_end(1024)
+                            .await
+                            .unwrap()
+                    } else {
+                        loop {
+                            let data = peer.connection.read_datagram().await.unwrap();
+                            if data.get(1) == Some(&COMMAND_TYPE_PACKET) {
+                                break data.to_vec();
+                            }
+                        }
+                    };
+                    let parsed = parse_udp_packet(&response).unwrap();
+                    assert_eq!(parsed.payload_fragment, b"reply");
+                    assert_eq!(
+                        parsed.remote_location.unwrap().port(),
+                        socket.local_addr().unwrap().port()
+                    );
+                }
+                peer.connection.close(0u32.into(), b"done");
+                let _ = peer.server.await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn authenticated_clients_can_connect_after_earlier_commands() {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1577,7 +1893,9 @@ mod auth_tests {
             ))
             .await;
 
-            // Commands preceding authentication are dispatched only after it succeeds.
+            // Commands may precede authentication and are dispatched only after it succeeds.
+            let mut partial = peer.connection.open_uni().await.unwrap();
+            partial.write_all(&[5]).await.unwrap();
             send_uni(&peer.connection, &[5, COMMAND_TYPE_DISSOCIATE, 0, 1]).await;
             send_uni(
                 &peer.connection,
@@ -1592,8 +1910,15 @@ mod auth_tests {
             send.write_all(&connect).await.unwrap();
             send.finish().unwrap();
             assert_eq!(recv.read_to_end(1024).await.unwrap(), b"hello");
+            partial
+                .write_all(&[COMMAND_TYPE_DISSOCIATE, 0, 2])
+                .await
+                .unwrap();
+            partial.finish().unwrap();
             echo_task.await.unwrap();
             assert!(!peer.server.is_finished());
+            peer.connection.close(0u32.into(), b"done");
+            let _ = peer.server.await;
         })
         .await
         .unwrap();
@@ -1666,5 +1991,215 @@ mod auth_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn pre_auth_pressure_and_cleanup_release_stream_permits() {
+        if std::env::var_os("SHOES_TUIC_PRESSURE_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tuic_server::auth_tests::pre_auth_pressure_and_cleanup_release_stream_permits",
+                    "--quiet",
+                ])
+                .env("SHOES_TUIC_PRESSURE_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"));
+            return;
+        }
+        crate::resources::configure(crate::config::GlobalLimits {
+            max_streams: Some(3),
+            max_streams_per_connection: Some(4),
+            ..Default::default()
+        })
+        .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                timeout(Duration::from_secs(15), async {
+                    let configured = crate::resources::limits();
+                    crate::resources::configure(crate::config::GlobalLimits {
+                        max_streams: Some(1),
+                        ..configured
+                    })
+                    .unwrap();
+                    let unauthenticated = direct_peer(crate::resources::limits()).await;
+                    send_uni(
+                        &unauthenticated.connection,
+                        &[5, COMMAND_TYPE_DISSOCIATE, 0, 1],
+                    )
+                    .await;
+                    while crate::resources::snapshot().quic_buffer_bytes.active == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(crate::resources::snapshot().streams.active, 0);
+                    let authenticated = direct_peer(crate::resources::limits()).await;
+                    send_uni(
+                        &authenticated.connection,
+                        &authenticate_command(&authenticated.connection, PASSWORD),
+                    )
+                    .await;
+                    tcp_roundtrip(&authenticated).await;
+                    authenticated.connection.close(0u32.into(), b"done");
+                    let _ = authenticated.server.await;
+                    unauthenticated.server.abort();
+                    let _ = unauthenticated.server.await;
+                    assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+                    crate::resources::configure(configured).unwrap();
+
+                    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let peer = direct_peer(crate::config::GlobalLimits {
+                        quic_receive_window: 131072,
+                        ..configured
+                    })
+                    .await;
+                    crate::resources::configure(crate::config::GlobalLimits {
+                        quic_receive_window: 65536,
+                        ..configured
+                    })
+                    .unwrap();
+                    let payload = vec![42; 40000];
+                    for _ in 0..2 {
+                        let mut stream = peer.connection.open_uni().await.unwrap();
+                        stream
+                            .write_all(&packet(socket.local_addr().unwrap(), &payload))
+                            .await
+                            .unwrap();
+                        assert_eq!(stream.stopped().await.unwrap(), Some(0u32.into()));
+                    }
+                    // Existing listeners retain their staging allowance across a window reload.
+                    assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 80034);
+                    send_uni(
+                        &peer.connection,
+                        &authenticate_command(&peer.connection, PASSWORD),
+                    )
+                    .await;
+                    let mut response = vec![0; 65535];
+                    for _ in 0..2 {
+                        let len = socket.recv(&mut response).await.unwrap();
+                        assert_eq!(&response[..len], &payload);
+                    }
+                    peer.connection.close(0u32.into(), b"done");
+                    let _ = peer.server.await;
+                    assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+
+                    let peer = direct_peer(configured).await;
+                    let rejected = crate::resources::snapshot().quic_buffer_bytes.rejected;
+                    crate::resources::configure(crate::config::GlobalLimits {
+                        quic_memory_bytes: Some(1),
+                        ..configured
+                    })
+                    .unwrap();
+                    let mut early = peer.connection.open_uni().await.unwrap();
+                    early
+                        .write_all(&packet(socket.local_addr().unwrap(), b"denied"))
+                        .await
+                        .unwrap();
+                    assert_eq!(early.stopped().await.unwrap(), Some(0u32.into()));
+                    assert!(crate::resources::snapshot().quic_buffer_bytes.rejected > rejected);
+                    assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+                    send_uni(
+                        &peer.connection,
+                        &authenticate_command(&peer.connection, PASSWORD),
+                    )
+                    .await;
+                    tcp_roundtrip(&peer).await;
+                    assert!(
+                        timeout(Duration::from_millis(20), socket.recv(&mut response))
+                            .await
+                            .is_err()
+                    );
+                    peer.connection.close(0u32.into(), b"done");
+                    let _ = peer.server.await;
+                    crate::resources::configure(configured).unwrap();
+
+                    for case in [
+                        "success",
+                        "invalid",
+                        "timeout",
+                        "cancel",
+                        "truncated",
+                        "peer_close",
+                    ] {
+                        let peer = direct_peer(crate::resources::limits()).await;
+                        let mut stalled = peer.connection.open_uni().await.unwrap();
+                        stalled.write_all(&[5]).await.unwrap();
+                        for id in 0..8 {
+                            send_uni(&peer.connection, &[5, COMMAND_TYPE_DISSOCIATE, 0, id]).await;
+                        }
+                        timeout(Duration::from_secs(1), async {
+                            while crate::resources::snapshot().quic_buffer_bytes.active == 0 {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        let mut bodies = None;
+                        if case != "success" {
+                            let mut partial = peer.connection.open_uni().await.unwrap();
+                            partial
+                                .write_all(&[5, 2, 0, 1, 0, 1, 1, 0, 255, 255, 0xff])
+                                .await
+                                .unwrap();
+                            let (mut send, recv) = peer.connection.open_bi().await.unwrap();
+                            send.write_all(&[5, COMMAND_TYPE_CONNECT]).await.unwrap();
+                            while crate::resources::snapshot().quic_buffer_bytes.active
+                                < 65546 + 4096
+                            {
+                                tokio::task::yield_now().await;
+                            }
+                            bodies = Some((partial, send, recv));
+                        }
+                        assert_eq!(crate::resources::snapshot().streams.active, 0);
+                        match case {
+                            "success" | "invalid" => {
+                                let password = if case == "success" { PASSWORD } else { "wrong" };
+                                send_uni(
+                                    &peer.connection,
+                                    &authenticate_command(&peer.connection, password),
+                                )
+                                .await;
+                            }
+                            "cancel" => peer.server.abort(),
+                            "truncated" => send_uni(&peer.connection, &[5]).await,
+                            "peer_close" => peer.connection.close(0u32.into(), b"done"),
+                            _ => {}
+                        }
+                        if case == "success" {
+                            tcp_roundtrip(&peer).await;
+                            timeout(Duration::from_secs(1), async {
+                                while crate::resources::snapshot().streams.active != 0 {
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .unwrap();
+                            assert!(!peer.server.is_finished());
+                            peer.connection.close(0u32.into(), b"done");
+                        }
+                        let _ = peer.server.await;
+                        drop(bodies);
+                        assert_eq!(crate::resources::snapshot().streams.active, 0, "{case}");
+                        assert_eq!(
+                            crate::resources::snapshot().quic_buffer_bytes.active,
+                            0,
+                            "{case}"
+                        );
+                        assert!(crate::resources::snapshot().streams.peak <= 3, "{case}");
+                        assert!(crate::resources::try_stream().is_some());
+                    }
+                })
+                .await
+                .unwrap();
+            });
     }
 }
