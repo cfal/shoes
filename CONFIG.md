@@ -485,7 +485,7 @@ groups. Selecting the same effective choice preserves samples. Groups become due
 again, after any active round finishes; no selector dependency graph is maintained.
 Surrounding route choices do not create additional health identities. Complete
 chains declared as members are probed end to end. External caller prefixes and
-suffixes are not tested.
+suffixes are not tested. URL-test groups are not supported by FFI.
 Probe connectors have separate round-robin counters, so probes never advance
 forwarding counters.
 
