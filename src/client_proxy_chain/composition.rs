@@ -34,6 +34,7 @@ pub(crate) struct Composition {
 struct Selection<'a> {
     choices: &'a Choices,
     view: Option<&'a SelectionView>,
+    udp_flow: bool,
 }
 
 fn unsupported() -> io::Error {
@@ -95,6 +96,7 @@ impl Composition {
         let selection = Selection {
             choices: &choices,
             view: self.selection.as_deref(),
+            udp_flow: udp,
         };
         let mut leaves = Vec::new();
         self.root.select(udp, &selection, &mut leaves)?;
@@ -385,23 +387,23 @@ impl Node {
     }
     fn select<'a>(
         &'a self,
-        udp: bool,
+        require_udp: bool,
         selection: &Selection<'_>,
         leaves: &mut Vec<&'a Leaf>,
     ) -> io::Result<()> {
         match self {
             Self::Client(leaf) => {
-                if udp && !leaf.udp {
+                if require_udp && !leaf.udp {
                     return Err(unsupported());
                 }
                 leaves.push(leaf);
             }
             Self::Sequence(nodes) => {
-                if !self.eligible(udp, selection.choices) {
+                if !self.eligible(require_udp, selection.choices) {
                     return Err(unsupported());
                 }
                 for (index, node) in nodes.iter().enumerate() {
-                    node.select(udp && index + 1 == nodes.len(), selection, leaves)?;
+                    node.select(require_udp && index + 1 == nodes.len(), selection, leaves)?;
                 }
             }
             Self::Choice {
@@ -413,14 +415,15 @@ impl Node {
                 static_members,
             } => {
                 if let Some(eligible) = static_members {
-                    let eligible = &eligible[usize::from(udp)];
+                    let eligible = &eligible[usize::from(require_udp)];
                     if eligible.is_empty() {
                         return Err(unsupported());
                     }
-                    let selected = eligible[next[usize::from(udp)].fetch_add(1, Ordering::Relaxed)
+                    let selected = eligible[next[usize::from(selection.udp_flow)]
+                        .fetch_add(1, Ordering::Relaxed)
                         as usize
                         % eligible.len()];
-                    return members[selected].select(udp, selection, leaves);
+                    return members[selected].select(require_udp, selection, leaves);
                 }
                 let eligible: Vec<_> = members
                     .iter()
@@ -428,7 +431,7 @@ impl Node {
                     .filter_map(|(index, member)| {
                         ((*kind != GroupType::Selector
                             || selection.choices.get(name) == Some(&labels[index]))
-                            && member.eligible(udp, selection.choices))
+                            && member.eligible(require_udp, selection.choices))
                         .then_some(index)
                     })
                     .collect();
@@ -447,7 +450,7 @@ impl Node {
                             .0
                             .get(name)
                             .ok_or_else(unsupported)?
-                            .choose(&names, udp)
+                            .choose(&names, selection.udp_flow)
                             .ok_or_else(unsupported)?;
                         eligible
                             .into_iter()
@@ -455,11 +458,13 @@ impl Node {
                             .unwrap()
                     }
                     _ => {
-                        eligible[next[usize::from(udp)].fetch_add(1, Ordering::Relaxed) as usize
+                        eligible[next[usize::from(selection.udp_flow)]
+                            .fetch_add(1, Ordering::Relaxed)
+                            as usize
                             % eligible.len()]
                     }
                 };
-                members[selected].select(udp, selection, leaves)?;
+                members[selected].select(require_udp, selection, leaves)?;
             }
         }
         Ok(())
@@ -694,6 +699,90 @@ mod tests {
                 resumed.tcp_selection_indices()
             );
         }
+    }
+
+    #[test]
+    fn nonterminal_choices_rotate_tcp_and_udp_independently() {
+        for nested_selector in [false, true] {
+            let (chain, _) = build(
+                json!([
+                    {"client_group":"entry","client_chain":{"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}}},
+                    {"client_group":"inner","type":"selector","client_chain":"entry"},
+                    {"client_group":"out","client_chains":[
+                        {"chain":[if nested_selector { "inner" } else { "entry" }]},
+                        {"chain":[{"name":"b","address":"192.0.2.2:80","protocol":{"type":"http"}}]}
+                    ]}
+                ]),
+                json!(["out", {"pool":[
+                    {"name":"c","address":"192.0.2.3:80","protocol":{"type":"http"}},
+                    {"name":"d","address":"192.0.2.4:80","protocol":{"type":"http"}}
+                ]}, {"address":"192.0.2.5:80","protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}}]),
+            );
+            let tree = chain.composition.as_ref().unwrap();
+            for index in 0..8 {
+                let expected = if index % 2 == 0 {
+                    ["a", "c"]
+                } else {
+                    ["b", "d"]
+                };
+                for udp in [false, true] {
+                    #[cfg(unix)]
+                    let before = tree.tcp_selection_indices();
+                    let pinned = tree.select(udp).unwrap();
+                    for (hop, name) in expected.into_iter().enumerate() {
+                        assert_eq!(pinned.origin(hop, 0).unwrap().name.as_ref(), name);
+                    }
+                    #[cfg(unix)]
+                    if udp {
+                        assert_eq!(tree.tcp_selection_indices(), before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nonterminal_url_test_keeps_tcp_and_udp_incumbents_separate() {
+        let (chain, catalog) = build(
+            json!([{"client_group":"out","type":"url-test","url":"http://192.0.2.1/","tolerance":50,"client_chains":[
+                {"chain":[{"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}}]},
+                {"chain":[{"name":"b","address":"192.0.2.2:80","protocol":{"type":"http"}}]}
+            ]}]),
+            json!(["out", {"address":"192.0.2.3:80","protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}}]),
+        );
+        let tree = chain.composition.as_ref().unwrap();
+        let automatic = &catalog.selection.automatic;
+        automatic.record("a", "http://192.0.2.1/", Some(100));
+        automatic.record("b", "http://192.0.2.1/", Some(120));
+        assert_eq!(
+            tree.select(false)
+                .unwrap()
+                .origin(0, 0)
+                .unwrap()
+                .name
+                .as_ref(),
+            "a"
+        );
+        automatic.record("a", "http://192.0.2.1/", Some(120));
+        automatic.record("b", "http://192.0.2.1/", Some(100));
+        assert_eq!(
+            tree.select(true)
+                .unwrap()
+                .origin(0, 0)
+                .unwrap()
+                .name
+                .as_ref(),
+            "b"
+        );
+        assert_eq!(
+            tree.select(false)
+                .unwrap()
+                .origin(0, 0)
+                .unwrap()
+                .name
+                .as_ref(),
+            "a"
+        );
     }
 
     #[test]
