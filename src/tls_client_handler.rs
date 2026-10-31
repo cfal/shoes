@@ -170,22 +170,28 @@ impl TcpClientHandler for TlsClientHandler {
 mod tests {
     use super::*;
 
+    enum IdentityPath {
+        Tcp,
+        Udp,
+        Xhttp,
+    }
+
     #[tokio::test]
     async fn verification_uses_hop_identity_even_without_wire_sni() {
-        check_hop_identity(false, false).await;
+        check_hop_identity(IdentityPath::Tcp).await;
     }
 
     #[tokio::test]
     async fn udp_verification_uses_hop_identity_even_without_wire_sni() {
-        check_hop_identity(true, false).await;
+        check_hop_identity(IdentityPath::Udp).await;
     }
 
     #[tokio::test]
     async fn xhttp_inner_tls_keeps_hop_identity_without_default_sni() {
-        check_hop_identity(false, true).await;
+        check_hop_identity(IdentityPath::Xhttp).await;
     }
 
-    async fn check_hop_identity(udp: bool, xhttp: bool) {
+    async fn check_hop_identity(path: IdentityPath) {
         use crate::address::NetLocation;
         use crate::async_stream::{AsyncFlushMessage, AsyncReadMessage, AsyncWriteMessage};
         use crate::tcp::tcp_client_handler_factory::create_tcp_client_handler;
@@ -211,6 +217,8 @@ mod tests {
             }
         }
 
+        let udp = matches!(path, IdentityPath::Udp);
+        let xhttp = matches!(path, IdentityPath::Xhttp);
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             for nested in [false, true] {
                 for (hop, sni, expected, wire_sni) in [

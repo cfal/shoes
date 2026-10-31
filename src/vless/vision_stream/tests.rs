@@ -702,7 +702,8 @@ async fn vision_udp_client_uses_mux_and_exchanges_arbitrary_datagrams() {
 #[tokio::test]
 async fn vision_udp_small_tls_buffers_keep_the_initial_prefix_in_one_record() {
     use crate::async_stream::{
-        AsyncFlushMessage, AsyncReadSessionMessage, AsyncShutdownMessage, AsyncWriteSessionMessage,
+        AsyncFlushMessage, AsyncReadSessionMessage, AsyncShutdownMessageExt,
+        AsyncWriteSessionMessage,
     };
     use crate::tcp::tcp_client_handler_factory::create_tcp_client_handler;
     use crate::xudp::message_stream::XudpMessageStream;
@@ -796,9 +797,7 @@ async fn vision_udp_small_tls_buffers_keep_the_initial_prefix_in_one_record() {
                         .unwrap();
                     assert_eq!(buf.filled(), payload);
                 }
-                poll_fn(|cx| Pin::new(&mut server).poll_shutdown_message(cx))
-                    .await
-                    .unwrap();
+                server.shutdown_message().await.unwrap();
             }
         }
     })
