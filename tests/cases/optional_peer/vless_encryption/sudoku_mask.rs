@@ -288,6 +288,11 @@ async fn xray_layouts_padding_and_stack_order() {
     for peer_client in [false, true] {
         for masks in [
             vec![json!({"password":"example"})],
+            vec![json!({"password":"example","padding_min":10,"padding_max":10})],
+            vec![json!({"ascii":"ascii","password":"example","padding_min":10,"padding_max":10})],
+            vec![
+                json!({"custom_tables":["xpxvvpvv"],"password":"example","padding_min":10,"padding_max":10}),
+            ],
             vec![json!({"ascii":"ascii","password":"example","padding_min":100,"padding_max":100})],
             vec![
                 json!({"custom_tables":["xpxvvpvv","vxpvxvvp"],"password":"rotating","padding_min":5,"padding_max":15}),

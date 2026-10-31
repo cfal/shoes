@@ -32,6 +32,10 @@ Clippy's `--all-features` compiles optional tests but does not execute them.
 Likewise, a filtered `cargo test` command that matches zero tests succeeds; check
 the reported test count when renaming modules or changing CI filters.
 
+The unit-test CI job also builds the [pinned AnyTLS reference peer](fixtures/anytls-peer/README.md)
+and explicitly runs its ignored TCP/UoT pooling test. Ordinary library runs do not
+require Go or an external peer binary.
+
 ## Integration Targets
 
 | Target | Feature | Prerequisites and scope |

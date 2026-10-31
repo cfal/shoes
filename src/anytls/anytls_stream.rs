@@ -17,6 +17,7 @@
 use super::anytls_client_session::{AnyTlsClientSession, OutgoingMessage};
 use crate::async_stream::{AsyncPing, AsyncStream};
 use bytes::Bytes;
+use futures::task::AtomicWaker;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,6 +26,118 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::PollSender;
+
+use super::anytls_client_pool::SessionPool;
+use crate::tcp::carrier_dialer::CarrierDialer;
+
+struct PoolReturn {
+    pool: std::sync::Weak<SessionPool>,
+    session: std::sync::Weak<AnyTlsClientSession>,
+    route: Arc<dyn CarrierDialer>,
+}
+
+impl PoolReturn {
+    fn prepare(self) -> Option<(Self, Arc<AnyTlsClientSession>)> {
+        self.session.upgrade().map(|session| (self, session))
+    }
+
+    fn release(self, session: Arc<AnyTlsClientSession>) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.release(session, self.route);
+        } else {
+            session.close();
+        }
+    }
+}
+
+struct Completion {
+    // Peer completion must cancel queue reservations before publishing idle.
+    write: WriteChannel,
+    finished: bool,
+    writer_disposed: bool,
+    error: Option<String>,
+    pool_return: Option<PoolReturn>,
+    handoff: Option<(PoolReturn, Arc<AnyTlsClientSession>)>,
+}
+
+pub(super) struct StreamLifecycle {
+    completion: parking_lot::Mutex<Completion>,
+    write_waker: AtomicWaker,
+}
+
+impl StreamLifecycle {
+    fn new(write: WriteChannel) -> Self {
+        Self {
+            completion: parking_lot::Mutex::new(Completion {
+                write,
+                finished: false,
+                writer_disposed: false,
+                error: None,
+                pool_return: None,
+                handoff: None,
+            }),
+            write_waker: AtomicWaker::new(),
+        }
+    }
+
+    pub(super) fn client(sender: mpsc::Sender<OutgoingMessage>) -> Self {
+        Self::new(WriteChannel::Client {
+            sender: PollSender::new(sender),
+            flush: None,
+        })
+    }
+
+    pub(super) fn finish(&self, error: Option<String>) {
+        let write = {
+            let mut state = self.completion.lock();
+            if state.finished {
+                return;
+            }
+            state.finished = true;
+            state.error = error;
+            // A woken caller may immediately drop the last stream keepalive.
+            state.handoff = state.pool_return.take().and_then(PoolReturn::prepare);
+            std::mem::replace(&mut state.write, WriteChannel::Closed)
+        };
+        // Dropping stored wakers can synchronously dispose of their stream.
+        // Keep both those destructors and explicit wakeups outside the lock.
+        drop(write);
+        let return_to_pool = {
+            let mut state = self.completion.lock();
+            state.writer_disposed = true;
+            state.handoff.take()
+        };
+        self.write_waker.wake();
+        if let Some((return_to_pool, session)) = return_to_pool {
+            return_to_pool.release(session);
+        }
+    }
+
+    fn error(&self) -> Option<io::Error> {
+        self.completion
+            .lock()
+            .error
+            .as_ref()
+            .map(|message| io::Error::new(io::ErrorKind::ConnectionRefused, message.clone()))
+    }
+
+    fn attach(&self, return_to_pool: PoolReturn) {
+        let mut state = self.completion.lock();
+        if state.writer_disposed {
+            let handoff = return_to_pool.prepare();
+            drop(state);
+            if let Some((return_to_pool, session)) = handoff {
+                return_to_pool.release(session);
+            }
+        } else if state.finished {
+            // Completion may be disposing the detached writer on another
+            // thread. Retain the handoff but do not publish idle before it ends.
+            state.handoff = return_to_pool.prepare();
+        } else {
+            state.pool_return = Some(return_to_pool);
+        }
+    }
+}
 
 /// Buffer size for bounded channels (number of messages, not bytes)
 /// Each message is typically a frame's worth of data (up to 64KB)
@@ -36,6 +149,7 @@ pub const STREAM_CHANNEL_BUFFER: usize = 16;
 const MAX_FRAME_DATA_SIZE: usize = 65535;
 
 enum WriteChannel {
+    Closed,
     Server(PollSender<(u32, Bytes)>),
     Client {
         sender: PollSender<OutgoingMessage>,
@@ -53,6 +167,7 @@ impl WriteChannel {
     }
     fn poll_reserve(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
         match self {
+            Self::Closed => Poll::Ready(Err(())),
             Self::Server(sender) => sender.poll_reserve(cx).map_err(|_| ()),
             Self::Client { sender, .. } => sender.poll_reserve(cx).map_err(|_| ()),
         }
@@ -60,6 +175,7 @@ impl WriteChannel {
 
     fn send_item(&mut self, (stream_id, data): (u32, Bytes)) -> Result<(), ()> {
         match self {
+            Self::Closed => Err(()),
             Self::Server(sender) => sender.send_item((stream_id, data)).map_err(|_| ()),
             Self::Client { sender, .. } => {
                 let message = if data.is_empty() {
@@ -74,6 +190,7 @@ impl WriteChannel {
 
     fn try_send_fin(&mut self, stream_id: u32) -> Result<(), ()> {
         match self {
+            Self::Closed => Err(()),
             Self::Server(sender) => sender
                 .get_ref()
                 .ok_or(())?
@@ -127,11 +244,6 @@ pub struct AnyTlsStream {
     /// Offset into read_buffer for partial consumption
     read_offset: usize,
 
-    /// Poll-based sender for outgoing data to session (bounded with backpressure)
-    /// Data sent here will be framed as PSH and written to the connection.
-    /// PollSender provides poll_reserve() for non-blocking backpressure.
-    data_tx: WriteChannel,
-
     /// Shared flag indicating session closure
     session_closed: Arc<AtomicBool>,
 
@@ -149,6 +261,7 @@ pub struct AnyTlsStream {
     /// Keepalive reference to the session (client-side only)
     /// This ensures the session stays alive as long as any stream exists
     _session_keepalive: Option<Arc<AnyTlsClientSession>>,
+    lifecycle: Arc<StreamLifecycle>,
 }
 
 impl AnyTlsStream {
@@ -170,13 +283,15 @@ impl AnyTlsStream {
             data_rx,
             read_buffer: Bytes::new(),
             read_offset: 0,
-            data_tx: WriteChannel::Server(PollSender::new(data_tx)),
             session_closed,
             stream_closed: false,
             shutdown_in_progress: false,
             fin_sent: false,
             eof: false,
             _session_keepalive: None,
+            lifecycle: Arc::new(StreamLifecycle::new(WriteChannel::Server(PollSender::new(
+                data_tx,
+            )))),
             peer: None,
         }
     }
@@ -188,25 +303,22 @@ impl AnyTlsStream {
     pub(super) fn with_keepalive(
         id: u32,
         data_rx: mpsc::Receiver<Bytes>,
-        data_tx: mpsc::Sender<OutgoingMessage>,
         session_closed: Arc<AtomicBool>,
         session: Arc<AnyTlsClientSession>,
+        lifecycle: Arc<StreamLifecycle>,
     ) -> Self {
         Self {
             id,
             data_rx,
             read_buffer: Bytes::new(),
             read_offset: 0,
-            data_tx: WriteChannel::Client {
-                sender: PollSender::new(data_tx),
-                flush: None,
-            },
             session_closed,
             stream_closed: false,
             shutdown_in_progress: false,
             fin_sent: false,
             eof: false,
             _session_keepalive: Some(session),
+            lifecycle,
             peer: None,
         }
     }
@@ -220,6 +332,21 @@ impl AnyTlsStream {
         self.data_rx.close();
     }
 
+    pub(super) fn attach_pool(&self, pool: &Arc<SessionPool>, route: Arc<dyn CarrierDialer>) {
+        self.lifecycle.attach(PoolReturn {
+            pool: Arc::downgrade(pool),
+            session: Arc::downgrade(self._session_keepalive.as_ref().unwrap()),
+            route,
+        });
+    }
+
+    fn finish(&self) {
+        if let Some(session) = &self._session_keepalive {
+            session.remove_stream(self.id);
+        }
+        self.lifecycle.finish(None);
+    }
+
     /// Best-effort FIN send for Drop (cannot block in Drop)
     ///
     /// This is only used when the stream is dropped without being properly shutdown.
@@ -227,9 +354,9 @@ impl AnyTlsStream {
     /// for the Drop path since we can't block there.
     ///
     /// For proper shutdown semantics, use `poll_shutdown` which blocks until FIN is sent.
-    fn send_fin_best_effort(&mut self) {
+    fn send_fin_best_effort(&self, write: &mut WriteChannel) {
         // Don't abort pending data - just try to send FIN if there's room
-        if self.data_tx.try_send_fin(self.id).is_err()
+        if write.try_send_fin(self.id).is_err()
             && let Some(session) = &self._session_keepalive
         {
             session.close();
@@ -290,7 +417,7 @@ impl AsyncRead for AnyTlsStream {
             Poll::Ready(None) => {
                 // Channel closed - EOF
                 self.eof = true;
-                Poll::Ready(Ok(()))
+                Poll::Ready(self.lifecycle.error().map_or(Ok(()), Err))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -299,14 +426,26 @@ impl AsyncRead for AnyTlsStream {
 
 impl AsyncWrite for AnyTlsStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let lifecycle = self.lifecycle.clone();
+        lifecycle.write_waker.register(cx.waker());
+        let mut completion = lifecycle.completion.lock();
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if self.stream_closed {
+        if completion.finished
+            && completion.error.is_none()
+            && !self.stream_closed
+            && !self.shutdown_in_progress
+        {
+            // Discarding late uploads lets the relay drain its response after peer FIN
+            // without aborting on a write error or touching a reused carrier.
+            return Poll::Ready(Ok(buf.len()));
+        }
+        if self.stream_closed || completion.finished {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stream closed",
@@ -327,16 +466,16 @@ impl AsyncWrite for AnyTlsStream {
             )));
         }
 
-        std::task::ready!(self.data_tx.poll_pending_flush(cx))?;
+        std::task::ready!(completion.write.poll_pending_flush(cx))?;
         // Use poll_reserve for backpressure - this will return Pending if channel is full
-        match self.data_tx.poll_reserve(cx) {
+        match completion.write.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
                 // Limit write size to max frame payload (u16::MAX = 65535)
                 // This prevents protocol corruption from length field truncation
                 let write_len = buf.len().min(MAX_FRAME_DATA_SIZE);
                 let data = Bytes::copy_from_slice(&buf[..write_len]);
                 let id = self.id;
-                match self.data_tx.send_item((id, data)) {
+                match completion.write.send_item((id, data)) {
                     Ok(()) => Poll::Ready(Ok(write_len)),
                     Err(_) => Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -359,47 +498,75 @@ impl AsyncWrite for AnyTlsStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.data_tx.poll_flush(cx)
+        let lifecycle = self.lifecycle.clone();
+        lifecycle.write_waker.register(cx.waker());
+        let mut completion = lifecycle.completion.lock();
+        if self.stream_closed || completion.finished {
+            // The carrier may already belong to another lease. Its writer and
+            // any obsolete flush barrier must not delay this terminal stream.
+            return Poll::Ready(Ok(()));
+        }
+        std::task::ready!(completion.write.poll_flush(cx))?;
+        // UoT flushes before every shutdown poll. That flush can consume the
+        // pending FIN barrier; remember completion rather than enqueueing it again.
+        if self.shutdown_in_progress && self.fin_sent {
+            self.data_rx.close();
+            self.stream_closed = true;
+            drop(completion);
+            self.finish();
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.stream_closed {
+        let lifecycle = self.lifecycle.clone();
+        lifecycle.write_waker.register(cx.waker());
+        let mut completion = lifecycle.completion.lock();
+        if self.stream_closed || completion.finished {
+            self.stream_closed = true;
             return Poll::Ready(Ok(()));
         }
         if self.session_closed.load(Ordering::Relaxed) {
             self.data_rx.close();
             self.stream_closed = true;
+            let write = std::mem::replace(&mut completion.write, WriteChannel::Closed);
+            drop(completion);
+            drop(write);
             return Poll::Ready(Ok(()));
         }
         self.shutdown_in_progress = true;
         if !self.fin_sent {
-            std::task::ready!(self.data_tx.poll_pending_flush(cx))?;
-            std::task::ready!(self.data_tx.poll_reserve(cx))
+            std::task::ready!(completion.write.poll_pending_flush(cx))?;
+            std::task::ready!(completion.write.poll_reserve(cx))
                 .map_err(|_| io::ErrorKind::BrokenPipe)?;
             let id = self.id;
-            self.data_tx
+            completion
+                .write
                 .send_item((id, Bytes::new()))
                 .map_err(|_| io::ErrorKind::BrokenPipe)?;
             self.fin_sent = true;
         }
-        std::task::ready!(self.data_tx.poll_flush(cx))?;
+        std::task::ready!(completion.write.poll_flush(cx))?;
         self.data_rx.close();
         self.stream_closed = true;
+        drop(completion);
+        self.finish();
         Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for AnyTlsStream {
     fn drop(&mut self) {
+        let lifecycle = self.lifecycle.clone();
+        let mut completion = lifecycle.completion.lock();
         // If stream wasn't properly shutdown, try best-effort FIN
         // This handles cases where the stream is dropped without calling shutdown()
-        if !self.stream_closed && !self.fin_sent {
+        if !self.stream_closed && !self.fin_sent && !completion.finished {
             self.stream_closed = true;
-            self.send_fin_best_effort();
+            self.send_fin_best_effort(&mut completion.write);
         }
-        if let Some(session) = &self._session_keepalive {
-            session.remove_stream(self.id);
-        }
+        drop(completion);
+        self.finish();
     }
 }
 

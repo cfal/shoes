@@ -4,9 +4,9 @@ use async_trait::async_trait;
 
 use super::{CipherSuite, Mldsa65VerifyKey, RealityClientConfig};
 use crate::address::ResolvedLocation;
-use crate::async_stream::AsyncStream;
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::crypto::{CryptoTlsStream, TlsReadMode};
-use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::tcp::tcp_handler::{ClientTransport, TcpClientHandler, TcpClientSetupResult};
 
 #[derive(Debug)]
 pub struct RealityClientHandler {
@@ -113,6 +113,38 @@ impl RealityClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for RealityClientHandler {
+    fn has_session_pool(&self) -> bool {
+        matches!(&self.handler, RealityInnerClientHandler::Default(handler) if handler.has_session_pool())
+    }
+
+    async fn connect_client_tcp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        if let RealityInnerClientHandler::Default(handler) = &self.handler {
+            let transport = transport.wrap(|stream| self.setup_client_stream_common(stream));
+            handler.connect_client_tcp(transport, target).await
+        } else {
+            self.setup_client_tcp_stream(transport.open.await?, target)
+                .await
+        }
+    }
+
+    async fn connect_client_udp(
+        &self,
+        transport: ClientTransport<'_>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        if let RealityInnerClientHandler::Default(handler) = &self.handler {
+            let transport = transport.wrap(|stream| self.setup_client_stream_common(stream));
+            handler.connect_client_udp(transport, target).await
+        } else {
+            self.setup_client_udp_bidirectional(transport.open.await?, target)
+                .await
+        }
+    }
+
     async fn prepare_target(
         &self,
         target: ResolvedLocation,

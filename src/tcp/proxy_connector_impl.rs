@@ -8,13 +8,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use log::debug;
 
+use super::carrier_dialer::CarrierDialer;
 use super::proxy_connector::ProxyConnector;
 use super::tcp_client_handler_factory::create_tcp_client_handler;
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::config::ClientConfig;
 use crate::resolver::Resolver;
-use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::tcp::tcp_handler::{ClientTransport, TcpClientHandler, TcpClientSetupResult};
 
 pub(crate) fn create_proxy_connector(
     config: ClientConfig,
@@ -43,6 +44,20 @@ pub struct ProxyConnectorImpl {
 }
 
 impl ProxyConnectorImpl {
+    fn client_transport(&self, dialer: Arc<dyn CarrierDialer>) -> ClientTransport<'_> {
+        ClientTransport {
+            route: dialer.clone(),
+            open: Box::pin(async move {
+                match &self.xhttp {
+                    Some(client) => {
+                        Ok(Box::new(client.open(dialer).await?) as Box<dyn AsyncStream>)
+                    }
+                    None => dialer.open_stream().await,
+                }
+            }),
+        }
+    }
+
     /// Create a ProxyConnector from a ClientConfig's protocol-related fields.
     ///
     /// Returns None for direct protocol (direct has no ProxyConnector).
@@ -86,34 +101,26 @@ impl ProxyConnector for ProxyConnectorImpl {
     }
 
     fn needs_carrier_dialer(&self) -> bool {
-        self.xhttp.is_some()
+        self.xhttp.is_some() || self.client_handler.has_session_pool()
     }
 
     async fn connect_tcp_with_dialer(
         &self,
-        dialer: Arc<dyn super::carrier_dialer::CarrierDialer>,
+        dialer: Arc<dyn CarrierDialer>,
         target: &ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let stream: Box<dyn AsyncStream> = match &self.xhttp {
-            Some(client) => Box::new(client.open(dialer).await?),
-            None => dialer.open_stream().await?,
-        };
         self.client_handler
-            .setup_client_tcp_stream(stream, target.clone())
+            .connect_client_tcp(self.client_transport(dialer), target.clone())
             .await
     }
 
     async fn connect_udp_with_dialer(
         &self,
-        dialer: Arc<dyn super::carrier_dialer::CarrierDialer>,
+        dialer: Arc<dyn CarrierDialer>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-        let stream: Box<dyn AsyncStream> = match &self.xhttp {
-            Some(client) => Box::new(client.open(dialer).await?),
-            None => dialer.open_stream().await?,
-        };
         self.client_handler
-            .setup_client_udp_bidirectional(stream, target)
+            .connect_client_udp(self.client_transport(dialer), target)
             .await
     }
 
@@ -181,10 +188,232 @@ mod tests {
     use super::*;
     use crate::config::ClientProxyConfig;
     use crate::resolver::NativeResolver;
+    use crate::tcp::carrier_dialer::RouteKey;
     use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn mock_resolver() -> Arc<dyn Resolver> {
         Arc::new(NativeResolver::new())
+    }
+
+    #[derive(Debug)]
+    struct UnopenedDialer(RouteKey);
+
+    #[async_trait]
+    impl CarrierDialer for UnopenedDialer {
+        fn route_key(&self) -> &RouteKey {
+            &self.0
+        }
+
+        async fn open_stream(&self) -> std::io::Result<Box<dyn AsyncStream>> {
+            panic!("pool hit must not open a carrier")
+        }
+    }
+
+    #[derive(Debug)]
+    struct PoolProbe {
+        open_transport: bool,
+    }
+
+    const PROBE_PAYLOAD: &[u8] = b"cleartext probe";
+
+    impl PoolProbe {
+        async fn probe(&self, transport: ClientTransport<'_>) -> std::io::Result<()> {
+            if self.open_transport {
+                let mut stream = transport.open.await?;
+                stream.write_all(PROBE_PAYLOAD).await?;
+                stream.flush().await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl TcpClientHandler for PoolProbe {
+        fn has_session_pool(&self) -> bool {
+            true
+        }
+
+        async fn connect_client_tcp(
+            &self,
+            transport: ClientTransport<'_>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            self.probe(transport).await?;
+            Err(std::io::Error::other("TCP pool reached"))
+        }
+
+        async fn connect_client_udp(
+            &self,
+            transport: ClientTransport<'_>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            self.probe(transport).await?;
+            Err(std::io::Error::other("UDP pool reached"))
+        }
+
+        async fn setup_client_tcp_stream(
+            &self,
+            _: Box<dyn AsyncStream>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            panic!("pool hit must use the lazy connect path")
+        }
+    }
+
+    async fn assert_pool_forwarding(connector: &ProxyConnectorImpl) {
+        assert!(connector.client_handler.has_session_pool());
+        assert!(connector.needs_carrier_dialer());
+        let dialer = Arc::new(UnopenedDialer(RouteKey(vec![1])));
+        let target = NetLocation::from_str("example.com:443", None)
+            .unwrap()
+            .into();
+        assert_eq!(
+            connector
+                .connect_tcp_with_dialer(dialer.clone(), &target)
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "TCP pool reached"
+        );
+        assert_eq!(
+            connector
+                .connect_udp_with_dialer(dialer, target)
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "UDP pool reached"
+        );
+    }
+
+    fn wrapper_handlers(open_transport: bool) -> Vec<(&'static str, Box<dyn TcpClientHandler>)> {
+        let tls = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let sudoku: crate::sudoku_mask::SudokuMaskConfig<()> =
+            serde_json::from_value(serde_json::json!({"protocol": null})).unwrap();
+        let mut public_key = [0; 32];
+        public_key[0] = 9;
+        let inner = || Box::new(PoolProbe { open_transport }) as Box<dyn TcpClientHandler>;
+        vec![
+            (
+                "tls",
+                Box::new(crate::tls_client_handler::TlsClientHandler::new(
+                    tls.clone(),
+                    None,
+                    "localhost".try_into().unwrap(),
+                    inner(),
+                )),
+            ),
+            (
+                "reality",
+                Box::new(crate::reality::RealityClientHandler::new(
+                    public_key,
+                    [0; 8],
+                    "localhost".try_into().unwrap(),
+                    vec![],
+                    inner(),
+                )),
+            ),
+            (
+                "shadowtls",
+                Box::new(crate::shadow_tls::ShadowTlsClientHandler::new(
+                    "test".into(),
+                    tls,
+                    "localhost".try_into().unwrap(),
+                    inner(),
+                )),
+            ),
+            (
+                "websocket",
+                Box::new(crate::websocket::WebsocketTcpClientHandler::new(
+                    "localhost:443".into(),
+                    None,
+                    None,
+                    Default::default(),
+                    inner(),
+                )),
+            ),
+            (
+                "sudoku",
+                Box::new(crate::sudoku_mask::handler::ClientHandler {
+                    config: sudoku.prepare().unwrap(),
+                    inner: inner(),
+                }),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn every_wrapper_forwards_pool_hits_without_opening_the_transport() {
+        for (_, client_handler) in wrapper_handlers(false) {
+            let connector = ProxyConnectorImpl {
+                location: NetLocation::from_str("localhost:443", None).unwrap(),
+                client_handler,
+                xhttp: None,
+            };
+            assert_pool_forwarding(&connector).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn every_wrapper_wraps_the_transport_on_pool_misses() {
+        for udp in [false, true] {
+            for (name, handler) in wrapper_handlers(true) {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    let (client, mut peer) = tokio::io::duplex(4096);
+                    let transport = ClientTransport {
+                        route: Arc::new(UnopenedDialer(RouteKey(vec![1]))),
+                        open: Box::pin(async { Ok(Box::new(client) as Box<dyn AsyncStream>) }),
+                    };
+                    let target = NetLocation::from_str("example.com:443", None)
+                        .unwrap()
+                        .into();
+                    let connect = async {
+                        if udp {
+                            let _ = handler.connect_client_udp(transport, target).await;
+                        } else {
+                            let _ = handler.connect_client_tcp(transport, target).await;
+                        }
+                    };
+                    let inspect = async {
+                        let mut prefix = [0; 4];
+                        peer.read_exact(&mut prefix).await.unwrap();
+                        match name {
+                            "websocket" => assert_eq!(&prefix, b"GET "),
+                            "sudoku" => assert_ne!(&prefix, &PROBE_PAYLOAD[..4]),
+                            _ => assert_eq!(&prefix[..2], &[0x16, 0x03]),
+                        }
+                        // Closing the peer ends handshakes after their first flight.
+                        drop(peer);
+                    };
+                    tokio::join!(connect, inspect);
+                })
+                .await
+                .unwrap_or_else(|_| panic!("wrapper did not emit bytes: {name}, udp={udp}"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn xhttp_pool_hits_do_not_open_the_transport() {
+        let config = serde_json::from_value(serde_json::json!({
+            "address": "localhost:443",
+            "protocol": {"type": "xhttp", "mode": "stream-one", "protocol": {"type": "socks"}}
+        }))
+        .unwrap();
+        let mut connector = ProxyConnectorImpl::from_config(config, mock_resolver())
+            .unwrap()
+            .unwrap();
+        assert!(connector.xhttp.is_some());
+        connector.client_handler = Box::new(PoolProbe {
+            open_transport: false,
+        });
+        assert_pool_forwarding(&connector).await;
     }
 
     #[derive(Debug)]

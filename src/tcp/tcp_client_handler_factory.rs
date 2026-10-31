@@ -446,6 +446,10 @@ pub(crate) fn create_with_hop_context(
             password,
             udp_enabled,
             padding_scheme,
+            idle_session_check_interval_secs,
+            idle_session_timeout_secs,
+            min_idle_session,
+            disable_reuse,
         } => {
             let padding = match padding_scheme {
                 Some(lines) => {
@@ -454,7 +458,17 @@ pub(crate) fn create_with_hop_context(
                 }
                 None => PaddingFactory::default_factory(),
             };
-            Box::new(AnyTlsClientHandler::new(password, padding, udp_enabled))
+            Box::new(AnyTlsClientHandler::with_options(
+                password,
+                padding,
+                udp_enabled,
+                crate::anytls::PoolOptions {
+                    idle_session_check_interval_secs,
+                    idle_session_timeout_secs,
+                    min_idle_session,
+                    disable_reuse,
+                },
+            ))
         }
         ClientProxyConfig::Naiveproxy {
             username,
