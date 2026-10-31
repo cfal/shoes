@@ -151,6 +151,16 @@ impl AnyTlsClientSession {
         self: &Arc<Self>,
         destination: NetLocation,
     ) -> io::Result<AnyTlsStream> {
+        self.try_open_stream(destination)
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "Session is closed"))
+    }
+
+    /// Returns None only when closure is observed before any stream frames are queued.
+    pub(super) async fn try_open_stream(
+        self: &Arc<Self>,
+        destination: NetLocation,
+    ) -> io::Result<Option<AnyTlsStream>> {
         self.state.open_stream(destination, Arc::clone(self)).await
     }
 
@@ -799,13 +809,10 @@ impl ClientSessionState {
         self: &Arc<Self>,
         destination: NetLocation,
         owner: Arc<AnyTlsClientSession>,
-    ) -> io::Result<AnyTlsStream> {
+    ) -> io::Result<Option<AnyTlsStream>> {
         validate_destination(&destination)?;
         if self.is_closed.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "Session is closed",
-            ));
+            return Ok(None);
         }
 
         // Allocate stream ID (sequential starting from 1, matching Go implementation)
@@ -827,7 +834,7 @@ impl ClientSessionState {
         {
             let mut streams = self.streams.lock();
             if self.is_closed.load(Ordering::Relaxed) {
-                return Err(io::ErrorKind::NotConnected.into());
+                return Ok(None);
             }
             streams.insert(
                 stream_id,
@@ -872,9 +879,18 @@ impl ClientSessionState {
             );
             self.send_buffered(data).await?;
         } else {
-            // Subsequent streams: send SYN and destination normally
-            self.send_control_frame(Command::Syn, stream_id, Bytes::new())
-                .await?;
+            let Ok(permit) = self.outgoing_tx.reserve().await else {
+                return Ok(None);
+            };
+            // Reservation is not admission; closure may occur while waiting for capacity.
+            if self.is_closed.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            permit.send(OutgoingMessage::Control {
+                cmd: Command::Syn,
+                stream_id,
+                data: Bytes::new(),
+            });
             self.send_control_frame(Command::Psh, stream_id, Bytes::from(dest_data))
                 .await?;
         }
@@ -888,7 +904,7 @@ impl ClientSessionState {
         );
         registration.armed = false;
 
-        Ok(stream)
+        Ok(Some(stream))
     }
 }
 
@@ -964,6 +980,121 @@ mod tests {
             close_notify: CancellationToken::new(),
         });
         (state, rx)
+    }
+
+    #[tokio::test]
+    async fn closed_stream_open_is_retryable_without_registering_or_queueing() {
+        let (state, mut rx) = writer_state();
+        let session = Arc::new(AnyTlsClientSession {
+            state: state.clone(),
+            tasks: Vec::new(),
+        });
+        state.close();
+        let destination = NetLocation::from_str("example.org:443", None).unwrap();
+        assert!(
+            session
+                .try_open_stream(destination.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.streams.lock().is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let error = session.open_stream(destination).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn queued_syn_is_the_stream_open_retry_boundary() {
+        for queued_syn in [false, true] {
+            let (state, mut rx) = writer_state();
+            let session = Arc::new(AnyTlsClientSession {
+                state: state.clone(),
+                tasks: Vec::new(),
+            });
+            let backlog = STREAM_CHANNEL_BUFFER - usize::from(queued_syn);
+            for _ in 0..backlog {
+                assert!(
+                    state
+                        .outgoing_tx
+                        .try_send(OutgoingMessage::Fin { stream_id: 1 })
+                        .is_ok()
+                );
+            }
+            let destination = NetLocation::from_str("example.org:443", None).unwrap();
+            let mut opening = Box::pin(session.try_open_stream(destination));
+            assert!(futures::poll!(&mut opening).is_pending());
+            rx.close();
+            for _ in 0..backlog {
+                assert!(matches!(
+                    rx.try_recv().unwrap(),
+                    OutgoingMessage::Fin { stream_id: 1 }
+                ));
+            }
+            if queued_syn {
+                assert!(matches!(
+                    rx.try_recv().unwrap(),
+                    OutgoingMessage::Control {
+                        cmd: Command::Syn,
+                        stream_id: 2,
+                        ..
+                    }
+                ));
+            }
+            assert!(rx.is_empty());
+            drop(rx);
+            let result = opening.await;
+            if queued_syn {
+                assert_eq!(result.err().unwrap().kind(), io::ErrorKind::BrokenPipe);
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+            assert!(!session.is_reusable());
+            assert!(state.streams.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn session_closure_while_reserving_syn_does_not_admit_it() {
+        let (state, mut rx) = writer_state();
+        let session = Arc::new(AnyTlsClientSession {
+            state: state.clone(),
+            tasks: Vec::new(),
+        });
+        for _ in 0..STREAM_CHANNEL_BUFFER {
+            assert!(
+                state
+                    .outgoing_tx
+                    .try_send(OutgoingMessage::Fin { stream_id: 1 })
+                    .is_ok()
+            );
+        }
+        let destination = NetLocation::from_str("example.org:443", None).unwrap();
+        let mut opening = Box::pin(session.try_open_stream(destination));
+        assert!(futures::poll!(&mut opening).is_pending());
+        state.close();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            OutgoingMessage::Fin { stream_id: 1 }
+        ));
+        assert!(matches!(
+            futures::poll!(&mut opening),
+            Poll::Ready(Ok(None))
+        ));
+        for _ in 1..STREAM_CHANNEL_BUFFER {
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                OutgoingMessage::Fin { stream_id: 1 }
+            ));
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(state.streams.lock().is_empty());
     }
 
     #[tokio::test]
