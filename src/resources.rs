@@ -242,14 +242,22 @@ pub(crate) fn configure_quic(
     bidi_streams: u32,
     uni_streams: u32,
 ) -> usize {
-    let limits = limits();
+    configure_quic_with_limits(config, bidi_streams, uni_streams, limits())
+}
+
+pub(crate) fn configure_quic_with_limits(
+    config: &mut quinn::ServerConfig,
+    bidi_streams: u32,
+    uni_streams: u32,
+    limits: GlobalLimits,
+) -> usize {
     // Pending Initials are buffered before connection memory is reserved.
     config
         .max_incoming(limits.max_connections.unwrap_or(128).min(128))
         .incoming_buffer_size(65536)
         .incoming_buffer_size_total(1 << 20);
     let transport = Arc::get_mut(&mut config.transport).unwrap();
-    let memory_bytes = configure_quic_transport(transport);
+    let memory_bytes = configure_quic_transport_with_limits(transport, limits);
     // Quinn eagerly allocates advertised stream credit. Unlimited admission keeps
     // the protocol's existing flow-control window rather than advertising infinity.
     let (bidi_streams, uni_streams) = match limits.max_streams_per_connection {

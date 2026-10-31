@@ -162,14 +162,14 @@ fn configs() -> (quinn::ClientConfig, quinn::ServerConfig) {
 /// Plain quinn endpoints on loopback whose client trusts the server's self-signed
 /// `localhost` certificate.
 pub(crate) fn test_endpoints() -> (quinn::Endpoint, quinn::Endpoint) {
-    test_endpoints_with_uni_limit(100)
+    test_endpoints_with_config(|_| {})
 }
 
-pub(crate) fn test_endpoints_with_uni_limit(limit: u32) -> (quinn::Endpoint, quinn::Endpoint) {
+pub(crate) fn test_endpoints_with_config(
+    configure: impl FnOnce(&mut quinn::ServerConfig),
+) -> (quinn::Endpoint, quinn::Endpoint) {
     let (client_config, mut server_config) = configs();
-    Arc::get_mut(&mut server_config.transport)
-        .unwrap()
-        .max_concurrent_uni_streams(limit.into());
+    configure(&mut server_config);
     let server = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     client.set_default_client_config(client_config);
