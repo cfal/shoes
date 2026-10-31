@@ -446,11 +446,7 @@ impl SocketConnectorImpl {
             addresses.sort_by_key(SocketAddr::is_ipv6);
         }
         let verification_name = address.address().to_string();
-        let domain = sni_hostname.as_deref().unwrap_or(if *native {
-            &verification_name
-        } else {
-            address.address().hostname().unwrap_or("example.com")
-        });
+        let domain = sni_hostname.as_deref().unwrap_or(&verification_name);
         let mut last_error = std::io::Error::other("no resolved addresses succeeded");
         for address in addresses {
             let endpoint = if let Some(hopping) = hopping {
@@ -744,7 +740,7 @@ mod tests {
         check_quic_verification(
             "localhost",
             "localhost",
-            None,
+            Some(None),
             false,
             true,
             &[
@@ -755,51 +751,56 @@ mod tests {
         .await;
     }
 
-    const NATIVE_QUIC_PROTOCOLS: &[&str] = &[
+    const QUIC_PROTOCOLS: &[&str] = &[
+        "{type: socks}",
+        "{type: xhttp, http_version: h3, protocol: {type: socks}}",
         "{type: hysteria2, password: password}",
         "{type: tuic, uuid: 01234567-89ab-4def-8123-456789abcdef, password: password}",
     ];
 
     #[tokio::test]
-    async fn native_quic_verifies_ip_certificates_without_sni() {
-        check_quic_verification(
-            "127.0.0.1",
-            "127.0.0.1",
-            None,
-            false,
-            true,
-            NATIVE_QUIC_PROTOCOLS,
-        )
-        .await;
+    async fn quic_verifies_ip_certificates_without_sni() {
+        for (host, ipv6) in [("127.0.0.1", false), ("::1", true)] {
+            for sni in [None, Some(None)] {
+                check_quic_verification(host, host, sni, ipv6, true, QUIC_PROTOCOLS).await;
+            }
+        }
     }
 
     #[tokio::test]
-    async fn native_quic_verifies_ipv6_hostnames_and_sni_overrides() {
+    async fn quic_verifies_hostnames_and_sni_overrides() {
         for (host, certificate_name, sni, ipv6, succeeds) in [
-            ("::1", "::1", None, true, true),
-            ("localhost", "localhost", None, true, true),
-            ("127.0.0.1", "localhost", Some("localhost"), false, true),
-            ("::1", "localhost", Some("localhost"), true, true),
+            ("localhost", "localhost", None, false, true),
+            ("localhost", "localhost", Some(None), true, true),
+            (
+                "127.0.0.1",
+                "localhost",
+                Some(Some("localhost")),
+                false,
+                true,
+            ),
+            ("::1", "localhost", Some(Some("localhost")), true, true),
             ("127.0.0.1", "localhost", None, false, false),
-            ("::1", "localhost", None, true, false),
-            ("localhost", "localhost", Some("wrong.example"), true, false),
+            ("::1", "localhost", Some(None), true, false),
+            ("127.0.0.1", "example.com", Some(None), false, false),
+            ("::1", "example.com", None, true, false),
+            (
+                "localhost",
+                "localhost",
+                Some(Some("wrong.example")),
+                true,
+                false,
+            ),
         ] {
-            check_quic_verification(
-                host,
-                certificate_name,
-                sni,
-                ipv6,
-                succeeds,
-                NATIVE_QUIC_PROTOCOLS,
-            )
-            .await;
+            check_quic_verification(host, certificate_name, sni, ipv6, succeeds, QUIC_PROTOCOLS)
+                .await;
         }
     }
 
     async fn check_quic_verification(
         host: &str,
         certificate_name: &str,
-        sni: Option<&str>,
+        sni: Option<Option<&str>>,
         ipv6: bool,
         succeeds: bool,
         protocols: &[&str],
@@ -844,11 +845,16 @@ mod tests {
             } else {
                 host.to_owned()
             };
-            let sni_yaml = sni.map_or("null".to_owned(), |name| format!("'{name}'"));
+            let sni_yaml = match sni {
+                None => String::new(),
+                Some(None) => "sni_hostname: null, ".into(),
+                Some(Some(name)) => format!("sni_hostname: '{name}', "),
+            };
             let config: ClientConfig = serde_yaml::from_str(&format!(
-                "address: '{host}:{port}'\ntransport: quic\nquic_settings: {{verify: true, sni_hostname: {sni_yaml}, alpn_protocols: [h3]}}\nprotocol: {protocol}\n"
+                "address: '{host}:{port}'\ntransport: quic\nquic_settings: {{verify: true, {sni_yaml}alpn_protocols: [h3]}}\nprotocol: {protocol}\n"
             ))
             .unwrap();
+            let expected_sni = sni.unwrap_or_else(|| config.address.address().hostname());
             let mut connector =
                 SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
             let TransportConfig::Quic {
@@ -859,7 +865,7 @@ mod tests {
             else {
                 unreachable!()
             };
-            assert_eq!(sni_hostname.as_deref(), sni);
+            assert_eq!(sni_hostname.as_deref(), expected_sni);
             let mut client_tls = try_create_client_config(
                 true,
                 vec![],
@@ -904,7 +910,7 @@ mod tests {
                     .unwrap()
                     .downcast::<quinn::crypto::rustls::HandshakeData>()
                     .unwrap();
-                assert_eq!(handshake.server_name.as_deref(), sni);
+                assert_eq!(handshake.server_name.as_deref(), expected_sni);
                 client.connection.close(0u32.into(), b"done");
             })
             .await
