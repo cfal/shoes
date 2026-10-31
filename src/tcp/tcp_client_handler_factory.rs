@@ -63,7 +63,7 @@ pub(crate) fn tls_verification_name(
     rustls::pki_types::ServerName::try_from(identity).map_err(std::io::Error::other)
 }
 
-fn create_with_hop_context(
+pub(crate) fn create_with_hop_context(
     client_proxy_config: ClientProxyConfig,
     hop_location: &NetLocation,
     default_sni_hostname: Option<String>,

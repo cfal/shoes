@@ -167,15 +167,20 @@ mod tests {
 
     #[tokio::test]
     async fn verification_uses_hop_identity_even_without_wire_sni() {
-        check_hop_identity(false).await;
+        check_hop_identity(false, false).await;
     }
 
     #[tokio::test]
     async fn udp_verification_uses_hop_identity_even_without_wire_sni() {
-        check_hop_identity(true).await;
+        check_hop_identity(true, false).await;
     }
 
-    async fn check_hop_identity(udp: bool) {
+    #[tokio::test]
+    async fn xhttp_inner_tls_keeps_hop_identity_without_default_sni() {
+        check_hop_identity(false, true).await;
+    }
+
+    async fn check_hop_identity(udp: bool, xhttp: bool) {
         use crate::address::NetLocation;
         use crate::async_stream::{AsyncFlushMessage, AsyncReadMessage, AsyncWriteMessage};
         use crate::tcp::tcp_client_handler_factory::create_tcp_client_handler;
@@ -208,7 +213,7 @@ mod tests {
                         "localhost:443",
                         "",
                         "localhost",
-                        if nested { None } else { Some("localhost") },
+                        if nested || xhttp { None } else { Some("localhost") },
                     ),
                     ("localhost:443", "sni_hostname: null", "localhost", None),
                     ("127.0.0.1:443", "", "127.0.0.1", None),
@@ -269,12 +274,22 @@ mod tests {
                             yaml
                         };
                         let handler = crate::rustls_config_util::with_test_roots(roots, || {
-                            create_tcp_client_handler(
-                                serde_yaml::from_str(&yaml).unwrap(),
-                                &hop,
-                                Arc::new(crate::resolver::NativeResolver::new()),
-                            )
-                            .unwrap()
+                            let protocol: crate::config::ClientProxyConfig =
+                                serde_yaml::from_str(&yaml).unwrap();
+                            let resolver = Arc::new(crate::resolver::NativeResolver::new());
+                            if xhttp {
+                                let config = serde_json::from_value(serde_json::json!({
+                                    "address": hop.to_string(),
+                                    "protocol": {"type": "xhttp", "protocol": protocol}
+                                }))
+                                .unwrap();
+                                crate::xhttp::connector::build(&config, resolver)
+                                    .unwrap()
+                                    .unwrap()
+                                    .1
+                            } else {
+                                create_tcp_client_handler(protocol, &hop, resolver).unwrap()
+                            }
                         });
                         let (io, peer) = tokio::io::duplex(65536);
                         let server_task = tokio::spawn(async move {
