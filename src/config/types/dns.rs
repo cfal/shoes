@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::types::rules::ClientChain;
-use crate::config::types::selection::ConfigSelection;
 use crate::dns::IpStrategy;
 use crate::option_util::NoneOrSome;
 
@@ -41,8 +40,8 @@ pub enum DnsServerSpec {
     /// Object with URL and optional client_chain, bootstrap_url, server_name, ip_strategy.
     WithOptions {
         url: String,
-        #[serde(default)]
-        client_chain: NoneOrSome<ConfigSelection<ClientChain>>,
+        #[serde(default, alias = "client_chains")]
+        client_chain: NoneOrSome<ClientChain>,
         /// Bootstrap resolver for hostname resolution.
         /// Can be a URL string (e.g., "udp://8.8.8.8") or a dns_group name.
         #[serde(default)]
@@ -105,8 +104,8 @@ impl DnsServerSpec {
     }
 
     /// Get the client_chain.
-    pub fn client_chains(&self) -> &NoneOrSome<ConfigSelection<ClientChain>> {
-        static NONE: NoneOrSome<ConfigSelection<ClientChain>> = NoneOrSome::None;
+    pub fn client_chains(&self) -> &NoneOrSome<ClientChain> {
+        static NONE: NoneOrSome<ClientChain> = NoneOrSome::None;
         if let Self::WithOptions { client_chain, .. } = self {
             client_chain
         } else {

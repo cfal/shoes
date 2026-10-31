@@ -106,9 +106,7 @@ fn visit_dns(
     for spec in specs.iter_mut() {
         if let super::DnsServerSpec::WithOptions { client_chain, .. } = spec {
             for chain in client_chain.iter_mut() {
-                if let ConfigSelection::Config(chain) = chain {
-                    visit_chain(chain, visitor)?;
-                }
+                visit_chain(chain, visitor)?;
             }
         }
     }

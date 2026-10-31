@@ -277,11 +277,11 @@ mod tests {
     }
 
     #[test]
-    fn group_members_are_alternatives_not_an_implicit_sequence() {
+    fn group_wrappers_are_alternatives_and_bare_lists_are_sequences() {
         let base = json!([
             {"client_group":"a", "client_chains":[proxy("a-leaf")]},
             {"client_group":"b", "client_chains":[proxy("b-leaf")]},
-            {"client_group":"out", "client_chains":["a","b"]},
+            {"client_group":"out", "client_chains":[{"chain": ["a"]},{"chain": ["b"]}]},
             {"address":"127.0.0.1:0","protocol":{"type":"socks"},
              "rules":[{"mask":"0.0.0.0/0","action":"allow","client_chain":"out"}]}
         ]);
@@ -299,7 +299,7 @@ mod tests {
         );
         assert_eq!(measure(hop, 0).unwrap().1, 1);
         let mut sequential = base;
-        sequential[2]["client_chains"] = json!([{"chain":["a","b"]}]);
+        sequential[2]["client_chains"] = json!(["a", "b"]);
         let sequential = validate(sequential).unwrap();
         let hop = route(&sequential).hops.iter().next().unwrap();
         let ClientChainHop::Choice(group) = hop else {
@@ -317,7 +317,7 @@ mod tests {
             {"client_group":"nl-hop","client_chains":[proxy("nl")]},
             {"client_group":"a1-selected-nl","client_chains":[{"chain":["a1-selected","nl-hop"]}]},
             {"client_group":"geo-reddit-selected","type":"selector","default":"a1-selected-nl",
-             "client_chains":["a1-selected","a1-selected-nl","direct"]},
+             "client_chains":[{"chain": ["a1-selected"]},{"chain": ["a1-selected-nl"]},{"chain": ["direct"]}]},
             {"address":"127.0.0.1:0","protocol":{"type":"socks"},
              "rules":[{"mask":"0.0.0.0/0","action":"allow","client_chain":"geo-reddit-selected"}]}
         ]))
@@ -343,6 +343,45 @@ mod tests {
         assert_eq!(measure(named.hops.iter().next().unwrap(), 0).unwrap().1, 2);
     }
 
+    #[test]
+    fn group_pool_stages_are_available_to_forwarding_and_probe_routes() {
+        for field in ["client_chain", "client_chains"] {
+            let validated = validate(json!([
+                {"client_group":"a", "client_chain":proxy("a-leaf")},
+                {"client_group":"b", "client_chain":proxy("b-leaf")},
+                {"client_group":"exit", "client_chain":proxy("exit-leaf")},
+                {"client_group":"out", "type":"selector", "default":"pooled",
+                 field:{"name":"pooled", "chain":[{"pool":["a", "b"]}, "exit"]}},
+                {"address":"127.0.0.1:0", "protocol":{"type":"socks"},
+                 "rules":[{"mask":"0.0.0.0/0", "client_chain":"out"}]}
+            ]))
+            .unwrap();
+            let probe = validated.catalog.as_ref().unwrap().route("out").unwrap();
+            for chain in [route(&validated), &probe] {
+                let ClientChainHop::Choice(group) = chain.hops.iter().next().unwrap() else {
+                    panic!()
+                };
+                assert_eq!(group.labels, ["pooled"]);
+                let hops: Vec<_> = group.members[0].hops.iter().collect();
+                assert_eq!(hops.len(), 2);
+                let ClientChainHop::Choice(pool) = hops[0] else {
+                    panic!()
+                };
+                assert_eq!(pool.members.len(), 2);
+                assert_eq!(
+                    clients(hops[0])
+                        .map(|client| client.name.as_deref().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["a-leaf", "b-leaf"]
+                );
+                assert_eq!(
+                    clients(hops[1]).next().unwrap().name.as_deref(),
+                    Some("exit-leaf")
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn group_origins_do_not_enter_wireguard_carriers_or_include_builtin_direct() {
@@ -352,7 +391,7 @@ mod tests {
         let validated = validate(json!([
             {"client_group":"carrier","type":"selector","client_chains":["direct"]},
             wireguard,
-            {"client_group":"out","type":"selector","client_chains":["wg","direct"]},
+            {"client_group":"out","type":"selector","client_chains":[{"chain": ["wg"]},{"chain": ["direct"]}]},
             {"address":"127.0.0.1:0","protocol":{"type":"socks"},
              "rules":[{"mask":"0.0.0.0/0","action":"allow","client_chain":"out"}]}
         ]))
@@ -382,11 +421,9 @@ mod tests {
     fn group_chain_wrappers_are_strict_and_selector_labels_are_explicit() {
         for members in [
             json!([]),
-            json!([["direct"]]),
             json!([{"chain":[]}]),
             json!([{"chain":["direct"],"typo":true}]),
             json!([{"chain":["direct"],"protocol":{"type":"direct"}}]),
-            json!([{"chain":[{"pool":["direct"]}]}]),
             json!([{"chain":[{"chain":["direct"]}]}]),
         ] {
             assert!(
@@ -394,7 +431,7 @@ mod tests {
                 "{members}"
             );
         }
-        assert!(validate(json!([{"client_group":"out","type":"selector","client_chains":[{"chain":["direct"]}]}])).is_err());
+        assert!(validate(json!([{"client_group":"out","type":"selector","client_chains":[{"chain":["direct", proxy("exit")]}]}])).is_err());
         validate(json!([{"client_group":"out","type":"selector","client_chains":[{"name":"local","chain":["direct"]}]}])).unwrap();
         assert!(
             validate(json!([
@@ -430,7 +467,7 @@ mod tests {
             json!([{"chain":[proxy("first"),"tail"]}]),
         ] {
             let error = validate(json!([
-                {"client_group":"tail","client_chains":["direct",proxy("last")]},
+                {"client_group":"tail","client_chains":[{"chain": ["direct"]},{"chain": [proxy("last")]}]},
                 {"client_group":"out","client_chains":members}
             ]))
             .err()
@@ -445,7 +482,7 @@ mod tests {
         for index in 1..20 {
             let previous = format!("g{}", index - 1);
             groups.push(
-                json!({"client_group":format!("g{index}"),"client_chains":[previous,previous]}),
+                json!({"client_group":format!("g{index}"),"client_chains":[{"chain": [previous]},{"chain": [previous]}]}),
             );
         }
         let error = validate(json!(groups)).err().unwrap();
@@ -496,7 +533,7 @@ mod tests {
             groups.push(json!({"client_group":format!("g{index}"),"client_chains":[format!("g{}",index-1)]}));
         }
         groups.extend([
-            json!({"client_group":"wide","client_chains":vec!["g16";1024]}),
+            json!({"client_group":"wide","client_chains":vec![json!({"chain":["g16"]});1024]}),
             json!({"client_group":"out","type":"fallback",
                 "health_check":{"url":"http://192.0.2.1/","interval_secs":30},
                 "client_chains":["wide"]}),
@@ -515,7 +552,7 @@ mod tests {
 
     #[test]
     fn repeated_automatic_occurrences_do_not_allocate_health_contexts() {
-        let members = vec!["auto"; 2048];
+        let members = vec![json!({"chain":["auto"]}); 2048];
         validate(json!([
             {"client_group":"auto","type":"url-test","url":"http://probe.invalid/","client_chains":["direct"]},
             {"client_group":"wide","client_chains":members}

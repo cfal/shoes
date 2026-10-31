@@ -956,7 +956,7 @@ async fn handshake_chains_expand_groups_and_load_certificates() {
     for chain in [json!("fallback"), client.clone()] {
         for protocol in handshake_protocols(chain) {
             let config = json!([
-                {"client_group": "fallback", "client_chains": [client.clone(), client.clone()]},
+                {"client_group": "fallback", "client_chains": [{"chain": [client.clone()]}, {"chain": [client.clone()]}]},
                 {"address": available_address().to_string(), "protocol": protocol}
             ]);
             std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();

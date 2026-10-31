@@ -1,21 +1,24 @@
 # Multi-hop proxy chain examples
 #
 # Round-robin behavior happens at multiple levels:
-# 1. Between chains: when using client_chains (plural), each connection picks the next chain
+# 1. Between explicit chain alternatives: each connection picks the next chain
 # 2. Between servers in a group: when a hop references a group with multiple proxies
 # 3. Between servers in a pool: when using pool: [...] syntax
 #
 # Traffic always flows: client -> hop1 -> hop2 -> ... -> target
+# client_chain and client_chains are aliases; a bare [a, b] is sequential under either spelling.
 
 # Define reusable proxy groups (each group round-robins between its members)
 - client_group: us-proxies
   client_chains:
-    - address: "us1.example.com:1080"
-      protocol:
-        type: socks
-    - address: "us2.example.com:1080"
-      protocol:
-        type: socks
+    - chain:
+        - address: "us1.example.com:1080"
+          protocol:
+            type: socks
+    - chain:
+        - address: "us2.example.com:1080"
+          protocol:
+            type: socks
 
 - client_group: eu-proxies
   client_chains:

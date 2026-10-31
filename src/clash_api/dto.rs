@@ -190,10 +190,10 @@ mod tests {
     fn relay_udp_support_follows_only_terminal_members_and_selector_choices() {
         let configs = serde_json::from_value(json!([
             {"client_group":"manual", "type":"selector", "default":"tcp", "client_chains":[
-                {"name":"tcp", "address":"192.0.2.1:80", "protocol":{"type":"http"}},
-                {"name":"udp", "address":"192.0.2.2:443", "protocol":{
+                {"chain": [{"name":"tcp", "address":"192.0.2.1:80", "protocol":{"type":"http"}}]},
+                {"chain": [{"name":"udp", "address":"192.0.2.2:443", "protocol":{
                     "type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"
-                }}
+                }}]}
             ]},
             {"client_group":"prefix", "client_chains":[
                 {"address":"192.0.2.4:80", "protocol":{"type":"http"}}
@@ -252,10 +252,10 @@ mod tests {
     fn url_test_dto_reports_transport_eligible_members_and_url_health() {
         let configs = serde_json::from_value(json!([
             {"client_group":"manual", "type":"selector", "default":"tcp", "client_chains":[
-                "direct", {"name":"tcp", "address":"proxy.invalid:80", "protocol":{"type":"http"}}
+                {"chain": ["direct"]}, {"chain": [{"name":"tcp", "address":"proxy.invalid:80", "protocol":{"type":"http"}}]}
             ]},
             {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":[
-                "manual", {"name":"udp", "protocol":{"type":"direct"}}
+                {"chain": ["manual"]}, {"chain": [{"name":"udp", "protocol":{"type":"direct"}}]}
             ]}
         ])).unwrap();
         let catalog = crate::config::create_server_configs(configs)
@@ -298,12 +298,12 @@ mod tests {
     fn catalog_dtos_preserve_group_types_members_and_selected_udp_support() {
         let configs = serde_json::from_value(json!([
             {"client_group":"child", "client_chains":[
-                {"name":"east", "address":"east.invalid:1080", "protocol":{"type":"socks"}},
-                "direct"
+                {"chain": [{"name":"east", "address":"east.invalid:1080", "protocol":{"type":"socks"}}]},
+                {"chain": ["direct"]}
             ]},
             {"client_group":"outbound", "type":"selector", "default":"child", "client_chains":[
-                "child",
-                {"name":"west", "address":"west.invalid:1080", "protocol":{"type":"socks"}}
+                {"chain": ["child"]},
+                {"chain": [{"name":"west", "address":"west.invalid:1080", "protocol":{"type":"socks"}}]}
             ]}
         ]))
         .unwrap();
