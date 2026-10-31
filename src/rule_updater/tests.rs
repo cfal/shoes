@@ -3278,25 +3278,26 @@ async fn normalized_sources_preserve_url_format_hints_without_retaining_delivery
     write_rule(&path, VALID);
     let mut remote = source("https://example.com/rules.json?SECRET", &path);
     remote.format = None;
+    let mut normalized = configs(&remote);
+    let deliveries =
+        crate::rule_set::normalize_sources(&mut normalized, &mut crate::rules::Compiler::default())
+            .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    let mut count = 0;
+    crate::rule_set::visit_sources(&mut normalized, &mut |source| {
+        assert!(source.url.is_none());
+        assert!(source.download.is_none());
+        assert!(source.update_interval.is_none());
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count, 1);
     let validated = crate::config::compile_configs(configs(&remote))
         .await
         .unwrap();
     assert_eq!(validated.remote_rules.len(), 1);
-    let mut count = 0;
-    for rule in crate::config::resolved_visit::rules(&validated.configs) {
-        rule.criteria
-            .expression
-            .clone()
-            .visit_sources(&mut |source| {
-                assert!(source.url.is_none());
-                assert!(source.download.is_none());
-                assert!(source.update_interval.is_none());
-                count += 1;
-                Ok(())
-            })
-            .unwrap();
-    }
-    assert_eq!(count, 1);
+    assert_eq!(predicates(&validated).len(), 1);
     assert!(validated.reload_files.is_empty());
 }
 

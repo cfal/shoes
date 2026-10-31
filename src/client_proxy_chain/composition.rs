@@ -664,18 +664,34 @@ mod tests {
             ]}
         ]);
         let route = json!(["out", "out"]);
+        let select = |chain: &ClientProxyChain| {
+            chain
+                .composition
+                .as_ref()
+                .unwrap()
+                .select(false)
+                .unwrap()
+                .origins
+                .into_iter()
+                .map(|pool| {
+                    let origin = pool.into_iter().next().unwrap().unwrap();
+                    (origin.name, origin.path)
+                })
+                .collect::<Vec<_>>()
+        };
         let (original, _) = build(config.clone(), route.clone());
         for _ in 0..7 {
-            original.select_indices(false).unwrap();
+            select(&original);
         }
         let state = original.tcp_selection_indices();
         assert_eq!(state.len(), 8);
         let (mut resumed, _) = build(config, route);
         resumed.restore_tcp_selection_indices(&state);
         for _ in 0..32 {
+            assert_eq!(select(&original), select(&resumed));
             assert_eq!(
-                original.select_indices(false).unwrap(),
-                resumed.select_indices(false).unwrap()
+                original.tcp_selection_indices(),
+                resumed.tcp_selection_indices()
             );
         }
     }
