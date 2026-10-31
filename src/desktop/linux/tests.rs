@@ -36,6 +36,26 @@ fn validated_configuration(
     Ok((config, spec))
 }
 
+fn uncompiled_redirect_configuration() -> crate::config::ResolvedTunConfig {
+    crate::config::test_support::from_json(json!({
+        "device_name":"unused", "rules":[{"masks":"0.0.0.0/0","action":"allow"}]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn redirect_short_circuit_fixture_rejects_selector_construction() {
+    let config = uncompiled_redirect_configuration();
+    let error =
+        crate::tun::proxy_selector(&config, Arc::new(crate::resolver::NativeResolver::new()))
+            .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "routing predicates must be compiled during config preparation"
+    );
+}
+
 #[test]
 fn managed_configuration_is_explicit_dual_stack_and_restart_identifiable() {
     let base = configuration(false);
@@ -654,12 +674,10 @@ async fn kernel_capture() -> io::Result<()> {
         let resolver: Arc<dyn crate::resolver::Resolver> =
             Arc::new(crate::resolver::NativeResolver::new());
         if !redirect {
-            let unexpanded = crate::config::test_support::from_json(json!({
-                "device_name":"unused", "rules":"unexpanded-rule"
-            }))?;
+            let uncompiled = uncompiled_redirect_configuration();
             assert!(
                 ingress
-                    .start_redirects(&unexpanded, resolver.clone(), None)?
+                    .start_redirects(&uncompiled, resolver.clone(), None)?
                     .is_empty()
             );
         }
