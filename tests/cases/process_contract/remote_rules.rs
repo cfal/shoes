@@ -489,6 +489,36 @@ async fn offline_checks_never_download_and_runtime_refetches_invalid_caches() {
 }
 
 #[tokio::test]
+async fn config_edits_during_bootstrap_survive_watch_rebuilds() {
+    let dir = directory();
+    let path = dir.path().join("config.yaml");
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    let mut value = write_config(
+        &path,
+        address,
+        echo.local_addr(),
+        &format!("http://{}/rules.json", origin.local_addr().unwrap()),
+        "7d",
+    );
+    let mut child = Process::start(&path, &[]);
+    let pending = request(&origin).await;
+    value[1]["rules"][0]["action"] = serde_json::json!("allow");
+    std::fs::write(&path, value.to_string()).unwrap();
+    respond(pending, BLOCK).await;
+    child.wait_for("Servers ready").await;
+    blocked(address).await;
+    child.wait_for("Servers ready").await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    quiet(&mut child).await;
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+}
+
+#[tokio::test]
 async fn startup_bootstraps_before_listeners_and_respects_root_ownership() {
     let dir = directory();
     let path = dir.path().join("config.yaml");
