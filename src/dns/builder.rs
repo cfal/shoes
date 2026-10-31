@@ -1087,7 +1087,7 @@ async fn build_entry_and_plan(
             bootstrap_resolver: bootstrap_resolver.clone(),
             chain_key: serde_yaml::to_string(&(
                 &spec.client_chains,
-                crate::control::catalog::chain_selection_key(&spec.client_chains)?,
+                crate::control::catalog::chain_selection_key(&spec.client_chains),
             ))
             .map_err(|e| {
                 std::io::Error::other(format!("failed to serialize client_chains: {e}"))

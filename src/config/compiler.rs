@@ -135,23 +135,19 @@ fn expand_with(
         }
     }
     let hops = plan_ops::map_one(pending, &mut |(pool, values)| {
-        let mut members = values
-            .into_vec()
-            .into_iter()
-            .map(|value| {
-                let hop = match value {
-                    ConfigSelection::Config(client) => HopPlan::Single(client),
-                    ConfigSelection::GroupName(name) => groups[&name].clone(),
-                };
-                ChainPlan {
-                    hops: OneOrSome::One(hop),
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut hops = values.into_vec().into_iter().map(|value| match value {
+            ConfigSelection::Config(client) => HopPlan::Single(client),
+            ConfigSelection::GroupName(name) => groups[&name].clone(),
+        });
         Ok::<_, io::Error>(if pool {
-            plan_ops::pool_choice(members)
+            plan_ops::pool_choice(
+                hops.map(|hop| ChainPlan {
+                    hops: OneOrSome::One(hop),
+                })
+                .collect(),
+            )
         } else {
-            members.remove(0).hops.into_vec().remove(0)
+            hops.next().expect("single stage has one selection")
         })
     })?;
     plan_ops::validate(&hops, client_nodes, validate_health, validate_position)?;

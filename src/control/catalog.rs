@@ -53,10 +53,8 @@ impl MemberOrigin {
     }
 }
 
-pub fn chain_selection_key(
-    chains: &[ResolvedClientChain],
-) -> io::Result<Vec<Vec<(String, String)>>> {
-    Ok(chains
+pub fn chain_selection_key(chains: &[ResolvedClientChain]) -> Vec<Vec<(String, String)>> {
+    chains
         .iter()
         .flat_map(|chain| chain.hops.iter())
         .flat_map(crate::config::composition::clients)
@@ -68,7 +66,7 @@ pub fn chain_selection_key(
                 .map(MemberOrigin::policy_path)
                 .unwrap_or_default()
         })
-        .collect())
+        .collect()
 }
 
 #[derive(Debug, Clone)]

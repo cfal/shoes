@@ -4,22 +4,6 @@ use super::resolved::{
     ResolvedClientConfig as ClientConfig, ResolvedClientProxyConfig as ClientProxyConfig,
 };
 
-pub(crate) fn validate_chain<'a>(
-    hops: impl IntoIterator<Item = impl IntoIterator<Item = &'a ClientConfig>>,
-) -> io::Result<()> {
-    // NaiveProxy sessions cannot follow variable chain prefixes.
-    let mut multiple_prefixes = false;
-    for hop in hops {
-        let mut members = 0usize;
-        for client in hop {
-            validate_client(client, multiple_prefixes)?;
-            members += 1;
-        }
-        multiple_prefixes |= members > 1;
-    }
-    Ok(())
-}
-
 pub(super) fn validate_client(client: &ClientConfig, multiple_prefixes: bool) -> io::Result<()> {
     if multiple_prefixes && contains_naive(&client.protocol) {
         return Err(io::Error::new(
@@ -116,7 +100,26 @@ mod tests {
     }
 
     #[test]
-    fn flat_chain_validation_preserves_fixed_and_variable_prefixes() {
+    fn composition_validation_preserves_fixed_and_variable_prefixes() {
+        use crate::config::{ResolvedClientChain, ResolvedClientHop, composition};
+        use crate::option_util::OneOrSome;
+
+        let validate = |pools: Vec<Vec<super::ClientConfig>>| {
+            let hops = pools
+                .into_iter()
+                .map(|clients| {
+                    composition::pool_choice(
+                        clients
+                            .into_iter()
+                            .map(|client| ResolvedClientChain {
+                                hops: OneOrSome::One(ResolvedClientHop::Single(client)),
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            composition::validate(&OneOrSome::Some(hops))
+        };
         let proxy: super::ClientConfig =
             crate::config::test_support::from_json(proxy("proxy")).unwrap();
         let protocol = json!({"type":"naive", "username":"user", "password":"secret"});
@@ -125,13 +128,21 @@ mod tests {
                 "address":"192.0.2.20:443", "protocol":protocol
             }))
             .unwrap();
-            super::validate_chain([vec![&proxy], vec![&naive]]).unwrap();
-            super::validate_chain([vec![&naive, &proxy], vec![&proxy]]).unwrap();
+            validate(vec![vec![proxy.clone()], vec![naive.clone()]]).unwrap();
+            validate(vec![
+                vec![naive.clone(), proxy.clone()],
+                vec![proxy.clone()],
+            ])
+            .unwrap();
             for hops in [
-                vec![vec![&proxy, &proxy], vec![&naive]],
-                vec![vec![&proxy, &proxy], vec![&proxy], vec![&naive]],
+                vec![vec![proxy.clone(), proxy.clone()], vec![naive.clone()]],
+                vec![
+                    vec![proxy.clone(), proxy.clone()],
+                    vec![proxy.clone()],
+                    vec![naive],
+                ],
             ] {
-                let error = super::validate_chain(hops).unwrap_err();
+                let error = validate(hops).unwrap_err();
                 assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
                 assert_eq!(error.to_string(), NAIVE);
             }
