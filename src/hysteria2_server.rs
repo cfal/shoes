@@ -4,7 +4,7 @@ use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use log::{debug, error};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
@@ -324,7 +324,7 @@ async fn run_udp_remote_to_local_loop(
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
-        let address_bytes: Bytes = wire_address(&src_addr).into_bytes().into();
+        let address_bytes = wire_address(&src_addr).into_bytes();
         let address_len_bytes = encode_varint(address_bytes.len() as u64)?;
 
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes

@@ -208,10 +208,12 @@ async fn read_bi(
                     .limit()
                     .unwrap()
                     .saturating_sub(budget.snapshot().active);
-                let Some(mut data) = (available != 0)
-                    .then(|| allocate(available.min(4096), &budget))
-                    .flatten()
-                else {
+                let allocation = if available == 0 {
+                    None
+                } else {
+                    allocate(available.min(4096), &budget)
+                };
+                let Some(mut data) = allocation else {
                     log::debug!("Rejecting pre-auth TUIC TCP stream: staging budget exhausted");
                     return Ok(None);
                 };
@@ -362,28 +364,12 @@ async fn collect(
     let mut bi = Vec::new();
     let authenticated = CancellationToken::new();
     loop {
-        tokio::select! {
+        let command = tokio::select! {
             biased;
-            Some(result) = uni_reads.next(), if !uni_reads.is_empty() => {
-                match result? {
-                    Some(UniCommand::Authenticate(credentials)) => {
-                        if !bool::from(credentials[..16].ct_eq(uuid) & credentials[16..].ct_eq(&token)) {
-                            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "incorrect credentials"));
-                        }
-                        authenticated.cancel();
-                        connection.set_max_concurrent_uni_streams((settings.uni_streams as u32).into());
-                        let uni = uni.into_iter().map(|command| futures::future::ready(Ok(Some(command))).boxed())
-                            .chain(uni_reads).collect();
-                        let bi = bi.into_iter().map(|stream| futures::future::ready(Ok(Some(stream))).boxed())
-                            .chain(bi_reads).collect();
-                        return Ok(Pending { uni, bi });
-                    }
-                    Some(command) if uni.len() < settings.uni_streams => uni.push(command),
-                    _ => {},
-                }
-            },
+            Some(result) = uni_reads.next(), if !uni_reads.is_empty() => result?,
             Some(result) = bi_reads.next(), if !bi_reads.is_empty() => {
                 if let Some(stream) = result? { bi.push(stream); }
+                continue;
             },
             stream = connection.accept_uni(), if uni_reads.len() <= settings.uni_streams => {
                 let stream = stream?;
@@ -401,12 +387,39 @@ async fn collect(
                     }).boxed()
                 };
                 uni_reads.push(reader);
+                continue;
             },
             stream = connection.accept_bi(), if bi_reads.len() + bi.len() < settings.bi_streams => {
                 let (send, recv) = stream?;
                 let reader = read_bi(ResetOnDrop(Some(send)), recv, connection.remote_address(), budget.clone(), authenticated.clone());
                 bi_reads.push(reader.boxed());
+                continue;
             },
+        };
+        match command {
+            Some(UniCommand::Authenticate(credentials)) => {
+                if !bool::from(credentials[..16].ct_eq(uuid) & credentials[16..].ct_eq(&token)) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "incorrect credentials",
+                    ));
+                }
+                authenticated.cancel();
+                connection.set_max_concurrent_uni_streams((settings.uni_streams as u32).into());
+                let uni = uni
+                    .into_iter()
+                    .map(|command| futures::future::ready(Ok(Some(command))).boxed())
+                    .chain(uni_reads)
+                    .collect();
+                let bi = bi
+                    .into_iter()
+                    .map(|stream| futures::future::ready(Ok(Some(stream))).boxed())
+                    .chain(bi_reads)
+                    .collect();
+                return Ok(Pending { uni, bi });
+            }
+            Some(command) if uni.len() < settings.uni_streams => uni.push(command),
+            _ => {}
         }
     }
 }

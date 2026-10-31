@@ -370,17 +370,17 @@ fn serialize_address(location: &NetLocation) -> Vec<u8> {
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    mut recv: Box<dyn AsyncStream>,
+    mut stream: Box<dyn AsyncStream>,
 ) -> std::io::Result<()> {
     let mut stream_reader = StreamReader::new_with_buffer_size(1024);
-    let tuic_version = stream_reader.read_u8(&mut recv).await?;
+    let tuic_version = stream_reader.read_u8(&mut stream).await?;
     if tuic_version != 5 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid tuic version: {tuic_version}"),
         ));
     }
-    let command_type = stream_reader.read_u8(&mut recv).await?;
+    let command_type = stream_reader.read_u8(&mut stream).await?;
     if command_type != COMMAND_TYPE_CONNECT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -388,12 +388,12 @@ async fn process_tcp_stream(
         ));
     }
 
-    let remote_location = read_address(&mut recv, &mut stream_reader)
+    let remote_location = read_address(&mut stream, &mut stream_reader)
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
     relay_tcp_stream(
-        recv,
+        stream,
         remote_location,
         stream_reader.into_unparsed_data(),
         client_proxy_selector,
@@ -509,11 +509,11 @@ impl Drop for UdpSession {
 }
 
 impl UdpSession {
-    #[allow(clippy::too_many_arguments)]
-    fn start_with_send_stream(
+    fn start(
         assoc_id: u16,
         connection: quinn::Connection,
         client_socket: Arc<UdpRelay>,
+        is_uni_stream: bool,
         parent_cancel_token: &CancellationToken,
         permit: crate::resources::BudgetPermit,
     ) -> Self {
@@ -529,51 +529,24 @@ impl UdpSession {
 
         session.task = Some(
             tokio::spawn(async move {
-                if let Err(e) = run_udp_remote_to_local_stream_loop(
-                    assoc_id,
-                    connection,
-                    client_socket,
-                    session_cancel_token,
-                )
-                .await
-                {
-                    error!("UDP remote-to-local write loop ended with error: {e}");
-                }
-            })
-            .abort_handle(),
-        );
-
-        session
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_with_datagram(
-        assoc_id: u16,
-        connection: quinn::Connection,
-        client_socket: Arc<UdpRelay>,
-        parent_cancel_token: &CancellationToken,
-        permit: crate::resources::BudgetPermit,
-    ) -> Self {
-        // Create a child token so this session is cancelled when the parent (connection) is cancelled
-        let session_cancel_token = parent_cancel_token.child_token();
-
-        let mut session = UdpSession {
-            send_socket: client_socket.clone(),
-            cancel_token: session_cancel_token.clone(),
-            task: None,
-            _permit: Some(permit),
-        };
-
-        session.task = Some(
-            tokio::spawn(async move {
-                if let Err(e) = run_udp_remote_to_local_datagram_loop(
-                    assoc_id,
-                    connection,
-                    client_socket,
-                    session_cancel_token,
-                )
-                .await
-                {
+                let result = if is_uni_stream {
+                    run_udp_remote_to_local_stream_loop(
+                        assoc_id,
+                        connection,
+                        client_socket,
+                        session_cancel_token,
+                    )
+                    .await
+                } else {
+                    run_udp_remote_to_local_datagram_loop(
+                        assoc_id,
+                        connection,
+                        client_socket,
+                        session_cancel_token,
+                    )
+                    .await
+                };
+                if let Err(e) = result {
                     error!("UDP remote-to-local write loop ended with error: {e}");
                 }
             })
@@ -881,6 +854,30 @@ async fn process_uni_stream(
         )));
     }
 
+    let packet = parse_udp_packet(&data)?;
+
+    process_udp_packet(
+        connection,
+        &client_proxy_selector,
+        &resolver,
+        &udp_session_map,
+        packet,
+        true,
+        &cancel_token,
+    )
+    .await
+}
+
+#[inline]
+async fn process_udp_packet(
+    connection: &quinn::Connection,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    udp_session_map: &UdpSessionMap,
+    packet: UdpPacket<'_>,
+    is_uni_stream: bool,
+    cancel_token: &CancellationToken,
+) -> std::io::Result<()> {
     let UdpPacket {
         assoc_id,
         packet_id,
@@ -888,42 +885,7 @@ async fn process_uni_stream(
         frag_id,
         remote_location,
         payload_fragment,
-    } = parse_udp_packet(&data)?;
-
-    process_udp_packet(
-        connection,
-        &client_proxy_selector,
-        &resolver,
-        &udp_session_map,
-        assoc_id,
-        packet_id,
-        frag_total,
-        frag_id,
-        remote_location,
-        payload_fragment,
-        true,
-        &cancel_token,
-    )
-    .await
-}
-
-// TODO: fix too many arguments warning
-#[allow(clippy::too_many_arguments)]
-#[inline]
-async fn process_udp_packet(
-    connection: &quinn::Connection,
-    client_proxy_selector: &Arc<ClientProxySelector>,
-    resolver: &Arc<dyn Resolver>,
-    udp_session_map: &UdpSessionMap,
-    assoc_id: u16,
-    packet_id: u16,
-    frag_total: u8,
-    frag_id: u8,
-    remote_location: Option<NetLocation>,
-    payload_fragment: &[u8],
-    is_uni_stream: bool,
-    cancel_token: &CancellationToken,
-) -> std::io::Result<()> {
+    } = packet;
     let Some((remote_location, payload)) = udp_session_map.fragments.lock().push(
         (assoc_id, packet_id),
         frag_total,
@@ -962,23 +924,14 @@ async fn process_udp_packet(
                     Some(connection.remote_address()),
                 )?;
 
-                let session = if is_uni_stream {
-                    UdpSession::start_with_send_stream(
-                        assoc_id,
-                        connection.clone(),
-                        Arc::new(client_socket),
-                        cancel_token,
-                        permit,
-                    )
-                } else {
-                    UdpSession::start_with_datagram(
-                        assoc_id,
-                        connection.clone(),
-                        Arc::new(client_socket),
-                        cancel_token,
-                        permit,
-                    )
-                };
+                let session = UdpSession::start(
+                    assoc_id,
+                    connection.clone(),
+                    Arc::new(client_socket),
+                    is_uni_stream,
+                    cancel_token,
+                    permit,
+                );
 
                 // it's possible that the session is already on the map since we last checked.
                 // TODO: why is there no way to get a Ref<_> from an Entry<_>? see if we can
@@ -1135,26 +1088,14 @@ async fn run_datagram_loop(
             )));
         }
 
-        let UdpPacket {
-            assoc_id,
-            packet_id,
-            frag_total,
-            frag_id,
-            remote_location,
-            payload_fragment,
-        } = parse_udp_packet(&data)?;
+        let packet = parse_udp_packet(&data)?;
 
         if let Err(e) = process_udp_packet(
             &connection,
             &client_proxy_selector,
             &resolver,
             &udp_session_map,
-            assoc_id,
-            packet_id,
-            frag_total,
-            frag_id,
-            remote_location,
-            payload_fragment,
+            packet,
             false,
             &cancel_token,
         )
@@ -1179,9 +1120,7 @@ fn configure_transport(
     Arc::get_mut(&mut server_config.transport)
         .unwrap()
         // AUTH has its own transport slot, even when application admission is one stream.
-        .max_concurrent_uni_streams(((settings.uni_streams + 1) as u32).into());
-    Arc::get_mut(&mut server_config.transport)
-        .unwrap()
+        .max_concurrent_uni_streams(((settings.uni_streams + 1) as u32).into())
         .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
         .keep_alive_interval(Some(Duration::from_secs(15)))
         // MTU settings per official TUIC reference
