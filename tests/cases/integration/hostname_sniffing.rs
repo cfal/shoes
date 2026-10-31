@@ -463,10 +463,10 @@ async fn listener_config_case(
     )
     .await;
     if sniff != Some(true) {
-        assert!(
-            result.is_err(),
-            "disabled sniff unexpectedly matched a hostname rule"
-        );
+        let error = result.expect_err("disabled sniff unexpectedly matched a hostname rule");
+        if protocol == "socks" {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
         assert!(
             timeout(Duration::from_millis(20), target.accept())
                 .await
