@@ -75,6 +75,17 @@ rules:
 
 Client chains define how traffic is routed through upstream proxies. Each chain is a sequence of "hops" - proxies that traffic passes through in order.
 
+In rules, client groups, and DNS server options, `client_chain` and `client_chains`
+are exact aliases. The value, not the field's plurality, determines the structure:
+`[a, b]` and `{chain: [a, b]}` both mean sequential hops. For alternative paths,
+use `[{chain: [a]}, {chain: [b]}]`. Nested lists (`[[a], [b]]`) also specify
+alternative chains; explicit wrappers are recommended for clarity.
+
+DNS previously treated a bare list as alternatives. It now interprets `[a, b]`
+as a sequence, matching routing, without a compatibility mode or warning.
+DNS alternatives require explicit chain wrappers (or a named group).
+System DNS still rejects client chains; UDP/H3 DNS still requires direct-only paths.
+
 ```yaml
 # Single proxy (simplest form)
 client_chain: my-proxy-group           # Reference a named group
@@ -91,7 +102,7 @@ client_chain:
 
 # Multiple chains (round-robin selection)
 client_chains:
-  - us-proxy-group                     # Chain 1: single hop
+  - chain: [us-proxy-group]            # Chain 1: single hop
   - chain: [proxy1, proxy2]            # Chain 2: multi-hop
 
 # Load balancing at a hop (pool)
@@ -101,7 +112,34 @@ client_chain:
     - final-proxy
 ```
 
-**Migration note:** The `client_proxy` / `client_proxies` fields still work but are deprecated. Please migrate to `client_chain` / `client_chains`.
+### Legacy Proxy Fields
+
+`client_proxy` and `client_proxies` still work in rules, client groups, and
+ShadowTLS remote handshakes, with a deprecation warning. Existing behavior is
+preserved: a legacy list contains alternatives, not sequential hops.
+Use `RUST_LOG=warn` or a more verbose log level to display these warnings.
+
+A single `client_proxy: upstream` can become `client_chain: upstream`.
+For a list, changing only the field name changes behavior. The following
+fragments assume groups `a` and `b` are defined elsewhere:
+
+```yaml
+# Old rule: client_proxies: [a, b]
+# Equivalent rule, retaining one-hop round-robin alternatives:
+client_chain:
+  chain:
+    - pool: [a, b]
+
+# Old group: client_proxies: [a, b]
+# Equivalent group, retaining separate policy members:
+client_group: outbound
+client_chains:
+  - chain: [a]
+  - chain: [b]
+```
+
+For ShadowTLS remote handshakes, use `client_chain: [{pool: [a, b]}]` to replace
+a legacy proxy list. Do not specify legacy and new fields together.
 
 ### Mask Syntax
 ```yaml

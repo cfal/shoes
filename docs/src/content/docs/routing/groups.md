@@ -3,16 +3,74 @@ title: "Named Groups"
 description: shoes named groups configuration.
 ---
 
-### Client Proxy Group
+### Client Group
+
+**Complete example:** [chain_groups.yaml](/examples/chain_groups/) demonstrates
+whole-path alternatives and manual selection. Adapt its addresses and credentials
+before deployment.
+
+`client_chain` and `client_chains` accept the same sequence and alternative-path
+syntax as routing. A bare `[a, b]` defines one sequential path; a list of explicit
+chain wrappers defines separate alternatives selected by the group's policy.
+Group references inside a path contribute their entire selected path, so
+alternatives may have different hop counts. Stages accept group references,
+inline clients, and `{pool: [...]}`. Unknown group chain-wrapper fields are rejected.
+Legacy group `client_proxy` / `client_proxies` lists retain their alternative-member
+behavior with a deprecation warning; see [migration examples](/routing/rules/#legacy-proxy-fields).
+
+The following fragments reference groups defined elsewhere:
+
+```yaml
+- client_group: a1-selected-nl
+  client_chains:
+    - chain: [a1-selected, nl-hop]
+
+- client_group: geo-reddit-selected
+  type: selector
+  default: a1-selected-nl
+  client_chains:
+    - {chain: [a1-selected]}
+    - {chain: [a1-selected-nl]}
+    - name: via-us
+      chain: [a1-selected, us-hop]
+    - {chain: [direct]}
+```
+
+An unnamed one-hop wrapper retains its referenced group or inline client's identity.
+Inline selector clients and multi-hop paths require explicit names. Other policies generate
+definition-site labels for unnamed paths; use explicit names for stable controller
+identities. Labels do not introduce another routing-reference namespace.
+The controller exposes named paths as `Relay` nodes, with whole-path delay probes
+and final-hop UDP capability.
+
+Round-robin selects immediate alternatives before their descendants, with independent
+TCP and UDP counters per occurrence, including nonterminal choices.
+Duplicate round-robin entries provide extra tickets;
+selector and URL-test members must be distinct. A nested group with ten
+members has the same outer weight as one inline client, not ten times its weight.
+Each new flow snapshots manual choices once and pins the complete selected path.
+Selecting a TCP-only path for UDP fails rather than choosing another selector member.
+Existing streams, UDP associations and carrier redials retain their pinned paths.
+
+The same composition works in routing, DNS, WireGuard peer chains, ShadowTLS
+handshake chains and REALITY destination chains. Direct, WireGuard and XHTTP H3
+clients are valid only at physical hop zero. UDP/H3 DNS still requires a direct-only
+route. Resolution rejects cycles, more than 16,384 expanded nodes, more than 64
+nested choices, or paths longer than 64 hops. Fixed one-hop round-robin aliases
+do not add choice depth. Health state is bounded by declared groups and members,
+not the number of route combinations.
+
 ```yaml
 - client_group: my-upstream
-  client_proxies:              # Define proxies in this group
-    - address: "proxy1.example.com:1080"
-      protocol:
-        type: socks
-    - address: "proxy2.example.com:1080"
-      protocol:
-        type: socks
+  client_chains:              # Define alternatives in this group
+    - chain:
+        - address: "proxy1.example.com:1080"
+          protocol:
+            type: socks
+    - chain:
+        - address: "proxy2.example.com:1080"
+          protocol:
+            type: socks
 
 # Reference in rules
 - address: "0.0.0.0:8080"

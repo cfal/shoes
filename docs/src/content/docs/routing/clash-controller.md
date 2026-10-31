@@ -44,17 +44,21 @@ Opt into manual selection explicitly:
 - client_group: outbound
   type: selector
   default: east
-  client_proxies:
-    - name: east
-      address: "east.example.com:1080"
-      protocol: {type: socks}
-    - name: west
-      address: "west.example.com:1080"
-      protocol: {type: socks}
+  client_chains:
+    - chain:
+        - name: east
+          address: "east.example.com:1080"
+          protocol: {type: socks}
+    - chain:
+        - name: west
+          address: "west.example.com:1080"
+          protocol: {type: socks}
 ```
 
 Rules continue to use `client_chain: outbound`. A selector chooses an immediate
-named member or referenced group; inline selector members require `name`.
+named member or referenced group; inline selector clients and multi-hop paths
+require `name`. See [whole-path groups](/routing/groups/#client-group) for naming,
+`Relay` nodes, and alternatives with different hop counts.
 The group discriminant is `type`: `round-robin` (the default), `selector`,
 or `url-test`. The removed `strategy` field and unknown types are errors. Nested round-robin weights,
 duplicate membership, and existing UDP filtering are preserved. A selected
@@ -75,13 +79,15 @@ see the [URL-test example](/examples/url_test/) for a complete file.
   timeout: 5000       # milliseconds, 1..60000, no longer than interval
   tolerance: 50       # milliseconds, 0..65535
   lazy: true
-  client_proxies:
-    - name: east
-      address: "east.example.com:1080"
-      protocol: {type: socks}
-    - name: west
-      address: "west.example.com:1080"
-      protocol: {type: socks}
+  client_chains:
+    - chain:
+        - name: east
+          address: "east.example.com:1080"
+          protocol: {type: socks}
+    - chain:
+        - name: west
+          address: "west.example.com:1080"
+          protocol: {type: socks}
 ```
 
 Only `url` is required for `url-test`; the values above are the other defaults.
@@ -102,8 +108,11 @@ still restrict eligibility, and intermediate chain hops only need TCP support.
 Changing selection affects new connections, not established streams or associations.
 
 There is one initial check after activation, including for lazy groups. Thereafter
-`lazy: true` checks only groups used by new forwarding connections during the last
-interval. Probes, dashboard reads, and WireGuard carrier maintenance never count as use.
+`lazy: true` normally checks only groups used by new forwarding connections during
+the last interval. Every effective manual selector change also makes all URL-test
+groups due for a check, including idle lazy groups unrelated to that selector.
+An active round finishes before the new check starts.
+Probes, dashboard reads, and WireGuard carrier maintenance never count as use.
 New outbound connections through a WireGuard endpoint wake its carrier groups,
 including nested carriers, without changing their existing associations. Inbound-only
 endpoints and long-lived flows need `lazy: false` for continuous checks. `lazy: false` checks idle
@@ -121,36 +130,53 @@ for example, XHTTP upload cancellation can lose the original cause and count as 
 remote failure.
 User payloads are never retried across candidates. Probes use HTTP HEAD and accept
 any HTTP response status, without redirects; HTTPS certificates are verified.
-Local probe lookups use guarded system DNS, not a server's configured DNS group.
-API probes with the same normalized URL and wildcard/default expected status also
-update selection. Other URLs and explicit status expectations cannot overwrite it.
+Checks use the generation's guarded system probe resolver and each member's
+declared chain, not a caller's surrounding route or DNS bootstrap.
+Background results update only the group performing the check. API probes with
+the same normalized URL and wildcard/default expected status also update matching
+groups. Other URLs and explicit status expectations cannot overwrite selection
+samples. Nested automatic groups use their shared group state.
 
-Periodic and API probes share a 16-probe limit. Each periodic round's timeout
-includes admission/queue time; members not admitted before the deadline retain
-their previous health. A deadline expiry after queueing is inconclusive and also
-preserves prior health; successful probes and explicit remote errors still update it.
-Members with no full-budget attempt, then the oldest full-budget attempts, lead each
-round, independently of health. Local failures cannot monopolize these slots, and
-queued attempts can receive a full budget on a later round. Tied members rotate on admission.
-Due groups with the oldest unqueued admission get priority, with stable catalog order
-breaking ties.
-Under sustained saturation, reduce group size, increase
-timeout/interval, or expect unprobed/stale members. Scheduling has one-second
+Periodic and API probes share a 16-probe limit. Each automatic member check gets
+its full timeout after admission; waiting for capacity does not consume that
+timeout or change health. An admitted check that times out records a failure.
+Due groups start in catalog order, and each round checks members in configuration
+order. Rounds have no overall deadline and can exceed the configured interval
+under load. Under sustained saturation, reduce group size or adjust
+timeouts/intervals, or expect unprobed/stale members. Scheduling has one-second
 granularity and does not overlap rounds within a group; other groups can run while
 a slow round is in flight. Activation/reload cancels old work and rejects obsolete
 results; an interrupted round is immediately eligible when its generation resumes.
 New committed generations start with unprobed health.
 
-The controller reports `type: URLTest`, effective TCP `now`, optional `udpNow`,
+Manual API group probes retain a request-wide deadline, including queue time.
+Expiry after queued admission is inconclusive and preserves prior health.
+API batches prioritize members with no full-budget API attempt, then the oldest
+such attempts; automatic rounds do not track or use these priorities.
+Long automatic rounds can keep capacity busy across multiple member timeouts,
+causing single-node API probes to report busy or API group probes to time out.
+
+The controller reports `type: URLTest`, group TCP `now`, optional `udpNow`,
 `testUrl`, and selected-member `health` (`unprobed`, `healthy`, `dead`, or `stale`).
 Its `alive` is true only for fresh healthy results. Manual selection PUTs for
 automatic groups are rejected; automatic choices are neither pinned nor persisted.
 Leaf histories remain bounded to ten samples per URL and eight URLs. Automatic
-selection retains its configured-URL samples and full-budget attempt timestamps
-independently of API eviction; other attempt URLs are capped at eight per member
-for each of filtered and unfiltered probes.
-Automatic checks test each immediate member as a standalone outbound, not every
-surrounding chain or destination. URL-test groups are not supported by FFI.
+selection retains its configured-URL samples independently of API eviction.
+API full-budget attempt timestamps for configured URLs also survive eviction;
+other attempt URLs are capped at eight per member for each of filtered and
+unfiltered probes.
+All occurrences of a URL-test group share its samples and TCP/UDP incumbents.
+There are no route contexts, per-occurrence probe rounds, or contextual samplers.
+Forwarding and dashboard selection consult the same group state, subject to each
+caller's transport eligibility. Any effective manual selector change clears all
+URL-test samples and incumbents and fences in-flight results, even for unrelated
+groups. Selecting the same effective choice preserves samples. Groups become due
+again, after any active round finishes; no selector dependency graph is maintained.
+Surrounding route choices do not create additional health identities. Complete
+chains declared as members are probed end to end. External caller prefixes and
+suffixes are not tested. URL-test groups are not supported by FFI.
+Probe connectors have separate round-robin counters, so probes never advance
+forwarding counters.
 
 ## Persistence
 
