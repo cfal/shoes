@@ -1,16 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+};
 use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 
+use super::early_data::{
+    AUTO_EARLY_DATA_HEADER, AUTO_MAX_EARLY_DATA, EarlyData, MAX_HTTP, MAX_HTTP_LINES, MAX_LINE,
+};
+use super::early_stream::EarlyWebsocketStream;
 use super::websocket_stream::WebsocketStream;
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::config::WebsocketPingType;
+use crate::prepend_stream::PrependStream;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -20,6 +29,7 @@ use crate::tcp::tcp_handler::{
 pub struct WebsocketServerTarget {
     pub matching_path: Option<String>,
     pub matching_headers: Option<FxHashMap<String, String>>,
+    pub early_data: EarlyData,
     pub ping_type: WebsocketPingType,
     pub handler: Box<dyn TcpServerHandler>,
 }
@@ -49,6 +59,7 @@ mod request_tests {
     #[tokio::test]
     async fn upgrade_response_is_flushed_before_inner_handshake() {
         let handler = WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+            early_data: EarlyData::default(),
             matching_path: None,
             matching_headers: None,
             ping_type: WebsocketPingType::Disabled,
@@ -119,115 +130,190 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             first_line,
             headers: mut request_headers,
             stream_reader,
+            duplicates,
         } = ParsedHttpData::parse(&mut server_stream).await?;
         let request_path = {
             if !first_line.ends_with(" HTTP/1.0") && !first_line.ends_with(" HTTP/1.1") {
-                return Err(std::io::Error::other(format!(
-                    "invalid http request version: {first_line}"
-                )));
+                return Err(std::io::Error::other("invalid http request version"));
             }
 
             if !first_line.starts_with("GET ") {
-                return Err(std::io::Error::other(format!(
-                    "invalid http request: {first_line}"
-                )));
+                return Err(std::io::Error::other("invalid http request"));
             }
 
-            let path = first_line
+            first_line
                 .get(4..first_line.len() - 9)
                 .filter(|path| {
                     !path.is_empty() && !path.bytes().any(|byte| byte.is_ascii_whitespace())
                 })
-                .ok_or_else(|| std::io::Error::other("invalid HTTP request target"))?;
-            path.to_owned()
+                .ok_or_else(|| std::io::Error::other("invalid HTTP request target"))?
         };
 
         let websocket_key = request_headers
             .remove("sec-websocket-key")
             .ok_or_else(|| std::io::Error::other("missing websocket key header"))?;
 
-        'outer: for server_target in self.server_targets.iter() {
-            let WebsocketServerTarget {
-                matching_path,
-                matching_headers,
-                ping_type,
-                handler,
-            } = server_target;
-
-            if let Some(path) = matching_path
-                && path != &request_path
-            {
-                continue;
-            }
-
-            if let Some(headers) = matching_headers {
-                for (header_key, header_val) in headers {
-                    if request_headers.get(header_key) != Some(header_val) {
-                        continue 'outer;
-                    }
-                }
-            }
-
-            let websocket_key_response = create_websocket_key_response(websocket_key);
-
-            let host_response_header = match request_headers.get("host") {
-                Some(v) => format!("Host: {v}\r\n"),
-                None => "".to_string(),
-            };
-
-            let websocket_version_response_header =
-                match request_headers.get("sec-websocket_version") {
-                    Some(v) => format!("Sec-WebSocket-Version: {v}\r\n"),
-                    None => "".to_string(),
+        let candidates: Vec<_> = self
+            .server_targets
+            .iter()
+            .filter(|target| {
+                let path_matches = match &target.matching_path {
+                    Some(path) if target.early_data.path_mode() => request_path.starts_with(path),
+                    Some(path) => path == request_path,
+                    None => true,
                 };
-
-            let http_response = format!(
-                concat!(
-                    "HTTP/1.1 101 Switching Protocol\r\n",
-                    "{}",
-                    "Upgrade: websocket\r\n",
-                    "Connection: Upgrade\r\n",
-                    "{}",
-                    "Sec-WebSocket-Accept: {}\r\n",
-                    "\r\n"
-                ),
-                host_response_header, websocket_version_response_header, websocket_key_response,
-            );
-
-            server_stream.write_all(http_response.as_bytes()).await?;
-            // Clients wait for the 101 before sending frames, and inner handlers read first.
-            server_stream.flush().await?;
-
-            let websocket_stream = Box::new(WebsocketStream::new(
-                server_stream,
-                false,
-                ping_type.clone(),
-                stream_reader.unparsed_data(),
+                path_matches
+                    && target.matching_headers.as_ref().is_none_or(|headers| {
+                        headers
+                            .iter()
+                            .all(|(key, value)| request_headers.get(key) == Some(value))
+                    })
+            })
+            .collect();
+        let Some(server_target) = candidates.first() else {
+            return Err(std::io::Error::other("No matching websocket targets"));
+        };
+        // Static subprotocol selectors retain their literal meaning, even for base64 tokens.
+        let auto_early_data = server_target.early_data.max == 0
+            && server_target
+                .matching_headers
+                .as_ref()
+                .is_none_or(|headers| !headers.contains_key(AUTO_EARLY_DATA_HEADER))
+            && (request_headers
+                .get(AUTO_EARLY_DATA_HEADER)
+                .is_some_and(|value| !value.is_empty())
+                || duplicates.contains(AUTO_EARLY_DATA_HEADER));
+        if candidates.len() > 1
+            && (auto_early_data || candidates.iter().any(|target| target.early_data.max > 0))
+        {
+            return Err(std::io::Error::other(
+                "ambiguous WebSocket early data target",
             ));
-
-            let mut target_setup_result = handler.setup_server_stream(websocket_stream).await;
-
-            if let Ok(ref mut setup_result) = target_setup_result {
-                if matches!(setup_result, TcpServerSetupResult::Session(_)) {
-                    return target_setup_result;
-                }
-                setup_result.set_need_initial_flush(true);
-                // Inner handler already has effective_selector from construction
-            }
-
-            return target_setup_result;
         }
+        let WebsocketServerTarget {
+            matching_path,
+            early_data,
+            ping_type,
+            handler,
+            ..
+        } = server_target;
+        let automatic = auto_early_data
+            .then(|| EarlyData::new(AUTO_MAX_EARLY_DATA, Some(AUTO_EARLY_DATA_HEADER)));
+        let early_data = automatic.as_ref().unwrap_or(early_data);
 
-        Err(std::io::Error::other("No matching websocket targets"))
+        let encoded = if early_data.max == 0 {
+            ""
+        } else if let Some(header) = &early_data.header {
+            request_headers
+                .get(header)
+                .map(String::as_str)
+                .unwrap_or("")
+        } else {
+            let path = matching_path.as_deref().ok_or_else(|| {
+                std::io::Error::other("WebSocket path early data requires matching_path")
+            })?;
+            request_path
+                .strip_prefix(path)
+                .ok_or_else(|| std::io::Error::other("invalid WebSocket early data path"))?
+        };
+        if early_data.max > 0
+            && duplicates.iter().any(|name| {
+                early_data.header.as_ref() == Some(name)
+                    || matches!(
+                        name.as_str(),
+                        "host"
+                            | "connection"
+                            | "upgrade"
+                            | "sec-websocket-key"
+                            | "sec-websocket-version"
+                            | "content-length"
+                            | "transfer-encoding"
+                    )
+                    || server_target
+                        .matching_headers
+                        .as_ref()
+                        .is_some_and(|headers| headers.contains_key(name))
+            })
+        {
+            return Err(std::io::Error::other(
+                "duplicate WebSocket handshake header",
+            ));
+        }
+        let prefix = early_data.decode(encoded)?;
+        let protocol_response = if early_data.header.as_deref() == Some("sec-websocket-protocol")
+            && !prefix.is_empty()
+        {
+            format!("Sec-WebSocket-Protocol: {encoded}\r\n")
+        } else {
+            String::new()
+        };
+
+        let websocket_key_response = create_websocket_key_response(websocket_key);
+
+        let host_response_header = match request_headers.get("host") {
+            Some(v) => format!("Host: {v}\r\n"),
+            None => "".to_string(),
+        };
+
+        let websocket_version_response_header = match request_headers.get("sec-websocket_version") {
+            Some(v) => format!("Sec-WebSocket-Version: {v}\r\n"),
+            None => "".to_string(),
+        };
+
+        let http_response = format!(
+            concat!(
+                "HTTP/1.1 101 Switching Protocol\r\n",
+                "{}",
+                "Upgrade: websocket\r\n",
+                "Connection: Upgrade\r\n",
+                "{}",
+                "Sec-WebSocket-Accept: {}\r\n",
+                "{}",
+                "\r\n"
+            ),
+            host_response_header,
+            websocket_version_response_header,
+            websocket_key_response,
+            protocol_response,
+        );
+
+        server_stream.write_all(http_response.as_bytes()).await?;
+        // Clients wait for the 101 before sending frames, and inner handlers read first.
+        server_stream.flush().await?;
+
+        let websocket_stream = WebsocketStream::new(
+            server_stream,
+            false,
+            ping_type.clone(),
+            stream_reader.unparsed_data(),
+        );
+        let websocket_stream: Box<dyn AsyncStream> = if prefix.is_empty() {
+            Box::new(websocket_stream)
+        } else {
+            Box::new(PrependStream::new(
+                websocket_stream,
+                Some(prefix.into_boxed_slice()),
+            ))
+        };
+
+        let mut result = handler.setup_server_stream(websocket_stream).await?;
+        result.set_need_initial_flush(true);
+        Ok(result)
     }
 }
 
 #[derive(Debug)]
 pub struct WebsocketTcpClientHandler {
+    handshake: Arc<ClientHandshake>,
+    handler: Box<dyn TcpClientHandler>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ClientHandshake {
     matching_path: Option<String>,
     matching_headers: Option<FxHashMap<String, String>>,
-    ping_type: WebsocketPingType,
-    handler: Box<dyn TcpClientHandler>,
+    pub ping_type: WebsocketPingType,
+    pub early_data: EarlyData,
 }
 
 impl WebsocketTcpClientHandler {
@@ -238,23 +324,52 @@ impl WebsocketTcpClientHandler {
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
         Self {
-            matching_path,
-            matching_headers,
-            ping_type,
+            handshake: Arc::new(ClientHandshake {
+                matching_path,
+                matching_headers,
+                ping_type,
+                early_data: EarlyData::default(),
+            }),
             handler,
         }
     }
 
+    pub fn with_early_data(mut self, max: usize, header: Option<&str>) -> Self {
+        Arc::make_mut(&mut self.handshake).early_data = EarlyData::new(max, header);
+        self
+    }
+
     async fn setup_client_stream_common(
         &self,
+        client_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<Box<dyn AsyncStream>> {
+        if self.handshake.early_data.max > 0 {
+            Ok(Box::new(EarlyWebsocketStream::new(
+                client_stream,
+                self.handshake.clone(),
+            )))
+        } else {
+            Ok(Box::new(self.handshake.upgrade(client_stream, &[]).await?))
+        }
+    }
+}
+
+impl ClientHandshake {
+    pub async fn upgrade(
+        &self,
         mut client_stream: Box<dyn AsyncStream>,
+        early: &[u8],
     ) -> std::io::Result<WebsocketStream> {
         let request_path = self.matching_path.as_deref().unwrap_or("/");
+        let encoded = URL_SAFE_NO_PAD.encode(early);
 
         let websocket_key = create_websocket_key();
         let mut http_request = String::with_capacity(1024);
         http_request.push_str("GET ");
         http_request.push_str(request_path);
+        if self.early_data.path_mode() {
+            http_request.push_str(&encoded);
+        }
         http_request.push_str(" HTTP/1.1\r\n");
         http_request.push_str(concat!("Connection: Upgrade\r\n", "Upgrade: websocket\r\n",));
 
@@ -265,6 +380,14 @@ impl WebsocketTcpClientHandler {
                 http_request.push_str(header_val);
                 http_request.push_str("\r\n");
             }
+        }
+        if !encoded.is_empty()
+            && let Some(header) = &self.early_data.header
+        {
+            http_request.push_str(header);
+            http_request.push_str(": ");
+            http_request.push_str(&encoded);
+            http_request.push_str("\r\n");
         }
 
         http_request.push_str(concat!(
@@ -281,12 +404,25 @@ impl WebsocketTcpClientHandler {
             first_line,
             headers: response_headers,
             stream_reader,
+            duplicates,
         } = ParsedHttpData::parse(&mut client_stream).await?;
 
-        if !first_line.starts_with("HTTP/1.1 101") && !first_line.starts_with("HTTP/1.0 101") {
-            return Err(std::io::Error::other(format!(
-                "Bad websocket response: {first_line}"
-            )));
+        let mut status = first_line.split_whitespace();
+        if !matches!(status.next(), Some("HTTP/1.1" | "HTTP/1.0")) || status.next() != Some("101") {
+            return Err(std::io::Error::other("Bad websocket response status"));
+        }
+        if duplicates.contains("sec-websocket-accept")
+            || duplicates.contains("sec-websocket-protocol")
+        {
+            return Err(std::io::Error::other("duplicate WebSocket response header"));
+        }
+        if !encoded.is_empty()
+            && self.early_data.header.as_deref() == Some("sec-websocket-protocol")
+            && response_headers
+                .get("sec-websocket-protocol")
+                .is_some_and(|value| value != &encoded)
+        {
+            return Err(std::io::Error::other("unexpected WebSocket subprotocol"));
         }
 
         let websocket_key_response = response_headers
@@ -295,9 +431,7 @@ impl WebsocketTcpClientHandler {
 
         let expected_key_response = create_websocket_key_response(websocket_key);
         if websocket_key_response != &expected_key_response {
-            return Err(std::io::Error::other(format!(
-                "incorrect websocket key response, expected {expected_key_response}, got {websocket_key_response}"
-            )));
+            return Err(std::io::Error::other("incorrect websocket key response"));
         }
 
         Ok(WebsocketStream::new(
@@ -326,7 +460,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
     ) -> std::io::Result<TcpClientSetupResult> {
         let websocket_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler
-            .setup_client_tcp_stream(Box::new(websocket_stream), remote_location)
+            .setup_client_tcp_stream(websocket_stream, remote_location)
             .await
     }
 
@@ -341,7 +475,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let websocket_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler
-            .setup_client_udp_bidirectional(Box::new(websocket_stream), target)
+            .setup_client_udp_bidirectional(websocket_stream, target)
             .await
     }
 }
@@ -350,6 +484,7 @@ struct ParsedHttpData {
     first_line: String,
     headers: HashMap<String, String>,
     stream_reader: StreamReader,
+    duplicates: HashSet<String>,
 }
 
 impl ParsedHttpData {
@@ -358,34 +493,39 @@ impl ParsedHttpData {
         let mut first_line: Option<String> = None;
         // don't use FxHashMap for unvalidated user data
         let mut headers: HashMap<String, String> = HashMap::new();
+        let mut duplicates = HashSet::new();
+        let mut total = 0;
 
         let mut line_count = 0;
         loop {
             let line = stream_reader.read_line(stream).await?;
+            total += line.len() + 2;
+            if total > MAX_HTTP {
+                return Err(std::io::Error::other("http header block is too long"));
+            }
             if line.is_empty() {
                 break;
             }
 
-            if line.len() >= 4096 {
+            if line.len() >= MAX_LINE {
                 return Err(std::io::Error::other("http request line is too long"));
             }
 
             if first_line.is_none() {
                 first_line = Some(line.to_string());
             } else {
-                let tokens: Vec<&str> = line.splitn(2, ':').collect();
-                if tokens.len() != 2 {
-                    return Err(std::io::Error::other(format!(
-                        "invalid http request line: {line}"
-                    )));
+                let (name, value) = line
+                    .split_once(':')
+                    .ok_or_else(|| std::io::Error::other("invalid http header line"))?;
+                let header_key = name.trim().to_lowercase();
+                let header_value = value.trim().to_string();
+                if headers.insert(header_key.clone(), header_value).is_some() {
+                    duplicates.insert(header_key);
                 }
-                let header_key = tokens[0].trim().to_lowercase();
-                let header_value = tokens[1].trim().to_string();
-                headers.insert(header_key, header_value);
             }
 
             line_count += 1;
-            if line_count >= 40 {
+            if line_count >= MAX_HTTP_LINES {
                 return Err(std::io::Error::other("http request is too long"));
             }
         }
@@ -396,6 +536,7 @@ impl ParsedHttpData {
             first_line,
             headers,
             stream_reader,
+            duplicates,
         })
     }
 }
@@ -412,3 +553,7 @@ fn create_websocket_key_response(key: String) -> String {
     let hash = digest(&SHA1_FOR_LEGACY_USE_ONLY, &input);
     BASE64.encode(hash.as_ref())
 }
+
+#[cfg(test)]
+#[path = "early_tests.rs"]
+mod early_tests;

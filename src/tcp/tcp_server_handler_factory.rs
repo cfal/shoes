@@ -736,9 +736,18 @@ fn create_websocket_server_target(
     bind_ip: Option<IpAddr>,
     scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<WebsocketServerTarget> {
+    crate::websocket::validate_early_data(
+        websocket_server_config.matching_path.as_deref(),
+        websocket_server_config.matching_headers.as_ref(),
+        websocket_server_config.max_early_data,
+        websocket_server_config.early_data_header_name.as_deref(),
+        true,
+    )?;
     let WebsocketServerConfig {
         matching_path,
         matching_headers,
+        max_early_data,
+        early_data_header_name,
         ping_type,
         protocol,
         override_rules,
@@ -764,6 +773,10 @@ fn create_websocket_server_target(
     Ok(WebsocketServerTarget {
         matching_path,
         matching_headers,
+        early_data: crate::websocket::EarlyData::new(
+            max_early_data,
+            early_data_header_name.as_deref(),
+        ),
         ping_type,
         handler,
     })

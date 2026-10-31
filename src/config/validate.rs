@@ -1619,6 +1619,13 @@ fn validate_client_proxy_config(
         }
 
         ClientProxyConfig::Websocket(ws_config) => {
+            crate::websocket::validate_early_data(
+                ws_config.matching_path.as_deref(),
+                ws_config.matching_headers.as_ref(),
+                ws_config.max_early_data,
+                ws_config.early_data_header_name.as_deref(),
+                false,
+            )?;
             validate_client_proxy_config(&mut ws_config.protocol, named_pems, None)?;
         }
 
@@ -2113,6 +2120,13 @@ fn validate_server_proxy_config(
         }
         ServerProxyConfig::Websocket { targets } => {
             for websocket_server_config in targets.iter_mut() {
+                crate::websocket::validate_early_data(
+                    websocket_server_config.matching_path.as_deref(),
+                    websocket_server_config.matching_headers.as_ref(),
+                    websocket_server_config.max_early_data,
+                    websocket_server_config.early_data_header_name.as_deref(),
+                    true,
+                )?;
                 let WebsocketServerConfig {
                     protocol,
                     override_rules,

@@ -243,6 +243,8 @@ fn create_test_server_config_websocket() -> ServerConfig {
             .into(),
         protocol: ServerProxyConfig::Websocket {
             targets: Box::new(OneOrSome::One(WebsocketServerConfig {
+                max_early_data: 0,
+                early_data_header_name: None,
                 matching_path: Some("/ws".to_string()),
                 matching_headers: None,
                 protocol: ServerProxyConfig::Http {
