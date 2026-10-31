@@ -287,7 +287,7 @@ impl Default for XhttpPool {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct XhttpClientConfig {
+pub struct XhttpClientRecord<P> {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
@@ -314,8 +314,10 @@ pub struct XhttpClientConfig {
     pub limits: XhttpLimits,
     #[serde(default)]
     pub pool: XhttpPool,
-    pub protocol: Box<ClientProxyConfig>,
+    pub protocol: Box<P>,
 }
+
+pub type XhttpClientConfig = XhttpClientRecord<ClientProxyConfig>;
 
 fn default_download_idle_timeout_secs() -> u64 {
     15 * 60
@@ -363,7 +365,7 @@ impl XhttpClientConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct XhttpServerConfig {
+pub struct XhttpServerRecord<P> {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
@@ -388,8 +390,10 @@ pub struct XhttpServerConfig {
     pub no_sse_header: bool,
     #[serde(default)]
     pub limits: XhttpLimits,
-    pub protocol: Box<ServerProxyConfig>,
+    pub protocol: Box<P>,
 }
+
+pub type XhttpServerConfig = XhttpServerRecord<ServerProxyConfig>;
 
 impl XhttpServerConfig {
     pub fn validate(&self) -> io::Result<()> {

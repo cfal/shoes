@@ -86,7 +86,7 @@ pub struct WireguardDeviceConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct WireguardClientConfig {
+pub struct WireguardClientRecord<C> {
     pub private_key: WireguardKey,
     pub public_key: WireguardKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,16 +101,18 @@ pub struct WireguardClientConfig {
     #[serde(default)]
     pub resource_limits: TunResourceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_client_chain: Option<ClientChain>,
+    pub peer_client_chain: Option<C>,
     #[serde(skip)]
     pub(crate) endpoint_id: String,
     #[serde(skip)]
     pub(crate) connector: Option<std::sync::Arc<dyn crate::tcp::socket_connector::SocketConnector>>,
 }
 
+pub type WireguardClientConfig = WireguardClientRecord<ClientChain>;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct WireguardServerConfig {
+pub struct WireguardServerRecord<C> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wireguard_name: Option<String>,
     pub private_key: WireguardKey,
@@ -123,8 +125,10 @@ pub struct WireguardServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_client_chain: Option<ClientChain>,
+    pub peer_client_chain: Option<C>,
 }
+
+pub type WireguardServerConfig = WireguardServerRecord<ClientChain>;
 
 fn default_allowed_ips() -> Vec<String> {
     vec!["0.0.0.0/0".into(), "::/0".into()]

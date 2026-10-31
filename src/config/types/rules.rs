@@ -10,10 +10,12 @@ use super::client::ClientConfig;
 use super::selection::ConfigSelection;
 
 #[derive(Debug, Clone)]
-pub struct RuleConfig {
+pub struct RuleRecord<C> {
     pub criteria: RuleCriteria,
-    pub action: RuleActionConfig,
+    pub action: RuleActionRecord<C>,
 }
+
+pub type RuleConfig = RuleRecord<ClientChain>;
 
 #[derive(Debug, Clone)]
 pub struct RuleCriteria {
@@ -34,7 +36,7 @@ impl Default for RuleCriteria {
     }
 }
 
-impl RuleConfig {
+impl<C> RuleRecord<C> {
     pub(crate) fn compile(&mut self, compiler: &mut crate::rules::Compiler) -> std::io::Result<()> {
         if self.criteria.compiled.is_some() {
             return Ok(());
@@ -47,7 +49,7 @@ impl RuleConfig {
             Expression::Legacy(masks) => compiler.legacy(masks.into_vec())?,
             expression => compiler.compile(expression)?,
         };
-        if matches!(self.action, RuleActionConfig::Block)
+        if matches!(self.action, RuleActionRecord::Block)
             && predicate.dependencies.ip
             && (self.criteria.no_resolve || predicate.has_no_resolve_ip())
         {
@@ -356,7 +358,7 @@ impl<'de> Deserialize<'de> for RuleConfig {
     }
 }
 
-impl Serialize for RuleConfig {
+impl<C: Serialize> Serialize for RuleRecord<C> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -371,8 +373,8 @@ impl Serialize for RuleConfig {
 
         // Count fields: masks + action fields
         let action_field_count = match &self.action {
-            RuleActionConfig::Block => 1, // action
-            RuleActionConfig::Allow {
+            RuleActionRecord::Block => 1, // action
+            RuleActionRecord::Allow {
                 override_address,
                 client_chains,
             } => {
@@ -407,10 +409,10 @@ impl Serialize for RuleConfig {
 
         // Serialize action fields (flattened)
         match &self.action {
-            RuleActionConfig::Block => {
+            RuleActionRecord::Block => {
                 map.serialize_entry("action", "block")?;
             }
-            RuleActionConfig::Allow {
+            RuleActionRecord::Allow {
                 override_address,
                 client_chains,
             } => {
@@ -565,7 +567,7 @@ impl serde::ser::Serialize for ClientChainHop {
 
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
-pub enum RuleActionConfig {
+pub enum RuleActionRecord<C> {
     Allow {
         override_address: Option<NetLocation>,
 
@@ -577,10 +579,12 @@ pub enum RuleActionConfig {
         /// - `NoneOrSome::None` → Error (validated later)
         /// - `NoneOrSome::One(chain)` → Single chain
         /// - `NoneOrSome::Some(chains)` → Multiple chains for round-robin
-        client_chains: NoneOrSome<ClientChain>,
+        client_chains: NoneOrSome<C>,
     },
     Block,
 }
+
+pub type RuleActionConfig = RuleActionRecord<ClientChain>;
 
 impl<'de> Deserialize<'de> for RuleActionConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -641,7 +645,7 @@ impl<'de> Deserialize<'de> for RuleActionConfig {
     }
 }
 
-impl Serialize for RuleActionConfig {
+impl<C: Serialize> Serialize for RuleActionRecord<C> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -649,12 +653,12 @@ impl Serialize for RuleActionConfig {
         use serde::ser::SerializeMap;
 
         match self {
-            RuleActionConfig::Block => {
+            RuleActionRecord::Block => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("action", "block")?;
                 map.end()
             }
-            RuleActionConfig::Allow {
+            RuleActionRecord::Allow {
                 override_address,
                 client_chains,
             } => {
