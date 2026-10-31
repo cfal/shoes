@@ -707,7 +707,7 @@ async fn tun_worker_failure_exits_nonzero_and_releases_other_listeners() {
 
 fn forward(address: SocketAddr, target: SocketAddr) -> String {
     format!(
-        "- global_limits: {{reload_grace_secs: 2}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{target}'\n"
+        "- global_settings: {{reload_grace_secs: 2}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{target}'\n"
     )
 }
 
@@ -1194,7 +1194,7 @@ async fn connection_budget_changes_only_with_accepted_reloads_and_counts_drainin
     let address = available_address();
     let config = |max_connections: usize| {
         format!(
-            "- global_limits: {{max_connections: {max_connections}, reload_grace_secs: 60}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{}'\n",
+            "- global_settings: {{max_connections: {max_connections}, reload_grace_secs: 60}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{}'\n",
             echo.local_addr()
         )
     };

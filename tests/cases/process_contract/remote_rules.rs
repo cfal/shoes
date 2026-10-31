@@ -38,7 +38,7 @@ fn config(
     interval: &str,
 ) -> serde_json::Value {
     let value = serde_json::json!([
-        {"rule_cache_dir": "./cache"},
+        {"global_settings": {"rule_cache_dir": "./cache"}},
         {"address": address.to_string(), "protocol": {"type": "forward", "target": target.to_string()},
          "rules": [
             {"url": url, "path": "cache/rules.json", "update_interval": interval, "download": {"client_chain": "direct", "bootstrap_url": "system"}, "action": "block"},
@@ -281,10 +281,10 @@ async fn generated_cache_paths_allow_restart_during_an_origin_outage() {
         &format!("http://{}/rules.json", origin.local_addr().unwrap()),
         "7d",
     );
-    value
-        .as_array_mut()
-        .unwrap()
-        .insert(0, serde_json::json!({"rule_cache_dir": "./cache"}));
+    value.as_array_mut().unwrap().insert(
+        0,
+        serde_json::json!({"global_settings": {"rule_cache_dir": "./cache"}}),
+    );
     std::fs::write(&path, value.to_string()).unwrap();
     let mut child = Process::start(&path, &["--no-reload"]);
     respond(request(&origin).await, BLOCK).await;
@@ -775,7 +775,7 @@ async fn reload_bootstrap_failure_retains_active_traffic_and_success_activates_o
     blocked(address).await;
     roundtrip(&mut retained).await;
     quiet(&mut child).await;
-    value[0]["rule_cache_dir"] = serde_json::json!("./other");
+    value[0]["global_settings"]["rule_cache_dir"] = serde_json::json!("./other");
     value[1]["rules"][0]["path"] = serde_json::json!("other/rules.json");
     std::fs::write(&path, value.to_string()).unwrap();
     child.signal(libc::SIGHUP);
@@ -783,7 +783,7 @@ async fn reload_bootstrap_failure_retains_active_traffic_and_success_activates_o
         .wait_for("changing rule_cache_dir requires a restart")
         .await;
     assert!(!dir.path().join("other").exists());
-    value[0]["rule_cache_dir"] = serde_json::json!("./cache");
+    value[0]["global_settings"]["rule_cache_dir"] = serde_json::json!("./cache");
     value[1]["rules"][0]["path"] = serde_json::json!("cache/next.json");
     std::fs::write(&path, value.to_string()).unwrap();
     std::fs::remove_dir_all(dir.path().join("cache")).unwrap();
@@ -1009,9 +1009,7 @@ async fn post_install_activation_failure_restores_traffic_and_retry_uses_cache()
             &format!("http://{}/rules.json", origin.local_addr().unwrap()),
             "7d",
         );
-        value.as_array_mut().unwrap().push(serde_json::json!({
-            "global_limits": {"reload_grace_secs": 60}
-        }));
+        value[0]["global_settings"]["reload_grace_secs"] = serde_json::json!(60);
         std::fs::write(&path, value.to_string()).unwrap();
         cached(&cache, MISS);
         if refresh {
@@ -1089,7 +1087,7 @@ async fn public_https_bootstrap_and_refresh_use_verified_tls() {
             .unwrap();
         let (hit_reservation, hit) = crate::reserve_address();
         let (miss_reservation, miss) = crate::reserve_address();
-        let mut value = vec![serde_json::json!({"rule_cache_dir": "./cache"})];
+        let mut value = vec![serde_json::json!({"global_settings": {"rule_cache_dir": "./cache"}})];
         for (address, target) in [(hit, "192.0.2.1:443"), (miss, "198.51.100.1:443")] {
             value.push(serde_json::json!({
                 "address": address.to_string(),

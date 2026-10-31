@@ -294,7 +294,7 @@ fn managed_cache_namespace_rejects_dangling_local_aliases() {
     let alias = dir.path().join("alias.json");
     std::os::unix::fs::symlink(&path, &alias).unwrap();
     let mut configs: Vec<Config> = serde_json::from_value(json!([
-        {"rule_cache_dir": cache_dir},
+        {"global_settings": {"rule_cache_dir": cache_dir}},
         {"rule_source_group": "local", "rules": [{"path": alias}]}
     ]))
     .unwrap();

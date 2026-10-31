@@ -151,7 +151,7 @@ async function main() {
   reservation.close();
   await once(reservation, 'close');
   const config = [
-    { global_limits: { reload_grace_secs: 60 } },
+    { global_settings: { reload_grace_secs: 60 } },
     { rule_source_group: 'imported', rules: [
       { path: path.resolve(domains), format: 'mihomo_yaml', behavior: 'domain' },
       path.resolve(cn),

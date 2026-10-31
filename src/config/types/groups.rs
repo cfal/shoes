@@ -6,7 +6,7 @@ use crate::option_util::OneOrSome;
 
 use super::client::ClientConfig;
 use super::dns::DnsConfigGroup;
-use super::global::GlobalLimits;
+use super::global::GlobalSettings;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;
 use super::server::ServerConfig;
@@ -525,9 +525,8 @@ impl Serialize for NamedPem {
 pub enum Config {
     ClashApi(super::ClashApiConfig),
     CacheFile(super::CacheFileConfig),
-    RuleCacheDirectory(std::path::PathBuf),
     CertificateSource(crate::certificates::NamedSource),
-    GlobalLimits(GlobalLimits),
+    GlobalSettings(GlobalSettings),
     Server(ServerConfig),
     /// TUN device server - accepts IP packets from a TUN device.
     /// This is separate from Server because TUN doesn't use bind_location or transport.
@@ -555,6 +554,30 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             Error::custom("Expected a YAML mapping for Config, but found a different type")
         })?;
 
+        if map.contains_key("rule_cache_dir") {
+            return Err(Error::custom(
+                "rule_cache_dir must be inside global_settings",
+            ));
+        }
+        if map.contains_key("global_settings") || map.contains_key("global_limits") {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct GlobalSettingsEntry {
+                #[serde(alias = "global_limits")]
+                global_settings: Option<GlobalSettings>,
+            }
+            let legacy = map.contains_key("global_limits");
+            let entry = serde_yaml::from_value::<GlobalSettingsEntry>(value)
+                .map_err(|e| Error::custom(format!("invalid global settings: {e}")))?;
+            if legacy {
+                log::warn!(
+                    "global_limits will be deprecated in the next version; rename it to global_settings"
+                );
+            }
+            return Ok(Config::GlobalSettings(
+                entry.global_settings.unwrap_or_default(),
+            ));
+        }
         if map.contains_key("clash_api_address") || map.contains_key("clash_api_path") {
             return serde_yaml::from_value(value)
                 .map(Config::ClashApi)
@@ -563,16 +586,6 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         if map.contains_key("cache_file_path") {
             return serde_yaml::from_value(value)
                 .map(Config::CacheFile)
-                .map_err(Error::custom);
-        }
-        if map.contains_key("rule_cache_dir") {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Directory {
-                rule_cache_dir: std::path::PathBuf,
-            }
-            return serde_yaml::from_value::<Directory>(value)
-                .map(|directory| Config::RuleCacheDirectory(directory.rule_cache_dir))
                 .map_err(Error::custom);
         }
 
@@ -597,15 +610,6 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             Err(Error::custom(
                 "rule_set was replaced by rule_source_group with file paths in rules",
             ))
-        } else if map.contains_key(Value::String("global_limits".to_string())) {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct GlobalLimitsEntry {
-                global_limits: Option<GlobalLimits>,
-            }
-            serde_yaml::from_value::<GlobalLimitsEntry>(value)
-                .map(|entry| Config::GlobalLimits(entry.global_limits.unwrap_or_default()))
-                .map_err(|e| Error::custom(format!("invalid global limits: {e}")))
         } else if map.contains_key("certificate_source") {
             serde_yaml::from_value(value)
                 .map(Config::CertificateSource)
@@ -659,7 +663,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                 - Client config group: must have 'client_group' field\n\
                 - Rule config group: must have 'rule_group' field\n\
                 - DNS config group: must have 'dns_group' field\n\
-                - Global limits: must have 'global_limits' field"
+                - Global settings: must have 'global_settings' field"
             )))
         }
     }
@@ -673,17 +677,11 @@ impl serde::ser::Serialize for Config {
         match self {
             Config::ClashApi(config) => config.serialize(serializer),
             Config::CacheFile(config) => config.serialize(serializer),
-            Config::RuleCacheDirectory(path) => {
-                use serde::ser::SerializeMap;
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("rule_cache_dir", path)?;
-                map.end()
-            }
             Config::CertificateSource(source) => source.serialize(serializer),
-            Config::GlobalLimits(limits) => {
+            Config::GlobalSettings(settings) => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("global_limits", limits)?;
+                map.serialize_entry("global_settings", settings)?;
                 map.end()
             }
             Config::Server(server) => server.serialize(serializer),

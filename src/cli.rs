@@ -23,15 +23,15 @@ fn print_usage_and_exit(arg0: String) -> ! {
     );
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
     eprintln!(
-        "    global_limits.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
+        "    global_settings.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
     );
     eprintln!("    QUIC connections disconnect immediately on reload.");
     eprintln!("    -V, --version        Print version information and exit");
     eprintln!();
     eprintln!("RESOURCE LIMITS:");
-    eprintln!("    Optional YAML entry: - global_limits: {{ max_connections: 1024 }}");
+    eprintln!("    Optional YAML entry: - global_settings: {{ max_connections: 1024 }}");
     eprintln!(
-        "    Admission is unlimited unless configured. Only one global_limits entry is allowed."
+        "    Admission is unlimited unless configured. Only one global_settings entry is allowed."
     );
     eprintln!();
     eprintln!("COMMANDS:");

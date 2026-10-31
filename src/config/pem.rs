@@ -632,8 +632,10 @@ mod tests {
             } else {
                 json!({"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "rules": [rule.clone()]})
             };
-            let configs =
-                serde_json::from_value(json!([{"rule_cache_dir": cache_dir}, server])).unwrap();
+            let configs = serde_json::from_value(
+                json!([{"global_settings": {"rule_cache_dir": cache_dir}}, server]),
+            )
+            .unwrap();
             let (configs, loaded) = convert_cert_paths(configs).await.unwrap();
             assert_eq!(loaded, 2);
             let validated = crate::config::compile_configs(configs).await.unwrap();

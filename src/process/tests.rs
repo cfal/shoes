@@ -21,7 +21,7 @@ async fn network_reconciliation_does_not_cancel_inflight_refresh() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = root.join("config.yaml");
         std::fs::write(&config, serde_json::json!([
-            {"rule_cache_dir": cache},
+            {"global_settings": {"rule_cache_dir": cache}},
             {"address":"127.0.0.1:0", "protocol":{"type":"socks"}, "rules":[{
                 "masks":{"path":path, "url":format!("http://{}/rules.json", listener.local_addr().unwrap()),
                     "download":{"client_chain":"direct", "bootstrap_url":"system"}, "update_interval":"7d"},
@@ -74,7 +74,7 @@ async fn runtime_reload_retains_a_lost_lease_without_reacquiring_it() {
         std::fs::write(
             &config,
             serde_json::json!([
-                {"rule_cache_dir": cache},
+                {"global_settings": {"rule_cache_dir": cache}},
                 {"address":"127.0.0.1:0", "protocol":{"type":"socks"}}
             ])
             .to_string(),

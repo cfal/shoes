@@ -580,10 +580,10 @@ impl Fixture {
             patch(&mut peer_config);
         }
         if version == "h3" && mode == "stream-one" {
-            shoes_config
-                .as_array_mut()
-                .unwrap()
-                .insert(0, json!({"global_limits":{"max_streams_per_connection":1}}));
+            shoes_config.as_array_mut().unwrap().insert(
+                0,
+                json!({"global_settings":{"max_streams_per_connection":1}}),
+            );
         }
         let shoes_config = serde_yaml::to_string(&shoes_config)?;
         if !shoes_client || peer == Peer::Shoes {

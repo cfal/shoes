@@ -144,14 +144,13 @@ pub(super) fn create_server_configs_with_memory(
                     ));
                 }
             }
-            Config::CertificateSource(_)
-            | Config::RuleSourceGroup(_)
-            | Config::RuleCacheDirectory(_) => {}
-            Config::GlobalLimits(limits) => {
+            Config::CertificateSource(_) | Config::RuleSourceGroup(_) => {}
+            Config::GlobalSettings(settings) => {
+                let limits = settings.limits;
                 if global_limits.replace(limits).is_some() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "global_limits may only be specified once across all config files",
+                        "global_settings may only be specified once across all config files",
                     ));
                 }
                 limits.validate()?;
@@ -491,10 +490,10 @@ pub(crate) fn validate_rule_bootstrap(
     let mut dns_names = HashSet::new();
     for config in configs {
         match config {
-            Config::GlobalLimits(value) => {
-                value.validate()?;
-                if limits.replace(*value).is_some() {
-                    return Err(invalid("global_limits may only be specified once"));
+            Config::GlobalSettings(settings) => {
+                settings.limits.validate()?;
+                if limits.replace(settings.limits).is_some() {
+                    return Err(invalid("global_settings may only be specified once"));
                 }
             }
             Config::NamedPem(pem) => {

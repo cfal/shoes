@@ -217,7 +217,7 @@ async fn bootstrap_budget_counts_retained_cached_and_downloaded_sources_before_s
         sources.push(retained);
     }
     let config = vec![
-        Config::RuleCacheDirectory(dir.path().to_path_buf()),
+        cache_config(dir.path().to_path_buf()),
         Config::RuleSourceGroup(crate::config::RuleSourceGroup {
             rule_source_group: "remote".into(),
             rules: sources
@@ -304,7 +304,7 @@ async fn remote_decode_scratch_counts_retained_sources_before_cache_or_memory_ch
             sources.push(source);
         }
         let configs = vec![
-            Config::RuleCacheDirectory(dir.path().into()),
+            cache_config(dir.path().into()),
             Config::RuleSourceGroup(crate::config::RuleSourceGroup {
                 rule_source_group: "remote".into(),
                 rules: sources
@@ -373,7 +373,7 @@ async fn local_decode_counts_remote_indexes_before_their_first_reference() {
             rules.push(crate::rules::Expression::Source(source));
         }
         let config = vec![
-            Config::RuleCacheDirectory(dir.path().into()),
+            cache_config(dir.path().into()),
             Config::RuleSourceGroup(crate::config::RuleSourceGroup {
                 rule_source_group: "mixed".into(),
                 rules,
@@ -441,7 +441,7 @@ async fn refresh_decode_excludes_replaced_indexes_and_reuses_identical_bytes_nea
             rules.push(crate::rules::Expression::Source(source));
         }
         let config = vec![
-            Config::RuleCacheDirectory(dir.path().into()),
+            cache_config(dir.path().into()),
             Config::RuleSourceGroup(crate::config::RuleSourceGroup {
                 rule_source_group: "remote".into(),
                 rules,
@@ -822,9 +822,16 @@ fn source(url: &str, path: &Path) -> RuleSource {
     source
 }
 
+fn cache_config(path: PathBuf) -> Config {
+    Config::GlobalSettings(crate::config::GlobalSettings {
+        rule_cache_dir: Some(path),
+        ..Default::default()
+    })
+}
+
 fn configs(source: &RuleSource) -> Vec<Config> {
     serde_json::from_value(
-        serde_json::json!([{"rule_cache_dir": source.path.parent()}, {
+        serde_json::json!([{"global_settings": {"rule_cache_dir": source.path.parent()}}, {
             "address": "127.0.0.1:0", "protocol": {"type": "socks"},
             "rules": [{"masks": source, "action": "block"}]
         }]),
@@ -1032,7 +1039,7 @@ async fn pathless_cached_sources_get_stable_names_and_restart_offline() {
     let (url, fixture) = serve(response(200, "", VALID)).await;
     let remote = source(&url, Path::new(""));
     let mut config = memory_configs(&remote);
-    config.insert(0, Config::RuleCacheDirectory(dir.path().to_path_buf()));
+    config.insert(0, cache_config(dir.path().to_path_buf()));
     let (config, memory) = super::bootstrap(config, &[], Default::default(), None)
         .await
         .unwrap();
@@ -2488,7 +2495,7 @@ async fn runtime_validation_uses_retained_sources_and_never_falls_back_to_disk()
         (second.path.clone(), load_cached(&second, None, 0).unwrap()),
     ]);
     let config: Vec<Config> = serde_json::from_value(serde_json::json!([
-        {"rule_cache_dir": dir.path()},
+        {"global_settings": {"rule_cache_dir": dir.path()}},
         {"rule_source_group": "shared", "rules": [first]},
         {"address": "127.0.0.1:0", "protocol": {"type": "socks"}, "rules": [
             {"masks": first, "action": "block"},
@@ -2965,7 +2972,7 @@ fn remote_sources_work_in_source_groups_policies_and_flat_overrides() {
     let mut flat = serde_json::to_value(&remote).unwrap();
     flat["action"] = "block".into();
     let config = serde_json::from_value(serde_json::json!([
-        {"rule_cache_dir": dir.path()},
+        {"global_settings": {"rule_cache_dir": dir.path()}},
         {"rule_source_group": "sources", "rules": [remote, {"domain": ["inline.example"]}]},
         {"rule_group": "policies", "rules": [flat]},
         {"address": "127.0.0.1:0", "rules": ["policies", {
@@ -3111,7 +3118,7 @@ async fn namespace_preflight_rejects_unresolved_parent_traversal_before_creating
         std::fs::write(
             &path,
             serde_json::json!([
-                {"rule_cache_dir": cache}, extra
+                {"global_settings": {"rule_cache_dir": cache}}, extra
             ])
             .to_string(),
         )
@@ -3150,9 +3157,9 @@ fn managed_tun_state_cannot_be_used_as_a_rule_cache() {
         );
         assert_eq!(std::fs::read(&path).ok(), contents);
     }
-    let mut empty = vec![Config::RuleCacheDirectory(root.into())];
+    let mut empty = vec![cache_config(root.into())];
     assert!(crate::rule_set::validate_remote_paths(&mut empty, &[]).is_err());
-    let mut separate = vec![Config::RuleCacheDirectory(root.join("rule-cache"))];
+    let mut separate = vec![cache_config(root.join("rule-cache"))];
     crate::rule_set::validate_remote_paths(&mut separate, &[]).unwrap();
 }
 
@@ -3169,13 +3176,13 @@ fn cache_namespace_is_reserved_even_without_remote_sources() {
         serde_json::json!({"rule_source_group": "local", "rules": [{"path": cache.join("missing.json")}]}),
     ] {
         let mut configs: Vec<Config> = serde_json::from_value(serde_json::json!([
-            {"rule_cache_dir": cache}, extra
+            {"global_settings": {"rule_cache_dir": cache}}, extra
         ]))
         .unwrap();
         let error = crate::rule_set::validate_remote_paths(&mut configs, &[]).unwrap_err();
         assert!(error.to_string().contains("overlap"), "{error}");
     }
-    let mut configs = vec![Config::RuleCacheDirectory(cache.clone())];
+    let mut configs = vec![cache_config(cache.clone())];
     assert!(
         crate::rule_set::validate_remote_paths(&mut configs, &[cache.join("config.yaml")]).is_err()
     );
@@ -3191,7 +3198,7 @@ fn cache_namespace_is_reserved_even_without_remote_sources() {
     let outside_alias = dir.path().join("alias");
     symlink(&cache, &outside_alias).unwrap();
     let mut configs: Vec<Config> = serde_json::from_value(serde_json::json!([
-        {"rule_cache_dir": cache},
+        {"global_settings": {"rule_cache_dir": cache}},
         {"cache_file_path": outside_alias.join("not-created/state")}
     ]))
     .unwrap();
@@ -3215,7 +3222,7 @@ fn remote_declarations_require_one_root_and_direct_unreserved_children() {
     ] {
         let remote = source("https://example.com/rules.json", &root.join(name));
         let mut config = configs(&remote);
-        config[0] = Config::RuleCacheDirectory(root.clone());
+        config[0] = cache_config(root.clone());
         assert!(
             crate::rule_set::validate_remote_paths(&mut config, &[]).is_err(),
             "{name}"
@@ -3225,7 +3232,7 @@ fn remote_declarations_require_one_root_and_direct_unreserved_children() {
     let mut config = configs(&remote);
     crate::rule_set::validate_remote_paths(&mut config, &[]).unwrap();
     let mut duplicate = config.clone();
-    duplicate.push(Config::RuleCacheDirectory(root));
+    duplicate.push(cache_config(root));
     assert!(crate::rule_set::validate_remote_paths(&mut duplicate, &[]).is_err());
     config.remove(0);
     assert!(
@@ -3248,7 +3255,7 @@ fn managed_root_cannot_intersect_acme_state_in_either_direction() {
     let root = dir.path().join("cache");
     for state in [dir.path().to_path_buf(), root.clone(), root.join("acme")] {
         let mut configs: Vec<Config> = serde_json::from_value(serde_json::json!([
-            {"rule_cache_dir": root},
+            {"global_settings": {"rule_cache_dir": root}},
             {"certificate_source": "acme", "type": "acme", "domains": ["example.com"],
              "directory_url": "https://ca.invalid/directory", "state_dir": state,
              "challenge": {"type": "tls_alpn01"}}

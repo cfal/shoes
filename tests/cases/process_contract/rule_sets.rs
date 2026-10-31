@@ -209,7 +209,7 @@ async fn rule_only_reload_rejects_invalid_sources_and_recovers_missing_candidate
         .unwrap();
     let address = available_address();
     let mut config = json!([
-        {"global_limits": {"reload_grace_secs": 60}},
+        {"global_settings": {"reload_grace_secs": 60}},
         {"rule_source_group": "deny", "rules": ["list.json"]},
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
          "rules": [{"masks": {"rule_source_group": "deny"}, "action": "block"}, {"masks": {"any_destination": true}, "action": "allow"}]}
@@ -317,7 +317,7 @@ async fn cyclic_source_recovers(with_remote: bool) {
         config
             .as_array_mut()
             .unwrap()
-            .push(json!({"rule_cache_dir": cache_dir}));
+            .push(json!({"global_settings": {"rule_cache_dir": cache_dir}}));
     }
     std::fs::write(&config_path, config.to_string()).unwrap();
     let mut process = Process::start(&config_path, &[]);

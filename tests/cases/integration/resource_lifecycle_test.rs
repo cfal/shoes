@@ -24,7 +24,7 @@ fn start_process_with_limits(
     limits: &str,
 ) -> io::Result<(ProcessGuard, tempfile::NamedTempFile, u32)> {
     let mut file = tempfile::NamedTempFile::new()?;
-    writeln!(file, "- global_limits: {{{limits}}}")?;
+    writeln!(file, "- global_settings: {{{limits}}}")?;
     file.write_all(config.as_bytes())?;
     file.flush()?;
     let binary = std::env::var_os("SHOES_TEST_SHOES_BIN")
@@ -169,7 +169,7 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
     );
     std::fs::write(
         file.path(),
-        format!("- global_limits: {{reload_grace_secs: 6}}\n{replacement_config}"),
+        format!("- global_settings: {{reload_grace_secs: 6}}\n{replacement_config}"),
     )?;
     round_trip(&mut existing, b"during reload").await?;
     // Allow the five-second debounce before identifying the new generation by its listener.

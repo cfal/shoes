@@ -919,7 +919,7 @@ fn xhttp_split_capacity_uses_candidate_global_stream_limit() {
                     for entry in entries {
                         let configs = serde_json::from_value(json!([
                             entry,
-                            {"global_limits": {"max_streams_per_connection": stream_limit}}
+                            {"global_settings": {"max_streams_per_connection": stream_limit}}
                         ]))
                         .unwrap();
                         let result = create_server_configs(configs);

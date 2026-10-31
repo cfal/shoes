@@ -9,6 +9,32 @@ fn diagnostic_contains_path(diagnostic: &str, path: &Path) -> bool {
 }
 
 #[test]
+fn legacy_global_limits_warns_but_canonical_settings_do_not() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("settings.yaml");
+    let warning =
+        "global_limits will be deprecated in the next version; rename it to global_settings";
+    for name in ["global_settings", "global_limits"] {
+        std::fs::write(&path, format!("- {name}: {{max_connections: 42}}\n")).unwrap();
+        for mode in ["check", "--dry-run"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .env("RUST_LOG", "warn")
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{diagnostic}");
+            assert_eq!(
+                diagnostic.contains(warning),
+                name == "global_limits",
+                "{diagnostic}"
+            );
+        }
+    }
+}
+
+#[test]
 fn check_diagnostic_paths_accept_display_and_debug_formats() {
     for path in [
         r"C:\tmp\nested.yaml",
@@ -48,7 +74,7 @@ fn check_diagnostics_include_file_and_nested_context_without_credentials() {
             "rules[1]",
         ),
         (
-            r#"- global_limits: {unsupported_policy: VALUE_SECRET_SENTINEL}
+            r#"- global_settings: {unsupported_policy: VALUE_SECRET_SENTINEL}
 "#,
             "unknown field `unsupported_policy`",
         ),
@@ -69,9 +95,9 @@ fn check_diagnostics_include_file_and_nested_context_without_credentials() {
         (
             r#"- clash_api_address: '127.0.0.1:9090'
   secret: CONTROLLER_SECRET_SENTINEL
-- global_limits: {max_connections: 0}
+- global_settings: {max_connections: 0}
 "#,
-            "global_limits.max_connections",
+            "global_settings.max_connections",
         ),
         (
             r#"- address: '127.0.0.1:1080'

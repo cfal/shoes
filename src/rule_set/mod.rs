@@ -510,25 +510,30 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
 }
 
 pub(crate) fn cache_directory(configs: &[Config]) -> io::Result<Option<PathBuf>> {
-    let mut directory = None;
+    let mut settings = None;
     for config in configs {
-        if let Config::RuleCacheDirectory(path) = config {
-            if !path.is_absolute()
-                || path.file_name().is_none()
-                || path
-                    .components()
-                    .any(|component| component == std::path::Component::ParentDir)
-            {
-                return Err(invalid(
-                    "rule_cache_dir must be an absolute directory without parent traversal",
-                ));
-            }
-            if directory.replace(std::path::absolute(path)?).is_some() {
-                return Err(invalid("rule_cache_dir may only be specified once"));
-            }
+        if let Config::GlobalSettings(value) = config
+            && settings.replace(value).is_some()
+        {
+            return Err(invalid(
+                "global_settings may only be specified once across all config files",
+            ));
         }
     }
-    Ok(directory)
+    let Some(path) = settings.and_then(|settings| settings.rule_cache_dir.as_ref()) else {
+        return Ok(None);
+    };
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(invalid(
+            "rule_cache_dir must be an absolute directory without parent traversal",
+        ));
+    }
+    Ok(Some(std::path::absolute(path)?))
 }
 
 pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
@@ -537,7 +542,9 @@ pub fn anchor(configs: &mut [Config], config_file: &Path) -> io::Result<()> {
         .ok_or_else(|| invalid("config path has no parent"))?
         .to_path_buf();
     for config in configs.iter_mut() {
-        if let Config::RuleCacheDirectory(path) = config {
+        if let Config::GlobalSettings(settings) = config
+            && let Some(path) = &mut settings.rule_cache_dir
+        {
             if path.as_os_str().is_empty() {
                 return Err(invalid("rule_cache_dir must not be empty"));
             }

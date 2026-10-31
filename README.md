@@ -635,7 +635,7 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   Split modes require at least two effective request lanes: two H1 connections,
   or `pool.max_connections * effective_requests_per_connection >= 2` for H2/H3.
   The effective per-connection limit is the smaller of
-  `limits.max_requests_per_connection` and `global_limits.max_streams_per_connection`
+  `limits.max_requests_per_connection` and `global_settings.max_streams_per_connection`
   when the latter is configured. Peer stream limits can reduce runtime capacity further.
   Stream-one needs only one lane, including REALITY's automatic mode.
 - Server `x_padding_bytes` is an acceptance range, independent of
@@ -744,7 +744,7 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
 - The server bounds the initial TCP HTTP header/preface to four seconds after
   transport setup (or the shorter configured setup timeout). H1 keep-alive idle
   periods and subsequent partial headers have no deadline. For exposed listeners,
-  set `global_limits.max_connections` and `global_limits.max_connections_per_ip`.
+  set `global_settings.max_connections` and `global_settings.max_connections_per_ip`.
 - Xray's H1 packet-up uploader (observed on 26.10.10) can lose pipelined requests
   when Go GC discards pooled connections with unread responses. Sustained uploads
   to slow destinations can therefore fail despite bounded server backpressure.

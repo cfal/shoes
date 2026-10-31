@@ -4,6 +4,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 
 ## Table of Contents
 - [Configuration Structure](#configuration-structure)
+- [Global Settings](#global-settings)
 - [Server Config](#server-config)
 - [Server Protocols](#server-protocols)
 - [TUN Config](#tun-config)
@@ -18,6 +19,31 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [Certificate Sources](#certificate-sources)
 - [Advanced Features](#advanced-features)
 - [Command Line](#command-line)
+
+## Global Settings
+
+Use one `global_settings` entry across all loaded configuration files for
+process-wide settings. Resource limits remain flat fields alongside the optional
+remote-rule cache directory:
+
+```yaml
+- global_settings:
+    max_connections: 10000
+    reload_grace_secs: 300
+    rule_cache_dir: ./rule-cache
+```
+
+Omitted or `null` admission caps are unlimited; transport buffer defaults are
+unchanged. Omit `rule_cache_dir` (or set it to `null`) to keep remote rules only in
+memory. A configured directory applies to all remote sources; per-source cache
+directories are not supported. See [remote rule sources](#remote-rule-sources)
+for cache permissions, relative paths, and restart requirements.
+
+`global_limits` remains an alias for `global_settings` and logs a warning that it
+will be deprecated in the next version; rename the entry to `global_settings`.
+Both names count toward the same single-entry limit, even for empty entries.
+Serialized configurations always use `global_settings`. Standalone
+`rule_cache_dir` entries are not supported; put the field inside `global_settings`.
 
 ## WireGuard
 
@@ -2094,7 +2120,8 @@ source object works in `rule_source_group.rules`, under `masks` (including
 `rules`, or supported `override_rules`. A flat source cannot also specify `masks`.
 
 ```yaml
-- rule_cache_dir: ./cache
+- global_settings:
+    rule_cache_dir: ./cache
 
 - rule_source_group: regional
   rules:
@@ -2131,7 +2158,7 @@ refresh uses the active generation's DNS, proxy clients, and selector choices.
 All runtime remote sources use compiled rules retained in memory, including when
 disk caching is enabled. Reloads reuse sources whose URL and decoding options
 are unchanged; runtime compilation never falls back to cache files.
-Omit `rule_cache_dir` to disable persistence. Shoes downloads required sources
+Omit `global_settings.rule_cache_dir` to disable persistence. Shoes downloads required sources
 before starting listeners. Periodic refresh still applies;
 failed downloads or rejected candidates leave the active rules unchanged. No
 cache, lock, staging, or temporary files are created. Download buffers are released
@@ -2140,7 +2167,7 @@ A cold start requires network access; a remote outage prevents startup when
 there is no persistent cache. `check` and `--dry-run` remain offline and cannot
 validate memory-only remote sources. Local file sources still require `path`.
 
-`rule_cache_dir` enables best-effort persistence in one private managed directory
+`global_settings.rule_cache_dir` enables best-effort persistence in one private managed directory
 across all config files. Valid downloads remain usable even when saving fails.
 Cache-save failures are logged; the next successful download retries saving,
 including byte-identical downloads. Until a save succeeds, a restart may restore
@@ -2610,7 +2637,7 @@ client_chain:
 
 ### QUIC Socket Buffers
 
-`global_limits.quic_socket_buffer` requests the UDP receive and send buffer size
+`global_settings.quic_socket_buffer` requests the UDP receive and send buffer size
 for each QUIC listener, outbound QUIC proxy endpoint and DNS-over-HTTP/3 socket.
 It defaults to **8388608 bytes (8 MiB)**; allowed values are 65536 through
 16777216 bytes. This is per socket, not per QUIC connection, and is separate
@@ -2618,7 +2645,7 @@ from QUIC flow-control windows and userspace buffer admission limits. Ordinary
 UDP forwarding sockets keep their existing buffer sizes.
 
 ```yaml
-- global_limits:
+- global_settings:
     quic_socket_buffer: 8388608
 ```
 
@@ -2671,7 +2698,7 @@ configuration, including control state, resource limits, DNS ownership, and
 certificate workers. A successful rollback keeps the process running; if rollback
 also fails, Shoes exits with status 1 rather than serving a partial generation.
 Existing TCP connections begin draining when their old listeners retire, for up
-to `global_limits.reload_grace_secs`. That deadline still applies after rollback.
+to `global_settings.reload_grace_secs`. That deadline still applies after rollback.
 TUN, WireGuard, and QUIC services are stopped and restarted; their existing
 sessions are not migrated or restored by rollback.
 
@@ -2681,7 +2708,7 @@ They rotate live without replacing listeners or closing QUIC connections; see
 
 QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. If the previous generation's sockets do not retire within the five-second socket-release guard, Shoes exits with an error rather than announcing a partially ready generation.
 
-Candidate QUIC buffer sizes are used during DNS preparation, but `global_limits` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.
+Candidate QUIC buffer sizes are used during DNS preparation, but `global_settings` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.
 
 On macOS, edit the configured file path or use SIGHUP when writing through a hard-link alias in another directory. Automatic detection of such alias writes is backend-dependent. System-volume directory symlinks are resolved without watching their immutable links.
 

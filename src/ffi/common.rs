@@ -227,7 +227,7 @@ pub async fn start_from_config(
 
     let mut remote_refresh = configs
         .iter()
-        .any(|config| matches!(config, Config::RuleCacheDirectory(_)));
+        .any(|config| matches!(config, Config::GlobalSettings(settings) if settings.rule_cache_dir.is_some()));
     if !remote_refresh {
         crate::rule_set::visit_sources(&mut configs, &mut |source| {
             remote_refresh |= source.parsed_url()?.is_some();
