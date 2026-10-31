@@ -121,8 +121,7 @@ impl PaddingFactory {
             .get("stop")
             .ok_or_else(|| "missing 'stop' in padding scheme".to_string())?
             .parse::<i64>()
-            .map_err(|_| "invalid 'stop' value in padding scheme".to_string())?
-            as u32;
+            .map_err(|_| "invalid 'stop' value in padding scheme".to_string())?;
 
         let mut hasher = Md5::new();
         hasher.update(raw_scheme);
@@ -135,7 +134,8 @@ impl PaddingFactory {
         Ok(Self {
             scheme,
             raw_scheme: raw_scheme.to_vec(),
-            stop,
+            // The reference wraps signed stop values to u32; -1 means never stop.
+            stop: stop as u32,
             md5,
         })
     }
@@ -177,44 +177,32 @@ impl PaddingFactory {
         };
 
         let mut sizes = Vec::new();
-        let parts: Vec<&str> = spec.split(',').collect();
-
-        for part in parts {
+        for part in spec.split(',') {
             let part = part.trim();
 
-            // Check mark - indicates "stop if no more data"
             if part == "c" {
                 sizes.push(CHECK_MARK);
                 continue;
             }
 
-            // Parse range: "min-max"
-            if let Some((min_str, max_str)) = part.split_once('-') {
-                let min_val: i64 = match min_str.trim().parse() {
-                    Ok(v) if v > 0 => v,
-                    _ => continue,
-                };
-                let max_val: i64 = match max_str.trim().parse() {
-                    Ok(v) if v > 0 => v,
-                    _ => continue,
-                };
-
-                // Ensure min <= max
-                let (min_val, max_val) = (min_val.min(max_val), min_val.max(max_val));
-                if max_val > 1 << 20 {
-                    continue;
-                }
-
-                if min_val == max_val {
-                    // Fixed size
-                    sizes.push(min_val as i32);
-                } else {
-                    // The reference draws from the half-open range [min, max).
-                    let mut rng = rand::rng();
-                    let size = rng.random_range(min_val..max_val);
-                    sizes.push(size as i32);
-                }
-            }
+            let Some((min, max)) = part.split_once('-') else {
+                continue;
+            };
+            let min: i64 = match min.trim().parse() {
+                Ok(value) if value > 0 && value <= 1 << 20 => value,
+                _ => continue,
+            };
+            let max: i64 = match max.trim().parse() {
+                Ok(value) if value > 0 && value <= 1 << 20 => value,
+                _ => continue,
+            };
+            let (min, max) = (min.min(max), min.max(max));
+            let size = if min == max {
+                min
+            } else {
+                rand::rng().random_range(min..max)
+            };
+            sizes.push(size as i32);
         }
 
         sizes
@@ -292,7 +280,7 @@ mod tests {
         for _ in 0..100 {
             let sizes = factory.generate_record_payload_sizes(1);
             assert_eq!(sizes.len(), 1);
-            assert!(sizes[0] >= 100 && sizes[0] <= 400);
+            assert!((100..400).contains(&sizes[0]));
         }
     }
 
@@ -303,9 +291,34 @@ mod tests {
         let sizes = factory.generate_record_payload_sizes(2);
 
         assert_eq!(sizes.len(), 3);
-        assert!(sizes[0] >= 400 && sizes[0] <= 500);
+        assert!((400..500).contains(&sizes[0]));
         assert_eq!(sizes[1], CHECK_MARK);
-        assert!(sizes[2] >= 500 && sizes[2] <= 1000);
+        assert!((500..1000).contains(&sizes[2]));
+    }
+
+    #[test]
+    fn ranges_are_exclusive_positive_and_bounded() {
+        for (range, expected) in [
+            ("1-2", vec![1]),
+            ("2-1", vec![1]),
+            ("1048576-1048576", vec![1 << 20]),
+            ("1048577-1048577", vec![]),
+            ("1-1048577", vec![]),
+            ("0-1", vec![]),
+            ("0-0", vec![]),
+            ("-1-1", vec![]),
+            ("invalid,1,1-x,1-2-3", vec![]),
+            ("invalid,2-2,0-1,3-3", vec![2, 3]),
+        ] {
+            let factory = PaddingFactory::new(format!("stop=2\n1={range}").as_bytes()).unwrap();
+            for _ in 0..64 {
+                assert_eq!(
+                    factory.generate_record_payload_sizes(1),
+                    expected,
+                    "{range}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -340,5 +353,31 @@ mod tests {
         let scheme = "0=100-100";
         let result = PaddingFactory::new(scheme.as_bytes());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn signed_stop_values_wrap_like_the_reference() {
+        for (stop, expected) in [
+            ("-1", u32::MAX),
+            ("-2", u32::MAX - 1),
+            ("4294967295", u32::MAX),
+            ("4294967296", 0),
+            ("4294967297", 1),
+        ] {
+            let scheme = format!("stop={stop}\n0=31-31");
+            assert_eq!(
+                PaddingFactory::new(scheme.as_bytes()).unwrap().stop(),
+                expected
+            );
+        }
+        for stop in [
+            "",
+            "-",
+            "1.5",
+            "9223372036854775808",
+            "-9223372036854775809",
+        ] {
+            assert!(PaddingFactory::new(format!("stop={stop}").as_bytes()).is_err());
+        }
     }
 }
