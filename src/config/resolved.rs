@@ -180,23 +180,3 @@ impl ResolvedDnsConfig {
 
 #[cfg(test)]
 mod tests;
-
-impl ResolvedClientConfig {
-    pub fn validate_quic_key_exchange(&self, initial_hop: bool) -> std::io::Result<()> {
-        let explicit_groups = self
-            .quic_settings
-            .as_ref()
-            .is_some_and(|settings| !settings.key_exchange_groups.is_default());
-        if explicit_groups
-            && (!initial_hop
-                || self.protocol.is_direct()
-                || self.transport != super::Transport::Quic)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "QUIC key_exchange_groups requires a non-direct client at chain hop 0 with transport: quic",
-            ));
-        }
-        Ok(())
-    }
-}
