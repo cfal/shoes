@@ -40,7 +40,18 @@ pub(super) async fn request_to(
         "socks" => {
             let mut response = [0; 10];
             socket.read_exact(&mut response).await?;
-            assert_eq!(&response[..4], &[5, 0, 0, 1]);
+            assert_eq!(response[0], 5);
+            assert_eq!(&response[2..4], &[0, 1]);
+            if response[1] != 0 {
+                assert_eq!(&response[4..], &[0; 6]);
+                let mut trailing = Vec::new();
+                socket.read_to_end(&mut trailing).await?;
+                assert!(trailing.is_empty());
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("SOCKS request rejected with REP {:02x}", response[1]),
+                ));
+            }
         }
         "http" => assert!(headers(socket).await?.starts_with(b"HTTP/1.1 200")),
         _ => {}
