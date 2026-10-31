@@ -400,6 +400,9 @@ impl AsyncPing for ShadowTlsStream {
 }
 
 impl AsyncStream for ShadowTlsStream {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.stream.peer_addr()
     }

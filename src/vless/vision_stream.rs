@@ -836,6 +836,9 @@ impl<S: VisionTransport> crate::async_stream::AsyncPing for VisionStream<S> {
 }
 
 impl<S: VisionTransport> AsyncStream for VisionStream<S> {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.tls.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.tls.peer_addr()
     }

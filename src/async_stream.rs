@@ -190,6 +190,9 @@ impl AsyncShutdownMessage for UdpSocket {
 }
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         None
     }
@@ -280,6 +283,9 @@ impl AsyncPing for TcpStream {
 }
 
 impl AsyncStream for TcpStream {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        TcpStream::local_addr(self).ok()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         TcpStream::peer_addr(self).ok()
     }
@@ -537,6 +543,9 @@ impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for 
 }
 
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        (**self).local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         (**self).peer_addr()
     }
@@ -553,6 +562,9 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
     }
 }
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        (**self).local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         (**self).peer_addr()
     }

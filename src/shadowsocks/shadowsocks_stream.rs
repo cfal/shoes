@@ -1163,6 +1163,9 @@ impl AsyncShutdownMessage for ShadowsocksStream {
 }
 
 impl AsyncStream for ShadowsocksStream {
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.stream.peer_addr()
     }

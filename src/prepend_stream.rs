@@ -99,6 +99,9 @@ impl<S: AsyncStream> AsyncStream for PrependStream<S> {
     fn flow(&self) -> Option<&std::sync::Arc<crate::control::flows::FlowEntry>> {
         self.inner.flow()
     }
+    fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.inner.peer_addr()
     }
