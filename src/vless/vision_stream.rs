@@ -145,6 +145,16 @@ where
         Ok(Self::new_common(tls, user_uuid, true, false))
     }
 
+    pub(crate) fn new_xudp_server(
+        tls: S,
+        user_uuid: [u8; 16],
+        initial_read_data: &[u8],
+    ) -> io::Result<Self> {
+        let mut stream = Self::new_server(tls, user_uuid, &[])?.with_xudp();
+        stream.feed_initial_read_data(initial_read_data)?;
+        Ok(stream)
+    }
+
     pub(crate) fn with_write_error_policy(mut self, policy: VisionWriteErrorPolicy) -> Self {
         self.write_error_policy = policy;
         self

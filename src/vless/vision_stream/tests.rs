@@ -592,6 +592,30 @@ async fn vision_target_plain_udp_preserves_preread_and_following_records() {
 }
 
 #[tokio::test]
+async fn xudp_preread_is_opaque_before_tls_detection() {
+    for backend in BACKENDS {
+        let (_, server) = connection_pair(backend);
+        let (_, io) = tokio::io::duplex(1024);
+        let data = b"prefix\x16\x03\x03\x00\x01\x01";
+        let padded = crate::vless::vision_pad::pad_with_uuid_and_command(data, &[7; 16], 0, false);
+        let mut stream = VisionStream::new_xudp_server(
+            CryptoTlsStream::new(io, server, Some(TlsDeframer::new())),
+            [7; 16],
+            &padded,
+        )
+        .unwrap();
+        assert_eq!(&stream.pending_read[..], data);
+        assert!(!stream.filter.is_tls());
+        for _ in 0..6 {
+            stream.filter.decrement_filter_count();
+        }
+        assert!(stream.filter.is_filtering());
+        stream.filter.decrement_filter_count();
+        assert!(!stream.filter.is_filtering());
+    }
+}
+
+#[tokio::test]
 async fn vision_udp_client_uses_mux_and_exchanges_arbitrary_datagrams() {
     use crate::client_proxy_selector::ClientProxySelector;
     use crate::resolver::{NativeResolver, Resolver};
