@@ -66,6 +66,11 @@ impl TlsClientHandler {
                 })?;
 
         if let Some(size) = self.tls_buffer_size {
+            // Vision peers require the UUID and first frame header in one TLS record.
+            let size = match self.handler {
+                TlsInnerClientHandler::VisionVless { .. } => size.max(21),
+                TlsInnerClientHandler::Default(_) => size,
+            };
             client_conn.set_buffer_limit(Some(size));
         }
 
