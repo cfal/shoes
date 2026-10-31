@@ -56,6 +56,29 @@ fn pad_one(output: &mut BytesMut, data: &[u8], uuid: Option<&[u8; 16]>, command:
     }
 }
 
+/// Calculate padding length based on content size and TLS detection
+fn calculate_padding_length(content_len: usize, is_tls: bool) -> usize {
+    let mut rng = rand::rng();
+
+    // Calculate maximum allowable padding (avoid overflow)
+    // Matches Xray-core logic: buf.Size - 21 - contentLen
+    // MAX_PADDING_SIZE is already (buf.Size - 21), so we only subtract content_len
+    let max_allowable = MAX_PADDING_SIZE.saturating_sub(content_len);
+
+    if is_tls && content_len < LONG_PADDING_MIN {
+        // Long padding for TLS handshake phase
+        let random_part = rng.random_range(0..LONG_PADDING_RANDOM_MAX);
+        let padding = LONG_PADDING_MIN
+            .saturating_sub(content_len)
+            .saturating_add(random_part);
+        std::cmp::min(padding, max_allowable)
+    } else {
+        // Short random padding
+        let padding = rng.random_range(0..SHORT_PADDING_RANDOM_MAX);
+        std::cmp::min(padding, max_allowable)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,28 +114,5 @@ mod tests {
                 }
             }
         }
-    }
-}
-
-/// Calculate padding length based on content size and TLS detection
-fn calculate_padding_length(content_len: usize, is_tls: bool) -> usize {
-    let mut rng = rand::rng();
-
-    // Calculate maximum allowable padding (avoid overflow)
-    // Matches Xray-core logic: buf.Size - 21 - contentLen
-    // MAX_PADDING_SIZE is already (buf.Size - 21), so we only subtract content_len
-    let max_allowable = MAX_PADDING_SIZE.saturating_sub(content_len);
-
-    if is_tls && content_len < LONG_PADDING_MIN {
-        // Long padding for TLS handshake phase
-        let random_part = rng.random_range(0..LONG_PADDING_RANDOM_MAX);
-        let padding = LONG_PADDING_MIN
-            .saturating_sub(content_len)
-            .saturating_add(random_part);
-        std::cmp::min(padding, max_allowable)
-    } else {
-        // Short random padding
-        let padding = rng.random_range(0..SHORT_PADDING_RANDOM_MAX);
-        std::cmp::min(padding, max_allowable)
     }
 }

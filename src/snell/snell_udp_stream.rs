@@ -13,68 +13,6 @@ use crate::async_stream::{
 };
 use crate::util::allocate_vec;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn oversized_datagrams_are_dropped_without_poisoning_the_relay() {
-        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.connect(peer.local_addr().unwrap()).await.unwrap();
-        let mut client = SnellUdpClientStream::new(Box::new(socket), 16383);
-        for (target, header_len) in [
-            (NetLocation::from_str("127.0.0.1:53", None).unwrap(), 9),
-            (NetLocation::from_str("[::1]:53", None).unwrap(), 21),
-            (
-                NetLocation::new(Address::Hostname("a".repeat(255)), 53),
-                259,
-            ),
-        ] {
-            for size in [65535, 16384 - header_len, 16383 - header_len] {
-                futures::future::poll_fn(|cx| {
-                    Pin::new(&mut client).poll_write_targeted_message(cx, &vec![1; size], &target)
-                })
-                .await
-                .unwrap();
-                assert_eq!(
-                    client.write_buf_end_offset,
-                    if size + header_len > 16383 { 0 } else { 16383 }
-                );
-            }
-            futures::future::poll_fn(|cx| Pin::new(&mut client).poll_flush_message(cx))
-                .await
-                .unwrap();
-            let mut received = vec![0; 16384];
-            assert_eq!(peer.recv(&mut received).await.unwrap(), 16383);
-        }
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.connect(peer.local_addr().unwrap()).await.unwrap();
-        let mut server = SnellUdpStream::new(Box::new(socket), 16383);
-        for (source, header_len) in [
-            (NetLocation::from_str("127.0.0.1:53", None).unwrap(), 7),
-            (NetLocation::from_str("[::1]:53", None).unwrap(), 19),
-        ] {
-            for size in [65535, 16384 - header_len, 16383 - header_len] {
-                futures::future::poll_fn(|cx| {
-                    Pin::new(&mut server).poll_write_sourced_message(cx, &vec![1; size], &source)
-                })
-                .await
-                .unwrap();
-                assert_eq!(
-                    server.write_buf_end_offset,
-                    if size + header_len > 16383 { 0 } else { 16383 }
-                );
-            }
-            futures::future::poll_fn(|cx| Pin::new(&mut server).poll_flush_message(cx))
-                .await
-                .unwrap();
-            let mut received = vec![0; 16384];
-            assert_eq!(peer.recv(&mut received).await.unwrap(), 16383);
-        }
-    }
-}
-
 pub struct SnellUdpStream {
     stream: Box<dyn AsyncMessageStream>,
     peer: Option<SocketAddr>,
@@ -505,3 +443,65 @@ impl AsyncPing for SnellUdpClientStream {
 }
 
 impl AsyncSourcedMessageStream for SnellUdpClientStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_datagrams_are_dropped_without_poisoning_the_relay() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let mut client = SnellUdpClientStream::new(Box::new(socket), 16383);
+        for (target, header_len) in [
+            (NetLocation::from_str("127.0.0.1:53", None).unwrap(), 9),
+            (NetLocation::from_str("[::1]:53", None).unwrap(), 21),
+            (
+                NetLocation::new(Address::Hostname("a".repeat(255)), 53),
+                259,
+            ),
+        ] {
+            for size in [65535, 16384 - header_len, 16383 - header_len] {
+                futures::future::poll_fn(|cx| {
+                    Pin::new(&mut client).poll_write_targeted_message(cx, &vec![1; size], &target)
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    client.write_buf_end_offset,
+                    if size + header_len > 16383 { 0 } else { 16383 }
+                );
+            }
+            futures::future::poll_fn(|cx| Pin::new(&mut client).poll_flush_message(cx))
+                .await
+                .unwrap();
+            let mut received = vec![0; 16384];
+            assert_eq!(peer.recv(&mut received).await.unwrap(), 16383);
+        }
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let mut server = SnellUdpStream::new(Box::new(socket), 16383);
+        for (source, header_len) in [
+            (NetLocation::from_str("127.0.0.1:53", None).unwrap(), 7),
+            (NetLocation::from_str("[::1]:53", None).unwrap(), 19),
+        ] {
+            for size in [65535, 16384 - header_len, 16383 - header_len] {
+                futures::future::poll_fn(|cx| {
+                    Pin::new(&mut server).poll_write_sourced_message(cx, &vec![1; size], &source)
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    server.write_buf_end_offset,
+                    if size + header_len > 16383 { 0 } else { 16383 }
+                );
+            }
+            futures::future::poll_fn(|cx| Pin::new(&mut server).poll_flush_message(cx))
+                .await
+                .unwrap();
+            let mut received = vec![0; 16384];
+            assert_eq!(peer.recv(&mut received).await.unwrap(), 16383);
+        }
+    }
+}
