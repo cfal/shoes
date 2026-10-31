@@ -49,8 +49,8 @@ fn next_layout(index: usize, count: usize) -> usize {
     if index + 1 == count { 0 } else { index + 1 }
 }
 
-fn pad(rng: &mut StdRng, padding: u8, pool: &[u8], output: &mut [u8]) -> usize {
-    if padding == 0 || (padding < 100 && rng.random_range(0..100u8) >= padding) {
+fn pad(rng: &mut impl rand::Rng, padding: u64, pool: &[u8], output: &mut [u8]) -> usize {
+    if padding == 0 || (padding < (1u64 << 32) && u64::from(rng.random::<u32>()) >= padding) {
         return 0;
     }
     output[0] = pool[rng.random_range(0..pool.len() as u32) as usize];
@@ -99,7 +99,8 @@ pub(super) struct Encoder {
     config: Arc<Prepared>,
     mode: Mode,
     layout: usize,
-    padding: u8,
+    // Includes 2^32 so 100% padding needs no probability draw.
+    padding: u64,
     rng: StdRng,
 }
 
@@ -107,6 +108,7 @@ impl Encoder {
     pub fn new(config: Arc<Prepared>, role: Role) -> Self {
         let mut rng = rand::make_rng::<StdRng>();
         let padding = rng.random_range(config.padding_min..=config.padding_max);
+        let padding = (u64::from(padding) << 32) / 100;
         Self {
             config,
             mode: match role {
@@ -836,6 +838,63 @@ mod tests {
     }
 
     #[test]
+    fn padding_thresholds_preserve_probability_boundaries_and_draw_counts() {
+        struct Draws(std::collections::VecDeque<u32>);
+
+        impl rand::TryRng for Draws {
+            type Error = std::convert::Infallible;
+
+            fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+                Ok(self.0.pop_front().expect("unexpected random draw"))
+            }
+
+            fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+                panic!("padding uses u32 draws")
+            }
+
+            fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), Self::Error> {
+                panic!("padding uses u32 draws")
+            }
+        }
+
+        for percent in 0..=100u64 {
+            let config = super::super::tests::config(json!({
+                "padding_min":percent, "padding_max":percent,
+            }));
+            let threshold = Encoder::new(config, Role::Client).padding;
+            let numerator = percent * (u64::from(u32::MAX) + 1);
+            assert!(threshold * 100 <= numerator);
+            assert!(numerator - threshold * 100 < 100);
+            for draw in [
+                0,
+                threshold.saturating_sub(1),
+                threshold,
+                u64::from(u32::MAX),
+            ] {
+                if draw > u64::from(u32::MAX) {
+                    continue;
+                }
+                let should_pad = draw < threshold;
+                let mut rng = Draws(std::collections::VecDeque::new());
+                if (1..100).contains(&percent) {
+                    rng.0.push_back(draw as u32);
+                }
+                if should_pad {
+                    rng.0.push_back(0);
+                }
+                let mut output = [0xa5; 2];
+                assert_eq!(
+                    pad(&mut rng, threshold, &[17, 23], &mut output),
+                    usize::from(should_pad)
+                );
+                assert_eq!(output, [if should_pad { 17 } else { 0xa5 }, 0xa5]);
+                assert!(rng.0.is_empty());
+            }
+        }
+        assert_eq!(pad(&mut Draws(Default::default()), 0, &[], &mut []), 0);
+    }
+
+    #[test]
     fn empty_encoding_preserves_output_rng_and_layout() {
         for options in [
             json!({}),
@@ -928,6 +987,28 @@ mod tests {
     fn export_rust_wire_samples() {
         let mut samples: Vec<Sample> =
             serde_json::from_str(include_str!("../../tests/fixtures/sudoku/xray.json")).unwrap();
+        for options in [
+            json!({}),
+            json!({"ascii":"ascii"}),
+            json!({"custom_tables":["xpxvvpvv"]}),
+            json!({"custom_tables":["", "xpxvvpvv", "vxpvxvvp"]}),
+        ] {
+            for padding in [0, 1, 10, 50, 99, 100] {
+                let mut config = options.clone();
+                config["password"] = json!("threshold-interop");
+                config["padding_min"] = json!(padding);
+                config["padding_max"] = json!(padding);
+                for packed in [false, true] {
+                    samples.push(Sample {
+                        config: config.clone(),
+                        packed,
+                        plain: STANDARD
+                            .encode((0..289).map(|i| (i * 37) as u8).collect::<Vec<_>>()),
+                        wire: String::new(),
+                    });
+                }
+            }
+        }
         for sample in &mut samples {
             let config = super::super::tests::config(sample.config.clone());
             let mut encoder = Encoder::new(
