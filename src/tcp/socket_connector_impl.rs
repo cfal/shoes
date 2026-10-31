@@ -665,6 +665,7 @@ impl crate::async_stream::AsyncMessageStream for UnconnectedUdpSocket {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::option_util::NoneOrOne;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::time::Instant;
@@ -740,7 +741,7 @@ mod tests {
         check_quic_verification(
             "localhost",
             "localhost",
-            Some(None),
+            NoneOrOne::None,
             false,
             true,
             &[
@@ -761,7 +762,7 @@ mod tests {
     #[tokio::test]
     async fn quic_verifies_ip_certificates_without_sni() {
         for (host, ipv6) in [("127.0.0.1", false), ("::1", true)] {
-            for sni in [None, Some(None)] {
+            for sni in [NoneOrOne::Unspecified, NoneOrOne::None] {
                 check_quic_verification(host, host, sni, ipv6, true, QUIC_PROTOCOLS).await;
             }
         }
@@ -769,28 +770,18 @@ mod tests {
 
     #[tokio::test]
     async fn quic_verifies_hostnames_and_sni_overrides() {
+        use NoneOrOne::{One, Unspecified};
+
         for (host, certificate_name, sni, ipv6, succeeds) in [
-            ("localhost", "localhost", None, false, true),
-            ("localhost", "localhost", Some(None), true, true),
-            (
-                "127.0.0.1",
-                "localhost",
-                Some(Some("localhost")),
-                false,
-                true,
-            ),
-            ("::1", "localhost", Some(Some("localhost")), true, true),
-            ("127.0.0.1", "localhost", None, false, false),
-            ("::1", "localhost", Some(None), true, false),
-            ("127.0.0.1", "example.com", Some(None), false, false),
-            ("::1", "example.com", None, true, false),
-            (
-                "localhost",
-                "localhost",
-                Some(Some("wrong.example")),
-                true,
-                false,
-            ),
+            ("localhost", "localhost", Unspecified, false, true),
+            ("localhost", "localhost", NoneOrOne::None, true, true),
+            ("127.0.0.1", "localhost", One("localhost"), false, true),
+            ("::1", "localhost", One("localhost"), true, true),
+            ("127.0.0.1", "localhost", Unspecified, false, false),
+            ("::1", "localhost", NoneOrOne::None, true, false),
+            ("127.0.0.1", "example.com", NoneOrOne::None, false, false),
+            ("::1", "example.com", Unspecified, true, false),
+            ("localhost", "localhost", One("wrong.example"), true, false),
         ] {
             check_quic_verification(host, certificate_name, sni, ipv6, succeeds, QUIC_PROTOCOLS)
                 .await;
@@ -800,7 +791,7 @@ mod tests {
     async fn check_quic_verification(
         host: &str,
         certificate_name: &str,
-        sni: Option<Option<&str>>,
+        sni: NoneOrOne<&str>,
         ipv6: bool,
         succeeds: bool,
         protocols: &[&str],
@@ -839,22 +830,26 @@ mod tests {
         )
         .build()
         .unwrap();
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+        let sni_yaml = match sni {
+            NoneOrOne::Unspecified => String::new(),
+            NoneOrOne::None => "sni_hostname: null, ".into(),
+            NoneOrOne::One(name) => format!("sni_hostname: '{name}', "),
+        };
         for protocol in protocols {
-            let host = if host.contains(':') {
-                format!("[{host}]")
-            } else {
-                host.to_owned()
-            };
-            let sni_yaml = match sni {
-                None => String::new(),
-                Some(None) => "sni_hostname: null, ".into(),
-                Some(Some(name)) => format!("sni_hostname: '{name}', "),
-            };
             let config: ClientConfig = serde_yaml::from_str(&format!(
                 "address: '{host}:{port}'\ntransport: quic\nquic_settings: {{verify: true, {sni_yaml}alpn_protocols: [h3]}}\nprotocol: {protocol}\n"
             ))
             .unwrap();
-            let expected_sni = sni.unwrap_or_else(|| config.address.address().hostname());
+            let expected_sni = match sni {
+                NoneOrOne::Unspecified => config.address.address().hostname(),
+                NoneOrOne::None => None,
+                NoneOrOne::One(name) => Some(name),
+            };
             let mut connector =
                 SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
             let TransportConfig::Quic {
