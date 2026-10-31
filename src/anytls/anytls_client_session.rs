@@ -156,12 +156,14 @@ impl AnyTlsClientSession {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "Session is closed"))
     }
 
-    /// Returns None only when closure is observed before any stream frames are queued.
+    /// Returns None only when closure is observed before this open queues any stream frames.
     pub(super) async fn try_open_stream(
         self: &Arc<Self>,
         destination: NetLocation,
     ) -> io::Result<Option<AnyTlsStream>> {
-        self.state.open_stream(destination, Arc::clone(self)).await
+        self.state
+            .try_open_stream(destination, Arc::clone(self))
+            .await
     }
 
     pub(super) fn remove_stream(&self, stream_id: u32) {
@@ -805,7 +807,7 @@ impl ClientSessionState {
     /// For the FIRST stream opened on a session, Settings + SYN + destination
     /// are sent together as a single TLS record to avoid fingerprinting.
     /// Subsequent streams use normal frame-by-frame transmission.
-    pub async fn open_stream(
+    pub async fn try_open_stream(
         self: &Arc<Self>,
         destination: NetLocation,
         owner: Arc<AnyTlsClientSession>,
@@ -982,14 +984,19 @@ mod tests {
         (state, rx)
     }
 
-    #[tokio::test]
-    async fn closed_stream_open_is_retryable_without_registering_or_queueing() {
-        let (state, mut rx) = writer_state();
+    fn warm_session() -> (Arc<AnyTlsClientSession>, mpsc::Receiver<OutgoingMessage>) {
+        let (state, rx) = writer_state();
         let session = Arc::new(AnyTlsClientSession {
-            state: state.clone(),
+            state,
             tasks: Vec::new(),
         });
-        state.close();
+        (session, rx)
+    }
+
+    #[tokio::test]
+    async fn closed_stream_open_is_retryable_without_registering_or_queueing() {
+        let (session, mut rx) = warm_session();
+        session.close();
         let destination = NetLocation::from_str("example.org:443", None).unwrap();
         assert!(
             session
@@ -998,7 +1005,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(state.streams.lock().is_empty());
+        assert!(session.state.streams.lock().is_empty());
         assert!(matches!(
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -1010,19 +1017,18 @@ mod tests {
     #[tokio::test]
     async fn queued_syn_is_the_stream_open_retry_boundary() {
         for queued_syn in [false, true] {
-            let (state, mut rx) = writer_state();
-            let session = Arc::new(AnyTlsClientSession {
-                state: state.clone(),
-                tasks: Vec::new(),
-            });
-            let backlog = STREAM_CHANNEL_BUFFER - usize::from(queued_syn);
+            let (session, mut rx) = warm_session();
+            let backlog = if queued_syn {
+                STREAM_CHANNEL_BUFFER - 1
+            } else {
+                STREAM_CHANNEL_BUFFER
+            };
             for _ in 0..backlog {
-                assert!(
-                    state
-                        .outgoing_tx
-                        .try_send(OutgoingMessage::Fin { stream_id: 1 })
-                        .is_ok()
-                );
+                session
+                    .state
+                    .outgoing_tx
+                    .try_send(OutgoingMessage::Fin { stream_id: 1 })
+                    .unwrap();
             }
             let destination = NetLocation::from_str("example.org:443", None).unwrap();
             let mut opening = Box::pin(session.try_open_stream(destination));
@@ -1053,29 +1059,24 @@ mod tests {
                 assert!(result.unwrap().is_none());
             }
             assert!(!session.is_reusable());
-            assert!(state.streams.lock().is_empty());
+            assert!(session.state.streams.lock().is_empty());
         }
     }
 
     #[tokio::test]
     async fn session_closure_while_reserving_syn_does_not_admit_it() {
-        let (state, mut rx) = writer_state();
-        let session = Arc::new(AnyTlsClientSession {
-            state: state.clone(),
-            tasks: Vec::new(),
-        });
+        let (session, mut rx) = warm_session();
         for _ in 0..STREAM_CHANNEL_BUFFER {
-            assert!(
-                state
-                    .outgoing_tx
-                    .try_send(OutgoingMessage::Fin { stream_id: 1 })
-                    .is_ok()
-            );
+            session
+                .state
+                .outgoing_tx
+                .try_send(OutgoingMessage::Fin { stream_id: 1 })
+                .unwrap();
         }
         let destination = NetLocation::from_str("example.org:443", None).unwrap();
         let mut opening = Box::pin(session.try_open_stream(destination));
         assert!(futures::poll!(&mut opening).is_pending());
-        state.close();
+        session.close();
         assert!(matches!(
             rx.try_recv().unwrap(),
             OutgoingMessage::Fin { stream_id: 1 }
@@ -1094,7 +1095,7 @@ mod tests {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
-        assert!(state.streams.lock().is_empty());
+        assert!(session.state.streams.lock().is_empty());
     }
 
     #[tokio::test]

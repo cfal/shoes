@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, DuplexStream};
 struct CloseOnTake {
     key: RouteKey,
     session: Arc<AnyTlsClientSession>,
-    triggered: Arc<AtomicBool>,
+    reusable_at_take: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -30,7 +30,7 @@ impl CarrierDialer for CloseOnTake {
 impl Drop for CloseOnTake {
     fn drop(&mut self) {
         // Removing the idle entry drops its retained route after the liveness check.
-        self.triggered
+        self.reusable_at_take
             .store(self.session.is_reusable(), Ordering::SeqCst);
         self.session.close();
     }
@@ -111,23 +111,23 @@ async fn stale_handler() -> (AnyTlsClientHandler, Arc<AtomicBool>, Peer) {
     peer.opened(target().location()).await;
     drop(stream);
     assert_eq!(peer.frame().await.cmd, Command::Fin);
-    let triggered = Arc::new(AtomicBool::new(false));
+    let reusable_at_take = Arc::new(AtomicBool::new(false));
     handler.pool.release(
         session.clone(),
         Arc::new(CloseOnTake {
             key: RouteKey(vec![1]),
             session,
-            triggered: triggered.clone(),
+            reusable_at_take: reusable_at_take.clone(),
         }),
     );
-    (handler, triggered, peer)
+    (handler, reusable_at_take, peer)
 }
 
 #[tokio::test]
-async fn stale_checkout_retries_wrapped_transport_once_for_tcp_and_udp() {
+async fn stale_checkout_falls_back_to_wrapped_transport_once_for_tcp_and_udp() {
     tokio::time::timeout(Duration::from_secs(3), async {
         for udp in [false, true] {
-            let (handler, triggered, mut old_peer) = stale_handler().await;
+            let (handler, reusable_at_take, mut old_peer) = stale_handler().await;
             let (io, peer) = tokio::io::duplex(4096);
             let calls = AtomicUsize::new(0);
             let wrappers = AtomicUsize::new(0);
@@ -167,7 +167,7 @@ async fn stale_checkout_retries_wrapped_transport_once_for_tcp_and_udp() {
                 let mut peer = Peer::new(peer).await;
                 peer.opened(target().location()).await;
             }
-            assert!(triggered.load(Ordering::SeqCst));
+            assert!(reusable_at_take.load(Ordering::SeqCst));
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(wrappers.load(Ordering::SeqCst), 1);
             let mut remaining = Vec::new();
@@ -184,7 +184,7 @@ async fn stale_checkout_retries_wrapped_transport_once_for_tcp_and_udp() {
 async fn stale_checkout_propagates_fresh_dial_failure_without_retrying_again() {
     tokio::time::timeout(Duration::from_secs(3), async {
         for udp in [false, true] {
-            let (handler, triggered, _peer) = stale_handler().await;
+            let (handler, reusable_at_take, _peer) = stale_handler().await;
             let calls = AtomicUsize::new(0);
             let transport = ClientTransport {
                 route: Arc::new(Route(RouteKey(vec![1]))),
@@ -202,7 +202,7 @@ async fn stale_checkout_propagates_fresh_dial_failure_without_retrying_again() {
                 handler.connect_client_tcp(transport, target()).await.err()
             }
             .unwrap();
-            assert!(triggered.load(Ordering::SeqCst));
+            assert!(reusable_at_take.load(Ordering::SeqCst));
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
             assert_eq!(error.to_string(), "fresh dial");
