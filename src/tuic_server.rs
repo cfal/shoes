@@ -1788,4 +1788,85 @@ mod auth_tests {
         .await
         .unwrap();
     }
+
+    #[test]
+    fn pre_auth_pressure_and_cleanup_release_stream_permits() {
+        if std::env::var_os("SHOES_TUIC_PRESSURE_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tuic_server::auth_tests::pre_auth_pressure_and_cleanup_release_stream_permits",
+                    "--quiet",
+                ])
+                .env("SHOES_TUIC_PRESSURE_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::resources::configure(crate::config::GlobalLimits {
+            max_streams: Some(3),
+            max_streams_per_connection: Some(4),
+            ..Default::default()
+        })
+        .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                timeout(Duration::from_secs(15), async {
+                    for case in ["success", "invalid", "timeout", "cancel", "truncated"] {
+                        let peer = connect(Arc::new(ClientProxySelector::new(Vec::new()))).await;
+                        let mut stalled = peer.connection.open_uni().await.unwrap();
+                        stalled.write_all(&[5]).await.unwrap();
+                        for id in 0..8 {
+                            send_uni(&peer.connection, &[5, COMMAND_TYPE_DISSOCIATE, 0, id]).await;
+                        }
+                        timeout(Duration::from_secs(1), async {
+                            while crate::resources::snapshot().streams.active == 0 {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        match case {
+                            "success" | "invalid" => {
+                                let password = if case == "success" { PASSWORD } else { "wrong" };
+                                send_uni(
+                                    &peer.connection,
+                                    &authenticate_command(&peer.connection, password),
+                                )
+                                .await;
+                            }
+                            "cancel" => peer.server.abort(),
+                            "truncated" => send_uni(&peer.connection, &[5]).await,
+                            _ => {}
+                        }
+                        if case == "success" {
+                            timeout(Duration::from_secs(1), async {
+                                while crate::resources::snapshot().streams.active != 0 {
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .unwrap();
+                            assert!(!peer.server.is_finished());
+                            peer.connection.close(0u32.into(), b"done");
+                        }
+                        let _ = peer.server.await;
+                        assert_eq!(crate::resources::snapshot().streams.active, 0, "{case}");
+                        assert!(crate::resources::snapshot().streams.peak <= 3, "{case}");
+                        assert!(crate::resources::try_stream().is_some());
+                    }
+                })
+                .await
+                .unwrap();
+            });
+    }
 }
