@@ -3,6 +3,86 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::time::{Duration, timeout};
 
 #[tokio::test]
+async fn padding_segments_preserve_empty_mixed_and_payload_only_writes() {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    #[derive(Debug, PartialEq)]
+    enum WriteEvent {
+        Data(Vec<u8>),
+        Flush,
+    }
+
+    struct RecordingWriter(Arc<SyncMutex<Vec<WriteEvent>>>);
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.lock().push(WriteEvent::Data(data.to_vec()));
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.lock().push(WriteEvent::Flush);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    timeout(Duration::from_secs(5), async {
+        for (sizes, payload_len, padding_lengths, write_lengths) in [
+            ("", 0, vec![], vec![]),
+            ("", 5, vec![], vec![5]),
+            ("c,20-20", 0, vec![], vec![]),
+            ("c,20-20", 5, vec![8], vec![20]),
+            ("5-5,c,20-20", 5, vec![], vec![5]),
+            ("10-10", 5, vec![], vec![5]),
+            ("12-12", 5, vec![], vec![5]),
+            ("13-13", 5, vec![1], vec![13]),
+            ("2-2,20-20", 5, vec![10], vec![2, 20]),
+            ("2-2", 5, vec![], vec![2, 3]),
+            ("20-20,2-2", 5, vec![8, 2], vec![20, 9]),
+            ("65555-65555", 5, vec![65535, 1], vec![65555]),
+            ("65536-65536", 0, vec![65535, 1], vec![65550]),
+        ] {
+            let padding =
+                Arc::new(PaddingFactory::new(format!("stop=8\n1={sizes}").as_bytes()).unwrap());
+            let (transport, _peer) = duplex(1);
+            let session = AnyTlsSession::new_server_test(transport, padding);
+            let events = Arc::new(SyncMutex::new(Vec::new()));
+            *session.writer.lock().await = Box::new(RecordingWriter(events.clone()));
+            let payload = BytesMut::from(vec![42; payload_len].as_slice());
+            let mut expected = payload.clone();
+            for length in padding_lengths {
+                Frame::with_data(Command::Waste, 0, Bytes::from(vec![0; length]))
+                    .encode_into(&mut expected)
+                    .unwrap();
+            }
+            let mut expected_events = Vec::new();
+            for length in write_lengths {
+                expected_events.push(WriteEvent::Data(expected.split_to(length).to_vec()));
+            }
+            assert!(expected.is_empty());
+            expected_events.push(WriteEvent::Flush);
+            session.write_with_padding(payload, 1).await.unwrap();
+            assert_eq!(
+                *events.lock(),
+                expected_events,
+                "sizes={sizes}, payload_len={payload_len}"
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn fake_dns_udp_modes() {
     use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
     timeout(Duration::from_secs(10), async {

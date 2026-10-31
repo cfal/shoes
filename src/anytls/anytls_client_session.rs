@@ -492,78 +492,55 @@ impl ClientSessionState {
         use crate::anytls::anytls_padding::CHECK_MARK;
 
         if !session.send_padding.load(Ordering::Relaxed) {
-            // Padding disabled, write directly
             return writer.write_all(data).await;
         }
 
-        // Increment packet counter and check if we should still pad
         let pkt = session.pkt_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let padding = session.padding.read().clone();
-        let stop = padding.stop();
 
-        if pkt >= stop {
+        if pkt >= padding.stop() {
             session.send_padding.store(false, Ordering::Relaxed);
             return writer.write_all(data).await;
         }
 
-        // Get padding sizes for this packet
         let pkt_sizes = padding.generate_record_payload_sizes(pkt);
-        if pkt_sizes.is_empty() {
-            return writer.write_all(data).await;
-        }
-
         let mut remaining = data;
 
         for size in pkt_sizes {
             if size == CHECK_MARK {
-                // Check mark: stop if no more payload
                 if remaining.is_empty() {
                     break;
                 }
                 continue;
             }
 
-            let l = size as usize;
-            let remain_len = remaining.len();
+            let size = size as usize;
+            let payload_len = remaining.len();
 
-            if remain_len > l {
-                // This segment is all payload, no padding needed
-                writer.write_all(&remaining[..l]).await?;
-                remaining = &remaining[l..];
-            } else if remain_len > 0 {
-                // This segment contains payload + padding
-                // We need to combine them into single write for correct TLS record
-                let padding_len = l.saturating_sub(remain_len + FRAME_HEADER_SIZE);
-                if padding_len > 0 {
-                    // Combine payload + WASTE frame into single buffer
+            if payload_len > size {
+                writer.write_all(&remaining[..size]).await?;
+                remaining = &remaining[size..];
+            } else if payload_len > 0 {
+                let padding_budget = size - payload_len;
+                if padding_budget > FRAME_HEADER_SIZE {
+                    // Payload and padding share one write to preserve TLS record boundaries.
                     padding_buf.clear();
-                    padding_buf.reserve(remain_len + FRAME_HEADER_SIZE + padding_len);
-
-                    // Add payload
+                    padding_buf.reserve(size);
                     padding_buf.extend_from_slice(remaining);
-
-                    append_padding(padding_buf, l - remain_len, true);
-
-                    // Single write for payload + padding (one TLS record)
+                    append_padding(padding_buf, padding_budget, true);
                     writer.write_all(padding_buf).await?;
                 } else {
-                    // Padding would be negative/zero, just write payload
                     writer.write_all(remaining).await?;
                 }
                 remaining = &[];
             } else {
-                // This segment is pure padding (no payload left)
-                // Build WASTE frame directly in padding_buf - NO Vec ALLOCATION
                 padding_buf.clear();
-                padding_buf.reserve(FRAME_HEADER_SIZE + l);
-
-                append_padding(padding_buf, l, false);
-
+                padding_buf.reserve(FRAME_HEADER_SIZE + size);
+                append_padding(padding_buf, size, false);
                 writer.write_all(padding_buf).await?;
             }
         }
 
-        // Write any remaining payload after padding scheme exhausted
         if !remaining.is_empty() {
             writer.write_all(remaining).await?;
         }

@@ -633,20 +633,11 @@ impl AnyTlsSession {
     async fn write_with_padding(&self, mut data: BytesMut, pkt: u32) -> io::Result<()> {
         let pkt_sizes = self.padding.generate_record_payload_sizes(pkt);
 
-        if pkt_sizes.is_empty() {
-            let mut writer = self.writer.lock().await;
-            writer.write_all(&data).await?;
-            return writer.flush().await;
-        }
-
         let mut writer = self.writer.lock().await;
 
         for size in pkt_sizes {
-            let remain_payload_len = data.len();
-
             if size == CHECK_MARK {
-                // Check mark: stop if no more data
-                if remain_payload_len == 0 {
+                if data.is_empty() {
                     break;
                 }
                 continue;
@@ -654,29 +645,21 @@ impl AnyTlsSession {
 
             let size = size as usize;
 
-            if remain_payload_len > size {
-                // This packet is all payload - send exactly `size` bytes
+            if data.len() > size {
                 writer.write_all(&data[..size]).await?;
                 data = data.split_off(size);
-            } else if remain_payload_len > 0 {
-                // This packet contains payload + padding
-                let padding_len = size.saturating_sub(remain_payload_len + FRAME_HEADER_SIZE);
-
-                if padding_len > 0 {
-                    // Append padding frame directly to data buffer (no intermediate allocation)
-                    append_padding(&mut data, size - remain_payload_len, true);
-                }
-
-                writer.write_all(&data).await?;
-                data.clear();
             } else {
-                append_padding(&mut data, size, false);
+                let payload_len = data.len();
+                if data.is_empty() {
+                    append_padding(&mut data, size, false);
+                } else {
+                    append_padding(&mut data, size - payload_len, true);
+                }
                 writer.write_all(&data).await?;
                 data.clear();
             }
         }
 
-        // Write any remaining payload
         if !data.is_empty() {
             writer.write_all(&data).await?;
         }
