@@ -2,7 +2,6 @@ use super::*;
 use crate::address::Address;
 use crate::client_proxy_chain::InitialHopEntry;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::config::ClientConfig;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::resolver::NativeResolver;
 use crate::tcp::socket_connector_impl::SocketConnectorImpl;
@@ -36,7 +35,11 @@ async fn authentication_fallback_preserves_preread_and_live_bytes() {
                 location.clone(),
                 ClientProxyChain::new(
                     vec![InitialHopEntry::Direct(Arc::new(
-                        SocketConnectorImpl::from_config(&ClientConfig::default(), None).unwrap(),
+                        SocketConnectorImpl::from_config(
+                            &crate::config::ResolvedClientConfig::default(),
+                            None,
+                        )
+                        .unwrap(),
                     ))],
                     Vec::new(),
                 ),

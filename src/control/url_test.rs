@@ -43,13 +43,12 @@ struct Sample {
 
 #[derive(Debug, Default)]
 struct State {
+    revision: u64,
     samples: HashMap<String, Sample>,
     incumbent: [Option<String>; 2],
     last_touch: Option<Instant>,
     last_check: Option<Instant>,
-    last_unqueued_admission: Option<Instant>,
     recheck: bool,
-    cursor: usize,
 }
 
 #[derive(Debug)]
@@ -133,6 +132,7 @@ impl AutomaticGroups {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn record(&self, member: &str, url: &str, delay: Option<u16>) {
         for group in self.0.values() {
             if group.config.url == url && group.members.iter().any(|name| name == member) {
@@ -144,6 +144,26 @@ impl AutomaticGroups {
                     },
                 );
             }
+        }
+    }
+
+    pub(crate) fn tickets(&self, member: &str, url: &str) -> Vec<(&AutomaticGroup, u64)> {
+        self.0
+            .values()
+            .filter(|group| {
+                group.config.url == url && group.members.iter().any(|name| name == member)
+            })
+            .map(|group| (group, group.state.lock().revision))
+            .collect()
+    }
+
+    pub(crate) fn choices_changed(&self) {
+        for group in self.0.values() {
+            let mut state = group.state.lock();
+            state.revision = state.revision.wrapping_add(1);
+            state.samples.clear();
+            state.incumbent = [None, None];
+            state.last_check = None;
         }
     }
 
@@ -159,6 +179,22 @@ impl AutomaticGroups {
 }
 
 impl AutomaticGroup {
+    pub(crate) fn revision(&self) -> u64 {
+        self.state.lock().revision
+    }
+
+    pub(crate) fn record_if_current(&self, member: &str, revision: u64, delay: Option<u16>) {
+        let mut state = self.state.lock();
+        if state.revision == revision {
+            state.samples.insert(
+                member.into(),
+                Sample {
+                    at: Instant::now(),
+                    delay,
+                },
+            );
+        }
+    }
     fn fresh(&self, sample: &Sample, now: Instant) -> bool {
         now.duration_since(sample.at)
             <= Duration::from_secs(self.config.interval * 2)
@@ -166,8 +202,8 @@ impl AutomaticGroup {
     }
 
     pub fn choose(&self, eligible: &HashSet<&str>, udp: bool) -> Option<String> {
-        let mut state = self.state.lock();
         let now = Instant::now();
+        let mut state = self.state.lock();
         let delay = |name: &str| {
             state
                 .samples
@@ -216,7 +252,7 @@ impl AutomaticGroup {
         }
     }
 
-    pub fn due_members(&self, now: Instant) -> Option<Vec<usize>> {
+    pub fn due_members(&self, now: Instant) -> Option<std::ops::Range<usize>> {
         let mut state = self.state.lock();
         let interval = Duration::from_secs(self.config.interval);
         if let Some(last_check) = state.last_check {
@@ -236,22 +272,7 @@ impl AutomaticGroup {
         }
         state.last_check = Some(now);
         state.recheck = false;
-        let members = (state.cursor..self.members.len())
-            .chain(0..state.cursor)
-            .collect();
-        Some(members)
-    }
-
-    pub fn admitted(&self, index: usize, queued: bool) {
-        let mut state = self.state.lock();
-        state.cursor = (index + 1) % self.members.len();
-        if !queued {
-            state.last_unqueued_admission = Some(Instant::now());
-        }
-    }
-
-    pub fn last_unqueued_admission(&self) -> Option<Instant> {
-        self.state.lock().last_unqueued_admission
+        Some(0..self.members.len())
     }
 
     pub fn cancel_check(&self) {
@@ -284,6 +305,55 @@ mod tests {
                 .unwrap();
         }
         groups
+    }
+
+    #[test]
+    fn every_selector_change_invalidates_all_groups_but_noops_preserve_samples() {
+        use crate::control::selection::{SelectionOwner, SelectorDefinition};
+        use std::sync::Arc;
+
+        let mut owner = SelectionOwner::new(None).unwrap();
+        let mut view = owner
+            .prepare(BTreeMap::from([(
+                "unrelated".into(),
+                SelectorDefinition {
+                    members: vec!["a".into(), "b".into()],
+                    default: None,
+                },
+            )]))
+            .unwrap();
+        Arc::get_mut(&mut view).unwrap().automatic = groups();
+        owner.activate(view.clone()).unwrap();
+        let groups = &view.automatic;
+        let group = &groups.0["one"];
+        let eligible = HashSet::from(["a", "b"]);
+        for group in groups.0.values() {
+            groups.record("b", &group.config.url, Some(5));
+            assert_eq!(group.choose(&eligible, false).as_deref(), Some("b"));
+            assert_eq!(group.choose(&eligible, true).as_deref(), Some("b"));
+            assert!(group.due_members(Instant::now()).is_some());
+        }
+        let (_, revision) = groups.tickets("b", &group.config.url)[0];
+        owner.select("unrelated", "a").unwrap();
+        assert_eq!(group.revision(), revision);
+        for group in groups.0.values() {
+            assert_eq!(group.health("b"), "healthy");
+            assert!(group.due_members(Instant::now()).is_none());
+        }
+
+        owner.select("unrelated", "b").unwrap();
+        owner.select("unrelated", "a").unwrap();
+        group.record_if_current("b", revision, Some(1));
+        for group in groups.0.values() {
+            assert_eq!(group.health("b"), "unprobed");
+            assert_eq!(group.choose(&eligible, false).as_deref(), Some("a"));
+            assert_eq!(group.choose(&eligible, true).as_deref(), Some("a"));
+            assert!(group.due_members(Instant::now()).is_some());
+        }
+        let (_, revision) = groups.tickets("a", &group.config.url)[0];
+        group.record_if_current("a", revision, Some(3));
+        assert_eq!(group.health("a"), "healthy");
+        assert_eq!(groups.0["two"].health("a"), "unprobed");
     }
 
     #[tokio::test(start_paused = true)]
@@ -327,7 +397,7 @@ mod tests {
     async fn lazy_startup_probe_suppression_touch_and_rate_limited_recheck() {
         let groups = groups();
         let group = &groups.0["one"];
-        assert!(group.due_members(Instant::now()).is_some());
+        assert_eq!(group.due_members(Instant::now()), Some(0..2));
         tokio::time::advance(Duration::from_secs(10)).await;
         BACKGROUND
             .scope((), async {
@@ -336,11 +406,11 @@ mod tests {
             .await;
         assert!(group.due_members(Instant::now()).is_none());
         groups.touch("one", false);
-        assert!(group.due_members(Instant::now()).is_some());
+        assert_eq!(group.due_members(Instant::now()), Some(0..2));
         groups.touch("one", true);
         assert!(group.due_members(Instant::now()).is_none());
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(group.due_members(Instant::now()).is_some());
+        assert_eq!(group.due_members(Instant::now()), Some(0..2));
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(group.due_members(Instant::now()).is_none());
     }

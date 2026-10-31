@@ -177,8 +177,8 @@ impl Session {
         )
     }
 
-    pub(crate) fn validate(&self, configs: &[crate::config::Config]) -> io::Result<()> {
-        if Spec::from_configs(configs)?.as_ref() != Some(&self.record.spec) {
+    pub(crate) fn validate(&self, configs: &[crate::config::ResolvedConfig]) -> io::Result<()> {
+        if Spec::from_resolved_configs(configs)?.as_ref() != Some(&self.record.spec) {
             return Err(spec::invalid(
                 "managed TUN topology changes require a restart",
             ));

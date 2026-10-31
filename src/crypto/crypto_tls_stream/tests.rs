@@ -633,7 +633,7 @@ async fn vision_prefix_stays_in_one_record_after_peer_key_update() {
         for size in [32, 8, 21, 27, 28, 47, 48, 64] {
             let hop = NetLocation::from_str("localhost:443", None).unwrap();
             let handler = create_tcp_client_handler(
-                serde_json::from_value(serde_json::json!({
+                crate::config::test_support::from_json(serde_json::json!({
                     "type": "tls", "verify": false, "vision": true,
                     "tls_buffer_size": size,
                     "protocol": {

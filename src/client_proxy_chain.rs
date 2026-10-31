@@ -35,6 +35,8 @@ use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 
+pub(crate) mod composition;
+
 /// Entry in the initial hop (hop 0) pool.
 ///
 /// Each entry pairs socket creation with optional protocol setup,
@@ -89,6 +91,7 @@ impl InitialHopEntry {
 /// - `initial_hop`: Pool of InitialHopEntry for hop 0 (socket + optional proxy paired)
 /// - `subsequent_hops`: Protocol connectors for hops 1+ (no socket creation needed)
 pub struct ClientProxyChain {
+    composition: Option<Arc<composition::Composition>>,
     origins: Vec<Vec<Option<MemberOrigin>>>,
     selection: Option<Arc<crate::control::selection::SelectionView>>,
     selector_hops: Vec<bool>,
@@ -137,6 +140,9 @@ impl std::fmt::Debug for ClientProxyChain {
 impl ClientProxyChain {
     #[cfg(unix)]
     pub(crate) fn tcp_selection_indices(&self) -> Vec<u32> {
+        if let Some(composition) = &self.composition {
+            return composition.tcp_selection_indices();
+        }
         std::iter::once(&self.initial_hop_next_index)
             .chain(&self.subsequent_next_indices)
             .map(|counter| counter.load(Ordering::Relaxed))
@@ -145,6 +151,10 @@ impl ClientProxyChain {
 
     #[cfg(unix)]
     pub(crate) fn restore_tcp_selection_indices(&mut self, indices: &[u32]) {
+        if let Some(composition) = &self.composition {
+            composition.restore_tcp_selection_indices(indices);
+            return;
+        }
         assert_eq!(indices.len(), self.num_hops());
         for (counter, index) in std::iter::once(&mut self.initial_hop_next_index)
             .chain(&mut self.subsequent_next_indices)
@@ -154,6 +164,26 @@ impl ClientProxyChain {
         }
     }
 
+    pub(crate) fn composed(
+        hops: crate::option_util::OneOrSome<crate::config::ResolvedClientHop>,
+        resolver: Arc<dyn Resolver>,
+        limits: crate::config::GlobalLimits,
+    ) -> std::io::Result<Self> {
+        let composition = composition::Composition::build(hops, resolver, limits)?;
+        Ok(Self {
+            selection: composition.selection().cloned(),
+            composition: Some(composition),
+            origins: Vec::new(),
+            selector_hops: Vec::new(),
+            initial_hop: Vec::new(),
+            initial_hop_next_index: AtomicU32::new(0),
+            subsequent_hops: Vec::new(),
+            subsequent_next_indices: Vec::new(),
+            udp_final_hop_indices: Vec::new(),
+            udp_final_hop_next_index: AtomicU32::new(0),
+            udp_uses_initial_hop: false,
+        })
+    }
     fn needs_carrier_dialer(&self) -> bool {
         self.initial_hop.iter().any(|entry| matches!(entry.as_ref(), InitialHopEntry::Proxy { proxy, .. } if proxy.needs_carrier_dialer()))
             || self.subsequent_hops.iter().flatten().any(|proxy| proxy.needs_carrier_dialer())
@@ -192,6 +222,10 @@ impl ClientProxyChain {
     }
 
     fn select_indices(&self, udp: bool) -> std::io::Result<Vec<usize>> {
+        #[cfg(test)]
+        if let Some(composition) = &self.composition {
+            return composition.test_select_indices(udp);
+        }
         let choices = self
             .selection
             .as_ref()
@@ -304,6 +338,10 @@ impl ClientProxyChain {
     }
 
     pub(crate) fn record_carrier_demand(&self) {
+        if let Some(composition) = &self.composition {
+            composition.record_demand();
+            return;
+        }
         if crate::control::url_test::is_background() {
             return;
         }
@@ -379,6 +417,7 @@ impl ClientProxyChain {
         let subsequent_next_indices = subsequent_hops.iter().map(|_| AtomicU32::new(0)).collect();
 
         Self {
+            composition: None,
             origins: Vec::new(),
             selection: None,
             selector_hops: Vec::new(),
@@ -395,13 +434,19 @@ impl ClientProxyChain {
         }
     }
 
-    /// Returns the total number of hops.
+    /// Returns the maximum physical hop count across the configured paths.
     pub fn num_hops(&self) -> usize {
+        if let Some(composition) = &self.composition {
+            return composition.num_hops();
+        }
         1 + self.subsequent_hops.len()
     }
 
     /// Returns true if this chain supports UDP connections.
     pub fn supports_udp(&self) -> bool {
+        if let Some(composition) = &self.composition {
+            return composition.supports_udp();
+        }
         !self.udp_final_hop_indices.is_empty()
     }
 
@@ -409,6 +454,9 @@ impl ClientProxyChain {
     /// and there are no subsequent hops. Such chains can be used for UDP/QUIC
     /// DNS while still supporting bind_interface.
     pub fn is_direct_only(&self) -> bool {
+        if let Some(composition) = &self.composition {
+            return composition.direct_only();
+        }
         if !self.subsequent_hops.is_empty() {
             return false;
         }
@@ -440,36 +488,44 @@ impl ClientProxyChain {
         target: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let indices = self.select_indices(false)?;
-        self.with_route_activity(&indices, async {
-            let mut route = self.selected_route(resolver, &indices);
-            let initial = match route.initial.as_deref() {
-                Some(InitialHopEntry::Proxy { proxy, .. }) => Some(proxy.as_ref()),
-                _ => None,
-            };
-            let mut pinned = std::collections::HashMap::new();
-            for proxy in initial
-                .into_iter()
-                .chain(route.subsequent.iter().map(AsRef::as_ref))
-                // The directly dialed proxy retains the socket connector's address fallback.
-                .skip(1)
-            {
-                let location = proxy.proxy_location();
-                if pinned.contains_key(location) {
-                    continue;
+        let pinned;
+        let (chain, indices) = if let Some(composition) = &self.composition {
+            pinned = composition.select(false)?;
+            let indices = vec![0; pinned.num_hops()];
+            (&pinned, indices)
+        } else {
+            (self, self.select_indices(false)?)
+        };
+        chain
+            .with_route_activity(&indices, async {
+                let mut route = chain.selected_route(resolver, &indices);
+                let initial = match route.initial.as_deref() {
+                    Some(InitialHopEntry::Proxy { proxy, .. }) => Some(proxy.as_ref()),
+                    _ => None,
+                };
+                let mut pinned = std::collections::HashMap::new();
+                for proxy in initial
+                    .into_iter()
+                    .chain(route.subsequent.iter().map(AsRef::as_ref))
+                    // The directly dialed proxy retains the socket connector's address fallback.
+                    .skip(1)
+                {
+                    let location = proxy.proxy_location();
+                    if pinned.contains_key(location) {
+                        continue;
+                    }
+                    let addresses = crate::resolver::resolve_addresses(resolver, location).await?;
+                    pinned.insert(location.clone(), addresses);
                 }
-                let addresses = crate::resolver::resolve_addresses(resolver, location).await?;
-                pinned.insert(location.clone(), addresses);
-            }
-            // Pin wire endpoints, not connector configurations: TLS still verifies the original name.
-            route.pinned_proxies = Some(Arc::new(PinnedProxies {
-                endpoints: pinned,
-                // Shared forks bound nested address races linearly in the selected route depth.
-                extra_attempts: tokio::sync::Semaphore::new(route.subsequent.len()),
-            }));
-            route.connect(target).await
-        })
-        .await
+                // Pin wire endpoints, not connector configurations: TLS still verifies the original name.
+                route.pinned_proxies = Some(Arc::new(PinnedProxies {
+                    endpoints: pinned,
+                    // Shared forks bound nested address races linearly in the selected route depth.
+                    extra_attempts: tokio::sync::Semaphore::new(route.subsequent.len()),
+                }));
+                route.connect(target).await
+            })
+            .await
     }
 
     async fn connect_tcp_observed(
@@ -478,15 +534,23 @@ impl ClientProxyChain {
         resolver: &Arc<dyn Resolver>,
         path: Option<&mut Vec<String>>,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let indices = self.select_indices(false)?;
+        let pinned;
+        let (chain, indices) = if let Some(composition) = &self.composition {
+            pinned = composition.select(false)?;
+            let indices = vec![0; pinned.num_hops()];
+            (&pinned, indices)
+        } else {
+            (self, self.select_indices(false)?)
+        };
         if let Some(path) = path {
-            *path = self.route_names(&indices);
+            *path = chain.route_names(&indices);
         }
-        self.with_route_activity(
-            &indices,
-            self.connect_tcp_selected(remote_location, resolver, &indices),
-        )
-        .await
+        chain
+            .with_route_activity(
+                &indices,
+                chain.connect_tcp_selected(remote_location, resolver, &indices),
+            )
+            .await
     }
 
     async fn connect_tcp_selected(
@@ -616,23 +680,29 @@ impl ClientProxyChain {
         target: ResolvedLocation,
         path: Option<&mut Vec<String>>,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-        // Check if UDP is supported
-        if self.udp_final_hop_indices.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Chain does not support UDP",
-            ));
-        }
-
-        let indices = self.select_indices(true)?;
+        let pinned;
+        let (chain, indices) = if let Some(composition) = &self.composition {
+            pinned = composition.select(true)?;
+            let indices = vec![0; pinned.num_hops()];
+            (&pinned, indices)
+        } else {
+            if self.udp_final_hop_indices.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Chain does not support UDP",
+                ));
+            }
+            (self, self.select_indices(true)?)
+        };
         if let Some(path) = path {
-            *path = self.route_names(&indices);
+            *path = chain.route_names(&indices);
         }
-        self.with_route_activity(
-            &indices,
-            self.connect_udp_selected(resolver, target, &indices),
-        )
-        .await
+        chain
+            .with_route_activity(
+                &indices,
+                chain.connect_udp_selected(resolver, target, &indices),
+            )
+            .await
     }
 
     async fn connect_udp_selected(
@@ -1055,6 +1125,9 @@ impl ClientChainGroup {
 
     pub(crate) fn may_connect_directly(&self) -> bool {
         self.chains.iter().any(|chain| {
+            if let Some(composition) = &chain.composition {
+                return composition.may_connect_directly();
+            }
             chain.subsequent_hops.is_empty()
                 && chain
                     .initial_hop
@@ -1064,7 +1137,7 @@ impl ClientChainGroup {
     }
 
     /// Selects the interface for a new direct UDP/QUIC DNS socket.
-    pub fn select_bind_interface(&self) -> std::io::Result<Option<&str>> {
+    pub fn select_bind_interface(&self) -> std::io::Result<Option<String>> {
         if !self.is_direct_only() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -1073,12 +1146,19 @@ impl ClientChainGroup {
         }
         let index = self.next_udp_index.fetch_add(1, Ordering::Relaxed) as usize;
         let chain = &self.chains[index % self.chains.len()];
+        let pinned;
+        let chain = if let Some(composition) = &chain.composition {
+            pinned = composition.select(true)?;
+            &pinned
+        } else {
+            chain
+        };
         let indices = chain.select_indices(true)?;
         chain.touch_automatic(&indices, false);
         let InitialHopEntry::Direct(socket) = chain.initial_hop[indices[0]].as_ref() else {
             unreachable!("direct-only chain checked above")
         };
-        Ok(socket.bind_interface())
+        Ok(socket.bind_interface().map(str::to_owned))
     }
 }
 

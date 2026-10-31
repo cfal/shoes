@@ -1163,7 +1163,7 @@ mod auth_tests {
             let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let resolver: Arc<dyn Resolver> = Arc::new(LocalResolver);
-            let rules = serde_yaml::from_str(&format!(
+            let rules = crate::config::test_support::from_yaml(&format!(
                 "- mask: blocked.test\n  action: block\n- mask: rewrite.test\n  action: allow\n  override_address: '{}'\n- mask: 0.0.0.0/0\n  action: allow\n",
                 second.local_addr().unwrap())).unwrap();
             let selector = Arc::new(crate::tcp::tcp_client_handler_factory::create_test_selector(rules, resolver.clone()).unwrap());

@@ -159,7 +159,7 @@ async fn legacy_and_native_address_forms_and_empty_udp_responses() {
         }));
         let mut listeners = Tasks(
             crate::tcp::tcp_server::start_servers(
-                crate::config::Config::Server(config),
+                crate::config::ResolvedConfig::Server(config),
                 Arc::new(NativeResolver::new()),
             )
             .await
@@ -353,7 +353,7 @@ async fn h2mux_multiplexes_concurrent_streams_over_one_encrypted_connection() {
         }));
         let mut listeners = Tasks(
             crate::tcp::tcp_server::start_servers(
-                crate::config::Config::Server(config),
+                crate::config::ResolvedConfig::Server(config),
                 Arc::new(NativeResolver::new()),
             )
             .await
@@ -519,7 +519,7 @@ async fn encrypted_xudp_control_empty_and_multiple_sessions_and_udp_flow_rejecti
     }));
     let mut listeners = Tasks(
         crate::tcp::tcp_server::start_servers(
-            crate::config::Config::Server(config),
+            crate::config::ResolvedConfig::Server(config),
             Arc::new(NativeResolver::new()),
         )
         .await

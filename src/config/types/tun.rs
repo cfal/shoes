@@ -182,7 +182,8 @@ fn default_mtu() -> u16 {
 /// - Platform-specific device creation (Linux name/address vs iOS/Android raw_fd)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct TunConfig {
+#[serde(bound(deserialize = "R: Deserialize<'de>, D: Deserialize<'de>"))]
+pub struct TunRecord<R, D> {
     #[serde(default, skip_serializing_if = "super::common::is_false")]
     pub auto_route: bool,
     #[serde(default, skip_serializing_if = "super::common::is_false")]
@@ -271,15 +272,17 @@ pub struct TunConfig {
         default,
         skip_serializing_if = "NoneOrSome::is_unspecified"
     )]
-    pub rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    pub rules: NoneOrSome<R>,
 
     /// DNS configuration for this TUN server (optional).
     /// Can reference a dns_group by name or specify inline DNS servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns: Option<DnsConfig>,
+    pub dns: Option<D>,
 }
 
-impl TunConfig {
+pub type TunConfig = TunRecord<ConfigSelection<RuleConfig>, DnsConfig>;
+
+impl<R, D> TunRecord<R, D> {
     pub(crate) fn has_managed_options(&self) -> bool {
         self.auto_route
             || self.auto_redirect

@@ -11,14 +11,17 @@ use crate::reality::{decode_private_key, decode_short_id};
 use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
 
+use super::compiler::{self, DraftClient};
+use super::plan_ops;
+use super::resolved::*;
+
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     BindLocation, ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config,
     ConfigSelection, DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec,
     ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits, PemSource, RuleActionConfig, RuleConfig,
-    ServerConfig, ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig,
-    ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, Transport, TunConfig,
-    WebsocketServerConfig, direct_allow_rule,
+    ServerConfig, ServerProxyConfig, ServerQuicConfig, ShadowTlsServerHandshakeConfig,
+    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
@@ -31,11 +34,11 @@ pub struct ValidatedConfigs {
     pub certificates: Vec<std::sync::Arc<crate::certificates::Source>>,
     pub reload_files: Vec<std::path::PathBuf>,
     pub global_limits: GlobalLimits,
-    pub configs: Vec<Config>,
+    pub configs: Vec<ResolvedConfig>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
     pub wireguard_endpoints: Vec<super::types::wireguard::WireguardDeviceConfig>,
-    pub(crate) remote_rules: Vec<crate::rule_set::RuleSource>,
+    pub(crate) remote_rules: Vec<crate::rule_set::ResolvedRuleSource>,
     pub(crate) rule_cache_dir: Option<std::path::PathBuf>,
 }
 
@@ -45,7 +48,7 @@ impl ValidatedConfigs {
         if self
             .configs
             .iter()
-            .any(|config| matches!(config, Config::TunServer(tun) if tun.auto_route))
+            .any(|config| matches!(config, ResolvedConfig::TunServer(tun) if tun.auto_route))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -86,23 +89,31 @@ pub(super) fn create_server_configs_with_memory(
 ) -> std::io::Result<ValidatedConfigs> {
     crate::rule_set::validate_remote_paths(&mut all_configs, &[])?;
     let rule_cache_dir = crate::rule_set::cache_directory(&all_configs)?;
+
     let certificates = crate::certificates::configure(&mut all_configs)?;
-    let catalog = crate::control::catalog::Catalog::capture(&mut all_configs)?;
+    let mut catalog = crate::control::catalog::CatalogDraft::capture(&mut all_configs)?;
     let mut control = super::ControlConfig::default();
     let mut compiler = crate::rules::Compiler::default();
     compiler.memory = memory.or_else(|| rule_cache_dir.is_none().then(Default::default));
     let mut reload_files = crate::rule_set::dependencies(&mut all_configs)?;
     reload_files.extend(super::pem_reload_dependencies(&mut all_configs)?);
-    let mut remote_rules = crate::rule_set::normalize_sources(&mut all_configs, &mut compiler)?;
+    let remote_rules = crate::rule_set::normalize_sources(&mut all_configs, &mut compiler)?;
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
     // First pass: collect raw groups with unresolved references
-    let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
-        HashMap::new();
+    let mut raw_client_groups: HashMap<
+        String,
+        (super::GroupType, OneOrSome<super::ClientGroupMember>),
+    > = HashMap::new();
     raw_client_groups.insert(
         String::from("direct"),
-        OneOrSome::One(ConfigSelection::Config(direct_client(catalog.as_ref()))),
+        (
+            super::GroupType::RoundRobin,
+            OneOrSome::One(super::ClientGroupMember::Client(ConfigSelection::Config(
+                direct_client(catalog.as_ref()),
+            ))),
+        ),
     );
 
     let mut rule_groups: HashMap<String, Vec<RuleConfig>> = HashMap::new();
@@ -157,7 +168,10 @@ pub(super) fn create_server_configs_with_memory(
             }
             Config::ClientConfigGroup(group) => {
                 if raw_client_groups
-                    .insert(group.client_group.clone(), group.client_proxies)
+                    .insert(
+                        group.client_group.clone(),
+                        (group.group_type, group.client_chains),
+                    )
                     .is_some()
                 {
                     return Err(std::io::Error::new(
@@ -215,12 +229,15 @@ pub(super) fn create_server_configs_with_memory(
     // Resolve client groups using topological sort
     let mut client_groups = resolve_client_groups_topologically(raw_client_groups)?;
 
-    // Embed PEMs into all client configs in groups before they're used
-    for configs in client_groups.values_mut() {
-        for config in configs.iter_mut() {
-            validate_client_config(config, &named_pems, global_limits)?;
-        }
-    }
+    client_groups = client_groups
+        .into_iter()
+        .map(|(name, hop)| {
+            let hop = plan_ops::map_hop(hop, &mut |client| {
+                compiler::lower_client(client, &named_pems, global_limits).map(DraftClient::Ready)
+            })?;
+            Ok((name, hop))
+        })
+        .collect::<std::io::Result<_>>()?;
 
     // Extract inline DNS configs from server/tun configs into dns_groups.
     // This replaces inline specs with group name references.
@@ -343,50 +360,48 @@ pub(super) fn create_server_configs_with_memory(
         });
     }
 
-    validate_rule_downloads(
-        &mut remote_rules,
+    let remote_rules = resolve_rule_downloads(
+        remote_rules,
         &client_groups,
         &named_pems,
         &group_names,
         global_limits,
     )?;
 
-    // Validate server configs (DNS is now just a group reference).
-    for config in server_configs.iter_mut() {
-        validate_server_config(
+    let mut result = Vec::new();
+    for config in server_configs {
+        let dns = config.dns.clone();
+        let config = resolve_server_config(
             config,
             &client_groups,
             &rule_groups,
             &named_pems,
             global_limits,
         )?;
-        validate_dns_group_ref(&config.dns, &group_names)?;
+        validate_dns_group_ref(&dns, &group_names)?;
+        result.push(ResolvedConfig::Server(config));
     }
-
-    // Validate TUN configs.
-    for config in tun_configs.iter_mut() {
-        validate_tun_config(
+    for config in tun_configs {
+        let dns = config.dns.clone();
+        let config = resolve_tun_config(
             config,
             &client_groups,
             &rule_groups,
             &named_pems,
             global_limits,
         )?;
-        validate_dns_group_ref(&config.dns, &group_names)?;
+        validate_dns_group_ref(&dns, &group_names)?;
+        result.push(ResolvedConfig::TunServer(config));
     }
-
-    // Combine into Config list (only Server and TunServer variants)
-    let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
-    result.extend(tun_configs.into_iter().map(Config::TunServer));
     crate::desktop::validate_config(&result)?;
     if result
         .iter()
-        .any(|config| matches!(config, Config::TunServer(tun) if tun.auto_route))
+        .any(|config| matches!(config, ResolvedConfig::TunServer(tun) if tun.auto_route))
     {
         let binds = result
             .iter()
             .filter_map(|config| match config {
-                Config::Server(server) => Some(&server.bind_location),
+                ResolvedConfig::Server(server) => Some(&server.bind_location),
                 _ => None,
             })
             .chain(control.listeners.iter().map(|listener| &listener.bind));
@@ -403,26 +418,22 @@ pub(super) fn create_server_configs_with_memory(
     }
 
     let mut evaluation_work = 0usize;
-    super::rule_visit::visit(
-        &mut result,
-        &mut |rule| {
-            let predicate =
-                rule.criteria.compiled.as_ref().ok_or_else(|| {
-                    crate::rules::invalid("rule is missing its compiled predicate")
-                })?;
-            evaluation_work = evaluation_work.saturating_add(predicate.evaluation_work);
-            if evaluation_work > crate::rules::MAX_ENTRIES {
-                return Err(crate::rules::invalid(
-                    "expanded rule evaluation budget exceeded",
-                ));
-            }
-            Ok(())
-        },
-        &mut |_| Ok(()),
-    )?;
+    for rule in super::resolved_visit::rules(&result) {
+        let predicate = rule
+            .criteria
+            .compiled
+            .as_ref()
+            .ok_or_else(|| crate::rules::invalid("rule is missing its compiled predicate"))?;
+        evaluation_work = evaluation_work.saturating_add(predicate.evaluation_work);
+        if evaluation_work > crate::rules::MAX_ENTRIES {
+            return Err(crate::rules::invalid(
+                "expanded rule evaluation budget exceeded",
+            ));
+        }
+    }
 
     let mut validated = ValidatedConfigs {
-        catalog,
+        catalog: None,
         control,
         certificates,
         reload_files,
@@ -435,54 +446,59 @@ pub(super) fn create_server_configs_with_memory(
     };
     validate_wireguard_dns(&validated)?;
     #[cfg(unix)]
-    super::wireguard_devices::collect_devices(&mut validated, &mut client_groups)?;
-    super::fake_dns::validate(&mut validated)?;
-    refresh_catalog_clients(&mut validated, &client_groups)?;
-    if let Some(catalog) = &mut validated.catalog {
-        // Unused definitions are still probeable, but must not activate WireGuard devices.
-        for node in catalog.nodes.values_mut() {
-            if let crate::control::catalog::CatalogNode::Leaf(client) = node {
-                expand_peer_chains(client, &client_groups)?;
-                validate_client_config(client, &named_pems, global_limits)?;
-            }
-        }
-    }
+    super::wireguard_devices::collect_devices(&mut validated, &mut client_groups, &mut catalog)?;
+    super::fake_dns::validate(
+        &mut validated,
+        catalog.as_ref().map(|catalog| catalog.selection.as_ref()),
+    )?;
+    refresh_catalog_clients(&mut validated, &client_groups, &mut catalog)?;
+    validated.catalog = catalog
+        .map(|catalog| {
+            catalog.finish(|client| {
+                compiler::compile_client(client, &client_groups, &named_pems, global_limits)
+            })
+        })
+        .transpose()?;
     Ok(validated)
 }
 
-fn validate_rule_downloads(
-    sources: &mut [crate::rule_set::RuleSource],
-    clients: &HashMap<String, Vec<ClientConfig>>,
+fn resolve_rule_downloads(
+    sources: Vec<crate::rule_set::RuleSource>,
+    clients: &compiler::Groups,
     pems: &HashMap<String, String>,
     dns_names: &HashSet<&str>,
     limits: GlobalLimits,
-) -> std::io::Result<()> {
-    for source in sources {
-        let download = source.download.as_mut().expect("remote source checked");
-        validate_client_chain(&mut download.client_chain.hops, 0, clients, pems, limits)?;
-        if chain_uses_wireguard(&download.client_chain) {
-            return Err(crate::rules::invalid(
-                "rule downloads cannot bootstrap through WireGuard devices",
-            ));
-        }
-        if !dns_names.contains(download.bootstrap_url.as_str()) {
-            let parsed = ParsedDnsUrl::parse(&download.bootstrap_url)
-                .map_err(|_| crate::rules::invalid("invalid rule download bootstrap_url"))?;
-            if parsed.has_hostname() {
+) -> std::io::Result<Vec<crate::rule_set::ResolvedRuleSource>> {
+    sources
+        .into_iter()
+        .map(|source| {
+            let source = source
+                .map_chain(|chain| compiler::compile_chain(chain.hops, clients, pems, limits))?;
+            let download = source.download.as_ref().expect("remote source checked");
+            if chain_uses_wireguard(&download.client_chain) {
                 return Err(crate::rules::invalid(
-                    "rule download bootstrap_url requires an IP URL, system, or DNS group",
+                    "rule downloads cannot bootstrap through WireGuard devices",
                 ));
             }
-        }
-    }
-    Ok(())
+            if !dns_names.contains(download.bootstrap_url.as_str()) {
+                let parsed = ParsedDnsUrl::parse(&download.bootstrap_url)
+                    .map_err(|_| crate::rules::invalid("invalid rule download bootstrap_url"))?;
+                if parsed.has_hostname() {
+                    return Err(crate::rules::invalid(
+                        "rule download bootstrap_url requires an IP URL, system, or DNS group",
+                    ));
+                }
+            }
+            Ok(source)
+        })
+        .collect()
 }
 
 #[cfg(unix)]
 pub(crate) fn validate_rule_bootstrap(
     configs: &[Config],
-    sources: &mut [crate::rule_set::RuleSource],
-) -> std::io::Result<GlobalLimits> {
+    sources: Vec<crate::rule_set::RuleSource>,
+) -> std::io::Result<(GlobalLimits, Vec<crate::rule_set::ResolvedRuleSource>)> {
     use crate::rules::invalid;
 
     let mut limits = None;
@@ -516,10 +532,15 @@ pub(crate) fn validate_rule_bootstrap(
         }
     }
     let limits = limits.unwrap_or_default();
-    let clients = HashMap::from([("direct".into(), vec![direct_client(None)])]);
+    let clients = HashMap::from([(
+        "direct".into(),
+        HopPlan::Single(compiler::DraftClient::Ready(ResolvedClientConfig::default())),
+    )]);
+    let mut resolved = Vec::with_capacity(sources.len());
     for source in sources {
+        let path = source.path.clone();
         let result = (|| {
-            let download = source.download.as_mut().expect("remote source checked");
+            let download = source.download.as_ref().expect("remote source checked");
             if dns_names.contains(download.bootstrap_url.as_str()) {
                 return Err(invalid(
                     "named DNS groups are not supported for missing-cache bootstrap",
@@ -548,19 +569,19 @@ pub(crate) fn validate_rule_bootstrap(
                     }
                 }
             }
-            validate_client_chain(&mut download.client_chain.hops, 0, &clients, &pems, limits)
+            source.map_chain(|chain| compiler::compile_chain(chain.hops, &clients, &pems, limits))
         })();
-        result.map_err(|error| {
+        resolved.push(result.map_err(|error| {
             std::io::Error::new(
                 error.kind(),
-                format!("rule bootstrap {}: {error}", source.path.display()),
+                format!("rule bootstrap {}: {error}", path.display()),
             )
-        })?;
+        })?);
     }
-    Ok(limits)
+    Ok((limits, resolved))
 }
 
-fn direct_client(catalog: Option<&crate::control::catalog::Catalog>) -> ClientConfig {
+fn direct_client(catalog: Option<&crate::control::catalog::CatalogDraft>) -> ClientConfig {
     let mut direct = ClientConfig::default();
     if let Some(catalog) = catalog {
         direct.control = Some(crate::control::catalog::MemberOrigin {
@@ -574,14 +595,21 @@ fn direct_client(catalog: Option<&crate::control::catalog::Catalog>) -> ClientCo
 
 pub(super) fn refresh_catalog_clients(
     validated: &mut ValidatedConfigs,
-    groups: &HashMap<String, Vec<ClientConfig>>,
+    groups: &compiler::Groups,
+    catalog: &mut Option<crate::control::catalog::CatalogDraft>,
 ) -> std::io::Result<()> {
-    if let Some(catalog) = &mut validated.catalog {
-        for client in groups.values().flatten() {
-            catalog.update_client(client);
+    if let Some(catalog) = catalog {
+        for group in groups.values() {
+            for client in plan_ops::clients(group) {
+                catalog.update_client(client.resolved());
+            }
         }
+        validated.visit_clients(&mut |client| {
+            catalog.update_client(client);
+            Ok(())
+        })?;
     }
-    validated.refresh_catalog()
+    Ok(())
 }
 
 fn validate_wireguard_dns(validated: &ValidatedConfigs) -> std::io::Result<()> {
@@ -630,89 +658,94 @@ fn validate_wireguard_dns(validated: &ValidatedConfigs) -> std::io::Result<()> {
 /// 2. Detects cycles
 /// 3. Resolves groups in topological order
 fn resolve_client_groups_topologically(
-    raw_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>>,
-) -> std::io::Result<HashMap<String, Vec<ClientConfig>>> {
-    // Build dependency graph: for each group, collect which groups it references
-    let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
-    for (group_name, selections) in &raw_groups {
-        let mut deps = vec![];
-        for selection in selections.iter() {
-            collect_client_dependencies(selection, &mut deps);
-        }
-        dependencies.insert(group_name.clone(), deps);
-    }
-
-    // Check for unknown group references
-    for (group_name, deps) in &dependencies {
-        for dep in deps {
-            if !raw_groups.contains_key(dep) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "Client group '{}' references unknown group '{}'",
-                        group_name, dep
-                    ),
-                ));
-            }
-        }
-    }
-
-    // Topological sort using Kahn's algorithm with cycle detection
-    let sorted_groups = topological_sort(&dependencies)?;
-
-    // Resolve groups in topological order
-    let mut resolved: HashMap<String, Vec<ClientConfig>> = HashMap::new();
-    for group_name in sorted_groups {
-        let selections = raw_groups.get(&group_name).unwrap();
-        let mut expanded_configs = vec![];
-
-        for selection in selections.iter() {
-            match selection {
-                ConfigSelection::Config(config) => {
-                    let mut config = config.clone();
-                    expand_peer_chains(&mut config, &resolved)?;
-                    if group_name != "direct"
-                        && let Some(origin) = &mut config.control
-                    {
-                        origin
-                            .path
-                            .insert(0, (group_name.clone(), origin.name.to_string()));
+    mut raw_groups: HashMap<String, (super::GroupType, OneOrSome<super::ClientGroupMember>)>,
+) -> std::io::Result<compiler::Groups> {
+    let mut dependencies = HashMap::new();
+    for (name, (_, members)) in &raw_groups {
+        let mut deps = Vec::new();
+        for member in members.iter() {
+            match member {
+                super::ClientGroupMember::Client(client) => {
+                    collect_client_dependencies(client, &mut deps);
+                }
+                super::ClientGroupMember::Chain { chain, .. } => {
+                    for hop in chain.hops.iter() {
+                        collect_hop_dependencies(hop, &mut deps);
                     }
-                    expanded_configs.push(config);
-                }
-                ConfigSelection::GroupName(ref_name) => {
-                    // This group should already be resolved (due to topological order)
-                    let referenced_configs = resolved.get(ref_name).ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!(
-                                "Internal error: group '{}' not resolved before '{}'",
-                                ref_name, group_name
-                            ),
-                        )
-                    })?;
-                    expanded_configs.extend(referenced_configs.iter().cloned().map(
-                        |mut config| {
-                            if let Some(origin) = &mut config.control {
-                                origin.path.insert(
-                                    0,
-                                    (
-                                        group_name.clone(),
-                                        crate::control::catalog::api_group(ref_name).to_owned(),
-                                    ),
-                                );
-                            }
-                            config
-                        },
-                    ));
                 }
             }
         }
-
-        resolved.insert(group_name, expanded_configs);
+        for dep in &deps {
+            if !raw_groups.contains_key(dep) {
+                return Err(super::composition::invalid(format!(
+                    "Client group '{name}' references unknown group '{dep}'"
+                )));
+            }
+        }
+        dependencies.insert(name.clone(), deps);
     }
-
+    let mut resolved = compiler::Groups::new();
+    for name in topological_sort(&dependencies)? {
+        let (kind, raw_members) = raw_groups.remove(&name).expect("sorted group exists");
+        let mut labels = Vec::new();
+        let mut members = Vec::new();
+        let mut budget = compiler::NodeBudget::default();
+        for (index, member) in raw_members.into_vec().into_iter().enumerate() {
+            let label = crate::control::catalog::group_member_name(&member)
+                .unwrap_or_else(|| format!("{name}-chain-{}", index + 1));
+            let chain = member.into_chain();
+            let mut chain = compiler::expand(chain.hops, &resolved, &mut budget)?;
+            for hop in chain.hops.iter_mut() {
+                prepend_origin(hop, &name, &label)?;
+            }
+            labels.push(label);
+            members.push(chain);
+        }
+        let hop = if kind == super::GroupType::RoundRobin
+            && members.len() == 1
+            && members[0].hops.iter().count() == 1
+        {
+            members.remove(0).hops.into_vec().remove(0)
+        } else {
+            budget.charge(1)?;
+            HopPlan::Choice(Box::new(ChoicePlan {
+                name: name.clone(),
+                group_type: kind,
+                labels,
+                members,
+            }))
+        };
+        compiler::measure(&hop, 0)?;
+        resolved.insert(name, hop);
+    }
     Ok(resolved)
+}
+
+fn prepend_origin(
+    hop: &mut HopPlan<DraftClient>,
+    group: &str,
+    member: &str,
+) -> std::io::Result<()> {
+    if group == "direct" {
+        return Ok(());
+    }
+    plan_ops::visit_leaves(hop, &mut |client| {
+        if let Some(origin) = client.origin_mut() {
+            origin.path.insert(0, (group.to_owned(), member.to_owned()));
+        }
+        Ok(())
+    })
+}
+
+fn collect_hop_dependencies(hop: &ClientChainHop, dependencies: &mut Vec<String>) {
+    match hop {
+        ClientChainHop::Single(selection) => collect_client_dependencies(selection, dependencies),
+        ClientChainHop::Pool(pool) => {
+            for selection in pool.iter() {
+                collect_client_dependencies(selection, dependencies);
+            }
+        }
+    }
 }
 
 fn collect_client_dependencies(
@@ -726,44 +759,11 @@ fn collect_client_dependencies(
                 && let Some(chain) = &config.peer_client_chain
             {
                 for hop in chain.hops.iter() {
-                    match hop {
-                        ClientChainHop::Single(selection) => {
-                            collect_client_dependencies(selection, dependencies)
-                        }
-                        ClientChainHop::Pool(selections) => {
-                            for selection in selections.iter() {
-                                collect_client_dependencies(selection, dependencies);
-                            }
-                        }
-                    }
+                    collect_hop_dependencies(hop, dependencies);
                 }
             }
         }
     }
-}
-
-fn expand_peer_chains(
-    client: &mut ClientConfig,
-    groups: &HashMap<String, Vec<ClientConfig>>,
-) -> std::io::Result<()> {
-    if let ClientProxyConfig::Wireguard(config) = &mut client.protocol
-        && let Some(chain) = &mut config.peer_client_chain
-    {
-        expand_client_chain(&mut chain.hops, groups)?;
-        for hop in chain.hops.iter_mut() {
-            match hop {
-                ClientChainHop::Single(selection) => {
-                    expand_peer_chains(selection.unwrap_config_mut(), groups)?
-                }
-                ClientChainHop::Pool(selections) => {
-                    for selection in selections.iter_mut() {
-                        expand_peer_chains(selection.unwrap_config_mut(), groups)?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Performs topological sort on a dependency graph using Kahn's algorithm.
@@ -1030,7 +1030,7 @@ fn validate_dns_group_ref(
 /// - Bootstrap URL validity (must be a known group or valid IP-only URL)
 fn expand_dns_specs(
     specs: &[DnsServerSpec],
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    client_groups: &compiler::Groups,
     named_pems: &HashMap<String, String>,
     dns_group_names: &HashSet<&str>,
     global_limits: GlobalLimits,
@@ -1053,19 +1053,15 @@ fn expand_dns_specs(
 
         // Expand and validate client chains
         let client_chains_raw = spec.client_chains();
-        let mut expanded_chains: Vec<ClientChain> = Vec::new();
+        let mut expanded_chains: Vec<ResolvedClientChain> = Vec::new();
 
-        for chain_selection in client_chains_raw.iter() {
-            let mut chain = match chain_selection {
-                ConfigSelection::Config(chain) => chain.clone(),
-                ConfigSelection::GroupName(name) => ClientChain {
-                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
-                        name.clone(),
-                    ))),
-                },
-            };
-            validate_client_chain(&mut chain.hops, 0, client_groups, named_pems, global_limits)?;
-            expanded_chains.push(chain);
+        for chain in client_chains_raw.iter() {
+            expanded_chains.push(compiler::compile_chain(
+                chain.hops.clone(),
+                client_groups,
+                named_pems,
+                global_limits,
+            )?);
         }
 
         // Validate protocol compatibility with chains
@@ -1078,7 +1074,9 @@ fn expand_dns_specs(
             }
 
             // Check if all chains are direct-only (for UDP/H3 validation)
-            let all_direct = expanded_chains.iter().all(is_chain_direct_only);
+            let all_direct = expanded_chains
+                .iter()
+                .all(|chain| super::composition::direct_only(&chain.hops));
 
             if !all_direct {
                 match &parsed_url {
@@ -1140,50 +1138,21 @@ fn expand_dns_specs(
     Ok(result)
 }
 
-fn hop_uses_wireguard(hop: &ClientChainHop) -> bool {
-    let uses_wireguard = |selection: &ConfigSelection<ClientConfig>| match selection {
-        ConfigSelection::Config(config) => config.protocol.is_wireguard(),
-        ConfigSelection::GroupName(_) => false,
-    };
-    match hop {
-        ClientChainHop::Single(selection) => uses_wireguard(selection),
-        ClientChainHop::Pool(selections) => selections.iter().any(uses_wireguard),
-    }
+pub(super) fn chain_uses_wireguard(chain: &ResolvedClientChain) -> bool {
+    chain
+        .hops
+        .iter()
+        .flat_map(super::composition::clients)
+        .any(|client| client.protocol.is_wireguard())
 }
 
-pub(super) fn chain_uses_wireguard(chain: &ClientChain) -> bool {
-    chain.hops.iter().any(hop_uses_wireguard)
-}
-
-/// Checks if a client chain is direct-only (single hop with all direct protocol configs).
-fn is_chain_direct_only(chain: &ClientChain) -> bool {
-    // Must have exactly one hop (OneOrSome::One variant)
-    let hop = match &chain.hops {
-        OneOrSome::One(hop) => hop,
-        OneOrSome::Some(_) => return false, // Multiple hops
-    };
-
-    // The single hop must be all direct configs
-    match hop {
-        ClientChainHop::Single(ConfigSelection::Config(config)) => config.protocol.is_direct(),
-        ClientChainHop::Single(ConfigSelection::GroupName(_)) => {
-            // Should not happen after expansion
-            false
-        }
-        ClientChainHop::Pool(selections) => selections.iter().all(|sel| match sel {
-            ConfigSelection::Config(config) => config.protocol.is_direct(),
-            ConfigSelection::GroupName(_) => false,
-        }),
-    }
-}
-
-fn validate_server_config(
-    server_config: &mut ServerConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+fn resolve_server_config(
+    mut server_config: ServerConfig,
+    client_groups: &compiler::Groups,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
-) -> std::io::Result<()> {
+) -> std::io::Result<ResolvedServerConfig> {
     crate::sudoku_mask::validate_server(&server_config.protocol, &server_config.transport)?;
     if let ServerProxyConfig::Wireguard(config) = &server_config.protocol {
         if server_config.transport != Transport::Udp
@@ -1194,16 +1163,22 @@ fn validate_server_config(
                 "WireGuard requires UDP transport without TCP/QUIC socket settings",
             ));
         }
-        config.device(server_config)?.validate()?;
-        if let ServerProxyConfig::Wireguard(config) = &mut server_config.protocol
-            && let Some(chain) = &mut config.peer_client_chain
+        config.validate_device(&server_config.bind_location, server_config.rules.is_empty())?;
+        let ServerProxyConfig::Wireguard(config) = server_config.protocol else {
+            unreachable!()
+        };
+        let peer_client_chain = config
+            .peer_client_chain
+            .map(|chain| {
+                compiler::compile_chain(chain.hops, client_groups, named_pems, global_limits)
+            })
+            .transpose()?;
+        if let Some(chain) = &peer_client_chain
+            && !crate::tcp::chain_builder::supports_udp_offline(chain)?
         {
-            validate_client_chain(&mut chain.hops, 0, client_groups, named_pems, global_limits)?;
-            if !crate::tcp::chain_builder::supports_udp_offline(chain)? {
-                return Err(super::types::wireguard::invalid(
-                    "WireGuard peer_client_chain does not support UDP",
-                ));
-            }
+            return Err(super::types::wireguard::invalid(
+                "WireGuard peer_client_chain does not support UDP",
+            ));
         }
         ConfigSelection::replace_none_or_some_groups(&mut server_config.rules, rule_groups)?;
         if server_config.rules.is_empty() {
@@ -1211,15 +1186,36 @@ fn validate_server_config(
                 "WireGuard server requires nonempty explicit rules",
             ));
         }
-        for rule in server_config.rules.iter_mut() {
-            validate_rule_config(
-                rule.unwrap_config_mut(),
+        let rules = plan_ops::map_some(server_config.rules, &mut |rule| {
+            resolve_rule_config(
+                rule.unwrap_config(),
                 client_groups,
                 named_pems,
                 global_limits,
-            )?;
-        }
-        return Ok(());
+            )
+        })?;
+        let protocol =
+            ResolvedServerProxyConfig::Wireguard(Box::new(ResolvedWireguardServerConfig {
+                wireguard_name: config.wireguard_name,
+                private_key: config.private_key,
+                addresses: config.addresses,
+                peers: config.peers,
+                mtu: config.mtu,
+                resource_limits: config.resource_limits,
+                bind_interface: config.bind_interface,
+                peer_client_chain,
+            }));
+        return Ok(ResolvedServerConfig {
+            name: server_config.name,
+            sniff: server_config.sniff,
+            bind_location: server_config.bind_location,
+            protocol,
+            transport: server_config.transport,
+            tcp_settings: server_config.tcp_settings,
+            quic_settings: server_config.quic_settings,
+            rules,
+            dns: resolve_dns_binding(server_config.dns),
+        });
     }
     if matches!(
         server_config.bind_location,
@@ -1284,7 +1280,7 @@ fn validate_server_config(
                 ref mut num_endpoints,
                 ..
             }) => {
-                validate_client_fingerprints(client_fingerprints)?;
+                normalize_fingerprints(client_fingerprints, "Client")?;
 
                 if *num_endpoints == 0 {
                     *num_endpoints = get_num_threads();
@@ -1319,44 +1315,63 @@ fn validate_server_config(
         server_config.rules = direct_allow_rule();
     }
 
-    for rule_config_selection in server_config.rules.iter_mut() {
-        validate_rule_config(
-            rule_config_selection.unwrap_config_mut(),
+    let rules = plan_ops::map_some(server_config.rules, &mut |rule| {
+        resolve_rule_config(
+            rule.unwrap_config(),
             client_groups,
             named_pems,
             global_limits,
-        )?;
-    }
-
-    validate_server_proxy_config(
-        &mut server_config.protocol,
+        )
+    })?;
+    let protocol = resolve_server_proxy_config(
+        server_config.protocol,
         client_groups,
         rule_groups,
         named_pems,
+        global_limits,
         if server_config.transport == Transport::Quic {
             ServerProtocolContext::Quic
         } else {
             ServerProtocolContext::Stream
         },
-        global_limits,
     )?;
-
-    Ok(())
+    Ok(ResolvedServerConfig {
+        name: server_config.name,
+        sniff: server_config.sniff,
+        bind_location: server_config.bind_location,
+        protocol,
+        transport: server_config.transport,
+        tcp_settings: server_config.tcp_settings,
+        quic_settings: server_config.quic_settings,
+        rules,
+        dns: resolve_dns_binding(server_config.dns),
+    })
 }
 
-fn validate_client_fingerprints(
-    client_fingerprints: &mut NoneOrSome<String>,
+pub(super) fn source_contains_xhttp(protocol: &ClientProxyConfig) -> bool {
+    match protocol {
+        ClientProxyConfig::Xhttp(_) => true,
+        ClientProxyConfig::Tls(config) => source_contains_xhttp(&config.protocol),
+        ClientProxyConfig::Reality { protocol, .. }
+        | ClientProxyConfig::ShadowTls { protocol, .. } => source_contains_xhttp(protocol),
+        ClientProxyConfig::Websocket(config) => source_contains_xhttp(&config.protocol),
+        ClientProxyConfig::SudokuMask(config) => source_contains_xhttp(&config.protocol),
+        _ => false,
+    }
+}
+
+fn normalize_fingerprints(
+    fingerprints: &mut NoneOrSome<String>,
+    peer: &str,
 ) -> std::io::Result<()> {
-    if !client_fingerprints.is_unspecified() && client_fingerprints.is_empty() {
-        println!("WARNING: Client fingerprints provided but empty, defaulting to 'any'");
+    if !fingerprints.is_unspecified() && fingerprints.is_empty() {
+        println!("WARNING: {peer} fingerprints provided but empty, defaulting to 'any'");
     }
 
-    if client_fingerprints.iter().any(|fp| fp == "any") {
-        let _ = std::mem::replace(client_fingerprints, NoneOrSome::Unspecified);
+    if fingerprints.iter().any(|fp| fp == "any") {
+        *fingerprints = NoneOrSome::Unspecified;
     } else {
-        let _ = crate::rustls_config_util::process_fingerprints(
-            &client_fingerprints.clone().into_vec(),
-        )?;
+        crate::rustls_config_util::process_fingerprints(&fingerprints.clone().into_vec())?;
     }
 
     Ok(())
@@ -1488,6 +1503,36 @@ pub(crate) fn validate_client_vision_protocol(
     }
 }
 
+pub(crate) fn validate_resolved_client_vision_protocol(
+    vision_enabled: bool,
+    protocol: &ResolvedClientProxyConfig,
+    config_type: &str,
+) -> std::io::Result<()> {
+    if !vision_enabled {
+        return Ok(());
+    }
+
+    match protocol {
+        ResolvedClientProxyConfig::Vless { encryption, .. } if !encryption.is_disabled() => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Native VLESS encryption requires outer TLS/REALITY vision: false; set vision: true on VLESS instead",
+            ))
+        }
+        ResolvedClientProxyConfig::Vless { .. } => Ok(()),
+        other_protocol => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} client config has vision=true but inner protocol is {} (not VLESS). \
+                 Vision (XTLS-RPRX-Vision) requires VLESS as the inner protocol. \
+                 Either set vision=false or change the inner protocol to VLESS.",
+                config_type,
+                other_protocol.protocol_name()
+            ),
+        )),
+    }
+}
+
 /// Recursive validation of client proxy config structure (Vision rules, etc.)
 fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
     let inner = match config {
@@ -1537,14 +1582,18 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
     Ok(())
 }
 
-fn validate_client_config(
-    client_config: &mut ClientConfig,
+pub(super) fn resolve_client_config(
+    mut client_config: ClientConfig,
+    carrier: Option<ChainPlan<DraftClient>>,
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
-) -> std::io::Result<()> {
+) -> std::io::Result<ResolvedClientConfig> {
+    #[cfg(test)]
+    tests::CLIENT_VALIDATIONS.with(|count| count.set(count.get() + 1));
     crate::sudoku_mask::validate_client(&client_config.protocol, &client_config.transport)?;
     client_config.validate_quic_key_exchange(true)?;
-    crate::quic_client::validate(client_config, true)?;
+    crate::quic_client::validate(&client_config, true)?;
+    let mut resolved_carrier = None;
     if let ClientProxyConfig::Wireguard(config) = &mut client_config.protocol {
         if client_config.transport != Transport::Udp
             || client_config.tcp_settings.is_some()
@@ -1554,25 +1603,22 @@ fn validate_client_config(
                 "WireGuard requires UDP transport without TCP/QUIC socket settings",
             ));
         }
-        config
-            .device(
-                &client_config.address,
-                client_config.bind_interface.clone().into_option(),
-            )
-            .validate()?;
-        if let Some(chain) = &mut config.peer_client_chain {
-            validate_client_chain(
-                &mut chain.hops,
-                0,
-                &HashMap::new(),
-                named_pems,
-                global_limits,
-            )?;
-            if !crate::tcp::chain_builder::supports_udp_offline(chain)? {
+        config.validate_device(
+            &client_config.address,
+            client_config
+                .bind_interface
+                .clone()
+                .into_option()
+                .as_deref(),
+        )?;
+        if let Some(chain) = carrier {
+            let chain = compiler::lower_chain(chain, named_pems, global_limits)?;
+            if !crate::tcp::chain_builder::supports_udp_offline(&chain)? {
                 return Err(super::types::wireguard::invalid(
                     "WireGuard peer_client_chain does not support UDP",
                 ));
             }
+            resolved_carrier = Some(chain);
         }
     }
     if client_config.transport != Transport::Tcp && client_config.tcp_settings.is_some() {
@@ -1605,7 +1651,7 @@ fn validate_client_config(
                 "Both client cert and key have to be specified, or both have to be omitted",
             ));
         }
-        validate_server_fingerprints(server_fingerprints)?;
+        normalize_fingerprints(server_fingerprints, "Server")?;
         validate_client_certificates(cert.as_deref(), key.as_deref())?;
     }
 
@@ -1624,33 +1670,16 @@ fn validate_client_config(
         client_config.address.address().hostname(),
     )?;
 
+    let client_config = super::lower::client(client_config, resolved_carrier);
     if crate::xhttp::connector::contains(&client_config.protocol) {
         crate::xhttp::connector::build_with_limits(
-            client_config,
+            &client_config,
             std::sync::Arc::new(crate::resolver::NativeResolver::new()),
             global_limits,
         )?;
     }
 
-    Ok(())
-}
-
-fn validate_server_fingerprints(
-    server_fingerprints: &mut NoneOrSome<String>,
-) -> std::io::Result<()> {
-    if !server_fingerprints.is_unspecified() && server_fingerprints.is_empty() {
-        println!("WARNING: Server fingerprints provided but empty, defaulting to 'any'");
-    }
-
-    if server_fingerprints.iter().any(|fp| fp == "any") {
-        let _ = std::mem::replace(server_fingerprints, NoneOrSome::Unspecified);
-    } else {
-        let _ = crate::rustls_config_util::process_fingerprints(
-            &server_fingerprints.clone().into_vec(),
-        )?;
-    }
-
-    Ok(())
+    Ok(client_config)
 }
 
 fn validate_client_proxy_config(
@@ -1753,7 +1782,7 @@ fn validate_client_proxy_config(
                     "Both client cert and key have to be specified, or both have to be omitted",
                 ));
             }
-            validate_server_fingerprints(&mut tls_config.server_fingerprints)?;
+            normalize_fingerprints(&mut tls_config.server_fingerprints, "Server")?;
             validate_client_certificates(tls_config.cert.as_deref(), tls_config.key.as_deref())?;
 
             validate_client_proxy_config(&mut tls_config.protocol, named_pems, None)?;
@@ -1872,6 +1901,27 @@ pub(crate) fn validate_server_vision(
     Ok(())
 }
 
+pub(crate) fn validate_resolved_server_vision(
+    vision: bool,
+    protocol: &ResolvedServerProxyConfig,
+) -> std::io::Result<()> {
+    if vision
+        && matches!(protocol, ResolvedServerProxyConfig::Vless { decryption, .. } if !decryption.is_disabled())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Native VLESS decryption requires outer TLS/REALITY vision: false; set vision: true on VLESS instead",
+        ));
+    }
+    if vision && !matches!(protocol, ResolvedServerProxyConfig::Vless { .. }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Server Vision requires VLESS as the inner protocol",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_nonempty_secret(secret: &str, protocol: &str) -> std::io::Result<()> {
     if secret.is_empty() {
         return Err(std::io::Error::new(
@@ -1943,26 +1993,14 @@ fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
     Ok(())
 }
 
-fn validate_server_proxy_config(
+fn validate_server_proxy_scalars(
     server_proxy_config: &mut ServerProxyConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-    rule_groups: &HashMap<String, Vec<RuleConfig>>,
-    named_pems: &HashMap<String, String>,
     context: ServerProtocolContext,
-    global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     validate_server_auth(server_proxy_config)?;
     match server_proxy_config {
         ServerProxyConfig::SudokuMask(config) => {
             config.prepare()?;
-            validate_server_proxy_config(
-                &mut config.protocol,
-                client_groups,
-                rule_groups,
-                named_pems,
-                ServerProtocolContext::Stream,
-                global_limits,
-            )?;
         }
         ServerProxyConfig::Wireguard(_) => {
             return Err(super::types::wireguard::invalid(
@@ -1979,14 +2017,6 @@ fn validate_server_proxy_config(
         }
         ServerProxyConfig::Xhttp(config) => {
             config.validate()?;
-            validate_server_proxy_config(
-                &mut config.protocol,
-                client_groups,
-                rule_groups,
-                named_pems,
-                ServerProtocolContext::Stream,
-                global_limits,
-            )?;
         }
         ServerProxyConfig::Anytls {
             padding_scheme: Some(lines),
@@ -2037,274 +2067,6 @@ fn validate_server_proxy_config(
             parse_uuid(user_id)?;
             validate_vmess_cipher(cipher)?;
         }
-        ServerProxyConfig::Tls {
-            tls_targets,
-            default_tls_target,
-            shadowtls_targets,
-            reality_targets,
-            tls_buffer_size,
-        } => {
-            if tls_targets.is_empty()
-                && default_tls_target.is_none()
-                && shadowtls_targets.is_empty()
-                && reality_targets.is_empty()
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "TLS server has no entries",
-                ));
-            }
-            for tls_server_config in tls_targets.values_mut() {
-                tls_server_config
-                    .key_exchange_groups
-                    .validate_vision(tls_server_config.vision)?;
-                validate_server_vision(tls_server_config.vision, &tls_server_config.protocol)?;
-                embed_pem_from_map(&mut tls_server_config.cert, named_pems);
-                embed_pem_from_map(&mut tls_server_config.key, named_pems);
-                for cert in tls_server_config.client_ca_certs.iter_mut() {
-                    embed_pem_from_map(cert, named_pems);
-                }
-                validate_server_certificates(
-                    &tls_server_config.cert,
-                    &tls_server_config.key,
-                    &tls_server_config.client_ca_certs,
-                    tls_server_config.certificate_binding.as_ref(),
-                )?;
-
-                let TlsServerConfig {
-                    ref mut protocol,
-                    ref mut override_rules,
-                    ref mut client_fingerprints,
-                    ..
-                } = *tls_server_config;
-
-                validate_client_fingerprints(client_fingerprints)?;
-
-                validate_server_proxy_config(
-                    protocol,
-                    client_groups,
-                    rule_groups,
-                    named_pems,
-                    ServerProtocolContext::Tls,
-                    global_limits,
-                )?;
-
-                ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
-
-                for rule_config_selection in override_rules.iter_mut() {
-                    validate_rule_config(
-                        rule_config_selection.unwrap_config_mut(),
-                        client_groups,
-                        named_pems,
-                        global_limits,
-                    )?;
-                }
-            }
-            if let Some(tls_server_config) = default_tls_target {
-                tls_server_config
-                    .key_exchange_groups
-                    .validate_vision(tls_server_config.vision)?;
-                validate_server_vision(tls_server_config.vision, &tls_server_config.protocol)?;
-                embed_pem_from_map(&mut tls_server_config.cert, named_pems);
-                embed_pem_from_map(&mut tls_server_config.key, named_pems);
-                for cert in tls_server_config.client_ca_certs.iter_mut() {
-                    embed_pem_from_map(cert, named_pems);
-                }
-                validate_server_certificates(
-                    &tls_server_config.cert,
-                    &tls_server_config.key,
-                    &tls_server_config.client_ca_certs,
-                    tls_server_config.certificate_binding.as_ref(),
-                )?;
-                validate_client_fingerprints(&mut tls_server_config.client_fingerprints)?;
-
-                let TlsServerConfig {
-                    ref mut protocol,
-                    ref mut override_rules,
-                    ..
-                } = **tls_server_config;
-                validate_server_proxy_config(
-                    protocol,
-                    client_groups,
-                    rule_groups,
-                    named_pems,
-                    ServerProtocolContext::Tls,
-                    global_limits,
-                )?;
-
-                ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
-
-                for rule_config_selection in override_rules.iter_mut() {
-                    validate_rule_config(
-                        rule_config_selection.unwrap_config_mut(),
-                        client_groups,
-                        named_pems,
-                        global_limits,
-                    )?;
-                }
-            }
-            for (sni_hostname, tls_server_config) in shadowtls_targets.iter_mut() {
-                validate_nonempty_secret(&tls_server_config.password, "ShadowTLS")?;
-                if tls_targets.contains_key(sni_hostname) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "duplicated SNI hostname between TLS and ShadowTLS targets: {sni_hostname}"
-                        ),
-                    ));
-                }
-                let ShadowTlsServerConfig {
-                    ref mut protocol,
-                    ref mut override_rules,
-                    ref mut handshake,
-                    ..
-                } = *tls_server_config;
-
-                if let ShadowTlsServerHandshakeConfig::Local(local_handshake) = handshake {
-                    embed_pem_from_map(&mut local_handshake.cert, named_pems);
-                    embed_pem_from_map(&mut local_handshake.key, named_pems);
-                    for cert in local_handshake.client_ca_certs.iter_mut() {
-                        embed_pem_from_map(cert, named_pems);
-                    }
-                    validate_server_certificates(
-                        &local_handshake.cert,
-                        &local_handshake.key,
-                        &local_handshake.client_ca_certs,
-                        None,
-                    )?;
-                    validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
-                } else if let ShadowTlsServerHandshakeConfig::Remote(remote_handshake) = handshake {
-                    validate_client_chain(
-                        &mut remote_handshake.client_chain,
-                        0,
-                        client_groups,
-                        named_pems,
-                        global_limits,
-                    )?;
-                }
-
-                validate_server_proxy_config(
-                    protocol,
-                    client_groups,
-                    rule_groups,
-                    named_pems,
-                    ServerProtocolContext::Stream,
-                    global_limits,
-                )?;
-
-                ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
-
-                for rule_config_selection in override_rules.iter_mut() {
-                    validate_rule_config(
-                        rule_config_selection.unwrap_config_mut(),
-                        client_groups,
-                        named_pems,
-                        global_limits,
-                    )?;
-                }
-            }
-
-            for (sni_hostname, reality_config) in reality_targets.iter_mut() {
-                validate_server_vision(reality_config.vision, &reality_config.protocol)?;
-                if tls_targets.contains_key(sni_hostname) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "duplicated SNI hostname between TLS and REALITY targets: {sni_hostname}"
-                        ),
-                    ));
-                }
-                if shadowtls_targets.contains_key(sni_hostname) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "duplicated SNI hostname between ShadowTLS and REALITY targets: {sni_hostname}"
-                        ),
-                    ));
-                }
-
-                validate_reality_private_key(&reality_config.private_key, sni_hostname)?;
-                if let Some(seed) = &reality_config.mldsa65_seed {
-                    crate::reality::decode_mldsa65_seed(seed)?;
-                }
-                validate_reality_server_short_ids(&reality_config.short_ids, sni_hostname)?;
-
-                if !reality_config.dest_client_chain.is_empty() {
-                    let mut hops = OneOrSome::Some(
-                        std::mem::take(&mut reality_config.dest_client_chain).into_vec(),
-                    );
-                    validate_client_chain(&mut hops, 0, client_groups, named_pems, global_limits)?;
-                    reality_config.dest_client_chain = NoneOrSome::Some(hops.into_vec());
-                }
-
-                validate_server_proxy_config(
-                    &mut reality_config.protocol,
-                    client_groups,
-                    rule_groups,
-                    named_pems,
-                    ServerProtocolContext::Tls,
-                    global_limits,
-                )?;
-
-                ConfigSelection::replace_none_or_some_groups(
-                    &mut reality_config.override_rules,
-                    rule_groups,
-                )?;
-
-                for rule_config_selection in reality_config.override_rules.iter_mut() {
-                    validate_rule_config(
-                        rule_config_selection.unwrap_config_mut(),
-                        client_groups,
-                        named_pems,
-                        global_limits,
-                    )?;
-                }
-            }
-
-            if let Some(size) = tls_buffer_size
-                && *size < MIN_TLS_BUFFER_SIZE
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("TLS buffer size must be at least {MIN_TLS_BUFFER_SIZE}"),
-                ));
-            }
-        }
-        ServerProxyConfig::Websocket { targets } => {
-            for websocket_server_config in targets.iter_mut() {
-                crate::websocket::validate_early_data(
-                    websocket_server_config.matching_path.as_deref(),
-                    websocket_server_config.matching_headers.as_ref(),
-                    websocket_server_config.max_early_data,
-                    websocket_server_config.early_data_header_name.as_deref(),
-                    true,
-                )?;
-                let WebsocketServerConfig {
-                    protocol,
-                    override_rules,
-                    ..
-                } = websocket_server_config;
-                validate_server_proxy_config(
-                    protocol,
-                    client_groups,
-                    rule_groups,
-                    named_pems,
-                    ServerProtocolContext::Stream,
-                    global_limits,
-                )?;
-
-                ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
-
-                for rule_config_selection in override_rules.iter_mut() {
-                    validate_rule_config(
-                        rule_config_selection.unwrap_config_mut(),
-                        client_groups,
-                        named_pems,
-                        global_limits,
-                    )?;
-                }
-            }
-        }
         ServerProxyConfig::TuicV5 { uuid, .. } => {
             parse_uuid(uuid)?;
         }
@@ -2330,14 +2092,432 @@ fn validate_server_proxy_config(
     Ok(())
 }
 
+fn resolve_server_proxy_config(
+    mut source: ServerProxyConfig,
+    groups: &compiler::Groups,
+    rules: &HashMap<String, Vec<RuleConfig>>,
+    pems: &HashMap<String, String>,
+    limits: GlobalLimits,
+    context: ServerProtocolContext,
+) -> std::io::Result<ResolvedServerProxyConfig> {
+    validate_server_proxy_scalars(&mut source, context)?;
+    Ok(match source {
+        ServerProxyConfig::Wireguard(_) => {
+            unreachable!("nested WireGuard rejected by structure validation")
+        }
+        ServerProxyConfig::SudokuMask(config) => {
+            let protocol = Box::new(resolve_server_proxy_config(
+                *config.protocol,
+                groups,
+                rules,
+                pems,
+                limits,
+                ServerProtocolContext::Stream,
+            )?);
+            ResolvedServerProxyConfig::SudokuMask(crate::sudoku_mask::SudokuMaskConfig {
+                password: config.password,
+                ascii: config.ascii,
+                custom_table: config.custom_table,
+                custom_tables: config.custom_tables,
+                padding_min: config.padding_min,
+                padding_max: config.padding_max,
+                protocol,
+            })
+        }
+        ServerProxyConfig::Xhttp(config) => {
+            let protocol = Box::new(resolve_server_proxy_config(
+                *config.protocol,
+                groups,
+                rules,
+                pems,
+                limits,
+                ServerProtocolContext::Stream,
+            )?);
+            ResolvedServerProxyConfig::Xhttp(ResolvedXhttpServerConfig {
+                path: config.path,
+                host: config.host,
+                matching_headers: config.matching_headers,
+                mode: config.mode,
+                http_version: config.http_version,
+                x_padding_bytes: config.x_padding_bytes,
+                sc_max_each_post_bytes: config.sc_max_each_post_bytes,
+                sc_max_buffered_posts: config.sc_max_buffered_posts,
+                sc_stream_up_server_secs: config.sc_stream_up_server_secs,
+                server_max_header_bytes: config.server_max_header_bytes,
+                no_sse_header: config.no_sse_header,
+                limits: config.limits,
+                protocol,
+            })
+        }
+        ServerProxyConfig::Websocket { targets } => {
+            let targets = plan_ops::map_one(*targets, &mut |config| {
+                crate::websocket::validate_early_data(
+                    config.matching_path.as_deref(),
+                    config.matching_headers.as_ref(),
+                    config.max_early_data,
+                    config.early_data_header_name.as_deref(),
+                    true,
+                )?;
+                let protocol = resolve_server_proxy_config(
+                    config.protocol,
+                    groups,
+                    rules,
+                    pems,
+                    limits,
+                    ServerProtocolContext::Stream,
+                )?;
+                let override_rules =
+                    resolve_rules(config.override_rules, groups, rules, pems, limits)?;
+                Ok::<_, std::io::Error>(ResolvedWebsocketServerConfig {
+                    matching_path: config.matching_path,
+                    matching_headers: config.matching_headers,
+                    max_early_data: config.max_early_data,
+                    early_data_header_name: config.early_data_header_name,
+                    protocol,
+                    ping_type: config.ping_type,
+                    override_rules,
+                })
+            })?;
+            ResolvedServerProxyConfig::Websocket {
+                targets: Box::new(targets),
+            }
+        }
+        ServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            tls_buffer_size,
+        } => {
+            if tls_targets.is_empty()
+                && default_tls_target.is_none()
+                && shadowtls_targets.is_empty()
+                && reality_targets.is_empty()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "TLS server has no entries",
+                ));
+            }
+            let tls_targets: HashMap<_, _> = tls_targets
+                .into_iter()
+                .map(|(name, config)| {
+                    Ok((
+                        name,
+                        resolve_tls_server(config, groups, rules, pems, limits)?,
+                    ))
+                })
+                .collect::<std::io::Result<_>>()?;
+            let default_tls_target = default_tls_target
+                .map(|config| {
+                    resolve_tls_server(*config, groups, rules, pems, limits).map(Box::new)
+                })
+                .transpose()?;
+            let mut shadow_targets = HashMap::with_capacity(shadowtls_targets.len());
+            for (name, config) in shadowtls_targets {
+                validate_nonempty_secret(&config.password, "ShadowTLS")?;
+                if tls_targets.contains_key(&name) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "duplicated SNI hostname between TLS and ShadowTLS targets: {name}"
+                        ),
+                    ));
+                }
+                let handshake = match config.handshake {
+                    ShadowTlsServerHandshakeConfig::Local(mut local) => {
+                        embed_pem_from_map(&mut local.cert, pems);
+                        embed_pem_from_map(&mut local.key, pems);
+                        for cert in local.client_ca_certs.iter_mut() {
+                            embed_pem_from_map(cert, pems);
+                        }
+                        validate_server_certificates(
+                            &local.cert,
+                            &local.key,
+                            &local.client_ca_certs,
+                            None,
+                        )?;
+                        normalize_fingerprints(&mut local.client_fingerprints, "Client")?;
+                        ResolvedShadowTlsServerHandshakeConfig::Local(local)
+                    }
+                    ShadowTlsServerHandshakeConfig::Remote(remote) => {
+                        let chain =
+                            compiler::compile_chain(remote.client_chain, groups, pems, limits)?;
+                        ResolvedShadowTlsServerHandshakeConfig::Remote(
+                            ResolvedShadowTlsRemoteHandshake {
+                                address: remote.address,
+                                client_chain: chain.hops,
+                            },
+                        )
+                    }
+                };
+                let protocol = resolve_server_proxy_config(
+                    config.protocol,
+                    groups,
+                    rules,
+                    pems,
+                    limits,
+                    ServerProtocolContext::Stream,
+                )?;
+                let override_rules =
+                    resolve_rules(config.override_rules, groups, rules, pems, limits)?;
+                shadow_targets.insert(
+                    name,
+                    ResolvedShadowTlsServerConfig {
+                        password: config.password,
+                        handshake,
+                        protocol,
+                        override_rules,
+                    },
+                );
+            }
+            let mut reality = HashMap::with_capacity(reality_targets.len());
+            for (name, config) in reality_targets {
+                validate_server_vision(config.vision, &config.protocol)?;
+                if tls_targets.contains_key(&name) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("duplicated SNI hostname between TLS and REALITY targets: {name}"),
+                    ));
+                }
+                if shadow_targets.contains_key(&name) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "duplicated SNI hostname between ShadowTLS and REALITY targets: {name}"
+                        ),
+                    ));
+                }
+                validate_reality_private_key(&config.private_key, &name)?;
+                if let Some(seed) = &config.mldsa65_seed {
+                    crate::reality::decode_mldsa65_seed(seed)?;
+                }
+                validate_reality_server_short_ids(&config.short_ids, &name)?;
+                let dest_client_chain = if config.dest_client_chain.is_empty() {
+                    match config.dest_client_chain {
+                        NoneOrSome::Unspecified => NoneOrSome::Unspecified,
+                        _ => NoneOrSome::None,
+                    }
+                } else {
+                    let chain = compiler::compile_chain(
+                        OneOrSome::Some(config.dest_client_chain.into_vec()),
+                        groups,
+                        pems,
+                        limits,
+                    )?;
+                    NoneOrSome::Some(chain.hops.into_vec())
+                };
+                let protocol = resolve_server_proxy_config(
+                    config.protocol,
+                    groups,
+                    rules,
+                    pems,
+                    limits,
+                    ServerProtocolContext::Tls,
+                )?;
+                let override_rules =
+                    resolve_rules(config.override_rules, groups, rules, pems, limits)?;
+                reality.insert(
+                    name,
+                    ResolvedRealityServerConfig {
+                        mldsa65_seed: config.mldsa65_seed,
+                        private_key: config.private_key,
+                        short_ids: config.short_ids,
+                        dest: config.dest,
+                        max_time_diff: config.max_time_diff,
+                        min_client_version: config.min_client_version,
+                        max_client_version: config.max_client_version,
+                        cipher_suites: config.cipher_suites,
+                        vision: config.vision,
+                        protocol,
+                        dest_client_chain,
+                        override_rules,
+                    },
+                );
+            }
+            if let Some(size) = tls_buffer_size
+                && size < MIN_TLS_BUFFER_SIZE
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("TLS buffer size must be at least {MIN_TLS_BUFFER_SIZE}"),
+                ));
+            }
+            ResolvedServerProxyConfig::Tls {
+                tls_targets,
+                default_tls_target,
+                shadowtls_targets: shadow_targets,
+                reality_targets: reality,
+                tls_buffer_size,
+            }
+        }
+        ServerProxyConfig::Http { username, password } => {
+            ResolvedServerProxyConfig::Http { username, password }
+        }
+        ServerProxyConfig::Socks {
+            username,
+            password,
+            udp_enabled,
+        } => ResolvedServerProxyConfig::Socks {
+            username,
+            password,
+            udp_enabled,
+        },
+        ServerProxyConfig::Shadowsocks {
+            config,
+            udp_enabled,
+        } => ResolvedServerProxyConfig::Shadowsocks {
+            config,
+            udp_enabled,
+        },
+        ServerProxyConfig::Snell {
+            cipher,
+            password,
+            udp_enabled,
+        } => ResolvedServerProxyConfig::Snell {
+            cipher,
+            password,
+            udp_enabled,
+        },
+        ServerProxyConfig::Vless {
+            user_id,
+            decryption,
+            _invalid_encryption,
+            vision,
+            encryption_limits,
+            udp_enabled,
+            fallback,
+        } => ResolvedServerProxyConfig::Vless {
+            user_id,
+            decryption,
+            _invalid_encryption,
+            vision,
+            encryption_limits,
+            udp_enabled,
+            fallback,
+        },
+        ServerProxyConfig::Trojan {
+            password,
+            shadowsocks,
+        } => ResolvedServerProxyConfig::Trojan {
+            password,
+            shadowsocks,
+        },
+        ServerProxyConfig::Vmess {
+            cipher,
+            user_id,
+            udp_enabled,
+        } => ResolvedServerProxyConfig::Vmess {
+            cipher,
+            user_id,
+            udp_enabled,
+        },
+        ServerProxyConfig::Anytls {
+            users,
+            padding_scheme,
+            udp_enabled,
+            fallback,
+        } => ResolvedServerProxyConfig::Anytls {
+            users,
+            padding_scheme,
+            udp_enabled,
+            fallback,
+        },
+        ServerProxyConfig::PortForward { targets } => {
+            ResolvedServerProxyConfig::PortForward { targets }
+        }
+        ServerProxyConfig::Hysteria2 {
+            password,
+            udp_enabled,
+        } => ResolvedServerProxyConfig::Hysteria2 {
+            password,
+            udp_enabled,
+        },
+        ServerProxyConfig::TuicV5 {
+            uuid,
+            password,
+            zero_rtt_handshake,
+        } => ResolvedServerProxyConfig::TuicV5 {
+            uuid,
+            password,
+            zero_rtt_handshake,
+        },
+        ServerProxyConfig::Mixed {
+            username,
+            password,
+            udp_enabled,
+        } => ResolvedServerProxyConfig::Mixed {
+            username,
+            password,
+            udp_enabled,
+        },
+        ServerProxyConfig::Naiveproxy {
+            users,
+            padding,
+            fallback,
+            udp_enabled,
+        } => ResolvedServerProxyConfig::Naiveproxy {
+            users,
+            padding,
+            fallback,
+            udp_enabled,
+        },
+    })
+}
+
+fn resolve_tls_server(
+    mut config: TlsServerConfig,
+    groups: &compiler::Groups,
+    rules: &HashMap<String, Vec<RuleConfig>>,
+    pems: &HashMap<String, String>,
+    limits: GlobalLimits,
+) -> std::io::Result<ResolvedTlsServerConfig> {
+    config.key_exchange_groups.validate_vision(config.vision)?;
+    validate_server_vision(config.vision, &config.protocol)?;
+    embed_pem_from_map(&mut config.cert, pems);
+    embed_pem_from_map(&mut config.key, pems);
+    for cert in config.client_ca_certs.iter_mut() {
+        embed_pem_from_map(cert, pems);
+    }
+    validate_server_certificates(
+        &config.cert,
+        &config.key,
+        &config.client_ca_certs,
+        config.certificate_binding.as_ref(),
+    )?;
+    normalize_fingerprints(&mut config.client_fingerprints, "Client")?;
+    let protocol = resolve_server_proxy_config(
+        config.protocol,
+        groups,
+        rules,
+        pems,
+        limits,
+        ServerProtocolContext::Tls,
+    )?;
+    let override_rules = resolve_rules(config.override_rules, groups, rules, pems, limits)?;
+    Ok(ResolvedTlsServerConfig {
+        certificate_source: config.certificate_source,
+        certificate_binding: config.certificate_binding,
+        key_exchange_groups: config.key_exchange_groups,
+        cert: config.cert,
+        key: config.key,
+        alpn_protocols: config.alpn_protocols,
+        client_ca_certs: config.client_ca_certs,
+        client_fingerprints: config.client_fingerprints,
+        vision: config.vision,
+        protocol,
+        override_rules,
+    })
+}
+
 /// Validates a TUN configuration.
-fn validate_tun_config(
-    config: &mut TunConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+fn resolve_tun_config(
+    config: TunConfig,
+    client_groups: &compiler::Groups,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
-) -> std::io::Result<()> {
+) -> std::io::Result<ResolvedTunConfig> {
     config.resource_limits.validate()?;
     if config.segmentation_offload == Some(true)
         && (!cfg!(target_os = "linux")
@@ -2389,273 +2569,101 @@ fn validate_tun_config(
         }
     }
 
-    // Resolve rule group references
-    ConfigSelection::replace_none_or_some_groups(&mut config.rules, rule_groups)?;
-
-    // Validate rules
-    for rule in config.rules.iter_mut() {
-        let rule = rule.unwrap_config_mut();
-        validate_rule_config(rule, client_groups, named_pems, global_limits)?;
-    }
-
-    Ok(())
+    let rules = resolve_rules(
+        config.rules,
+        client_groups,
+        rule_groups,
+        named_pems,
+        global_limits,
+    )?;
+    Ok(ResolvedTunConfig {
+        auto_route: config.auto_route,
+        auto_redirect: config.auto_redirect,
+        auto_dns: config.auto_dns,
+        addresses: config.addresses,
+        route_address: config.route_address,
+        route_exclude_address: config.route_exclude_address,
+        bootstrap_dns: config.bootstrap_dns,
+        linux: config.linux,
+        dns_hijack: config.dns_hijack,
+        name: config.name,
+        sniff: config.sniff,
+        segmentation_offload: config.segmentation_offload,
+        resource_limits: config.resource_limits,
+        packet_information: config.packet_information,
+        device_name: config.device_name,
+        device_fd: config.device_fd,
+        address: config.address,
+        netmask: config.netmask,
+        destination: config.destination,
+        mtu: config.mtu,
+        tcp_enabled: config.tcp_enabled,
+        udp_enabled: config.udp_enabled,
+        icmp_enabled: config.icmp_enabled,
+        rules,
+        dns: resolve_dns_binding(config.dns),
+    })
 }
 
-fn validate_rule_config(
-    rule_config: &mut RuleConfig,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
+pub(super) fn resolve_rule_config(
+    mut rule: RuleConfig,
+    client_groups: &compiler::Groups,
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
-) -> std::io::Result<()> {
-    // Only generated defaults remain uncompiled; user predicates compile before expansion.
-    rule_config.compile(&mut crate::rules::Compiler::default())?;
-    if let RuleActionConfig::Allow {
-        ref mut client_chains,
-        ..
-    } = rule_config.action
-    {
-        // Handle unspecified: default to single chain with direct hop
-        if client_chains.is_unspecified() {
-            *client_chains = NoneOrSome::One(ClientChain::default());
-        }
-
-        // Validate not explicitly empty (client_chains: [])
-        if matches!(client_chains, NoneOrSome::None) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "client_chains cannot be empty; omit the field for default direct connection",
-            ));
-        }
-
-        for (chain_index, chain) in client_chains.iter_mut().enumerate() {
-            validate_client_chain(
-                &mut chain.hops,
-                chain_index,
-                client_groups,
-                named_pems,
-                global_limits,
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_client_chain(
-    hops: &mut OneOrSome<ClientChainHop>,
-    chain_index: usize,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-    named_pems: &HashMap<String, String>,
-    global_limits: GlobalLimits,
-) -> std::io::Result<()> {
-    for hop in hops.iter_mut() {
-        validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
-    }
-    expand_client_chain(hops, client_groups)?;
-    validate_connector_positions(hops, chain_index)
-}
-
-/// Rejects connector protocols that cannot wrap an existing stream at later hops.
-fn validate_connector_positions(
-    hops: &OneOrSome<ClientChainHop>,
-    chain_index: usize,
-) -> std::io::Result<()> {
-    for (hop_index, hop) in hops.iter().enumerate() {
-        if hop_index == 0 {
-            // Direct connectors are allowed at hop 0
-            continue;
-        }
-
-        if hop_uses_wireguard(hop) {
-            return Err(super::types::wireguard::invalid(
-                "WireGuard is only supported at hop 0; configure peer_client_chain in the protocol for preceding proxies",
-            ));
-        }
-
-        for selection in hop.selections() {
-            let ConfigSelection::Config(client) = selection else {
-                unreachable!("groups have been expanded");
-            };
-            crate::quic_client::validate(client, false)?;
-        }
-        let unsupported_h3 = |selection: &ConfigSelection<ClientConfig>| {
-            matches!(selection, ConfigSelection::Config(config)
-                if config.transport == Transport::Quic && crate::xhttp::connector::contains(&config.protocol))
-        };
-        if match hop {
-            ClientChainHop::Single(selection) => unsupported_h3(selection),
-            ClientChainHop::Pool(selections) => selections.iter().any(unsupported_h3),
-        } {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "XHTTP H3 is only supported at hop 0",
-            ));
-        }
-
-        // For hop 1+, check if any connector is direct
-        let has_direct = match hop {
-            ClientChainHop::Single(ConfigSelection::Config(config)) => config.protocol.is_direct(),
-            ClientChainHop::Single(ConfigSelection::GroupName(_)) => {
-                // Groups should already be expanded at this point
-                unreachable!("Group references should be expanded before validation")
+) -> std::io::Result<ResolvedRuleConfig> {
+    rule.compile(&mut crate::rules::Compiler::default())?;
+    let action = match rule.action {
+        RuleActionConfig::Block => ResolvedRuleActionConfig::Block,
+        RuleActionConfig::Allow {
+            override_address,
+            mut client_chains,
+        } => {
+            if client_chains.is_unspecified() {
+                client_chains = NoneOrSome::One(ClientChain::default());
             }
-            ClientChainHop::Pool(selections) => {
-                selections.iter().any(|selection| match selection {
-                    ConfigSelection::Config(config) => config.protocol.is_direct(),
-                    ConfigSelection::GroupName(_) => {
-                        unreachable!("Group references should be expanded before validation")
-                    }
-                })
-            }
-        };
-
-        if has_direct {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Direct connector at chain {} hop {} is invalid. \
-                     Direct connectors can only be used at hop 0 (the first hop) \
-                     because they create the TCP connection. At hop 1+, the connection \
-                     already exists through the previous hop.",
-                    chain_index, hop_index
-                ),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_client_chain_hop(
-    hop: &mut ClientChainHop,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-    named_pems: &HashMap<String, String>,
-    global_limits: GlobalLimits,
-) -> std::io::Result<()> {
-    match hop {
-        ClientChainHop::Single(selection) => {
-            validate_and_expand_selection(selection, client_groups, named_pems, global_limits)?;
-        }
-        ClientChainHop::Pool(selections) => {
-            for selection in selections.iter_mut() {
-                validate_and_expand_selection(selection, client_groups, named_pems, global_limits)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Validates a ConfigSelection and expands group references to inline configs.
-fn validate_and_expand_selection(
-    selection: &mut ConfigSelection<ClientConfig>,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-    named_pems: &HashMap<String, String>,
-    global_limits: GlobalLimits,
-) -> std::io::Result<()> {
-    match selection {
-        ConfigSelection::Config(client_config) => {
-            expand_peer_chains(client_config, client_groups)?;
-            validate_client_config(client_config, named_pems, global_limits)?;
-        }
-        ConfigSelection::GroupName(group_name) => {
-            let group_configs = client_groups.get(group_name).ok_or_else(|| {
-                std::io::Error::new(
+            if matches!(client_chains, NoneOrSome::None) {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("Unknown client_group in chain: {group_name}"),
-                )
+                    "client_chains cannot be empty; omit the field for default direct connection",
+                ));
+            }
+            let client_chains = plan_ops::map_some(client_chains, &mut |chain| {
+                compiler::compile_chain(chain.hops, client_groups, named_pems, global_limits)
             })?;
-            // Validate all configs in the group; expansion happens in expand_client_chain
-            for mut config in group_configs.clone() {
-                validate_client_config(&mut config, named_pems, global_limits)?;
+            ResolvedRuleActionConfig::Allow {
+                override_address,
+                client_chains,
             }
         }
-    }
-    Ok(())
-}
-
-/// Expands all group references in a client chain to their resolved configs.
-/// This should be called after validate_client_chain_hop to replace GroupName
-/// selections with their actual configs.
-fn expand_client_chain(
-    client_chain: &mut OneOrSome<ClientChainHop>,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-) -> std::io::Result<()> {
-    let expanded_hops: Vec<ClientChainHop> = client_chain
-        .iter()
-        .map(|hop| expand_chain_hop(hop, client_groups))
-        .collect::<std::io::Result<Vec<_>>>()?;
-
-    for (index, hop) in expanded_hops.iter().enumerate() {
-        let validate = |selection: &ConfigSelection<ClientConfig>| match selection {
-            ConfigSelection::Config(config) => config.validate_quic_key_exchange(index == 0),
-            ConfigSelection::GroupName(_) => unreachable!("groups have been expanded"),
-        };
-        match hop {
-            ClientChainHop::Single(selection) => validate(selection)?,
-            ClientChainHop::Pool(selections) => {
-                for selection in selections.iter() {
-                    validate(selection)?;
-                }
-            }
-        }
-    }
-
-    *client_chain = if expanded_hops.len() == 1 {
-        OneOrSome::One(expanded_hops.into_iter().next().unwrap())
-    } else {
-        OneOrSome::Some(expanded_hops)
     };
-    Ok(())
+    Ok(ResolvedRuleConfig {
+        criteria: rule.criteria,
+        action,
+    })
 }
 
-/// Expands a single chain hop by resolving all group references.
-fn expand_chain_hop(
-    hop: &ClientChainHop,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-) -> std::io::Result<ClientChainHop> {
-    match hop {
-        ClientChainHop::Single(selection) => {
-            let configs = expand_selection(selection, client_groups)?;
-            // Single becomes a Pool if the group has multiple configs
-            if configs.len() == 1 {
-                Ok(ClientChainHop::Single(ConfigSelection::Config(
-                    configs.into_iter().next().unwrap(),
-                )))
-            } else {
-                Ok(ClientChainHop::Pool(OneOrSome::Some(
-                    configs.into_iter().map(ConfigSelection::Config).collect(),
-                )))
-            }
-        }
-        ClientChainHop::Pool(selections) => {
-            let mut all_configs = vec![];
-            for selection in selections.iter() {
-                all_configs.extend(expand_selection(selection, client_groups)?);
-            }
-            Ok(ClientChainHop::Pool(OneOrSome::Some(
-                all_configs
-                    .into_iter()
-                    .map(ConfigSelection::Config)
-                    .collect(),
-            )))
-        }
-    }
+pub(super) fn resolve_rules(
+    mut rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    client_groups: &compiler::Groups,
+    rule_groups: &HashMap<String, Vec<RuleConfig>>,
+    named_pems: &HashMap<String, String>,
+    global_limits: GlobalLimits,
+) -> std::io::Result<NoneOrSome<ResolvedRuleConfig>> {
+    ConfigSelection::replace_none_or_some_groups(&mut rules, rule_groups)?;
+    plan_ops::map_some(rules, &mut |rule| {
+        resolve_rule_config(
+            rule.unwrap_config(),
+            client_groups,
+            named_pems,
+            global_limits,
+        )
+    })
 }
 
-/// Expands a single selection to its constituent configs.
-fn expand_selection(
-    selection: &ConfigSelection<ClientConfig>,
-    client_groups: &HashMap<String, Vec<ClientConfig>>,
-) -> std::io::Result<Vec<ClientConfig>> {
-    match selection {
-        ConfigSelection::Config(config) => Ok(vec![config.clone()]),
-        ConfigSelection::GroupName(name) => client_groups.get(name).cloned().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Unknown client group: {name}"),
-            )
-        }),
-    }
+fn resolve_dns_binding(dns: Option<DnsConfig>) -> Option<ResolvedDnsConfig> {
+    dns.map(|dns| ResolvedDnsConfig {
+        group: dns.resolved_group().map(str::to_owned),
+    })
 }
 
 #[cfg(test)]

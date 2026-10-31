@@ -5,7 +5,8 @@ use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    Config, TunConfig,
+    Config, ResolvedConfig,
+    tun::TunRecord,
     tun::{LinuxTunOptions, next_ip_address},
 };
 
@@ -32,11 +33,24 @@ pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
 
 impl Spec {
     pub(crate) fn from_configs(configs: &[Config]) -> io::Result<Option<Self>> {
+        Self::from_tuns(configs.iter().filter_map(|config| match config {
+            Config::TunServer(tun) => Some(tun),
+            _ => None,
+        }))
+    }
+
+    pub(crate) fn from_resolved_configs(configs: &[ResolvedConfig]) -> io::Result<Option<Self>> {
+        Self::from_tuns(configs.iter().filter_map(|config| match config {
+            ResolvedConfig::TunServer(tun) => Some(tun),
+            _ => None,
+        }))
+    }
+
+    fn from_tuns<'a, R: 'a, D: 'a>(
+        tuns: impl IntoIterator<Item = &'a TunRecord<R, D>>,
+    ) -> io::Result<Option<Self>> {
         let mut selected = None;
-        for config in configs {
-            let Config::TunServer(tun) = config else {
-                continue;
-            };
+        for tun in tuns {
             if !tun.auto_route {
                 if tun.has_managed_options() {
                     return Err(invalid("TUN network automation options require auto_route"));
@@ -51,7 +65,7 @@ impl Spec {
         Ok(selected)
     }
 
-    fn new(tun: &TunConfig) -> io::Result<Self> {
+    fn new<R, D>(tun: &TunRecord<R, D>) -> io::Result<Self> {
         if tun.address.is_some() || tun.netmask.is_some() || tun.destination.is_some() {
             return Err(invalid(
                 "managed TUN uses addresses CIDRs, not manual address/netmask/destination settings",

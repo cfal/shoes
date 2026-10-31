@@ -6,7 +6,7 @@ use log::{debug, error};
 use tokio::task::JoinHandle;
 
 use crate::config::{
-    BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
+    BindLocation, ResolvedServerConfig, ResolvedServerProxyConfig, ServerQuicConfig,
 };
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
@@ -129,10 +129,10 @@ async fn process_streams(
 }
 
 pub async fn start_quic_servers(
-    config: ServerConfig,
+    config: ResolvedServerConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let ServerConfig {
+    let ResolvedServerConfig {
         bind_location,
         quic_settings,
         protocol,
@@ -143,7 +143,7 @@ pub async fn start_quic_servers(
 
     println!("Starting {} QUIC server at {}", protocol, bind_location);
 
-    let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
+    let rules = rules.into_vec();
     // A direct entry must always exist
     assert!(!rules.is_empty());
 
@@ -177,7 +177,7 @@ pub async fn start_quic_servers(
         client_fingerprints,
         num_endpoints,
     } = quic_settings.unwrap();
-    if let ServerProxyConfig::TuicV5 {
+    if let ResolvedServerProxyConfig::TuicV5 {
         zero_rtt_handshake, ..
     } = &protocol
     {
@@ -193,12 +193,13 @@ pub async fn start_quic_servers(
         processed_ca_certs.push(cert.as_bytes().to_vec());
     }
 
-    let alpn_protocols =
-        if matches!(protocol, ServerProxyConfig::Xhttp(_)) && alpn_protocols.is_unspecified() {
-            vec!["h3".to_owned()]
-        } else {
-            alpn_protocols.into_vec()
-        };
+    let alpn_protocols = if matches!(protocol, ResolvedServerProxyConfig::Xhttp(_))
+        && alpn_protocols.is_unspecified()
+    {
+        vec!["h3".to_owned()]
+    } else {
+        alpn_protocols.into_vec()
+    };
     let mut server_config = try_create_server_config_with_source(
         &cert_bytes,
         &key_bytes,
@@ -223,7 +224,7 @@ pub async fn start_quic_servers(
     let mut handles = vec![];
 
     match protocol {
-        ServerProxyConfig::Xhttp(config) => {
+        ResolvedServerProxyConfig::Xhttp(config) => {
             if !matches!(
                 config.http_version,
                 crate::config::xhttp::XhttpVersion::Auto | crate::config::xhttp::XhttpVersion::H3
@@ -289,7 +290,7 @@ pub async fn start_quic_servers(
                 }));
             }
         }
-        ServerProxyConfig::Hysteria2 {
+        ResolvedServerProxyConfig::Hysteria2 {
             password,
             udp_enabled,
         } => {
@@ -313,7 +314,7 @@ pub async fn start_quic_servers(
                 collect_started_listeners(&mut handles, result).await?;
             }
         }
-        ServerProxyConfig::TuicV5 {
+        ResolvedServerProxyConfig::TuicV5 {
             uuid,
             password,
             zero_rtt_handshake,
@@ -405,21 +406,21 @@ async fn collect_started_listeners(
 mod tests {
     use super::*;
     use crate::address::NetLocation;
-    use crate::config::{RuleConfig, Transport};
+    use crate::config::{ResolvedRuleConfig, Transport};
     use crate::option_util::{NoneOrSome, OneOrSome};
     use crate::resolver::NativeResolver;
     use std::time::Duration;
 
-    async fn assert_partial_startup_cleanup(protocol: ServerProxyConfig) {
+    async fn assert_partial_startup_cleanup(protocol: ResolvedServerProxyConfig) {
         let first = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let first_addr = first.local_addr().unwrap();
         let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let occupied_addr = occupied.local_addr().unwrap();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let mut rule = RuleConfig::default();
+        let mut rule = ResolvedRuleConfig::default();
         rule.compile(&mut crate::rules::Compiler::default())
             .unwrap();
-        let config = ServerConfig {
+        let config = ResolvedServerConfig {
             name: None,
             sniff: false,
             bind_location: BindLocation::Address(OneOrSome::Some(
@@ -442,7 +443,7 @@ mod tests {
                 client_fingerprints: NoneOrSome::None,
                 num_endpoints: 2,
             }),
-            rules: NoneOrSome::One(ConfigSelection::Config(rule)),
+            rules: NoneOrSome::One(rule),
             dns: None,
         };
         drop(first);
@@ -464,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_hysteria2_startup_releases_earlier_listeners() {
-        assert_partial_startup_cleanup(ServerProxyConfig::Hysteria2 {
+        assert_partial_startup_cleanup(ResolvedServerProxyConfig::Hysteria2 {
             password: "password".into(),
             udp_enabled: true,
         })
@@ -473,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_tuic_startup_releases_earlier_listeners() {
-        assert_partial_startup_cleanup(ServerProxyConfig::TuicV5 {
+        assert_partial_startup_cleanup(ResolvedServerProxyConfig::TuicV5 {
             uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
             password: "password".into(),
             zero_rtt_handshake: false,
@@ -483,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_generic_quic_startup_releases_earlier_listeners() {
-        assert_partial_startup_cleanup(ServerProxyConfig::Http {
+        assert_partial_startup_cleanup(ResolvedServerProxyConfig::Http {
             username: None,
             password: None,
         })

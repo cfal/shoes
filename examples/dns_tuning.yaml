@@ -56,7 +56,7 @@
 
 # Reusable proxy tunnel for remote DNS resolution.
 - client_group: dns-tunnel
-  client_proxies:
+  client_chains:
     - address: "edge.example.com:443"
       protocol:
         type: tls

@@ -62,7 +62,7 @@ async fn dns_client_chain_resolves_proxy_through_configured_bootstrap() {
     let configs = serde_json::from_value(serde_json::json!([
         {
             "client_group": "out",
-            "client_proxies": [{
+            "client_chains": [{
                 "address": "private-proxy.invalid:80",
                 "protocol": {"type": "http"}
             }]
@@ -133,7 +133,7 @@ async fn native_cache_policy_distinguishes_implicit_and_explicit_system() {
         let configs =
             crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
         let mut registry = build_dns_registry(configs.dns_groups).await.unwrap();
-        let crate::config::Config::Server(server) = &configs.configs[0] else {
+        let crate::config::ResolvedConfig::Server(server) = &configs.configs[0] else {
             panic!("expected server")
         };
         let resolver = registry.get_for_server(server.dns.as_ref());
@@ -197,7 +197,7 @@ fn system_bootstrap_dependencies_preserve_named_group_precedence() {
     group.specs[0] = make_spec("udp://127.0.0.1:53");
     assert!(!group_uses_system(group, &known).unwrap());
     group.specs[0].client_chains = vec![
-        serde_json::from_value(serde_json::json!({
+        crate::config::test_support::from_json(serde_json::json!({
             "address": "proxy.invalid:1080", "protocol": {"type": "socks"}
         }))
         .unwrap(),
@@ -218,7 +218,7 @@ async fn explicit_proxy_bootstrap_does_not_require_native_dns_preflight() {
     spec.url = "tcp://127.0.0.1:53".into();
     spec.bootstrap_url = Some("udp://127.0.0.1:54".into());
     spec.client_chains = vec![
-        serde_json::from_value(serde_json::json!({
+        crate::config::test_support::from_json(serde_json::json!({
             "address": "proxy.invalid:1080", "protocol": {"type": "socks"}
         }))
         .unwrap(),
@@ -1134,17 +1134,17 @@ async fn selector_identity_prevents_dns_pooling_of_identical_members() {
     let configs = serde_yaml::from_str(
         r#"
 - client_group: east
-  client_proxies: [{name: east-direct, protocol: {type: direct}, bind_interface: east}]
+  client_chains: [{name: east-direct, protocol: {type: direct}, bind_interface: east}]
 - client_group: west
-  client_proxies: [{name: west-direct, protocol: {type: direct}, bind_interface: west}]
+  client_chains: [{name: west-direct, protocol: {type: direct}, bind_interface: west}]
 - client_group: first
   type: selector
   default: east
-  client_proxies: [east, west]
+  client_chains: [{chain: [east]}, {chain: [west]}]
 - client_group: second
   type: selector
   default: west
-  client_proxies: [east, west]
+  client_chains: [{chain: [east]}, {chain: [west]}]
 - dns_group: selected
   dns_servers:
     - {url: 'udp://192.0.2.1', client_chain: first}
@@ -1154,7 +1154,7 @@ async fn selector_identity_prevents_dns_pooling_of_identical_members() {
     .unwrap();
     let validated = crate::config::create_server_configs(configs).unwrap();
     let specs = &validated.dns_groups[0].specs;
-    assert_eq!(
+    assert_ne!(
         serde_yaml::to_string(&specs[0].client_chains).unwrap(),
         serde_yaml::to_string(&specs[1].client_chains).unwrap()
     );
@@ -1177,11 +1177,19 @@ async fn selector_identity_prevents_dns_pooling_of_identical_members() {
     let resolver = build_hickory_resolver_group(&plans).await.unwrap();
     assert!(format!("{resolver:?}").contains("CompositeResolver"));
     assert_eq!(
-        plans[0].chain_group.select_bind_interface().unwrap(),
+        plans[0]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("east")
     );
     assert_eq!(
-        plans[1].chain_group.select_bind_interface().unwrap(),
+        plans[1]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("west")
     );
     let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
@@ -1190,20 +1198,36 @@ async fn selector_identity_prevents_dns_pooling_of_identical_members() {
         .unwrap();
     owner.select("first", "west").unwrap();
     assert_eq!(
-        plans[0].chain_group.select_bind_interface().unwrap(),
+        plans[0]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("west")
     );
     assert_eq!(
-        plans[1].chain_group.select_bind_interface().unwrap(),
+        plans[1]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("west")
     );
     owner.select("second", "east").unwrap();
     assert_eq!(
-        plans[0].chain_group.select_bind_interface().unwrap(),
+        plans[0]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("west")
     );
     assert_eq!(
-        plans[1].chain_group.select_bind_interface().unwrap(),
+        plans[1]
+            .chain_group
+            .select_bind_interface()
+            .unwrap()
+            .as_deref(),
         Some("east")
     );
 }

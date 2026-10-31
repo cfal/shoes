@@ -1233,7 +1233,7 @@ mod lifecycle_tests {
                 let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
                 let selector = Arc::new(
                     crate::tcp::tcp_client_handler_factory::create_test_selector(
-                        vec![crate::config::RuleConfig::default()],
+                        vec![crate::config::ResolvedRuleConfig::default()],
                         resolver.clone(),
                     )
                     .unwrap(),
@@ -1525,8 +1525,11 @@ mod auth_tests {
     async fn direct_peer(limits: crate::config::GlobalLimits) -> Peer {
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let selector = Arc::new(
-            create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone())
-                .unwrap(),
+            create_test_selector(
+                vec![crate::config::ResolvedRuleConfig::default()],
+                resolver.clone(),
+            )
+            .unwrap(),
         );
         connect_with_limits(selector, resolver, limits).await
     }
@@ -1791,7 +1794,7 @@ mod auth_tests {
                 let peer = connect_with_resolver(
                     Arc::new(
                         create_test_selector(
-                            vec![crate::config::RuleConfig::default()],
+                            vec![crate::config::ResolvedRuleConfig::default()],
                             resolver.clone(),
                         )
                         .unwrap(),
@@ -1889,7 +1892,8 @@ mod auth_tests {
             });
             let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
             let peer = connect(Arc::new(
-                create_test_selector(vec![crate::config::RuleConfig::default()], resolver).unwrap(),
+                create_test_selector(vec![crate::config::ResolvedRuleConfig::default()], resolver)
+                    .unwrap(),
             ))
             .await;
 
@@ -1935,7 +1939,8 @@ mod auth_tests {
             .unwrap();
             let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
             let peer = connect(Arc::new(
-                create_test_selector(vec![crate::config::RuleConfig::default()], resolver).unwrap(),
+                create_test_selector(vec![crate::config::ResolvedRuleConfig::default()], resolver)
+                    .unwrap(),
             ))
             .await;
             let mut packet = vec![5, COMMAND_TYPE_PACKET, 0, 7, 0, 9, 1, 0, 0, 5];

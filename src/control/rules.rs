@@ -4,7 +4,9 @@ use std::sync::Arc;
 use super::catalog::RuleDescription;
 use super::flows::{FlowContext, FlowRegistry};
 use crate::config::client_visit::sorted_targets;
-use crate::config::{Config, ConfigSelection, RuleConfig, ServerProxyConfig, ValidatedConfigs};
+use crate::config::{
+    ResolvedConfig, ResolvedRuleConfig, ResolvedServerProxyConfig, ValidatedConfigs,
+};
 use crate::option_util::NoneOrSome;
 
 struct Builder {
@@ -16,15 +18,12 @@ struct Builder {
 impl Builder {
     fn project_rules(
         &mut self,
-        rules: &mut NoneOrSome<ConfigSelection<RuleConfig>>,
+        rules: &mut NoneOrSome<ResolvedRuleConfig>,
         inbound: &str,
         scope: &str,
         protocol: &str,
     ) {
-        for selected in rules.iter_mut() {
-            let ConfigSelection::Config(rule) = selected else {
-                continue;
-            };
+        for rule in rules.iter_mut() {
             let mut description = rule
                 .criteria
                 .description
@@ -32,7 +31,8 @@ impl Builder {
                 .cloned()
                 .unwrap_or_else(|| RuleDescription {
                     payload: "match all".into(),
-                    proxy: if matches!(rule.action, crate::config::RuleActionConfig::Block) {
+                    proxy: if matches!(rule.action, crate::config::ResolvedRuleActionConfig::Block)
+                    {
                         "REJECT"
                     } else {
                         "DIRECT"
@@ -63,9 +63,9 @@ impl Builder {
 
     fn project_target(
         &mut self,
-        rules: &mut NoneOrSome<ConfigSelection<RuleConfig>>,
-        protocol: &mut ServerProxyConfig,
-        inherited: &NoneOrSome<ConfigSelection<RuleConfig>>,
+        rules: &mut NoneOrSome<ResolvedRuleConfig>,
+        protocol: &mut ResolvedServerProxyConfig,
+        inherited: &NoneOrSome<ResolvedRuleConfig>,
         inbound: &str,
         scope: &str,
     ) {
@@ -86,13 +86,13 @@ impl Builder {
 
     fn project_protocol(
         &mut self,
-        protocol: &mut ServerProxyConfig,
+        protocol: &mut ResolvedServerProxyConfig,
         inbound: &str,
         scope: &str,
-        inherited: &NoneOrSome<ConfigSelection<RuleConfig>>,
+        inherited: &NoneOrSome<ResolvedRuleConfig>,
     ) {
         match protocol {
-            ServerProxyConfig::Tls {
+            ResolvedServerProxyConfig::Tls {
                 tls_targets,
                 default_tls_target,
                 shadowtls_targets,
@@ -140,7 +140,7 @@ impl Builder {
                     );
                 }
             }
-            ServerProxyConfig::Websocket { targets } => {
+            ResolvedServerProxyConfig::Websocket { targets } => {
                 for (index, target) in targets.iter_mut().enumerate() {
                     let scope = format!("{scope}/websocket/{index}");
                     self.project_target(
@@ -152,13 +152,13 @@ impl Builder {
                     );
                 }
             }
-            ServerProxyConfig::SudokuMask(config) => self.project_protocol(
+            ResolvedServerProxyConfig::SudokuMask(config) => self.project_protocol(
                 &mut config.protocol,
                 inbound,
                 &format!("{scope}/sudoku_mask"),
                 inherited,
             ),
-            ServerProxyConfig::Xhttp(config) => self.project_target(
+            ResolvedServerProxyConfig::Xhttp(config) => self.project_target(
                 &mut NoneOrSome::None,
                 &mut config.protocol,
                 inherited,
@@ -170,21 +170,21 @@ impl Builder {
     }
 }
 
-pub fn inbound_type(protocol: &ServerProxyConfig) -> &'static str {
+pub fn inbound_type(protocol: &ResolvedServerProxyConfig) -> &'static str {
     match protocol {
-        ServerProxyConfig::Socks { .. } => "Socks5",
-        ServerProxyConfig::Http { .. } => "HTTP",
-        ServerProxyConfig::Vless { .. } => "VLESS",
-        ServerProxyConfig::Vmess { .. } => "Vmess",
-        ServerProxyConfig::Shadowsocks { .. } => "Shadowsocks",
-        ServerProxyConfig::Snell { .. } => "Snell",
-        ServerProxyConfig::Trojan { .. } => "Trojan",
-        ServerProxyConfig::Anytls { .. } => "AnyTLS",
-        ServerProxyConfig::Wireguard(_) => "WireGuard",
-        ServerProxyConfig::Tls { .. } => "TLS",
-        ServerProxyConfig::Websocket { .. } => "WebSocket",
-        ServerProxyConfig::SudokuMask(config) => inbound_type(&config.protocol),
-        ServerProxyConfig::Xhttp(_) => "XHTTP",
+        ResolvedServerProxyConfig::Socks { .. } => "Socks5",
+        ResolvedServerProxyConfig::Http { .. } => "HTTP",
+        ResolvedServerProxyConfig::Vless { .. } => "VLESS",
+        ResolvedServerProxyConfig::Vmess { .. } => "Vmess",
+        ResolvedServerProxyConfig::Shadowsocks { .. } => "Shadowsocks",
+        ResolvedServerProxyConfig::Snell { .. } => "Snell",
+        ResolvedServerProxyConfig::Trojan { .. } => "Trojan",
+        ResolvedServerProxyConfig::Anytls { .. } => "AnyTLS",
+        ResolvedServerProxyConfig::Wireguard(_) => "WireGuard",
+        ResolvedServerProxyConfig::Tls { .. } => "TLS",
+        ResolvedServerProxyConfig::Websocket { .. } => "WebSocket",
+        ResolvedServerProxyConfig::SudokuMask(config) => inbound_type(&config.protocol),
+        ResolvedServerProxyConfig::Xhttp(_) => "XHTTP",
         _ => "Shoes",
     }
 }
@@ -201,7 +201,7 @@ pub fn attach(
     };
     for (index, config) in validated.configs.iter_mut().enumerate() {
         match config {
-            Config::Server(server) => {
+            ResolvedConfig::Server(server) => {
                 let inbound = server
                     .name
                     .clone()
@@ -214,11 +214,10 @@ pub fn attach(
                 );
                 builder.project_protocol(&mut server.protocol, &inbound, "root", &server.rules);
             }
-            Config::TunServer(tun) => {
+            ResolvedConfig::TunServer(tun) => {
                 let inbound = tun.name.clone().unwrap_or_else(|| format!("tun-{index}"));
                 builder.project_rules(&mut tun.rules, &inbound, "root", "Tun");
             }
-            _ => {}
         }
     }
     for endpoint in &mut validated.wireguard_endpoints {
@@ -251,6 +250,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_rule_and_connection_projections_omit_delivery_secrets() {
+        use crate::config::Config;
         use serde_json::json;
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
@@ -278,40 +278,32 @@ mod tests {
             ]}
         ])).unwrap();
         let mut captured = configs.clone();
-        crate::control::catalog::Catalog::capture(&mut captured).unwrap();
+        crate::control::catalog::CatalogDraft::capture(&mut captured).unwrap();
         let serialized = serde_json::to_string(&captured).unwrap();
         assert!(serialized.contains("QUERY_SENTINEL"));
         assert!(serialized.contains("PASSWORD_SENTINEL"));
         assert!(serialized.contains("PRIVATE KEY"));
         let mut validated = crate::config::create_server_configs(configs).unwrap();
-        crate::config::rule_visit::visit(
-            &mut validated.configs,
-            &mut |rule| {
-                let retained = serde_json::to_string(&rule.criteria.expression).unwrap();
-                for secret in [
-                    "QUERY_SENTINEL",
-                    "PASSWORD_SENTINEL",
-                    "PRIVATE KEY",
-                    "download",
-                ] {
-                    assert!(
-                        !retained.contains(secret),
-                        "delivery metadata retained in predicates: {secret}"
-                    );
-                }
-                Ok(())
-            },
-            &mut |_| Ok(()),
-        )
-        .unwrap();
+        for rule in crate::config::resolved_visit::rules(&validated.configs) {
+            let retained = serde_json::to_string(&rule.criteria.expression).unwrap();
+            for secret in [
+                "QUERY_SENTINEL",
+                "PASSWORD_SENTINEL",
+                "PRIVATE KEY",
+                "download",
+            ] {
+                assert!(
+                    !retained.contains(secret),
+                    "delivery metadata retained in predicates: {secret}"
+                );
+            }
+        }
         let registry = Arc::new(FlowRegistry::default());
         let projection = attach(&mut validated, 1, Some(registry.clone())).unwrap();
-        let Config::Server(server) = &validated.configs[0] else {
+        let ResolvedConfig::Server(server) = &validated.configs[0] else {
             panic!()
         };
-        let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-            panic!()
-        };
+        let rule = server.rules.iter().next().unwrap();
         let description = rule.criteria.description.as_ref().unwrap();
         let guard = description.context.as_ref().unwrap().register(
             "tcp",
@@ -373,23 +365,21 @@ mod tests {
         assert_eq!(rules[1]["shoes"]["scope"], "root/sudoku_mask/tls/default");
         assert_eq!(rules[1]["proxy"], "REJECT");
 
-        let Config::Server(server) = &validated.configs[0] else {
+        let ResolvedConfig::Server(server) = &validated.configs[0] else {
             panic!()
         };
         assert_eq!(inbound_type(&server.protocol), "TLS");
-        let ServerProxyConfig::SudokuMask(mask) = &server.protocol else {
+        let ResolvedServerProxyConfig::SudokuMask(mask) = &server.protocol else {
             panic!()
         };
-        let ServerProxyConfig::Tls {
+        let ResolvedServerProxyConfig::Tls {
             default_tls_target: Some(target),
             ..
         } = mask.protocol.as_ref()
         else {
             panic!()
         };
-        let ConfigSelection::Config(rule) = target.override_rules.iter().next().unwrap() else {
-            panic!()
-        };
+        let rule = target.override_rules.iter().next().unwrap();
         let context = rule
             .criteria
             .description
@@ -415,12 +405,10 @@ mod tests {
         let rules = attach(&mut validated, 1, None).unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["proxy"], "DIRECT");
-        let Config::Server(server) = &validated.configs[0] else {
+        let ResolvedConfig::Server(server) = &validated.configs[0] else {
             panic!()
         };
-        let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-            panic!()
-        };
+        let rule = server.rules.iter().next().unwrap();
         assert!(
             rule.criteria
                 .description
@@ -452,10 +440,10 @@ mod tests {
         assert_eq!(rules[1]["shoes"]["inherited"], true);
         assert_eq!(rules[1]["proxy"], "DIRECT");
         assert_eq!(rules[2]["proxy"], "REJECT");
-        let Config::Server(server) = &validated.configs[0] else {
+        let ResolvedConfig::Server(server) = &validated.configs[0] else {
             panic!()
         };
-        let ServerProxyConfig::Websocket { targets } = &server.protocol else {
+        let ResolvedServerProxyConfig::Websocket { targets } = &server.protocol else {
             panic!()
         };
         assert!(targets.iter().next().unwrap().override_rules.is_empty());

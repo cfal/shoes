@@ -7,7 +7,7 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::config::TunConfig;
+use crate::config::ResolvedTunConfig;
 use crate::resolver::Resolver;
 
 use super::spec::Spec;
@@ -50,7 +50,7 @@ impl Ingress {
         Ok(ports)
     }
 
-    pub(crate) fn tcp_admission(config: &TunConfig) -> Option<Arc<Semaphore>> {
+    pub(crate) fn tcp_admission(config: &ResolvedTunConfig) -> Option<Arc<Semaphore>> {
         config
             .resource_limits
             .tcp_connection_limit()
@@ -59,7 +59,7 @@ impl Ingress {
 
     pub(crate) async fn start(
         &self,
-        config: &TunConfig,
+        config: &ResolvedTunConfig,
         resolver: Arc<dyn Resolver>,
         admission: Option<Arc<Semaphore>>,
         tasks: &mut Vec<JoinHandle<io::Result<()>>>,
@@ -79,7 +79,7 @@ impl Ingress {
 
     pub(super) fn start_redirects(
         &self,
-        config: &TunConfig,
+        config: &ResolvedTunConfig,
         resolver: Arc<dyn Resolver>,
         admission: Option<Arc<Semaphore>>,
     ) -> io::Result<Vec<JoinHandle<io::Result<()>>>> {

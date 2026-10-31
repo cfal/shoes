@@ -325,8 +325,11 @@ async fn incompatible_hellos_and_small_targets_forward_unchanged() {
             ))),
             dest_client_chain: ClientProxyChain::new(
                 vec![InitialHopEntry::Direct(Arc::new(
-                    SocketConnectorImpl::from_config(&crate::config::ClientConfig::default(), None)
-                        .unwrap(),
+                    SocketConnectorImpl::from_config(
+                        &crate::config::ResolvedClientConfig::default(),
+                        None,
+                    )
+                    .unwrap(),
                 ))],
                 Vec::new(),
             ),
@@ -467,8 +470,11 @@ async fn authenticated_non_vision_oversized_preread_returns_error_without_panick
         ))),
         dest_client_chain: ClientProxyChain::new(
             vec![InitialHopEntry::Direct(Arc::new(
-                SocketConnectorImpl::from_config(&crate::config::ClientConfig::default(), None)
-                    .unwrap(),
+                SocketConnectorImpl::from_config(
+                    &crate::config::ResolvedClientConfig::default(),
+                    None,
+                )
+                .unwrap(),
             ))],
             Vec::new(),
         ),
@@ -551,8 +557,11 @@ async fn authenticated_vless_handoff_flushes_buffered_response() {
         )),
         dest_client_chain: ClientProxyChain::new(
             vec![InitialHopEntry::Direct(Arc::new(
-                SocketConnectorImpl::from_config(&crate::config::ClientConfig::default(), None)
-                    .unwrap(),
+                SocketConnectorImpl::from_config(
+                    &crate::config::ResolvedClientConfig::default(),
+                    None,
+                )
+                .unwrap(),
             ))],
             Vec::new(),
         ),

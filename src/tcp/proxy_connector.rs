@@ -6,7 +6,7 @@
 //!
 //! ## Design
 //!
-//! Every `ClientConfig` with a non-direct protocol implicitly defines a `ProxyConnector`
+//! Every `ResolvedClientConfig` with a non-direct protocol implicitly defines a `ProxyConnector`
 //! through its `protocol` and `address` fields.
 //!
 //! When a config is used:

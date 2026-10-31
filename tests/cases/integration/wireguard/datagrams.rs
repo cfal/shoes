@@ -17,7 +17,7 @@ async fn udp_boundaries_asymmetric_mtu_and_oversized_responses_preserve_the_flow
                 for (server_mtu, client_mtu) in [(1280, 1420), (1420, 1280)] {
                     let pair = Pair::start(detour, |server, client| {
                         server["protocol"]["mtu"] = json!(server_mtu);
-                        client["client_proxies"][0]["protocol"]["mtu"] = json!(client_mtu);
+                        client["client_chains"][0]["protocol"]["mtu"] = json!(client_mtu);
                     }).await?;
                     let echo = start_udp_response_server(if ipv6 { "::" } else { "0.0.0.0" }, 0, |data, _| {
                         if data == b"oversized response" { vec![0xab; 1500] } else { data.to_vec() }

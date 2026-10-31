@@ -12,7 +12,7 @@ use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use super::tcp_server_handler_factory::create_tcp_server_handler;
 
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
-use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
+use crate::config::{BindLocation, ResolvedConfig, ResolvedServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::quic_server::start_quic_servers;
@@ -431,7 +431,7 @@ pub async fn run_udp_copy(
 
 #[cfg(any(test, target_os = "android", target_os = "ios", feature = "ffi"))]
 pub async fn start_servers(
-    config: Config,
+    config: ResolvedConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     start_servers_with_listeners(config, resolver, &mut TcpListeners::default()).await
@@ -448,7 +448,7 @@ pub(crate) struct TcpListeners {
 
 impl TcpListeners {
     pub(crate) fn prepare(
-        configs: &[Config],
+        configs: &[ResolvedConfig],
         previous: &Self,
         retiring_http: &[SocketAddr],
     ) -> std::io::Result<Self> {
@@ -456,7 +456,7 @@ impl TcpListeners {
         next.defer_admission();
         let mut seen = std::collections::HashSet::new();
         for config in configs {
-            let Config::Server(server) = config else {
+            let ResolvedConfig::Server(server) = config else {
                 continue;
             };
             if server.transport != Transport::Tcp {
@@ -546,13 +546,13 @@ impl TcpListeners {
 }
 
 pub(crate) async fn start_servers_with_listeners(
-    config: Config,
+    config: ResolvedConfig,
     resolver: Arc<dyn Resolver>,
     listeners: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
         #[cfg(unix)]
-        Config::TunServer(tun_config) => {
+        ResolvedConfig::TunServer(tun_config) => {
             let task = tokio_util::task::AbortOnDropHandle::new(
                 start_tun_server(tun_config, resolver).await?,
             );
@@ -566,22 +566,18 @@ pub(crate) async fn start_servers_with_listeners(
             })])
         }
         #[cfg(not(unix))]
-        Config::TunServer(_) => Err(std::io::Error::new(
+        ResolvedConfig::TunServer(_) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
         )),
-        Config::Server(server_config) => {
+        ResolvedConfig::Server(server_config) => {
             start_tcp_or_quic_servers(server_config, resolver, listeners).await
         }
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Expected a server configuration",
-        )),
     }
 }
 
 async fn start_tcp_or_quic_servers(
-    config: ServerConfig,
+    config: ResolvedServerConfig,
     resolver: Arc<dyn Resolver>,
     listeners: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
@@ -608,11 +604,11 @@ async fn start_tcp_or_quic_servers(
 }
 
 async fn start_tcp_servers(
-    config: ServerConfig,
+    config: ResolvedServerConfig,
     resolver: Arc<dyn Resolver>,
     sockets: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let ServerConfig {
+    let ResolvedServerConfig {
         bind_location,
         tcp_settings,
         protocol,
@@ -623,7 +619,7 @@ async fn start_tcp_servers(
 
     println!("Starting {} TCP server at {}", protocol, bind_location);
 
-    let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
+    let rules = rules.into_vec();
     // We should always have a direct entry.
     assert!(!rules.is_empty());
 

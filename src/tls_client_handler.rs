@@ -344,7 +344,7 @@ mod tests {
                                 serde_yaml::from_str(&yaml).unwrap();
                             let resolver = Arc::new(crate::resolver::NativeResolver::new());
                             if xhttp {
-                                let config = serde_json::from_value(serde_json::json!({
+                                let config = crate::config::test_support::from_json(serde_json::json!({
                                     "address": hop.to_string(),
                                     "protocol": {"type": "xhttp", "protocol": protocol}
                                 }))
@@ -354,7 +354,11 @@ mod tests {
                                     .unwrap()
                                     .1
                             } else {
-                                create_tcp_client_handler(protocol, &hop, resolver).unwrap()
+                                create_tcp_client_handler(
+                                    crate::config::test_support::from_yaml(&yaml).unwrap(),
+                                    &hop,
+                                    resolver,
+                                ).unwrap()
                             }
                         });
                         let (io, peer) = tokio::io::duplex(65536);

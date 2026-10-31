@@ -93,7 +93,11 @@ async fn roundtrips(ipv6: bool, framed: bool) {
         .packet_information(framed);
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let selector = Arc::new(
-        create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone()).unwrap(),
+        create_test_selector(
+            vec![crate::config::ResolvedRuleConfig::default()],
+            resolver.clone(),
+        )
+        .unwrap(),
     );
     let (shutdown, shutdown_rx) = oneshot::channel();
     let mut tasks = JoinSet::new();
@@ -228,7 +232,11 @@ async fn raw_fd_fake_dns_and_restored_application_udp_preserve_sources() {
     let context = Arc::new(DnsContext::new(Default::default(), real.clone()).unwrap());
     let resolver: Arc<dyn Resolver> = Arc::new(FakeDnsResolver::new(real, context));
     let selector = Arc::new(
-        create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone()).unwrap(),
+        create_test_selector(
+            vec![crate::config::ResolvedRuleConfig::default()],
+            resolver.clone(),
+        )
+        .unwrap(),
     );
     let (shutdown, shutdown_rx) = oneshot::channel();
     let mut tasks = JoinSet::new();

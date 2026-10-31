@@ -11,7 +11,7 @@ mod lifecycle;
 mod listeners;
 mod transports;
 
-fn compiled_server(value: Value) -> crate::config::ServerConfig {
+fn compiled_server(value: Value) -> crate::config::ResolvedServerConfig {
     let mut configs = [crate::config::Config::Server(
         serde_json::from_value(value).unwrap(),
     )];
@@ -20,7 +20,7 @@ fn compiled_server(value: Value) -> crate::config::ServerConfig {
     let [crate::config::Config::Server(server)] = configs else {
         unreachable!()
     };
-    server
+    crate::config::test_support::Inline::inline(server)
 }
 
 pub(super) fn fixtures() -> Value {

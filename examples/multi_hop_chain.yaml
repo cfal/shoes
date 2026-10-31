@@ -1,30 +1,33 @@
 # Multi-hop proxy chain examples
 #
 # Round-robin behavior happens at multiple levels:
-# 1. Between chains: when using client_chains (plural), each connection picks the next chain
+# 1. Between explicit chain alternatives: each connection picks the next chain
 # 2. Between servers in a group: when a hop references a group with multiple proxies
 # 3. Between servers in a pool: when using pool: [...] syntax
 #
 # Traffic always flows: client -> hop1 -> hop2 -> ... -> target
+# client_chain and client_chains are aliases; a bare [a, b] is sequential under either spelling.
 
 # Define reusable proxy groups (each group round-robins between its members)
 - client_group: us-proxies
-  client_proxies:
-    - address: "us1.example.com:1080"
-      protocol:
-        type: socks
-    - address: "us2.example.com:1080"
-      protocol:
-        type: socks
+  client_chains:
+    - chain:
+        - address: "us1.example.com:1080"
+          protocol:
+            type: socks
+    - chain:
+        - address: "us2.example.com:1080"
+          protocol:
+            type: socks
 
 - client_group: eu-proxies
-  client_proxies:
+  client_chains:
     - address: "eu1.example.com:1080"
       protocol:
         type: socks
 
 - client_group: exit-proxy
-  client_proxies:
+  client_chains:
     - address: "exit.example.com:443"
       protocol:
         type: tls
@@ -113,13 +116,14 @@
         - chain:
             - us-proxies
             - exit-proxy
-        # Chain 2: Single hop (no chain: needed for one hop)
-        - eu-proxies
+        # Chain 2: Single hop
+        - chain: [eu-proxies]
 
 #
-# Example 5: Pool at a hop - combine multiple sources
-# A pool merges proxies from groups and inline configs into one round-robin set.
-# First hop round-robins between: us1, us2, backup
+# Example 5: Pool at a hop - alternate between groups and inline proxies
+# Each listed alternative gets one round-robin turn; groups retain their policy.
+# First hop sends half the connections through us-proxies and half through backup.
+# Within us-proxies, us1 and us2 each receive a quarter of the total connections.
 # Second hop is always exit-proxy.
 #
 - address: "127.0.0.1:1084"
@@ -129,9 +133,9 @@
     - masks: "0.0.0.0/0"
       action: allow
       client_chain:
-        # First hop: pool combines us-proxies group + inline backup
+        # First hop: alternate between us-proxies and inline backup
         - pool:
-            - us-proxies  # Expands to us1, us2
+            - us-proxies  # Round-robins between us1 and us2 on its turns
             - address: "backup.example.com:1080"
               protocol:
                 type: socks

@@ -3,6 +3,7 @@ use std::{
     io,
 };
 
+pub use crate::config::resolved::{ResolvedXhttpClientConfig, ResolvedXhttpServerConfig};
 use serde::{Deserialize, Serialize};
 
 use super::{ClientProxyConfig, GlobalLimits, ServerProxyConfig};
@@ -287,7 +288,7 @@ impl Default for XhttpPool {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct XhttpClientConfig {
+pub struct XhttpClientRecord<P> {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
@@ -314,8 +315,10 @@ pub struct XhttpClientConfig {
     pub limits: XhttpLimits,
     #[serde(default)]
     pub pool: XhttpPool,
-    pub protocol: Box<ClientProxyConfig>,
+    pub protocol: Box<P>,
 }
+
+pub type XhttpClientConfig = XhttpClientRecord<ClientProxyConfig>;
 
 fn default_download_idle_timeout_secs() -> u64 {
     15 * 60
@@ -325,8 +328,8 @@ fn default_packet_pipeline_depth() -> usize {
     30
 }
 
-impl XhttpClientConfig {
-    pub fn validate(&self) -> io::Result<()> {
+impl<P> XhttpClientRecord<P> {
+    fn validate_settings(&self, inner_direct: bool) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
         self.limits.validate()?;
         if self.download_idle_timeout_secs == 0 {
@@ -352,7 +355,7 @@ impl XhttpClientConfig {
                 "XHTTP packet size and pool limits must be positive",
             ));
         }
-        if self.protocol.is_direct() {
+        if inner_direct {
             return Err(invalid("direct cannot be an XHTTP inner protocol"));
         }
         validate_header_names("headers", self.headers.keys())?;
@@ -363,7 +366,7 @@ impl XhttpClientConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct XhttpServerConfig {
+pub struct XhttpServerRecord<P> {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
@@ -388,18 +391,20 @@ pub struct XhttpServerConfig {
     pub no_sse_header: bool,
     #[serde(default)]
     pub limits: XhttpLimits,
-    pub protocol: Box<ServerProxyConfig>,
+    pub protocol: Box<P>,
 }
 
-impl XhttpServerConfig {
-    pub fn validate(&self) -> io::Result<()> {
+pub type XhttpServerConfig = XhttpServerRecord<ServerProxyConfig>;
+
+impl<P> XhttpServerRecord<P> {
+    fn validate_settings(&self, nested_xhttp: bool) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
         validate_header_names("matching_headers", self.matching_headers.keys())?;
         validate_header_values(
             "matching_headers",
             self.matching_headers.values().flat_map(OneOrSome::iter),
         )?;
-        if contains_server(&self.protocol) {
+        if nested_xhttp {
             return Err(invalid("nested XHTTP is not supported"));
         }
         self.limits.validate()?;
@@ -482,6 +487,62 @@ impl XhttpServerConfig {
         } else {
             self.sc_max_buffered_posts
         }
+    }
+}
+
+impl XhttpClientConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        self.validate_settings(self.protocol.is_direct())
+    }
+}
+impl ResolvedXhttpClientConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        self.validate_settings(self.protocol.is_direct())
+    }
+}
+impl XhttpServerConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        self.validate_settings(contains_server(&self.protocol))
+    }
+}
+impl ResolvedXhttpServerConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        self.validate_settings(contains_resolved_server(&self.protocol))
+    }
+}
+
+pub(crate) fn contains_resolved_server(
+    protocol: &crate::config::ResolvedServerProxyConfig,
+) -> bool {
+    match protocol {
+        crate::config::ResolvedServerProxyConfig::SudokuMask(config) => {
+            contains_resolved_server(&config.protocol)
+        }
+        crate::config::ResolvedServerProxyConfig::Xhttp(_) => true,
+        crate::config::ResolvedServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            ..
+        } => {
+            tls_targets
+                .values()
+                .any(|t| contains_resolved_server(&t.protocol))
+                || default_tls_target
+                    .as_ref()
+                    .is_some_and(|t| contains_resolved_server(&t.protocol))
+                || shadowtls_targets
+                    .values()
+                    .any(|t| contains_resolved_server(&t.protocol))
+                || reality_targets
+                    .values()
+                    .any(|t| contains_resolved_server(&t.protocol))
+        }
+        crate::config::ResolvedServerProxyConfig::Websocket { targets } => targets
+            .iter()
+            .any(|t| contains_resolved_server(&t.protocol)),
+        _ => false,
     }
 }
 

@@ -14,20 +14,22 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
 - client_group: inner
   type: url-test
   url: http://inner.invalid/
-  client_proxies:
-    - name: http
-      address: 127.0.0.1:8000
-      protocol: {{type: http}}
-    - name: udp
-      address: 127.0.0.1:8001
-      protocol: {{type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}}
+  client_chains:
+    - chain:
+        - name: http
+          address: 127.0.0.1:8000
+          protocol: {{type: http}}
+    - chain:
+        - name: udp
+          address: 127.0.0.1:8001
+          protocol: {{type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}}
 - client_group: manual
   type: selector
-  client_proxies: [inner, direct]
+  client_chains: [{{chain: [inner]}}, {{chain: [direct]}}]
 - client_group: outer
   type: url-test
   url: http://outer.invalid/
-  client_proxies: [manual, direct]
+  client_chains: [{{chain: [manual]}}, {{chain: [direct]}}]
 - address: 127.0.0.1:1080
   protocol: {{type: socks}}
   rules: [{{mask: 0.0.0.0/0, action: allow, client_chain: {route}}}]
@@ -37,13 +39,12 @@ fn url_test_nested_groups_and_each_chain_hop_preserve_udp_eligibility() {
             crate::config::create_server_configs(serde_yaml::from_str(&yaml).unwrap()).unwrap();
         assert!(validated.control.listeners.is_empty());
         let catalog = validated.catalog.take().unwrap();
-        let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+        let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
             panic!()
         };
-        let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-            panic!()
-        };
-        let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+        let rule = server.rules.into_vec().remove(0);
+        let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action
+        else {
             panic!()
         };
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
@@ -84,13 +85,13 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
             };
             json!({
                 "client_group": format!("deep-{index}"),
-                "client_proxies": [member]
+                "client_chains": [member]
             })
         })
         .collect();
     configs.push(json!({
         "client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
-        "client_proxies":["deep-0", {"name":"other", "protocol":{"type":"direct"}}]
+        "client_chains":[{"chain": ["deep-0"]}, {"chain": [{"name":"other", "protocol":{"type":"direct"}}]}]
     }));
     configs.push(json!({
         "address":"127.0.0.1:1080", "protocol":{"type":"socks"},
@@ -100,13 +101,11 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
         crate::config::create_server_configs(serde_json::from_value(json!(configs)).unwrap())
             .unwrap();
     let catalog = validated.catalog.take().unwrap();
-    let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
     };
-    let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-        panic!()
-    };
-    let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+    let rule = server.rules.into_vec().remove(0);
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action else {
         panic!()
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
@@ -144,21 +143,23 @@ fn unselected_large_pools_keep_constant_time_round_robin() {
 }
 
 #[test]
-fn selectors_filter_all_hops_without_changing_flattened_weights() {
+fn selectors_preserve_declared_branch_weights_and_duplicate_tickets() {
     let yaml = "
 - client_group: leaves
-  client_proxies:
-    - name: http
-      address: 127.0.0.1:8000
-      protocol: {type: http}
-    - name: udp
-      address: 127.0.0.1:8001
-      protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
+  client_chains:
+    - chain:
+        - name: http
+          address: 127.0.0.1:8000
+          protocol: {type: http}
+    - chain:
+        - name: udp
+          address: 127.0.0.1:8001
+          protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
 - client_group: weighted
-  client_proxies: [leaves, leaves, direct]
+  client_chains: [{chain: [leaves]}, {chain: [leaves]}, {chain: [direct]}]
 - client_group: choose
   type: selector
-  client_proxies: [weighted, direct]
+  client_chains: [{chain: [weighted]}, {chain: [direct]}]
 - address: 127.0.0.1:1080
   protocol: {type: socks}
   rules: [{mask: 0.0.0.0/0, action: allow, client_chain: choose}]
@@ -166,21 +167,19 @@ fn selectors_filter_all_hops_without_changing_flattened_weights() {
     let mut validated =
         crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
     let catalog = validated.catalog.take().unwrap();
-    let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
     };
-    let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-        panic!()
-    };
-    let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+    let rule = server.rules.into_vec().remove(0);
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action else {
         panic!()
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let group =
         crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver).unwrap();
     let chain = &group.chains[0];
-    for index in 0..10 {
-        assert_eq!(chain.select_indices(false).unwrap(), [index % 5]);
+    for index in [0, 2, 4, 1, 3, 4, 0, 2, 4, 1, 3, 4] {
+        assert_eq!(chain.select_indices(false).unwrap(), [index]);
     }
     for index in [1, 3, 4, 1, 3, 4] {
         assert_eq!(chain.select_indices(true).unwrap(), [index]);
@@ -198,13 +197,15 @@ fn udp_selection_rejects_ineligible_member_without_falling_back() {
 - client_group: leaves
   type: selector
   default: http
-  client_proxies:
-    - name: http
-      address: 127.0.0.1:8000
-      protocol: {type: http}
-    - name: udp
-      address: 127.0.0.1:8001
-      protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
+  client_chains:
+    - chain:
+        - name: http
+          address: 127.0.0.1:8000
+          protocol: {type: http}
+    - chain:
+        - name: udp
+          address: 127.0.0.1:8001
+          protocol: {type: vless, user_id: 550e8400-e29b-41d4-a716-446655440000}
 - address: 127.0.0.1:1080
   protocol: {type: socks}
   rules: [{mask: 0.0.0.0/0, action: allow, client_chain: leaves}]
@@ -212,13 +213,11 @@ fn udp_selection_rejects_ineligible_member_without_falling_back() {
     let mut validated =
         crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
     let catalog = validated.catalog.take().unwrap();
-    let crate::config::Config::Server(server) = validated.configs.remove(0) else {
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
     };
-    let crate::config::ConfigSelection::Config(rule) = server.rules.into_vec().remove(0) else {
-        panic!()
-    };
-    let crate::config::RuleActionConfig::Allow { client_chains, .. } = rule.action else {
+    let rule = server.rules.into_vec().remove(0);
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } = rule.action else {
         panic!()
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());

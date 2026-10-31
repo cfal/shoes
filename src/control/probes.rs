@@ -15,10 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::address::NetLocation;
 use crate::client_proxy_chain::ClientChainGroup;
-use crate::config::{ClientChainHop, ClientConfig, ConfigSelection};
-use crate::control::catalog::{Catalog, CatalogNode, MemberOrigin};
+use crate::control::catalog::Catalog;
 use crate::control::runtime::{ControlRuntime, Generation};
-use crate::option_util::OneOrSome;
 use crate::resolver::Resolver;
 
 pub(crate) const PROBE_CONCURRENCY: usize = 16;
@@ -37,6 +35,7 @@ struct UrlHistory {
 
 #[derive(Default)]
 struct FullBudgetAttempts {
+    // API batches retain request-wide deadlines and prioritize full-budget attempts.
     configured: IndexMap<String, tokio::time::Instant>,
     unfiltered: IndexMap<String, tokio::time::Instant>,
     filtered: IndexMap<String, tokio::time::Instant>,
@@ -172,12 +171,9 @@ impl ProbeState {
         if let Some(connector) = self.connectors.lock().get(name) {
             return Ok(connector.clone());
         }
-        let mut clients = Vec::new();
-        expand(catalog, name, &mut Vec::new(), &mut clients)?;
+        let route = catalog.route(name)?;
         let chain = crate::tcp::chain_builder::try_build_client_proxy_chain(
-            OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(
-                clients.into_iter().map(ConfigSelection::Config).collect(),
-            ))),
+            route.hops,
             self.resolver.clone(),
         )?;
         let connector = Arc::new(ClientChainGroup::new(vec![chain]));
@@ -188,51 +184,6 @@ impl ProbeState {
             .or_insert(connector)
             .clone())
     }
-}
-
-fn expand(
-    catalog: &Catalog,
-    name: &str,
-    path: &mut Vec<(String, String)>,
-    clients: &mut Vec<ClientConfig>,
-) -> io::Result<()> {
-    if clients.len() >= 16_384 || path.len() >= 128 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "probe subject expansion exceeds limit",
-        ));
-    }
-    match catalog.nodes.get(name) {
-        Some(CatalogNode::Leaf(config)) => {
-            let mut config = (**config).clone();
-            config.control = Some(MemberOrigin {
-                name: Arc::from(name),
-                path: path.clone(),
-                selection: catalog.selection.clone(),
-            });
-            clients.push(config);
-        }
-        Some(CatalogNode::Group { members, .. }) => {
-            for member in members {
-                path.push((name.into(), member.clone()));
-                expand(catalog, member, path, clients)?;
-                path.pop();
-            }
-        }
-        Some(CatalogNode::Reject) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "REJECT cannot carry a probe",
-            ));
-        }
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "proxy does not exist",
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub struct ProbeQuery {
@@ -331,6 +282,7 @@ pub async fn probe(
         tokio::time::Instant::now() + query.timeout,
         false,
         &epoch,
+        None,
     )
     .await
 }
@@ -382,6 +334,7 @@ pub async fn probe_group(
                     deadline,
                     waited || ordinal >= PROBE_CONCURRENCY,
                     epoch,
+                    None,
                 )
                 .await;
                 (name, Some(result))
@@ -443,6 +396,7 @@ fn with_probe_epoch<T>(
     })?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn probe_until(
     runtime: &ControlRuntime,
     generation: &Generation,
@@ -451,9 +405,10 @@ async fn probe_until(
     deadline: tokio::time::Instant,
     queued: bool,
     epoch: &CancellationToken,
+    group: Option<&super::url_test::AutomaticGroup>,
 ) -> io::Result<u16> {
     with_probe_epoch(runtime, generation, epoch, || {
-        if !queued {
+        if group.is_none() && !queued {
             generation.probes.record_full_budget_attempt(
                 name,
                 query,
@@ -463,6 +418,16 @@ async fn probe_until(
     })?;
     let probe_request =
         crate::control::url_test::BACKGROUND.scope((), request(generation, name, query));
+    let tickets = group.map_or_else(
+        || {
+            generation
+                .catalog
+                .selection
+                .automatic
+                .tickets(name, query.url.as_str())
+        },
+        |group| vec![(group, group.revision())],
+    );
     let result = tokio::select! {
         biased;
         _ = runtime.shutdown.cancelled() => {
@@ -491,11 +456,9 @@ async fn probe_until(
             .probes
             .record(name, query.url.as_str(), delay, satisfied);
         if query.expected.is_empty() {
-            generation.catalog.selection.automatic.record(
-                name,
-                query.url.as_str(),
-                (satisfied && delay != 0).then_some(delay),
-            );
+            for (group, revision) in tickets {
+                group.record_if_current(name, revision, (satisfied && delay != 0).then_some(delay));
+            }
         }
     })?;
     result.map(|(delay, _)| delay)
@@ -507,7 +470,10 @@ pub(crate) fn local_failure(error: &io::Error) -> bool {
     }
     let mut error: &(dyn std::error::Error + 'static) = error;
     loop {
-        if error.is::<ProbePolicyDenied>() || error.is::<crate::dns::SyntheticDnsAnswer>() {
+        if error.is::<ProbePolicyDenied>()
+            || error.is::<crate::dns::SyntheticDnsAnswer>()
+            || error.is::<super::catalog::RouteCapacity>()
+        {
             return true;
         }
         let source = if let Some(error) = error.downcast_ref::<io::Error>() {
@@ -601,26 +567,23 @@ pub(crate) async fn run_automatic(
             return;
         }
         let now = tokio::time::Instant::now();
-        let mut due: Vec<_> = groups
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !checking[*index])
-            .filter_map(|(index, group)| group.due_members(now).map(|members| (index, members)))
-            .collect();
-        // A busy, short-interval group must not reset a waiting group's priority.
-        due.sort_by_key(|(index, _)| groups[*index].last_unqueued_admission());
-        for (index, members) in due {
-            let group = groups[index];
+        for (index, group) in groups.iter().enumerate() {
+            if checking[index] {
+                continue;
+            }
+            let Some(members) = group.due_members(now) else {
+                continue;
+            };
             checking[index] = true;
+            let runtime = runtime.clone();
+            let generation = &generation;
+            let epoch = &epoch;
             let round = AutomaticRound {
                 group,
                 completed: false,
             };
-            let runtime = runtime.clone();
-            let generation = &generation;
-            let epoch = &epoch;
             rounds.push(async move {
-                run_automatic_round(round, &runtime, generation, members, now, epoch).await;
+                run_automatic_round(round, &runtime, generation, members, epoch).await;
                 index
             });
         }
@@ -644,8 +607,7 @@ async fn run_automatic_round(
     mut round: AutomaticRound<'_>,
     runtime: &ControlRuntime,
     generation: &Generation,
-    mut members: Vec<usize>,
-    started: tokio::time::Instant,
+    members: std::ops::Range<usize>,
     epoch: &CancellationToken,
 ) {
     let group = round.group;
@@ -654,35 +616,28 @@ async fn run_automatic_round(
         timeout: Duration::from_millis(group.config.timeout),
         expected: Vec::new(),
     };
-    let deadline = started + query.timeout;
-    // Local failures do not change health, but must not monopolize full-budget slots.
-    generation
-        .probes
-        .order_members(&mut members, &group.members, &query);
-    let mut probes = futures::stream::iter(members.into_iter().enumerate())
-        .map(|(ordinal, index)| {
+    let mut probes = futures::stream::iter(members)
+        .map(|index| {
             let query = &query;
             async move {
-                let Ok((_permit, waited)) = acquire_probe(runtime, deadline).await else {
+                let permit = tokio::select! {
+                    biased;
+                    _ = runtime.shutdown.cancelled() => return,
+                    _ = epoch.cancelled() => return,
+                    permit = runtime.probes.acquire() => permit,
+                };
+                let Ok(_permit) = permit else {
                     return;
                 };
-                if tokio::time::Instant::now() >= deadline {
-                    return;
-                }
-                let queued = waited || ordinal >= PROBE_CONCURRENCY;
-                if with_probe_epoch(runtime, generation, epoch, || group.admitted(index, queued))
-                    .is_err()
-                {
-                    return;
-                }
                 let _ = probe_until(
                     runtime,
                     generation,
                     &group.members[index],
                     query,
-                    deadline,
-                    queued,
+                    tokio::time::Instant::now() + query.timeout,
+                    false,
                     epoch,
+                    Some(group),
                 )
                 .await;
             }
@@ -692,7 +647,7 @@ async fn run_automatic_round(
     round.completed = with_probe_epoch(runtime, generation, epoch, || ()).is_ok();
 }
 
-async fn request(
+pub(crate) async fn request(
     generation: &Generation,
     name: &str,
     query: &ProbeQuery,

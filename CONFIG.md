@@ -73,7 +73,7 @@ A client has one remote peer. Its ordinary `address` identifies that peer;
 
 ```yaml
 - client_group: vpn
-  client_proxies:
+  client_chains:
     - address: "vpn.example:51820"
       protocol:
         type: wireguard
@@ -304,7 +304,7 @@ A configuration file is a YAML array containing one or more configuration entrie
 
 # Client config groups have 'client_group'
 - client_group: my-upstream
-  client_proxy: ...
+  client_chains: ...
 
 # Rule config groups have 'rule_group'
 - rule_group: my-rules
@@ -358,13 +358,15 @@ Opt into manual selection explicitly:
 - client_group: outbound
   type: selector
   default: east
-  client_proxies:
-    - name: east
-      address: "east.example.com:1080"
-      protocol: {type: socks}
-    - name: west
-      address: "west.example.com:1080"
-      protocol: {type: socks}
+  client_chains:
+    - chain:
+        - name: east
+          address: "east.example.com:1080"
+          protocol: {type: socks}
+    - chain:
+        - name: west
+          address: "west.example.com:1080"
+          protocol: {type: socks}
 ```
 
 Rules continue to use `client_chain: outbound`. A selector chooses an immediate
@@ -388,13 +390,15 @@ Automatic selection does not require a controller listener or a cache file:
   timeout: 5000       # milliseconds, 1..60000, no longer than interval
   tolerance: 50       # milliseconds, 0..65535
   lazy: true
-  client_proxies:
-    - name: east
-      address: "east.example.com:1080"
-      protocol: {type: socks}
-    - name: west
-      address: "west.example.com:1080"
-      protocol: {type: socks}
+  client_chains:
+    - chain:
+        - name: east
+          address: "east.example.com:1080"
+          protocol: {type: socks}
+    - chain:
+        - name: west
+          address: "west.example.com:1080"
+          protocol: {type: socks}
 ```
 
 Only `url` is required for `url-test`; the values above are the other defaults.
@@ -415,8 +419,11 @@ still restrict eligibility, and intermediate chain hops only need TCP support.
 Changing selection affects new connections, not established streams or associations.
 
 There is one initial check after activation, including for lazy groups. Thereafter
-`lazy: true` checks only groups used by new forwarding connections during the last
-interval. Probes, dashboard reads, and WireGuard carrier maintenance never count as use.
+`lazy: true` normally checks only groups used by new forwarding connections during
+the last interval. Every effective manual selector change also makes all URL-test
+groups due for a check, including idle lazy groups unrelated to that selector.
+An active round finishes before the new check starts.
+Probes, dashboard reads, and WireGuard carrier maintenance never count as use.
 New outbound connections through a WireGuard endpoint wake its carrier groups,
 including nested carriers, without changing their existing associations. Inbound-only
 endpoints and long-lived flows need `lazy: false` for continuous checks. `lazy: false` checks idle
@@ -434,36 +441,53 @@ for example, XHTTP upload cancellation can lose the original cause and count as 
 remote failure.
 User payloads are never retried across candidates. Probes use HTTP HEAD and accept
 any HTTP response status, without redirects; HTTPS certificates are verified.
-Local probe lookups use guarded system DNS, not a server's configured DNS group.
-API probes with the same normalized URL and wildcard/default expected status also
-update selection. Other URLs and explicit status expectations cannot overwrite it.
+Checks use the generation's guarded system probe resolver and each member's
+declared chain, not a caller's surrounding route or DNS bootstrap.
+Background results update only the group performing the check. API probes with
+the same normalized URL and wildcard/default expected status also update matching
+groups. Other URLs and explicit status expectations cannot overwrite selection
+samples. Nested automatic groups use their shared group state.
 
-Periodic and API probes share a 16-probe limit. Each periodic round's timeout
-includes admission/queue time; members not admitted before the deadline retain
-their previous health. A deadline expiry after queueing is inconclusive and also
-preserves prior health; successful probes and explicit remote errors still update it.
-Members with no full-budget attempt, then the oldest full-budget attempts, lead each
-round, independently of health. Local failures cannot monopolize these slots, and
-queued attempts can receive a full budget on a later round. Tied members rotate on admission.
-Due groups with the oldest unqueued admission get priority, with stable catalog order
-breaking ties.
-Under sustained saturation, reduce group size, increase
-timeout/interval, or expect unprobed/stale members. Scheduling has one-second
+Periodic and API probes share a 16-probe limit. Each automatic member check gets
+its full timeout after admission; waiting for capacity does not consume that
+timeout or change health. An admitted check that times out records a failure.
+Due groups start in catalog order, and each round checks members in configuration
+order. Rounds have no overall deadline and can exceed the configured interval
+under load. Under sustained saturation, reduce group size or adjust
+timeouts/intervals, or expect unprobed/stale members. Scheduling has one-second
 granularity and does not overlap rounds within a group; other groups can run while
 a slow round is in flight. Activation/reload cancels old work and rejects obsolete
 results; an interrupted round is immediately eligible when its generation resumes.
 New committed generations start with unprobed health.
 
-The controller reports `type: URLTest`, effective TCP `now`, optional `udpNow`,
+Manual API group probes retain a request-wide deadline, including queue time.
+Expiry after queued admission is inconclusive and preserves prior health.
+API batches prioritize members with no full-budget API attempt, then the oldest
+such attempts; automatic rounds do not track or use these priorities.
+Long automatic rounds can keep capacity busy across multiple member timeouts,
+causing single-node API probes to report busy or API group probes to time out.
+
+The controller reports `type: URLTest`, group TCP `now`, optional `udpNow`,
 `testUrl`, and selected-member `health` (`unprobed`, `healthy`, `dead`, or `stale`).
 Its `alive` is true only for fresh healthy results. Manual selection PUTs for
 automatic groups are rejected; automatic choices are neither pinned nor persisted.
 Leaf histories remain bounded to ten samples per URL and eight URLs. Automatic
-selection retains its configured-URL samples and full-budget attempt timestamps
-independently of API eviction; other attempt URLs are capped at eight per member
-for each of filtered and unfiltered probes.
-Automatic checks test each immediate member as a standalone outbound, not every
-surrounding chain or destination. URL-test groups are not supported by FFI.
+selection retains its configured-URL samples independently of API eviction.
+API full-budget attempt timestamps for configured URLs also survive eviction;
+other attempt URLs are capped at eight per member for each of filtered and
+unfiltered probes.
+All occurrences of a URL-test group share its samples and TCP/UDP incumbents.
+There are no route contexts, per-occurrence probe rounds, or contextual samplers.
+Forwarding and dashboard selection consult the same group state, subject to each
+caller's transport eligibility. Any effective manual selector change clears all
+URL-test samples and incumbents and fences in-flight results, even for unrelated
+groups. Selecting the same effective choice preserves samples. Groups become due
+again, after any active round finishes; no selector dependency graph is maintained.
+Surrounding route choices do not create additional health identities. Complete
+chains declared as members are probed end to end. External caller prefixes and
+suffixes are not tested. URL-test groups are not supported by FFI.
+Probe connectors have separate round-robin counters, so probes never advance
+forwarding counters.
 
 Only one `cache_file_path` is allowed across all input files. Its absence disables
 persistence; relative paths resolve against the process working directory.
@@ -827,7 +851,7 @@ protocol:
         client_fingerprints: [string]
         # OR Remote handshake (proxy to real server):
         address: string        # e.g., "google.com:443"
-        client_proxies: [ClientConfig] # Optional proxies for handshake
+        client_chain: ClientChain? # Optional proxy chain for handshake
       protocol: ServerProxyConfig
       override_rules: [RuleConfig]
 
@@ -1591,6 +1615,12 @@ HTTP/2 PING watchdog. Peer stream limits and timeouts still apply. In particular
 Caddy v2.11.7 defaults to a one-minute request-body idle timeout, which can end a
 quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
 
+Session reuse is scoped to the selected proxy prefix. Each NaiveProxy handler
+retains one reusable session; changing the prefix replaces it without closing
+active tunnels. Alternating prefixes therefore opens new sessions, while warm
+connections through the same prefix share a session. Concurrent cold connections
+may establish separate sessions.
+
 ## Native DNS Freshness
 
 Omitting a listener's `dns` or leaving `dns.servers` empty uses native OS/NSS
@@ -1846,6 +1876,17 @@ rules:
 
 Client chains define how traffic is routed through upstream proxies. Each chain is a sequence of "hops" - proxies that traffic passes through in order.
 
+In rules, client groups, and DNS server options, `client_chain` and `client_chains`
+are exact aliases. The value, not the field's plurality, determines the structure:
+`[a, b]` and `{chain: [a, b]}` both mean sequential hops. For alternative paths,
+use `[{chain: [a]}, {chain: [b]}]`. Nested lists (`[[a], [b]]`) also specify
+alternative chains; explicit wrappers are recommended for clarity.
+
+DNS previously treated a bare list as alternatives. It now interprets `[a, b]`
+as a sequence, matching routing, without a compatibility mode or warning.
+DNS alternatives require explicit chain wrappers (or a named group).
+System DNS still rejects client chains; UDP/H3 DNS still requires direct-only paths.
+
 ```yaml
 # Single proxy (simplest form)
 client_chain: my-proxy-group           # Reference a named group
@@ -1862,7 +1903,7 @@ client_chain:
 
 # Multiple chains (round-robin selection)
 client_chains:
-  - us-proxy-group                     # Chain 1: single hop
+  - chain: [us-proxy-group]            # Chain 1: single hop
   - chain: [proxy1, proxy2]            # Chain 2: multi-hop
 
 # Load balancing at a hop (pool)
@@ -1872,7 +1913,33 @@ client_chain:
     - final-proxy
 ```
 
-**Migration note:** The `client_proxy` / `client_proxies` fields still work but are deprecated. Please migrate to `client_chain` / `client_chains`.
+### Legacy Proxy Fields
+
+`client_proxy` and `client_proxies` still work in rules, client groups, and
+ShadowTLS remote handshakes, with a deprecation warning. Existing behavior is
+preserved: a legacy list contains alternatives, not sequential hops.
+Use `RUST_LOG=warn` or a more verbose log level to display these warnings.
+
+A single `client_proxy: upstream` can become `client_chain: upstream`.
+For a list, changing only the field name changes behavior. Migrate as follows:
+
+```yaml
+# Old rule: client_proxies: [a, b]
+# Equivalent rule, retaining one-hop round-robin alternatives:
+client_chain:
+  chain:
+    - pool: [a, b]
+
+# Old group: client_proxies: [a, b]
+# Equivalent group, retaining separate policy members:
+client_group: outbound
+client_chains:
+  - chain: [a]
+  - chain: [b]
+```
+
+For ShadowTLS remote handshakes, use `client_chain: [{pool: [a, b]}]` to replace
+a legacy proxy list. Do not specify legacy and new fields together.
 
 ### Mask Syntax
 ```yaml
@@ -2116,16 +2183,67 @@ rules:
 
 ## Named Groups
 
-### Client Proxy Group
+### Client Group
+
+`client_chain` and `client_chains` accept the same sequence and alternative-path
+syntax as routing. A bare `[a, b]` defines one sequential path; a list of explicit
+chain wrappers defines separate alternatives selected by the group's policy.
+Group references inside a path contribute their entire selected path, so
+alternatives may have different hop counts. Stages accept group references,
+inline clients, and `{pool: [...]}`. Unknown group chain-wrapper fields are rejected.
+Legacy group `client_proxy` / `client_proxies` lists retain their alternative-member
+behavior with a deprecation warning; see [migration examples](#legacy-proxy-fields).
+
+```yaml
+- client_group: a1-selected-nl
+  client_chains:
+    - chain: [a1-selected, nl-hop]
+
+- client_group: geo-reddit-selected
+  type: selector
+  default: a1-selected-nl
+  client_chains:
+    - {chain: [a1-selected]}
+    - {chain: [a1-selected-nl]}
+    - name: via-us
+      chain: [a1-selected, us-hop]
+    - {chain: [direct]}
+```
+
+An unnamed one-hop wrapper retains its referenced group or inline client's identity.
+Inline selector clients and multi-hop paths require explicit names. Other policies generate
+definition-site labels for unnamed paths; use explicit names for stable controller
+identities. Labels do not introduce another routing-reference namespace.
+The controller exposes named paths as `Relay` nodes, with whole-path delay probes
+and final-hop UDP capability.
+
+Round-robin selects immediate alternatives before their descendants, with independent
+counters per occurrence. Duplicate round-robin entries provide extra tickets;
+selector and URL-test members must be distinct. A nested group with ten
+members has the same outer weight as one inline client, not ten times its weight.
+Each new flow snapshots manual choices once and pins the complete selected path.
+Selecting a TCP-only path for UDP fails rather than choosing another selector member.
+Existing streams, UDP associations and carrier redials retain their pinned paths.
+
+The same composition works in routing, DNS, WireGuard peer chains, ShadowTLS
+handshake chains and REALITY destination chains. Direct, WireGuard and XHTTP H3
+clients are valid only at physical hop zero. UDP/H3 DNS still requires a direct-only
+route. Resolution rejects cycles, more than 16,384 expanded nodes, more than 64
+nested choices, or paths longer than 64 hops. Fixed one-hop round-robin aliases
+do not add choice depth. Health state is bounded by declared groups and members,
+not the number of route combinations.
+
 ```yaml
 - client_group: my-upstream
-  client_proxies:              # Define proxies in this group
-    - address: "proxy1.example.com:1080"
-      protocol:
-        type: socks
-    - address: "proxy2.example.com:1080"
-      protocol:
-        type: socks
+  client_chains:              # Define proxies in this group
+    - chain:
+        - address: "proxy1.example.com:1080"
+          protocol:
+            type: socks
+    - chain:
+        - address: "proxy2.example.com:1080"
+          protocol:
+            type: socks
 
 # Reference in rules
 - address: "0.0.0.0:8080"

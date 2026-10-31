@@ -2,8 +2,11 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io;
 
-use crate::config::{ClientChain, ClientChainHop, ConfigSelection, GroupType};
-use crate::control::catalog::{Catalog, CatalogNode, protocol_type};
+use crate::config::{
+    ClientChainHop, ClientConfig, ConfigSelection, GroupType, ResolvedClientChain,
+    ResolvedClientHop,
+};
+use crate::control::catalog::{Catalog, CatalogNode, api_group, protocol_type};
 use crate::control::runtime::Generation;
 use crate::control::selection::Choices;
 use crate::control::url_test::AutomaticGroup;
@@ -15,10 +18,8 @@ pub fn leaf_udp_support(catalog: &Catalog) -> io::Result<HashMap<String, bool>> 
         let CatalogNode::Leaf(client) = node else {
             continue;
         };
-        let chain = ClientChain {
-            hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                (**client).clone(),
-            ))),
+        let chain = ResolvedClientChain {
+            hops: OneOrSome::One(ResolvedClientHop::Single((**client).clone())),
         };
         let udp = crate::tcp::chain_builder::supports_udp_offline(&chain)?;
         support.insert(name.clone(), udp);
@@ -32,6 +33,14 @@ pub fn proxy(generation: &Generation, choices: &Choices, name: &str) -> Option<V
     let mut value = match node {
         CatalogNode::Leaf(client) => {
             json!({"name":name,"type":protocol_type(&client.protocol),"udp":udp})
+        }
+        CatalogNode::Chain(chain) => {
+            let all: Vec<_> = chain
+                .hops
+                .iter()
+                .map(crate::control::catalog::hop_target)
+                .collect();
+            json!({"name":name,"type":"Relay","all":all,"udp":udp})
         }
         CatalogNode::Reject => json!({"name":name,"type":"Reject","udp":false}),
         CatalogNode::Group {
@@ -92,6 +101,25 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str) -> bool 
             continue;
         }
         match generation.catalog.nodes.get(name) {
+            Some(CatalogNode::Chain(chain)) => {
+                let Some(hop) = chain.hops.iter().last() else {
+                    continue;
+                };
+                let selections: Box<dyn Iterator<Item = &ConfigSelection<ClientConfig>>> = match hop
+                {
+                    ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
+                    ClientChainHop::Pool(pool) => pool.iter(),
+                };
+                pending.extend(selections.map(|selection| {
+                    match selection {
+                        ConfigSelection::GroupName(name) => api_group(name),
+                        ConfigSelection::Config(client) => client
+                            .control
+                            .as_ref()
+                            .map_or("DIRECT", |origin| origin.name.as_ref()),
+                    }
+                }));
+            }
             Some(CatalogNode::Group {
                 members,
                 group_type,
@@ -148,13 +176,80 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn relay_udp_support_follows_only_terminal_members_and_selector_choices() {
+        let configs = serde_json::from_value(json!([
+            {"client_group":"manual", "type":"selector", "default":"tcp", "client_chains":[
+                {"chain": [{"name":"tcp", "address":"192.0.2.1:80", "protocol":{"type":"http"}}]},
+                {"chain": [{"name":"udp", "address":"192.0.2.2:443", "protocol":{
+                    "type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+                }}]}
+            ]},
+            {"client_group":"prefix", "client_chains":[
+                {"address":"192.0.2.4:80", "protocol":{"type":"http"}}
+            ]},
+            {"client_group":"relays", "client_chains":[
+                {"name":"via-manual", "chain":["prefix", "manual"]},
+                {"name":"inline", "chain":["prefix",
+                    {"name":"inline-udp", "address":"192.0.2.3:443", "protocol":{
+                        "type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+                    }}
+                ]},
+                {"name":"pooled", "chain":[{"pool":["manual", "direct"]}]},
+                {"name":"pooled-prefix", "chain":[{"pool":["prefix", "prefix"]}, "manual"]}
+            ]}
+        ]))
+        .unwrap();
+        let catalog = crate::config::create_server_configs(configs)
+            .unwrap()
+            .catalog
+            .unwrap();
+        let generation = Generation {
+            id: 1,
+            leaf_udp_support: leaf_udp_support(&catalog).unwrap(),
+            catalog,
+            rules: Vec::new(),
+            probes: super::super::probes::ProbeState::new(
+                Arc::new(crate::resolver::NativeResolver::new()),
+                Vec::new(),
+            ),
+        };
+        let mut owner = SelectionOwner::new(None).unwrap();
+        owner
+            .activate(generation.catalog.selection.clone())
+            .unwrap();
+        for (selected, expected) in [("tcp", false), ("udp", true)] {
+            owner.select("manual", selected).unwrap();
+            let choices = generation.catalog.selection.snapshot();
+            assert_eq!(
+                proxy(&generation, &choices, "via-manual").unwrap()["udp"],
+                expected
+            );
+            assert_eq!(proxy(&generation, &choices, "inline").unwrap()["udp"], true);
+            assert_eq!(proxy(&generation, &choices, "pooled").unwrap()["udp"], true);
+            assert_eq!(
+                proxy(&generation, &choices, "pooled-prefix").unwrap()["udp"],
+                expected
+            );
+            for (name, expected) in [
+                ("via-manual", json!(["prefix", "manual"])),
+                ("inline", json!(["prefix", "inline-udp"])),
+                ("pooled", json!(["pool[manual | DIRECT]"])),
+                ("pooled-prefix", json!(["pool[prefix | prefix]", "manual"])),
+            ] {
+                assert_eq!(proxy(&generation, &choices, name).unwrap()["all"], expected);
+            }
+        }
+    }
+
+    #[test]
+
     fn url_test_dto_reports_transport_eligible_members_and_url_health() {
         let configs = serde_json::from_value(json!([
-            {"client_group":"manual", "type":"selector", "default":"tcp", "client_proxies":[
-                "direct", {"name":"tcp", "address":"proxy.invalid:80", "protocol":{"type":"http"}}
+            {"client_group":"manual", "type":"selector", "default":"tcp", "client_chains":[
+                {"chain": ["direct"]}, {"chain": [{"name":"tcp", "address":"proxy.invalid:80", "protocol":{"type":"http"}}]}
             ]},
-            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":[
-                "manual", {"name":"udp", "protocol":{"type":"direct"}}
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":[
+                {"chain": ["manual"]}, {"chain": [{"name":"udp", "protocol":{"type":"direct"}}]}
             ]}
         ])).unwrap();
         let catalog = crate::config::create_server_configs(configs)
@@ -196,13 +291,13 @@ mod tests {
     #[test]
     fn catalog_dtos_preserve_group_types_members_and_selected_udp_support() {
         let configs = serde_json::from_value(json!([
-            {"client_group":"child", "client_proxies":[
-                {"name":"east", "address":"east.invalid:1080", "protocol":{"type":"socks"}},
-                "direct"
+            {"client_group":"child", "client_chains":[
+                {"chain": [{"name":"east", "address":"east.invalid:1080", "protocol":{"type":"socks"}}]},
+                {"chain": ["direct"]}
             ]},
-            {"client_group":"outbound", "type":"selector", "default":"child", "client_proxies":[
-                "child",
-                {"name":"west", "address":"west.invalid:1080", "protocol":{"type":"socks"}}
+            {"client_group":"outbound", "type":"selector", "default":"child", "client_chains":[
+                {"chain": ["child"]},
+                {"chain": [{"name":"west", "address":"west.invalid:1080", "protocol":{"type":"socks"}}]}
             ]}
         ]))
         .unwrap();

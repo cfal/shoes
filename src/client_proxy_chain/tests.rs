@@ -648,3 +648,49 @@ fn test_chain_complex_multi_hop_mixed_udp() {
     assert_eq!(chain.num_hops(), 4);
     assert!(chain.supports_udp()); // This was the bug - old code returned false
 }
+
+#[test]
+fn compiled_routes_keep_flat_fast_path_and_independent_choice_counters() {
+    use crate::config::{ResolvedConfig, ResolvedRuleActionConfig};
+    use serde_json::json;
+    let socks = |port| json!({"address":format!("127.0.0.1:{port}"),"protocol":{"type":"socks"}});
+    for (route, composed) in [
+        (json!([socks(1080), socks(1081)]), false),
+        (json!([{"pool":[socks(1080), socks(1081)]}]), true),
+    ] {
+        let mut configs = crate::config::create_server_configs(
+            serde_json::from_value(json!([
+                {"address":"127.0.0.1:0","protocol":{"type":"socks"},
+                 "rules":[{"masks":"0.0.0.0/0","action":"allow","client_chain":route}]}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let ResolvedConfig::Server(server) = configs.configs.remove(0) else {
+            panic!("expected server")
+        };
+        let ResolvedRuleActionConfig::Allow { client_chains, .. } =
+            server.rules.into_vec().remove(0).action
+        else {
+            panic!("expected route")
+        };
+        let plan = client_chains.into_vec().remove(0);
+        let build = || {
+            crate::tcp::chain_builder::try_build_client_proxy_chain(
+                plan.hops.clone(),
+                Arc::new(crate::resolver::NativeResolver::new()),
+            )
+            .unwrap()
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(first.composition.is_some(), composed);
+        if composed {
+            assert_eq!(first.select_indices(false).unwrap(), [0]);
+            assert_eq!(first.select_indices(false).unwrap(), [1]);
+            assert_eq!(second.select_indices(false).unwrap(), [0]);
+        } else {
+            assert_eq!(first.num_hops(), 2);
+        }
+    }
+}

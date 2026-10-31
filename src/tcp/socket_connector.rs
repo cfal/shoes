@@ -8,7 +8,7 @@
 //!
 //! ## Design
 //!
-//! Every `ClientConfig` implicitly defines a `SocketConnector` through its
+//! Every `ResolvedClientConfig` implicitly defines a `SocketConnector` through its
 //! socket-related fields: `bind_interface`, `transport`, `tcp_settings`, `quic_settings`.
 //!
 //! When a config is used:

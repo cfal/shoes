@@ -10,10 +10,12 @@ use super::client::ClientConfig;
 use super::selection::ConfigSelection;
 
 #[derive(Debug, Clone)]
-pub struct RuleConfig {
+pub struct RuleRecord<C> {
     pub criteria: RuleCriteria,
-    pub action: RuleActionConfig,
+    pub action: RuleActionRecord<C>,
 }
+
+pub type RuleConfig = RuleRecord<ClientChain>;
 
 #[derive(Debug, Clone)]
 pub struct RuleCriteria {
@@ -34,7 +36,7 @@ impl Default for RuleCriteria {
     }
 }
 
-impl RuleConfig {
+impl<C> RuleRecord<C> {
     pub(crate) fn compile(&mut self, compiler: &mut crate::rules::Compiler) -> std::io::Result<()> {
         if self.criteria.compiled.is_some() {
             return Ok(());
@@ -47,7 +49,7 @@ impl RuleConfig {
             Expression::Legacy(masks) => compiler.legacy(masks.into_vec())?,
             expression => compiler.compile(expression)?,
         };
-        if matches!(self.action, RuleActionConfig::Block)
+        if matches!(self.action, RuleActionRecord::Block)
             && predicate.dependencies.ip
             && (self.criteria.no_resolve || predicate.has_no_resolve_ip())
         {
@@ -217,6 +219,39 @@ impl Serialize for ClientChain {
     }
 }
 
+fn convert_legacy_proxies(
+    proxies: NoneOrSome<ConfigSelection<ClientConfig>>,
+    chains: NoneOrSome<ClientChain>,
+) -> Result<NoneOrSome<ClientChain>, &'static str> {
+    if proxies.is_empty() {
+        return Ok(if chains.is_empty() {
+            NoneOrSome::Unspecified
+        } else {
+            chains
+        });
+    }
+    if !chains.is_empty() {
+        return Err(
+            "cannot specify both 'client_proxies' and 'client_chains'/'client_chain' in the same rule. \
+             'client_proxies' is deprecated - please use 'client_chains' instead.",
+        );
+    }
+    log::warn!(
+        "client_proxy/client_proxies is deprecated; use client_chain/client_chains. \
+         Preserve a proxy list's alternatives with {{chain: [{{pool: [a, b]}}]}}; \
+         a bare [a, b] specifies sequential hops."
+    );
+    let proxies = proxies.into_vec();
+    let hop = if proxies.len() == 1 {
+        ClientChainHop::Single(proxies.into_iter().next().unwrap())
+    } else {
+        ClientChainHop::Pool(OneOrSome::Some(proxies))
+    };
+    Ok(NoneOrSome::One(ClientChain {
+        hops: OneOrSome::One(hop),
+    }))
+}
+
 impl<'de> Deserialize<'de> for RuleConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -303,41 +338,8 @@ impl<'de> Deserialize<'de> for RuleConfig {
                     None
                 };
 
-                // Check for conflicting fields
-                let has_client_proxies = !temp.client_proxies.is_empty();
-                let has_client_chains = !temp.client_chains.is_empty();
-
-                if has_client_proxies && has_client_chains {
-                    return Err(D::Error::custom(
-                        "cannot specify both 'client_proxies' and 'client_chains'/'client_chain' in the same rule. \
-                         'client_proxies' is deprecated - please use 'client_chains' instead.",
-                    ));
-                }
-
-                // Convert client_proxies to client_chains if present
-                let client_chains: NoneOrSome<ClientChain> = if has_client_proxies {
-                    log::warn!(
-                        "The 'client_proxies' field is deprecated and will be removed in a future version. \
-                         Please use 'client_chains' instead. Your config will continue to work, but consider updating it."
-                    );
-
-                    // Convert to client_chains format:
-                    // All proxies become a single chain with one hop (pool if multiple)
-                    let proxy_list = temp.client_proxies.into_vec();
-                    let hop = if proxy_list.len() == 1 {
-                        ClientChainHop::Single(proxy_list.into_iter().next().unwrap())
-                    } else {
-                        ClientChainHop::Pool(OneOrSome::Some(proxy_list))
-                    };
-                    NoneOrSome::One(ClientChain {
-                        hops: OneOrSome::One(hop),
-                    })
-                } else if has_client_chains {
-                    temp.client_chains
-                } else {
-                    // Default: unspecified means single chain with direct hop
-                    NoneOrSome::Unspecified
-                };
+                let client_chains = convert_legacy_proxies(temp.client_proxies, temp.client_chains)
+                    .map_err(D::Error::custom)?;
 
                 RuleActionConfig::Allow {
                     override_address,
@@ -356,7 +358,7 @@ impl<'de> Deserialize<'de> for RuleConfig {
     }
 }
 
-impl Serialize for RuleConfig {
+impl<C: Serialize> Serialize for RuleRecord<C> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -371,8 +373,8 @@ impl Serialize for RuleConfig {
 
         // Count fields: masks + action fields
         let action_field_count = match &self.action {
-            RuleActionConfig::Block => 1, // action
-            RuleActionConfig::Allow {
+            RuleActionRecord::Block => 1, // action
+            RuleActionRecord::Allow {
                 override_address,
                 client_chains,
             } => {
@@ -407,10 +409,10 @@ impl Serialize for RuleConfig {
 
         // Serialize action fields (flattened)
         match &self.action {
-            RuleActionConfig::Block => {
+            RuleActionRecord::Block => {
                 map.serialize_entry("action", "block")?;
             }
-            RuleActionConfig::Allow {
+            RuleActionRecord::Allow {
                 override_address,
                 client_chains,
             } => {
@@ -428,20 +430,18 @@ impl Serialize for RuleConfig {
     }
 }
 
-/// A single hop in a proxy chain.
+/// A step in a proxy chain, possibly expanded into a complete group member path.
 ///
 /// Each hop represents one step in the chain. A hop can be:
-/// - A single proxy (inline config or group reference)
-/// - A pool of proxies for load balancing (mix of inline configs and group refs)
+/// - An inline proxy or a group reference retaining the group's selection policy
+/// - A round-robin pool of immediate alternatives (inline proxies or groups)
 #[derive(Debug, Clone)]
 pub enum ClientChainHop {
-    /// Single proxy for this hop - either an inline config or a group reference.
-    /// If a group reference, the group's proxies become the pool for this hop.
+    /// Inline proxy or group reference, preserving the group's policy and member paths.
     Single(ConfigSelection<ClientConfig>),
 
-    /// Pool of proxies for this hop (round-robin load balancing).
-    /// Can mix inline configs and group references.
-    /// Group references are expanded, and all configs are combined into one pool.
+    /// Round-robin pool of inline proxies and group references.
+    /// Each listed alternative gets one turn; nested groups retain their own policy.
     Pool(OneOrSome<ConfigSelection<ClientConfig>>),
 }
 
@@ -562,7 +562,7 @@ impl serde::ser::Serialize for ClientChainHop {
 
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
-pub enum RuleActionConfig {
+pub enum RuleActionRecord<C> {
     Allow {
         override_address: Option<NetLocation>,
 
@@ -574,10 +574,12 @@ pub enum RuleActionConfig {
         /// - `NoneOrSome::None` → Error (validated later)
         /// - `NoneOrSome::One(chain)` → Single chain
         /// - `NoneOrSome::Some(chains)` → Multiple chains for round-robin
-        client_chains: NoneOrSome<ClientChain>,
+        client_chains: NoneOrSome<C>,
     },
     Block,
 }
+
+pub type RuleActionConfig = RuleActionRecord<ClientChain>;
 
 impl<'de> Deserialize<'de> for RuleActionConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -622,41 +624,8 @@ impl<'de> Deserialize<'de> for RuleActionConfig {
                     None
                 };
 
-                // Check for conflicting fields
-                let has_client_proxies = !temp.client_proxies.is_empty();
-                let has_client_chains = !temp.client_chains.is_empty();
-
-                if has_client_proxies && has_client_chains {
-                    return Err(D::Error::custom(
-                        "cannot specify both 'client_proxies' and 'client_chains'/'client_chain' in the same rule. \
-                         'client_proxies' is deprecated - please use 'client_chains' instead.",
-                    ));
-                }
-
-                // Convert client_proxies to client_chains if present
-                let client_chains: NoneOrSome<ClientChain> = if has_client_proxies {
-                    log::warn!(
-                        "The 'client_proxies' field is deprecated and will be removed in a future version. \
-                         Please use 'client_chains' instead. Your config will continue to work, but consider updating it."
-                    );
-
-                    // Convert to client_chains format:
-                    // All proxies become a single chain with one hop (pool if multiple)
-                    let proxy_list = temp.client_proxies.into_vec();
-                    let hop = if proxy_list.len() == 1 {
-                        ClientChainHop::Single(proxy_list.into_iter().next().unwrap())
-                    } else {
-                        ClientChainHop::Pool(OneOrSome::Some(proxy_list))
-                    };
-                    NoneOrSome::One(ClientChain {
-                        hops: OneOrSome::One(hop),
-                    })
-                } else if has_client_chains {
-                    temp.client_chains
-                } else {
-                    // Default: unspecified means single chain with direct hop
-                    NoneOrSome::Unspecified
-                };
+                let client_chains = convert_legacy_proxies(temp.client_proxies, temp.client_chains)
+                    .map_err(D::Error::custom)?;
 
                 Ok(RuleActionConfig::Allow {
                     override_address,
@@ -671,7 +640,7 @@ impl<'de> Deserialize<'de> for RuleActionConfig {
     }
 }
 
-impl Serialize for RuleActionConfig {
+impl<C: Serialize> Serialize for RuleActionRecord<C> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -679,12 +648,12 @@ impl Serialize for RuleActionConfig {
         use serde::ser::SerializeMap;
 
         match self {
-            RuleActionConfig::Block => {
+            RuleActionRecord::Block => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("action", "block")?;
                 map.end()
             }
-            RuleActionConfig::Allow {
+            RuleActionRecord::Allow {
                 override_address,
                 client_chains,
             } => {

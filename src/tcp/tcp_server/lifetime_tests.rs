@@ -481,7 +481,7 @@ async fn initial_writes_and_flushes_have_deadlines() {
 async fn protocol_response_precedes_chained_greeting() {
     use tokio::io::AsyncReadExt;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let rule = serde_yaml::from_str(&format!(
+    let rule = crate::config::test_support::from_yaml(&format!(
         "masks: '0.0.0.0/0'\nclient_proxy:\n  address: '{}'\n  protocol: {{type: socks}}\n",
         listener.local_addr().unwrap()
     ))

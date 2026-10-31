@@ -157,14 +157,14 @@ pub fn direct_allow_rule() -> NoneOrSome<ConfigSelection<RuleConfig>> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ServerConfig {
+pub struct ServerRecord<P, R, D> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub sniff: bool,
     #[serde(flatten)]
     pub bind_location: BindLocation,
-    pub protocol: ServerProxyConfig,
+    pub protocol: P,
     #[serde(
         alias = "transport",
         default,
@@ -180,12 +180,14 @@ pub struct ServerConfig {
         default = "direct_allow_rule",
         skip_serializing_if = "NoneOrSome::is_unspecified"
     )]
-    pub rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    pub rules: NoneOrSome<R>,
     /// DNS configuration for this server (optional).
     /// Can reference a dns_group by name or specify inline DNS servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns: Option<DnsConfig>,
+    pub dns: Option<D>,
 }
+
+pub type ServerConfig = ServerRecord<ServerProxyConfig, ConfigSelection<RuleConfig>, DnsConfig>;
 
 impl<'de> serde::de::Deserialize<'de> for ServerConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -350,7 +352,8 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RealityServerConfig {
+#[serde(bound(deserialize = "P: Deserialize<'de>, R: Deserialize<'de>, H: Deserialize<'de>"))]
+pub struct RealityServerRecord<P, R, H> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mldsa65_seed: Option<String>,
     /// X25519 private key (32 bytes, base64url encoded)
@@ -388,20 +391,24 @@ pub struct RealityServerConfig {
     #[serde(default)]
     pub vision: bool,
     /// Inner protocol (VLESS, Trojan, etc.)
-    pub protocol: ServerProxyConfig,
+    pub protocol: P,
 
     /// Client chain for connecting to dest server (for fallback connections).
     /// If not specified, connects directly to dest.
     #[serde(default)]
-    pub dest_client_chain: NoneOrSome<ClientChainHop>,
+    pub dest_client_chain: NoneOrSome<H>,
 
     /// Override rules
     #[serde(alias = "override_rule", default)]
-    pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    pub override_rules: NoneOrSome<R>,
 }
 
+pub type RealityServerConfig =
+    RealityServerRecord<ServerProxyConfig, ConfigSelection<RuleConfig>, ClientChainHop>;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TlsServerConfig {
+#[serde(bound(deserialize = "P: Deserialize<'de>, R: Deserialize<'de>"))]
+pub struct TlsServerRecord<P, R> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate_source: Option<String>,
     #[serde(skip)]
@@ -447,21 +454,30 @@ pub struct TlsServerConfig {
     /// Requires TLS 1.3.
     #[serde(default)]
     pub vision: bool,
-    pub protocol: ServerProxyConfig,
+    pub protocol: P,
 
     #[serde(alias = "override_rule", default)]
-    pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    pub override_rules: NoneOrSome<R>,
 }
+
+pub type TlsServerConfig = TlsServerRecord<ServerProxyConfig, ConfigSelection<RuleConfig>>;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ShadowTlsServerConfig {
+#[serde(bound(deserialize = "P: Deserialize<'de>, R: Deserialize<'de>, H: Deserialize<'de>"))]
+pub struct ShadowTlsServerRecord<P, R, H> {
     pub password: String,
-    pub handshake: ShadowTlsServerHandshakeConfig,
-    pub protocol: ServerProxyConfig,
+    pub handshake: H,
+    pub protocol: P,
     #[serde(alias = "override_rule", default)]
-    pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    pub override_rules: NoneOrSome<R>,
 }
+
+pub type ShadowTlsServerConfig = ShadowTlsServerRecord<
+    ServerProxyConfig,
+    ConfigSelection<RuleConfig>,
+    ShadowTlsServerHandshakeConfig,
+>;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -489,12 +505,14 @@ pub struct ShadowTlsLocalHandshake {
 }
 
 #[derive(Debug, Clone)]
-pub struct ShadowTlsRemoteHandshake {
+pub struct ShadowTlsRemoteHandshakeRecord<H> {
     pub address: NetLocation,
     /// Ordered chain of proxy hops for reaching the remote handshake server.
     /// Guaranteed to be non-empty - if not specified, defaults to a single direct hop.
-    pub client_chain: OneOrSome<ClientChainHop>,
+    pub client_chain: OneOrSome<H>,
 }
+
+pub type ShadowTlsRemoteHandshake = ShadowTlsRemoteHandshakeRecord<ClientChainHop>;
 
 impl<'de> Deserialize<'de> for ShadowTlsRemoteHandshake {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -531,8 +549,9 @@ impl<'de> Deserialize<'de> for ShadowTlsRemoteHandshake {
         // Convert client_proxies to client_chain if present
         let client_chain: OneOrSome<ClientChainHop> = if has_client_proxies {
             log::warn!(
-                "The 'client_proxies' field in ShadowTLS remote handshake is deprecated and will be removed in a future version. \
-                 Please use 'client_chain' instead. Your config will continue to work, but consider updating it."
+                "client_proxy/client_proxies in ShadowTLS remote handshake is deprecated; use client_chain. \
+                 Preserve a proxy list's alternatives with [{{pool: [a, b]}}]; \
+                 a bare [a, b] specifies sequential hops."
             );
 
             // Convert to client_chain format:
@@ -569,7 +588,7 @@ impl<'de> Deserialize<'de> for ShadowTlsRemoteHandshake {
     }
 }
 
-impl Serialize for ShadowTlsRemoteHandshake {
+impl<H: Serialize> Serialize for ShadowTlsRemoteHandshakeRecord<H> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -666,7 +685,8 @@ impl serde::ser::Serialize for ShadowTlsServerHandshakeConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WebsocketServerConfig {
+#[serde(bound(deserialize = "P: Deserialize<'de>, R: Deserialize<'de>"))]
+pub struct WebsocketServerRecord<P, R> {
     #[serde(default)]
     pub matching_path: Option<String>,
     #[serde(default)]
@@ -675,13 +695,16 @@ pub struct WebsocketServerConfig {
     pub max_early_data: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub early_data_header_name: Option<String>,
-    pub protocol: ServerProxyConfig,
+    pub protocol: P,
     #[serde(default)]
     pub ping_type: WebsocketPingType,
 
     #[serde(alias = "override_rule", default)]
-    pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    pub override_rules: NoneOrSome<R>,
 }
+
+pub type WebsocketServerConfig =
+    WebsocketServerRecord<ServerProxyConfig, ConfigSelection<RuleConfig>>;
 
 #[derive(Default, Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -874,6 +897,160 @@ pub enum ServerProxyConfig {
 }
 
 impl std::fmt::Display for ServerProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SudokuMask(config) => write!(f, "Sudoku mask ({})", config.protocol),
+            Self::Wireguard(_) => write!(f, "WireGuard"),
+            Self::Http { .. } => write!(f, "HTTP"),
+            Self::Socks { .. } => write!(f, "SOCKS"),
+            Self::Shadowsocks { .. } => write!(f, "Shadowsocks"),
+            Self::Snell { .. } => write!(f, "Snell"),
+            Self::Vless { .. } => write!(f, "Vless"),
+            Self::Trojan { .. } => write!(f, "Trojan"),
+            Self::Tls {
+                tls_targets,
+                default_tls_target,
+                shadowtls_targets,
+                reality_targets,
+                ..
+            } => {
+                let mut parts = vec![];
+
+                if !tls_targets.is_empty() {
+                    parts.push("TLS");
+                }
+
+                if !reality_targets.is_empty() {
+                    parts.push("REALITY");
+                }
+                if !shadowtls_targets.is_empty() {
+                    parts.push("ShadowTLSv3");
+                }
+                if tls_targets.values().any(|cfg| cfg.vision)
+                    || default_tls_target.as_ref().is_some_and(|cfg| cfg.vision)
+                    || reality_targets.values().any(|cfg| cfg.vision)
+                {
+                    parts.push("Vision");
+                }
+
+                write!(f, "{}", parts.join("+"))
+            }
+            Self::Vmess { .. } => write!(f, "Vmess"),
+            Self::Websocket { .. } => write!(f, "Websocket"),
+            Self::Xhttp(..) => write!(f, "XHTTP"),
+            Self::PortForward { .. } => write!(f, "Portforward"),
+            Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
+            Self::TuicV5 { .. } => write!(f, "TuicV5"),
+            Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
+            Self::Anytls { .. } => write!(f, "AnyTLS"),
+            Self::Naiveproxy { .. } => write!(f, "NaiveProxy"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ResolvedServerProxyConfig {
+    #[serde(rename = "sudoku_mask")]
+    SudokuMask(crate::sudoku_mask::SudokuMaskConfig<ResolvedServerProxyConfig>),
+    Wireguard(Box<crate::config::resolved::ResolvedWireguardServerConfig>),
+    Xhttp(crate::config::resolved::ResolvedXhttpServerConfig),
+    Http {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+    },
+    Socks {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+        udp_enabled: bool,
+    },
+    #[serde(serialize_with = "serialize_shadowsocks_server")]
+    Shadowsocks {
+        config: ShadowsocksConfig,
+        udp_enabled: bool,
+    },
+    Snell {
+        cipher: String,
+        password: String,
+        udp_enabled: bool,
+    },
+    Vless {
+        user_id: String,
+        #[serde(skip_serializing_if = "super::vless::VlessEncryptionSetting::is_disabled")]
+        decryption: super::vless::VlessEncryptionSetting,
+        #[serde(rename = "encryption", skip_serializing)]
+        _invalid_encryption: (),
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        vision: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encryption_limits: Option<super::vless::VlessEncryptionLimits>,
+        udp_enabled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fallback: Option<NetLocation>,
+    },
+    Trojan {
+        password: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shadowsocks: Option<ShadowsocksConfig>,
+    },
+    Tls {
+        tls_targets: HashMap<String, crate::config::resolved::ResolvedTlsServerConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_tls_target: Option<Box<crate::config::resolved::ResolvedTlsServerConfig>>,
+        shadowtls_targets: HashMap<String, crate::config::resolved::ResolvedShadowTlsServerConfig>,
+        reality_targets: HashMap<String, crate::config::resolved::ResolvedRealityServerConfig>,
+
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tls_buffer_size: Option<usize>,
+    },
+    Vmess {
+        cipher: String,
+        user_id: String,
+        udp_enabled: bool,
+    },
+    Anytls {
+        users: OneOrSome<AnyTlsUserConfig>,
+        padding_scheme: Option<Vec<String>>,
+        udp_enabled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fallback: Option<NetLocation>,
+    },
+    Websocket {
+        targets: Box<OneOrSome<crate::config::resolved::ResolvedWebsocketServerConfig>>,
+    },
+    PortForward {
+        targets: OneOrSome<NetLocation>,
+    },
+    Hysteria2 {
+        password: String,
+        udp_enabled: bool,
+    },
+    TuicV5 {
+        uuid: String,
+        password: String,
+        zero_rtt_handshake: bool,
+    },
+    Mixed {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+        udp_enabled: bool,
+    },
+    Naiveproxy {
+        users: OneOrSome<NaiveUserConfig>,
+        padding: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fallback: Option<NaiveFallbackConfig>,
+        udp_enabled: bool,
+    },
+}
+
+impl std::fmt::Display for ResolvedServerProxyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SudokuMask(config) => write!(f, "Sudoku mask ({})", config.protocol),

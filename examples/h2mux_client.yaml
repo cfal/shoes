@@ -8,7 +8,7 @@
 
 # Reusable upstream chain for both traffic and DNS.
 - client_group: h2mux-exit
-  client_proxies:
+  client_chains:
     - address: "example.com:443"
       protocol:
         type: tls
