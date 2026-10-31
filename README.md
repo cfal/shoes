@@ -475,6 +475,11 @@ migration error instead of silently disabling Vision.
 ```
 
 ### Hysteria2 Server
+Hysteria2 and TUIC also support native QUIC clients with TCP and UDP. See
+[client configuration](CONFIG.md#hysteria2-client) and
+[runnable client examples](examples/quic_clients.yaml). Hysteria2 clients support
+Salamander and port hopping; TUIC clients support both UDP relay modes.
+
 ```yaml
 - address: 0.0.0.0:443
   transport: quic

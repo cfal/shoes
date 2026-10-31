@@ -62,7 +62,7 @@ async fn peer(
     .await
     .unwrap();
     let chain: ClientChain = serde_json::from_value(json!({
-        "address": format!("127.0.0.1:{port}"),
+        "address": format!("{}:{port}", if protocol.get("hopping").is_some() { "localhost" } else { "127.0.0.1" }),
         "quic_settings": {"verify": false, "sni_hostname": "localhost"},
         "protocol": protocol
     }))
@@ -210,4 +210,48 @@ async fn hysteria2_sing_box_hopping_with_salamander_keeps_existing_flows() {
         "hysteria2",
     )
     .await;
+}
+
+#[tokio::test]
+async fn sing_box_rejects_wrong_credentials_without_target_data() {
+    for (kind, protocol) in [
+        (
+            "hysteria2",
+            json!({"type":"hysteria2", "password":"wrong-password"}),
+        ),
+        (
+            "tuic",
+            json!({"type":"tuic", "password":"wrong-password", "uuid":"01234567-89ab-4def-8123-456789abcdef"}),
+        ),
+    ] {
+        let (chain, resolver, _peer, _config) = peer(protocol, kind).await;
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let target = NetLocation::from_str(
+            &format!("127.0.0.1:{}", listener.local_addr().unwrap().port()),
+            None,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            match chain.connect_tcp(target.into(), &resolver).await {
+                Err(error) if kind == "hysteria2" => {
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied)
+                }
+                Err(_) => {}
+                Ok(mut setup) => {
+                    assert_eq!(
+                        kind, "tuic",
+                        "HY2 must authenticate before publishing a connection"
+                    );
+                    assert!(setup.client_stream.read_exact(&mut [0; 1]).await.is_err());
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
 }

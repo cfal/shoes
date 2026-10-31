@@ -73,6 +73,7 @@ pub(crate) struct QuicEndpoint {
 }
 
 impl QuicEndpoint {
+    #[cfg(test)]
     pub fn new(
         config: Option<quinn::ServerConfig>,
         socket: std::net::UdpSocket,

@@ -134,11 +134,11 @@ impl AsyncUdpSocket for HoppingSocket {
     ) -> Poll<io::Result<usize>> {
         self.reader.register(cx.waker());
         let state = self.state.read();
-        if let Some(previous) = &state.previous {
-            if let Poll::Ready(Ok(count)) = previous.poll_recv(cx, bufs, meta) {
-                self.canonicalise(meta, count);
-                return Poll::Ready(Ok(count));
-            }
+        if let Some(previous) = &state.previous
+            && let Poll::Ready(Ok(count)) = previous.poll_recv(cx, bufs, meta)
+        {
+            self.canonicalise(meta, count);
+            return Poll::Ready(Ok(count));
         }
         let count = std::task::ready!(state.current.poll_recv(cx, bufs, meta))?;
         self.canonicalise(meta, count);
@@ -175,6 +175,58 @@ impl UdpPoller for HoppingPoller {
 mod tests {
     use super::*;
     use quinn::Runtime;
+
+    #[tokio::test]
+    async fn idle_poller_does_not_retain_old_sockets_and_failed_hops_keep_current() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sockets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let failed = Arc::new(AtomicBool::new(false));
+        let factory: SocketFactory = {
+            let sockets = sockets.clone();
+            let failed = failed.clone();
+            Arc::new(move || {
+                if failed.load(Ordering::Relaxed) {
+                    return Err(io::Error::other("test socket failure"));
+                }
+                let socket =
+                    quinn::TokioRuntime.wrap_udp_socket(std::net::UdpSocket::bind("0.0.0.0:0")?)?;
+                sockets.lock().push(Arc::downgrade(&socket));
+                Ok(socket)
+            })
+        };
+        let config = HoppingConfig {
+            ports: "10000-10001".into(),
+            interval_secs: None,
+            min_interval_secs: None,
+            max_interval_secs: None,
+        };
+        let socket =
+            HoppingSocket::new(factory, "127.0.0.1:443".parse().unwrap(), &config).unwrap();
+        let poller = socket.clone().create_io_poller();
+        for _ in 0..10 {
+            socket.hop().unwrap();
+            assert_eq!(
+                sockets
+                    .lock()
+                    .iter()
+                    .filter(|socket| socket.strong_count() > 0)
+                    .count(),
+                2
+            );
+            assert!([10000, 10001].contains(&socket.state.read().destination.port()));
+        }
+        failed.store(true, Ordering::Relaxed);
+        let address = socket.local_addr().unwrap();
+        assert!(socket.hop().is_err());
+        assert_eq!(socket.local_addr().unwrap(), address);
+        drop((socket, poller));
+        assert!(
+            sockets
+                .lock()
+                .iter()
+                .all(|socket| socket.strong_count() == 0)
+        );
+    }
 
     #[tokio::test]
     async fn hops_refresh_poller_and_drain_previous_socket() {

@@ -79,6 +79,16 @@ impl Registry {
         let Some(sender) = self.entries.get(&fragment.session) else {
             return;
         };
+        // An unfragmented HY2 packet's packet ID is unspecified, so it must not
+        // evict an unrelated fragmented packet with the same numeric ID.
+        if fragment.count == 1
+            && fragment.index == 0
+            && fragment.location.is_some()
+            && fragment.payload.len() <= MAX_UDP_PAYLOAD
+        {
+            let _ = sender.try_send(Bytes::copy_from_slice(fragment.payload));
+            return;
+        }
         if let Ok(Some((_, data))) = self.fragments.push(
             (fragment.session, fragment.packet),
             fragment.count,
@@ -116,8 +126,9 @@ pub(super) async fn receive(
                 });
             }
             Some(packet) = streams.join_next(), if !streams.is_empty() => {
-                if let Ok(Ok(Ok(packet))) = packet {
-                    if let Ok(fragment) = tuic::decode(&packet) { registry.lock().deliver(fragment); }
+                if let Ok(Ok(Ok(packet))) = packet
+                    && let Ok(fragment) = tuic::decode(&packet) {
+                    registry.lock().deliver(fragment);
                 }
             }
             _ = expiry.tick() => registry.lock().fragments.expire(),
@@ -174,13 +185,13 @@ impl Association {
 
 impl Drop for Association {
     fn drop(&mut self) {
-        if self.close() {
-            if let Some(sender) = &self.generation.dissociate {
-                let _ = sender.try_send(tuic::Dissociate {
-                    id: self.id as u16,
-                    completed: None,
-                });
-            }
+        if self.close()
+            && let Some(sender) = &self.generation.dissociate
+        {
+            let _ = sender.try_send(tuic::Dissociate {
+                id: self.id as u16,
+                completed: None,
+            });
         }
     }
 }
@@ -285,26 +296,26 @@ impl AsyncShutdownMessage for Association {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         std::task::ready!(self.poll_write(cx))?;
-        if self.close() {
-            if let Some(sender) = self.generation.dissociate.clone() {
-                let id = self.id as u16;
-                self.shutdown = Some(Box::pin(async move {
-                    tokio::time::timeout(Duration::from_secs(5), async move {
-                        let (completed, result) = tokio::sync::oneshot::channel();
-                        sender
-                            .send(tuic::Dissociate {
-                                id,
-                                completed: Some(completed),
-                            })
-                            .await
-                            .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
-                        result
-                            .await
-                            .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?
-                    })
-                    .await?
-                }));
-            }
+        if self.close()
+            && let Some(sender) = self.generation.dissociate.clone()
+        {
+            let id = self.id as u16;
+            self.shutdown = Some(Box::pin(async move {
+                tokio::time::timeout(Duration::from_secs(5), async move {
+                    let (completed, result) = tokio::sync::oneshot::channel();
+                    sender
+                        .send(tuic::Dissociate {
+                            id,
+                            completed: Some(completed),
+                        })
+                        .await
+                        .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
+                    result
+                        .await
+                        .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?
+                })
+                .await?
+            }));
         }
         if let Some(shutdown) = &mut self.shutdown {
             let result = std::task::ready!(shutdown.as_mut().poll(cx));
@@ -375,5 +386,16 @@ mod tests {
         registry.close();
         assert!(ra.recv().await.is_none());
         assert!(rb.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unfragmented_packets_do_not_evict_unrelated_reassembly() {
+        let mut registry = Registry::new(1);
+        let (id, mut receiver) = registry.register().unwrap().unwrap();
+        registry.deliver(fragment(id, 9, 2, 0, b"head"));
+        registry.deliver(fragment(id, 9, 1, 0, b"single"));
+        registry.deliver(fragment(id, 9, 2, 1, b"tail"));
+        assert_eq!(receiver.recv().await.unwrap().as_ref(), b"single");
+        assert_eq!(receiver.recv().await.unwrap().as_ref(), b"headtail");
     }
 }

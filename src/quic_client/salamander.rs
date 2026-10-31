@@ -162,6 +162,14 @@ impl AsyncUdpSocket for Salamander {
 mod tests {
     use super::*;
 
+    #[test]
+    fn apernet_known_answer() {
+        // apernet/hysteria extras/v2/obfs WrapPacketConnSalamander output.
+        let mut wire = [0xf0, 0xf5, 0x80, 0xb2, 0xd9, 0x0e, 0x4b, 0x57, 0xe8];
+        assert_eq!(decode("salamander psk", &mut wire), Some(1));
+        assert_eq!(wire[0], 1);
+    }
+
     fn wire(data: &[u8]) -> Vec<u8> {
         let mut wire = vec![1; 8];
         wire.extend_from_slice(data);

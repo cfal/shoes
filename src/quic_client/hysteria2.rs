@@ -267,7 +267,8 @@ pub(super) fn decode(mut input: &[u8]) -> io::Result<Fragment<'_>> {
     Ok(Fragment {
         session,
         packet,
-        index,
+        // HY2 assigns no meaning to fragment IDs on unfragmented packets.
+        index: if count == 1 { 0 } else { index },
         count,
         location: Some(location),
         payload: &input[length..],
@@ -417,5 +418,12 @@ mod tests {
         }
         assert!(decode(&[0; 8]).is_err());
         assert!(decode(&[0, 0, 0, 0, 0, 0, 0, 1, 0xff]).is_err());
+        let target = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+        let mut packet = encode(0, 0, &target, b"single", 1200)
+            .unwrap()
+            .remove(0)
+            .to_vec();
+        packet[6] = 255;
+        assert_eq!(decode(&packet).unwrap().index, 0);
     }
 }

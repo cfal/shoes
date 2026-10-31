@@ -2,6 +2,8 @@ pub(crate) mod hop;
 mod hysteria2;
 #[cfg(all(test, feature = "optional-peer-tests"))]
 mod interop;
+#[cfg(test)]
+mod lifecycle_tests;
 pub(crate) mod salamander;
 mod session;
 mod tuic;
