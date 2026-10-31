@@ -101,10 +101,15 @@ cargo install shoes
 ```
 
 GitHub release builds pin `h3` and `h3-quinn` to the
-[`cfal/h3` fork](https://github.com/cfal/h3/tree/a0a7a53a143798d71884df36cfac4dd36cd087e6),
+[`cfal/h3` fork](https://github.com/cfal/h3/tree/90e3013710e35143d1969dc3421f5951fbe49966),
 including the [empty-DATA fix](https://github.com/hyperium/h3/pull/373).
 Empty HTTP/3 DATA frames must not be treated as body EOF; XHTTP uses them for
-idle cancellation probes. The workspace patches cover direct and transitive
+idle cancellation probes. The fork also backports
+[bounded frame buffering](https://github.com/hyperium/h3/pull/366): oversized
+buffered frames are rejected from their declared lengths, and unknown-frame
+payloads are skipped incrementally. The fork defaults the local decoded-header
+limit to 64 KiB; callers can set their own limit. DATA payloads remain streamed.
+The workspace patches cover direct and transitive
 dependencies, including DNS over HTTP/3. The experimental zero-copy change in
 [h3 #368](https://github.com/hyperium/h3/pull/368) is not included.
 

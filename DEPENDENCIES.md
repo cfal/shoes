@@ -14,8 +14,11 @@ The workspace patches in `Cargo.toml` are required by checkout/release builds:
 - `cfal/rustls`: REALITY/TLS integration; retain the matching exact rustls
   requirements in both workspace manifests.
 - `cfal/BLAKE3`: binary-context derivation for VLESS Encryption.
-- `cfal/h3`: empty-DATA handling and idle-stream cancellation, used by both
-  Shoes and Hickory through h3/h3-quinn.
+- `cfal/h3`: empty-DATA handling and idle-stream cancellation, plus the
+  [bounded-frame backport](https://github.com/hyperium/h3/pull/366) that rejects
+  oversized buffered frames from their declared lengths and skips unknown-frame
+  payloads incrementally. The fork also defaults the local decoded-header limit
+  to 64 KiB. Used by both Shoes and Hickory through h3/h3-quinn.
 - `cfal/hickory-dns`: connection-close recovery and healthy-upstream failover.
 - `cfal/smoltcp`: TUN/WireGuard TCP retransmission ACK sequencing.
 

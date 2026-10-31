@@ -1043,7 +1043,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/cfal/h3?rev=a0a7a53a143798d71884df36cfac4dd36cd087e6#a0a7a53a143798d71884df36cfac4dd36cd087e6"
+source = "git+https://github.com/cfal/h3?rev=90e3013710e35143d1969dc3421f5951fbe49966#90e3013710e35143d1969dc3421f5951fbe49966"
 dependencies = [
  "bytes",
  "fastrand",
@@ -1056,7 +1056,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/cfal/h3?rev=a0a7a53a143798d71884df36cfac4dd36cd087e6#a0a7a53a143798d71884df36cfac4dd36cd087e6"
+source = "git+https://github.com/cfal/h3?rev=90e3013710e35143d1969dc3421f5951fbe49966#90e3013710e35143d1969dc3421f5951fbe49966"
 dependencies = [
  "bytes",
  "futures-util",

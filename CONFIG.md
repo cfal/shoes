@@ -1223,6 +1223,10 @@ replacement never migrates existing flows or replays application bytes. UDP
 queues and fragmented-packet reassembly are bounded; overload drops packets.
 UDP requires permission from the server. TCP target errors surface when reading
 the response, allowing application writes before the server's success response.
+HTTP/3 authentication headers are limited to 16 KiB decoded. The H3 dependency
+rejects buffered frames larger than 1 MiB from their declared length and
+discards unknown-frame payloads incrementally, without a lifetime byte budget.
+These limits do not apply to proxied TCP or UDP traffic.
 
 Congestion control is adaptive (Quinn's default CUBIC), with unknown receive
 bandwidth advertised as zero. Brutal and fixed-bandwidth negotiation are not

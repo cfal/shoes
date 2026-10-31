@@ -7,6 +7,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use quinn_proto::coding::Codec;
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio_util::task::AbortOnDropHandle;
@@ -72,7 +73,9 @@ pub(super) async fn authenticate(
     connection: &quinn::Connection,
     config: &Hysteria2ClientConfig,
 ) -> io::Result<(bool, AbortOnDropHandle<()>)> {
-    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+    let (mut driver, mut sender) = h3::client::builder()
+        .max_field_section_size(16 * 1024)
+        .build::<_, _, Bytes>(h3_quinn::Connection::new(connection.clone()))
         .await
         .map_err(io::Error::other)?;
     let hold = sender.clone();
@@ -92,22 +95,27 @@ pub(super) async fn authenticate(
     Ok((enabled, task))
 }
 
-pub(super) fn authority(location: &NetLocation) -> String {
-    match location.address() {
+fn authority(location: &NetLocation) -> io::Result<String> {
+    let address = match location.address() {
         Address::Ipv6(ip) => format!("[{ip}]:{}", location.port()),
         address => format!("{address}:{}", location.port()),
+    };
+    if address.len() > 2048 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HY2 address too long",
+        ));
     }
+    Ok(address)
 }
 
-pub(super) fn put_varint(out: &mut BytesMut, value: usize) -> io::Result<()> {
-    use quinn_proto::coding::Codec;
+fn put_varint(out: &mut BytesMut, value: usize) -> io::Result<()> {
     let value = quinn::VarInt::from_u64(value as u64).map_err(io::Error::other)?;
     value.encode(out);
     Ok(())
 }
 
-pub(super) fn take_varint(input: &mut &[u8]) -> io::Result<usize> {
-    use quinn_proto::coding::Codec;
+fn take_varint(input: &mut &[u8]) -> io::Result<usize> {
     quinn::VarInt::decode(input)
         .map_err(|_| invalid("truncated HY2 varint"))?
         .into_inner()
@@ -120,13 +128,7 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 fn request(target: &NetLocation) -> io::Result<Bytes> {
-    let address = authority(target);
-    if address.len() > 2048 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "HY2 address too long",
-        ));
-    }
+    let address = authority(target)?;
     let padding = padding(64, 512);
     let mut bytes = BytesMut::new();
     put_varint(&mut bytes, 0x401)?;
@@ -170,7 +172,7 @@ async fn response(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<()> {
 
 type Response = Pin<Box<dyn Future<Output = io::Result<quinn::RecvStream>> + Send + Sync>>;
 
-pub(super) struct Stream {
+struct Stream {
     send: quinn::SendStream,
     recv: Option<quinn::RecvStream>,
     response: Option<Response>,
@@ -283,13 +285,7 @@ pub(super) fn encode(
     payload: &[u8],
     mtu: usize,
 ) -> io::Result<Vec<Bytes>> {
-    let address = authority(target);
-    if address.len() > 2048 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "HY2 address too long",
-        ));
-    }
+    let address = authority(target)?;
     let mut suffix = BytesMut::new();
     put_varint(&mut suffix, address.len())?;
     suffix.extend_from_slice(address.as_bytes());
@@ -321,7 +317,139 @@ pub(super) fn encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{config::quic_client::Secret, quic_client::test_connection_pair};
     use tokio::io::AsyncWriteExt;
+
+    fn config(password: &str) -> Hysteria2ClientConfig {
+        Hysteria2ClientConfig {
+            password: Secret(password.into()),
+            udp_enabled: true,
+            obfs: None,
+            hopping: None,
+        }
+    }
+
+    fn auth_headers(padding: usize) -> Bytes {
+        let mut block = BytesMut::new();
+        h3::qpack::encode_stateless(
+            &mut block,
+            [
+                h3::qpack::HeaderField::new(":status", "233"),
+                h3::qpack::HeaderField::new("hysteria-padding", vec![b'x'; padding]),
+            ],
+        )
+        .unwrap();
+        let mut frame = BytesMut::new();
+        put_varint(&mut frame, 1).unwrap();
+        put_varint(&mut frame, block.len()).unwrap();
+        frame.extend_from_slice(&block);
+        frame.freeze()
+    }
+
+    fn oversized_frame() -> Bytes {
+        let mut frame = BytesMut::new();
+        put_varint(&mut frame, 1).unwrap();
+        put_varint(&mut frame, 1 << 30).unwrap();
+        frame.freeze()
+    }
+
+    async fn rejects_h3_input(input: Bytes, after_auth: bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (server, endpoint) = crate::quic_endpoint::test_endpoints();
+            let (client, peer) = test_connection_pair(&server, &endpoint).await;
+            let (authenticated, ready) = tokio::sync::oneshot::channel();
+            let peer = AbortOnDropHandle::new(tokio::spawn(async move {
+                let mut control = peer.open_uni().await.unwrap();
+                control.write_all(&[0, 4, 0]).await.unwrap();
+                let (mut response, mut request) = peer.accept_bi().await.unwrap();
+                request.read_to_end(16 * 1024).await.unwrap();
+                if after_auth {
+                    response.write_all(&auth_headers(0)).await.unwrap();
+                    response.finish().unwrap();
+                    ready.await.unwrap();
+                    let _ = control.write_all(&input).await;
+                } else {
+                    let _ = response.write_all(&input).await;
+                }
+                let closed = peer.closed().await;
+                if after_auth {
+                    assert!(matches!(
+                        closed,
+                        quinn::ConnectionError::ApplicationClosed(error)
+                            if error.error_code.into_inner() == h3::error::Code::H3_EXCESSIVE_LOAD.value()
+                    ));
+                }
+            }));
+            let result = authenticate(&client, &config("password")).await;
+            if after_auth {
+                let (_, _driver) = result.unwrap();
+                authenticated.send(()).unwrap();
+                client.closed().await;
+            } else {
+                let error = result.expect_err("oversized authentication response accepted");
+                assert!(matches!(
+                    error.get_ref().and_then(|error| error.downcast_ref::<h3::error::StreamError>()),
+                    Some(h3::error::StreamError::HeaderTooBig { .. })
+                ), "unexpected authentication error: {error}");
+                client.close(0u32.into(), b"done");
+            }
+            peer.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn auth_headers_have_a_decoded_size_limit() {
+        rejects_h3_input(auth_headers(32 * 1024), false).await;
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_oversized_headers_before_payload() {
+        rejects_h3_input(oversized_frame(), false).await;
+    }
+
+    #[tokio::test]
+    async fn retained_h3_control_stream_rejects_oversized_frames_before_payload() {
+        rejects_h3_input(oversized_frame(), true).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_h3_frames_do_not_exhaust_a_lifetime_budget() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (server, endpoint) = crate::quic_endpoint::test_endpoints();
+            let (client, peer) = test_connection_pair(&server, &endpoint).await;
+            let (authenticated, ready) = tokio::sync::oneshot::channel();
+            let peer = AbortOnDropHandle::new(tokio::spawn(async move {
+                let mut unknown = BytesMut::new();
+                put_varint(&mut unknown, 0x21).unwrap();
+                put_varint(&mut unknown, 2 * 1024 * 1024).unwrap();
+                unknown.resize(unknown.len() + 2 * 1024 * 1024, 0xff);
+                let mut control = peer.open_uni().await.unwrap();
+                control.write_all(&[0, 4, 0]).await.unwrap();
+                let (mut response, mut request) = peer.accept_bi().await.unwrap();
+                request.read_to_end(16 * 1024).await.unwrap();
+                response.write_all(&unknown).await.unwrap();
+                response.write_all(&auth_headers(0)).await.unwrap();
+                response.finish().unwrap();
+                ready.await.unwrap();
+                control.write_all(&unknown).await.unwrap();
+                // The error proves the control decoder reached the next frame.
+                control.write_all(&[0, 0]).await.unwrap();
+                assert!(matches!(
+                    peer.closed().await,
+                    quinn::ConnectionError::ApplicationClosed(error)
+                        if error.error_code.into_inner() == h3::error::Code::H3_FRAME_UNEXPECTED.value()
+                ));
+            }));
+            let (_, _driver) = authenticate(&client, &config("password")).await.unwrap();
+            authenticated.send(()).unwrap();
+            client.closed().await;
+            peer.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn authentication_headers_are_sensitive_and_permission_fails_closed() {
@@ -330,6 +458,13 @@ mod tests {
         assert!(request.headers()["hysteria-auth"].is_sensitive());
         assert!(!format!("{request:?}").contains("secret"));
         assert!(auth_request("bad\r\nheader").is_err());
+        let password = "p\u{e4}ssword";
+        let request = auth_request(password).unwrap();
+        assert_eq!(
+            request.headers()["hysteria-auth"].as_bytes(),
+            password.as_bytes()
+        );
+        assert!(config(password).validate().is_ok());
         for (header, expected) in [
             (None, false),
             (Some("true"), true),
