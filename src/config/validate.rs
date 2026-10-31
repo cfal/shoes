@@ -2472,7 +2472,10 @@ fn validate_connector_positions(
             ));
         }
 
-        for client in super::health::clients(hop) {
+        for selection in hop.selections() {
+            let ConfigSelection::Config(client) = selection else {
+                unreachable!("groups have been expanded");
+            };
             crate::quic_client::validate(client, false)?;
         }
         let unsupported_h3 = |selection: &ConfigSelection<ClientConfig>| {

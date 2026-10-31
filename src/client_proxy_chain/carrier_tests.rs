@@ -561,7 +561,7 @@ mod pinned_fallback {
             &self.location
         }
 
-        fn supports_udp_over_tcp(&self) -> bool {
+        fn supports_udp(&self) -> bool {
             false
         }
 

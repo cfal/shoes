@@ -445,7 +445,6 @@ pub enum ClientChainHop {
     Pool(OneOrSome<ConfigSelection<ClientConfig>>),
 }
 
-#[cfg(unix)]
 impl ClientChainHop {
     pub(crate) fn selections(&self) -> &[ConfigSelection<ClientConfig>] {
         match self {
