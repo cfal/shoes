@@ -46,10 +46,10 @@ pub(crate) async fn prepare(
                 }
                 missing.push(source);
             }
-            let global = if missing.is_empty() {
-                Default::default()
+            let (global, missing) = if missing.is_empty() {
+                (Default::default(), Vec::new())
             } else {
-                crate::config::validate_rule_bootstrap(&configs, &mut missing)?
+                crate::config::validate_rule_bootstrap(&configs, missing)?
             };
             Ok((configs, missing, global, persistent, memory, budget))
         })

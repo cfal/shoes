@@ -55,6 +55,7 @@ pub(crate) fn validate(hops: &OneOrSome<ClientChainHop>) -> io::Result<()> {
 
 pub(super) fn validate_position(client: &ClientConfig, offset: usize) -> io::Result<()> {
     client.validate_quic_key_exchange(offset == 0)?;
+    crate::quic_client::validate_resolved(client, offset == 0)?;
     validate_position_flags(
         client.protocol.is_direct(),
         client.protocol.is_wireguard(),
@@ -399,8 +400,7 @@ mod tests {
         }
         groups.extend([
             json!({"client_group":"wide","client_chains":vec![json!({"chain":["g16"]});1024]}),
-            json!({"client_group":"out","type":"fallback",
-                "health_check":{"url":"http://192.0.2.1/","interval_secs":30},
+            json!({"client_group":"out","type":"selector",
                 "client_chains":["wide"]}),
         ]);
         let validated = validate(json!(groups)).unwrap();

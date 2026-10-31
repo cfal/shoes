@@ -13,6 +13,59 @@ use crate::option_util::NoneOrSome;
 
 type Visitor<'a> = dyn FnMut(&mut ClientConfig) -> io::Result<()> + 'a;
 
+pub(crate) fn rules(configs: &[Config]) -> impl Iterator<Item = &RuleConfig> {
+    configs.iter().flat_map(|config| {
+        let (rules, protocol) = match config {
+            Config::Server(server) => (&server.rules, Some(&server.protocol)),
+            Config::TunServer(tun) => (&tun.rules, None),
+        };
+        rules
+            .iter()
+            .chain(protocol.into_iter().flat_map(protocol_rules))
+    })
+}
+
+fn protocol_rules(protocol: &ServerProxyConfig) -> Box<dyn Iterator<Item = &RuleConfig> + '_> {
+    let mut targets = Vec::new();
+    match protocol {
+        ServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            ..
+        } => {
+            for target in tls_targets
+                .values()
+                .chain(default_tls_target.iter().map(Box::as_ref))
+            {
+                targets.push((&target.override_rules, &target.protocol));
+            }
+            for target in shadowtls_targets.values() {
+                targets.push((&target.override_rules, &target.protocol));
+            }
+            for target in reality_targets.values() {
+                targets.push((&target.override_rules, &target.protocol));
+            }
+        }
+        ServerProxyConfig::Websocket { targets: websocket } => {
+            targets.extend(
+                websocket
+                    .iter()
+                    .map(|target| (&target.override_rules, &target.protocol)),
+            );
+        }
+        ServerProxyConfig::SudokuMask(config) => return protocol_rules(&config.protocol),
+        ServerProxyConfig::Xhttp(config) => return protocol_rules(&config.protocol),
+        _ => {}
+    }
+    Box::new(
+        targets
+            .into_iter()
+            .flat_map(|(rules, protocol)| rules.iter().chain(protocol_rules(protocol))),
+    )
+}
+
 pub(crate) fn visit_chain(chain: &mut ClientChain, visitor: &mut Visitor<'_>) -> io::Result<()> {
     for hop in chain.hops.iter_mut() {
         visit_hop(hop, visitor)?;
@@ -125,6 +178,11 @@ impl ValidatedConfigs {
     }
 
     pub(crate) fn visit_clients(&mut self, visitor: &mut Visitor<'_>) -> io::Result<()> {
+        for source in &mut self.remote_rules {
+            if let Some(download) = &mut source.download {
+                visit_chain(&mut download.client_chain, visitor)?;
+            }
+        }
         for config in &mut self.configs {
             match config {
                 Config::Server(server) => {

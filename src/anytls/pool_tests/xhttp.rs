@@ -44,7 +44,7 @@ async fn check_reuse(disable_reuse: bool) {
         ),
     )]));
     let server: Arc<dyn TcpServerHandler> = create_tcp_server_handler(
-        serde_json::from_value(json!({
+        crate::config::test_support::from_json(json!({
             "type": "xhttp",
             "http_version": "h1",
             "path": "/anytls",
@@ -68,7 +68,7 @@ async fn check_reuse(disable_reuse: bool) {
         calls: AtomicUsize::new(0),
         key: RouteKey(vec![1]),
     });
-    let config = serde_json::from_value(json!({
+    let config = crate::config::test_support::from_json(json!({
         "address": address,
         "protocol": {
             "type": "xhttp",

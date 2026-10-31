@@ -36,6 +36,8 @@ fn client_protocol(
             })
         }
         ClientProxyConfig::Direct => ResolvedClientProxyConfig::Direct,
+        ClientProxyConfig::Hysteria2(config) => ResolvedClientProxyConfig::Hysteria2(config),
+        ClientProxyConfig::Tuic(config) => ResolvedClientProxyConfig::Tuic(config),
         ClientProxyConfig::Wireguard(config) => {
             ResolvedClientProxyConfig::Wireguard(Box::new(ResolvedWireguardClientConfig {
                 settings: super::types::wireguard::WireguardClientRecord {
@@ -158,6 +160,8 @@ fn client_protocol(
             ResolvedClientProxyConfig::Websocket(ResolvedWebsocketClientConfig {
                 matching_path: config.matching_path,
                 matching_headers: config.matching_headers,
+                max_early_data: config.max_early_data,
+                early_data_header_name: config.early_data_header_name,
                 ping_type: config.ping_type,
                 protocol: Box::new(client_protocol(*config.protocol, None)),
             })
@@ -185,10 +189,18 @@ fn client_protocol(
             password,
             udp_enabled,
             padding_scheme,
+            idle_session_check_interval_secs,
+            idle_session_timeout_secs,
+            min_idle_session,
+            disable_reuse,
         } => ResolvedClientProxyConfig::Anytls {
             password,
             udp_enabled,
             padding_scheme,
+            idle_session_check_interval_secs,
+            idle_session_timeout_secs,
+            min_idle_session,
+            disable_reuse,
         },
         ClientProxyConfig::Naiveproxy {
             username,

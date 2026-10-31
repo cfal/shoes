@@ -16,6 +16,17 @@ use crate::config::{
     GroupType, RuleActionConfig,
 };
 
+#[derive(Debug)]
+pub(crate) struct RouteCapacity;
+
+impl std::fmt::Display for RouteCapacity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("probe route exceeds composition limits")
+    }
+}
+
+impl std::error::Error for RouteCapacity {}
+
 #[derive(Debug, Clone)]
 pub struct MemberOrigin {
     pub name: Arc<str>,
@@ -455,16 +466,12 @@ impl Catalog {
         fn charge(count: &mut usize, nodes: usize) -> io::Result<()> {
             *count = count.saturating_add(nodes);
             if *count > crate::config::composition::MAX_NODES {
-                return Err(super::health::capacity_error(
-                    "probe route exceeds composition limits".into(),
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, RouteCapacity));
             }
             Ok(())
         }
         if depth > 2 * crate::config::composition::MAX_DEPTH {
-            return Err(super::health::capacity_error(
-                "probe route exceeds composition limits".into(),
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, RouteCapacity));
         }
         // Fixed one-hop aliases do not consume composition nodes or recursion depth.
         let mut name = name.to_owned();
@@ -822,14 +829,17 @@ mod tests {
             .collect();
         for _ in 0..16 {
             let mut configs: Vec<Config> = serde_json::from_value(config.clone()).unwrap();
-            let catalog = Catalog::capture(&mut configs).unwrap().unwrap();
+            let catalog = CatalogDraft::capture(&mut configs).unwrap().unwrap();
             let actual: Vec<_> = catalog
                 .nodes
                 .into_iter()
                 .filter_map(|(name, node)| match node {
-                    CatalogNode::Leaf(client) if name != "DIRECT" => {
-                        Some((name, client.address.to_string()))
-                    }
+                    CatalogEntry::Leaf(client) if name != "DIRECT" => match *client {
+                        DraftLeaf::Source(client) => Some((name, client.address.to_string())),
+                        DraftLeaf::Resolved(_) => {
+                            panic!("draft capture must preserve source clients")
+                        }
+                    },
                     _ => None,
                 })
                 .collect();

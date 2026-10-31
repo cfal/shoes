@@ -16,6 +16,27 @@ pub(crate) fn protects_tun_endpoints(configs: &[ResolvedConfig]) -> bool {
     })
 }
 
+#[cfg(unix)]
+pub(crate) fn source_tun_endpoint_ips(
+    configs: &[super::Config],
+) -> impl Iterator<Item = IpAddr> + '_ {
+    configs
+        .iter()
+        .filter_map(|config| match config {
+            super::Config::TunServer(tun) => Some(tun),
+            _ => None,
+        })
+        .flat_map(tun_ips)
+}
+
+fn tun_ips<R, D>(tun: &super::types::tun::TunRecord<R, D>) -> impl Iterator<Item = IpAddr> + '_ {
+    [tun.address, tun.destination]
+        .into_iter()
+        .flatten()
+        .chain(tun.addresses.iter().map(IpNetwork::ip))
+        .chain(tun.virtual_dns_addresses())
+}
+
 pub(crate) fn tun_endpoint_ips(configs: &[ResolvedConfig]) -> impl Iterator<Item = IpAddr> + '_ {
     configs
         .iter()
@@ -23,13 +44,7 @@ pub(crate) fn tun_endpoint_ips(configs: &[ResolvedConfig]) -> impl Iterator<Item
             ResolvedConfig::TunServer(tun) => Some(tun),
             _ => None,
         })
-        .flat_map(|tun| {
-            [tun.address, tun.destination]
-                .into_iter()
-                .flatten()
-                .chain(tun.addresses.iter().map(IpNetwork::ip))
-                .chain(tun.virtual_dns_addresses())
-        })
+        .flat_map(tun_ips)
 }
 
 pub(crate) fn validate_tun_endpoints(
@@ -216,7 +231,11 @@ impl ValidatedConfigs {
             }
         }
         if let Some(selection) = selection {
-            let urls = selection.automatic.0.values().map(|group| group.config.url.as_str());
+            let urls = selection
+                .automatic
+                .0
+                .values()
+                .map(|group| group.config.url.as_str());
             for url in urls {
                 let url = url::Url::parse(url).map_err(io::Error::other)?;
                 let ip = match url.host() {

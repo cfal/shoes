@@ -865,7 +865,7 @@ mod tests {
                         Arc::new(crate::resolver::NativeResolver::new());
                     let selector = Arc::new(
                         crate::tcp::tcp_client_handler_factory::create_test_selector(
-                            vec![crate::config::RuleConfig::default()],
+                            vec![crate::config::ResolvedRuleConfig::default()],
                             resolver.clone(),
                         )
                         .unwrap(),

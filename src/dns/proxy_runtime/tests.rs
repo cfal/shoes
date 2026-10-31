@@ -54,7 +54,7 @@ async fn downstream_dns_proxy_names_remain_remote_for_forwarding() {
         .unwrap();
     });
     let resolver: Arc<dyn Resolver> = Arc::new(RemoteOnly);
-    let chain: crate::config::ClientChain = serde_json::from_value(serde_json::json!([
+    let chain = crate::config::test_support::from_json(serde_json::json!([
         {"address": first.to_string(), "protocol": {"type": "socks"}},
         {"address": "second.invalid:1080", "protocol": {"type": "socks"}}
     ]))

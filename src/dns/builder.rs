@@ -121,10 +121,12 @@ impl DnsRegistry {
                 }
             }
         }
-        let protect_tun_endpoints = crate::config::protects_tun_endpoints(configs);
+        let protect_tun_endpoints = configs.iter().any(|config| {
+            matches!(config, crate::config::Config::TunServer(tun) if tun.auto_route || tun.dns_hijack == Some(true))
+        });
         if !forbidden.is_empty() || protect_tun_endpoints {
             forbidden.extend(
-                crate::config::tun_endpoint_ips(configs)
+                crate::config::source_tun_endpoint_ips(configs)
                     .map(|ip| IpNetwork::from(ip.to_canonical())),
             );
         }
@@ -318,7 +320,7 @@ fn group_uses_system(
         let mut proxy_hostname = false;
         for chain in &mut spec.client_chains {
             for hop in chain.hops.iter_mut() {
-                crate::config::client_visit::visit_hop(hop, &mut |client| {
+                crate::config::resolved_visit::visit_hop(hop, &mut |client| {
                     proxy_hostname |= client.address.address().hostname().is_some();
                     Ok(())
                 })?;

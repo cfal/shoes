@@ -250,6 +250,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_rule_and_connection_projections_omit_delivery_secrets() {
+        use crate::config::Config;
         use serde_json::json;
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
@@ -277,40 +278,32 @@ mod tests {
             ]}
         ])).unwrap();
         let mut captured = configs.clone();
-        crate::control::catalog::Catalog::capture(&mut captured).unwrap();
+        crate::control::catalog::CatalogDraft::capture(&mut captured).unwrap();
         let serialized = serde_json::to_string(&captured).unwrap();
         assert!(serialized.contains("QUERY_SENTINEL"));
         assert!(serialized.contains("PASSWORD_SENTINEL"));
         assert!(serialized.contains("PRIVATE KEY"));
         let mut validated = crate::config::create_server_configs(configs).unwrap();
-        crate::config::rule_visit::visit(
-            &mut validated.configs,
-            &mut |rule| {
-                let retained = serde_json::to_string(&rule.criteria.expression).unwrap();
-                for secret in [
-                    "QUERY_SENTINEL",
-                    "PASSWORD_SENTINEL",
-                    "PRIVATE KEY",
-                    "download",
-                ] {
-                    assert!(
-                        !retained.contains(secret),
-                        "delivery metadata retained in predicates: {secret}"
-                    );
-                }
-                Ok(())
-            },
-            &mut |_| Ok(()),
-        )
-        .unwrap();
+        for rule in crate::config::resolved_visit::rules(&validated.configs) {
+            let retained = serde_json::to_string(&rule.criteria.expression).unwrap();
+            for secret in [
+                "QUERY_SENTINEL",
+                "PASSWORD_SENTINEL",
+                "PRIVATE KEY",
+                "download",
+            ] {
+                assert!(
+                    !retained.contains(secret),
+                    "delivery metadata retained in predicates: {secret}"
+                );
+            }
+        }
         let registry = Arc::new(FlowRegistry::default());
         let projection = attach(&mut validated, 1, Some(registry.clone())).unwrap();
-        let Config::Server(server) = &validated.configs[0] else {
+        let ResolvedConfig::Server(server) = &validated.configs[0] else {
             panic!()
         };
-        let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-            panic!()
-        };
+        let rule = server.rules.iter().next().unwrap();
         let description = rule.criteria.description.as_ref().unwrap();
         let guard = description.context.as_ref().unwrap().register(
             "tcp",

@@ -2213,7 +2213,7 @@ and final-hop UDP capability.
 
 Round-robin selects immediate alternatives before their descendants, with independent
 counters per occurrence. Duplicate round-robin entries provide extra tickets;
-selector, URL-test and fallback members must be distinct. A nested group with ten
+selector and URL-test members must be distinct. A nested group with ten
 members has the same outer weight as one inline client, not ten times its weight.
 Each new flow snapshots manual choices once and pins the complete selected path.
 Selecting a TCP-only path for UDP fails rather than choosing another selector member.

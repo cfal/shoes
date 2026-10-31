@@ -38,7 +38,7 @@ pub struct ValidatedConfigs {
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
     pub wireguard_endpoints: Vec<super::types::wireguard::WireguardDeviceConfig>,
-    pub(crate) remote_rules: Vec<crate::rule_set::RuleSource>,
+    pub(crate) remote_rules: Vec<crate::rule_set::ResolvedRuleSource>,
     pub(crate) rule_cache_dir: Option<std::path::PathBuf>,
 }
 
@@ -97,7 +97,7 @@ pub(super) fn create_server_configs_with_memory(
     compiler.memory = memory.or_else(|| rule_cache_dir.is_none().then(Default::default));
     let mut reload_files = crate::rule_set::dependencies(&mut all_configs)?;
     reload_files.extend(super::pem_reload_dependencies(&mut all_configs)?);
-    let mut remote_rules = crate::rule_set::normalize_sources(&mut all_configs, &mut compiler)?;
+    let remote_rules = crate::rule_set::normalize_sources(&mut all_configs, &mut compiler)?;
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
@@ -360,8 +360,8 @@ pub(super) fn create_server_configs_with_memory(
         });
     }
 
-    validate_rule_downloads(
-        &mut remote_rules,
+    let remote_rules = resolve_rule_downloads(
+        remote_rules,
         &client_groups,
         &named_pems,
         &group_names,
@@ -418,23 +418,19 @@ pub(super) fn create_server_configs_with_memory(
     }
 
     let mut evaluation_work = 0usize;
-    super::rule_visit::visit(
-        &mut result,
-        &mut |rule| {
-            let predicate =
-                rule.criteria.compiled.as_ref().ok_or_else(|| {
-                    crate::rules::invalid("rule is missing its compiled predicate")
-                })?;
-            evaluation_work = evaluation_work.saturating_add(predicate.evaluation_work);
-            if evaluation_work > crate::rules::MAX_ENTRIES {
-                return Err(crate::rules::invalid(
-                    "expanded rule evaluation budget exceeded",
-                ));
-            }
-            Ok(())
-        },
-        &mut |_| Ok(()),
-    )?;
+    for rule in super::resolved_visit::rules(&result) {
+        let predicate = rule
+            .criteria
+            .compiled
+            .as_ref()
+            .ok_or_else(|| crate::rules::invalid("rule is missing its compiled predicate"))?;
+        evaluation_work = evaluation_work.saturating_add(predicate.evaluation_work);
+        if evaluation_work > crate::rules::MAX_ENTRIES {
+            return Err(crate::rules::invalid(
+                "expanded rule evaluation budget exceeded",
+            ));
+        }
+    }
 
     let mut validated = ValidatedConfigs {
         catalog: None,
@@ -466,39 +462,43 @@ pub(super) fn create_server_configs_with_memory(
     Ok(validated)
 }
 
-fn validate_rule_downloads(
-    sources: &mut [crate::rule_set::RuleSource],
-    clients: &super::composition::Groups,
+fn resolve_rule_downloads(
+    sources: Vec<crate::rule_set::RuleSource>,
+    clients: &compiler::Groups,
     pems: &HashMap<String, String>,
     dns_names: &HashSet<&str>,
     limits: GlobalLimits,
-) -> std::io::Result<()> {
-    for source in sources {
-        let download = source.download.as_mut().expect("remote source checked");
-        validate_client_chain(&mut download.client_chain.hops, 0, clients, pems, limits)?;
-        if chain_uses_wireguard(&download.client_chain) {
-            return Err(crate::rules::invalid(
-                "rule downloads cannot bootstrap through WireGuard devices",
-            ));
-        }
-        if !dns_names.contains(download.bootstrap_url.as_str()) {
-            let parsed = ParsedDnsUrl::parse(&download.bootstrap_url)
-                .map_err(|_| crate::rules::invalid("invalid rule download bootstrap_url"))?;
-            if parsed.has_hostname() {
+) -> std::io::Result<Vec<crate::rule_set::ResolvedRuleSource>> {
+    sources
+        .into_iter()
+        .map(|source| {
+            let source = source
+                .map_chain(|chain| compiler::compile_chain(chain.hops, clients, pems, limits))?;
+            let download = source.download.as_ref().expect("remote source checked");
+            if chain_uses_wireguard(&download.client_chain) {
                 return Err(crate::rules::invalid(
-                    "rule download bootstrap_url requires an IP URL, system, or DNS group",
+                    "rule downloads cannot bootstrap through WireGuard devices",
                 ));
             }
-        }
-    }
-    Ok(())
+            if !dns_names.contains(download.bootstrap_url.as_str()) {
+                let parsed = ParsedDnsUrl::parse(&download.bootstrap_url)
+                    .map_err(|_| crate::rules::invalid("invalid rule download bootstrap_url"))?;
+                if parsed.has_hostname() {
+                    return Err(crate::rules::invalid(
+                        "rule download bootstrap_url requires an IP URL, system, or DNS group",
+                    ));
+                }
+            }
+            Ok(source)
+        })
+        .collect()
 }
 
 #[cfg(unix)]
 pub(crate) fn validate_rule_bootstrap(
     configs: &[Config],
-    sources: &mut [crate::rule_set::RuleSource],
-) -> std::io::Result<GlobalLimits> {
+    sources: Vec<crate::rule_set::RuleSource>,
+) -> std::io::Result<(GlobalLimits, Vec<crate::rule_set::ResolvedRuleSource>)> {
     use crate::rules::invalid;
 
     let mut limits = None;
@@ -532,10 +532,15 @@ pub(crate) fn validate_rule_bootstrap(
         }
     }
     let limits = limits.unwrap_or_default();
-    let clients = HashMap::from([("direct".into(), ClientChainHop::Single(ConfigSelection::Config(direct_client(None))))]);
+    let clients = HashMap::from([(
+        "direct".into(),
+        HopPlan::Single(compiler::DraftClient::Ready(ResolvedClientConfig::default())),
+    )]);
+    let mut resolved = Vec::with_capacity(sources.len());
     for source in sources {
+        let path = source.path.clone();
         let result = (|| {
-            let download = source.download.as_mut().expect("remote source checked");
+            let download = source.download.as_ref().expect("remote source checked");
             if dns_names.contains(download.bootstrap_url.as_str()) {
                 return Err(invalid(
                     "named DNS groups are not supported for missing-cache bootstrap",
@@ -564,19 +569,19 @@ pub(crate) fn validate_rule_bootstrap(
                     }
                 }
             }
-            validate_client_chain(&mut download.client_chain.hops, 0, &clients, &pems, limits)
+            source.map_chain(|chain| compiler::compile_chain(chain.hops, &clients, &pems, limits))
         })();
-        result.map_err(|error| {
+        resolved.push(result.map_err(|error| {
             std::io::Error::new(
                 error.kind(),
-                format!("rule bootstrap {}: {error}", source.path.display()),
+                format!("rule bootstrap {}: {error}", path.display()),
             )
-        })?;
+        })?);
     }
-    Ok(limits)
+    Ok((limits, resolved))
 }
 
-fn direct_client(catalog: Option<&crate::control::catalog::Catalog>) -> ClientConfig {
+fn direct_client(catalog: Option<&crate::control::catalog::CatalogDraft>) -> ClientConfig {
     let mut direct = ClientConfig::default();
     if let Some(catalog) = catalog {
         direct.control = Some(crate::control::catalog::MemberOrigin {
@@ -2146,6 +2151,13 @@ fn resolve_server_proxy_config(
         }
         ServerProxyConfig::Websocket { targets } => {
             let targets = plan_ops::map_one(*targets, &mut |config| {
+                crate::websocket::validate_early_data(
+                    config.matching_path.as_deref(),
+                    config.matching_headers.as_ref(),
+                    config.max_early_data,
+                    config.early_data_header_name.as_deref(),
+                    true,
+                )?;
                 let protocol = resolve_server_proxy_config(
                     config.protocol,
                     groups,
@@ -2159,6 +2171,8 @@ fn resolve_server_proxy_config(
                 Ok::<_, std::io::Error>(ResolvedWebsocketServerConfig {
                     matching_path: config.matching_path,
                     matching_headers: config.matching_headers,
+                    max_early_data: config.max_early_data,
+                    early_data_header_name: config.early_data_header_name,
                     protocol,
                     ping_type: config.ping_type,
                     override_rules,

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::config::{Config, GlobalLimits, ValidatedConfigs};
 use crate::dns::DnsRegistry;
-use crate::rule_set::{MemorySource, MemorySources, RuleSource};
+use crate::rule_set::{MemorySource, MemorySources, ResolvedRuleSource, RuleSource};
 use crate::rules::invalid;
 use install::Install;
 use tokio::time::{Instant, timeout};
@@ -42,7 +42,7 @@ struct Downloaded {
 }
 
 async fn download_source(
-    source: &RuleSource,
+    source: &ResolvedRuleSource,
     previous: Option<&Arc<MemorySource>>,
     dns: &DnsRegistry,
     global: GlobalLimits,
@@ -81,8 +81,8 @@ async fn download_source(
     .await
 }
 
-fn load_cached(
-    source: &RuleSource,
+fn load_cached<C>(
+    source: &RuleSource<C>,
     lease: Option<&CacheLease>,
     retained_bytes: usize,
 ) -> io::Result<Arc<MemorySource>> {
@@ -109,8 +109,8 @@ fn load_cached(
     Ok(Arc::new(loaded))
 }
 
-async fn save_cache(
-    source: &RuleSource,
+async fn save_cache<C>(
+    source: &RuleSource<C>,
     bytes: Vec<u8>,
     digest: blake3::Hash,
     lease: Option<Arc<CacheLease>>,
@@ -146,14 +146,14 @@ async fn validate_memory(
 
 struct Scheduled {
     identity: serde_json::Value,
-    source: RuleSource,
+    source: ResolvedRuleSource,
     due: Instant,
     failures: u32,
     download: http::DownloadState,
 }
 
 async fn refresh_source(
-    source: &RuleSource,
+    source: &ResolvedRuleSource,
     configs: &[Config],
     memory: &mut MemorySources,
     dns: &DnsRegistry,
@@ -204,7 +204,7 @@ pub(crate) struct Refresh {
 impl Refresh {
     pub(crate) fn new(
         configs: Vec<Config>,
-        sources: &[RuleSource],
+        sources: &[ResolvedRuleSource],
         memory: MemorySources,
         previous: Option<&Self>,
         cache_lease: Option<Arc<CacheLease>>,

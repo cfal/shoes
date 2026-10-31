@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{RuleConfig, create_server_configs};
+use crate::config::{ResolvedConfig, RuleConfig, create_server_configs};
 use crate::rules::Outcome;
 use serde_json::{Value, json};
 
@@ -91,12 +91,10 @@ fn native_source_groups_compose_and_forward_reference_without_actions() {
         &dir.path().join("config.yaml"),
     )
     .unwrap();
-    let Config::Server(server) = &validated.configs[0] else {
+    let ResolvedConfig::Server(server) = &validated.configs[0] else {
         panic!()
     };
-    let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-        panic!()
-    };
+    let rule = server.rules.iter().next().unwrap();
     let predicate = rule.criteria.compiled.as_ref().unwrap();
     for (name, port, expected) in [
         ("example.com", 443, Outcome::Match),
@@ -227,12 +225,10 @@ fn source_group_work_budget_counts_repeated_references_and_caller_compositions()
         let result = create_server_configs(serde_json::from_value(json!(configs)).unwrap());
         if copies == 1 {
             let validated = result.unwrap();
-            let Config::Server(server) = &validated.configs[0] else {
+            let ResolvedConfig::Server(server) = &validated.configs[0] else {
                 panic!()
             };
-            let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-                panic!()
-            };
+            let rule = server.rules.iter().next().unwrap();
             let predicate = rule.criteria.compiled.as_ref().unwrap();
             assert!(!predicate.has_no_resolve_ip());
             assert_eq!(

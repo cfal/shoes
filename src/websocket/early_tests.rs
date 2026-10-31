@@ -558,7 +558,7 @@ async fn server_factory_preserves_mixed_case_selectors_and_explicit_carrier_limi
             let resolver: Arc<dyn crate::resolver::Resolver> =
                 Arc::new(crate::resolver::NativeResolver::new());
             let handler = create_tcp_server_handler(
-                serde_json::from_value(config).unwrap(),
+                crate::config::test_support::from_json(config).unwrap(),
                 &Arc::new(ClientProxySelector::new(vec![])),
                 &resolver,
                 None,
