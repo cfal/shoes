@@ -135,7 +135,6 @@ pub(super) fn measure<C: Sync>(
 pub(super) fn validate<C: Sync>(
     hops: &OneOrSome<HopPlan<C>>,
     leaf_nodes: fn(&C, usize) -> io::Result<usize>,
-    health: fn(&C, bool) -> io::Result<()>,
     position: fn(&C, usize) -> io::Result<()>,
 ) -> io::Result<()> {
     use super::composition::{MAX_HOPS, MAX_NODES, invalid};
@@ -152,28 +151,7 @@ pub(super) fn validate<C: Sync>(
     if nodes > MAX_NODES || longest > MAX_HOPS {
         return Err(invalid("client composition exceeds 16384 nodes or 64 hops"));
     }
-    walk_health(hops, false, health)?;
     walk_positions(hops, 0, position).map(|_| ())
-}
-
-fn walk_health<C: Sync>(
-    hops: &OneOrSome<HopPlan<C>>,
-    mut multiple: bool,
-    visit: fn(&C, bool) -> io::Result<()>,
-) -> io::Result<bool> {
-    for hop in hops.iter() {
-        match hop {
-            HopPlan::Single(client) => visit(client, multiple)?,
-            HopPlan::Choice(choice) => {
-                let mut paths = choice.members.len() > 1;
-                for member in &choice.members {
-                    paths |= walk_health(&member.hops, multiple, visit)?;
-                }
-                multiple = paths;
-            }
-        }
-    }
-    Ok(multiple)
 }
 
 fn walk_positions<C: Sync>(

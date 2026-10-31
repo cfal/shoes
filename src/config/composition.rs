@@ -45,12 +45,7 @@ pub(crate) fn client_nodes(client: &ClientConfig, depth: usize) -> io::Result<us
 }
 
 pub(crate) fn validate(hops: &OneOrSome<ClientChainHop>) -> io::Result<()> {
-    super::plan_ops::validate(
-        hops,
-        client_nodes,
-        super::health::validate_client,
-        validate_position,
-    )
+    super::plan_ops::validate(hops, client_nodes, validate_position)
 }
 
 pub(super) fn validate_position(client: &ClientConfig, offset: usize) -> io::Result<()> {
