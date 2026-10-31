@@ -96,6 +96,53 @@ async fn parsed_header_block_limit_is_inclusive() {
     }
 }
 
+#[tokio::test]
+async fn parsed_line_length_and_count_limits_are_exclusive() {
+    for header_line in [false, true] {
+        for length in [MAX_LINE - 1, MAX_LINE] {
+            let bytes = if header_line {
+                request("/ws", &format!("X-Pad: {}\r\n", "x".repeat(length - 7)))
+            } else {
+                request(&format!("/{}", "x".repeat(length - 14)), "")
+            };
+            assert_eq!(
+                bytes
+                    .split(|b| *b == b'\n')
+                    .map(|line| line.len().saturating_sub(1))
+                    .max(),
+                Some(length)
+            );
+            let (mut peer, server) = tokio::io::duplex(8192);
+            peer.write_all(&bytes).await.unwrap();
+            let mut server: Box<dyn AsyncStream> = Box::new(server);
+            let result = ParsedHttpData::parse(&mut server).await;
+            if length < MAX_LINE {
+                assert!(result.is_ok(), "header_line={header_line}, length={length}");
+            } else {
+                assert_eq!(
+                    result.err().unwrap().to_string(),
+                    "http request line is too long"
+                );
+            }
+        }
+    }
+    for count in [MAX_HTTP_LINES - 1, MAX_HTTP_LINES] {
+        let bytes = request("/ws", &"X-Pad: x\r\n".repeat(count - 6));
+        let (mut peer, server) = tokio::io::duplex(8192);
+        peer.write_all(&bytes).await.unwrap();
+        let mut server: Box<dyn AsyncStream> = Box::new(server);
+        let result = ParsedHttpData::parse(&mut server).await;
+        if count < MAX_HTTP_LINES {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "http request is too long"
+            );
+        }
+    }
+}
+
 async fn accept(
     mut peer: Box<dyn AsyncStream>,
     max: usize,
@@ -107,12 +154,8 @@ async fn accept(
     if let Some(header) = header {
         assert_eq!(parsed.first_line, "GET /ws HTTP/1.1");
         assert_eq!(
-            parsed
-                .headers
-                .get(&header.to_ascii_lowercase())
-                .map(String::as_str)
-                .unwrap_or(""),
-            encoded
+            parsed.headers.get(&header.to_ascii_lowercase()),
+            (!encoded.is_empty()).then_some(&encoded)
         );
     } else {
         assert_eq!(parsed.first_line, format!("GET /ws{encoded} HTTP/1.1"));
@@ -215,6 +258,50 @@ async fn early_prefix_is_owned_and_split_exactly_once_for_all_carriers() {
 }
 
 #[tokio::test]
+async fn largest_validated_carriers_round_trip_above_the_automatic_cap() {
+    for header in [None, Some("X-Early-Data"), Some("Sec-WebSocket-Protocol")] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let headers = HashMap::from_iter([("Host".into(), "example.test".into())]);
+            let max = (2049..MAX_LINE)
+                .rev()
+                .find(|max| {
+                    crate::websocket::validate_early_data(
+                        Some("/ws"),
+                        Some(&headers),
+                        *max,
+                        header,
+                        false,
+                    )
+                    .is_ok()
+                })
+                .unwrap();
+            crate::websocket::validate_early_data(Some("/ws"), None, max, header, true).unwrap();
+            let (client, server) = tokio::io::duplex(65536);
+            let mut client =
+                EarlyWebsocketStream::new(Box::new(client), handshake_options(max, header));
+            let payload: Vec<_> = (0..max + 1).map(|i| (i * 131 + 255) as u8).collect();
+            assert_eq!(client.write(&payload).await.unwrap(), max);
+            let handler = WebsocketTcpServerHandler::new(vec![target("/ws", max, header)]);
+            let (result, sent) =
+                tokio::join!(handler.setup_server_stream(Box::new(server)), async {
+                    client.write_all(&payload[max..]).await.unwrap();
+                    client.flush().await
+                });
+            sent.unwrap();
+            let TcpServerSetupResult::TcpForward { mut stream, .. } = result.unwrap() else {
+                panic!()
+            };
+            let mut received = vec![0; payload.len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, payload);
+            assert!(futures::poll!(Box::pin(stream.read_u8())).is_pending());
+        })
+        .await
+        .unwrap_or_else(|_| panic!("carrier={header:?} timed out"));
+    }
+}
+
+#[tokio::test]
 async fn server_prefix_precedes_coalesced_frames_and_echoes_only_protocol_header() {
     for (max, header) in [
         (32, None),
@@ -253,16 +340,28 @@ async fn server_prefix_precedes_coalesced_frames_and_echoes_only_protocol_header
             };
             assert!(need_initial_flush);
             let mut peer: Box<dyn AsyncStream> = Box::new(peer);
-            let response = ParsedHttpData::parse(&mut peer).await.unwrap();
+            let response =
+                tokio::time::timeout(Duration::from_secs(5), ParsedHttpData::parse(&mut peer))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("upgrade timed out: max={max}, header={header:?}, length={length}")
+                    })
+                    .unwrap();
             assert_eq!(
                 response.headers.get("sec-websocket-protocol"),
                 (header == Some("Sec-WebSocket-Protocol") && length > 0).then_some(&encoded)
             );
             assert_eq!(stream.read(&mut []).await.unwrap(), 0);
             let expected = [prefix, tail].concat();
-            for byte in expected {
-                assert_eq!(stream.read_u8().await.unwrap(), byte);
-            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for byte in expected {
+                    assert_eq!(stream.read_u8().await.unwrap(), byte);
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("prefix read timed out: max={max}, header={header:?}, length={length}")
+            });
             assert!(futures::poll!(Box::pin(stream.read_u8())).is_pending());
         }
     }
@@ -273,7 +372,7 @@ async fn malformed_early_data_is_rejected_before_upgrade_without_fallback() {
     for encoded in [
         "a", "YQ=", "YQ==", "+w", "/w", "YR", "YQ,Yg", "Y Q", "YQ?x=1", "YWJjZGU",
     ] {
-        for header in [None, Some("Sec-WebSocket-Protocol")] {
+        for header in [None, Some("X-Early-Data"), Some("Sec-WebSocket-Protocol")] {
             let (mut peer, server) = tokio::io::duplex(8192);
             peer.write_all(&early_request(header, encoded))
                 .await
@@ -286,15 +385,25 @@ async fn malformed_early_data_is_rejected_before_upgrade_without_fallback() {
             assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
         }
     }
-    for extra in [
-        "Sec-WebSocket-Protocol: YQ\r\nsec-websocket-protocol: Yg\r\n",
-        "Sec-WebSocket-Protocol: YQ\r\nHost: other.test\r\n",
-        "Sec-WebSocket-Protocol: YQ\r\nSec-WebSocket-Key: duplicate\r\n",
+    for (header, extra) in [
+        ("X-Early-Data", "X-Early-Data: YQ\r\nx-early-data: Yg\r\n"),
+        (
+            "Sec-WebSocket-Protocol",
+            "Sec-WebSocket-Protocol: YQ\r\nsec-websocket-protocol: Yg\r\n",
+        ),
+        (
+            "Sec-WebSocket-Protocol",
+            "Sec-WebSocket-Protocol: YQ\r\nHost: other.test\r\n",
+        ),
+        (
+            "Sec-WebSocket-Protocol",
+            "Sec-WebSocket-Protocol: YQ\r\nSec-WebSocket-Key: duplicate\r\n",
+        ),
     ] {
         let (mut peer, server) = tokio::io::duplex(8192);
         peer.write_all(&request("/ws", extra)).await.unwrap();
         assert!(
-            WebsocketTcpServerHandler::new(vec![target("/ws", 4, Some("Sec-WebSocket-Protocol"))])
+            WebsocketTcpServerHandler::new(vec![target("/ws", 4, Some(header))])
                 .setup_server_stream(Box::new(server))
                 .await
                 .is_err()
@@ -329,6 +438,116 @@ async fn overlapping_targets_reject_explicit_early_data_but_plain_routing_stays_
     let handler =
         WebsocketTcpServerHandler::new(vec![target("/ws", 32, None), target("/wsYQ", 0, None)]);
     assert!(handler.setup_server_stream(Box::new(server)).await.is_err());
+}
+
+#[tokio::test]
+async fn structural_matching_precedes_decoding_and_only_candidates_are_ambiguous() {
+    for excluded_by in [None, Some("path"), Some("header")] {
+        let mut first = target("/ws", 32, None);
+        if excluded_by == Some("path") {
+            first.matching_path = Some("/other".into());
+        } else if excluded_by == Some("header") {
+            first.matching_headers =
+                Some(FxHashMap::from_iter([("x-route".into(), "other".into())]));
+        }
+        let (mut peer, server) = tokio::io::duplex(8192);
+        // The suffix matches structurally but is not canonical base64url.
+        let mut bytes = request("/ws/admin", "");
+        bytes.extend(frame(b"tail"));
+        peer.write_all(&bytes).await.unwrap();
+        let result = WebsocketTcpServerHandler::new(vec![first, target("/ws/admin", 0, None)])
+            .setup_server_stream(Box::new(server))
+            .await;
+        if excluded_by.is_none() {
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "ambiguous WebSocket early data target"
+            );
+            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        } else {
+            let TcpServerSetupResult::TcpForward { mut stream, .. } = result.unwrap() else {
+                panic!()
+            };
+            let mut received = [0; 4];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&received, b"tail");
+        }
+    }
+}
+
+#[tokio::test]
+async fn server_factory_preserves_mixed_case_selectors_and_explicit_carrier_limits() {
+    use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
+    use serde_json::json;
+
+    for (max, token) in [(0, "chat"), (0, "YQ"), (4, "YQ"), (4, "YWJjZGU")] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut selected = json!({"matching_path": "/ws", "max_early_data": max,
+                "protocol": {"type": "forward", "targets": "127.0.0.1:81"}});
+            let header = if max == 0 {
+                selected["matching_headers"] = json!({"Sec-WebSocket-Protocol": token});
+                "Sec-WebSocket-Protocol"
+            } else {
+                selected["early_data_header_name"] = "X-Early".into();
+                "x-EARLY"
+            };
+            let config = json!({"type": "ws", "targets": [selected,
+                {"matching_path": if max == 0 { "/ws" } else { "/other" },
+                    "protocol": {"type": "forward", "targets": "127.0.0.1:80"}}
+            ]});
+            let resolver: Arc<dyn crate::resolver::Resolver> =
+                Arc::new(crate::resolver::NativeResolver::new());
+            let handler = create_tcp_server_handler(
+                serde_json::from_value(config).unwrap(),
+                &Arc::new(ClientProxySelector::new(vec![])),
+                &resolver,
+                None,
+            )
+            .unwrap();
+            let (mut peer, server) = tokio::io::duplex(8192);
+            let mut bytes = request(
+                "/ws",
+                &format!("{header}: {token}\r\nX-Other: a\r\nx-other: b\r\n"),
+            );
+            bytes.extend(frame(b"tail"));
+            peer.write_all(&bytes).await.unwrap();
+            let result = handler.setup_server_stream(Box::new(server)).await;
+            if token == "YWJjZGU" {
+                assert_eq!(
+                    result.err().unwrap().to_string(),
+                    "WebSocket early data exceeds configured limit"
+                );
+                assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+                return;
+            }
+            let TcpServerSetupResult::TcpForward {
+                mut stream,
+                remote_location,
+                ..
+            } = result.unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(remote_location.port(), 81);
+            let expected = if max == 0 {
+                b"tail".as_slice()
+            } else {
+                b"atail"
+            };
+            let mut received = vec![0; expected.len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            assert!(futures::poll!(Box::pin(stream.read_u8())).is_pending());
+            let mut peer: Box<dyn AsyncStream> = Box::new(peer);
+            let response = ParsedHttpData::parse(&mut peer).await.unwrap();
+            assert!(!response.headers.contains_key("sec-websocket-protocol"));
+        })
+        .await
+        .unwrap_or_else(|_| panic!("max={max}, token={token} timed out"));
+    }
 }
 
 #[tokio::test]
@@ -370,7 +589,15 @@ async fn automatic_early_data_rejects_invalid_oversized_and_duplicate_headers_be
             "Sec-WebSocket-Protocol: {first}\r\nsEc-WeBsOcKeT-pRoToCoL: {last}\r\n"
         ));
     }
-    for duplicate in ["Host: other.test", "Sec-WebSocket-Key: duplicate"] {
+    for duplicate in [
+        "Host: other.test",
+        "Sec-WebSocket-Key: duplicate",
+        "Connection: Upgrade",
+        "Upgrade: websocket",
+        "Sec-WebSocket-Version: 13",
+        "Content-Length: 0\r\ncontent-length: 0",
+        "Transfer-Encoding: chunked\r\ntransfer-encoding: chunked",
+    ] {
         extras.push(format!("Sec-WebSocket-Protocol: YQ\r\n{duplicate}\r\n"));
     }
     for catch_all in [false, true] {
@@ -458,7 +685,12 @@ async fn automatic_routing_preserves_static_selectors_and_rejects_ambiguous_data
                 b"atail"
             };
             let mut received = vec![0; expected.len()];
-            stream.read_exact(&mut received).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("selector_first={selector_first:?}, extra={extra:?} timed out")
+                })
+                .unwrap();
             assert_eq!(received, expected);
             let mut peer: Box<dyn AsyncStream> = Box::new(peer);
             let response = ParsedHttpData::parse(&mut peer).await.unwrap();
@@ -577,6 +809,153 @@ async fn cancelled_reader_does_not_steal_handshake_writer_wakeup() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn independently_scheduled_split_halves_finish_upgrades_and_failures() {
+    use std::future::Future;
+    use tokio::sync::oneshot;
+
+    async fn notify_first_pending<F: Future>(
+        operation: F,
+        pending: oneshot::Sender<()>,
+    ) -> F::Output {
+        let mut operation = Box::pin(operation);
+        let mut pending = Some(pending);
+        std::future::poll_fn(|cx| {
+            let result = operation.as_mut().poll(cx);
+            if result.is_pending()
+                && let Some(sender) = pending.take()
+            {
+                sender.send(()).unwrap();
+            }
+            result
+        })
+        .await
+    }
+
+    for case in ["success", "bad-status", "eof", "timeout", "cancel-reader"] {
+        let (client, peer) = tokio::io::duplex(8192);
+        let mut stream = EarlyWebsocketStream::new(Box::new(client), handshake_options(32, None));
+        stream.write_all(b"early").await.unwrap();
+        let (mut read, mut write) = tokio::io::split(stream);
+        let (reader_pending, reader_ready) = oneshot::channel();
+        let (writer_pending, writer_ready) = oneshot::channel();
+        let reader = tokio::spawn(async move {
+            let mut banner = [0; 6];
+            notify_first_pending(read.read_exact(&mut banner), reader_pending).await?;
+            assert_eq!(&banner, b"banner");
+            io::Result::Ok(())
+        });
+        let writer = tokio::spawn(async move {
+            notify_first_pending(write.write_all(b"tail"), writer_pending).await?;
+            write.shutdown().await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            reader_ready.await.unwrap();
+            writer_ready.await.unwrap();
+        })
+        .await
+        .unwrap();
+        if case == "cancel-reader" {
+            reader.abort();
+        }
+        let mut peer: Box<dyn AsyncStream> = Box::new(peer);
+        let mut websocket = None;
+        let mut silent_peer = None;
+        if matches!(case, "success" | "cancel-reader") {
+            let mut ws =
+                tokio::time::timeout(Duration::from_secs(5), accept(peer, 32, None, b"early"))
+                    .await
+                    .unwrap();
+            ws.write_all(b"banner").await.unwrap();
+            ws.flush().await.unwrap();
+            websocket = Some(ws);
+        } else {
+            let request =
+                tokio::time::timeout(Duration::from_secs(5), ParsedHttpData::parse(&mut peer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(request.first_line, "GET /wsZWFybHk HTTP/1.1");
+            match case {
+                "bad-status" => peer
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                    .await
+                    .unwrap(),
+                "timeout" => tokio::time::advance(crate::util::STREAM_SETUP_TIMEOUT).await,
+                _ => (),
+            }
+            if case == "timeout" {
+                silent_peer = Some(peer);
+            } else {
+                drop(peer);
+            }
+        }
+        // A deadline around the task handles cannot rescue a lost operation wakeup.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let read = reader.await;
+            let write = writer.await.unwrap();
+            if matches!(case, "success" | "cancel-reader") {
+                if case == "cancel-reader" {
+                    assert!(read.unwrap_err().is_cancelled());
+                } else {
+                    read.unwrap().unwrap();
+                }
+                write.unwrap();
+                let mut tail = Vec::new();
+                websocket
+                    .as_mut()
+                    .unwrap()
+                    .read_to_end(&mut tail)
+                    .await
+                    .unwrap();
+                assert_eq!(tail, b"tail");
+            } else {
+                let read = read.unwrap().unwrap_err();
+                let write = write.unwrap_err();
+                assert_eq!(read.kind(), write.kind(), "{case}");
+                assert_eq!(read.to_string(), write.to_string(), "{case}");
+                if case == "timeout" {
+                    assert_eq!(read.kind(), io::ErrorKind::TimedOut);
+                }
+                if case == "bad-status" {
+                    assert_eq!(read.to_string(), "Bad websocket response status");
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("split upgrade {case} timed out"));
+        drop(silent_peer);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_time_and_noop_operations_do_not_start_the_upgrade_deadline() {
+    let (client, mut peer) = tokio::io::duplex(8192);
+    let mut options = handshake_options(32, Some("Sec-WebSocket-Protocol"));
+    Arc::get_mut(&mut options).unwrap().ping_type = WebsocketPingType::Disabled;
+    let mut stream = EarlyWebsocketStream::new(Box::new(client), options);
+    assert_eq!(
+        stream
+            .write_vectored(&[io::IoSlice::new(&[])])
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        !std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_ping(cx))
+            .await
+            .unwrap()
+    );
+    tokio::time::advance(crate::util::STREAM_SETUP_TIMEOUT + Duration::from_secs(1)).await;
+    assert!(futures::poll!(Box::pin(peer.read_u8())).is_pending());
+    stream.write_all(b"early").await.unwrap();
+    let (result, _peer) = tokio::join!(
+        stream.flush(),
+        accept(Box::new(peer), 32, Some("Sec-WebSocket-Protocol"), b"early")
+    );
+    result.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn upgrade_deadline_and_failures_are_sticky() {
     let (client, _peer) = tokio::io::duplex(8192);
     let mut stream = EarlyWebsocketStream::new(Box::new(client), handshake_options(32, None));
@@ -604,7 +983,9 @@ async fn upgrade_deadline_and_failures_are_sticky() {
 async fn client_rejects_bad_status_accept_and_subprotocol_but_accepts_absent_or_exact_echo() {
     for case in [
         "status",
+        "version",
         "accept",
+        "missing-accept",
         "protocol",
         "duplicate",
         "duplicate-protocol",
@@ -644,14 +1025,25 @@ async fn client_rejects_bad_status_accept_and_subprotocol_but_accepts_absent_or_
                 ),
                 _ => String::new(),
             };
+            let version = if case == "version" {
+                "HTTP/2"
+            } else {
+                "HTTP/1.1"
+            };
+            let accept_header = if case == "missing-accept" {
+                String::new()
+            } else {
+                format!("Sec-WebSocket-Accept: {accept}\r\n")
+            };
             let mut response = format!(
                 concat!(
-                    "HTTP/1.1 {status} Switching Protocols\r\n",
-                    "Sec-WebSocket-Accept: {accept}\r\n",
+                    "{version} {status} Switching Protocols\r\n",
+                    "{accept_header}",
                     "{extra}\r\n",
                 ),
                 status = status,
-                accept = accept,
+                version = version,
+                accept_header = accept_header,
                 extra = extra,
             )
             .into_bytes();
@@ -661,10 +1053,23 @@ async fn client_rejects_bad_status_accept_and_subprotocol_but_accepts_absent_or_
         if matches!(case, "none" | "echo") {
             stream.flush().await.unwrap();
             let mut received = vec![0; 24000];
-            stream.read_exact(&mut received).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+                .await
+                .unwrap_or_else(|_| panic!("response read timed out: {case}"))
+                .unwrap();
             assert_eq!(received, vec![0x33; 24000]);
         } else {
             let first = stream.flush().await.unwrap_err().to_string();
+            let expected = match case {
+                "status" | "version" => "Bad websocket response status",
+                "accept" => "incorrect websocket key response",
+                "missing-accept" => "missing websocket key response",
+                "protocol" => "unexpected WebSocket subprotocol",
+                "duplicate" | "duplicate-protocol" => "duplicate WebSocket response header",
+                "eof" => "EOF while reading",
+                _ => unreachable!(),
+            };
+            assert!(first.contains(expected), "{case}: {first}");
             assert_eq!(stream.flush().await.unwrap_err().to_string(), first);
             assert_eq!(stream.write(b"later").await.unwrap_err().to_string(), first);
         }
@@ -750,27 +1155,29 @@ impl TcpClientHandler for ReadFirstClient {
 
 #[tokio::test]
 async fn read_first_inner_setup_and_destination_early_data_are_preserved() {
-    let (client, peer) = tokio::io::duplex(8192);
-    let handler = WebsocketTcpClientHandler {
-        handshake: handshake_options(32, None),
-        handler: Box::new(ReadFirstClient),
-    };
-    let task = tokio::spawn(async move {
-        let mut peer = accept(Box::new(peer), 32, None, &[]).await;
-        peer.write_all(b"banner").await.unwrap();
-        peer.flush().await.unwrap();
-        peer
-    });
-    let location = crate::address::NetLocation::from_ip_addr("127.0.0.1".parse().unwrap(), 80);
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        handler.setup_client_tcp_stream(Box::new(client), ResolvedLocation::new(location)),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(result.early_data.as_deref(), Some(b"banner".as_slice()));
-    task.await.unwrap();
+    for header in [None, Some("Sec-WebSocket-Protocol")] {
+        let (client, peer) = tokio::io::duplex(8192);
+        let handler = WebsocketTcpClientHandler {
+            handshake: handshake_options(32, header),
+            handler: Box::new(ReadFirstClient),
+        };
+        let task = tokio::spawn(async move {
+            let mut peer = accept(Box::new(peer), 32, header, &[]).await;
+            peer.write_all(b"banner").await.unwrap();
+            peer.flush().await.unwrap();
+            peer
+        });
+        let location = crate::address::NetLocation::from_ip_addr("127.0.0.1".parse().unwrap(), 80);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            handler.setup_client_tcp_stream(Box::new(client), ResolvedLocation::new(location)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.early_data.as_deref(), Some(b"banner".as_slice()));
+        task.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -806,7 +1213,10 @@ async fn automatic_and_explicit_servers_only_prepend_nonempty_data() {
             b"framed"
         };
         let mut data = vec![0; expected.len()];
-        stream.read_exact(&mut data).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut data))
+            .await
+            .unwrap_or_else(|_| panic!("prefix read timed out: max={max}, extra={extra:?}"))
+            .unwrap();
         assert_eq!(data, expected);
         let mut peer: Box<dyn AsyncStream> = Box::new(peer);
         let response = ParsedHttpData::parse(&mut peer).await.unwrap();

@@ -311,10 +311,19 @@ mod tests {
             let config: crate::config::ClientProxyConfig = serde_json::from_value(value).unwrap();
             let serialized = serde_json::to_value(config).unwrap();
             assert_eq!(serialized.get("max_early_data").is_some(), enabled);
-            assert_eq!(serialized.get("early_data_header_name").is_some(), enabled);
+            assert_eq!(
+                serialized
+                    .get("early_data_header_name")
+                    .and_then(|v| v.as_str()),
+                enabled.then_some("Sec-WebSocket-Protocol")
+            );
             let config: crate::config::WebsocketServerConfig =
                 serde_json::from_value(serialized).unwrap();
             assert_eq!(config.max_early_data, if enabled { 2048 } else { 0 });
+            assert_eq!(
+                config.early_data_header_name.as_deref(),
+                enabled.then_some("Sec-WebSocket-Protocol")
+            );
             assert_eq!(
                 serde_json::to_value(config)
                     .unwrap()
