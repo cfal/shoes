@@ -2,6 +2,24 @@
 
 shoes is a high-performance multi-protocol proxy server written in Rust.
 
+Documentation: [shoes-rs.github.io](https://shoes-rs.github.io/) for installation,
+configuration, protocol reference, CLI usage, and complete examples.
+
+## Quick start
+
+With Shoes installed, validate and run the loopback-only SOCKS5 example from
+this checkout:
+
+```sh
+shoes check examples/quickstart_socks.yaml
+shoes examples/quickstart_socks.yaml
+```
+
+See the [first-configuration guide](https://shoes-rs.github.io/start/first-config/),
+[CLI reference](https://shoes-rs.github.io/operations/cli/), and
+[copyable example catalog](https://shoes-rs.github.io/start/examples/). The
+[tracked YAML files](examples/) are the source of those example pages.
+
 ## Supported Protocols
 
 ### Proxy Protocols
@@ -309,233 +327,6 @@ Set `SHOES_TEST_WG_BIN` to an absolute path to override `wg`.
 ```sh
 CARGO_BUILD_JOBS=1 cargo test --locked --features privileged-tests --test privileged wireguard_kernel:: -- --test-threads=1
 ```
-
-## Usage
-
-```
-shoes [OPTIONS] <config.yaml> [config.yaml...]
-
-OPTIONS:
-    -t, --threads NUM    Set the number of worker threads (default: CPU count)
-    -d, --dry-run        Validate the config and certificates, then exit
-    --no-reload          Disable automatic config reloading on file changes
-
-COMMANDS:
-    check <config.yaml>                       Alias for --dry-run
-    version                                  Alias for --version
-    generate-reality-keypair                  Generate a new Reality X25519 keypair
-    generate-reality-mldsa65-keypair           Generate optional Reality ML-DSA-65 keys
-    generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password
-```
-
-### Examples
-```bash
-# Run with a single config file
-shoes config.yaml
-
-# Run with multiple config files
-shoes server1.yaml server2.yaml rules.yaml
-
-# Run with custom thread count
-shoes --threads 8 config.yaml
-
-# Validate configuration without starting
-shoes --dry-run config.yaml
-
-# Run without hot-reloading
-shoes --no-reload config.yaml
-
-# Generate Reality keypair
-shoes generate-reality-keypair
-
-# Generate Shadowsocks 2022 cipher password
-shoes generate-shadowsocks-2022-password 2022-blake3-aes-256-gcm
-```
-
-## Configuration
-
-See the [configuration documentation](https://shoes-rs.github.io/) for guides, protocol-specific reference pages, and copyable examples. [CONFIG.md](./CONFIG.md) is a short source index.
-
-## Examples
-
-See the [examples](./examples) directory for all examples.
-
-### Basic VMess Server
-```yaml
-- address: 0.0.0.0:16823
-  protocol:
-    type: vmess
-    cipher: chacha20-poly1305
-    user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
-    udp_enabled: true
-```
-
-### VLESS with Vision over TLS
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: tls
-    tls_targets:
-      "vless.example.com":
-        cert: cert.pem
-        key: key.pem
-        vision: true
-        alpn_protocols: ["http/1.1"]
-        protocol:
-          type: vless
-          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-          udp_enabled: true
-```
-
-### Native VLESS Encryption
-
-See the [VLESS Encryption reference](https://shoes-rs.github.io/protocols/vless-encryption/)
-for credential generation, native Vision composition, resumption limits, and
-rollback considerations.
-
-### Reality Server
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: tls
-    reality_targets:
-      "www.example.com":
-        private_key: "YOUR_BASE64URL_PRIVATE_KEY"
-        short_ids: ["0123456789abcdef", ""]
-        dest: "www.example.com:443"
-        protocol:
-          type: vless
-          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-          udp_enabled: true
-```
-
-### Reality Client
-```yaml
-- address: 127.0.0.1:1080
-  protocol:
-    type: socks
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain:
-        address: "server.example.com:443"
-        protocol:
-          type: reality
-          public_key: "SERVER_PUBLIC_KEY"
-          short_id: "0123456789abcdef"
-          sni_hostname: "www.example.com"
-          protocol:
-            type: vless
-            user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-```
-
-### Hysteria2 Server
-Hysteria2 and TUIC also support native QUIC clients with TCP and UDP. See
-[Hysteria2 client configuration](https://shoes-rs.github.io/protocols/hysteria2/) and
-[runnable client examples](examples/quic_clients.yaml). Hysteria2 clients support
-Salamander and port hopping; TUIC clients support both UDP relay modes.
-
-```yaml
-- address: 0.0.0.0:443
-  transport: quic
-  quic_settings:
-    cert: cert.pem
-    key: key.pem
-    alpn_protocols: ["h3"]
-  protocol:
-    type: hysteria2
-    password: supersecret
-    udp_enabled: true
-```
-
-### TUIC v5 Server
-```yaml
-- address: 0.0.0.0:443
-  transport: quic
-  quic_settings:
-    cert: cert.pem
-    key: key.pem
-  protocol:
-    type: tuic
-    uuid: d685aef3-b3c4-4932-9a9d-d0c2f6727dfa
-    password: supersecret
-```
-
-### Mixed HTTP/SOCKS5 Server
-```yaml
-- address: 0.0.0.0:7890
-  protocol:
-    type: mixed
-    username: myuser
-    password: mypassword
-```
-
-### AnyTLS Server
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: tls
-    tls_targets:
-      "anytls.example.com":
-        cert: cert.pem
-        key: key.pem
-        protocol:
-          type: anytls
-          users:
-            - name: user1
-              password: secret123
-          udp_enabled: true
-```
-
-### NaiveProxy Server
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: tls
-    tls_targets:
-      "naive.example.com":
-        cert: cert.pem
-        key: key.pem
-        alpn_protocols: ["h2"]
-        protocol:
-          type: naiveproxy
-          users:
-            - username: user1
-              password: secret123
-          padding: true
-```
-
-### TUN VPN
-```yaml
-- device_name: tun0
-  address: 10.0.0.1
-  netmask: 255.255.255.0
-  mtu: 1500
-  tcp_enabled: true
-  udp_enabled: true
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain:
-        address: "proxy.example.com:443"
-        protocol:
-          type: tls
-          protocol:
-            type: vless
-            user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-```
-
-On created Linux devices, TCPv4 transmit segmentation offload is selected
-automatically when available. IPv6 continues using ordinary MTU-sized packets;
-the configured MTU and TCP buffer sizes are unchanged. Set
-`segmentation_offload: false` to disable it, or `true` to require it at startup.
-Explicit enablement is not supported with `device_fd`, packet-information
-headers, or non-Linux devices. Automatic setup falls back to ordinary packets
-if offload initialization fails.
-
-### XHTTP / SplitHTTP
-
-See the [XHTTP configuration reference](https://shoes-rs.github.io/protocols/xhttp/) for modes, limits, placement, and complete examples.
 
 ## Similar Projects
 
