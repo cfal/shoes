@@ -6,32 +6,70 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 
 	anytls "github.com/sagernet/sing-anytls"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 )
 
 type handler struct{}
 
 func (handler) NewConnectionEx(ctx context.Context, conn net.Conn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	defer conn.Close()
-	if destination.Fqdn == "sp.v2.udp-over-tcp.arpa" {
-		var connect [1]byte
-		if _, err := io.ReadFull(conn, connect[:]); err != nil {
-			return
+	if destination.Fqdn == uot.MagicAddress {
+		if err := relayUDP(conn); err != nil {
+			fmt.Fprintln(os.Stderr, err)
 		}
-		if connect[0] != 1 {
-			return
-		}
-		if _, err := M.SocksaddrSerializer.ReadAddrPort(conn); err != nil {
-			return
-		}
+		return
 	}
 	if err := N.ReportHandshakeSuccess(conn); err != nil {
 		return
 	}
 	io.Copy(conn, conn)
+}
+
+func relayUDP(conn net.Conn) error {
+	request, err := uot.ReadRequest(conn)
+	if err != nil {
+		return err
+	}
+	if !request.IsConnect || !request.Destination.Addr.IsLoopback() {
+		return fmt.Errorf("fixture requires connected UoT to a loopback address")
+	}
+	remote, err := net.DialUDP("udp", nil, request.Destination.UDPAddr())
+	if err != nil {
+		return err
+	}
+	defer remote.Close()
+	if err := N.ReportHandshakeSuccess(conn); err != nil {
+		return err
+	}
+	packets := uot.NewConn(conn, *request)
+	buffer := make([]byte, 65535)
+	for {
+		n, err := packets.Read(buffer)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := remote.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			return err
+		}
+		if _, err := remote.Write(buffer[:n]); err != nil {
+			return err
+		}
+		n, err = remote.Read(buffer)
+		if err != nil {
+			return err
+		}
+		if _, err := packets.Write(buffer[:n]); err != nil {
+			return err
+		}
+	}
 }
 
 func main() {
