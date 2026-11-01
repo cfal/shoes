@@ -241,6 +241,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_distinguishes_routes_with_shared_prefix_identities() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let keys = [vec![1], vec![1, 2], vec![1, 2, 3], vec![1, 2, 4]];
+        let mut peers = Vec::new();
+        let mut sessions = Vec::new();
+        for key in &keys {
+            let (client, peer) = tokio::io::duplex(8192);
+            peers.push(peer);
+            let mut transport = transport(0, Some(client));
+            transport.route = Arc::new(Route(RouteKey(key.clone())));
+            let session = handler.session_for(transport).await.unwrap();
+            assert!(
+                sessions
+                    .iter()
+                    .all(|previous: &NaiveClientSession| !previous.same_generation(&session))
+            );
+            sessions.push(session);
+        }
+        assert_eq!(handler.sessions.lock().len(), keys.len());
+        for index in [3, 0, 2, 1, 3] {
+            let mut transport = transport(0, None);
+            transport.route = Arc::new(Route(RouteKey(keys[index].clone())));
+            let warm = handler.session_for(transport).await.unwrap();
+            assert!(sessions[index].same_generation(&warm));
+        }
+    }
+
+    #[tokio::test]
     async fn insertion_prunes_all_closed_sessions_before_evicting_a_live_path() {
         let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
         let mut peers = Vec::new();
