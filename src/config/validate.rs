@@ -101,7 +101,7 @@ pub(super) fn create_server_configs_with_memory(
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
-    let mut default_dns = None;
+    let mut global_default_dns = None;
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<
         String,
@@ -166,7 +166,7 @@ pub(super) fn create_server_configs_with_memory(
                     ));
                 }
                 limits.validate()?;
-                default_dns = settings.default_dns;
+                global_default_dns = settings.default_dns;
             }
             Config::ClientConfigGroup(group) => {
                 if raw_client_groups
@@ -296,9 +296,10 @@ pub(super) fn create_server_configs_with_memory(
         )?;
     }
 
-    // Normalizes once so inherited fake DNS shares a stable persisted pool owner.
+    // Runs after inbound extraction to preserve inline numbering. Normalizing once
+    // gives inherited fake DNS a shared, stable persisted pool owner.
     extract_inline_dns(
-        &mut default_dns,
+        &mut global_default_dns,
         &mut dns_groups,
         &mut inline_dns_counter,
         "global_settings",
@@ -310,7 +311,7 @@ pub(super) fn create_server_configs_with_memory(
         .chain(tun_configs.iter_mut().map(|tun| &mut tun.dns))
     {
         if dns.is_none() {
-            *dns = default_dns.clone();
+            *dns = global_default_dns.clone();
         }
     }
 
@@ -362,7 +363,11 @@ pub(super) fn create_server_configs_with_memory(
     // Expand and validate DNS specs (client chains, protocol compatibility).
     let mut final_dns_groups: Vec<ExpandedDnsGroup> = Vec::new();
     let group_names: HashSet<&str> = expanded_dns_groups.keys().map(|s| s.as_str()).collect();
-    validate_dns_group_ref(&default_dns, &group_names, "global_settings.default_dns")?;
+    validate_dns_group_ref(
+        &global_default_dns,
+        &group_names,
+        "global_settings.default_dns",
+    )?;
 
     for name in dns_group_order {
         let specs = expanded_dns_groups.get(&name).unwrap();
