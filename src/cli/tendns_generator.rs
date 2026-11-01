@@ -7,6 +7,7 @@ use tendns::{
 use zeroize::Zeroizing;
 
 pub(super) fn generate(args: &[String]) -> Result<String> {
+    // Discards VarError, which can include the secret value.
     let key = Zeroizing::new(
         std::env::var("TENDNS_KEY")
             .map_err(|_| anyhow::anyhow!("TENDNS_KEY must be set to an unpadded base64url key"))?,
@@ -47,10 +48,12 @@ fn generate_at(args: &[String], encoded_key: &str, issued_at: u64) -> Result<Str
 }
 
 fn parse_entry(text: &str) -> Result<Entry> {
-    let mut parts = text.splitn(3, ':');
-    let label = parts.next().context("entry must be LABEL:TYPE:VALUE")?;
-    let kind = parts.next().context("entry must be LABEL:TYPE:VALUE")?;
-    let value = parts.next().context("entry must be LABEL:TYPE:VALUE")?;
+    let (label, rest) = text
+        .split_once(':')
+        .context("entry must be LABEL:TYPE:VALUE")?;
+    let (kind, value) = rest
+        .split_once(':')
+        .context("entry must be LABEL:TYPE:VALUE")?;
     Ok(Entry {
         subdomain: if label == "@" {
             String::new()
@@ -143,7 +146,10 @@ mod tests {
             "--name",
             "--unknown value",
             "--name example.com --name other.test --entry @:A:192.0.2.7",
+            "--name example.com --entry nas",
+            "--name example.com --entry :",
             "--name example.com --entry nas:A",
+            "--name example.com --entry nas:A:",
             "--name example.com --entry :A:192.0.2.7",
             "--name example.com --entry nas:MX:mail.test",
             "--name example.com --entry nas:A:2001:db8::1",

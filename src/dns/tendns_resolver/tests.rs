@@ -105,15 +105,16 @@ fn policy() -> Arc<Policy> {
 }
 
 fn adapter(raw: Arc<Mock>, clock: Arc<Clock>) -> TendnsResolver {
+    let policy = policy();
     let mut adapter = TendnsResolver::new(
-        policy(),
+        policy.clone(),
         raw.clone(),
         IpStrategy::Ipv4AndIpv6,
         Duration::from_secs(5),
     )
     .unwrap();
     adapter.private = Arc::new(tendns::Resolver::with_clock(
-        policy(),
+        policy,
         Arc::new(RawExchange(raw)),
         clock,
     ));
@@ -147,21 +148,11 @@ fn location(host: &str) -> NetLocation {
 }
 
 fn native_addresses(port: u16) -> Vec<SocketAddr> {
-    let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
-        "fe80::1".parse().unwrap(),
-        port,
-        7,
-        42,
-    ));
+    let scoped = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), port, 7, 42));
     vec![
         scoped,
         SocketAddr::new("192.0.2.99".parse().unwrap(), port),
-        SocketAddr::V6(std::net::SocketAddrV6::new(
-            "fe80::2".parse().unwrap(),
-            port,
-            9,
-            43,
-        )),
+        SocketAddr::V6(SocketAddrV6::new("fe80::2".parse().unwrap(), port, 9, 43)),
         scoped,
     ]
 }
@@ -224,6 +215,7 @@ async fn unrelated_native_names_preserve_case_form_order_duplicates_and_scope() 
     for host in [
         "MiXeD",
         "Public.Example.",
+        "[2001:db8::1]",
         "[fe80::1%42]",
         "fe80::1%42",
         "192.0.2.7",
@@ -311,6 +303,7 @@ async fn invalid_hostnames_fail_closed_before_native_or_txt_work() {
         "fe80::1%",
         "fe80::1%4294967296",
         "[fe80::1%42",
+        "[2001:db8::1]:443",
     ] {
         let error = adapter.resolve_location(&location(host)).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{host:?}");
@@ -459,18 +452,14 @@ async fn publication_caches_are_isolated_and_completed_addresses_do_not_outlive_
     assert_eq!(
         a.resolve_location(&location("nas.example.com"))
             .await
-            .unwrap()[0]
-            .ip()
-            .to_string(),
-        "192.0.2.1"
+            .unwrap(),
+        vec!["192.0.2.1:443".parse().unwrap()]
     );
     assert_eq!(
         b.resolve_location(&location("nas.example.com"))
             .await
-            .unwrap()[0]
-            .ip()
-            .to_string(),
-        "192.0.2.2"
+            .unwrap(),
+        vec!["192.0.2.2:443".parse().unwrap()]
     );
     clock.0.store(200, Ordering::SeqCst);
     assert!(

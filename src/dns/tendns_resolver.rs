@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -149,17 +149,7 @@ impl Resolver for TendnsResolver {
                 ))
             });
         }
-        if host.parse::<std::net::IpAddr>().is_ok()
-            || (host.starts_with('[')
-                && location
-                    .to_string()
-                    .parse::<std::net::SocketAddrV6>()
-                    .is_ok())
-            || (host.contains('%')
-                && format!("[{host}]:0")
-                    .parse::<std::net::SocketAddrV6>()
-                    .is_ok())
-        {
+        if is_ip_literal(host) {
             return self.raw.resolve_location(location);
         }
         // Normalizes UTS 46 separators before Hickory splits the name into labels.
@@ -216,6 +206,12 @@ impl Resolver for TendnsResolver {
     fn exchange_with_deadline(&self, bytes: Vec<u8>, deadline: Instant) -> DnsExchangeFuture {
         self.exchange_inner(bytes, Some(deadline))
     }
+}
+
+fn is_ip_literal(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok()
+        || (host.starts_with('[') && format!("{host}:0").parse::<SocketAddrV6>().is_ok())
+        || (host.contains('%') && format!("[{host}]:0").parse::<SocketAddrV6>().is_ok())
 }
 
 fn check_deadline(deadline: Instant) -> io::Result<()> {
