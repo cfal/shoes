@@ -22,6 +22,7 @@ COMMANDS:
   generate-shadowsocks-2022-password <cipher>    Generate Shadowsocks 2022 password
   generate-vless-user-id                         Generate a VLESS/VMess UUID v4
   generate-vless-encryption [options]            Generate matched VLESS encryption credentials
+  generate-tendns-txt [options]                  Generate an encrypted tendns TXT value
 ```
 
 `generate-vless-encryption` accepts repeated `--auth x25519|mlkem768`,
@@ -31,6 +32,46 @@ SIGHUP reloads configuration even with `--no-reload`; SIGINT/SIGTERM stop
 listeners without waiting for the TCP reload drain.
 
 `check` and `--dry-run` exit with status 0 for valid configuration and 1 for errors. They do not open listeners, create a file watcher, or perform DNS bootstrap networking. Runtime failures such as unavailable bind addresses remain possible after a successful check.
+
+### Tendns TXT Generation
+
+[Tendns](https://github.com/cfal/tendns) is a Rust library and DNS forwarder for
+publishing encrypted A, AAAA, and CNAME entries in ordinary DNS TXT records.
+A tendns-aware resolver uses a shared discovery key to decrypt them and resolve
+the published names.
+
+`generate-tendns-txt` creates an encrypted TXT publication offline, without a
+Shoes configuration file or DNS-provider access. Supply an existing 32-byte
+unpadded base64url discovery key through `TENDNS_KEY`, not a command-line option.
+
+```bash
+read -r -s -p 'Tendns key: ' TENDNS_KEY
+export TENDNS_KEY
+shoes generate-tendns-txt \
+  --name example.com \
+  --entry nas:A:192.0.2.10 \
+  --entry nas:AAAA:2001:db8::10 \
+  --entry web:CNAME:service.example.net \
+  --valid-for-secs 86400
+unset TENDNS_KEY
+```
+
+`--name` is the public TXT owner. Each repeatable `--entry LABEL:TYPE:VALUE`
+adds an A, AAAA, or CNAME entry; use `@` for the owner itself or a single label
+such as `nas` for `nas.example.com`. A CNAME must be the only entry for its name.
+The default validity is 86,400 seconds from generation, independent of DNS TTL.
+Regenerate the publication before it expires.
+
+Standard output contains only the encrypted `td1.` value. Publish that value as
+TXT at the specified owner using your DNS provider. Values longer than 255 bytes
+must be split into adjacent strings within **one TXT record**, without adding
+spaces to the data or creating separate records for the fragments.
+
+The value represents a whole publication, not an update to an existing one.
+Replace or remove the old `td1.` value when updating; merely adding the new value
+alongside it leaves both active. An invalid or expired value makes the lookup
+fail even when another value at the same owner is valid. Generation does not
+enable tendns resolution in Shoes; runtime activation is not available yet.
 
 ### Configuration Diagnostics
 

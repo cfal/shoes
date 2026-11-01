@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct GlobalSettings {
     #[serde(flatten)]
     pub limits: GlobalLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_cache_dir: Option<std::path::PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_dns: Option<super::dns::DnsConfig>,
 }
 
 impl<'de> Deserialize<'de> for GlobalSettings {
@@ -19,10 +21,15 @@ impl<'de> Deserialize<'de> for GlobalSettings {
             Some(value) => serde_yaml::from_value(value).map_err(Error::custom)?,
             None => None,
         };
+        let default_dns = match fields.remove("default_dns") {
+            Some(value) => serde_yaml::from_value(value).map_err(Error::custom)?,
+            None => None,
+        };
         let limits = serde_yaml::from_value(Value::Mapping(fields)).map_err(Error::custom)?;
         Ok(Self {
             limits,
             rule_cache_dir,
+            default_dns,
         })
     }
 }
@@ -258,7 +265,7 @@ mod tests {
         for name in ["global_settings", "global_limits"] {
             for cache in ["null", "./cache"] {
                 let yaml = format!(
-                    "- {name}: {{max_connections: 42, reload_grace_secs: 7, rule_cache_dir: {cache}}}"
+                    "- {name}: {{max_connections: 42, reload_grace_secs: 7, rule_cache_dir: {cache}, default_dns: {{servers: system, fake_ip: false}}}}"
                 );
                 let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
                 let Config::GlobalSettings(settings) = &configs[0] else {
@@ -275,17 +282,16 @@ mod tests {
                 assert!(json[0].get("global_limits").is_none());
                 assert!(json[0]["global_settings"].get("limits").is_none());
                 assert_eq!(json[0]["global_settings"]["max_connections"], 42);
-                let decoded: Vec<Config> = serde_json::from_value(json).unwrap();
-                let Config::GlobalSettings(decoded) = &decoded[0] else {
-                    panic!("expected global settings");
-                };
-                assert_eq!(decoded, settings);
+                assert_eq!(
+                    json[0]["global_settings"]["default_dns"]["servers"],
+                    "system"
+                );
+                assert_eq!(json[0]["global_settings"]["default_dns"]["fake_ip"], false);
+                let decoded: Vec<Config> = serde_json::from_value(json.clone()).unwrap();
+                assert_eq!(serde_json::to_value(decoded).unwrap(), json);
                 let serialized = serde_yaml::to_string(&configs).unwrap();
                 let decoded: Vec<Config> = serde_yaml::from_str(&serialized).unwrap();
-                let Config::GlobalSettings(decoded) = &decoded[0] else {
-                    panic!("expected global settings");
-                };
-                assert_eq!(decoded, settings);
+                assert_eq!(serde_json::to_value(decoded).unwrap(), json);
             }
         }
     }

@@ -197,7 +197,7 @@ pub struct DnsConfigGroup {
 }
 
 /// DNS configuration for servers.
-/// The `servers` field can be a group name, inline specs, or None (use default).
+/// The `servers` field can be a group name, inline specs, or None (underlying system resolver).
 /// After validation, `servers` is mutated to a single group name reference.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

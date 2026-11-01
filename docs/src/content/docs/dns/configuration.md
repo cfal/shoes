@@ -4,9 +4,13 @@ description: Choose resolvers, reusable groups, bootstrap, and proxy routing.
 ---
 
 A server, WireGuard listener, or TUN entry can select an inline resolver or a
-named `dns_group`. Omitted `dns` uses the native system resolver; see
+named `dns_group`. Omitted or null `dns` inherits `global_settings.default_dns`
+when set, otherwise it uses the native system resolver; see
 [native DNS freshness](/dns/native/) for its cache behavior. Use
 [Fake DNS](/dns/fake/) only when synthetic address mapping is needed.
+
+An explicit `dns` object, including `dns: {}`, replaces the default; see
+[global settings](/config/global-settings/#default-dns) for precedence and scope.
 
 **Complete example:** [dns_tuning.yaml](/examples/dns_tuning/). Its proxy
 addresses and credentials need deployment-specific values.

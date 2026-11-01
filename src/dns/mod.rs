@@ -24,6 +24,11 @@ mod parsed;
 mod proxy_runtime;
 mod stream;
 mod system;
+#[allow(
+    dead_code,
+    reason = "staged adapter; global tendns policy is not activated yet"
+)]
+mod tendns_resolver;
 
 #[cfg(target_os = "linux")]
 pub(crate) use bootstrap::controlled as controlled_bootstrap;

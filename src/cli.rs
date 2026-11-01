@@ -10,6 +10,8 @@ use crate::shadowsocks::ShadowsocksCipher;
 use crate::thread_util::set_num_threads;
 use crate::{logging, process, uuid_util};
 
+mod tendns_generator;
+
 fn print_usage_and_exit(arg0: String) -> ! {
     eprintln!("{arg0} [OPTIONS] <config.yaml> [config.yaml...]");
     eprintln!();
@@ -58,6 +60,11 @@ fn print_usage_and_exit(arg0: String) -> ! {
     );
     eprintln!("      --auth x25519|mlkem768 (repeatable), --mode native|xorpub|random");
     eprintln!("      --rtt 0rtt|1rtt, --lifetime 600s|N-Ms|0s");
+    eprintln!(
+        "    generate-tendns-txt [options]                  Generate an encrypted tendns TXT value"
+    );
+    eprintln!("      --name OWNER, --entry LABEL:TYPE:VALUE (repeatable), --valid-for-secs N");
+    eprintln!("      Reads the discovery key from TENDNS_KEY; default validity: 86400 seconds");
     std::process::exit(1);
 }
 
@@ -156,6 +163,17 @@ fn run() -> i32 {
     if let Err(error) = logging::init_multi_logger(writers, directives) {
         eprintln!("Failed to initialize logger: {error}");
         return 1;
+    }
+
+    if args.first().is_some_and(|s| s == "generate-tendns-txt") {
+        match tendns_generator::generate(&args[1..]) {
+            Ok(txt) => println!("{txt}"),
+            Err(error) => {
+                eprintln!("Tendns TXT generation failed: {error:#}");
+                return 1;
+            }
+        }
+        return 0;
     }
 
     if args

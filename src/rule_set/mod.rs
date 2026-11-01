@@ -479,6 +479,10 @@ pub(crate) fn validate_remote_paths(configs: &mut [Config], extra: &[PathBuf]) -
     };
     for config in configs.iter() {
         let dns = match config {
+            Config::GlobalSettings(settings) => settings
+                .default_dns
+                .as_ref()
+                .and_then(|dns| dns.fake_ip.as_ref()),
             Config::Server(server) => {
                 if let crate::config::BindLocation::Path(path) = &server.bind_location {
                     reserve_state(path)?;

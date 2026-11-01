@@ -1,6 +1,6 @@
 ---
 title: "全局设置"
-description: "进程范围的准入限制、远程规则缓存、QUIC 缓冲区和重新加载宽限期。"
+description: "默认 DNS、准入限制、远程规则缓存、QUIC 缓冲区和重新加载宽限期。"
 ---
 
 所有配置文件中最多使用一个 `global_settings` 条目。省略的准入上限不受限制；传输窗口和缓冲区具有有限的默认值。省略、空或空的 `global_settings` 条目使用这些默认值。
@@ -18,6 +18,24 @@ description: "进程范围的准入限制、远程规则缓存、QUIC 缓冲区�
 `rule_cache_dir` 是可选的。省略它或将其设置为 `null` 以仅在内存中保留远程规则。一个配置的目录为所有远程源提供服务；不接受每个源缓存目录和独立的 `rule_cache_dir` 条目。它的路径是相对于声明配置文件的。有关所有权、权限、引导和重新启动要求，请参阅[远程规则源](/zh-cn/routing/remote-sources/)。
 
 `global_limits` 仍然是兼容性别名，但会记录警告并将被弃用。将其重命名为 `global_settings`。两个名称均计入相同的单条目限制，即使对于空条目也是如此。序列化始终使用 `global_settings`。
+
+<a id="default-dns"></a>
+## 默认 DNS
+
+`default_dns` 接受与监听器的 `dns` 相同的对象：`servers` 可以引用命名组或配置内联上游，还可以指定可选的 `fake_ip` 设置。
+`default_dns` 对象在省略或清空 `servers` 时使用底层系统解析器，仅配置 Fake IP 设置时也是如此。
+
+```yaml
+- global_settings:
+    default_dns:
+      servers: secure-dns
+```
+
+监听器、TUN 条目和 WireGuard 入站在省略 `dns` 或将其设为 null 时继承此默认值。显式的 `dns` 对象会完全替换默认值，不会按字段合并。在任何显式对象中，省略或清空 `servers` 都会使用底层系统解析器，不会再次继承全局默认值。因此，`dns: {}` 可以退出继承。系统解析器的缓存行为参见[原生 DNS](/zh-cn/dns/native/)。
+
+内联默认配置会创建一个共享的解析器组。如果启用 Fake IP，所有继承该配置的入站将共享一个映射池和状态文件，其所有者为 `global_settings`，不依赖监听器身份。
+
+独立的 DNS 引导、规则下载、ACME、WireGuard 对等端准备和控制器探测不会继承此设置。上游选项和引导要求参见[DNS 配置](/zh-cn/dns/configuration/)。
 
 <a id="admission-caps"></a>
 ## 准入上限

@@ -121,6 +121,7 @@ required-features = ["stress-tests"]
 
 [dependencies]
 aho-corasick = "1"
+anyhow = "1"
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
@@ -179,6 +180,7 @@ shake = "*"
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "segmentation-offload"] }
 socket2 = { version = "*", features = ["all"] }
 subtle = "*"
+tendns = { version = "0.2", default-features = false }
 tokio = { version = "*", features = [
     "fs",
     "io-util",
