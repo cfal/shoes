@@ -402,6 +402,81 @@ fn test_group_all_support_udp() {
     assert_eq!(group.udp_chain_indices, vec![0, 1]);
 }
 
+#[tokio::test]
+async fn group_connect_attempts_rotate_tcp_and_udp_eligible_routes_independently() {
+    #[derive(Debug)]
+    struct RecordingSocket(Arc<std::sync::Mutex<Vec<u16>>>);
+
+    #[async_trait]
+    impl SocketConnector for RecordingSocket {
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            address: &ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncStream>> {
+            self.0.lock().unwrap().push(address.port());
+            Err(std::io::ErrorKind::ConnectionRefused.into())
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            panic!("proxy routes require a TCP carrier, not direct UDP")
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let group = ClientChainGroup::new(
+        (0..3)
+            .map(|index| {
+                ClientProxyChain::new(
+                    vec![InitialHopEntry::Proxy {
+                        socket: Arc::new(RecordingSocket(calls.clone())),
+                        proxy: mock_proxy(1080 + index, index != 1),
+                    }],
+                    vec![],
+                )
+            })
+            .collect(),
+    );
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let target: ResolvedLocation = NetLocation::from_str("192.0.2.1:80", None).unwrap().into();
+    for (tcp_port, udp_port) in [(1080, 1080), (1081, 1082), (1082, 1080), (1080, 1082)] {
+        assert_eq!(
+            group
+                .connect_tcp(target.clone(), &resolver)
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert_eq!(
+            calls.lock().unwrap().drain(..).collect::<Vec<_>>(),
+            [tcp_port]
+        );
+        assert_eq!(
+            group
+                .connect_udp_with_info(&resolver, target.clone(), Default::default())
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert_eq!(
+            calls.lock().unwrap().drain(..).collect::<Vec<_>>(),
+            [udp_port]
+        );
+    }
+}
+
 #[test]
 fn test_group_none_support_udp() {
     let chain1 = ClientProxyChain::new(vec![proxy_entry(1080, false)], vec![]);

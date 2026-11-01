@@ -2244,29 +2244,61 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
 }
 
 #[tokio::test]
-async fn refresh_pools_rotate_after_success_failure_and_generation_replacement() {
-    for first_result in ["success", "failure", "cancelled"] {
-        for replace_generation in [false, true] {
+async fn refresh_routes_rotate_after_success_failure_and_generation_replacement() {
+    for outcome in ["success", "failure", "cancelled"] {
+        for (replace_generation, whole_paths) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let outcome_attempt = usize::from(whole_paths);
+            let attempts = if whole_paths { 4 } else { 3 };
             let dir = directory();
             let path = dir.path().join("cache.json");
             write_rule(&path, OLD);
             let trap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = trap.local_addr().unwrap();
             let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a_client = serde_json::json!({"address": a.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}});
+            let b_client = serde_json::json!({"address": b.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}});
             let mut source = source(
                 &format!("http://{}/rules", trap.local_addr().unwrap()),
                 &path,
             );
             source.download.as_mut().unwrap().client_chain =
-                serde_json::from_value(serde_json::json!([{"pool": [
-                    {"address": a.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
-                    {"address": b.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}}
-                ]}]))
+                serde_json::from_value(if whole_paths {
+                    serde_json::json!("fetch")
+                } else {
+                    serde_json::json!([{"pool": [a_client, b_client]}])
+                })
                 .unwrap();
-            let fixture = tokio::spawn(async move {
+            let mut config = configs(&source);
+            if whole_paths {
+                config.insert(
+                    0,
+                    serde_json::from_value(serde_json::json!({
+                        "client_group":"inner", "client_chains":[[a_client], [b_client]]
+                    }))
+                    .unwrap(),
+                );
+                config.insert(
+                    0,
+                    serde_json::from_value(serde_json::json!({
+                        "client_group":"fetch", "client_chains":[
+                            {"name":"short", "chain":["inner"]},
+                            {"name":"long", "chain":["inner", {
+                                "address":"192.0.2.2:1080", "protocol":{"type":"socks"}
+                            }]}
+                        ]
+                    }))
+                    .unwrap(),
+                );
+            }
+            let (accepted, mut admission) = tokio::sync::oneshot::channel();
+            let fixture = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
                 let mut selected = Vec::new();
                 let mut stalled = None;
-                for attempt in 0..3 {
+                let mut accepted = Some(accepted);
+                for attempt in 0..attempts {
                     let (index, mut stream) = timeout(Duration::from_secs(5), async {
                         tokio::select! {
                             result = a.accept() => (0, result.unwrap().0),
@@ -2276,27 +2308,54 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                     .await
                     .unwrap();
                     selected.push(index);
-                    if attempt == 0 {
-                        if first_result == "failure" {
+                    if whole_paths && attempt % 2 == 1 {
+                        assert_eq!(
+                            socks_connect(&mut stream).await,
+                            [5, 1, 0, 1, 192, 0, 2, 2, 4, 56]
+                        );
+                        stream
+                            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                            .await
+                            .unwrap();
+                    }
+                    let port = target.port().to_be_bytes();
+                    assert_eq!(
+                        socks_connect(&mut stream).await,
+                        [5, 1, 0, 1, 127, 0, 0, 1, port[0], port[1]]
+                    );
+                    if attempt == outcome_attempt {
+                        accepted.take().unwrap().send(()).unwrap();
+                        if outcome == "failure" {
                             continue;
                         }
-                        if first_result == "cancelled" {
+                        if outcome == "cancelled" {
                             stalled = Some(stream);
                             continue;
                         }
                     }
-                    socks_connect(&mut stream).await;
                     stream
                         .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
                         .await
                         .unwrap();
-                    request(&mut stream).await;
+                    assert!(
+                        request(&mut stream)
+                            .await
+                            .starts_with("GET /rules HTTP/1.1\r\n")
+                    );
                     stream.write_all(&response(200, "", VALID)).await.unwrap();
                 }
-                drop(stalled);
+                if let Some(mut stream) = stalled {
+                    assert_eq!(
+                        timeout(Duration::from_secs(5), stream.read(&mut [0]))
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        0,
+                        "cancelled download retained its connection"
+                    );
+                }
                 selected
-            });
-            let config = configs(&source);
+            }));
             let sources = crate::config::compile_configs(config.clone())
                 .await
                 .unwrap()
@@ -2309,7 +2368,8 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                 None,
             )
             .unwrap();
-            for attempt in 0..3 {
+            for attempt in 0..attempts {
+                let cached = std::fs::read(&path).unwrap();
                 let item = &mut refresh.scheduled[0];
                 let dns = DnsRegistry::new();
                 let future = refresh_source(
@@ -2321,10 +2381,13 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                     &mut item.download,
                     None,
                 );
-                if first_result == "cancelled" && attempt == 0 {
-                    assert!(timeout(Duration::from_millis(100), future).await.is_err());
-                    assert_eq!(std::fs::read(&path).unwrap(), OLD);
-                } else if first_result == "failure" && attempt == 0 {
+                if outcome == "cancelled" && attempt == outcome_attempt {
+                    tokio::select! {
+                        result = future => panic!("download completed before cancellation: {result:?}"),
+                        result = timeout(Duration::from_secs(5), &mut admission) => result.unwrap().unwrap(),
+                    }
+                    assert_eq!(std::fs::read(&path).unwrap(), cached);
+                } else if outcome == "failure" && attempt == outcome_attempt {
                     assert!(
                         future
                             .await
@@ -2332,7 +2395,7 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                             .to_string()
                             .contains("configured rule download chain failed")
                     );
-                    assert_eq!(std::fs::read(&path).unwrap(), OLD);
+                    assert_eq!(std::fs::read(&path).unwrap(), cached);
                 } else {
                     future.await.unwrap();
                 }
@@ -2347,7 +2410,15 @@ async fn refresh_pools_rotate_after_success_failure_and_generation_replacement()
                     .unwrap();
                 }
             }
-            assert_eq!(fixture.await.unwrap(), [0, 1, 0]);
+            assert_eq!(
+                fixture.await.unwrap(),
+                if whole_paths {
+                    vec![0, 0, 1, 1]
+                } else {
+                    vec![0, 1, 0]
+                },
+                "outcome={outcome}, replace_generation={replace_generation}, whole_paths={whole_paths}"
+            );
             assert!(
                 timeout(Duration::from_millis(20), trap.accept())
                     .await

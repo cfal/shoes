@@ -9,7 +9,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde_json::json;
+use serde_json::{Value, json};
 use shoes_test_support::{
     certs::generate_test_cert_files,
     port_helper::PortHelper,
@@ -51,6 +51,96 @@ async fn native_caddy_naive_preserves_multiplexing_idle_and_large_transfers()
     transport_compatibility(Peer::Caddy).await
 }
 
+fn caddy_config(server: u16, cert: &std::path::Path, key: &std::path::Path) -> Value {
+    json!({
+        "admin": {"disabled": true},
+        "apps": {
+            "http": {"servers": {"naive": {
+                "listen": [format!("0.0.0.0:{server}")],
+                "automatic_https": {"disable_redirects": true},
+                "routes": [{"handle": [{"handler": "forward_proxy",
+                    "auth_credentials": [STANDARD.encode(STANDARD.encode("user:pass"))],
+                    "hide_ip": true, "hide_via": true,
+                    "acl": [{"subjects": ["all"], "allow": true}]}]}],
+                "tls_connection_policies": [{
+                    "certificate_selection": {"any_tag": ["naive"]}, "alpn": ["h2"]}]
+            }}},
+            "tls": {"certificates": {"load_files": [{
+                "certificate": cert, "key": key, "tags": ["naive"]}]}}
+        }
+    })
+}
+
+#[tokio::test]
+async fn native_caddy_whole_path_prefixes_reuse_separate_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (cert, key) = generate_test_cert_files()?;
+        let mut ports = PortHelper::new();
+        let (_, server) = ports.get_localhost_listener_port();
+        let (_, entry) = ports.get_localhost_listener_port();
+        let (_, socks) = ports.get_localhost_listener_port();
+        let _peer = start_naive_caddy_server(&caddy_config(server, &cert, &key).to_string())?;
+        let mut forwarding = JoinSet::new();
+        let mut observed = Vec::new();
+        for destination in [socks, socks, server] {
+            let listener = TcpListener::bind("0.0.0.0:0").await?;
+            let address = format!("127.0.0.1:{}", listener.local_addr()?.port());
+            let count = Arc::new(AtomicUsize::new(0));
+            forwarding.spawn(forward_carriers(listener, destination, count.clone()));
+            observed.push((address, count));
+        }
+        let prefix = |index: usize| json!({"address":observed[index].0, "protocol":{"type":"socks"}});
+        let shoes = json!([
+            {"client_group":"prefix", "client_chains":[
+                {"chain":[prefix(0)]}, {"chain":[prefix(0), prefix(1)]}
+            ]},
+            {"address":format!("0.0.0.0:{socks}"), "protocol":{"type":"socks"}},
+            {"address":format!("0.0.0.0:{entry}"), "protocol":{"type":"http"}, "rules":[
+                {"mask":"0.0.0.0/0", "action":"allow", "client_chain":["prefix", {
+                    "address":observed[2].0, "protocol":{
+                        "type":"tls", "verify":false, "sni_hostname":"test.local", "alpn_protocols":["h2"],
+                        "protocol":{"type":"naiveproxy", "username":"user", "password":"pass"}
+                    }
+                }]}
+            ]}
+        ]);
+        let _shoes = start_shoes_server(&serde_yaml::to_string(&shoes)?)?;
+        let scenario = async {
+            ports.wait_for_all_ports().await?;
+            let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
+            let target = format!("127.0.0.1:{}", echo.local_addr().port());
+            let mut streams = Vec::new();
+            for index in 0..6u8 {
+                let mut stream = support::connect(entry, &target).await?;
+                stream.write_all(&[index]).await?;
+                assert_eq!(stream.read_u8().await?, index);
+                let counts: Vec<_> = observed.iter().map(|(_, count)| count.load(Ordering::SeqCst)).collect();
+                assert_eq!(counts, if index == 0 { vec![1, 0, 1] } else { vec![2, 1, 2] });
+                streams.push(stream);
+            }
+            for (index, mut stream) in streams.into_iter().enumerate().rev() {
+                let payload: Vec<_> = (0..65537).map(|i| (i % 251) as u8 ^ index as u8).collect();
+                let (mut read, mut write) = stream.split();
+                tokio::try_join!(async {
+                    write.write_all(&payload).await?;
+                    write.shutdown().await
+                }, async {
+                    let mut response = Vec::new();
+                    read.read_to_end(&mut response).await?;
+                    assert_eq!(response, payload);
+                    Ok::<_, io::Error>(())
+                })?;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        tokio::select! {
+            result = scenario => result,
+            result = forwarding.join_next() => Err(io::Error::other(format!("prefix forwarder stopped: {result:?}")).into()),
+        }
+    }).await?
+}
+
 async fn transport_compatibility(peer: Peer) -> Result<(), Box<dyn std::error::Error>> {
     let phase = Cell::new("startup");
     let exchanges: [ExchangeProgress; 4] = std::array::from_fn(|_| ExchangeProgress::default());
@@ -69,23 +159,7 @@ async fn transport_compatibility(peer: Peer) -> Result<(), Box<dyn std::error::E
                         "alpn": ["h2"]}}],
                 "outbounds": [{"type": "direct"}]
             }).to_string())?,
-            Peer::Caddy => start_naive_caddy_server(&json!({
-                "admin": {"disabled": true},
-                "apps": {
-                    "http": {"servers": {"naive": {
-                        "listen": [format!("0.0.0.0:{server}")],
-                        "automatic_https": {"disable_redirects": true},
-                        "routes": [{"handle": [{"handler": "forward_proxy",
-                            "auth_credentials": [STANDARD.encode(STANDARD.encode("user:pass"))],
-                            "hide_ip": true, "hide_via": true,
-                            "acl": [{"subjects": ["all"], "allow": true}]}]}],
-                        "tls_connection_policies": [{
-                            "certificate_selection": {"any_tag": ["naive"]}, "alpn": ["h2"]}]
-                    }}},
-                    "tls": {"certificates": {"load_files": [{
-                        "certificate": cert.to_str().unwrap(), "key": key.to_str().unwrap(), "tags": ["naive"]}]}}
-                }
-            }).to_string())?,
+            Peer::Caddy => start_naive_caddy_server(&caddy_config(server, &cert, &key).to_string())?,
         };
 
         // Count carriers outside TLS, so successful requests alone cannot mask redialing.

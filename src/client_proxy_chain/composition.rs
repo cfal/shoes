@@ -636,6 +636,8 @@ mod tests {
     #[test]
     fn mixed_length_selection_pins_the_whole_path_and_fails_udp_closed() {
         let (chain, catalog) = fixture();
+        assert!(chain.may_connect_directly());
+        assert!(!chain.is_direct_only());
         let tree = chain.composition().unwrap();
         let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
         owner.activate(catalog.selection.clone()).unwrap();
@@ -651,6 +653,10 @@ mod tests {
         assert!(two.supports_udp());
         assert_eq!(two.origin(0).unwrap().name.as_ref(), "entrance");
         assert_eq!(two.origin(1).unwrap().name.as_ref(), "exit-leaf");
+        let names = two.route_names();
+        assert_eq!(names.first().unwrap(), "exit-leaf");
+        assert_eq!(names.last().unwrap(), "out");
+        assert!(names.iter().any(|name| name == "entrance"));
         for hop in 0..2 {
             let origin = two.origin(hop).unwrap();
             assert_eq!(origin.path[0], ("out".into(), "via-exit".into()));
@@ -680,12 +686,11 @@ mod tests {
     #[tokio::test]
     async fn forwarding_failure_rechecks_only_the_selected_automatic_group() {
         use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::time::{Instant, timeout};
 
-        // A bound, non-listening socket reserves the refusing endpoint without a port race.
-        let refused = tokio::net::TcpSocket::new_v4().unwrap();
-        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let address = refused.local_addr().unwrap().to_string();
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let member =
             |name| json!({"name":name,"chain":[{"address":address,"protocol":{"type":"socks"}}]});
         let (chain, catalog) = build(
@@ -710,15 +715,22 @@ mod tests {
         }
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let target = NetLocation::from_str("192.0.2.1:80", None).unwrap();
-        let error = timeout(
-            Duration::from_secs(5),
-            chain.connect_tcp(target.into(), &resolver),
-        )
+        let peer = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.shutdown().await.unwrap();
+        };
+        let (_, result) = timeout(Duration::from_secs(5), async {
+            tokio::join!(peer, chain.connect_tcp(target.into(), &resolver))
+        })
         .await
-        .unwrap()
-        .err()
-        .expect("reserved endpoint must refuse connections");
-        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        .unwrap();
+        let error = result
+            .err()
+            .expect("peer must close during SOCKS negotiation");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(
             automatic.0["auto"].due_members(now + Duration::from_secs(1)),
             Some(0..2)
@@ -767,6 +779,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn url_test_selects_complete_mixed_length_members_by_chain_label() {
+        let (chain, catalog) = build(
+            json!([{"client_group":"out", "type":"url-test", "url":"http://probe.invalid/", "tolerance":10,
+            "client_chains":[
+                {"name":"short", "chain":[{"name":"a", "address":"192.0.2.1:80", "protocol":{"type":"http"}}]},
+                {"name":"long", "chain":[
+                    {"name":"b", "address":"192.0.2.2:80", "protocol":{"type":"http"}},
+                    {"name":"c", "address":"192.0.2.3:80", "protocol":{"type":"vless", "user_id":"550e8400-e29b-41d4-a716-446655440000"}}
+                ]}
+            ]}]),
+            json!("out"),
+        );
+        let automatic = &catalog.selection.automatic;
+        automatic.record("short", "http://probe.invalid/", Some(10));
+        automatic.record("long", "http://probe.invalid/", Some(100));
+        let short = chain.select(false).unwrap().into_owned();
+        assert_eq!(short.num_hops(), 1);
+        assert_eq!(short.origin(0).unwrap().name.as_ref(), "a");
+        automatic.record("short", "http://probe.invalid/", Some(100));
+        automatic.record("long", "http://probe.invalid/", Some(10));
+        let long = chain.select(false).unwrap().into_owned();
+        assert_eq!(long.num_hops(), 2);
+        for (hop, name) in ["b", "c"].into_iter().enumerate() {
+            let origin = long.origin(hop).unwrap();
+            assert_eq!(origin.name.as_ref(), name);
+            assert_eq!(origin.path[0], ("out".into(), "long".into()));
+        }
+        automatic.record("short", "http://probe.invalid/", Some(1));
+        automatic.record("long", "http://probe.invalid/", Some(100));
+        assert_eq!(
+            chain
+                .select(false)
+                .unwrap()
+                .origin(0)
+                .unwrap()
+                .name
+                .as_ref(),
+            "a"
+        );
+        assert_eq!(chain.select(true).unwrap().num_hops(), 2);
+    }
+
+    #[tokio::test]
+    async fn forwarding_and_carrier_demand_wake_nested_lazy_groups() {
+        use crate::async_stream::{AsyncReadMessage, AsyncWriteMessage};
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for activity in ["tcp", "udp", "carrier"] {
+                let (chain, catalog) = build(json!([
+                    {"client_group":"inner", "type":"url-test", "url":"http://probe.invalid/", "interval":10,
+                     "client_chain":{"name":"local", "protocol":{"type":"direct"}}},
+                    {"client_group":"outer", "type":"url-test", "url":"http://probe.invalid/", "interval":10,
+                     "client_chain":"inner"}
+                ]), json!("outer"));
+                let groups = &catalog.selection.automatic.0;
+                let start = Instant::now();
+                let due = start + Duration::from_secs(10);
+                for group in groups.values() {
+                    assert!(group.due_members(start).is_some());
+                    assert!(group.due_members(due).is_none());
+                }
+                let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+                let target: ResolvedLocation = crate::address::NetLocation::from_ip_addr(
+                    "127.0.0.1".parse().unwrap(), listener.local_addr().unwrap().port(),
+                ).into();
+                let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+                if activity == "carrier" {
+                    chain.record_carrier_demand();
+                } else if activity == "udp" {
+                    let peer = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+                    let udp_target = crate::address::NetLocation::from_ip_addr(
+                        "127.0.0.1".parse().unwrap(), peer.local_addr().unwrap().port(),
+                    ).into();
+                    let mut stream = chain.connect_udp_bidirectional(&resolver, udp_target).await.unwrap();
+                    futures::future::poll_fn(|cx| std::pin::Pin::new(&mut stream).poll_write_message(cx, b"demand"))
+                        .await.unwrap();
+                    let mut bytes = [0; 32];
+                    let (size, source) = peer.recv_from(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes[..size], b"demand");
+                    peer.send_to(b"reply", source).await.unwrap();
+                    let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+                    futures::future::poll_fn(|cx| std::pin::Pin::new(&mut stream).poll_read_message(cx, &mut buf))
+                        .await.unwrap();
+                    assert_eq!(buf.filled(), b"reply");
+                } else {
+                    drop(chain.connect_tcp(target.clone(), &resolver).await.unwrap());
+                    drop(listener.accept().await.unwrap());
+                }
+                for group in groups.values() {
+                    assert!(group.due_members(due).is_some());
+                    assert!(group.due_members(due + Duration::from_secs(1)).is_none());
+                }
+                drop(listener);
+                if activity == "tcp" {
+                    let error = chain.connect_tcp(target.clone(), &resolver).await.err().unwrap();
+                    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+                    for group in groups.values() {
+                        assert!(group.due_members(due + Duration::from_secs(1)).is_some());
+                    }
+                    let background = crate::control::url_test::BACKGROUND.scope((), async {
+                        chain.connect_tcp(target, &resolver).await
+                    }).await;
+                    assert!(background.is_err());
+                    for group in groups.values() {
+                        assert!(group.due_members(due + Duration::from_secs(2)).is_none());
+                    }
+                }
+            }
+        }).await.unwrap();
     }
 
     #[test]
@@ -915,6 +1041,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rejected_udp_paths_do_not_advance_earlier_round_robin_choices() {
+        let (chain, catalog) = build(
+            json!([
+                {"client_group":"prefix","client_chains":[
+                    {"name":"short","chain":[{"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}}]},
+                    {"name":"long","chain":[
+                        {"name":"b","address":"192.0.2.2:80","protocol":{"type":"http"}},
+                        {"name":"c","address":"192.0.2.3:80","protocol":{"type":"http"}}
+                    ]}
+                ]},
+                {"client_group":"exit","type":"selector","default":"tcp","client_chains":[
+                    {"chain":[{"name":"tcp","address":"192.0.2.4:80","protocol":{"type":"http"}}]},
+                    {"chain":[{"name":"udp","address":"192.0.2.5:80","protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}}]}
+                ]}
+            ]),
+            json!(["prefix", "exit"]),
+        );
+        let tree = chain.composition().unwrap();
+        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+        owner.activate(catalog.selection.clone()).unwrap();
+        let names = |udp| {
+            tree.select(udp)
+                .unwrap()
+                .origins
+                .iter()
+                .map(|origin| origin.as_ref().unwrap().name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false), ["a", "tcp"]);
+        for _ in 0..3 {
+            assert_eq!(
+                tree.select(true).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        owner.select("exit", "udp").unwrap();
+        assert_eq!(names(true), ["a", "udp"]);
+        assert_eq!(names(false), ["b", "c", "udp"]);
+        owner.select("exit", "tcp").unwrap();
+        assert_eq!(
+            tree.select(true).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        owner.select("exit", "udp").unwrap();
+        assert_eq!(names(true), ["b", "c", "udp"]);
+        assert_eq!(names(false), ["a", "udp"]);
     }
 
     #[test]

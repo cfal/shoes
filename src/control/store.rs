@@ -285,7 +285,7 @@ mod tests {
         let (store, selected) = SelectionStore::open(&path).unwrap();
         assert_eq!(selected, choices("east"));
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert_eq!(store.path(), path);
+        assert_eq!(store.path(), path.canonicalize().unwrap());
     }
 
     #[test]
