@@ -48,13 +48,13 @@ async fn request_with_body(address: SocketAddr, method: &str, path: &str, body: 
 async fn whole_path_selector_pins_kernel_tcp_and_udp_flows() {
     timeout(TEST_TIMEOUT, async {
         for ipv6 in [false, true] {
+            let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let prefix_port = listener.local_addr().unwrap().port();
             let mut ports = shoes_test_support::port_helper::PortHelper::new();
             let (_, api_port) = ports.get_localhost_listener_port();
             let (_, socks_port) = ports.get_localhost_listener_port();
             let (_, exit_port) = ports.get_localhost_listener_port();
             let controller = SocketAddr::from(([127, 0, 0, 1], api_port));
-            let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-            let prefix_port = listener.local_addr().unwrap().port();
             let count = Arc::new(AtomicUsize::new(0));
             let observed = count.clone();
             let _prefix = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -77,6 +77,9 @@ async fn whole_path_selector_pins_kernel_tcp_and_udp_flows() {
                     }
                 }
             }));
+            // Keeps the UDP port distinct from the TUN readiness destination.
+            let bind = if ipv6 { "::" } else { "0.0.0.0" };
+            let udp_peer = start_udp_echo_server_with_suffix(bind, 0, b"").await.unwrap();
             let protocol = json!({"type":"vless", "user_id":"550e8400-e29b-41d4-a716-446655440000", "udp_enabled":true});
             let tun = KernelTun::start_with(ipv6, Some(false), 1500, 32768, |config| {
                 let mut config: Value = serde_yaml::from_str(config).unwrap();
@@ -96,9 +99,7 @@ async fn whole_path_selector_pins_kernel_tcp_and_udp_flows() {
                 ]);
                 start_shoes_server_with_sudo(&serde_yaml::to_string(&config).unwrap())
             }).await.unwrap();
-            let bind = if ipv6 { "::" } else { "0.0.0.0" };
             let tcp_peer = start_tcp_stream_echo_server(bind, 0).await.unwrap();
-            let udp_peer = start_udp_echo_server_with_suffix(bind, 0, b"").await.unwrap();
             let destination = SocketAddr::new(tun.target, udp_peer.local_addr().port());
             let old_udp = UdpSocket::bind(SocketAddr::new(tun.source, 0)).await.unwrap();
             let mut old_tcp = tun.connect_tcp(tcp_peer.local_addr().port()).await.unwrap();
@@ -132,12 +133,17 @@ async fn whole_path_selector_pins_kernel_tcp_and_udp_flows() {
             tcp_exchange(&mut fresh_tcp, b"short again").await.unwrap();
             assert_eq!(count.load(Ordering::SeqCst), 2);
             let snapshot = request(controller, "GET", "/connections").await;
-            for (network, port) in [("tcp", long_tcp.local_addr().unwrap().port()), ("udp", long_udp.local_addr().unwrap().port())] {
-                let port = port.to_string();
+            for (network, source, destination) in [
+                ("tcp", long_tcp.local_addr().unwrap().port(), tcp_peer.local_addr().port()),
+                ("udp", long_udp.local_addr().unwrap().port(), udp_peer.local_addr().port()),
+            ] {
+                let source = source.to_string();
+                let destination = destination.to_string();
                 let flow = snapshot["connections"].as_array().unwrap().iter().find(|flow| {
                     flow["metadata"]["network"] == network
                         && flow["metadata"]["sourceIP"] == tun.source.to_string()
-                        && flow["metadata"]["sourcePort"] == port
+                        && flow["metadata"]["sourcePort"] == source
+                        && flow["metadata"]["destinationPort"] == destination
                 }).unwrap();
                 assert_eq!(flow["chains"], json!(["exit", "outbound", "prefix", "outbound"]));
             }
