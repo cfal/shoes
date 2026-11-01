@@ -207,8 +207,8 @@ impl DnsRegistry {
         &self.forbidden
     }
 
-    /// Get or create the guarded system resolver with cached native lookups.
-    /// Used when a server has no `dns` field configured.
+    /// Gets or creates the guarded underlying system resolver with cached native lookups.
+    /// Used when the effective DNS binding has no group after inheritance.
     pub fn get_or_create_default(&mut self) -> Arc<dyn Resolver> {
         let forbidden = self.forbidden.clone();
         self.default_resolver
@@ -225,7 +225,7 @@ impl DnsRegistry {
             .clone()
     }
 
-    /// Gets the resolver for a compiled listener binding, or the default resolver.
+    /// Gets the resolver for a compiled listener binding, or the underlying system resolver.
     pub fn get_for_server(&mut self, dns: Option<&ResolvedDnsConfig>) -> Arc<dyn Resolver> {
         match dns.and_then(|c| c.resolved_group()) {
             Some(group_name) => self
