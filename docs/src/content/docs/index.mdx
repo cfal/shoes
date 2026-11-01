@@ -1,9 +1,20 @@
 ---
-title: Shoes documentation
-description: Configure and operate the Shoes proxy.
+title: Shoes
+description: A high-performance multi-protocol proxy server written in Rust.
+head:
+  - tag: title
+    content: Shoes documentation
+sidebar:
+  label: Overview
 ---
 
-Shoes reads YAML configuration files. Start with a local SOCKS5 listener, then add upstream clients, routing, or transparent capture as needed.
+Shoes is a high-performance multi-protocol proxy server written in Rust.
+Use it as a local HTTP or SOCKS5 proxy, accept connections from remote clients,
+or forward traffic through one or more upstream proxies. YAML configuration
+combines listeners, protocol stacks, routing rules, and DNS settings in one
+process.
+
+## Get started
 
 - [Installation](/start/installation/) and [first configuration](/start/first-config/): run and validate a local listener.
 - [Configuration model](/start/configuration-model/): understand entries, groups, and files.
@@ -12,4 +23,42 @@ Shoes reads YAML configuration files. Start with a local SOCKS5 listener, then a
 - [Protocols](/protocols/socks5/): server and client settings by protocol.
 - [Rules](/routing/rules/), [DNS](/dns/configuration/), and [TUN](/config/tun/): traffic handling.
 
-This reference documents the source revision shown above. Development documentation can include features that are not yet available in a released binary.
+## What Shoes does
+
+- **Connect different proxy protocols.** Configure server and client protocols
+  independently, with TCP and QUIC transports where supported.
+- **Route and chain traffic.** Match IP addresses, CIDRs, or hostnames; build
+  [multi-hop chains](/routing/chains/); and select upstreams through
+  [reusable groups](/routing/groups/) with load balancing or health checks.
+- **Manage TLS and certificates.** Route by SNI, use certificate pinning or
+  [mutual TLS](/security/mtls/), and share [certificate sources](/security/certificates/)
+  with live file rotation or ACME renewal.
+- **Handle DNS and transparent proxying.** Configure [DNS upstreams](/dns/configuration/)
+  and [fake-IP resolution](/dns/fake/), or use [TUN](/config/tun/) on Linux,
+  Android, and iOS. [WireGuard](/protocols/wireguard/) provides userspace
+  TCP/UDP client and server support on Unix without an OS TUN or host route changes.
+- **Manage running services.** Share named settings,
+  [reload configuration](/operations/reload/), and optionally use a
+  [Clash-compatible controller](/routing/clash-controller/) for upstream selection
+  and connection monitoring.
+
+## Supported protocols
+
+**Proxy protocols:** [HTTP/HTTPS](/protocols/http/), [SOCKS5](/protocols/socks5/),
+[mixed HTTP/SOCKS5](/protocols/mixed/), [VMess AEAD](/protocols/vmess/),
+[VLESS](/protocols/vless/), [Shadowsocks](/protocols/shadowsocks/),
+[Trojan](/protocols/trojan/), [Snell v3](/protocols/snell/),
+[Hysteria2](/protocols/hysteria2/), [TUIC v5](/protocols/tuic/),
+[AnyTLS](/protocols/anytls/), and [NaiveProxy](/protocols/naiveproxy/).
+
+**Transports and wrappers:** [TLS](/protocols/tls/), [ShadowTLS v3](/protocols/shadowtls/),
+[WebSocket](/protocols/websocket/), [XHTTP / SplitHTTP](/protocols/xhttp/),
+[REALITY](/protocols/reality/), [XTLS Vision](/protocols/vision/),
+and [Sudoku TCP masking](/protocols/sudoku/). [H2MUX](/protocols/h2mux/)
+provides multiplexing for supported inner protocols.
+
+Each protocol page describes its client/server support and composition constraints;
+not every protocol and transport can be combined.
+
+This reference documents the source revision in the header. Development documentation
+can include features that are not yet available in a released binary.

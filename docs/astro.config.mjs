@@ -9,7 +9,7 @@ export default defineConfig({
   integrations: [starlight({
     title: 'Shoes',
     description: 'Configuration and operation of Shoes',
-    components: { Banner: './src/components/VersionBanner.astro' },
+    components: { SiteTitle: './src/components/SiteTitle.astro' },
     head: [{ tag: 'meta', attrs: { name: 'shoes-source-ref', content: sourceRef } }],
     sidebar: [
       { label: 'Start', items: ['index', 'start/installation', 'start/first-config', 'start/configuration-model', 'start/examples'] },

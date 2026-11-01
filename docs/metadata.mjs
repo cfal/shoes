@@ -18,4 +18,4 @@ if (explicitRef !== undefined && !/^[0-9a-f]{40}$/.test(explicitRef)) {
 
 export const sourceRef = explicitRef ?? localRef();
 export const sourceRefKnown = /^[0-9a-f]{40}$/.test(sourceRef);
-export const docsLabel = process.env.SHOES_DOCS_LABEL || 'Unreleased / development';
+export const docsLabel = process.env.SHOES_DOCS_LABEL || 'dev';

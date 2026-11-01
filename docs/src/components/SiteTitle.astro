@@ -1,0 +1,63 @@
+---
+import DefaultSiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
+import { Icon } from '@astrojs/starlight/components';
+import { docsLabel, sourceRef, sourceRefKnown } from '../../metadata.mjs';
+---
+
+<div class="site-identity">
+  <div class="brand">
+    <DefaultSiteTitle />
+    <a class="repository" href="https://github.com/cfal/shoes" aria-label="Shoes on GitHub" title="Shoes on GitHub">
+      <Icon name="github" size="1.25rem" />
+    </a>
+  </div>
+  <div class="docs-version" role="note" aria-label="Documentation version" data-pagefind-ignore>
+    <span title={docsLabel === 'dev' ? 'Unreleased development documentation' : docsLabel}>{docsLabel}</span>
+    {sourceRefKnown
+      ? <a href={`https://github.com/cfal/shoes/commit/${sourceRef}`}>Source {sourceRef.slice(0, 12)}</a>
+      : <span>Source revision unavailable</span>}
+  </div>
+</div>
+
+<style>
+  :global(:root) {
+    --sl-nav-height: 5rem;
+    --sl-nav-pad-y: 0.5rem;
+  }
+  .site-identity,
+  .docs-version {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-height: 1.75rem;
+  }
+  .brand :global(.site-title) { line-height: 1.25; }
+  .repository {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    color: var(--sl-color-text);
+  }
+  .repository:hover { color: var(--sl-color-text-accent); }
+  .docs-version {
+    color: var(--sl-color-gray-2);
+    font-size: 0.75rem;
+    line-height: 1.4;
+  }
+  .docs-version a { color: inherit; }
+  @media (min-width: 50rem) {
+    :global(:root) { --sl-nav-height: 4rem; }
+    .site-identity {
+      flex-direction: row;
+      align-items: center;
+      gap: 1rem;
+    }
+  }
+</style>
