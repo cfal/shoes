@@ -45,7 +45,11 @@ captured output. Empty-filter and failed-child regressions exercise the guard.
 the output-discarding throughput helper.
 The curl POST helper kills and reaps its child on stdin write/flush failure;
 the Linux regression uses an isolated fake curl and verifies both `BrokenPipe`
-and cleanup. Cancelling its `spawn_blocking` await is a separate, untested contract.
+and cleanup. Dropping a pending curl request now requests termination of its direct
+child through Tokio's process ownership. Cancellation tests cover output waiting
+and a POST body larger than the measured stdin pipe capacity. Reaping after
+cancellation is best effort, not a synchronous barrier; override scripts must
+`exec` their payload rather than leave descendants outside that ownership.
 
 The unit-test CI job also builds the [pinned AnyTLS reference peer](fixtures/anytls-peer/README.md)
 and explicitly runs its ignored TCP/UoT pooling test. UoT packets are decoded by
