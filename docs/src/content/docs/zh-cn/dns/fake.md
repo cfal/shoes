@@ -1,5 +1,5 @@
 ---
-title: "假DNS"
+title: "Fake DNS"
 description: "shoes假dns配置。"
 ---
 

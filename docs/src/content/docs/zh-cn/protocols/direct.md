@@ -1,5 +1,5 @@
 ---
-title: "直接"
+title: "直连"
 description: "shoes直接配置。"
 ---
 

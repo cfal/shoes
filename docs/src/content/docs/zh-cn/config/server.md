@@ -1,6 +1,6 @@
 ---
-title: "服务器配置"
-description: "shoes 服务器配置参考。"
+title: "服务端配置"
+description: "shoes 服务端配置参考。"
 ---
 
 WireGuard 服务器需要一个带有非零端口的文字 UDP 地址，或者在配置 `peer_client_chain` 时省略绑定位置。它们不支持端口范围、多个绑定地址或 Unix 套接字路径。请参阅[WireGuard](/zh-cn/protocols/wireguard/)。
