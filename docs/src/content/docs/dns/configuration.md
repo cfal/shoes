@@ -9,12 +9,8 @@ when set, otherwise it uses the native system resolver; see
 [native DNS freshness](/dns/native/) for its cache behavior. Use
 [Fake DNS](/dns/fake/) only when synthetic address mapping is needed.
 
-The global default has the same shape as `dns`. An explicit per-inbound `dns`
-object replaces it completely: `dns: {}` uses system DNS, even with a global
-default. A default with omitted `servers` also uses system DNS, not itself.
-Inline fake-IP defaults share one pool across inheriting inbounds. Independent
-bootstrap resolvers keep their own configuration. See
-[global settings](/config/global-settings/#default-dns).
+An explicit `dns` object, including `dns: {}`, replaces the default; see
+[global settings](/config/global-settings/#default-dns) for precedence and scope.
 
 **Complete example:** [dns_tuning.yaml](/examples/dns_tuning/). Its proxy
 addresses and credentials need deployment-specific values.

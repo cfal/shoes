@@ -44,17 +44,15 @@ Listeners, TUN entries, and WireGuard inbounds with omitted or null `dns` inheri
 this default. An explicit `dns` object replaces it completely, without merging
 fields. In any explicit object, omitted or empty `servers` uses the underlying
 system resolver; it never inherits the default again. `dns: {}` therefore opts
-out, and `dns: {servers: system}` selects explicit system DNS without application
-memoization. See [native DNS](/dns/native/).
+out. See [native DNS](/dns/native/) for system resolver caching.
 
 An inline default creates one shared resolver group. If it enables fake IPs,
-all inheriting inbounds share one mapping pool and state file. Explicit per-inbound
-overrides retain their own existing ownership rules.
+all inheriting inbounds share one mapping pool and state file, owned by
+`global_settings` independently of listener identities.
 
-Without `default_dns`, existing system defaults are unchanged. Independent DNS
-bootstrap, rule downloads, ACME, WireGuard peer preparation, and controller probes
-do not inherit this setting. See [DNS configuration](/dns/configuration/) for
-upstream options and bootstrap requirements.
+Independent DNS bootstrap, rule downloads, ACME, WireGuard peer preparation,
+and controller probes do not inherit this setting. See
+[DNS configuration](/dns/configuration/) for upstream options and bootstrap requirements.
 
 ## Admission caps
 
