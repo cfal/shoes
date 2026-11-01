@@ -38,6 +38,21 @@ function checkSiteLink(source, href, base) {
 }
 
 for (const [file, { document }] of pages) {
+  const version = document.querySelector('header [aria-label="Documentation version"]');
+  const sourceRef = document.querySelector('meta[name="shoes-source-ref"]')?.getAttribute('content');
+  if (!version?.hasAttribute('data-pagefind-ignore')) {
+    errors.push(`${path.relative(root, file)}: missing header version metadata`);
+  }
+  if (/^[0-9a-f]{40}$/.test(sourceRef ?? '')) {
+    if (!version?.querySelector(`a[href="https://github.com/cfal/shoes/commit/${sourceRef}"]`)) {
+      errors.push(`${path.relative(root, file)}: missing header source link`);
+    }
+  } else if (version?.querySelector('a')) {
+    errors.push(`${path.relative(root, file)}: unexpected source link for unknown revision`);
+  }
+  if (!document.querySelector('header a[href="https://github.com/cfal/shoes"][aria-label="Shoes on GitHub"]')) {
+    errors.push(`${path.relative(root, file)}: missing header repository link`);
+  }
   for (const link of document.querySelectorAll('a[href]')) {
     const href = link.getAttribute('href');
     if (href) checkSiteLink(path.relative(root, file), href, `https://shoes-rs.github.io/${path.relative(root, file)}`);
@@ -89,5 +104,5 @@ if (errors.length) {
   console.error(errors.join('\n'));
   process.exitCode = 1;
 } else {
-  console.log(`Checked internal links and anchors in ${files.length} HTML pages and copy payloads for ${examples.length} examples.`);
+  console.log(`Checked headers, internal links and anchors in ${files.length} HTML pages and copy payloads for ${examples.length} examples.`);
 }
