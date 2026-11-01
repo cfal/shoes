@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{ConfigSelection, RuleActionConfig, RuleConfig, create_server_configs};
+use crate::config::{ResolvedConfig, RuleConfig, create_server_configs};
 use crate::rules::Outcome;
 use serde_json::{Value, json};
 
@@ -44,22 +44,19 @@ fn source_unions_inline_references_and_policy_order() {
         validated.reload_files,
         [dir.path().join("a.json"), dir.path().join("b.json")]
     );
-    let Config::Server(server) = &validated.configs[0] else {
+    let crate::config::ResolvedConfig::Server(server) = &validated.configs[0] else {
         panic!("expected server")
     };
-    let rules: Vec<_> = server
-        .rules
-        .iter()
-        .map(|selection| {
-            let ConfigSelection::Config(rule) = selection else {
-                panic!("unexpanded policy")
-            };
-            rule
-        })
-        .collect();
+    let rules: Vec<_> = server.rules.iter().collect();
     assert_eq!(rules.len(), 3);
-    assert!(matches!(rules[0].action, RuleActionConfig::Block));
-    assert!(matches!(rules[1].action, RuleActionConfig::Allow { .. }));
+    assert!(matches!(
+        rules[0].action,
+        crate::config::ResolvedRuleActionConfig::Block
+    ));
+    assert!(matches!(
+        rules[1].action,
+        crate::config::ResolvedRuleActionConfig::Allow { .. }
+    ));
     let union = rules[0].criteria.compiled.as_ref().unwrap();
     for name in ["a.example", "b.example"] {
         assert_eq!(union.evaluate(Some(name), None, 80), Outcome::Match);
@@ -94,12 +91,10 @@ fn native_source_groups_compose_and_forward_reference_without_actions() {
         &dir.path().join("config.yaml"),
     )
     .unwrap();
-    let Config::Server(server) = &validated.configs[0] else {
+    let ResolvedConfig::Server(server) = &validated.configs[0] else {
         panic!()
     };
-    let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-        panic!()
-    };
+    let rule = server.rules.iter().next().unwrap();
     let predicate = rule.criteria.compiled.as_ref().unwrap();
     for (name, port, expected) in [
         ("example.com", 443, Outcome::Match),
@@ -230,12 +225,10 @@ fn source_group_work_budget_counts_repeated_references_and_caller_compositions()
         let result = create_server_configs(serde_json::from_value(json!(configs)).unwrap());
         if copies == 1 {
             let validated = result.unwrap();
-            let Config::Server(server) = &validated.configs[0] else {
+            let ResolvedConfig::Server(server) = &validated.configs[0] else {
                 panic!()
             };
-            let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-                panic!()
-            };
+            let rule = server.rules.iter().next().unwrap();
             let predicate = rule.criteria.compiled.as_ref().unwrap();
             assert!(!predicate.has_no_resolve_ip());
             assert_eq!(
@@ -322,8 +315,8 @@ fn inline_and_named_sources_share_the_same_predicate() {
         panic!("expected server")
     };
     for selection in server.rules.iter() {
-        let ConfigSelection::Config(rule) = selection else {
-            panic!("expected rule")
+        let crate::config::ConfigSelection::Config(rule) = selection else {
+            panic!("expected inline rule")
         };
         assert!(Arc::ptr_eq(
             rule.criteria.compiled.as_ref().unwrap(),
@@ -500,12 +493,10 @@ async fn each_config_file_anchors_its_own_inline_and_group_sources() {
     let configs = crate::config::load_configs(&files).await.unwrap();
     let validated = create_server_configs(configs).unwrap();
     for (index, name) in ["first.example", "second.example"].into_iter().enumerate() {
-        let Config::Server(server) = &validated.configs[index] else {
+        let crate::config::ResolvedConfig::Server(server) = &validated.configs[index] else {
             panic!("expected server")
         };
-        let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-            panic!("expected rule")
-        };
+        let rule = server.rules.iter().next().unwrap();
         assert_eq!(
             rule.criteria
                 .compiled

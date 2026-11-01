@@ -272,7 +272,7 @@ async fn abandoned_h3_auth_is_closed_when_its_connector_retires() {
 #[tokio::test]
 async fn native_placement_is_checked_in_builder_and_mixed_pools() {
     use crate::{
-        config::ClientChain,
+        config::ResolvedClientChain,
         resolver::{NativeResolver, Resolver},
         tcp::chain_builder::try_build_client_proxy_chain,
     };
@@ -289,14 +289,15 @@ async fn native_placement_is_checked_in_builder_and_mixed_pools() {
             json!([native.clone(), next.clone()]),
             json!([{"pool": [native.clone(), next.clone()]}]),
         ] {
-            let chain: ClientChain = serde_json::from_value(valid).unwrap();
+            let chain: ResolvedClientChain = crate::config::test_support::from_json(valid).unwrap();
             assert!(try_build_client_proxy_chain(chain.hops, resolver.clone()).is_ok());
         }
         let mut wrong_transport = native.clone();
         wrong_transport["transport"] = json!("tcp");
         let nested = json!({"address":"127.0.0.1:443", "protocol":{"type":"tls", "verify":false, "protocol":protocol}});
         for invalid in [wrong_transport, json!([next, native]), nested] {
-            let chain: ClientChain = serde_json::from_value(invalid).unwrap();
+            let chain: ResolvedClientChain =
+                crate::config::test_support::from_json(invalid).unwrap();
             assert!(try_build_client_proxy_chain(chain.hops, resolver.clone()).is_err());
         }
     }

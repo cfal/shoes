@@ -54,7 +54,7 @@ async fn downstream_dns_proxy_names_remain_remote_for_forwarding() {
         .unwrap();
     });
     let resolver: Arc<dyn Resolver> = Arc::new(RemoteOnly);
-    let chain: crate::config::ClientChain = serde_json::from_value(serde_json::json!([
+    let chain = crate::config::test_support::from_json(serde_json::json!([
         {"address": first.to_string(), "protocol": {"type": "socks"}},
         {"address": "second.invalid:1080", "protocol": {"type": "socks"}}
     ]))
@@ -152,12 +152,14 @@ async fn new_dns_sockets_follow_direct_selector_changes() {
 - client_group: dns-route
   type: selector
   default: usable
-  client_proxies:
-    - name: unavailable
-      bind_interface: shoes-missing
-      protocol: {type: direct}
-    - name: usable
-      protocol: {type: direct}
+  client_chains:
+    - chain:
+        - name: unavailable
+          bind_interface: shoes-missing
+          protocol: {type: direct}
+    - chain:
+        - name: usable
+          protocol: {type: direct}
 - dns_group: upstream
   dns_servers:
     - url: udp://192.0.2.1

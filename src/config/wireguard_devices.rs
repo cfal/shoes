@@ -5,11 +5,11 @@ use std::net::SocketAddrV6;
 use gotatun::x25519::{PublicKey, StaticSecret};
 use ipnetwork::IpNetwork;
 
-use super::client_visit::visit_client;
+use super::resolved_visit::visit_client;
 use super::types::wireguard::{WireguardDeviceConfig, invalid};
 use super::{
-    ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection, ServerProxyConfig,
-    ValidatedConfigs,
+    ResolvedClientConfig, ResolvedClientHop, ResolvedClientProxyConfig, ResolvedConfig,
+    ResolvedServerProxyConfig, ValidatedConfigs,
 };
 use crate::address::{Address, NetLocation};
 use crate::option_util::NoneOrOne;
@@ -29,7 +29,7 @@ struct ClientRegistry {
 }
 
 impl ClientRegistry {
-    fn register(&mut self, client: &mut ClientConfig) -> io::Result<()> {
+    fn register(&mut self, client: &mut ResolvedClientConfig) -> io::Result<()> {
         normalize_client(client)?;
         if !client.protocol.is_wireguard() {
             return Ok(());
@@ -40,6 +40,11 @@ impl ClientRegistry {
         settings.control = None;
         let mut selection_paths = Vec::new();
         visit_client(&mut settings, &mut |carrier| {
+            if let ResolvedClientProxyConfig::Wireguard(config) = &mut carrier.protocol
+                && let Some(chain) = &mut config.peer_client_chain
+            {
+                normalize_round_robin_names(chain);
+            }
             selection_paths.push(
                 carrier
                     .control
@@ -62,7 +67,7 @@ impl ClientRegistry {
         // Serialization excludes generation-local IDs and prepared connectors.
         let settings = serde_yaml::to_value((settings, selection_paths))
             .map_err(|_| invalid("cannot compare WireGuard client settings"))?;
-        let ClientProxyConfig::Wireguard(config) = &mut client.protocol else {
+        let ResolvedClientProxyConfig::Wireguard(config) = &mut client.protocol else {
             unreachable!("checked WireGuard protocol")
         };
         let identity = ClientIdentity {
@@ -94,8 +99,24 @@ impl ClientRegistry {
     }
 }
 
-fn normalize_client(client: &mut ClientConfig) -> io::Result<()> {
-    let ClientProxyConfig::Wireguard(config) = &mut client.protocol else {
+fn normalize_round_robin_names(chain: &mut super::ResolvedClientChain) {
+    for hop in chain.hops.iter_mut() {
+        if let ResolvedClientHop::Choice(choice) = hop {
+            if choice.group_type == super::GroupType::RoundRobin {
+                choice.name.clear();
+                choice.labels = (0..choice.members.len())
+                    .map(|index| index.to_string())
+                    .collect();
+            }
+            for member in &mut choice.members {
+                normalize_round_robin_names(member);
+            }
+        }
+    }
+}
+
+fn normalize_client(client: &mut ResolvedClientConfig) -> io::Result<()> {
+    let ResolvedClientProxyConfig::Wireguard(config) = &mut client.protocol else {
         return Ok(());
     };
     if client.bind_interface.is_unspecified() {
@@ -134,18 +155,34 @@ fn normalize_client(client: &mut ClientConfig) -> io::Result<()> {
     }
     normalize_cidrs(&mut config.addresses, false)?;
     normalize_cidrs(&mut config.allowed_ips, true)?;
-    config.resource_limits = config.device(&client.address, None).limits();
-    if let Some(chain) = &mut config.peer_client_chain {
-        for hop in chain.hops.iter_mut() {
-            if let ClientChainHop::Pool(pool) = hop
-                && pool.iter().count() == 1
-            {
-                let selection = pool.iter().next().unwrap().clone();
-                *hop = ClientChainHop::Single(selection);
+    config.resource_limits = super::types::wireguard::device_limits(&config.resource_limits);
+    config.peer_client_chain = config.peer_client_chain.take().map(normalize_fixed_chain);
+    Ok(())
+}
+
+fn normalize_fixed_chain(chain: super::ResolvedClientChain) -> super::ResolvedClientChain {
+    let mut hops = Vec::new();
+    for hop in chain.hops.into_vec() {
+        match hop {
+            ResolvedClientHop::Choice(mut choice) => {
+                choice.members = choice
+                    .members
+                    .into_iter()
+                    .map(normalize_fixed_chain)
+                    .collect();
+                // A fixed alias carries no scheduling policy; leaf origins retain selectors.
+                if choice.group_type == super::GroupType::RoundRobin && choice.members.len() == 1 {
+                    hops.extend(choice.members.remove(0).hops.into_vec());
+                } else {
+                    hops.push(ResolvedClientHop::Choice(choice));
+                }
             }
+            hop => hops.push(hop),
         }
     }
-    Ok(())
+    super::ResolvedClientChain {
+        hops: crate::option_util::OneOrSome::Some(hops),
+    }
 }
 
 fn normalize_cidrs(prefixes: &mut Vec<String>, routes: bool) -> io::Result<()> {
@@ -170,16 +207,17 @@ fn validate_carrier_mtu(device: &WireguardDeviceConfig) -> io::Result<()> {
     let Some(chain) = &device.peer_client_chain else {
         return Ok(());
     };
+    validate_carrier_chain_mtu(chain, device.mtu)
+}
+
+fn validate_carrier_chain_mtu(chain: &super::ResolvedClientChain, mtu: u16) -> io::Result<()> {
     if chain.hops.iter().count() != 1 {
         return Ok(());
     }
-    let check = |selection: &ConfigSelection<ClientConfig>| {
-        let ConfigSelection::Config(client) = selection else {
-            unreachable!("expanded client group")
-        };
-        if let ClientProxyConfig::Wireguard(carrier) = &client.protocol {
+    let check = |client: &ResolvedClientConfig| {
+        if let ResolvedClientProxyConfig::Wireguard(carrier) = &client.protocol {
             // IPv6 UDP plus WireGuard header, tag and worst-case padding.
-            let required = device.mtu.next_multiple_of(16) + 80;
+            let required = mtu.next_multiple_of(16) + 80;
             if carrier.mtu < required {
                 return Err(invalid(format!(
                     "WireGuard peer_client_chain requires carrier MTU >= {required}"
@@ -189,40 +227,42 @@ fn validate_carrier_mtu(device: &WireguardDeviceConfig) -> io::Result<()> {
         Ok(())
     };
     match chain.hops.iter().next().unwrap() {
-        ClientChainHop::Single(selection) => check(selection),
-        ClientChainHop::Pool(selections) => {
-            for selection in selections.iter() {
-                check(selection)?;
+        ResolvedClientHop::Choice(choice) => {
+            for member in &choice.members {
+                validate_carrier_chain_mtu(member, mtu)?;
             }
             Ok(())
         }
+        ResolvedClientHop::Single(selection) => check(selection),
     }
 }
 
 pub(super) fn collect_devices(
     validated: &mut ValidatedConfigs,
-    groups: &mut HashMap<String, Vec<ClientConfig>>,
+    groups: &mut super::compiler::Groups,
+    catalog: &mut Option<crate::control::catalog::CatalogDraft>,
 ) -> io::Result<()> {
     let mut clients = ClientRegistry::default();
     // Unused groups are validated for conflicts but do not start devices.
     let mut sorted_groups: Vec<_> = groups.iter_mut().collect();
     sorted_groups.sort_by_key(|(name, _)| *name);
     for (_, group) in sorted_groups {
-        for client in group {
-            visit_client(client, &mut |client| clients.register(client))?;
-        }
+        super::plan_ops::visit_leaves(group, &mut |client| {
+            super::resolved_visit::visit_client(client.resolved_mut(), &mut |client| {
+                clients.register(client)
+            })
+        })?;
     }
     validated.visit_clients(&mut |client| clients.register(client))?;
     if !validated.control.listeners.is_empty() {
-        super::validate::refresh_catalog_clients(validated, groups)?;
+        super::validate::refresh_catalog_clients(validated, groups, catalog)?;
     }
     let referenced_dns: HashSet<_> = validated
         .configs
         .iter()
         .filter_map(|config| match config {
-            Config::Server(server) => server.dns.as_ref(),
-            Config::TunServer(tun) => tun.dns.as_ref(),
-            _ => None,
+            ResolvedConfig::Server(server) => server.dns.as_ref(),
+            ResolvedConfig::TunServer(tun) => tun.dns.as_ref(),
         })
         .filter_map(|dns| dns.resolved_group())
         .collect();
@@ -237,7 +277,7 @@ pub(super) fn collect_devices(
     });
     let mut used = HashSet::new();
     validated.visit_clients(&mut |client| {
-        if let ClientProxyConfig::Wireguard(config) = &client.protocol {
+        if let ResolvedClientProxyConfig::Wireguard(config) = &client.protocol {
             used.insert(config.endpoint_id.clone());
         }
         Ok(())
@@ -250,8 +290,8 @@ pub(super) fn collect_devices(
     let mut listeners = Vec::new();
     let mut binds = HashSet::new();
     for config in std::mem::take(&mut validated.configs) {
-        if let Config::Server(server) = &config
-            && let ServerProxyConfig::Wireguard(protocol) = &server.protocol
+        if let ResolvedConfig::Server(server) = &config
+            && let ResolvedServerProxyConfig::Wireguard(protocol) = &server.protocol
         {
             let mut device = protocol.device(server)?;
             if let Some(listen) = device.listen

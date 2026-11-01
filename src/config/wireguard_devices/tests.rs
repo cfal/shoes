@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::{Config, ResolvedClientProxyConfig, ServerProxyConfig};
 use serde_json::{Value, json};
 
 fn key(byte: u8) -> String {
@@ -495,8 +496,8 @@ fn validate(values: Value) -> io::Result<ValidatedConfigs> {
 
 fn copies(second: Value) -> Value {
     json!([
-        {"client_group": "one", "client_proxies": [client()]},
-        {"client_group": "two", "client_proxies": [second]},
+        {"client_group": "one", "client_chains": [client()]},
+        {"client_group": "two", "client_chains": [second]},
         {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
          "rules": [{"masks": "0.0.0.0/0", "action": "allow",
                     "client_chain": [{"pool": ["one", "two", client()]}]}]},
@@ -526,7 +527,7 @@ fn copied_clients_share_after_defaults_and_normalization() {
     let mut ids = Vec::new();
     validated
         .visit_clients(&mut |client| {
-            if let ClientProxyConfig::Wireguard(config) = &client.protocol {
+            if let ResolvedClientProxyConfig::Wireguard(config) = &client.protocol {
                 ids.push(config.endpoint_id.clone());
             }
             Ok(())
@@ -589,8 +590,8 @@ fn copied_clients_share_with_equivalent_carrier_socket_defaults() {
         let mut second = client();
         second["protocol"]["peer_client_chain"] = chain.clone();
         let configs = json!([
-            {"client_group": "one", "client_proxies": [first]},
-            {"client_group": "relay", "client_proxies": [{"protocol": {"type": "direct"}}]},
+            {"client_group": "one", "client_chains": [first]},
+            {"client_group": "relay", "client_chains": [{"protocol": {"type": "direct"}}]},
             {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
              "rules": [{"masks": "0.0.0.0/0", "action": "allow",
                         "client_chain": [{"pool": ["one", second]}]}]},
@@ -609,6 +610,70 @@ fn copied_clients_share_with_equivalent_carrier_socket_defaults() {
                 .to_string()
                 .contains("conflicting")
         );
+    }
+}
+
+#[test]
+fn simplification_round_robin_carrier_names_do_not_affect_device_identity() {
+    let mut first = client();
+    first["protocol"]["peer_client_chain"] = json!("relay");
+    let mut second = client();
+    second["protocol"]["peer_client_chain"] = json!([{"pool":["direct", "direct"]}]);
+    let configs = json!([
+        {"client_group":"relay", "client_chains":[{"chain": ["direct"]}, {"chain": ["direct"]}]},
+        {"address":"0.0.0.0:1080", "protocol":{"type":"socks"},
+            "rules":[{"masks":"0.0.0.0/0", "action":"allow",
+                "client_chain":[{"pool":[first, second]}]}]}
+    ]);
+    let validated = validate(configs.clone()).unwrap();
+    assert_eq!(validated.wireguard_endpoints.len(), 1);
+    let mut different_weight = configs;
+    different_weight[0]["client_chains"] =
+        json!([{"chain":["direct"]}, {"chain":["direct"]}, {"chain":["direct"]}]);
+    assert!(
+        validate(different_weight)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("conflicting")
+    );
+}
+
+#[test]
+fn carrier_mtu_checks_single_hop_choice_members() {
+    use crate::config::ResolvedClientChain as ClientChain;
+    use crate::option_util::OneOrSome;
+
+    for mtu in [1359, 1360] {
+        let mut carrier = client();
+        carrier["protocol"]["mtu"] = json!(mtu);
+        let single: ClientChain = crate::config::test_support::from_json(json!([carrier])).unwrap();
+        let multiple: ClientChain = crate::config::test_support::from_json(json!([
+            carrier,
+            {"address":"192.0.2.1:1080", "protocol":{"type":"socks"}}
+        ]))
+        .unwrap();
+        let choice = ClientChain {
+            hops: OneOrSome::One(super::super::composition::pool_choice(vec![
+                multiple.clone(),
+                single,
+            ])),
+        };
+        let result = validate_carrier_chain_mtu(&choice, 1280);
+        if mtu < 1360 {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "WireGuard peer_client_chain requires carrier MTU >= 1360"
+            );
+        } else {
+            result.unwrap();
+        }
+        let choice = ClientChain {
+            hops: OneOrSome::One(super::super::composition::pool_choice(vec![multiple])),
+        };
+        validate_carrier_chain_mtu(&choice, 1280).unwrap();
     }
 }
 
@@ -670,7 +735,7 @@ fn scoped_endpoints_share_by_address_and_numeric_scope() {
 
 #[test]
 fn unused_groups_validate_without_starting_devices() {
-    let configs = json!([{"client_group": "unused", "client_proxies": [client()]}]);
+    let configs = json!([{"client_group": "unused", "client_chains": [client()]}]);
     assert!(
         validate(configs.clone())
             .unwrap()
@@ -678,7 +743,7 @@ fn unused_groups_validate_without_starting_devices() {
             .is_empty()
     );
     let mut invalid = configs;
-    invalid[0]["client_proxies"][0]["protocol"]["mtu"] = json!(9000);
+    invalid[0]["client_chains"][0]["protocol"]["mtu"] = json!(9000);
     assert!(validate(invalid).is_err());
 }
 
@@ -686,9 +751,9 @@ fn unused_groups_validate_without_starting_devices() {
 fn selectors_share_wireguard_devices_without_activating_unused_nodes() {
     let mut configs = json!([
         {"clash_api_address":"127.0.0.1:9090","secret":"test"},
-        {"client_group":"vpn","client_proxies":[client()]},
-        {"client_group":"outbound","type":"selector","client_proxies":["vpn","direct"]},
-        {"client_group":"another","type":"selector","client_proxies":["outbound","vpn"]}
+        {"client_group":"vpn","client_chains":[client()]},
+        {"client_group":"outbound","type":"selector","client_chains":[{"chain": ["vpn"]},{"chain": ["direct"]}]},
+        {"client_group":"another","type":"selector","client_chains":[{"chain": ["outbound"]},{"chain": ["vpn"]}]}
     ]);
     assert!(
         validate(configs.clone())
@@ -764,10 +829,35 @@ fn unused_wireguard_dns_groups_validate_without_starting_devices() {
 }
 
 #[test]
+fn discarded_dns_groups_keep_normalized_catalog_leaves() {
+    let mut client = client();
+    client["name"] = json!("dns-vpn");
+    client["protocol"]["peer_client_chain"] = json!("direct");
+    let validated = validate(json!([
+        {"clash_api_address":"127.0.0.1:0","secret":"test"},
+        {"dns_group":"unused","dns_servers":[{"url":"tcp://192.0.2.53","client_chain":client}]}
+    ]))
+    .unwrap();
+    assert!(validated.dns_groups.is_empty());
+    assert!(validated.wireguard_endpoints.is_empty());
+    let catalog = validated.catalog.unwrap();
+    let crate::control::catalog::CatalogNode::Leaf(client) = &catalog.nodes["dns-vpn"] else {
+        panic!()
+    };
+    let ResolvedClientProxyConfig::Wireguard(config) = &client.protocol else {
+        panic!()
+    };
+    assert!(!config.endpoint_id.is_empty());
+    assert!(config.peer_client_chain.is_some());
+    assert!(config.connector.is_none());
+    assert_eq!(config.resource_limits.max_tcp_connections, Some(256));
+}
+
+#[test]
 fn old_endpoint_forms_and_client_peer_lists_are_rejected() {
     for value in [
         json!([{"wireguard": "old", "private_key": key(42), "addresses": ["10.77.0.2/32"], "peers": []}]),
-        json!([{"client_group": "old", "client_proxies": [{"protocol": {"type": "wireguard", "endpoint": "old"}}]}]),
+        json!([{"client_group": "old", "client_chains": [{"protocol": {"type": "wireguard", "endpoint": "old"}}]}]),
     ] {
         assert!(validate(value).is_err());
     }

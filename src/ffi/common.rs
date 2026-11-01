@@ -10,6 +10,7 @@ use log::info;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::config::ResolvedConfig;
 use crate::config::{Config, convert_cert_paths, load_config_str};
 use crate::dns::build_dns_registry_for_runtime;
 use crate::logging::{FILE_LOG_FLUSH_TIMEOUT, FileLogWriter, LogWriter};
@@ -263,9 +264,9 @@ pub async fn start_from_config(
 
     // Build DNS registry from expanded groups
     let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated_configs).collect();
-    let protect_tun_endpoints = validated_configs
-        .iter()
-        .any(|config| matches!(config, Config::TunServer(tun) if tun.dns_hijack == Some(true)));
+    let protect_tun_endpoints = validated_configs.iter().any(
+        |config| matches!(config, ResolvedConfig::TunServer(tun) if tun.dns_hijack == Some(true)),
+    );
     let mut dns_registry = build_dns_registry_for_runtime(
         dns_groups,
         global_limits,
@@ -282,7 +283,7 @@ pub async fn start_from_config(
 
     for config in validated_configs {
         match config {
-            Config::TunServer(tc) => {
+            ResolvedConfig::TunServer(tc) => {
                 if tun_config.is_some() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -305,10 +306,9 @@ pub async fn start_from_config(
                 );
                 tun_config = Some(tc);
             }
-            Config::Server(sc) => {
+            ResolvedConfig::Server(sc) => {
                 server_configs.push(sc);
             }
-            _ => {}
         }
     }
 
@@ -335,7 +335,7 @@ pub async fn start_from_config(
 
     for server_config in server_configs {
         let resolver = dns_registry.get_for_server(server_config.dns.as_ref());
-        match start_servers(Config::Server(server_config), resolver).await {
+        match start_servers(ResolvedConfig::Server(server_config), resolver).await {
             Ok(tasks) => join_handles.0.extend(tasks),
             Err(error) => {
                 join_handles.stop().await;
@@ -436,7 +436,7 @@ mod tests {
 - client_group: automatic
   type: url-test
   url: http://probe.invalid/
-  client_proxies: [direct]
+  client_chains: [direct]
 "#;
         let (_shutdown, shutdown) = oneshot::channel();
         let error = start_from_config(config, shutdown).await.unwrap_err();

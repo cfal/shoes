@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use crate::{
     address::{NetLocation, ResolvedLocation},
     async_stream::{AsyncMessageStream, AsyncStream},
-    config::{ClientConfig, ClientProxyConfig, Transport},
+    config::{
+        ClientConfig, ClientProxyConfig, ResolvedClientConfig, ResolvedClientProxyConfig, Transport,
+    },
     tcp::{
         carrier_dialer::CarrierDialer, proxy_connector::ProxyConnector,
         tcp_handler::TcpClientSetupResult,
@@ -36,6 +38,23 @@ pub(crate) fn validate(config: &ClientConfig, first: bool) -> io::Result<()> {
     match &config.protocol {
         ClientProxyConfig::Hysteria2(settings) => settings.validate(),
         ClientProxyConfig::Tuic(settings) => settings.validate(),
+        _ => unreachable!(),
+    }
+}
+
+pub(crate) fn validate_resolved(config: &ResolvedClientConfig, first: bool) -> io::Result<()> {
+    if !config.protocol.is_native_quic() {
+        return Ok(());
+    }
+    if !first || config.transport != Transport::Quic || config.tcp_settings.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "native QUIC clients require transport: quic at hop 0 without TCP settings",
+        ));
+    }
+    match &config.protocol {
+        ResolvedClientProxyConfig::Hysteria2(settings) => settings.validate(),
+        ResolvedClientProxyConfig::Tuic(settings) => settings.validate(),
         _ => unreachable!(),
     }
 }
@@ -70,11 +89,11 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    pub fn new(config: ClientConfig) -> io::Result<Self> {
-        validate(&config, true)?;
+    pub fn new(config: ResolvedClientConfig) -> io::Result<Self> {
+        validate_resolved(&config, true)?;
         let protocol = match config.protocol {
-            ClientProxyConfig::Hysteria2(config) => Protocol::Hysteria2(config),
-            ClientProxyConfig::Tuic(config) => Protocol::Tuic(config),
+            ResolvedClientProxyConfig::Hysteria2(config) => Protocol::Hysteria2(config),
+            ResolvedClientProxyConfig::Tuic(config) => Protocol::Tuic(config),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,

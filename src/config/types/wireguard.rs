@@ -1,3 +1,7 @@
+use crate::config::resolved::{
+    ResolvedClientChain, ResolvedDnsConfig, ResolvedRuleConfig, ResolvedServerConfig,
+    ResolvedWireguardClientConfig, ResolvedWireguardServerConfig,
+};
 #[cfg(unix)]
 use std::collections::HashSet;
 use std::{fmt, io, net::SocketAddr};
@@ -5,9 +9,7 @@ use std::{fmt, io, net::SocketAddr};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    ClientChain, DnsConfig, RuleConfig, selection::ConfigSelection, tun::TunResourceLimits,
-};
+use super::{ClientChain, tun::TunResourceLimits};
 use crate::option_util::NoneOrSome;
 
 #[derive(Clone)]
@@ -58,9 +60,9 @@ pub struct WireguardInbound {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "super::common::is_false")]
     pub sniff: bool,
-    pub rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    pub rules: NoneOrSome<ResolvedRuleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dns: Option<DnsConfig>,
+    pub dns: Option<ResolvedDnsConfig>,
 }
 
 /// A validated device, private to one configuration generation.
@@ -75,7 +77,7 @@ pub struct WireguardDeviceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_client_chain: Option<ClientChain>,
+    pub peer_client_chain: Option<ResolvedClientChain>,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,7 +88,7 @@ pub struct WireguardDeviceConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct WireguardClientConfig {
+pub struct WireguardClientRecord<C> {
     pub private_key: WireguardKey,
     pub public_key: WireguardKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,16 +103,14 @@ pub struct WireguardClientConfig {
     #[serde(default)]
     pub resource_limits: TunResourceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_client_chain: Option<ClientChain>,
-    #[serde(skip)]
-    pub(crate) endpoint_id: String,
-    #[serde(skip)]
-    pub(crate) connector: Option<std::sync::Arc<dyn crate::tcp::socket_connector::SocketConnector>>,
+    pub peer_client_chain: Option<C>,
 }
+
+pub type WireguardClientConfig = WireguardClientRecord<ClientChain>;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct WireguardServerConfig {
+pub struct WireguardServerRecord<C> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wireguard_name: Option<String>,
     pub private_key: WireguardKey,
@@ -123,14 +123,16 @@ pub struct WireguardServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_client_chain: Option<ClientChain>,
+    pub peer_client_chain: Option<C>,
 }
+
+pub type WireguardServerConfig = WireguardServerRecord<ClientChain>;
 
 fn default_allowed_ips() -> Vec<String> {
     vec!["0.0.0.0/0".into(), "::/0".into()]
 }
 
-impl WireguardClientConfig {
+impl ResolvedWireguardClientConfig {
     pub(crate) fn device(
         &self,
         address: &crate::address::NetLocation,
@@ -157,7 +159,7 @@ impl WireguardClientConfig {
     }
 }
 
-impl WireguardServerConfig {
+impl<C> WireguardServerRecord<C> {
     #[cfg(unix)]
     pub(crate) fn server_id(&self) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -179,8 +181,8 @@ impl WireguardServerConfig {
         }
     }
 
-    pub(crate) fn device(&self, server: &super::ServerConfig) -> io::Result<WireguardDeviceConfig> {
-        let listen = match &server.bind_location {
+    fn listen(&self, bind: &super::BindLocation) -> io::Result<Option<SocketAddr>> {
+        let listen = match bind {
             super::BindLocation::Unspecified {} if self.peer_client_chain.is_some() => None,
             super::BindLocation::Address(addresses) if addresses.iter().count() == 1 => {
                 let address = addresses.iter().next().unwrap();
@@ -205,6 +207,35 @@ impl WireguardServerConfig {
                 "WireGuard server peer_client_chain requires persistent_keepalive for every peer",
             ));
         }
+        Ok(listen)
+    }
+
+    pub(crate) fn validate_device(
+        &self,
+        bind: &super::BindLocation,
+        rules_empty: bool,
+    ) -> io::Result<()> {
+        DeviceValidation {
+            private_key: &self.private_key,
+            addresses: &self.addresses,
+            peers: &self.peers,
+            listen: self.listen(bind)?,
+            bind_interface: self.bind_interface.as_deref(),
+            has_carrier: self.peer_client_chain.is_some(),
+            mtu: self.mtu,
+            resource_limits: &self.resource_limits,
+            empty_rules: rules_empty,
+        }
+        .validate()
+    }
+}
+
+impl ResolvedWireguardServerConfig {
+    pub(crate) fn device(
+        &self,
+        server: &ResolvedServerConfig,
+    ) -> io::Result<WireguardDeviceConfig> {
+        let listen = self.listen(&server.bind_location)?;
         Ok(WireguardDeviceConfig {
             id: String::new(),
             private_key: self.private_key.clone(),
@@ -236,26 +267,46 @@ pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
 impl WireguardDeviceConfig {
     #[cfg(unix)]
     pub(crate) fn can_reach_endpoint(&self, endpoint: SocketAddr) -> bool {
-        self.listen.is_none_or(|listen| {
-            let listen_ip = listen.ip().to_canonical();
-            let endpoint_ip = endpoint.ip().to_canonical();
-            listen_ip.is_ipv4() == endpoint_ip.is_ipv4()
-                || listen_ip.is_ipv6() && listen_ip.is_unspecified()
-        })
+        can_reach_endpoint(self.listen, endpoint)
     }
 
     pub fn limits(&self) -> TunResourceLimits {
-        let mut limits = self.resource_limits.clone();
-        limits.tcp_memory_bytes.get_or_insert(32 * 1024 * 1024);
-        limits.max_tcp_connections.get_or_insert(256);
-        limits.max_udp_sessions.get_or_insert(1024);
-        limits.max_udp_destinations.get_or_insert(4096);
-        limits.max_udp_destinations_per_session.get_or_insert(64);
-        limits.max_udp_queued_bytes.get_or_insert(8 * 1024 * 1024);
-        limits
+        device_limits(&self.resource_limits)
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        DeviceValidation {
+            private_key: &self.private_key,
+            addresses: &self.addresses,
+            peers: &self.peers,
+            listen: self.listen,
+            bind_interface: self.bind_interface.as_deref(),
+            has_carrier: self.peer_client_chain.is_some(),
+            mtu: self.mtu,
+            resource_limits: &self.resource_limits,
+            empty_rules: self
+                .inbound
+                .as_ref()
+                .is_some_and(|inbound| inbound.rules.is_empty()),
+        }
+        .validate()
+    }
+}
+
+struct DeviceValidation<'a> {
+    private_key: &'a WireguardKey,
+    addresses: &'a [String],
+    peers: &'a [WireguardPeer],
+    listen: Option<SocketAddr>,
+    bind_interface: Option<&'a str>,
+    has_carrier: bool,
+    mtu: u16,
+    resource_limits: &'a TunResourceLimits,
+    empty_rules: bool,
+}
+
+impl DeviceValidation<'_> {
+    fn validate(&self) -> io::Result<()> {
         if !cfg!(unix) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -268,8 +319,8 @@ impl WireguardDeviceConfig {
         if !(1280..=1420).contains(&self.mtu) {
             return Err(invalid("WireGuard MTU must be between 1280 and 1420"));
         }
-        self.limits().validate()?;
-        if self.peer_client_chain.is_some() {
+        device_limits(self.resource_limits).validate()?;
+        if self.has_carrier {
             if self.listen.is_some() || self.bind_interface.is_some() {
                 return Err(invalid(
                     "WireGuard peer_client_chain conflicts with listen and bind_interface",
@@ -281,11 +332,7 @@ impl WireguardDeviceConfig {
                 ));
             }
         }
-        if self
-            .inbound
-            .as_ref()
-            .is_some_and(|inbound| inbound.rules.is_empty())
-        {
+        if self.empty_rules {
             return Err(invalid("WireGuard server requires nonempty explicit rules"));
         }
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "fuchsia")))]
@@ -299,7 +346,7 @@ impl WireguardDeviceConfig {
             use gotatun::x25519::{PublicKey, StaticSecret};
             use ipnetwork::IpNetwork;
             let mut families = HashSet::new();
-            for address in &self.addresses {
+            for address in self.addresses {
                 let network: IpNetwork = address
                     .parse()
                     .map_err(|_| invalid("invalid WireGuard local CIDR"))?;
@@ -343,7 +390,7 @@ impl WireguardDeviceConfig {
                     }
                     if location
                         .to_socket_addr_nonblocking()
-                        .is_some_and(|address| !self.can_reach_endpoint(address))
+                        .is_some_and(|address| !can_reach_endpoint(self.listen, address))
                     {
                         return Err(invalid(
                             "WireGuard peer endpoint is incompatible with the listen address",
@@ -366,6 +413,55 @@ impl WireguardDeviceConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn can_reach_endpoint(listen: Option<SocketAddr>, endpoint: SocketAddr) -> bool {
+    listen.is_none_or(|listen| {
+        let listen_ip = listen.ip().to_canonical();
+        let endpoint_ip = endpoint.ip().to_canonical();
+        listen_ip.is_ipv4() == endpoint_ip.is_ipv4()
+            || listen_ip.is_ipv6() && listen_ip.is_unspecified()
+    })
+}
+
+pub(crate) fn device_limits(resource_limits: &TunResourceLimits) -> TunResourceLimits {
+    let mut limits = resource_limits.clone();
+    limits.tcp_memory_bytes.get_or_insert(32 * 1024 * 1024);
+    limits.max_tcp_connections.get_or_insert(256);
+    limits.max_udp_sessions.get_or_insert(1024);
+    limits.max_udp_destinations.get_or_insert(4096);
+    limits.max_udp_destinations_per_session.get_or_insert(64);
+    limits.max_udp_queued_bytes.get_or_insert(8 * 1024 * 1024);
+    limits
+}
+
+impl<C> WireguardClientRecord<C> {
+    pub(crate) fn validate_device(
+        &self,
+        address: &crate::address::NetLocation,
+        bind_interface: Option<&str>,
+    ) -> io::Result<()> {
+        let peer = WireguardPeer {
+            public_key: self.public_key.clone(),
+            pre_shared_key: self.pre_shared_key.clone(),
+            endpoint: Some(address.to_string()),
+            allowed_ips: self.allowed_ips.clone(),
+            persistent_keepalive: self.persistent_keepalive,
+        };
+        DeviceValidation {
+            private_key: &self.private_key,
+            addresses: &self.addresses,
+            peers: &[peer],
+            listen: None,
+            bind_interface,
+            has_carrier: self.peer_client_chain.is_some(),
+            mtu: self.mtu,
+            resource_limits: &self.resource_limits,
+            empty_rules: false,
+        }
+        .validate()
     }
 }
 

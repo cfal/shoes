@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::composition;
 use crate::config::pem::convert_cert_paths;
 use crate::dns::IpStrategy;
 
@@ -73,7 +74,7 @@ fn websocket_early_data_validation_reaches_clients_and_every_server_target() {
                     protocol
                 ]});
                 let handler = create_tcp_server_handler(
-                    serde_json::from_value(protocol.clone()).unwrap(),
+                    crate::config::test_support::from_json(protocol.clone()).unwrap(),
                     &selector,
                     &resolver,
                     None,
@@ -85,7 +86,7 @@ fn websocket_early_data_validation_reaches_clients_and_every_server_target() {
             } else {
                 protocol["type"] = "ws".into();
                 let handler = create_tcp_client_handler(
-                    serde_json::from_value(protocol.clone()).unwrap(),
+                    crate::config::test_support::from_json(protocol.clone()).unwrap(),
                     &crate::address::NetLocation::from_str("127.0.0.1:443", None).unwrap(),
                     resolver.clone(),
                 );
@@ -153,10 +154,10 @@ async fn sudoku_mask_walkers_reach_certificates_rules_clients_and_fake_dns_targe
     validated
         .visit_clients(&mut |client| {
             clients += 1;
-            let ClientProxyConfig::SudokuMask(mask) = &client.protocol else {
+            let ResolvedClientProxyConfig::SudokuMask(mask) = &client.protocol else {
                 panic!("mask lost")
             };
-            let ClientProxyConfig::Tls(tls) = mask.protocol.as_ref() else {
+            let ResolvedClientProxyConfig::Tls(tls) = mask.protocol.as_ref() else {
                 panic!("TLS lost")
             };
             assert!(tls.cert.as_ref().unwrap().contains("BEGIN CERTIFICATE"));
@@ -165,26 +166,33 @@ async fn sudoku_mask_walkers_reach_certificates_rules_clients_and_fake_dns_targe
         })
         .unwrap();
     assert_eq!(clients, 1);
-    let mut overrides = 0;
-    crate::config::rule_visit::visit(
-        &mut validated.configs,
-        &mut |rule| {
-            assert!(rule.criteria.compiled.is_some());
-            if matches!(
-                &rule.action,
-                RuleActionConfig::Allow {
-                    override_address: Some(_),
-                    ..
-                }
-            ) {
-                overrides += 1;
-            }
-            Ok(())
-        },
-        &mut |_| panic!("unexpanded group"),
-    )
-    .unwrap();
-    assert_eq!(overrides, 1);
+    let ResolvedConfig::Server(server) = &validated.configs[0] else {
+        panic!("expected server")
+    };
+    let ResolvedServerProxyConfig::SudokuMask(mask) = &server.protocol else {
+        panic!("expected mask")
+    };
+    let ResolvedServerProxyConfig::Tls {
+        default_tls_target, ..
+    } = mask.protocol.as_ref()
+    else {
+        panic!("expected TLS")
+    };
+    let rule = default_tls_target
+        .as_ref()
+        .unwrap()
+        .override_rules
+        .iter()
+        .next()
+        .unwrap();
+    assert!(rule.criteria.compiled.is_some());
+    assert!(matches!(
+        &rule.action,
+        ResolvedRuleActionConfig::Allow {
+            override_address: Some(_),
+            ..
+        }
+    ));
     let error = validated
         .validate_network_endpoints(&["198.18.0.0/15".parse().unwrap()])
         .unwrap_err();
@@ -229,12 +237,12 @@ fn sudoku_mask_rejects_non_tcp_transports_even_inside_xhttp() {
     ];
     for protocol in clients {
         for transport in ["quic", "udp"] {
-            let mut config: ClientConfig = serde_json::from_value(
+            let config: ClientConfig = serde_json::from_value(
                 json!({"address":"localhost:1234","transport":transport,"protocol":protocol}),
             )
             .unwrap();
             let error =
-                validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default())
+                resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default())
                     .unwrap_err();
             assert!(
                 error.to_string().contains("sudoku_mask requires TCP"),
@@ -250,12 +258,12 @@ fn sudoku_mask_rejects_non_tcp_transports_even_inside_xhttp() {
     ];
     for protocol in servers {
         for transport in ["quic", "udp"] {
-            let mut config: ServerConfig = serde_json::from_value(
+            let config: ServerConfig = serde_json::from_value(
                 json!({"address":"0.0.0.0:1234","transport":transport,"protocol":protocol}),
             )
             .unwrap();
-            let error = validate_server_config(
-                &mut config,
+            let error = resolve_server_config(
+                config,
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
@@ -280,7 +288,7 @@ fn sudoku_mask_preserves_sni_and_existing_immediate_child_constraints() {
     validate_client_proxy_config(&mut reality, &HashMap::new(), Some("origin.example")).unwrap();
     let resolver = std::sync::Arc::new(crate::resolver::NativeResolver::new());
     crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
-        reality,
+        crate::config::test_support::Inline::inline(reality),
         &crate::address::NetLocation::from_str("origin.example:443", None).unwrap(),
         resolver,
     )
@@ -301,14 +309,14 @@ fn sudoku_mask_preserves_sni_and_existing_immediate_child_constraints() {
         assert_eq!(validate_client_proxy_structure(&protocol).is_ok(), valid);
     }
     let naive = json!({"type":"naive","users":[{"username":"user","password":"secret"}]});
-    let mut protocol = serde_json::from_value(mask(naive.clone())).unwrap();
-    let error = validate_server_proxy_config(
-        &mut protocol,
+    let protocol = serde_json::from_value(mask(naive.clone())).unwrap();
+    let error = resolve_server_proxy_config(
+        protocol,
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
-        ServerProtocolContext::Tls,
         GlobalLimits::default(),
+        ServerProtocolContext::Tls,
     )
     .unwrap_err();
     assert!(error.to_string().contains("NaiveProxy must be used inside"));
@@ -342,12 +350,12 @@ fn sudoku_mask_rejects_inner_client_placements() {
         json!({"type":"tls","protocol":{"type":"xhttp","protocol":inner}}),
     ] {
         for protocol in [protocol.clone(), mask(mask(protocol))] {
-            let mut config: ClientConfig = serde_json::from_value(json!({
+            let config: ClientConfig = serde_json::from_value(json!({
                 "address":"localhost:443", "protocol":protocol
             }))
             .unwrap();
             let error =
-                validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default())
+                resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default())
                     .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             assert!(
@@ -380,12 +388,12 @@ fn sudoku_mask_rejects_inner_server_placements_in_every_target_branch() {
         }}),
     ] {
         for protocol in [protocol.clone(), mask(mask(protocol))] {
-            let mut config: ServerConfig = serde_json::from_value(json!({
+            let config: ServerConfig = serde_json::from_value(json!({
                 "address":"0.0.0.0:443", "protocol":protocol
             }))
             .unwrap();
-            let error = validate_server_config(
-                &mut config,
+            let error = resolve_server_config(
+                config,
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
@@ -409,11 +417,11 @@ fn sudoku_mask_accepts_consecutive_outer_prefixes() {
         for _ in 0..depth {
             protocol = json!({"type":"sudoku_mask","protocol":protocol});
         }
-        let mut client: ClientConfig = serde_json::from_value(json!({
+        let client: ClientConfig = serde_json::from_value(json!({
             "address":"localhost:1080","protocol":protocol
         }))
         .unwrap();
-        validate_client_config(&mut client, &HashMap::new(), GlobalLimits::default()).unwrap();
+        resolve_client_config(client, None, &HashMap::new(), GlobalLimits::default()).unwrap();
         let configs = serde_json::from_value(json!([{
             "address":"0.0.0.0:1080","protocol":protocol
         }]))
@@ -438,6 +446,63 @@ fn sudoku_mask_outer_prefix_preserves_tls_alpn_validation() {
                 valid
             );
         }
+    }
+}
+
+thread_local! {
+    pub(super) static CLIENT_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+#[cfg(unix)]
+fn review_nested_carrier_validation_visits_each_client_once() {
+    use base64::Engine;
+    use serde_json::json;
+
+    let key = |byte| base64::engine::general_purpose::STANDARD.encode([byte; 32]);
+    let public = gotatun::x25519::PublicKey::from(&gotatun::x25519::StaticSecret::from([99; 32]));
+    for depth in [4, 8] {
+        let mut nested = None;
+        for index in 0..depth {
+            let mut client = json!({
+                "address":format!("192.0.2.{}:51820", index + 1),
+                "protocol":{
+                    "type":"wireguard", "private_key":key(index + 1),
+                    "public_key":base64::engine::general_purpose::STANDARD.encode(public.as_bytes()),
+                    "addresses":["10.77.0.2/32"], "mtu":1280
+                }
+            });
+            if let Some(nested) = nested {
+                client["protocol"]["peer_client_chain"] = json!([
+                    nested,
+                    {"address":"192.0.2.99:443", "protocol":{
+                        "type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+                    }}
+                ]);
+            }
+            nested = Some(client);
+        }
+        let client = nested.unwrap();
+        let chain: ClientChain = serde_json::from_value(json!([client])).unwrap();
+        CLIENT_VALIDATIONS.set(0);
+        compiler::compile_chain(
+            chain.hops,
+            &HashMap::new(),
+            &HashMap::new(),
+            GlobalLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(CLIENT_VALIDATIONS.get(), usize::from(depth) * 2 - 1);
+
+        CLIENT_VALIDATIONS.set(0);
+        create_server_configs(
+            serde_json::from_value(json!([
+                {"client_group":"nested", "client_chains":[client]}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(CLIENT_VALIDATIONS.get() <= usize::from(depth) * 4 + 10);
     }
 }
 
@@ -502,25 +567,25 @@ fn native_vless_configuration_rejects_ambiguous_vision_and_secrets() {
         validate_client_vision_protocol(false, &client_config, outer).unwrap();
     }
     let validate_server = |value: serde_json::Value| {
-        let mut config = serde_json::from_value(value).unwrap();
-        validate_server_proxy_config(
-            &mut config,
+        let config = serde_json::from_value(value).unwrap();
+        let config = resolve_server_proxy_config(
+            config,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            ServerProtocolContext::Stream,
             GlobalLimits::default(),
+            ServerProtocolContext::Stream,
         )?;
         Ok::<_, std::io::Error>(config)
     };
     let server_config = validate_server(server.clone()).unwrap();
     assert!(
-        validate_server_vision(true, &server_config)
+        validate_resolved_server_vision(true, &server_config)
             .unwrap_err()
             .to_string()
             .contains("outer TLS/REALITY vision: false")
     );
-    validate_server_vision(false, &server_config).unwrap();
+    validate_resolved_server_vision(false, &server_config).unwrap();
     for (key, value) in [
         ("encryption", json!("none")),
         ("encryption", json!("invalid-secret-do-not-log")),
@@ -554,7 +619,7 @@ fn native_vless_configuration_rejects_ambiguous_vision_and_secrets() {
         let mut config = server.clone();
         config["decryption"] = json!(disabled);
         config["vision"] = json!(false);
-        validate_server_vision(true, &validate_server(config).unwrap()).unwrap();
+        validate_resolved_server_vision(true, &validate_server(config).unwrap()).unwrap();
     }
 }
 
@@ -733,14 +798,14 @@ fn server_protocol_context_enforces_transport_and_termination() {
             ServerProtocolContext::Tls,
             ServerProtocolContext::Quic,
         ] {
-            let mut protocol = serde_json::from_value(value.clone()).unwrap();
-            let result = validate_server_proxy_config(
-                &mut protocol,
+            let protocol = serde_json::from_value(value.clone()).unwrap();
+            let result = resolve_server_proxy_config(
+                protocol,
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
-                context,
                 GlobalLimits::default(),
+                context,
             );
             assert_eq!(result.is_ok(), context == valid_context);
             if let Err(error) = result {
@@ -765,7 +830,7 @@ fn server_protocol_context_enforces_transport_and_termination() {
 
 #[test]
 fn nested_structure_errors_precede_protocol_field_errors() {
-    let mut config = serde_json::from_value(serde_json::json!({
+    let config = serde_json::from_value(serde_json::json!({
         "address": "example.com:443",
         "protocol": {
             "type": "reality", "public_key": "invalid",
@@ -774,7 +839,7 @@ fn nested_structure_errors_precede_protocol_field_errors() {
     }))
     .unwrap();
     let error =
-        validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default()).unwrap_err();
+        resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default()).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(
         error.to_string(),
@@ -821,12 +886,12 @@ fn reality_sni_defaults_only_at_the_outer_client_layer() {
             false,
         ),
     ] {
-        let mut config: ClientConfig = serde_json::from_value(serde_json::json!({
+        let config: ClientConfig = serde_json::from_value(serde_json::json!({
             "address": address, "protocol": protocol
         }))
         .unwrap();
         assert_eq!(
-            validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default()).is_ok(),
+            resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default()).is_ok(),
             valid
         );
     }
@@ -851,9 +916,9 @@ fn reality_mldsa_client_key_validation() {
         if let Some(key) = key {
             value["protocol"]["mldsa65_verify"] = key.into();
         }
-        let mut config: ClientConfig = serde_json::from_value(value).unwrap();
+        let config: ClientConfig = serde_json::from_value(value).unwrap();
         assert_eq!(
-            validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default()).is_ok(),
+            resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default()).is_ok(),
             expected
         );
     }
@@ -883,7 +948,7 @@ async fn reality_mldsa_server_seed_validation() {
     }
 }
 
-async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
+async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<ResolvedConfig>> {
     let (converted_configs, _) = convert_cert_paths(configs).await?;
     let validated = create_server_configs(converted_configs)?;
     Ok(validated.configs)
@@ -910,7 +975,7 @@ fn xhttp_split_capacity_uses_candidate_global_stream_limit() {
                     let rules =
                         json!([{"masks": "0.0.0.0/0", "action": "allow", "client_chain": client}]);
                     let entries = [
-                        json!({"client_group": "proxy", "client_proxies": client}),
+                        json!({"client_group": "proxy", "client_chains": client}),
                         json!({"address": "0.0.0.0:1080", "protocol": {"type": "socks"}, "rules": rules}),
                         json!({"dns_group": "dns", "dns_servers": [{"url": "https://1.1.1.1/dns-query", "client_chain": client}]}),
                         json!({"device_fd": 1, "rules": rules}),
@@ -956,14 +1021,14 @@ fn hybrid_only_rejects_vision_and_tuic_early_handshakes() {
         serde_json::json!({"type": "tls", "tls_targets": {"localhost": tls_target}}),
         serde_json::json!({"type": "tls", "default_tls_target": tls_target}),
     ] {
-        let mut server: ServerProxyConfig = serde_json::from_value(protocol).unwrap();
-        let error = validate_server_proxy_config(
-            &mut server,
+        let server: ServerProxyConfig = serde_json::from_value(protocol).unwrap();
+        let error = resolve_server_proxy_config(
+            server,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            ServerProtocolContext::Stream,
             GlobalLimits::default(),
+            ServerProtocolContext::Stream,
         )
         .unwrap_err();
         assert!(error.to_string().contains("hybrid-only"), "{error}");
@@ -979,14 +1044,14 @@ fn hybrid_only_rejects_vision_and_tuic_early_handshakes() {
             .to_string()
             .contains("hybrid-only")
     );
-    let mut server: ServerConfig = serde_json::from_value(serde_json::json!({
+    let server: ServerConfig = serde_json::from_value(serde_json::json!({
             "address": "0.0.0.0:443", "transport": "quic",
             "quic_settings": {"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem(), "key_exchange_groups": ["X25519MLKEM768"]},
             "protocol": {"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "test", "zero_rtt_handshake": true}
         })).unwrap();
     assert!(
-        validate_server_config(
-            &mut server,
+        resolve_server_config(
+            server,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -1012,14 +1077,16 @@ fn quic_allowlists_cannot_be_ignored_by_direct_or_later_hops() {
         }
         let direct =
             json!({"protocol": {"type": "direct"}, "transport": "quic", "quic_settings": settings});
-        let mut config: ClientConfig = serde_json::from_value(direct).unwrap();
-        let result = validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default());
+        let config: ClientConfig = serde_json::from_value(direct).unwrap();
+        let result = resolve_client_config(config, None, &HashMap::new(), GlobalLimits::default());
         assert_eq!(result.is_err(), groups.is_some());
 
         let proxy = json!({"address": "127.0.0.1:443", "protocol": {"type": "socks"}, "transport": "quic", "quic_settings": settings});
         let group_configs = HashMap::from([(
             "proxy".into(),
-            vec![serde_json::from_value::<ClientConfig>(proxy.clone()).unwrap()],
+            HopPlan::Single(DraftClient::Ready(crate::config::test_support::client(
+                serde_json::from_value::<ClientConfig>(proxy.clone()).unwrap(),
+            ))),
         )]);
         for hop in [
             proxy.clone(),
@@ -1029,11 +1096,10 @@ fn quic_allowlists_cannot_be_ignored_by_direct_or_later_hops() {
             let direct = json!({"protocol": {"type": "direct"}});
             for chain in [json!([hop]), json!([direct, hop])] {
                 let later_hop = chain.as_array().unwrap().len() > 1;
-                let mut parsed: super::super::types::ClientChain =
+                let parsed: super::super::types::ClientChain =
                     serde_json::from_value(chain.clone()).unwrap();
-                let result = validate_client_chain(
-                    &mut parsed.hops,
-                    0,
+                let result = compiler::compile_chain(
+                    parsed.hops,
                     &group_configs,
                     &HashMap::new(),
                     GlobalLimits::default(),
@@ -1082,11 +1148,44 @@ async fn test_validate_config_success() {
             group_type: Default::default(),
             default: None,
             client_group: "test-group".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
     ];
 
     assert!(validate_configs_test(configs).await.is_ok());
+}
+
+#[test]
+fn hop_dependencies_preserve_pool_order_duplicates_and_nested_carriers() {
+    use serde_json::json;
+
+    let member = ConfigSelection::GroupName("member".to_owned());
+    for hop in [
+        ClientChainHop::Single(member.clone()),
+        ClientChainHop::Pool(OneOrSome::One(member)),
+    ] {
+        let mut dependencies = Vec::new();
+        collect_hop_dependencies(&hop, &mut dependencies);
+        assert_eq!(dependencies, ["member"]);
+    }
+
+    let wireguard = |chain| {
+        json!({"address":"192.0.2.1:51820", "protocol":{
+            "type":"wireguard",
+            "private_key":"KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+            "public_key":"CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "addresses":["10.77.0.2/32"], "peer_client_chain":chain
+        }})
+    };
+    let inner = wireguard(json!([{"pool":["inner", "inner"]}, "tail"]));
+    let outer = wireguard(json!([inner, "outer"]));
+    let hop = serde_json::from_value(json!({"pool":["head", outer, "head"]})).unwrap();
+    let mut dependencies = Vec::new();
+    collect_hop_dependencies(&hop, &mut dependencies);
+    assert_eq!(
+        dependencies,
+        ["head", "inner", "inner", "tail", "outer", "head"]
+    );
 }
 
 #[tokio::test]
@@ -1099,13 +1198,13 @@ async fn test_topological_sort_simple() {
             group_type: Default::default(),
             default: None,
             client_group: "group-a".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-b".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
     ];
 
@@ -1121,13 +1220,13 @@ async fn test_topological_sort_cycle_detected() {
             group_type: Default::default(),
             default: None,
             client_group: "group-a".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-b".to_string()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-b".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-a".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-a".to_string()).into()),
         }),
     ];
 
@@ -1148,7 +1247,7 @@ async fn test_topological_sort_unknown_group() {
         group_type: Default::default(),
         default: None,
         client_group: "group-a".to_string(),
-        client_proxies: OneOrSome::One(ConfigSelection::GroupName("nonexistent".to_string())),
+        client_chains: OneOrSome::One(ConfigSelection::GroupName("nonexistent".to_string()).into()),
     })];
 
     let result = validate_configs_test(configs).await;
@@ -1170,27 +1269,27 @@ async fn test_topological_sort_diamond() {
             group_type: Default::default(),
             default: None,
             client_group: "group-d".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-c".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-b".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string())),
+            client_chains: OneOrSome::One(ConfigSelection::GroupName("group-d".to_string()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "group-a".to_string(),
-            client_proxies: OneOrSome::Some(vec![
-                ConfigSelection::GroupName("group-b".to_string()),
-                ConfigSelection::GroupName("group-c".to_string()),
+            client_chains: OneOrSome::Some(vec![
+                ConfigSelection::GroupName("group-b".to_string()).into(),
+                ConfigSelection::GroupName("group-c".to_string()).into(),
             ]),
         }),
     ];
@@ -1207,21 +1306,21 @@ async fn test_nested_groups_resolve() {
             group_type: Default::default(),
             default: None,
             client_group: "us-proxies".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "eu-proxies".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::ClientConfigGroup(ClientConfigGroup {
             group_type: Default::default(),
             default: None,
             client_group: "all-proxies".to_string(),
-            client_proxies: OneOrSome::Some(vec![
-                ConfigSelection::GroupName("us-proxies".to_string()),
-                ConfigSelection::GroupName("eu-proxies".to_string()),
+            client_chains: OneOrSome::Some(vec![
+                ConfigSelection::GroupName("us-proxies".to_string()).into(),
+                ConfigSelection::GroupName("eu-proxies".to_string()).into(),
             ]),
         }),
     ];
@@ -1361,7 +1460,7 @@ async fn test_recursive_certificate_embedding() {
     assert_eq!(load_count, 11);
 
     let validated = create_server_configs(converted_configs).unwrap();
-    let Config::Server(server_config) = &validated.configs[0] else {
+    let ResolvedConfig::Server(server_config) = &validated.configs[0] else {
         panic!("expected Config::Server");
     };
 
@@ -1369,7 +1468,7 @@ async fn test_recursive_certificate_embedding() {
     assert!(quic_settings.cert.contains("BEGIN CERTIFICATE"));
     assert!(quic_settings.key.contains("BEGIN PRIVATE KEY"));
 
-    if let ServerProxyConfig::Tls {
+    if let ResolvedServerProxyConfig::Tls {
         tls_targets,
         shadowtls_targets,
         ..
@@ -1380,7 +1479,7 @@ async fn test_recursive_certificate_embedding() {
         assert!(tls_config.key.contains("BEGIN PRIVATE KEY"));
 
         let shadow_config = shadowtls_targets.get("shadow.com").unwrap();
-        if let ShadowTlsServerHandshakeConfig::Local(handshake) = &shadow_config.handshake {
+        if let ResolvedShadowTlsServerHandshakeConfig::Local(handshake) = &shadow_config.handshake {
             assert!(handshake.cert.contains("BEGIN CERTIFICATE"));
             assert!(handshake.key.contains("BEGIN PRIVATE KEY"));
         }
@@ -1394,7 +1493,10 @@ fn test_direct_connector_at_hop_0_allowed() {
         ClientConfig::default(), // default is direct
     )));
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 fn http_proxy_config() -> ClientProxyConfig {
@@ -1424,7 +1526,10 @@ fn test_direct_then_proxy_allowed() {
         })),
     ]);
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1441,7 +1546,10 @@ fn test_proxy_then_proxy_allowed() {
         })),
     ]);
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1455,7 +1563,8 @@ fn test_direct_at_hop_1_rejected() {
         ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())), // direct
     ]);
 
-    let result = validate_connector_positions(&hops, 0);
+    let result =
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("hop 1"));
@@ -1476,7 +1585,8 @@ fn test_direct_in_middle_of_chain_rejected() {
         })),
     ]);
 
-    let result = validate_connector_positions(&hops, 0);
+    let result =
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("hop 1"));
@@ -1493,7 +1603,10 @@ fn test_direct_in_pool_at_hop_0_allowed() {
         }),
     ])));
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1513,7 +1626,8 @@ fn test_direct_in_pool_at_hop_1_rejected() {
         ])),
     ]);
 
-    let result = validate_connector_positions(&hops, 0);
+    let result =
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("hop 1"));
@@ -1534,7 +1648,10 @@ fn test_three_hop_direct_first_then_proxies_allowed() {
         })),
     ]);
 
-    assert!(validate_connector_positions(&hops, 0).is_ok());
+    assert!(
+        composition::validate(&crate::config::test_support::chain(ClientChain { hops }).hops)
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -1726,7 +1843,7 @@ async fn test_dns_system_with_client_chain_rejected() {
         dns_group: "test-dns".to_string(),
         dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
             url: "system".to_string(),
-            client_chain: NoneOrSome::One(ConfigSelection::Config(ClientChain::default())),
+            client_chain: NoneOrSome::One(ClientChain::default()),
             bootstrap_url: None,
             server_name: None,
             ip_strategy: IpStrategy::default(),
@@ -1744,6 +1861,38 @@ async fn test_dns_system_with_client_chain_rejected() {
         err.contains("client_chain is not supported for system DNS"),
         "Expected system DNS client_chain error, got: {err}"
     );
+}
+
+#[test]
+fn dns_chain_aliases_expand_sequential_groups_in_order() {
+    use serde_json::json;
+    for field in ["client_chain", "client_chains"] {
+        for chain in [
+            json!(["a", "b"]),
+            json!({"chain": ["a", "b"]}),
+            json!([{"chain": ["a", "b"]}]),
+        ] {
+            let configs = serde_json::from_value(json!([
+            {"client_group":"a", "client_chain":{"address":"192.0.2.1:1080", "protocol":{"type":"socks"}}},
+            {"client_group":"b", "client_chain":{"address":"192.0.2.2:1080", "protocol":{"type":"socks"}}},
+            {"dns_group":"dns", "dns_servers":[{"url":"tcp://192.0.2.53", field:chain}]}
+        ])).unwrap();
+            let validated = crate::config::create_server_configs(configs).unwrap();
+            let chains = &validated.dns_groups[0].specs[0].client_chains;
+            assert_eq!(chains.len(), 1);
+            let addresses: Vec<_> = chains[0]
+                .hops
+                .iter()
+                .map(|hop| {
+                    let ResolvedClientHop::Single(client) = hop else {
+                        panic!("expected a fixed hop")
+                    };
+                    client.address.to_string()
+                })
+                .collect();
+            assert_eq!(addresses, ["192.0.2.1:1080", "192.0.2.2:1080"]);
+        }
+    }
 }
 
 #[test]
@@ -1805,14 +1954,18 @@ async fn test_dns_udp_with_proxy_chain_rejected() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
+            client_chains: OneOrSome::One(ConfigSelection::Config(socks_config).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "udp://8.8.8.8".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -1843,16 +1996,18 @@ async fn test_dns_udp_with_direct_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "direct-chain".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "udp://8.8.8.8".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName(
-                    "direct-chain".to_string(),
-                )),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "direct-chain".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -1885,14 +2040,18 @@ async fn test_dns_h3_with_proxy_chain_rejected() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
+            client_chains: OneOrSome::One(ConfigSelection::Config(socks_config).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "h3://1.1.1.1/dns-query".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -1923,16 +2082,18 @@ async fn test_dns_h3_with_direct_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "direct-chain".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "h3://1.1.1.1/dns-query".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName(
-                    "direct-chain".to_string(),
-                )),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "direct-chain".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -1956,14 +2117,18 @@ async fn test_dns_tcp_with_client_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "tcp://8.8.8.8".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -1988,14 +2153,18 @@ async fn test_dns_tls_with_client_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "tls://1.1.1.1".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -2020,14 +2189,18 @@ async fn test_dns_https_with_client_chain_allowed() {
             group_type: Default::default(),
             default: None,
             client_group: "test-proxy".to_string(),
-            client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 url: "https://1.1.1.1/dns-query".to_string(),
-                client_chain: NoneOrSome::One(ConfigSelection::GroupName("test-proxy".to_string())),
+                client_chain: NoneOrSome::One(ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    ))),
+                }),
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
@@ -2207,11 +2380,9 @@ async fn test_empty_dns_lists_use_default_resolver() {
     assert_eq!(configs.len(), 2);
     for config in configs {
         let dns = match config {
-            Config::Server(server) => server.dns.unwrap(),
-            Config::TunServer(tun) => tun.dns.unwrap(),
-            _ => unreachable!(),
+            ResolvedConfig::Server(server) => server.dns.unwrap(),
+            ResolvedConfig::TunServer(tun) => tun.dns.unwrap(),
         };
-        assert!(matches!(dns.servers, NoneOrSome::None));
         assert_eq!(dns.resolved_group(), None);
     }
 }
@@ -2263,7 +2434,7 @@ async fn test_server_dns_with_group_ref() {
 
     // Verify servers is still the group name (not expanded)
     let validated = result.unwrap();
-    if let Config::Server(s) = &validated[0] {
+    if let ResolvedConfig::Server(s) = &validated[0] {
         assert_eq!(s.dns.as_ref().unwrap().resolved_group(), Some("my-dns"));
     }
 }
@@ -2318,7 +2489,7 @@ async fn test_server_dns_with_mixed_group_and_url() {
 
     // Verify servers was expanded to an inline group name
     let validated = result.unwrap();
-    if let Config::Server(s) = &validated[0] {
+    if let ResolvedConfig::Server(s) = &validated[0] {
         let group = s.dns.as_ref().unwrap().resolved_group().unwrap();
         assert!(
             group.starts_with("__inline_dns_"),
@@ -2383,7 +2554,7 @@ async fn test_server_dns_with_multiple_group_refs() {
 
     // Verify servers was expanded to an inline group name
     let validated = result.unwrap();
-    if let Config::Server(s) = &validated[0] {
+    if let ResolvedConfig::Server(s) = &validated[0] {
         let group = s.dns.as_ref().unwrap().resolved_group().unwrap();
         assert!(
             group.starts_with("__inline_dns_"),

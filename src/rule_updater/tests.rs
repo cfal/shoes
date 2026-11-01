@@ -34,7 +34,7 @@ async fn bootstrap(
 }
 
 async fn refresh_once(
-    source: &RuleSource,
+    source: &ResolvedRuleSource,
     configs: &[Config],
     memory: &mut MemorySources,
     lease: Option<Arc<CacheLease>>,
@@ -75,11 +75,7 @@ fn bootstrap_routes_are_inline_tcp_and_preserve_dns_name_precedence() {
             source.download.as_mut().unwrap().client_chain =
                 serde_json::from_value(chain.clone()).unwrap();
             source.download.as_mut().unwrap().bootstrap_url = dns.into();
-            crate::config::validate_rule_bootstrap(
-                &configs(&source),
-                std::slice::from_mut(&mut source),
-            )
-            .unwrap();
+            crate::config::validate_rule_bootstrap(&configs(&source), vec![source]).unwrap();
         }
     }
     for chain in [
@@ -90,24 +86,12 @@ fn bootstrap_routes_are_inline_tcp_and_preserve_dns_name_precedence() {
     ] {
         let mut source = remote.clone();
         source.download.as_mut().unwrap().client_chain = serde_json::from_value(chain).unwrap();
-        assert!(
-            crate::config::validate_rule_bootstrap(
-                &configs(&source),
-                std::slice::from_mut(&mut source)
-            )
-            .is_err()
-        );
+        assert!(crate::config::validate_rule_bootstrap(&configs(&source), vec![source]).is_err());
     }
     for dns in ["h3://127.0.0.1", "udp://dns.invalid", "named"] {
         let mut source = remote.clone();
         source.download.as_mut().unwrap().bootstrap_url = dns.into();
-        assert!(
-            crate::config::validate_rule_bootstrap(
-                &configs(&source),
-                std::slice::from_mut(&mut source)
-            )
-            .is_err()
-        );
+        assert!(crate::config::validate_rule_bootstrap(&configs(&source), vec![source]).is_err());
     }
     let mut config = configs(&remote);
     config.push(
@@ -116,7 +100,7 @@ fn bootstrap_routes_are_inline_tcp_and_preserve_dns_name_precedence() {
         )
         .unwrap(),
     );
-    let error = crate::config::validate_rule_bootstrap(&config, &mut [remote]).unwrap_err();
+    let error = crate::config::validate_rule_bootstrap(&config, vec![remote]).unwrap_err();
     assert!(error.to_string().contains("named DNS"), "{error}");
 }
 
@@ -320,7 +304,7 @@ async fn remote_decode_scratch_counts_retained_sources_before_cache_or_memory_ch
         let error = if mode == "refresh" {
             let previous = load_cached(&remote, None, 0).unwrap();
             memory.insert(remote.path.clone(), previous.clone());
-            let result = refresh_once(&remote, &configs, &mut memory, None).await;
+            let result = refresh_once(&inline_source(&remote), &configs, &mut memory, None).await;
             assert!(Arc::ptr_eq(&previous, &memory[&remote.path]));
             result.unwrap_err()
         } else {
@@ -448,7 +432,7 @@ async fn refresh_decode_excludes_replaced_indexes_and_reuses_identical_bytes_nea
             }),
         ];
         assert_eq!(
-            refresh_once(&remote, &config, &mut memory, None)
+            refresh_once(&inline_source(&remote), &config, &mut memory, None)
                 .await
                 .unwrap(),
             !identical,
@@ -759,7 +743,7 @@ async fn resolved_synthetic_targets_and_downstream_proxies_are_rejected_before_c
         .unwrap();
         dns.register("bootstrap".into(), resolver.clone());
         let error = download_source(
-            &source,
+            &inline_source(&source),
             None,
             &dns,
             GlobalLimits::default(),
@@ -804,7 +788,7 @@ fn write_rule(path: &Path, bytes: &[u8]) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-fn cached_sources(sources: &[RuleSource]) -> MemorySources {
+fn cached_sources<C>(sources: &[RuleSource<C>]) -> MemorySources {
     sources
         .iter()
         .map(|source| (source.path.clone(), load_cached(source, None, 0).unwrap()))
@@ -820,6 +804,13 @@ fn source(url: &str, path: &Path) -> RuleSource {
         bootstrap_url: "system".into(),
     }));
     source
+}
+
+fn inline_source(source: &RuleSource) -> ResolvedRuleSource {
+    source
+        .clone()
+        .map_chain(|chain| Ok(crate::config::test_support::chain(chain)))
+        .unwrap()
 }
 
 fn cache_config(path: PathBuf) -> Config {
@@ -848,18 +839,13 @@ fn memory_configs(source: &RuleSource) -> Vec<Config> {
 }
 
 fn predicates(validated: &ValidatedConfigs) -> Vec<Arc<crate::rules::Predicate>> {
-    let Config::Server(server) = &validated.configs[0] else {
+    let crate::config::ResolvedConfig::Server(server) = &validated.configs[0] else {
         panic!("expected server")
     };
     server
         .rules
         .iter()
-        .map(|rule| {
-            let crate::config::ConfigSelection::Config(rule) = rule else {
-                panic!("unexpanded rule")
-            };
-            rule.criteria.compiled.as_ref().unwrap().clone()
-        })
+        .map(|rule| rule.criteria.compiled.as_ref().unwrap().clone())
         .collect()
 }
 
@@ -917,7 +903,7 @@ async fn memory_refresh_validates_changed_candidates_without_replacing_on_failur
                 .unwrap(),
             );
         }
-        let result = refresh_once(&source, &config, &mut memory, None).await;
+        let result = refresh_once(&inline_source(&source), &config, &mut memory, None).await;
         fixture.await.unwrap();
         if body == OLD {
             assert!(!result.unwrap());
@@ -982,7 +968,7 @@ async fn retained_sources_do_not_read_a_replaced_cache_namespace() {
         .unwrap();
     Refresh::new(
         config.clone(),
-        &[first.clone(), second.clone()],
+        &validated.remote_rules,
         reused,
         None,
         Some(lease.clone()),
@@ -1023,7 +1009,7 @@ async fn memory_refresh_validates_new_source_and_preserves_other_sources() {
         Arc::new(crate::rule_set::load_memory(first, OLD, blake3::hash(OLD), 0).unwrap());
     let mut memory = MemorySources::from([(first.path.clone(), original.clone())]);
     assert!(
-        refresh_once(second, &config, &mut memory, None)
+        refresh_once(&inline_source(second), &config, &mut memory, None)
             .await
             .unwrap()
     );
@@ -1082,9 +1068,14 @@ async fn cache_save_failure_keeps_validated_rules_and_identical_download_retries
         }
     });
     assert!(
-        refresh_once(&remote, &config, &mut memory, Some(lease.clone()))
-            .await
-            .unwrap()
+        refresh_once(
+            &inline_source(&remote),
+            &config,
+            &mut memory,
+            Some(lease.clone())
+        )
+        .await
+        .unwrap()
     );
     assert_eq!(memory[&path].digest, blake3::hash(VALID));
     assert_eq!(std::fs::read(&path).unwrap(), OLD);
@@ -1093,16 +1084,26 @@ async fn cache_save_failure_keeps_validated_rules_and_identical_download_retries
     let loaded = memory[&path].clone();
     std::fs::remove_file(stage_path(&path)).unwrap();
     assert!(
-        !refresh_once(&remote, &config, &mut memory, Some(lease.clone()))
-            .await
-            .unwrap()
+        !refresh_once(
+            &inline_source(&remote),
+            &config,
+            &mut memory,
+            Some(lease.clone())
+        )
+        .await
+        .unwrap()
     );
     assert!(Arc::ptr_eq(&loaded, &memory[&path]));
     assert_eq!(std::fs::read(&path).unwrap(), VALID);
     assert!(
-        refresh_once(&remote, &config, &mut memory, Some(lease.clone()))
-            .await
-            .is_err()
+        refresh_once(
+            &inline_source(&remote),
+            &config,
+            &mut memory,
+            Some(lease.clone())
+        )
+        .await
+        .is_err()
     );
     fixture.await.unwrap();
     assert!(Arc::ptr_eq(&loaded, &memory[&path]));
@@ -1169,7 +1170,7 @@ async fn refresh_after_lease_loss_updates_only_memory() {
         write_rule(&first.path, b"replacement namespace");
         write_rule(&second.path, b"replacement namespace");
         assert!(
-            refresh_once(&first, &config, &mut memory, Some(lease))
+            refresh_once(&inline_source(&first), &config, &mut memory, Some(lease))
                 .await
                 .unwrap()
         );
@@ -1227,7 +1228,7 @@ async fn memory_inputs_share_predicates_across_references_and_reloads_without_re
 
 async fn update(source: &RuleSource, limits: Limits) -> io::Result<Outcome> {
     let downloaded = download_source(
-        source,
+        &inline_source(source),
         None,
         &DnsRegistry::new(),
         GlobalLimits::default(),
@@ -1959,7 +1960,7 @@ async fn stalled_url_address_does_not_block_another_guarded_candidate() {
         timeout(
             Duration::from_secs(2),
             download_source(
-                &source,
+                &inline_source(&source),
                 None,
                 &dns,
                 GlobalLimits::default(),
@@ -2217,7 +2218,7 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
     source.update_interval = Some("7d".into());
     let mut refresh = Refresh::new(
         configs(&source),
-        std::slice::from_ref(&source),
+        &[inline_source(&source)],
         cached_sources(std::slice::from_ref(&source)),
         None,
         None,
@@ -2236,7 +2237,7 @@ async fn refresh_noop_remembers_check_time_and_removal_drops_download() {
     assert!(refresh.scheduled[0].due > Instant::now() + Duration::from_secs(3600));
     let next = Refresh::new(
         configs(&source),
-        &[source],
+        &[inline_source(&source)],
         refresh.memory.clone(),
         Some(&refresh),
         None,
@@ -2382,7 +2383,7 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
     let mut source = source("https://example.com/first.json", &path);
     let mut previous = Refresh::new(
         configs(&source),
-        std::slice::from_ref(&source),
+        &[inline_source(&source)],
         cached_sources(std::slice::from_ref(&source)),
         None,
         None,
@@ -2393,7 +2394,7 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
 
     let next = Refresh::new(
         configs(&source),
-        std::slice::from_ref(&source),
+        &[inline_source(&source)],
         previous.memory.clone(),
         Some(&previous),
         None,
@@ -2405,7 +2406,7 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
     source.url = Some("https://example.com/second.json".into());
     let changed = Refresh::new(
         configs(&source),
-        std::slice::from_ref(&source),
+        &[inline_source(&source)],
         cached_sources(std::slice::from_ref(&source)),
         Some(&previous),
         None,
@@ -2428,7 +2429,14 @@ fn cached_source_age_is_preserved_when_the_refresh_interval_changes() {
     source.update_interval = Some("1s".into());
     let memory = cached_sources(std::slice::from_ref(&source));
     source.update_interval = Some("2h".into());
-    let refresh = Refresh::new(configs(&source), &[source], memory, None, None).unwrap();
+    let refresh = Refresh::new(
+        configs(&source),
+        &[inline_source(&source)],
+        memory,
+        None,
+        None,
+    )
+    .unwrap();
     let remaining = refresh.scheduled[0].due.duration_since(Instant::now());
     assert!(remaining > Duration::from_secs(3595));
     assert!(remaining <= Duration::from_secs(3600));
@@ -2451,7 +2459,7 @@ async fn refresh_validates_the_whole_candidate_only_for_changed_bytes() {
             .unwrap(),
         );
         let result = refresh_once(
-            &source,
+            &inline_source(&source),
             &config,
             &mut cached_sources(std::slice::from_ref(&source)),
             None,
@@ -2571,7 +2579,7 @@ async fn explicit_bootstrap_resolves_target_without_system_dns() {
     );
     source.download.as_mut().unwrap().bootstrap_url = "bootstrap".into();
     let downloaded = download_source(
-        &source,
+        &inline_source(&source),
         None,
         &dns,
         GlobalLimits::default(),
@@ -2694,7 +2702,7 @@ async fn multihop_download_pins_bootstrap_answers_and_preserves_proxy_tls_names(
             }
         });
         let downloaded = download_source(
-            &source,
+            &inline_source(&source),
             None,
             &dns,
             GlobalLimits::default(),
@@ -2850,7 +2858,7 @@ async fn first_download_proxy_retains_bootstrap_address_fallback() {
         });
         drop(
             download_source(
-                &source,
+                &inline_source(&source),
                 None,
                 &dns,
                 GlobalLimits::default(),
@@ -2982,23 +2990,17 @@ fn remote_sources_work_in_source_groups_policies_and_flat_overrides() {
         }]}}
     ]))
     .unwrap();
-    let mut validated = crate::config::create_server_configs(config).unwrap();
+    let validated = crate::config::create_server_configs(config).unwrap();
     assert_eq!(validated.remote_rules.len(), 1);
     let mut count = 0;
-    crate::config::rule_visit::visit(
-        &mut validated.configs,
-        &mut |rule| {
-            assert!(matches!(
-                rule.action,
-                crate::config::RuleActionConfig::Block
-            ));
-            assert!(rule.criteria.compiled.is_some());
-            count += 1;
-            Ok(())
-        },
-        &mut |_| panic!("unexpanded policy group"),
-    )
-    .unwrap();
+    for rule in crate::config::resolved_visit::rules(&validated.configs) {
+        assert!(matches!(
+            rule.action,
+            crate::config::ResolvedRuleActionConfig::Block
+        ));
+        assert!(rule.criteria.compiled.is_some());
+        count += 1;
+    }
     assert_eq!(count, 3);
 }
 
@@ -3276,17 +3278,26 @@ async fn normalized_sources_preserve_url_format_hints_without_retaining_delivery
     write_rule(&path, VALID);
     let mut remote = source("https://example.com/rules.json?SECRET", &path);
     remote.format = None;
-    let mut validated = crate::config::compile_configs(configs(&remote))
-        .await
-        .unwrap();
-    assert_eq!(validated.remote_rules.len(), 1);
-    crate::rule_set::visit_sources(&mut validated.configs, &mut |source| {
+    let mut normalized = configs(&remote);
+    let deliveries =
+        crate::rule_set::normalize_sources(&mut normalized, &mut crate::rules::Compiler::default())
+            .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    let mut count = 0;
+    crate::rule_set::visit_sources(&mut normalized, &mut |source| {
         assert!(source.url.is_none());
         assert!(source.download.is_none());
         assert!(source.update_interval.is_none());
+        count += 1;
         Ok(())
     })
     .unwrap();
+    assert_eq!(count, 1);
+    let validated = crate::config::compile_configs(configs(&remote))
+        .await
+        .unwrap();
+    assert_eq!(validated.remote_rules.len(), 1);
+    assert_eq!(predicates(&validated).len(), 1);
     assert!(validated.reload_files.is_empty());
 }
 

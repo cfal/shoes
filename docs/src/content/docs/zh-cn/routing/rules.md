@@ -40,6 +40,10 @@ rules:
 
 客户端链定义流量如何通过上游代理路由。每条链都是一系列“跃点”——流量按顺序通过的代理。
 
+在规则、客户端组和 DNS 服务器选项中，`client_chain` 与 `client_chains` 是完全等价的别名。结构由字段值决定，而不是由字段名的单复数决定：`[a, b]` 和 `{chain: [a, b]}` 都表示顺序跃点。备选路径使用 `[{chain: [a]}, {chain: [b]}]`。嵌套列表（`[[a], [b]]`）也表示备选链；建议使用显式包装以便阅读。
+
+DNS 以前将普通列表解释为备选路径，现在将 `[a, b]` 解释为顺序路径，与路由保持一致，不提供兼容模式或警告。DNS 备选路径必须使用显式链包装或命名组。系统 DNS 仍不接受客户端链；UDP/H3 DNS 仍要求仅含直连的路径。
+
 ```yaml
 # Single proxy (simplest form)
 client_chain: my-proxy-group           # Reference a named group
@@ -56,7 +60,7 @@ client_chain:
 
 # Multiple chains (round-robin selection)
 client_chains:
-  - us-proxy-group                     # Chain 1: single hop
+  - chain: [us-proxy-group]            # Chain 1: single hop
   - chain: [proxy1, proxy2]            # Chain 2: multi-hop
 
 # Load balancing at a hop (pool)
@@ -66,7 +70,29 @@ client_chain:
     - final-proxy
 ```
 
-**迁移说明：** `client_proxy` / `client_proxies` 字段仍然有效，但已弃用。请迁移到 `client_chain` / `client_chains`。
+<a id="legacy-proxy-fields"></a>
+### 旧版代理字段
+
+`client_proxy` 和 `client_proxies` 仍可用于规则、客户端组和 ShadowTLS 远程握手，但会产生弃用警告。原有行为保持不变：旧版列表表示备选项，而不是顺序跃点。使用 `RUST_LOG=warn` 或更详细的日志级别可查看这些警告。
+
+单个 `client_proxy: upstream` 可改为 `client_chain: upstream`。对于列表，仅更改字段名会改变行为。以下片段假设组 `a` 和 `b` 已在其他位置定义：
+
+```yaml
+# Old rule: client_proxies: [a, b]
+# Equivalent rule, retaining one-hop round-robin alternatives:
+client_chain:
+  chain:
+    - pool: [a, b]
+
+# Old group: client_proxies: [a, b]
+# Equivalent group, retaining separate policy members:
+client_group: outbound
+client_chains:
+  - chain: [a]
+  - chain: [b]
+```
+
+对于 ShadowTLS 远程握手，使用 `client_chain: [{pool: [a, b]}]` 替换旧版代理列表。不要同时指定旧版和新版字段。
 
 ### 掩码语法
 ```yaml

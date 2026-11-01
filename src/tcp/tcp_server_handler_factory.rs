@@ -7,10 +7,11 @@ use rustc_hash::FxHashMap;
 
 use crate::anytls::{AnyTlsServerHandler, PaddingFactory};
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::config::{ClientChainHop, ClientConfig};
+use crate::config::{ResolvedClientConfig, ResolvedClientHop};
 use crate::config::{
-    ConfigSelection, RealityServerConfig, RuleConfig, ServerProxyConfig, ShadowTlsServerConfig,
-    ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, WebsocketServerConfig,
+    ResolvedRealityServerConfig, ResolvedRuleConfig, ResolvedServerProxyConfig,
+    ResolvedShadowTlsServerConfig, ResolvedShadowTlsServerHandshakeConfig, ResolvedTlsServerConfig,
+    ResolvedWebsocketServerConfig, ShadowsocksConfig,
 };
 use crate::http_handler::HttpTcpServerHandler;
 use crate::mixed_handler::MixedTcpServerHandler;
@@ -71,13 +72,11 @@ fn create_auth_credentials(
 }
 
 fn create_override_selector(
-    override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    override_rules: NoneOrSome<ResolvedRuleConfig>,
     parent: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
 ) -> std::io::Result<Arc<ClientProxySelector>> {
-    let rules = override_rules
-        .map(ConfigSelection::unwrap_config)
-        .into_vec();
+    let rules = override_rules.into_vec();
     Ok(Arc::new(
         create_tcp_client_proxy_selector(rules, resolver.clone())?
             .inherit_inbound_policy(parent)?,
@@ -96,7 +95,7 @@ fn create_override_selector(
 /// - `Socks` with `udp_enabled: true` (for UDP ASSOCIATE)
 /// - `Mixed` with `udp_enabled: true` (for UDP ASSOCIATE)
 pub fn create_tcp_server_handler(
-    server_proxy_config: ServerProxyConfig,
+    server_proxy_config: ResolvedServerProxyConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
@@ -111,7 +110,7 @@ pub fn create_tcp_server_handler(
 }
 
 pub(crate) fn create_tcp_server_handler_shared(
-    config: ServerProxyConfig,
+    config: ResolvedServerProxyConfig,
     selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
@@ -130,14 +129,14 @@ pub(crate) fn create_tcp_server_handler_shared(
 }
 
 fn create_handler(
-    server_proxy_config: ServerProxyConfig,
+    server_proxy_config: ResolvedServerProxyConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<Box<dyn TcpServerHandler>> {
     Ok(match server_proxy_config {
-        ServerProxyConfig::SudokuMask(config) => {
+        ResolvedServerProxyConfig::SudokuMask(config) => {
             let prepared = config.prepare()?;
             Box::new(crate::sudoku_mask::handler::ServerHandler {
                 config: prepared,
@@ -150,7 +149,7 @@ fn create_handler(
                 )?,
             })
         }
-        ServerProxyConfig::Xhttp(config) => {
+        ResolvedServerProxyConfig::Xhttp(config) => {
             let service = match scope.services.xhttp.entry(scope.path.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
@@ -159,12 +158,14 @@ fn create_handler(
             };
             Box::new(service.clone())
         }
-        ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
-            create_auth_credentials(username, password),
-            client_proxy_selector.clone(),
-            resolver.clone(),
-        )),
-        ServerProxyConfig::Socks {
+        ResolvedServerProxyConfig::Http { username, password } => {
+            Box::new(HttpTcpServerHandler::new(
+                create_auth_credentials(username, password),
+                client_proxy_selector.clone(),
+                resolver.clone(),
+            ))
+        }
+        ResolvedServerProxyConfig::Socks {
             username,
             password,
             udp_enabled,
@@ -179,7 +180,7 @@ fn create_handler(
                 resolver.clone(),
             ))
         }
-        ServerProxyConfig::Mixed {
+        ResolvedServerProxyConfig::Mixed {
             username,
             password,
             udp_enabled,
@@ -194,7 +195,7 @@ fn create_handler(
                 resolver.clone(),
             ))
         }
-        ServerProxyConfig::Shadowsocks {
+        ResolvedServerProxyConfig::Shadowsocks {
             config,
             udp_enabled,
         } => match config {
@@ -217,7 +218,7 @@ fn create_handler(
                 resolver.clone(),
             )),
         },
-        ServerProxyConfig::Snell {
+        ResolvedServerProxyConfig::Snell {
             cipher,
             password,
             udp_enabled,
@@ -228,7 +229,7 @@ fn create_handler(
             client_proxy_selector.clone(),
             resolver.clone(),
         )),
-        ServerProxyConfig::Vless {
+        ResolvedServerProxyConfig::Vless {
             user_id,
             udp_enabled,
             fallback,
@@ -267,7 +268,7 @@ fn create_handler(
                 vision,
             )?)
         }
-        ServerProxyConfig::Trojan {
+        ResolvedServerProxyConfig::Trojan {
             password,
             shadowsocks,
         } => Box::new(TrojanTcpHandler::new_server(
@@ -276,7 +277,7 @@ fn create_handler(
             client_proxy_selector.clone(),
             resolver.clone(),
         )),
-        ServerProxyConfig::Tls {
+        ResolvedServerProxyConfig::Tls {
             tls_targets,
             default_tls_target,
             shadowtls_targets,
@@ -348,7 +349,7 @@ fn create_handler(
                 resolver.clone(),
             ))
         }
-        ServerProxyConfig::Vmess {
+        ResolvedServerProxyConfig::Vmess {
             cipher,
             user_id,
             udp_enabled,
@@ -359,7 +360,7 @@ fn create_handler(
             client_proxy_selector.clone(),
             resolver.clone(),
         )?),
-        ServerProxyConfig::Websocket { targets } => {
+        ResolvedServerProxyConfig::Websocket { targets } => {
             let server_targets: Vec<WebsocketServerTarget> = targets
                 .into_vec()
                 .into_iter()
@@ -376,14 +377,14 @@ fn create_handler(
                 .collect::<std::io::Result<Vec<_>>>()?;
             Box::new(WebsocketTcpServerHandler::new(server_targets))
         }
-        ServerProxyConfig::PortForward { targets } => {
+        ResolvedServerProxyConfig::PortForward { targets } => {
             let targets = targets.into_vec();
             Box::new(PortForwardServerHandler::new(
                 targets,
                 client_proxy_selector.clone(),
             ))
         }
-        ServerProxyConfig::Anytls {
+        ResolvedServerProxyConfig::Anytls {
             users,
             padding_scheme,
             udp_enabled,
@@ -413,7 +414,7 @@ fn create_handler(
                 fallback,
             ))
         }
-        ServerProxyConfig::Naiveproxy { .. } => {
+        ResolvedServerProxyConfig::Naiveproxy { .. } => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "NaiveProxy must be used inside a TLS or Reality protocol",
@@ -428,9 +429,11 @@ fn create_handler(
     })
 }
 
-fn create_vision_vless_config(protocol: &ServerProxyConfig) -> std::io::Result<VisionVlessConfig> {
-    crate::config::validate_server_vision(true, protocol)?;
-    let ServerProxyConfig::Vless {
+fn create_vision_vless_config(
+    protocol: &ResolvedServerProxyConfig,
+) -> std::io::Result<VisionVlessConfig> {
+    crate::config::validate_resolved_server_vision(true, protocol)?;
+    let ResolvedServerProxyConfig::Vless {
         user_id,
         udp_enabled,
         fallback,
@@ -451,13 +454,13 @@ fn create_vision_vless_config(protocol: &ServerProxyConfig) -> std::io::Result<V
 }
 
 fn create_tls_server_target(
-    tls_server_config: TlsServerConfig,
+    tls_server_config: ResolvedTlsServerConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<TlsServerTarget> {
-    let TlsServerConfig {
+    let ResolvedTlsServerConfig {
         certificate_source: _,
         certificate_binding,
         key_exchange_groups,
@@ -472,7 +475,7 @@ fn create_tls_server_target(
     } = tls_server_config;
     key_exchange_groups.validate_vision(vision)?;
 
-    if vision && !matches!(protocol, ServerProxyConfig::Vless { .. }) {
+    if vision && !matches!(protocol, ResolvedServerProxyConfig::Vless { .. }) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Vision requires VLESS",
@@ -489,7 +492,7 @@ fn create_tls_server_target(
         .collect();
 
     // For NaiveProxy, hardcode ALPN to h2 and http/1.1
-    let is_naive = matches!(protocol, ServerProxyConfig::Naiveproxy { .. });
+    let is_naive = matches!(protocol, ResolvedServerProxyConfig::Naiveproxy { .. });
     let effective_alpn: Vec<String> = if is_naive {
         let naive_alpn = vec!["h2".to_string(), "http/1.1".to_string()];
         let user_alpn = alpn_protocols.into_vec();
@@ -500,7 +503,7 @@ fn create_tls_server_target(
             );
         }
         naive_alpn
-    } else if let ServerProxyConfig::Xhttp(config) = &protocol {
+    } else if let ResolvedServerProxyConfig::Xhttp(config) = &protocol {
         config.tls_alpn(&alpn_protocols)?
     } else {
         alpn_protocols.into_vec()
@@ -525,7 +528,7 @@ fn create_tls_server_target(
     };
 
     // Create inner_protocol based on protocol type
-    let inner_protocol = if let ServerProxyConfig::Naiveproxy {
+    let inner_protocol = if let ResolvedServerProxyConfig::Naiveproxy {
         users,
         padding,
         fallback,
@@ -561,13 +564,13 @@ fn create_tls_server_target(
 }
 
 fn create_shadow_tls_server_target(
-    shadow_tls_server_config: ShadowTlsServerConfig,
+    shadow_tls_server_config: ResolvedShadowTlsServerConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<TlsServerTarget> {
-    let ShadowTlsServerConfig {
+    let ResolvedShadowTlsServerConfig {
         password,
         handshake,
         protocol,
@@ -575,7 +578,7 @@ fn create_shadow_tls_server_target(
     } = shadow_tls_server_config;
 
     let target_handshake = match handshake {
-        ShadowTlsServerHandshakeConfig::Local(handshake) => {
+        ResolvedShadowTlsServerHandshakeConfig::Local(handshake) => {
             // Certificates are already embedded as PEM data during config validation
             let cert_bytes = handshake.cert.as_bytes().to_vec();
             let key_bytes = handshake.key.as_bytes().to_vec();
@@ -597,7 +600,7 @@ fn create_shadow_tls_server_target(
 
             ShadowTlsServerTargetHandshake::new_local(server_config)
         }
-        ShadowTlsServerHandshakeConfig::Remote(handshake) => {
+        ResolvedShadowTlsServerHandshakeConfig::Remote(handshake) => {
             // Build ClientProxyChain from client_chain
             // client_chain is guaranteed to be non-empty (defaults to direct hop)
             let client_chain =
@@ -622,13 +625,13 @@ fn create_shadow_tls_server_target(
 }
 
 fn create_reality_server_target(
-    reality_server_config: RealityServerConfig,
+    reality_server_config: ResolvedRealityServerConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<TlsServerTarget> {
-    let RealityServerConfig {
+    let ResolvedRealityServerConfig {
         mldsa65_seed,
         private_key,
         short_ids,
@@ -643,7 +646,7 @@ fn create_reality_server_target(
         override_rules,
     } = reality_server_config;
 
-    if vision && !matches!(protocol, ServerProxyConfig::Vless { .. }) {
+    if vision && !matches!(protocol, ResolvedServerProxyConfig::Vless { .. }) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Vision requires VLESS",
@@ -668,7 +671,7 @@ fn create_reality_server_target(
     };
 
     // Create inner_protocol based on protocol type
-    let inner_protocol = if let ServerProxyConfig::Naiveproxy {
+    let inner_protocol = if let ResolvedServerProxyConfig::Naiveproxy {
         users,
         padding,
         fallback,
@@ -701,9 +704,7 @@ fn create_reality_server_target(
         if hops.is_empty() {
             // Default to direct connection
             try_build_client_proxy_chain(
-                OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                    ClientConfig::default(),
-                ))),
+                OneOrSome::One(ResolvedClientHop::Single(ResolvedClientConfig::default())),
                 resolver.clone(),
             )
         } else {
@@ -730,7 +731,7 @@ fn create_reality_server_target(
 }
 
 fn create_websocket_server_target(
-    websocket_server_config: WebsocketServerConfig,
+    websocket_server_config: ResolvedWebsocketServerConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
@@ -743,7 +744,7 @@ fn create_websocket_server_target(
         websocket_server_config.early_data_header_name.as_deref(),
         true,
     )?;
-    let WebsocketServerConfig {
+    let ResolvedWebsocketServerConfig {
         matching_path,
         matching_headers,
         max_early_data,
@@ -792,7 +793,7 @@ mod tests {
     fn override_selectors_inherit_context_and_sniff_but_keep_their_own_rules() {
         use crate::address::{NetLocation, NetLocationMask};
         use crate::client_proxy_selector::IngressTarget;
-        use crate::config::RuleActionConfig;
+        use crate::config::ResolvedRuleActionConfig;
         use crate::dns::DnsContext;
 
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
@@ -804,7 +805,7 @@ mod tests {
                 .unwrap(),
         );
         for (mask, should_sniff) in [("0.0.0.0/0", false), ("child.example", true)] {
-            let mut rule = RuleConfig {
+            let mut rule = ResolvedRuleConfig {
                 criteria: crate::config::rules::RuleCriteria {
                     expression: crate::rules::Expression::Legacy(OneOrSome::One(
                         NetLocationMask::from(mask).unwrap(),
@@ -815,7 +816,7 @@ mod tests {
             };
             rule.compile(&mut crate::rules::Compiler::default())
                 .unwrap();
-            let rules = NoneOrSome::One(ConfigSelection::Config(rule));
+            let rules = NoneOrSome::One(rule);
             let child = create_override_selector(rules, &parent, &resolver).unwrap();
             assert!(!Arc::ptr_eq(&child, &parent));
             let IngressTarget::LocalDns {
@@ -840,8 +841,8 @@ mod tests {
             assert_eq!(child.should_sniff(&target), should_sniff);
         }
 
-        let mut rule = RuleConfig::default();
-        let RuleActionConfig::Allow {
+        let mut rule = ResolvedRuleConfig::default();
+        let ResolvedRuleActionConfig::Allow {
             override_address, ..
         } = &mut rule.action
         else {
@@ -850,12 +851,8 @@ mod tests {
         *override_address = Some(NetLocation::from_str("198.18.0.9:53", None).unwrap());
         rule.compile(&mut crate::rules::Compiler::default())
             .unwrap();
-        let error = create_override_selector(
-            NoneOrSome::One(ConfigSelection::Config(rule)),
-            &parent,
-            &resolver,
-        )
-        .unwrap_err();
+        let error =
+            create_override_selector(NoneOrSome::One(rule), &parent, &resolver).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
@@ -880,7 +877,8 @@ mod tests {
         for _ in 0..mask_depth {
             value = json!({"type":"sudoku_mask","protocol":value});
         }
-        let config: ServerProxyConfig = serde_json::from_value(value).unwrap();
+        let config: ResolvedServerProxyConfig =
+            crate::config::test_support::from_json(value).unwrap();
         let path = vec!["sudoku_mask".to_owned(); mask_depth];
         let mut services = HandlerServices::default();
         let first = create_tcp_server_handler_shared(
@@ -962,7 +960,7 @@ mod tests {
                 "Vision requires VLESS",
             ),
         ] {
-            let protocol = serde_json::from_value(value).unwrap();
+            let protocol = crate::config::test_support::from_json(value).unwrap();
             let error =
                 create_tcp_server_handler(protocol, &selector, &resolver, None).unwrap_err();
             assert_eq!(error.kind(), expected_kind);

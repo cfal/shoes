@@ -44,7 +44,7 @@ pub fn server(port: u16) -> Value {
 pub fn client(port: u16) -> Value {
     json!({
         "client_group": "wg",
-        "client_proxies": [{
+        "client_chains": [{
             "address": format!("127.0.0.1:{port}"),
             "protocol": {
                 "type": "wireguard",

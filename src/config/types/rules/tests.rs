@@ -1,6 +1,90 @@
 use super::*;
 use std::net::{IpAddr, Ipv4Addr};
 
+#[test]
+fn rule_and_standalone_action_share_legacy_chain_conversion() {
+    use serde_json::{Value, json};
+
+    let parse = |value: Value, standalone| -> Result<RuleActionConfig, String> {
+        if standalone {
+            serde_json::from_value(value).map_err(|error| error.to_string())
+        } else {
+            let mut value = value;
+            value["masks"] = json!("0.0.0.0/0");
+            serde_json::from_value::<RuleConfig>(value)
+                .map(|rule| rule.action)
+                .map_err(|error| error.to_string())
+        }
+    };
+    for proxy_field in ["client_proxy", "client_proxies"] {
+        for chain_field in ["client_chain", "client_chains"] {
+            for (proxies, count) in [
+                (json!(null), 0),
+                (json!([]), 0),
+                (json!("a"), 1),
+                (json!(["a"]), 1),
+                (json!(["a", "b"]), 2),
+            ] {
+                for (chains, has_chains) in [
+                    (json!(null), false),
+                    (json!([]), false),
+                    (json!(["c", "d"]), true),
+                ] {
+                    for action in ["allow", "block"] {
+                        let value =
+                            json!({"action":action, proxy_field:proxies, chain_field:chains});
+                        for standalone in [false, true] {
+                            let result = parse(value.clone(), standalone);
+                            if action == "block" {
+                                assert!(matches!(result.unwrap(), RuleActionConfig::Block));
+                            } else if count > 0 && has_chains {
+                                assert_eq!(
+                                    result.unwrap_err(),
+                                    "cannot specify both 'client_proxies' and 'client_chains'/'client_chain' in the same rule. \
+                                     'client_proxies' is deprecated - please use 'client_chains' instead."
+                                );
+                            } else {
+                                let RuleActionConfig::Allow { client_chains, .. } = result.unwrap()
+                                else {
+                                    panic!()
+                                };
+                                if count == 0 && !has_chains {
+                                    assert!(client_chains.is_unspecified());
+                                    continue;
+                                }
+                                let NoneOrSome::One(chain) = client_chains else {
+                                    panic!("expected one chain")
+                                };
+                                let hops: Vec<_> = chain
+                                    .hops
+                                    .iter()
+                                    .map(|hop| serde_json::to_value(hop).unwrap())
+                                    .collect();
+                                let expected = if count == 0 {
+                                    vec![json!("c"), json!("d")]
+                                } else if count == 1 {
+                                    vec![json!("a")]
+                                } else {
+                                    vec![json!({"pool":["a", "b"]})]
+                                };
+                                assert_eq!(hops, expected);
+                            }
+                        }
+                    }
+                }
+            }
+            for standalone in [false, true] {
+                let value =
+                    json!({"override_address":"host:not-a-port", proxy_field:"a", chain_field:"b"});
+                assert_eq!(
+                    parse(value, standalone).unwrap_err(),
+                    "invalid override_address 'host:not-a-port': expected format like 'host:port' or 'host'"
+                );
+            }
+        }
+    }
+}
+
 fn create_test_rule_config() -> RuleConfig {
     RuleConfig {
         criteria: RuleCriteria {

@@ -8,9 +8,10 @@ use super::flows::FlowRegistry;
 struct CountingAllocator;
 
 #[derive(Clone, Copy, Default)]
-struct Counts {
-    allocations: usize,
-    live_bytes: isize,
+pub(crate) struct Counts {
+    pub allocations: usize,
+    pub live_bytes: isize,
+    pub peak_bytes: isize,
 }
 
 // Debug-only, thread-local counting leaves release benchmark allocation unchanged.
@@ -23,6 +24,7 @@ fn count(allocations: usize, bytes: isize) {
         if let Some(mut current) = counts.get() {
             current.allocations += allocations;
             current.live_bytes += bytes;
+            current.peak_bytes = current.peak_bytes.max(current.live_bytes);
             counts.set(Some(current));
         }
     });
@@ -51,6 +53,20 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+pub(crate) fn measure<T>(f: impl FnOnce() -> T) -> (T, Counts) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COUNTS.set(None);
+        }
+    }
+    assert!(COUNTS.get().is_none());
+    COUNTS.set(Some(Counts::default()));
+    let _reset = Reset;
+    let result = f();
+    (result, COUNTS.get().unwrap())
+}
 
 #[test]
 fn disabled_notes_allocate_nothing_and_enabled_buffers_fit_budget() {

@@ -33,11 +33,11 @@ impl NetworkSession {
         Ok(Self::default())
     }
 
-    pub(crate) fn validate(&self, configs: &[crate::config::Config]) -> io::Result<()> {
+    pub(crate) fn validate(&self, configs: &[crate::config::ResolvedConfig]) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         match &self.session {
             Some(session) => return session.validate(configs),
-            None if linux::Spec::from_configs(configs)?.is_some() => {
+            None if linux::Spec::from_resolved_configs(configs)?.is_some() => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "enabling managed TUN requires a restart",
@@ -127,14 +127,14 @@ impl NetworkSession {
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{Ingress, cleanup};
 
-pub(crate) fn validate_config(configs: &[crate::config::Config]) -> io::Result<()> {
+pub(crate) fn validate_config(configs: &[crate::config::ResolvedConfig]) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        linux::Spec::from_configs(configs)?;
+        linux::Spec::from_resolved_configs(configs)?;
     }
     #[cfg(not(target_os = "linux"))]
     for config in configs {
-        if let crate::config::Config::TunServer(tun) = config
+        if let crate::config::ResolvedConfig::TunServer(tun) = config
             && tun.has_managed_options()
         {
             return Err(io::Error::new(

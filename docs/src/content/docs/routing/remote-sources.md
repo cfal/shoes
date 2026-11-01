@@ -41,12 +41,16 @@ source object works in `rule_source_group.rules`, under `masks` (including
 ```
 
 Replace `proxy.example.net:1080` with your proxy address. `download.client_chain` accepts
-the existing chain, pool, inline-client, and group syntax. It is independent of
+the [chain, pool, inline-client, and whole-path group syntax](/routing/rules/#client-chains). It is independent of
 the outer policy's `client_chain`, which routes matched traffic. Both
 `download.client_chain` and `download.bootstrap_url` are required. Bootstrap may
 be `system`, an IP-based DNS URL, or a named DNS group. Target and proxy hostnames
 use this resolver; failed refresh routing never falls back to direct. Automatic
 refresh uses the active generation's DNS, proxy clients, and selector choices.
+Named groups retain their round-robin, selector, or URL-test policies and pin one
+complete path per connection attempt. Hosts with several resolved addresses may
+try a different path for each address. The stricter missing-content bootstrap
+rules below still apply.
 
 All runtime remote sources use compiled rules retained in memory, including when
 disk caching is enabled. Reloads reuse sources whose URL and decoding options

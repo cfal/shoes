@@ -83,7 +83,7 @@ fn handler(options: PoolOptions) -> AnyTlsClientHandler {
 
 fn configured_handler(config: serde_json::Value) -> Box<dyn TcpClientHandler> {
     crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
-        serde_json::from_value(config).unwrap(),
+        crate::config::test_support::from_json(config).unwrap(),
         &NetLocation::from_str("127.0.0.1:443", None).unwrap(),
         Arc::new(crate::resolver::NativeResolver::new()),
     )
@@ -1240,7 +1240,7 @@ async fn chains_reuse_tls_once_per_selected_prefix_for_tcp_and_udp() {
         let resolver: Arc<dyn crate::resolver::Resolver> =
             Arc::new(crate::resolver::NativeResolver::new());
         let proxy = || {
-            let config = serde_json::from_value(serde_json::json!({
+            let config = crate::config::test_support::from_json(serde_json::json!({
                 "address": "localhost:443",
                 "protocol": {
                     "type": "tls",
@@ -1361,7 +1361,7 @@ async fn dropping_chained_idle_pools_closes_every_carrier() {
                 (sockets, None)
             };
             let proxy = || {
-                let config = serde_json::from_value(serde_json::json!({
+                let config = crate::config::test_support::from_json(serde_json::json!({
                     "address": "127.0.0.1:443",
                     "protocol": {
                         "type": "anytls",

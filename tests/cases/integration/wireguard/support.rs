@@ -40,8 +40,8 @@ impl Pair {
         if detour {
             let (_, outer) = ports.get_localhost_listener_port();
             let protocol = config::vless_protocol();
-            client["client_proxies"][0]["address"] = json!(format!("192.0.2.200:{port}"));
-            client["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{
+            client["client_chains"][0]["address"] = json!(format!("192.0.2.200:{port}"));
+            client["client_chains"][0]["protocol"]["peer_client_chain"] = json!([{
                 "address": format!("127.0.0.1:{outer}"), "protocol": protocol,
             }]);
             servers.push(json!({

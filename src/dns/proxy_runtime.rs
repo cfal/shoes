@@ -155,7 +155,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         let chain_group = self.chain_group.clone();
 
         Box::pin(async move {
-            let bind_interface = chain_group.select_bind_interface()?.map(str::to_owned);
+            let bind_interface = chain_group.select_bind_interface()?;
             let socket = crate::socket_util::new_outbound_socket2_udp_socket(
                 local_addr.is_ipv6(),
                 bind_interface,
@@ -190,7 +190,7 @@ impl QuicSocketBinder for ProxyQuicBinder {
             .ok_or_else(|| crate::resources::quic_memory_exhausted(self.memory_bytes))?;
         let socket = crate::socket_util::new_outbound_socket2_udp_socket(
             local_addr.is_ipv6(),
-            self.chain_group.select_bind_interface()?.map(str::to_owned),
+            self.chain_group.select_bind_interface()?,
             Some(local_addr),
         )?;
         crate::socket_util::set_udp_socket_buffers(

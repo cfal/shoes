@@ -36,7 +36,7 @@ A client has one remote peer. Its ordinary `address` identifies that peer;
 
 ```yaml
 - client_group: vpn
-  client_proxies:
+  client_chains:
     - address: "vpn.example:51820"
       protocol:
         type: wireguard

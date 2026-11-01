@@ -669,7 +669,7 @@ async fn preparation_preserves_ipv6_scope_ids_and_port_ranges() {
     let prepared = prepare(&[path.to_str().unwrap().to_owned()], None)
         .await
         .unwrap();
-    let Config::Server(server) = &prepared.validated.configs[0] else {
+    let crate::config::ResolvedConfig::Server(server) = &prepared.validated.configs[0] else {
         panic!()
     };
     let BindLocation::Address(addresses) = &server.bind_location else {

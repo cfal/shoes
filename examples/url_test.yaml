@@ -6,17 +6,19 @@
   timeout: 5000
   tolerance: 50
   lazy: true
-  client_proxies:
-    - name: east
-      address: "east.example.com:443"
-      protocol:
-        type: vless
-        user_id: "550e8400-e29b-41d4-a716-446655440000"
-    - name: west
-      address: "west.example.com:443"
-      protocol:
-        type: vless
-        user_id: "550e8400-e29b-41d4-a716-446655440000"
+  client_chains:
+    - chain:
+        - name: east
+          address: "east.example.com:443"
+          protocol:
+            type: vless
+            user_id: "550e8400-e29b-41d4-a716-446655440000"
+    - chain:
+        - name: west
+          address: "west.example.com:443"
+          protocol:
+            type: vless
+            user_id: "550e8400-e29b-41d4-a716-446655440000"
 
 - address: "127.0.0.1:1080"
   protocol: {type: socks}

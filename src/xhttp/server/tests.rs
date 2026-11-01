@@ -36,7 +36,7 @@ fn service() -> Arc<State> {
 }
 
 fn service_with_limits(limits: XhttpLimits) -> Arc<State> {
-    let config: XhttpServerConfig = serde_json::from_value(json!({
+    let config: ResolvedXhttpServerConfig = crate::config::test_support::from_json(json!({
         "path": "/t", "sc_max_buffered_posts": 2, "sc_max_each_post_bytes": 16,
         "limits": limits, "protocol": {"type": "socks"}
     }))
