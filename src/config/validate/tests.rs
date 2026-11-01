@@ -1155,6 +1155,39 @@ async fn test_validate_config_success() {
     assert!(validate_configs_test(configs).await.is_ok());
 }
 
+#[test]
+fn hop_dependencies_preserve_pool_order_duplicates_and_nested_carriers() {
+    use serde_json::json;
+
+    let member = ConfigSelection::GroupName("member".to_owned());
+    for hop in [
+        ClientChainHop::Single(member.clone()),
+        ClientChainHop::Pool(OneOrSome::One(member)),
+    ] {
+        let mut dependencies = Vec::new();
+        collect_hop_dependencies(&hop, &mut dependencies);
+        assert_eq!(dependencies, ["member"]);
+    }
+
+    let wireguard = |chain| {
+        json!({"address":"192.0.2.1:51820", "protocol":{
+            "type":"wireguard",
+            "private_key":"KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+            "public_key":"CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "addresses":["10.77.0.2/32"], "peer_client_chain":chain
+        }})
+    };
+    let inner = wireguard(json!([{"pool":["inner", "inner"]}, "tail"]));
+    let outer = wireguard(json!([inner, "outer"]));
+    let hop = serde_json::from_value(json!({"pool":["head", outer, "head"]})).unwrap();
+    let mut dependencies = Vec::new();
+    collect_hop_dependencies(&hop, &mut dependencies);
+    assert_eq!(
+        dependencies,
+        ["head", "inner", "inner", "tail", "outer", "head"]
+    );
+}
+
 #[tokio::test]
 async fn test_topological_sort_simple() {
     use crate::config::types::ClientConfigGroup;

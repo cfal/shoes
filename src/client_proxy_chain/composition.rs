@@ -22,7 +22,7 @@ enum Node {
         labels: Vec<String>,
         members: Vec<Node>,
         next: [AtomicU32; 2],
-        static_members: Option<[Vec<usize>; 2]>,
+        static_eligible_indices: Option<[Vec<usize>; 2]>,
     },
 }
 
@@ -269,8 +269,8 @@ fn node(
             for member in choice.members {
                 members.push(sequence(member.hops, first, resolver, limits)?);
             }
-            let static_members = (choice.group_type == GroupType::RoundRobin
-                && !members.iter().any(Node::has_dynamic_policy))
+            let static_eligible_indices = (choice.group_type == GroupType::RoundRobin
+                && !members.iter().any(Node::contains_selector))
             .then(|| {
                 [
                     (0..members.len()).collect(),
@@ -287,7 +287,7 @@ fn node(
                 labels: choice.labels,
                 members,
                 next: [AtomicU32::new(0), AtomicU32::new(0)],
-                static_members,
+                static_eligible_indices,
             })
         }
     }
@@ -335,7 +335,7 @@ impl Node {
             labels: Vec::new(),
             members,
             next: [AtomicU32::new(0), AtomicU32::new(0)],
-            static_members: Some(eligible),
+            static_eligible_indices: Some(eligible),
         }
     }
     #[cfg(unix)]
@@ -363,12 +363,12 @@ impl Node {
             Self::Choice { members, .. } => members.iter().map(Self::num_hops).max().unwrap_or(0),
         }
     }
-    fn has_dynamic_policy(&self) -> bool {
+    fn contains_selector(&self) -> bool {
         match self {
             Self::Client(_) => false,
-            Self::Sequence(nodes) => nodes.iter().any(Self::has_dynamic_policy),
+            Self::Sequence(nodes) => nodes.iter().any(Self::contains_selector),
             Self::Choice { kind, members, .. } => {
-                matches!(kind, GroupType::Selector) || members.iter().any(Self::has_dynamic_policy)
+                matches!(kind, GroupType::Selector) || members.iter().any(Self::contains_selector)
             }
         }
     }
@@ -461,9 +461,9 @@ impl Node {
                 labels,
                 members,
                 next,
-                static_members,
+                static_eligible_indices,
             } => {
-                if let Some(eligible) = static_members {
+                if let Some(eligible) = static_eligible_indices {
                     let eligible = &eligible[usize::from(require_udp)];
                     if eligible.is_empty() {
                         return Err(unsupported());
@@ -736,7 +736,7 @@ mod tests {
         );
         let tree = chain.composition().unwrap();
         let Node::Choice {
-            static_members: Some(indices),
+            static_eligible_indices: Some(indices),
             ..
         } = &tree.root
         else {
@@ -763,10 +763,18 @@ mod tests {
                 json!([dynamic, {"client_group":"out","client_chains":[{"chain":["dynamic"]},{"chain":["direct"]}]}]),
                 json!("out"),
             );
-            let Node::Choice { static_members, .. } = &chain.composition().unwrap().root else {
+            let Node::Choice {
+                static_eligible_indices,
+                ..
+            } = &chain.composition().unwrap().root
+            else {
                 panic!()
             };
-            assert_eq!(static_members.is_some(), kind == "url-test", "{kind}");
+            assert_eq!(
+                static_eligible_indices.is_some(),
+                kind == "url-test",
+                "{kind}"
+            );
         }
     }
 

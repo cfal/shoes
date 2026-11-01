@@ -2,10 +2,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io;
 
-use crate::config::{
-    ClientChainHop, ClientConfig, ConfigSelection, GroupType, ResolvedClientChain,
-    ResolvedClientHop,
-};
+use crate::config::{ConfigSelection, GroupType, ResolvedClientChain, ResolvedClientHop};
 use crate::control::catalog::{Catalog, CatalogNode, api_group, protocol_type};
 use crate::control::runtime::Generation;
 use crate::control::selection::Choices;
@@ -105,12 +102,7 @@ fn supports_udp(generation: &Generation, choices: &Choices, name: &str) -> bool 
                 let Some(hop) = chain.hops.iter().last() else {
                     continue;
                 };
-                let selections: Box<dyn Iterator<Item = &ConfigSelection<ClientConfig>>> = match hop
-                {
-                    ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
-                    ClientChainHop::Pool(pool) => pool.iter(),
-                };
-                pending.extend(selections.map(|selection| {
+                pending.extend(hop.selections().iter().map(|selection| {
                     match selection {
                         ConfigSelection::GroupName(name) => api_group(name),
                         ConfigSelection::Config(client) => client
@@ -242,7 +234,6 @@ mod tests {
     }
 
     #[test]
-
     fn url_test_dto_reports_transport_eligible_members_and_url_health() {
         let configs = serde_json::from_value(json!([
             {"client_group":"manual", "type":"selector", "default":"tcp", "client_chains":[

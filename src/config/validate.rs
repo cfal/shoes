@@ -738,13 +738,8 @@ fn prepend_origin(
 }
 
 fn collect_hop_dependencies(hop: &ClientChainHop, dependencies: &mut Vec<String>) {
-    match hop {
-        ClientChainHop::Single(selection) => collect_client_dependencies(selection, dependencies),
-        ClientChainHop::Pool(pool) => {
-            for selection in pool.iter() {
-                collect_client_dependencies(selection, dependencies);
-            }
-        }
+    for selection in hop.selections() {
+        collect_client_dependencies(selection, dependencies);
     }
 }
 
