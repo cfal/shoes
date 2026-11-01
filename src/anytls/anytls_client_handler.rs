@@ -56,11 +56,21 @@ impl AnyTlsClientHandler {
         }
     }
 
-    async fn acquire(&self, transport: ClientTransport<'_>) -> std::io::Result<OpeningSession> {
+    async fn open_stream(
+        &self,
+        transport: ClientTransport<'_>,
+        destination: NetLocation,
+    ) -> std::io::Result<(OpeningSession, AnyTlsStream)> {
         if let Some(session) = self.pool.take(transport.route.route_key()) {
-            return Ok(OpeningSession::new(session));
+            let opening = OpeningSession::new(session);
+            // Errors may follow queued frames; only None permits a fresh transport.
+            if let Some(stream) = opening.session.try_open_stream(destination.clone()).await? {
+                return Ok((opening, stream));
+            }
         }
-        self.create(transport.open.await?).await
+        let opening = self.create(transport.open.await?).await?;
+        let stream = opening.session.open_stream(destination).await?;
+        Ok((opening, stream))
     }
 
     async fn create(&self, transport: Box<dyn AsyncStream>) -> std::io::Result<OpeningSession> {
@@ -79,19 +89,19 @@ impl AnyTlsClientHandler {
         validate_destination(target.location())
     }
 
-    async fn open_udp(
-        &self,
-        session: &Arc<AnyTlsClientSession>,
+    fn udp_destination() -> NetLocation {
+        NetLocation::new(Address::Hostname(UOT_V2_MAGIC_ADDRESS.to_string()), 0)
+    }
+
+    async fn write_udp_request(
+        stream: &mut AnyTlsStream,
         target: &ResolvedLocation,
-    ) -> std::io::Result<AnyTlsStream> {
-        let uot_dest = NetLocation::new(Address::Hostname(UOT_V2_MAGIC_ADDRESS.to_string()), 0);
-        let mut stream = session.open_stream(uot_dest).await?;
+    ) -> std::io::Result<()> {
         stream.write_u8(1).await?;
         stream
             .write_all(&write_location_to_vec(target.location())?)
             .await?;
-        stream.flush().await?;
-        Ok(stream)
+        stream.flush().await
     }
 }
 
@@ -108,8 +118,7 @@ impl TcpClientHandler for AnyTlsClientHandler {
     ) -> std::io::Result<TcpClientSetupResult> {
         validate_destination(target.location())?;
         let route = transport.route.clone();
-        let opening = self.acquire(transport).await?;
-        let stream = opening.session.open_stream(target.into_location()).await?;
+        let (opening, stream) = self.open_stream(transport, target.into_location()).await?;
         stream.attach_pool(&self.pool, route);
         opening.disarm();
         Ok(TcpClientSetupResult {
@@ -125,8 +134,8 @@ impl TcpClientHandler for AnyTlsClientHandler {
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         self.validate_udp(&target)?;
         let route = transport.route.clone();
-        let opening = self.acquire(transport).await?;
-        let stream = self.open_udp(&opening.session, &target).await?;
+        let (opening, mut stream) = self.open_stream(transport, Self::udp_destination()).await?;
+        Self::write_udp_request(&mut stream, &target).await?;
         stream.attach_pool(&self.pool, route);
         opening.disarm();
         Ok(Box::new(VlessMessageStream::new(stream)))
@@ -162,8 +171,13 @@ impl TcpClientHandler for AnyTlsClientHandler {
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         self.validate_udp(&target)?;
         let opening = self.create(client_stream).await?;
-        let stream = self.open_udp(&opening.session, &target).await?;
+        let mut stream = opening.session.open_stream(Self::udp_destination()).await?;
+        Self::write_udp_request(&mut stream, &target).await?;
         opening.disarm();
         Ok(Box::new(VlessMessageStream::new(stream)))
     }
 }
+
+#[cfg(test)]
+#[path = "pool_tests/stale_checkout.rs"]
+mod tests;
