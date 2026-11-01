@@ -210,7 +210,7 @@ async fn flat_round_robin_keeps_naive_prefixes_isolated() {
             echo(&mut first).await;
             echo(&mut second).await;
             echo(&mut third).await;
-            assert_eq!(a.connections.load(Ordering::SeqCst), 2);
+            assert_eq!(a.connections.load(Ordering::SeqCst), 1);
             assert_eq!(b.connections.load(Ordering::SeqCst), 1);
             assert_eq!(
                 a.requests
@@ -219,7 +219,7 @@ async fn flat_round_robin_keeps_naive_prefixes_isolated() {
                     .iter()
                     .map(|r| r.0)
                     .collect::<Vec<_>>(),
-                [0, 1]
+                [0, 0]
             );
             assert_eq!(
                 b.requests
@@ -271,7 +271,7 @@ async fn composed_naive_prefix_selection_preserves_live_tunnels() {
                 owner.select("prefix", "a").unwrap();
             }
             let mut third = open(&chain, b'A').await;
-            assert_eq!(a.connections.load(Ordering::SeqCst), 2);
+            assert_eq!(a.connections.load(Ordering::SeqCst), 1);
             assert_eq!(b.connections.load(Ordering::SeqCst), 1);
             echo(&mut first).await;
             echo(&mut second).await;

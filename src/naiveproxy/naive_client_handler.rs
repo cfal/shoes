@@ -1,7 +1,7 @@
 //! NaiveProxy client handler with HTTP/2 multiplexing support.
 //!
-//! One reusable H2 session is retained for its selected prefix. Replacing the
-//! cached session leaves existing tunnels alive through their session owners.
+//! A bounded cache retains H2 sessions by selected prefix. Eviction leaves
+//! existing tunnels alive through their session owners.
 
 use std::io;
 use std::sync::Arc;
@@ -18,6 +18,8 @@ use crate::tcp::tcp_handler::{ClientTransport, TcpClientHandler, TcpClientSetupR
 
 use super::naive_client_session::NaiveClientSession;
 
+const MAX_CACHED_SESSIONS: usize = 16;
+
 struct CachedSession {
     session: NaiveClientSession,
     // Retains connector identities so pointer-based route keys cannot be recycled.
@@ -33,8 +35,8 @@ pub struct NaiveProxyTcpClientHandler {
     auth_header: String,
     /// Enable padding
     padding_enabled: bool,
-    /// Session slot for lazy init and reconnection (session itself is cheap to clone)
-    session: Arc<Mutex<Option<CachedSession>>>,
+    /// Least recently used first; sessions are cheap to clone.
+    sessions: Arc<Mutex<Vec<CachedSession>>>,
 }
 
 impl std::fmt::Debug for NaiveProxyTcpClientHandler {
@@ -50,8 +52,7 @@ impl Clone for NaiveProxyTcpClientHandler {
         Self {
             auth_header: self.auth_header.clone(),
             padding_enabled: self.padding_enabled,
-            // Share the same session slot across clones for multiplexing
-            session: Arc::clone(&self.session),
+            sessions: Arc::clone(&self.sessions),
         }
     }
 }
@@ -64,7 +65,7 @@ impl NaiveProxyTcpClientHandler {
         Self {
             auth_header,
             padding_enabled,
-            session: Arc::new(Mutex::new(None)),
+            sessions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -108,15 +109,11 @@ impl NaiveProxyTcpClientHandler {
             Ok(stream) => stream,
             Err(e) => {
                 let retired = {
-                    let mut slot = self.session.lock();
-                    if slot
-                        .as_ref()
-                        .is_some_and(|current| current.session.same_generation(&session))
-                    {
-                        slot.take()
-                    } else {
-                        None
-                    }
+                    let mut sessions = self.sessions.lock();
+                    sessions
+                        .iter()
+                        .position(|current| current.session.same_generation(&session))
+                        .map(|index| sessions.remove(index))
                 };
                 drop(retired);
                 return Err(e);
@@ -129,14 +126,18 @@ impl NaiveProxyTcpClientHandler {
         })
     }
     async fn session_for(&self, transport: ClientTransport<'_>) -> io::Result<NaiveClientSession> {
-        let cached = self
-            .session
-            .lock()
-            .as_ref()
-            .filter(|cached| {
+        let cached = {
+            let mut sessions = self.sessions.lock();
+            let index = sessions.iter().position(|cached| {
                 cached.route.route_key() == transport.route.route_key() && cached.session.is_ready()
+            });
+            index.map(|index| {
+                let cached = sessions.remove(index);
+                let session = cached.session.clone();
+                sessions.push(cached);
+                session
             })
-            .map(|cached| cached.session.clone());
+        };
         if let Some(session) = cached {
             debug!("NaiveProxy: reusing session for selected prefix");
             return Ok(session);
@@ -145,10 +146,28 @@ impl NaiveProxyTcpClientHandler {
         // Dialing stays outside the lock so a stalled prefix cannot block others.
         // Each cold flow uses its own transport, even if another flow publishes first.
         let session = NaiveClientSession::new(transport.open.await?).await?;
-        let retired = self.session.lock().replace(CachedSession {
-            session: session.clone(),
-            route: transport.route,
-        });
+        let mut retired = Vec::new();
+        {
+            let mut sessions = self.sessions.lock();
+            let mut index = 0;
+            while index < sessions.len() {
+                let cached = &sessions[index];
+                if !cached.session.is_ready()
+                    || cached.route.route_key() == transport.route.route_key()
+                {
+                    retired.push(sessions.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            if sessions.len() == MAX_CACHED_SESSIONS {
+                retired.push(sessions.remove(0));
+            }
+            sessions.push(CachedSession {
+                session: session.clone(),
+                route: transport.route,
+            });
+        }
         drop(retired);
 
         Ok(session)
@@ -189,6 +208,145 @@ mod tests {
         crate::address::NetLocation::from_str("example.com:443", None)
             .unwrap()
             .into()
+    }
+
+    #[tokio::test]
+    async fn cache_retains_sixteen_paths_and_evicts_the_least_recently_used() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let mut peers = Vec::new();
+        let mut sessions = Vec::new();
+        let mut routes = Vec::new();
+        for id in 0..16 {
+            let (client, peer) = tokio::io::duplex(8192);
+            peers.push(peer);
+            let transport = transport(id, Some(client));
+            routes.push(Arc::downgrade(&transport.route));
+            sessions.push(handler.session_for(transport).await.unwrap());
+        }
+        assert_eq!(handler.sessions.lock().len(), 16);
+        assert!(
+            sessions[0].same_generation(&handler.session_for(transport(0, None)).await.unwrap())
+        );
+        let (client, peer) = tokio::io::duplex(8192);
+        peers.push(peer);
+        sessions.push(
+            handler
+                .session_for(transport(16, Some(client)))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(handler.sessions.lock().len(), 16);
+        assert!(routes[1].upgrade().is_none());
+        assert!(
+            sessions[1].is_ready(),
+            "eviction must not close a retained session"
+        );
+        for id in (0..=16).filter(|id| *id != 1) {
+            let warm = handler.session_for(transport(id, None)).await.unwrap();
+            assert!(sessions[id].same_generation(&warm));
+        }
+        drop(handler);
+        assert!(routes.iter().all(|route| route.upgrade().is_none()));
+    }
+
+    #[tokio::test]
+    async fn insertion_prunes_all_closed_sessions_before_evicting_a_live_path() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let mut peers = Vec::new();
+        let mut sessions = Vec::new();
+        let mut routes = Vec::new();
+        for id in 0..16 {
+            let (client, peer) = tokio::io::duplex(8192);
+            peers.push(Some(peer));
+            let transport = transport(id, Some(client));
+            routes.push(Arc::downgrade(&transport.route));
+            sessions.push(handler.session_for(transport).await.unwrap());
+        }
+        drop(peers[4].take());
+        drop(peers[15].take());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sessions[4].is_ready() || sessions[15].is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (client, peer) = tokio::io::duplex(8192);
+        peers.push(Some(peer));
+        handler
+            .session_for(transport(16, Some(client)))
+            .await
+            .unwrap();
+        assert_eq!(handler.sessions.lock().len(), 15);
+        for id in 0..16 {
+            if id == 4 || id == 15 {
+                assert!(routes[id].upgrade().is_none());
+            } else {
+                let warm = handler.session_for(transport(id, None)).await.unwrap();
+                assert!(sessions[id].same_generation(&warm));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn eviction_keeps_an_active_tunnel_working() {
+        use bytes::Bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, peer) = tokio::io::duplex(8192);
+        let peer = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let mut receive = request.into_body();
+            let exchange = async {
+                let mut received = Vec::new();
+                while let Some(data) = receive.data().await {
+                    let data = data.unwrap();
+                    receive.flow_control().release_capacity(data.len()).unwrap();
+                    received.extend_from_slice(&data);
+                }
+                assert_eq!(received, b"after eviction");
+                send.send_data(Bytes::from(received), true).unwrap();
+            };
+            tokio::pin!(exchange);
+            tokio::select! {
+                _ = &mut exchange => {},
+                _ = connection.accept() => panic!("unexpected connection end"),
+            }
+            while connection.accept().await.is_some() {}
+        });
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let route = transport(0, Some(client));
+        let weak = Arc::downgrade(&route.route);
+        let mut stream = handler
+            .connect_client_tcp(route, target())
+            .await
+            .unwrap()
+            .client_stream;
+        let mut peers = Vec::new();
+        for id in 1..=16 {
+            let (client, peer) = tokio::io::duplex(8192);
+            peers.push(peer);
+            handler
+                .session_for(transport(id, Some(client)))
+                .await
+                .unwrap();
+        }
+        assert!(weak.upgrade().is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            stream.write_all(b"after eviction").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut echoed = Vec::new();
+            stream.read_to_end(&mut echoed).await.unwrap();
+            assert_eq!(echoed, b"after eviction");
+            drop(stream);
+            peer.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -259,24 +417,37 @@ mod tests {
             opener.connect_client_tcp(transport(1, None), target).await
         });
         arrival.await.unwrap();
-        assert!(handler.session.try_lock().is_some());
-        let (transport, _peer) = tokio::io::duplex(8192);
-        let replacement = NaiveClientSession::new(Box::new(transport)).await.unwrap();
-        *handler.session.lock() = Some(CachedSession {
-            session: replacement.clone(),
-            route: Arc::new(Route(RouteKey(vec![2]))),
-        });
+        assert!(handler.sessions.try_lock().is_some());
+        let (replacement_stream, _peer) = tokio::io::duplex(8192);
+        let replacement = NaiveClientSession::new(Box::new(replacement_stream))
+            .await
+            .unwrap();
+        let retired = std::mem::replace(
+            &mut handler.sessions.lock()[0],
+            CachedSession {
+                session: replacement.clone(),
+                route: Arc::new(Route(RouteKey(vec![1]))),
+            },
+        );
+        drop(retired);
+        let (other, _other_peer) = tokio::io::duplex(8192);
+        let other = handler
+            .session_for(transport(2, Some(other)))
+            .await
+            .unwrap();
         release.send(()).unwrap();
         assert!(opening.await.unwrap().is_err());
         assert!(
             handler
-                .session
+                .sessions
                 .lock()
-                .as_ref()
+                .first()
                 .unwrap()
                 .session
                 .same_generation(&replacement)
         );
+        assert_eq!(handler.sessions.lock().len(), 2);
+        assert!(other.same_generation(&handler.session_for(transport(2, None)).await.unwrap()));
         peer.abort();
         let _ = peer.await;
     }
@@ -337,7 +508,7 @@ mod tests {
             .connect_client_tcp(transport(1, None), target.into())
             .await;
         assert!(result.is_err());
-        assert!(handler.session.lock().is_none());
+        assert!(handler.sessions.lock().is_empty());
         stream.write_all(b"FINAL-TAIL").await.unwrap();
         stream.flush().await.unwrap();
         stream.shutdown().await.unwrap();
@@ -418,7 +589,8 @@ mod tests {
         );
         let warm = handler.session_for(transport(1, None)).await.unwrap();
         assert!(first.same_generation(&warm));
-        assert!(handler.session.try_lock().is_some());
+        assert_eq!(handler.sessions.lock().len(), 1);
+        assert!(handler.sessions.try_lock().is_some());
     }
 
     #[tokio::test]
@@ -444,6 +616,7 @@ mod tests {
             .unwrap();
         release.send(()).unwrap();
         let slow = opening.await.unwrap();
+        assert_eq!(handler.sessions.lock().len(), 1);
         assert!(
             !slow.same_generation(&fast),
             "opened transports must not be discarded"
@@ -461,8 +634,10 @@ mod tests {
         let next = transport(2, Some(client));
         let next_route = Arc::downgrade(&next.route);
         handler.session_for(next).await.unwrap();
-        assert!(route.upgrade().is_none());
+        assert_eq!(handler.sessions.lock().len(), 2);
+        assert!(route.upgrade().is_some());
         drop(handler);
+        assert!(route.upgrade().is_none());
         assert!(next_route.upgrade().is_none());
     }
 
@@ -512,7 +687,7 @@ mod tests {
                         .same_generation(&cached)
                 );
             } else {
-                assert!(handler.session.lock().is_none());
+                assert!(handler.sessions.lock().is_empty());
             }
             drop(result);
             peer.abort();
@@ -535,12 +710,11 @@ mod tests {
     }
 
     #[test]
-    fn test_handler_clone_shares_session_slot() {
+    fn test_handler_clone_shares_session_cache() {
         let handler1 = NaiveProxyTcpClientHandler::new("user", "pass", true);
         let handler2 = handler1.clone();
 
-        // Both handlers should share the same session slot
-        assert!(Arc::ptr_eq(&handler1.session, &handler2.session));
+        assert!(Arc::ptr_eq(&handler1.sessions, &handler2.sessions));
     }
 
     #[test]

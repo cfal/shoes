@@ -42,7 +42,8 @@ Caddy v2.11.7 defaults to a one-minute request-body idle timeout, which can end 
 quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
 
 Session reuse is scoped to the selected proxy prefix. Each NaiveProxy handler
-retains one reusable session; changing the prefix replaces it without closing
-active tunnels. Alternating prefixes therefore opens new sessions, while warm
-connections through the same prefix share a session. Concurrent cold connections
-may establish separate sessions.
+retains up to 16 reusable sessions, one per selected prefix. Inserting a session
+prunes closed sessions first, then evicts the least-recently-used entry if the
+cache is still full. Eviction does not close active tunnels. Alternating cached
+prefixes reuses their sessions; this is a cache bound, not a limit on active
+connections. Concurrent cold connections may still establish separate sessions.
