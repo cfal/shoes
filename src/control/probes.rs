@@ -280,9 +280,8 @@ pub async fn probe(
         name,
         query,
         tokio::time::Instant::now() + query.timeout,
-        false,
         &epoch,
-        None,
+        ProbeKind::Request { queued: false },
     )
     .await
 }
@@ -332,9 +331,10 @@ pub async fn probe_group(
                     &name,
                     query,
                     deadline,
-                    waited || ordinal >= PROBE_CONCURRENCY,
                     epoch,
-                    None,
+                    ProbeKind::Request {
+                        queued: waited || ordinal >= PROBE_CONCURRENCY,
+                    },
                 )
                 .await;
                 (name, Some(result))
@@ -396,19 +396,22 @@ fn with_probe_epoch<T>(
     })?
 }
 
-#[allow(clippy::too_many_arguments)]
+enum ProbeKind<'a> {
+    Request { queued: bool },
+    Automatic(&'a super::url_test::AutomaticGroup),
+}
+
 async fn probe_until(
     runtime: &ControlRuntime,
     generation: &Generation,
     name: &str,
     query: &ProbeQuery,
     deadline: tokio::time::Instant,
-    queued: bool,
     epoch: &CancellationToken,
-    group: Option<&super::url_test::AutomaticGroup>,
+    kind: ProbeKind<'_>,
 ) -> io::Result<u16> {
     with_probe_epoch(runtime, generation, epoch, || {
-        if group.is_none() && !queued {
+        if matches!(kind, ProbeKind::Request { queued: false }) {
             generation.probes.record_full_budget_attempt(
                 name,
                 query,
@@ -418,16 +421,14 @@ async fn probe_until(
     })?;
     let probe_request =
         crate::control::url_test::BACKGROUND.scope((), request(generation, name, query));
-    let tickets = group.map_or_else(
-        || {
-            generation
-                .catalog
-                .selection
-                .automatic
-                .tickets(name, query.url.as_str())
-        },
-        |group| vec![(group, group.revision())],
-    );
+    let tickets = match kind {
+        ProbeKind::Request { .. } => generation
+            .catalog
+            .selection
+            .automatic
+            .tickets(name, query.url.as_str()),
+        ProbeKind::Automatic(group) => vec![(group, group.revision())],
+    };
     let result = tokio::select! {
         biased;
         _ = runtime.shutdown.cancelled() => {
@@ -440,7 +441,9 @@ async fn probe_until(
             match result {
                 Ok(result) => result,
                 // Queue time shortened this attempt's budget; expiry is not evidence of remote failure.
-                Err(_) if queued => return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")),
+                Err(_) if matches!(kind, ProbeKind::Request { queued: true }) => {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout"));
+                }
                 Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout")),
             }
         }
@@ -635,9 +638,8 @@ async fn run_automatic_round(
                     &group.members[index],
                     query,
                     tokio::time::Instant::now() + query.timeout,
-                    false,
                     epoch,
-                    Some(group),
+                    ProbeKind::Automatic(group),
                 )
                 .await;
             }
