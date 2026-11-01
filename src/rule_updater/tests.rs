@@ -2406,6 +2406,56 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
     assert_eq!(changed.scheduled[0].failures, 0);
 }
 
+#[tokio::test]
+async fn changed_download_chain_shape_resets_rotation_before_the_next_attempt() {
+    timeout(Duration::from_secs(5), async {
+        let dir = directory();
+        let path = dir.path().join("cache.json");
+        write_rule(&path, OLD);
+        let refused = tokio::net::TcpSocket::new_v4().unwrap();
+        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = refused.local_addr().unwrap().to_string();
+        let proxy = serde_json::json!({"address":address,"protocol":{"type":"socks"}});
+        let pool = serde_json::json!({"pool":[proxy,proxy]});
+        let mut source = source("http://127.0.0.1:9/rules.json", &path);
+        let mut previous = None;
+        for stages in [1, 2] {
+            source.download.as_mut().unwrap().client_chain =
+                serde_json::from_value(serde_json::json!(vec![pool.clone(); stages])).unwrap();
+            let resolved = inline_source(&source);
+            let mut refresh = Refresh::new(
+                configs(&source),
+                std::slice::from_ref(&resolved),
+                cached_sources(std::slice::from_ref(&resolved)),
+                previous.as_ref(),
+                None,
+            )
+            .unwrap();
+            let item = &mut refresh.scheduled[0];
+            // Failed attempts retain rotation indices; changing the number of pools
+            // must discard them before the next connection restores its counters.
+            let error = http::download(
+                &item.source,
+                &DnsRegistry::new(),
+                GlobalLimits::default(),
+                Limits::default(),
+                &mut item.download,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("configured rule download chain failed"),
+                "{error}"
+            );
+            previous = Some(refresh);
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[test]
 fn cached_source_age_is_preserved_when_the_refresh_interval_changes() {
     let dir = directory();

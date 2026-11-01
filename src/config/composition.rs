@@ -340,6 +340,76 @@ mod tests {
     }
 
     #[test]
+    fn physical_hop_limit_counts_sequences_and_the_longest_alternative() {
+        let hops = |name: &str, length: usize| {
+            (0..length)
+                .map(|index| proxy(&format!("{name}-{index}")))
+                .collect::<Vec<_>>()
+        };
+        let server = |chain: Value| {
+            json!({"address":"127.0.0.1:0","protocol":{"type":"socks"},
+                "rules":[{"mask":"0.0.0.0/0","client_chain":chain}]})
+        };
+        let assert_length = |chain: &ClientChain, expected| {
+            super::validate(&chain.hops).unwrap();
+            assert_eq!(
+                chain
+                    .hops
+                    .iter()
+                    .map(|hop| measure(hop, 0).unwrap().1)
+                    .sum::<usize>(),
+                expected
+            );
+        };
+        let assert_limit = |error: io::Error| {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("64 hops"), "{error}");
+        };
+
+        for length in [64, 65] {
+            let result = validate(json!([server(json!(hops("inline", length)))]));
+            if length == 64 {
+                assert_length(route(&result.unwrap()), length);
+            } else {
+                assert_limit(result.err().unwrap());
+            }
+        }
+
+        for (prefix, alternatives, used, accepted) in [
+            (0, [64, 64], true, true),
+            (0, [1, 64], true, true),
+            (1, [1, 63], true, true),
+            (1, [1, 64], true, false),
+            (0, [1, 65], true, false),
+            (0, [1, 65], false, false),
+        ] {
+            let mut stages = hops("prefix", prefix);
+            stages.push(json!("choices"));
+            let mut config = vec![
+                json!({"client_group":"choices","type":"selector","default":"branch-0",
+                    "client_chains": alternatives.into_iter().enumerate().map(|(index, length)| {
+                        let name = format!("branch-{index}");
+                        json!({"name":name,"chain":hops(&name, length)})
+                    }).collect::<Vec<_>>()}),
+                json!({"client_group":"out","client_chains":stages}),
+            ];
+            if used {
+                config.push(server(json!("out")));
+            }
+            let result = validate(json!(config));
+            if accepted {
+                let validated = result.unwrap();
+                let expected = prefix + alternatives.into_iter().max().unwrap();
+                assert_length(route(&validated), expected);
+                let probe = validated.catalog.as_ref().unwrap().route("out").unwrap();
+                assert_length(&probe, expected);
+            } else {
+                assert_limit(result.err().unwrap());
+            }
+        }
+    }
+
+    #[test]
     fn expansion_is_bounded_before_exponential_materialization() {
         let mut groups = vec![json!({"client_group":"g0","client_chains":["direct"]})];
         for index in 1..20 {
