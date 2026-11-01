@@ -329,3 +329,34 @@ fn selector_routes_do_not_enumerate_pool_products() {
     ]))
     .unwrap();
 }
+
+#[test]
+fn physical_hop_limit_accepts_sixty_four_flat_hops_but_not_sixty_five() {
+    let hop = json!({"address":"192.0.2.10:80", "protocol":{"type":"http"}});
+    validate(json!([server(json!(vec![hop.clone(); 64]))])).unwrap();
+    let error = validate(json!([server(json!(vec![hop; 65]))]))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("64 hops"), "{error}");
+}
+
+#[test]
+fn physical_hop_limit_uses_the_longest_alternative_plus_the_suffix() {
+    let hop = json!({"address":"192.0.2.10:80", "protocol":{"type":"http"}});
+    let group = selector(json!([
+        {"name":"short", "chain":vec![hop.clone(); 31]},
+        {"name":"long", "chain":vec![hop.clone(); 32]}
+    ]));
+    for suffix in [32, 33] {
+        let mut route = vec![json!("out")];
+        route.extend(vec![hop.clone(); suffix]);
+        let result = validate(json!([group, server(json!(route))]));
+        if suffix == 32 {
+            result.unwrap();
+        } else {
+            let error = result.err().unwrap().to_string();
+            assert!(error.contains("64 hops"), "{error}");
+        }
+    }
+}
