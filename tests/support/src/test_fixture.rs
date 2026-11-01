@@ -5501,6 +5501,9 @@ impl ProxyTestFixture {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 impl Default for ProxyTestFixture {
     fn default() -> Self {
         Self::new()
@@ -5562,6 +5565,7 @@ impl BuiltFixture {
 
         let mut options = super::curl::CurlOptions::new()
             .proxy(format!("http://{}:{}", self.entry_ip, self.entry_port))
+            .fail_on_http_error(true)
             .timeout(30);
 
         if insecure {
@@ -5833,6 +5837,7 @@ impl BuiltFixture {
 
         let mut options = super::curl::CurlOptions::new()
             .proxy(format!("http://{}:{}", self.entry_ip, self.entry_port))
+            .fail_on_http_error(true)
             .timeout(timeout_secs)
             .discard_output(true);
 

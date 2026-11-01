@@ -1,5 +1,8 @@
 //! AnyTLS integration tests using sing-box as a peer.
+use std::time::Duration;
+
 use shoes_test_support as common;
+use tokio::time::timeout;
 
 use common::curl::CurlOptions;
 use common::test_fixture::ProxyTestFixture;
@@ -44,9 +47,9 @@ async fn test_anytls_multiplex() -> Result<(), Box<dyn std::error::Error>> {
         fixture.test_local_server("/bytes/102", false),
         fixture.test_local_server("/bytes/103", false),
     );
-    assert_eq!(r1?.len(), 101);
-    assert_eq!(r2?.len(), 102);
-    assert_eq!(r3?.len(), 103);
+    assert_eq!(r1?, vec![b'X'; 101]);
+    assert_eq!(r2?, vec![b'X'; 102]);
+    assert_eq!(r3?, vec![b'X'; 103]);
     Ok(())
 }
 
@@ -151,9 +154,11 @@ async fn test_anytls_large_transfer() -> Result<(), Box<dyn std::error::Error>> 
         .await?;
 
     // Test 1MB transfer
-    let elapsed = fixture
-        .test_local_server_streaming("/bytes/1048576", false, 60)
-        .await?;
+    let elapsed = timeout(
+        Duration::from_secs(60),
+        fixture.test_local_server_streaming_verified(1048576, 60),
+    )
+    .await??;
 
     let mb_per_sec = 1.0 / elapsed.as_secs_f64();
     eprintln!(
@@ -178,9 +183,11 @@ async fn test_anytls_streaming_10mb() -> Result<(), Box<dyn std::error::Error>> 
         .await?;
 
     // 10MB = 10485760 bytes, timeout 60 seconds
-    let elapsed = fixture
-        .test_local_server_streaming("/bytes/10485760", false, 60)
-        .await?;
+    let elapsed = timeout(
+        Duration::from_secs(60),
+        fixture.test_local_server_streaming_verified(10485760, 60),
+    )
+    .await??;
 
     let mb_per_sec = 10.0 / elapsed.as_secs_f64();
     eprintln!(

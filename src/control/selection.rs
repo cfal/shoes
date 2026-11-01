@@ -253,6 +253,42 @@ mod tests {
     }
 
     #[test]
+    fn removed_members_fall_back_without_overwriting_the_saved_choice() {
+        for default in [None, Some("south")] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("cache.db");
+            let mut owner = SelectionOwner::new(Some(&path)).unwrap();
+            owner
+                .activate(owner.prepare(definitions("east")).unwrap())
+                .unwrap();
+            owner.select("outbound", "west").unwrap();
+            let saved = std::fs::read(&path).unwrap();
+
+            let mut reduced = definitions("east");
+            let group = reduced.get_mut("outbound").unwrap();
+            group.members = vec!["north".into(), "south".into()];
+            group.default = default.map(str::to_owned);
+            let fallback = owner.prepare(reduced.clone()).unwrap();
+            owner.activate(fallback.clone()).unwrap();
+            assert_eq!(fallback.snapshot()["outbound"], default.unwrap_or("north"));
+            assert_eq!(owner.explicit["outbound"], "west");
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+            drop(owner);
+            let mut owner = SelectionOwner::new(Some(&path)).unwrap();
+            owner.activate(owner.prepare(reduced).unwrap()).unwrap();
+            assert_eq!(
+                owner.active.snapshot()["outbound"],
+                default.unwrap_or("north")
+            );
+            let restored = owner.prepare(definitions("east")).unwrap();
+            owner.activate(restored.clone()).unwrap();
+            assert_eq!(restored.snapshot()["outbound"], "west");
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+        }
+    }
+
+    #[test]
     fn invalid_members_and_defaults_are_rejected() {
         let mut owner = SelectionOwner::new(None).unwrap();
         assert!(owner.prepare(definitions("missing")).is_err());

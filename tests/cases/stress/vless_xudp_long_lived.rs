@@ -149,16 +149,19 @@ async fn test_high_volume_burst_1000_packets() -> Result<(), Box<dyn std::error:
 
 #[tokio::test]
 async fn test_content_integrity_varying_sizes() -> Result<(), Box<dyn std::error::Error>> {
-    let mut fixture = StressFixture::start(b"").await?;
-    let test_sizes = [1, 7, 16, 100, 255, 256, 512, 1024, 1400, 2048, 4096, 8192];
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut fixture = StressFixture::start(b"").await?;
+        let test_sizes = [1, 7, 16, 100, 255, 256, 512, 1024, 1400, 2048, 4096, 8192];
 
-    for size in test_sizes {
-        let payload: Vec<u8> = (0..size)
-            .map(|index| ((index * 17 + 42) % 256) as u8)
-            .collect();
-        fixture.client.send_packet(&payload).await?;
-        let response = fixture.client.recv_packet(Duration::from_secs(5)).await?;
-        assert_eq!(response, payload, "payload mismatch at {size} bytes");
-    }
-    Ok(())
+        for size in test_sizes {
+            let payload: Vec<u8> = (0..size)
+                .map(|index| ((index * 17 + 42) % 256) as u8)
+                .collect();
+            fixture.client.send_packet(&payload).await?;
+            let response = fixture.client.recv_packet(Duration::from_secs(5)).await?;
+            assert_eq!(response, payload, "payload mismatch at {size} bytes");
+        }
+        Ok(())
+    })
+    .await?
 }

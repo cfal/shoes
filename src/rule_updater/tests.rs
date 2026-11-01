@@ -612,20 +612,10 @@ async fn bootstrap_preflights_later_synthetic_endpoints_before_any_download() {
 async fn bootstrap_preflights_managed_system_dns_before_any_download() {
     const CHILD: &str = "SHOES_BOOTSTRAP_PREFLIGHT_TEST";
     if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "rule_updater::tests::bootstrap_preflights_managed_system_dns_before_any_download",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        shoes_test_support::isolated::run_isolated(
+            "rule_updater::tests::bootstrap_preflights_managed_system_dns_before_any_download",
+            CHILD,
+            "1",
         );
         return;
     }
@@ -2414,6 +2404,61 @@ fn refresh_inherits_schedule_and_backoff_only_for_identical_deliveries() {
     .unwrap();
     assert!(changed.scheduled[0].due <= Instant::now());
     assert_eq!(changed.scheduled[0].failures, 0);
+}
+
+#[tokio::test]
+async fn changed_download_chain_shape_resets_rotation_before_the_next_attempt() {
+    timeout(Duration::from_secs(5), async {
+        let dir = directory();
+        let path = dir.path().join("cache.json");
+        write_rule(&path, OLD);
+        // Accept-and-close avoids platform-dependent refusal of bound, non-listening ports.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let proxy = serde_json::json!({"address":address,"protocol":{"type":"socks"}});
+        let pool = serde_json::json!({"pool":[proxy,proxy]});
+        let mut source = source("http://127.0.0.1:9/rules.json", &path);
+        let mut previous = None;
+        for stages in [1, 2] {
+            source.download.as_mut().unwrap().client_chain =
+                serde_json::from_value(serde_json::json!(vec![pool.clone(); stages])).unwrap();
+            let resolved = inline_source(&source);
+            let mut refresh = Refresh::new(
+                configs(&source),
+                std::slice::from_ref(&resolved),
+                cached_sources(std::slice::from_ref(&resolved)),
+                previous.as_ref(),
+                None,
+            )
+            .unwrap();
+            let item = &mut refresh.scheduled[0];
+            // Failed attempts retain rotation indices; changing the number of pools
+            // must discard them before the next connection restores its counters.
+            let dns = DnsRegistry::new();
+            let (result, ()) = tokio::join!(
+                http::download(
+                    &item.source,
+                    &dns,
+                    GlobalLimits::default(),
+                    Limits::default(),
+                    &mut item.download,
+                ),
+                async {
+                    drop(listener.accept().await.unwrap());
+                }
+            );
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("configured rule download chain failed"),
+                "{error}"
+            );
+            previous = Some(refresh);
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[test]

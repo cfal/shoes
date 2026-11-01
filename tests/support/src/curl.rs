@@ -1,6 +1,6 @@
 //! Curl helper utilities for integration tests
 
-use std::process::{Command, Output};
+use std::process::Output;
 
 /// Options for configuring curl requests
 pub struct CurlOptions {
@@ -163,8 +163,10 @@ impl CurlOptions {
 
 /// Run curl command with the given options
 ///
-/// This function uses `spawn_blocking` for async contexts and handles
-/// common curl options including:
+/// Dropping the request future requests termination of the direct curl child.
+/// Cancellation reaping is best effort and may complete after the future is dropped.
+/// Normal completion and stdin errors await child cleanup.
+/// Handles common curl options including:
 /// - HTTP proxy support
 /// - TLS configuration
 /// - Timeout handling
@@ -178,138 +180,123 @@ impl CurlOptions {
 /// # Returns
 /// Command output with stdout/stderr
 pub async fn run_curl(url: &str, options: CurlOptions) -> std::io::Result<Output> {
-    let url = url.to_string();
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
 
-    tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        use std::process::Stdio;
-
-        let curl = std::env::var_os("SHOES_TEST_CURL_BIN").unwrap_or_else(|| {
-            if std::path::Path::new("/usr/bin/curl").is_file() {
-                "/usr/bin/curl".into()
-            } else {
-                "curl".into()
-            }
-        });
-        let mut cmd = Command::new(curl);
-        cmd.arg("-q");
-
-        // Explicitly unset proxy environment variables to prevent interference
-        // as setting --noproxy is not sufficient
-        cmd.env_remove("http_proxy")
-            .env_remove("https_proxy")
-            .env_remove("HTTP_PROXY")
-            .env_remove("HTTPS_PROXY")
-            .env_remove("all_proxy")
-            .env_remove("ALL_PROXY")
-            .env_remove("no_proxy")
-            .env_remove("NO_PROXY");
-
-        // Add proxy if specified
-        if let Some(proxy) = &options.proxy {
-            cmd.arg("--proxy").arg(proxy);
-        }
-
-        // Add interface if specified
-        if let Some(iface) = &options.interface {
-            cmd.arg("--interface").arg(iface);
-        }
-
-        // Add TLS options
-        if options.insecure {
-            cmd.arg("--insecure");
-        }
-
-        if let Some(version) = &options.tls_version {
-            cmd.arg(format!("--tlsv{}", version));
-        }
-
-        if let Some(max_version) = &options.tls_max_version {
-            cmd.arg("--tls-max").arg(max_version);
-        }
-
-        // Add custom headers
-        for (name, value) in &options.headers {
-            cmd.arg("-H").arg(format!("{}: {}", name, value));
-        }
-
-        // Add DNS resolve entries
-        for entry in &options.resolve {
-            cmd.arg("--resolve").arg(entry);
-        }
-
-        // Set HTTP method if specified
-        if let Some(ref method) = options.method {
-            cmd.arg("-X").arg(method);
-        }
-
-        // If POST data is provided, read from stdin using --data-binary @-
-        if let Some(ref _data) = options.post_data {
-            cmd.arg("--data-binary").arg("@-");
-            cmd.stdin(Stdio::piped());
-        }
-
-        // Common curl options
-        cmd.arg("--silent")
-            .arg("--show-error")
-            .arg("--no-buffer") // Disable output buffering for more realistic traffic patterns
-            .arg("--max-time")
-            .arg(options.timeout_secs.to_string());
-
-        // Fail on HTTP error responses (4xx, 5xx)
-        if options.fail_on_http_error {
-            cmd.arg("--fail");
-        }
-
-        // Discard output to /dev/null for benchmarking (avoids memory buffering)
-        if options.discard_output {
-            cmd.arg("-o").arg("/dev/null");
-        }
-
-        // Force HTTP version
-        if let Some(ref version) = options.http_version {
-            match version.as_str() {
-                "1.1" => cmd.arg("--http1.1"),
-                "2" => cmd.arg("--http2"),
-                _ => &mut cmd,
-            };
-        }
-
-        // Include HTTP response headers in output
-        if options.include_headers {
-            cmd.arg("-i");
-        }
-
-        // Write headers to stderr
-        if options.headers_to_stderr {
-            cmd.arg("-D").arg("/dev/stderr");
-        }
-
-        cmd.arg(&url);
-
-        // Execute curl
-        if let Some(data) = options.post_data {
-            // Spawn with stdin pipe
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-            let mut child = cmd.spawn()?;
-
-            // Write data to stdin
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(&data)?;
-                stdin.flush()?;
-                // stdin drops here, closing the pipe
-            }
-
-            // Wait for completion and collect output
-            child.wait_with_output()
+    let curl = std::env::var_os("SHOES_TEST_CURL_BIN").unwrap_or_else(|| {
+        if std::path::Path::new("/usr/bin/curl").is_file() {
+            "/usr/bin/curl".into()
         } else {
-            // Regular GET request
-            cmd.output()
+            "curl".into()
         }
-    })
-    .await
-    .expect("spawn_blocking failed")
+    });
+    let mut cmd = tokio::process::Command::new(curl);
+    cmd.arg("-q").kill_on_drop(true);
+
+    // Explicitly unset proxy environment variables to prevent interference
+    // as setting --noproxy is not sufficient
+    cmd.env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("NO_PROXY");
+
+    if let Some(proxy) = &options.proxy {
+        cmd.arg("--proxy").arg(proxy);
+    }
+
+    if let Some(iface) = &options.interface {
+        cmd.arg("--interface").arg(iface);
+    }
+
+    if options.insecure {
+        cmd.arg("--insecure");
+    }
+
+    if let Some(version) = &options.tls_version {
+        cmd.arg(format!("--tlsv{}", version));
+    }
+
+    if let Some(max_version) = &options.tls_max_version {
+        cmd.arg("--tls-max").arg(max_version);
+    }
+
+    for (name, value) in &options.headers {
+        cmd.arg("-H").arg(format!("{}: {}", name, value));
+    }
+
+    for entry in &options.resolve {
+        cmd.arg("--resolve").arg(entry);
+    }
+
+    if let Some(method) = &options.method {
+        cmd.arg("-X").arg(method);
+    }
+
+    if options.post_data.is_some() {
+        cmd.arg("--data-binary").arg("@-");
+        cmd.stdin(Stdio::piped());
+    }
+
+    cmd.arg("--silent")
+        .arg("--show-error")
+        .arg("--no-buffer") // Disable output buffering for more realistic traffic patterns
+        .arg("--max-time")
+        .arg(options.timeout_secs.to_string());
+
+    if options.fail_on_http_error {
+        cmd.arg("--fail");
+    }
+
+    // Discard output to /dev/null for benchmarking (avoids memory buffering)
+    if options.discard_output {
+        cmd.arg("-o").arg("/dev/null");
+    }
+
+    match options.http_version.as_deref() {
+        Some("1.1") => {
+            cmd.arg("--http1.1");
+        }
+        Some("2") => {
+            cmd.arg("--http2");
+        }
+        _ => {}
+    }
+
+    if options.include_headers {
+        cmd.arg("-i");
+    }
+
+    if options.headers_to_stderr {
+        cmd.arg("-D").arg("/dev/stderr");
+    }
+
+    cmd.arg(url);
+
+    let Some(data) = options.post_data else {
+        return cmd.stdin(Stdio::null()).output().await;
+    };
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let written = async {
+            stdin.write_all(&data).await?;
+            stdin.flush().await
+        }
+        .await;
+        drop(stdin);
+        if let Err(error) = written {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
+    }
+    child.wait_with_output().await
 }
 
 /// Extracts the last HTTP status from headers emitted by curl.
@@ -467,6 +454,212 @@ pub async fn curl_post_https_tls12_via_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn run_fake_curl_child(name: &str, marker: &str, script_contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("curl");
+        std::fs::write(&script, script_contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(marker, "1")
+            .env("SHOES_TEST_CURL_BIN", script)
+            .env("SHOES_TEST_CURL_PID", directory.path().join("pid"))
+            .output()
+            .unwrap();
+        crate::isolated::assert_one_test_passed(&output);
+    }
+
+    #[tokio::test]
+    async fn post_body_closes_stdin_and_preserves_response_bytes() {
+        let server = crate::test_servers::start_local_http_server("0.0.0.0", 0)
+            .await
+            .unwrap();
+        let payload: Vec<_> = (0..131071).map(|index| (index * 37) as u8).collect();
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_curl(
+                &format!("http://127.0.0.1:{}/echo", server.local_addr().port()),
+                CurlOptions::new()
+                    .post_data(payload.clone())
+                    .fail_on_http_error(true)
+                    .timeout(5),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, payload);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_terminates_curl_during_output_and_stdin_waits() {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        use std::time::Duration;
+
+        const CHILD: &str = "SHOES_CURL_CANCEL_CHILD";
+        const PID: &str = "SHOES_TEST_CURL_PID";
+        if std::env::var_os(CHILD).is_none() {
+            run_fake_curl_child(
+                "curl::tests::cancellation_terminates_curl_during_output_and_stdin_waits",
+                CHILD,
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$SHOES_TEST_CURL_PID\"\nexec sleep 30\n",
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pid_file = std::path::PathBuf::from(std::env::var_os(PID).unwrap());
+        for post in [false, true] {
+            const BODY_SIZE: usize = 2 << 20;
+            let options = if post {
+                CurlOptions::new().post_data(vec![0; BODY_SIZE])
+            } else {
+                CurlOptions::new()
+            };
+            let mut request = Box::pin(run_curl("http://127.0.0.1/", options));
+            let pid: libc::pid_t = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        result = &mut request => panic!("curl exited before cancellation: {result:?}"),
+                        pid = async {
+                            loop {
+                                if let Ok(value) = std::fs::read_to_string(&pid_file)
+                                    && let Some(value) = value.strip_suffix('\n')
+                                    && let Ok(pid) = value.parse() {
+                                    break pid;
+                                }
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        } => pid,
+                    }
+                }).await.unwrap()
+            });
+            let capacity = post.then(|| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(format!("/proc/{pid}/fd/0"))
+                    .map(|stdin| unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_GETPIPE_SZ) })
+            });
+            let pending = runtime.block_on(async { futures::poll!(&mut request).is_pending() });
+            drop(request);
+            let exited = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                        let result = unsafe {
+                            libc::waitid(
+                                libc::P_PID,
+                                pid as libc::id_t,
+                                information.as_mut_ptr(),
+                                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                            )
+                        };
+                        if result != 0 {
+                            break std::io::Error::last_os_error().raw_os_error()
+                                == Some(libc::ECHILD);
+                        }
+                        if unsafe { information.assume_init().si_pid() } == pid {
+                            break true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+            });
+            // Reaps the observed exit, or disposes the still-owned child before failing.
+            let mut status = 0;
+            if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == 0 {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+            }
+            assert!(
+                pending,
+                "post={post}: request completed before cancellation"
+            );
+            if let Some(capacity) = capacity {
+                let capacity = capacity.unwrap();
+                assert!(capacity > 0 && (capacity as usize) < BODY_SIZE);
+            }
+            assert_eq!(exited, Ok(true), "post={post}: curl survived cancellation");
+            std::fs::remove_file(&pid_file).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_stdin_failure_terminates_and_reaps_curl() {
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "SHOES_CURL_STDIN_FAILURE_CHILD";
+        const PID: &str = "SHOES_TEST_CURL_PID";
+        if std::env::var_os(CHILD).is_none() {
+            run_fake_curl_child(
+                "curl::tests::post_stdin_failure_terminates_and_reaps_curl",
+                CHILD,
+                "#!/bin/sh\nprintf '%s' \"$$\" > \"$SHOES_TEST_CURL_PID\"\nexec 0<&-\nexec sleep 30\n",
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                run_curl(
+                    "http://127.0.0.1/",
+                    CurlOptions::new().post_data(vec![0; 1 << 20]),
+                ),
+            )
+            .await
+        });
+        let elapsed = started.elapsed();
+        let pid: libc::pid_t = std::fs::read_to_string(std::env::var_os(PID).unwrap())
+            .unwrap()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        let wait_error = std::io::Error::last_os_error().raw_os_error();
+        // Cleans up the deliberately persistent fixture even when testing a broken helper.
+        if waited == 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        assert_eq!(
+            result
+                .expect("curl stdin failure stalled")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(!alive, "curl child survived the stdin error");
+        assert_eq!(waited, -1, "curl child was not reaped before helper return");
+        assert_eq!(wait_error, Some(libc::ECHILD));
+        assert!(elapsed < Duration::from_secs(5));
+    }
 
     #[test]
     fn extracts_last_response_status() {

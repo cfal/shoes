@@ -20,16 +20,11 @@ mod tests {
             super::set_num_threads(2);
             assert_eq!(super::get_num_threads(), 2);
         } else {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "thread_util::tests::library_callers_have_a_nonzero_thread_default",
-                    "--quiet",
-                ])
-                .env("SHOES_THREAD_DEFAULT_TEST_CHILD", "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+            shoes_test_support::isolated::run_isolated(
+                "thread_util::tests::library_callers_have_a_nonzero_thread_default",
+                "SHOES_THREAD_DEFAULT_TEST_CHILD",
+                "1",
+            );
         }
     }
 }

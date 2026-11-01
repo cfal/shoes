@@ -677,6 +677,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn forwarding_failure_rechecks_only_the_selected_automatic_group() {
+        use std::time::Duration;
+        use tokio::time::{Instant, timeout};
+
+        // A bound, non-listening socket reserves the refusing endpoint without a port race.
+        let refused = tokio::net::TcpSocket::new_v4().unwrap();
+        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = refused.local_addr().unwrap().to_string();
+        let member =
+            |name| json!({"name":name,"chain":[{"address":address,"protocol":{"type":"socks"}}]});
+        let (chain, catalog) = build(
+            json!([
+                {"client_group":"auto","type":"url-test","url":"http://probe.invalid/",
+                 "client_chains":[member("a"),member("b")]},
+                {"client_group":"other","type":"url-test","url":"http://probe.invalid/",
+                 "client_chains":[member("c"),member("d")]},
+                {"client_group":"out","type":"selector","default":"auto",
+                 "client_chains":[{"chain":["auto"]},{"chain":["other"]}]}
+            ]),
+            json!("out"),
+        );
+        let automatic = &catalog.selection.automatic;
+        for (member, delay) in [("a", 1), ("b", 100), ("c", 1), ("d", 100)] {
+            automatic.record(member, "http://probe.invalid/", Some(delay));
+        }
+        let now = Instant::now();
+        for group in automatic.0.values() {
+            assert_eq!(group.due_members(now), Some(0..2));
+            assert!(group.due_members(now + Duration::from_secs(1)).is_none());
+        }
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let target = NetLocation::from_str("192.0.2.1:80", None).unwrap();
+        let error = timeout(
+            Duration::from_secs(5),
+            chain.connect_tcp(target.into(), &resolver),
+        )
+        .await
+        .unwrap()
+        .err()
+        .expect("reserved endpoint must refuse connections");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            automatic.0["auto"].due_members(now + Duration::from_secs(1)),
+            Some(0..2)
+        );
+        assert!(
+            automatic.0["other"]
+                .due_members(now + Duration::from_secs(1))
+                .is_none()
+        );
+    }
+
     #[test]
     fn same_length_alternatives_never_mix_their_hops() {
         for kind in ["selector", "round-robin"] {

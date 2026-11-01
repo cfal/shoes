@@ -5,10 +5,12 @@ use crate::tcp::carrier_dialer::{CarrierDialer, RouteKey};
 use bytes::BytesMut;
 use std::{
     io,
+    pin::Pin,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    task::{Context, Poll},
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, DuplexStream};
+use tokio::io::{AsyncReadExt, DuplexStream, ReadBuf};
 
 #[derive(Debug)]
 struct CloseOnTake {
@@ -211,6 +213,217 @@ async fn stale_checkout_propagates_fresh_dial_failure_without_retrying_again() {
     })
     .await
     .unwrap();
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryPhase {
+    Wrapper,
+    AuthWrite,
+    AuthFlush,
+}
+
+impl RecoveryPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wrapper => "wrapper",
+            Self::AuthWrite => "auth-write",
+            Self::AuthFlush => "auth-flush",
+        }
+    }
+}
+
+struct RecoveryIo {
+    io: Box<dyn AsyncStream>,
+    phase: RecoveryPhase,
+    stall: bool,
+    entered: Arc<AtomicBool>,
+}
+
+impl RecoveryIo {
+    fn fault<T>(&self) -> Poll<io::Result<T>> {
+        self.entered.store(true, Ordering::SeqCst);
+        if self.stall {
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(io::Error::other(format!(
+                "fresh {}",
+                self.phase.label()
+            ))))
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for RecoveryIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buffer)
+    }
+}
+
+impl tokio::io::AsyncWrite for RecoveryIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.phase == RecoveryPhase::AuthWrite {
+            self.fault()
+        } else {
+            Pin::new(&mut self.io).poll_write(cx, bytes)
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        assert_eq!(self.phase.label(), "auth-flush");
+        self.fault()
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+impl crate::async_stream::AsyncPing for RecoveryIo {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        unreachable!("recovery must fail before session tasks start")
+    }
+}
+
+impl AsyncStream for RecoveryIo {}
+
+async fn check_failed_recovery(cancel: bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for phase in [
+            RecoveryPhase::Wrapper,
+            RecoveryPhase::AuthWrite,
+            RecoveryPhase::AuthFlush,
+        ] {
+            for udp in [false, true] {
+                let (handler, reusable_at_take, mut old_peer) = stale_handler().await;
+                let (io, mut peer) = tokio::io::duplex(4096);
+                let calls = AtomicUsize::new(0);
+                let wrappers = AtomicUsize::new(0);
+                let entered = Arc::new(AtomicBool::new(false));
+                let gate = entered.clone();
+                let wraps = &wrappers;
+                let transport = ClientTransport {
+                    route: Arc::new(Route(RouteKey(vec![1]))),
+                    open: Box::pin(async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(Box::new(io) as Box<dyn AsyncStream>)
+                    }),
+                }
+                .wrap(move |io| async move {
+                    wraps.fetch_add(1, Ordering::SeqCst);
+                    if phase == RecoveryPhase::Wrapper {
+                        gate.store(true, Ordering::SeqCst);
+                        if cancel {
+                            std::future::pending::<()>().await;
+                        }
+                        return Err(io::Error::other("fresh wrapper"));
+                    }
+                    Ok(RecoveryIo {
+                        io,
+                        phase,
+                        stall: cancel,
+                        entered: gate,
+                    })
+                });
+                let mut opening = Box::pin(async {
+                    if udp {
+                        handler
+                            .connect_client_udp(transport, target())
+                            .await
+                            .map(|_| ())
+                    } else {
+                        handler
+                            .connect_client_tcp(transport, target())
+                            .await
+                            .map(|_| ())
+                    }
+                });
+                if cancel {
+                    assert!(futures::poll!(&mut opening).is_pending());
+                } else {
+                    let error = (&mut opening).await.unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::Other);
+                    assert_eq!(error.to_string(), format!("fresh {}", phase.label()));
+                }
+                assert!(
+                    entered.load(Ordering::SeqCst),
+                    "{}, udp={udp}",
+                    phase.label()
+                );
+                drop(opening);
+                assert!(reusable_at_take.load(Ordering::SeqCst));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(wrappers.load(Ordering::SeqCst), 1);
+                assert!(handler.pool.take(&RouteKey(vec![1])).is_none());
+                let mut bytes = Vec::new();
+                old_peer.io.read_to_end(&mut bytes).await.unwrap();
+                assert!(bytes.is_empty());
+                assert!(old_peer.buffer.is_empty());
+                peer.read_to_end(&mut bytes).await.unwrap();
+                if phase == RecoveryPhase::AuthFlush {
+                    assert_eq!(bytes.len(), 34);
+                    assert_eq!(&bytes[32..], &[0, 0]);
+                } else {
+                    assert!(bytes.is_empty());
+                }
+
+                let (io, peer) = tokio::io::duplex(4096);
+                let transport = ClientTransport {
+                    route: Arc::new(Route(RouteKey(vec![1]))),
+                    open: Box::pin(async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(Box::new(io) as Box<dyn AsyncStream>)
+                    }),
+                }
+                .wrap(|io| async {
+                    wrappers.fetch_add(1, Ordering::SeqCst);
+                    Ok(io)
+                });
+                if udp {
+                    let _stream = handler
+                        .connect_client_udp(transport, target())
+                        .await
+                        .unwrap();
+                    Peer::new(peer)
+                        .await
+                        .opened(&AnyTlsClientHandler::udp_destination())
+                        .await;
+                } else {
+                    let mut stream = handler
+                        .connect_client_tcp(transport, target())
+                        .await
+                        .unwrap();
+                    stream.client_stream.flush().await.unwrap();
+                    Peer::new(peer).await.opened(target().location()).await;
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert_eq!(wrappers.load(Ordering::SeqCst), 2);
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn stale_recovery_wrapper_and_authentication_errors_do_not_retry() {
+    check_failed_recovery(false).await;
+}
+
+#[tokio::test]
+async fn stale_recovery_cancellation_disposes_wrapped_and_authenticating_transports() {
+    check_failed_recovery(true).await;
 }
 
 #[tokio::test]

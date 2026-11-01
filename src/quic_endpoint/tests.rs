@@ -270,16 +270,11 @@ async fn endpoint_reservations_survive_window_reload() {
     use crate::config::GlobalLimits;
 
     if std::env::var_os("SHOES_QUIC_RELOAD_TEST_CHILD").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "quic_endpoint::tests::endpoint_reservations_survive_window_reload",
-                "--nocapture",
-            ])
-            .env("SHOES_QUIC_RELOAD_TEST_CHILD", "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        shoes_test_support::isolated::run_isolated(
+            "quic_endpoint::tests::endpoint_reservations_survive_window_reload",
+            "SHOES_QUIC_RELOAD_TEST_CHILD",
+            "1",
+        );
         return;
     }
 

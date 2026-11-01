@@ -486,16 +486,11 @@ mod tests {
     #[test]
     fn timed_out_service_cannot_clear_replacement_socket_protector() {
         if std::env::var_os("SHOES_FFI_RESTART_TEST_CHILD").is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "ffi::common::tests::timed_out_service_cannot_clear_replacement_socket_protector",
-                    "--nocapture",
-                ])
-                .env("SHOES_FFI_RESTART_TEST_CHILD", "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+            shoes_test_support::isolated::run_isolated(
+                "ffi::common::tests::timed_out_service_cannot_clear_replacement_socket_protector",
+                "SHOES_FFI_RESTART_TEST_CHILD",
+                "1",
+            );
             return;
         }
         let (_old_peer, old_fd) = UnixDatagram::pair().unwrap();

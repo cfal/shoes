@@ -1202,12 +1202,7 @@ async fn resolved_foreign_namespace() -> io::Result<()> {
         .kill_on_drop(true)
         .output()
         .await?;
-    assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    shoes_test_support::isolated::assert_one_test_passed(&output);
     assert_eq!(resolved_link_settings(3)?, before);
     Ok(())
 }

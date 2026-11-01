@@ -230,14 +230,10 @@ mod tests {
     async fn native_preflight_checks_managed_bootstrap_instead_of_os_dns() {
         const CHILD: &str = "SHOES_NATIVE_PREFLIGHT_TEST";
         if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "dns::system::tests::native_preflight_checks_managed_bootstrap_instead_of_os_dns", "--nocapture"])
-                .env(CHILD, "1").output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+            shoes_test_support::isolated::run_isolated(
+                "dns::system::tests::native_preflight_checks_managed_bootstrap_instead_of_os_dns",
+                CHILD,
+                "1",
             );
             return;
         }

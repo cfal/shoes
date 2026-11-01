@@ -112,16 +112,11 @@ async fn response_after_request_eof() {
 #[test]
 fn saturated_pipe_budget_falls_back_and_recovers() {
     if std::env::var_os("SHOES_SPLICE_SATURATION_CHILD").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "splice::tests::saturated_pipe_budget_falls_back_and_recovers",
-                "--nocapture",
-            ])
-            .env("SHOES_SPLICE_SATURATION_CHILD", "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        shoes_test_support::isolated::run_isolated(
+            "splice::tests::saturated_pipe_budget_falls_back_and_recovers",
+            "SHOES_SPLICE_SATURATION_CHILD",
+            "1",
+        );
         return;
     }
 
