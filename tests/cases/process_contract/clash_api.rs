@@ -666,22 +666,19 @@ async fn chain_choices_route_probe_and_restore_as_whole_paths() {
     check_flow(&mut retained, b'W').await;
     let mut restored = flow(fixture.entry, b'W').await;
     let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let connections = snapshot["connections"].as_array().unwrap();
     for port in [
         retained_port,
         restored.local_addr().unwrap().port().to_string(),
     ] {
-        let connection = snapshot["connections"]
-            .as_array()
-            .unwrap()
+        let connection = connections
             .iter()
             .find(|connection| connection["metadata"]["sourcePort"] == port)
             .unwrap();
         assert_eq!(connection["shoesGeneration"].as_u64().unwrap(), generation);
     }
     assert!(
-        snapshot["connections"]
-            .as_array()
-            .unwrap()
+        connections
             .iter()
             .any(|connection| connection["id"] == before["id"])
     );

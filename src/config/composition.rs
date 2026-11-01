@@ -366,14 +366,13 @@ mod tests {
             assert!(error.to_string().contains("64 hops"), "{error}");
         };
 
-        for length in [64, 65] {
-            let result = validate(json!([server(json!(hops("inline", length)))]));
-            if length == 64 {
-                assert_length(route(&result.unwrap()), length);
-            } else {
-                assert_limit(result.err().unwrap());
-            }
-        }
+        let inline = validate(json!([server(json!(hops("inline", 64)))])).unwrap();
+        assert_length(route(&inline), 64);
+        assert_limit(
+            validate(json!([server(json!(hops("inline", 65)))]))
+                .err()
+                .unwrap(),
+        );
 
         for (prefix, alternatives, used, accepted) in [
             (0, [64, 64], true, true),
@@ -385,12 +384,17 @@ mod tests {
         ] {
             let mut stages = hops("prefix", prefix);
             stages.push(json!("choices"));
+            let branches: Vec<_> = alternatives
+                .into_iter()
+                .enumerate()
+                .map(|(index, length)| {
+                    let name = format!("branch-{index}");
+                    json!({"name":name,"chain":hops(&name, length)})
+                })
+                .collect();
             let mut config = vec![
                 json!({"client_group":"choices","type":"selector","default":"branch-0",
-                    "client_chains": alternatives.into_iter().enumerate().map(|(index, length)| {
-                        let name = format!("branch-{index}");
-                        json!({"name":name,"chain":hops(&name, length)})
-                    }).collect::<Vec<_>>()}),
+                    "client_chains":branches}),
                 json!({"client_group":"out","client_chains":stages}),
             ];
             if used {

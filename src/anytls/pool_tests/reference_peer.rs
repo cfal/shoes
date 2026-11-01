@@ -51,7 +51,7 @@ async fn reference_peer_tcp_uot_and_concurrent_session_reuse() {
         for size in [1, 13, 4095, 16384, 65507, 7] {
             let payload: Vec<_> = (0..size).map(|index| (index * 37 + size) as u8).collect();
             let expected: Vec<_> = payload.iter().map(|byte| byte ^ 0x5a).collect();
-            let ((), ()) = tokio::join!(
+            tokio::join!(
                 async {
                     futures::future::poll_fn(|cx| {
                         Pin::new(&mut *udp).poll_write_message(cx, &payload)
@@ -98,5 +98,4 @@ async fn reference_peer_tcp_uot_and_concurrent_session_reuse() {
     .await
     .unwrap();
     child.kill().await.unwrap();
-    child.wait().await.unwrap();
 }

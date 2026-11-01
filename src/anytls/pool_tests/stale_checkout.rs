@@ -215,9 +215,26 @@ async fn stale_checkout_propagates_fresh_dial_failure_without_retrying_again() {
     .unwrap();
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryPhase {
+    Wrapper,
+    AuthWrite,
+    AuthFlush,
+}
+
+impl RecoveryPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wrapper => "wrapper",
+            Self::AuthWrite => "auth-write",
+            Self::AuthFlush => "auth-flush",
+        }
+    }
+}
+
 struct RecoveryIo {
     io: Box<dyn AsyncStream>,
-    phase: &'static str,
+    phase: RecoveryPhase,
     stall: bool,
     entered: Arc<AtomicBool>,
 }
@@ -228,7 +245,10 @@ impl RecoveryIo {
         if self.stall {
             Poll::Pending
         } else {
-            Poll::Ready(Err(io::Error::other(format!("fresh {}", self.phase))))
+            Poll::Ready(Err(io::Error::other(format!(
+                "fresh {}",
+                self.phase.label()
+            ))))
         }
     }
 }
@@ -249,7 +269,7 @@ impl tokio::io::AsyncWrite for RecoveryIo {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.phase == "auth-write" {
+        if self.phase == RecoveryPhase::AuthWrite {
             self.fault()
         } else {
             Pin::new(&mut self.io).poll_write(cx, bytes)
@@ -257,7 +277,7 @@ impl tokio::io::AsyncWrite for RecoveryIo {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        assert_eq!(self.phase, "auth-flush");
+        assert_eq!(self.phase.label(), "auth-flush");
         self.fault()
     }
 
@@ -280,7 +300,11 @@ impl AsyncStream for RecoveryIo {}
 
 async fn check_failed_recovery(cancel: bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        for phase in ["wrapper", "auth-write", "auth-flush"] {
+        for phase in [
+            RecoveryPhase::Wrapper,
+            RecoveryPhase::AuthWrite,
+            RecoveryPhase::AuthFlush,
+        ] {
             for udp in [false, true] {
                 let (handler, reusable_at_take, mut old_peer) = stale_handler().await;
                 let (io, mut peer) = tokio::io::duplex(4096);
@@ -298,7 +322,7 @@ async fn check_failed_recovery(cancel: bool) {
                 }
                 .wrap(move |io| async move {
                     wraps.fetch_add(1, Ordering::SeqCst);
-                    if phase == "wrapper" {
+                    if phase == RecoveryPhase::Wrapper {
                         gate.store(true, Ordering::SeqCst);
                         if cancel {
                             std::future::pending::<()>().await;
@@ -330,9 +354,13 @@ async fn check_failed_recovery(cancel: bool) {
                 } else {
                     let error = (&mut opening).await.unwrap_err();
                     assert_eq!(error.kind(), io::ErrorKind::Other);
-                    assert_eq!(error.to_string(), format!("fresh {phase}"));
+                    assert_eq!(error.to_string(), format!("fresh {}", phase.label()));
                 }
-                assert!(entered.load(Ordering::SeqCst), "{phase}, udp={udp}");
+                assert!(
+                    entered.load(Ordering::SeqCst),
+                    "{}, udp={udp}",
+                    phase.label()
+                );
                 drop(opening);
                 assert!(reusable_at_take.load(Ordering::SeqCst));
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -343,7 +371,7 @@ async fn check_failed_recovery(cancel: bool) {
                 assert!(bytes.is_empty());
                 assert!(old_peer.buffer.is_empty());
                 peer.read_to_end(&mut bytes).await.unwrap();
-                if phase == "auth-flush" {
+                if phase == RecoveryPhase::AuthFlush {
                     assert_eq!(bytes.len(), 34);
                     assert_eq!(&bytes[32..], &[0, 0]);
                 } else {
