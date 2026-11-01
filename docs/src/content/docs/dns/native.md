@@ -3,7 +3,9 @@ title: "Native DNS Freshness"
 description: shoes native dns freshness configuration.
 ---
 
-Omitting a listener's `dns` or leaving `dns.servers` empty uses native OS/NSS
+Without `global_settings.default_dns`, omitting a listener's `dns` uses native
+OS/NSS resolution. An explicit `dns` object with empty `servers` always selects
+this underlying system resolver, even when a global default is set. It provides
 hostname resolution with a **60-second application memoization window**. The
 same default resolver serves controller probes. The window starts when a
 successful lookup finishes; an entry expires at the window boundary. All returned

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added `global_settings.default_dns` for listeners, TUN entries, and WireGuard inbounds. Omitted or null `dns` inherits it; explicit `dns` objects replace it completely. Inline fake-IP defaults share one mapping pool. Independent bootstrap and service lookups retain their own DNS configuration.
 - Added a native Hysteria2 client with shared HTTP/3 authentication, TCP streams, bounded UDP fragmentation and demultiplexing, and connection-owned reconnect lifetimes. Native QUIC clients must be outermost at chain hop 0; existing stream-based proxies can follow them. Brutal and 0-RTT are not supported.
 - Added a TUIC v5 client with TCP, native and QUIC-stream UDP relay modes, session-exporter authentication, heartbeats, and bounded association teardown.
 - Added optional Salamander obfuscation for Hysteria2 clients, including coalesced UDP receive handling and transport MTU accounting.

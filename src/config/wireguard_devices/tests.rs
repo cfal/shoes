@@ -35,6 +35,33 @@ fn server() -> Value {
 }
 
 #[test]
+fn servers_inherit_global_default_dns_before_device_extraction() {
+    let validated = validate(json!([
+        {"global_settings": {"default_dns": {"servers": "selected"}}},
+        {"dns_group": "selected", "dns_servers": "tcp://192.0.2.53"},
+        server()
+    ]))
+    .unwrap();
+    assert_eq!(
+        validated.wireguard_endpoints[0]
+            .inbound
+            .as_ref()
+            .unwrap()
+            .dns
+            .as_ref()
+            .unwrap()
+            .resolved_group(),
+        Some("selected")
+    );
+    assert!(
+        validated
+            .dns_groups
+            .iter()
+            .any(|group| group.name == "selected")
+    );
+}
+
+#[test]
 fn servers_keep_inbound_sniff_setting() {
     for sniff in [false, true] {
         let mut config = server();

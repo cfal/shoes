@@ -5,7 +5,8 @@
 # - connect_timeout_secs: connection setup timeout for TCP/TLS/HTTPS/H3 upstreams
 # - attempts: retry count for failed queries
 #
-# With no dns field, or a dns field with omitted or empty servers, destination
+# Without a global default, no dns field uses the OS resolver. An explicit dns
+# field with omitted or empty servers always uses it. In either case, destination
 # lookups use the OS resolver. shoes caches successful results for 60 seconds from
 # lookup completion, across ports, with at most 10,000 cached hosts.
 # This is an application result-age policy, not a DNS record TTL: OS/getaddrinfo
@@ -21,7 +22,13 @@
 # bootstrap unchanged.
 
 # Native OS/NSS lookup memoization is separate from hickory tuning and DNS TTLs.
-# Omitted listener dns defaults to 60 seconds. Explicit system defaults to no cache.
+# Implicit system DNS caches for 60 seconds. Explicit system defaults to no cache.
+# This default sends the HTTP proxy's destination lookups through tuned-direct-dns,
+# not the OS resolver; the OS memoization policy above does not apply to them.
+- global_settings:
+    default_dns:
+      servers: tuned-direct-dns
+
 - dns_group: native-short-cache
   dns_servers:
     - url: system
@@ -47,10 +54,8 @@
       connect_timeout_secs: 2
       attempts: 1
 
-# HTTP proxy using the tuned direct DNS group.
+# HTTP proxy inheriting the tuned direct DNS group.
 - address: "127.0.0.1:8080"
-  dns:
-    servers: tuned-direct-dns
   protocol:
     type: http
 

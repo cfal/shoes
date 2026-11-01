@@ -98,6 +98,11 @@ pub(crate) fn visit_source_configs(
 ) -> io::Result<()> {
     for config in configs.iter_mut() {
         match config {
+            Config::GlobalSettings(settings) => {
+                if let Some(dns) = &mut settings.default_dns {
+                    visit_dns(&mut dns.servers, visitor)?;
+                }
+            }
             Config::ClientConfigGroup(group) => {
                 for member in group.client_chains.iter_mut() {
                     match member {

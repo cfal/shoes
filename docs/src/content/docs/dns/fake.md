@@ -68,6 +68,10 @@ fake_ip:
   transfers, and non-query operations are refused. Synthesized answers are
   unsigned and do not claim DNSSEC authentication.
 
+An inline `global_settings.default_dns` with `fake_ip` also creates one shared
+pool for all inheriting listeners, TUN entries, and WireGuard inbounds. An
+explicit per-inbound `dns` object replaces the default rather than merging it.
+
 Named DNS groups share one pool across every referencing inbound:
 
 ```yaml

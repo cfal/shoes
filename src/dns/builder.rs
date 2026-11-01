@@ -105,6 +105,10 @@ impl DnsRegistry {
         let mut forbidden = retained_ranges.to_vec();
         for config in configs {
             let policy = match config {
+                crate::config::Config::GlobalSettings(settings) => settings
+                    .default_dns
+                    .as_ref()
+                    .and_then(|dns| dns.fake_ip.as_ref()),
                 crate::config::Config::DnsConfigGroup(group) => group.fake_ip.as_ref(),
                 crate::config::Config::Server(server) => {
                     server.dns.as_ref().and_then(|dns| dns.fake_ip.as_ref())
