@@ -1,16 +1,19 @@
 ---
-import DefaultSiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
 import { Icon } from '@astrojs/starlight/components';
 import LanguageSelect from 'virtual:starlight/components/LanguageSelect';
 import { docsLabel, sourceRef, sourceRefKnown } from '../../metadata.mjs';
 
+const { siteTitle, siteTitleHref } = Astro.locals.starlightRoute;
 const chinese = Astro.currentLocale === 'zh-CN';
 const repositoryLabel = chinese ? 'GitHub 上的 shoes' : 'shoes on GitHub';
 ---
 
 <div class="site-identity">
   <div class="brand">
-    <DefaultSiteTitle />
+    <a class="site-title" href={siteTitleHref}>
+      <span class="shoe-mark" aria-hidden="true"></span>
+      <span translate="no">{siteTitle}</span>
+    </a>
     <a class="repository" href="https://github.com/cfal/shoes" aria-label={repositoryLabel} title={repositoryLabel}>
       <Icon name="github" size="1.25rem" />
     </a>
@@ -41,7 +44,25 @@ const repositoryLabel = chinese ? 'GitHub 上的 shoes' : 'shoes on GitHub';
     gap: 0.75rem;
     min-height: 1.75rem;
   }
-  .brand :global(.site-title) { line-height: 1.25; }
+  .site-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-width: 0;
+    color: var(--sl-color-text-accent);
+    font-size: var(--sl-text-h4);
+    font-weight: 600;
+    line-height: 1.25;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .shoe-mark {
+    flex: none;
+    width: 2.65rem;
+    height: 1.3rem;
+    background: currentColor;
+    mask: url('/shoes-mark.svg') center / contain no-repeat;
+  }
   .repository {
     display: inline-flex;
     align-items: center;
