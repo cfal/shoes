@@ -26,7 +26,7 @@ fn fixture(port: u16) -> BuiltFixture {
 async fn local_success_helpers_reject_http_errors_with_nonempty_bodies() {
     tokio::time::timeout(Duration::from_secs(10), async {
         for streaming in [false, true] {
-            for status in ["200 OK", "502 Bad Gateway"] {
+            for (status, succeeds) in [("200 OK", true), ("502 Bad Gateway", false)] {
                 let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
                 let fixture = fixture(listener.local_addr().unwrap().port());
                 let body = b"a complete nonempty response";
@@ -59,7 +59,7 @@ async fn local_success_helpers_reject_http_errors_with_nonempty_bodies() {
                     })
                     .catch_unwind()
                 );
-                if status.starts_with("200") {
+                if succeeds {
                     assert!(result.is_ok(), "streaming={streaming}: success rejected");
                 } else {
                     let panic = result.expect_err("HTTP 502 must not satisfy a success helper");

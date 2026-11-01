@@ -204,17 +204,14 @@ pub async fn run_curl(url: &str, options: CurlOptions) -> std::io::Result<Output
         .env_remove("no_proxy")
         .env_remove("NO_PROXY");
 
-    // Add proxy if specified
     if let Some(proxy) = &options.proxy {
         cmd.arg("--proxy").arg(proxy);
     }
 
-    // Add interface if specified
     if let Some(iface) = &options.interface {
         cmd.arg("--interface").arg(iface);
     }
 
-    // Add TLS options
     if options.insecure {
         cmd.arg("--insecure");
     }
@@ -227,35 +224,29 @@ pub async fn run_curl(url: &str, options: CurlOptions) -> std::io::Result<Output
         cmd.arg("--tls-max").arg(max_version);
     }
 
-    // Add custom headers
     for (name, value) in &options.headers {
         cmd.arg("-H").arg(format!("{}: {}", name, value));
     }
 
-    // Add DNS resolve entries
     for entry in &options.resolve {
         cmd.arg("--resolve").arg(entry);
     }
 
-    // Set HTTP method if specified
-    if let Some(ref method) = options.method {
+    if let Some(method) = &options.method {
         cmd.arg("-X").arg(method);
     }
 
-    // If POST data is provided, read from stdin using --data-binary @-
-    if let Some(ref _data) = options.post_data {
+    if options.post_data.is_some() {
         cmd.arg("--data-binary").arg("@-");
         cmd.stdin(Stdio::piped());
     }
 
-    // Common curl options
     cmd.arg("--silent")
         .arg("--show-error")
         .arg("--no-buffer") // Disable output buffering for more realistic traffic patterns
         .arg("--max-time")
         .arg(options.timeout_secs.to_string());
 
-    // Fail on HTTP error responses (4xx, 5xx)
     if options.fail_on_http_error {
         cmd.arg("--fail");
     }
@@ -265,55 +256,47 @@ pub async fn run_curl(url: &str, options: CurlOptions) -> std::io::Result<Output
         cmd.arg("-o").arg("/dev/null");
     }
 
-    // Force HTTP version
-    if let Some(ref version) = options.http_version {
-        match version.as_str() {
-            "1.1" => cmd.arg("--http1.1"),
-            "2" => cmd.arg("--http2"),
-            _ => &mut cmd,
-        };
+    match options.http_version.as_deref() {
+        Some("1.1") => {
+            cmd.arg("--http1.1");
+        }
+        Some("2") => {
+            cmd.arg("--http2");
+        }
+        _ => {}
     }
 
-    // Include HTTP response headers in output
     if options.include_headers {
         cmd.arg("-i");
     }
 
-    // Write headers to stderr
     if options.headers_to_stderr {
         cmd.arg("-D").arg("/dev/stderr");
     }
 
     cmd.arg(url);
 
-    // Execute curl
-    if let Some(data) = options.post_data {
-        // Spawn with stdin pipe
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let Some(data) = options.post_data else {
+        return cmd.stdin(Stdio::null()).output().await;
+    };
 
-        let mut child = cmd.spawn()?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
 
-        // Write data to stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            let written = async {
-                stdin.write_all(&data).await?;
-                stdin.flush().await
-            }
-            .await;
-            drop(stdin);
-            if let Err(error) = written {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(error);
-            }
+    if let Some(mut stdin) = child.stdin.take() {
+        let written = async {
+            stdin.write_all(&data).await?;
+            stdin.flush().await
         }
-
-        // Wait for completion and collect output
-        child.wait_with_output().await
-    } else {
-        // Regular GET request
-        cmd.stdin(Stdio::null()).output().await
+        .await;
+        drop(stdin);
+        if let Err(error) = written {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
     }
+    child.wait_with_output().await
 }
 
 /// Extracts the last HTTP status from headers emitted by curl.
@@ -472,6 +455,24 @@ pub async fn curl_post_https_tls12_via_proxy(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn run_fake_curl_child(name: &str, marker: &str, script_contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("curl");
+        std::fs::write(&script, script_contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(marker, "1")
+            .env("SHOES_TEST_CURL_BIN", script)
+            .env("SHOES_TEST_CURL_PID", directory.path().join("pid"))
+            .output()
+            .unwrap();
+        crate::isolated::assert_one_test_passed(&output);
+    }
+
     #[tokio::test]
     async fn post_body_closes_stdin_and_preserves_response_bytes() {
         let server = crate::test_servers::start_local_http_server("0.0.0.0", 0)
@@ -502,35 +503,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cancellation_terminates_curl_during_output_and_stdin_waits() {
-        use std::os::{
-            fd::AsRawFd,
-            unix::fs::{OpenOptionsExt, PermissionsExt},
-        };
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
         use std::time::Duration;
 
         const CHILD: &str = "SHOES_CURL_CANCEL_CHILD";
         const PID: &str = "SHOES_TEST_CURL_PID";
         if std::env::var_os(CHILD).is_none() {
-            let directory = tempfile::tempdir().unwrap();
-            let script = directory.path().join("curl");
-            std::fs::write(
-                &script,
+            run_fake_curl_child(
+                "curl::tests::cancellation_terminates_curl_during_output_and_stdin_waits",
+                CHILD,
                 "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$SHOES_TEST_CURL_PID\"\nexec sleep 30\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "curl::tests::cancellation_terminates_curl_during_output_and_stdin_waits",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("SHOES_TEST_CURL_BIN", script)
-                .env(PID, directory.path().join("pid"))
-                .output()
-                .unwrap();
-            crate::isolated::assert_one_test_passed(&output);
+            );
             return;
         }
 
@@ -621,33 +604,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn post_stdin_failure_terminates_and_reaps_curl() {
-        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
 
         const CHILD: &str = "SHOES_CURL_STDIN_FAILURE_CHILD";
         const PID: &str = "SHOES_TEST_CURL_PID";
         if std::env::var_os(CHILD).is_none() {
-            let directory = tempfile::tempdir().unwrap();
-            let script = directory.path().join("curl");
-            let pid_file = directory.path().join("pid");
-            std::fs::write(
-                &script,
+            run_fake_curl_child(
+                "curl::tests::post_stdin_failure_terminates_and_reaps_curl",
+                CHILD,
                 "#!/bin/sh\nprintf '%s' \"$$\" > \"$SHOES_TEST_CURL_PID\"\nexec 0<&-\nexec sleep 30\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "curl::tests::post_stdin_failure_terminates_and_reaps_curl",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("SHOES_TEST_CURL_BIN", script)
-                .env(PID, pid_file)
-                .output()
-                .unwrap();
-            crate::isolated::assert_one_test_passed(&output);
+            );
             return;
         }
 
