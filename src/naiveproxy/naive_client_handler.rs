@@ -30,6 +30,7 @@ struct CachedSession {
 ///
 /// Establishes HTTP/2 CONNECT tunnels with padding support, reusing H2 sessions
 /// across multiple connections for efficient multiplexing.
+#[derive(Clone)]
 pub struct NaiveProxyTcpClientHandler {
     /// Base64-encoded credentials for Basic Auth
     auth_header: String,
@@ -44,16 +45,6 @@ impl std::fmt::Debug for NaiveProxyTcpClientHandler {
         f.debug_struct("NaiveProxyTcpClientHandler")
             .field("padding_enabled", &self.padding_enabled)
             .finish()
-    }
-}
-
-impl Clone for NaiveProxyTcpClientHandler {
-    fn clone(&self) -> Self {
-        Self {
-            auth_header: self.auth_header.clone(),
-            padding_enabled: self.padding_enabled,
-            sessions: Arc::clone(&self.sessions),
-        }
     }
 }
 
