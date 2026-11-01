@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use super::selection::{
-    Choices, SelectionOwner, SelectionView, SelectorDefinition, SelectorDefinitions,
-};
+use super::selection::{SelectionOwner, SelectionView, SelectorDefinition, SelectorDefinitions};
 use super::store::valid_name;
 use crate::config::resolved::{
     ResolvedClientChain, ResolvedClientChoice, ResolvedClientConfig, ResolvedClientHop,
@@ -40,22 +38,12 @@ impl MemberOrigin {
             || self.selection.automatic.0.contains_key(group)
     }
 
-    pub fn has_selector(&self) -> bool {
-        self.path.iter().any(|(group, _)| self.manages(group))
-    }
-
     pub(crate) fn policy_path(&self) -> Vec<(String, String)> {
         self.path
             .iter()
             .filter(|(group, _)| self.manages(group))
             .cloned()
             .collect()
-    }
-
-    pub fn allowed(&self, choices: &Choices) -> bool {
-        self.path
-            .iter()
-            .all(|(group, member)| choices.get(group).is_none_or(|selected| selected == member))
     }
 
     pub fn chains(&self) -> impl Iterator<Item = String> + '_ {
@@ -716,7 +704,6 @@ mod tests {
     fn composition_retains_definition_identity_and_every_group_branch() {
         let validated =
             crate::config::create_server_configs(serde_yaml::from_str(CONFIG).unwrap()).unwrap();
-        let catalog = validated.catalog.as_ref().unwrap();
         let crate::config::ResolvedConfig::Server(server) = &validated.configs[0] else {
             panic!()
         };
@@ -751,13 +738,6 @@ mod tests {
                 ("child".into(), "east".into())
             ]
         );
-        assert!(origins[0].allowed(&catalog.selection.snapshot()));
-        assert!(!origins[2].allowed(&catalog.selection.snapshot()));
-        let mut owner = SelectionOwner::new(None).unwrap();
-        owner.activate(catalog.selection.clone()).unwrap();
-        owner.select("outbound", "DIRECT").unwrap();
-        assert!(!origins[0].allowed(&catalog.selection.snapshot()));
-        assert!(origins[2].allowed(&catalog.selection.snapshot()));
     }
 
     #[test]

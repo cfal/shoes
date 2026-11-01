@@ -118,9 +118,32 @@ async fn reuse_respects_selected_entry_target_and_multihop_boundaries() {
     // The next selected entry is cold; it must not borrow the previous entry's session.
     assert!(chain.connect_tcp(target.clone(), &resolver).await.is_err());
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let result = chain
+        .connect_tcp_pinned(target.clone(), &resolver)
+        .await
+        .unwrap();
+    assert_eq!(result.early_data.unwrap(), target.to_string().as_bytes());
+    assert!(
+        chain
+            .connect_tcp_pinned(target.clone(), &resolver)
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
     let chain = ClientProxyChain::new(vec![warm()], vec![vec![mock_proxy(1082, false)]]);
-    assert!(chain.connect_tcp(target, &resolver).await.is_err());
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(chain.connect_tcp(target.clone(), &resolver).await.is_err());
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    let error = chain
+        .connect_tcp_pinned(target, &resolver)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "unexpected early data from intermediate proxy"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
@@ -138,12 +161,23 @@ async fn rejected_reuse_does_not_fall_back_to_a_fresh_connect() {
         }],
         vec![],
     );
-    let target = NetLocation::from_str("example.com:443", None)
+    let target: ResolvedLocation = NetLocation::from_str("example.com:443", None)
         .unwrap()
         .into();
-    let error = chain.connect_tcp(target, &resolver).await.err().unwrap();
+    let error = chain
+        .connect_tcp(target.clone(), &resolver)
+        .await
+        .err()
+        .unwrap();
     assert_eq!(error.to_string(), "CONNECT rejected");
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let error = chain
+        .connect_tcp_pinned(target, &resolver)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "CONNECT rejected");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
 }
 
 #[async_trait]
@@ -271,9 +305,9 @@ fn test_chain_mixed_initial_pool() {
     );
     assert_eq!(chain.num_hops(), 1);
     assert!(chain.supports_udp());
-    // All 3 entries support UDP (initial hop IS final hop)
-    assert!(chain.udp_uses_initial_hop);
-    assert_eq!(chain.udp_final_hop_indices, vec![0, 1, 2]);
+    for index in [0, 1, 2, 0] {
+        assert_eq!(chain.select_indices(true).unwrap(), [index]);
+    }
 }
 
 #[test]
@@ -287,9 +321,9 @@ fn test_chain_mixed_initial_pool_partial_udp() {
         vec![],
     );
     assert!(chain.supports_udp());
-    // Only entries 1 and 2 support UDP (initial hop IS final hop)
-    assert!(chain.udp_uses_initial_hop);
-    assert_eq!(chain.udp_final_hop_indices, vec![1, 2]);
+    for index in [1, 2, 1, 2] {
+        assert_eq!(chain.select_indices(true).unwrap(), [index]);
+    }
 }
 
 #[test]
@@ -320,6 +354,21 @@ fn test_chain_pool_at_subsequent_hop() {
 #[should_panic(expected = "must have at least one initial hop entry")]
 fn test_chain_empty_initial_hop_panics() {
     ClientProxyChain::new(vec![], vec![]);
+}
+
+#[cfg(unix)]
+#[test]
+fn fixed_paths_borrow_connectors_without_selection_state() {
+    let mut chain = ClientProxyChain::new(vec![direct_entry()], vec![vec![mock_proxy(1080, true)]]);
+    chain.restore_tcp_selection_indices(&[]);
+    let first = chain.select(false).unwrap();
+    for udp in [true, false, true] {
+        let next = chain.select(udp).unwrap();
+        assert!(matches!(next, std::borrow::Cow::Borrowed(_)));
+        assert!(Arc::ptr_eq(&first.initial, &next.initial));
+        assert!(Arc::ptr_eq(&first.subsequent[0], &next.subsequent[0]));
+        assert!(chain.tcp_selection_indices().is_empty());
+    }
 }
 
 #[test]
@@ -377,7 +426,8 @@ fn test_pool_pairing_fix_socket_proxy_always_paired() {
     // Select entries multiple times and verify pairing
     // Round-robin should cycle: 0, 1, 2, 0, 1, 2, ...
     for iteration in 0..6 {
-        let entry = chain.initial_hop[chain.select_indices(false).unwrap()[0]].as_ref();
+        let path = chain.select(false).unwrap();
+        let entry = path.initial.as_ref();
         let expected_idx = iteration % 3;
 
         match (expected_idx, entry) {
@@ -427,19 +477,10 @@ fn test_pool_pairing_fix_udp_selection_also_paired() {
         vec![],
     );
 
-    // UDP selection should only return entries 1 and 2 (initial hop IS final hop)
-    assert!(chain.udp_uses_initial_hop);
-    assert_eq!(chain.udp_final_hop_indices, vec![1, 2]);
-
-    // Verify UDP selection cycles through UDP-capable entries only
-    // Manually select using the new logic
     for iteration in 0..4 {
-        let idx = chain
-            .udp_final_hop_next_index
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-        let pool_idx = chain.udp_final_hop_indices[idx % chain.udp_final_hop_indices.len()];
-        let entry = &chain.initial_hop[pool_idx];
-        let expected_udp_idx = iteration % 2; // 0 or 1 in udp_initial_hop_indices
+        let path = chain.select(true).unwrap();
+        let entry = &path.initial;
+        let expected_udp_idx = iteration % 2;
 
         match (expected_udp_idx, entry.as_ref()) {
             (0, InitialHopEntry::Proxy { proxy, .. }) => {
@@ -467,9 +508,6 @@ fn test_pool_pairing_fix_udp_selection_also_paired() {
 
 #[test]
 fn test_udp_selection_with_subsequent_hops() {
-    // Test that when udp_uses_initial_hop = false, we select:
-    // - Initial hop normally (from all entries)
-    // - Final hop from udp_final_hop_indices
     let chain = ClientProxyChain::new(
         vec![
             proxy_entry(1080, false), // HTTP - no UDP (but should be usable for UDP!)
@@ -482,14 +520,9 @@ fn test_udp_selection_with_subsequent_hops() {
         ]],
     );
 
-    assert!(!chain.udp_uses_initial_hop);
-    assert_eq!(chain.udp_final_hop_indices, vec![1, 2]);
-
-    // Verify that initial hop selection would use all entries (indices 0 and 1)
-    // We can't easily test this without calling connect_udp_bidirectional(), but we can verify
-    // that the normal round-robin will cycle through both
-    for i in 0..4 {
-        let entry = chain.initial_hop[chain.select_indices(false).unwrap()[0]].as_ref();
+    for i in 0..6 {
+        let path = chain.select(true).unwrap();
+        let entry = path.initial.as_ref();
         let expected_idx = i % 2;
         match (expected_idx, entry) {
             (0, InitialHopEntry::Proxy { proxy, .. }) => {
@@ -500,36 +533,12 @@ fn test_udp_selection_with_subsequent_hops() {
             }
             _ => panic!("Unexpected entry"),
         }
-    }
-
-    // Verify that final hop selection cycles through udp_final_hop_indices only
-    let final_hop = chain.subsequent_hops.last().unwrap();
-    for iteration in 0..6 {
-        let idx = chain
-            .udp_final_hop_next_index
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-        let pool_idx = chain.udp_final_hop_indices[idx % chain.udp_final_hop_indices.len()];
-        let proxy = &final_hop[pool_idx];
-
-        let expected_udp_idx = iteration % 2; // 0 or 1 in udp_final_hop_indices
-        match expected_udp_idx {
-            0 => {
-                // udp_final_hop_indices[0] = 1 -> VMess at port 443
-                assert_eq!(proxy.proxy_location().port(), 443);
-            }
-            1 => {
-                // udp_final_hop_indices[1] = 2 -> VLESS at port 444
-                assert_eq!(proxy.proxy_location().port(), 444);
-            }
-            _ => panic!("Unexpected index"),
-        }
+        assert_eq!(path.subsequent[0].proxy_location().port(), 443 + i % 2);
     }
 }
 
 #[test]
 fn test_chain_with_subsequent_hops_uses_final_hop_indices() {
-    // Test the key insight: when has subsequent hops, udp_final_hop_indices
-    // points to the FINAL subsequent hop, not the initial hop
     let chain = ClientProxyChain::new(
         vec![
             proxy_entry(1080, false), // HTTP - no UDP
@@ -545,12 +554,9 @@ fn test_chain_with_subsequent_hops_uses_final_hop_indices() {
     assert_eq!(chain.num_hops(), 2);
     assert!(chain.supports_udp());
 
-    // Key: udp_uses_initial_hop should be FALSE
-    assert!(!chain.udp_uses_initial_hop);
-
-    // udp_final_hop_indices should point to indices in the FINAL subsequent hop
-    // NOT the initial hop! Only indices 1 and 2 (VMess, VLESS) support UDP
-    assert_eq!(chain.udp_final_hop_indices, vec![1, 2]);
+    for indices in [[0, 1], [1, 2], [0, 1], [1, 2]] {
+        assert_eq!(chain.select_indices(true).unwrap(), indices);
+    }
 }
 
 #[test]
@@ -684,7 +690,7 @@ fn compiled_routes_keep_flat_fast_path_and_independent_choice_counters() {
         };
         let first = build();
         let second = build();
-        assert_eq!(first.composition.is_some(), composed);
+        assert_eq!(first.composition().is_some(), composed);
         if composed {
             assert_eq!(first.select_indices(false).unwrap(), [0]);
             assert_eq!(first.select_indices(false).unwrap(), [1]);

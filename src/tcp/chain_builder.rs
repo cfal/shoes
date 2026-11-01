@@ -107,10 +107,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
         }
     };
 
-    let origins = hops
-        .iter()
-        .map(|client| vec![client.control.clone()])
-        .collect();
+    let origins = hops.iter().map(|client| client.control.clone()).collect();
     let mut subsequent_hops = Vec::new();
     for (hop_index, config) in hops.into_iter().enumerate().skip(1) {
         if config.transport == crate::config::Transport::Quic
@@ -132,10 +129,14 @@ pub(crate) fn build_client_proxy_chain_with_limits(
         }
         let proxy = create_proxy_connector(config, resolver.clone())?
             .ok_or_else(|| std::io::Error::other("Missing proxy connector for subsequent hop"))?;
-        subsequent_hops.push(vec![proxy]);
+        subsequent_hops.push(proxy);
     }
 
-    Ok(ClientProxyChain::new(vec![initial_hop], subsequent_hops).with_origins(origins))
+    Ok(ClientProxyChain::fixed(
+        initial_hop,
+        subsequent_hops,
+        origins,
+    ))
 }
 
 /// Find the first proxy address in the chain (for socket connector target).

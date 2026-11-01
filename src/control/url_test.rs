@@ -62,49 +62,6 @@ pub struct AutomaticGroup {
 pub struct AutomaticGroups(pub BTreeMap<String, AutomaticGroup>);
 
 impl AutomaticGroups {
-    pub fn filter(
-        &self,
-        origins: &[Option<super::catalog::MemberOrigin>],
-        candidates: &mut Vec<usize>,
-        udp: bool,
-    ) {
-        let mut depths = HashMap::<&str, usize>::new();
-        for &index in candidates.iter() {
-            let Some(origin) = &origins[index] else {
-                continue;
-            };
-            for (depth, (group, _)) in origin.path.iter().enumerate() {
-                if self.0.contains_key(group) {
-                    depths
-                        .entry(group)
-                        .and_modify(|value| *value = (*value).max(depth))
-                        .or_insert(depth);
-                }
-            }
-        }
-        let mut groups: Vec<_> = depths.into_iter().collect();
-        groups.sort_unstable_by_key(|(_, depth)| std::cmp::Reverse(*depth));
-        for (group, _) in groups {
-            let eligible = candidates
-                .iter()
-                .filter_map(|&index| origins[index].as_ref())
-                .flat_map(|origin| &origin.path)
-                .filter(|(name, _)| name == group)
-                .map(|(_, member)| member.as_str())
-                .collect();
-            if let Some(selected) = self.0[group].choose(&eligible, udp) {
-                candidates.retain(|&index| {
-                    origins[index].as_ref().is_none_or(|origin| {
-                        origin
-                            .path
-                            .iter()
-                            .all(|(name, member)| name != group || member == &selected)
-                    })
-                });
-            }
-        }
-    }
-
     pub fn insert(
         &mut self,
         name: String,

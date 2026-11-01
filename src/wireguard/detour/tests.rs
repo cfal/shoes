@@ -94,19 +94,15 @@ async fn url_test_idle_reconnects_do_not_activate_lazy_groups() {
         .unwrap();
     let selection = Arc::new(selection);
     let attempts = Arc::new(AtomicU64::new(0));
-    let chain = Arc::new(
-        ClientProxyChain::new(
-            vec![InitialHopEntry::Direct(Arc::new(FailingSocket(
-                attempts.clone(),
-            )))],
-            vec![],
-        )
-        .with_origins(vec![vec![Some(crate::control::catalog::MemberOrigin {
+    let chain = Arc::new(ClientProxyChain::fixed(
+        InitialHopEntry::Direct(Arc::new(FailingSocket(attempts.clone()))),
+        vec![],
+        vec![Some(crate::control::catalog::MemberOrigin {
             name: Arc::from("peer"),
             path: vec![("carrier".into(), "peer".into())],
             selection: selection.clone(),
-        })]]),
-    );
+        })],
+    ));
     let group = &selection.automatic.0["carrier"];
     assert!(group.due_members(Instant::now()).is_some());
     let (_sender, receiver, released) = start(

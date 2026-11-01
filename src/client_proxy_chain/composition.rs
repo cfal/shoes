@@ -65,8 +65,44 @@ impl Composition {
         });
     }
 
-    pub(super) fn selection(&self) -> Option<&Arc<SelectionView>> {
-        self.selection.as_ref()
+    #[cfg(test)]
+    pub(super) fn from_connectors(
+        initial: Vec<InitialHopEntry>,
+        subsequent: Vec<Vec<Box<dyn ProxyConnector>>>,
+    ) -> Arc<Self> {
+        let mut nodes = vec![Node::pool(
+            initial
+                .into_iter()
+                .map(|entry| {
+                    Node::Client(Leaf {
+                        origin: None,
+                        direct: matches!(entry, InitialHopEntry::Direct(_)),
+                        udp: entry.supports_udp(),
+                        initial: Some(Arc::new(entry)),
+                        proxy: None,
+                    })
+                })
+                .collect(),
+        )];
+        nodes.extend(subsequent.into_iter().map(|pool| {
+            Node::pool(
+                pool.into_iter()
+                    .map(|proxy| {
+                        Node::Client(Leaf {
+                            origin: None,
+                            direct: false,
+                            udp: proxy.supports_udp(),
+                            initial: None,
+                            proxy: Some(Arc::from(proxy)),
+                        })
+                    })
+                    .collect(),
+            )
+        }));
+        Arc::new(Self {
+            root: Node::sequence(nodes),
+            selection: None,
+        })
     }
     pub(super) fn build(
         hops: OneOrSome<ResolvedClientHop>,
@@ -87,7 +123,7 @@ impl Composition {
         Ok(Arc::new(Self { root, selection }))
     }
 
-    pub(super) fn select(&self, udp: bool) -> io::Result<ClientProxyChain> {
+    pub(super) fn select(&self, udp: bool) -> io::Result<SelectedPath> {
         let choices = self
             .selection
             .as_ref()
@@ -154,19 +190,17 @@ impl Composition {
         let mut indices = vec![
             pools[0]
                 .iter()
-                .position(|leaf| {
-                    Arc::ptr_eq(leaf.initial.as_ref().unwrap(), &selected.initial_hop[0])
-                })
+                .position(|leaf| Arc::ptr_eq(leaf.initial.as_ref().unwrap(), &selected.initial))
                 .unwrap(),
         ];
-        for (index, hop) in selected.subsequent_hops.iter().enumerate() {
+        for (index, hop) in selected.subsequent.iter().enumerate() {
             indices.push(
                 pools[index + 1]
                     .iter()
                     .position(|leaf| {
                         leaf.proxy
                             .as_ref()
-                            .is_some_and(|proxy| Arc::ptr_eq(proxy, &hop[0]))
+                            .is_some_and(|proxy| Arc::ptr_eq(proxy, hop))
                     })
                     .unwrap(),
             );
@@ -188,11 +222,7 @@ fn sequence(
     if nodes.is_empty() {
         return Err(crate::config::composition::invalid("chain cannot be empty"));
     }
-    Ok(if nodes.len() == 1 {
-        nodes.remove(0)
-    } else {
-        Node::Sequence(nodes)
-    })
+    Ok(Node::sequence(nodes))
 }
 
 fn node(
@@ -212,7 +242,10 @@ fn node(
                     resolver.clone(),
                     limits,
                 )?;
-                let entry = chain.initial_hop[0].clone();
+                let ChainPlan::Fixed(path) = chain.plan else {
+                    unreachable!("single leaf builds a fixed path")
+                };
+                let entry = path.initial;
                 let udp = entry.supports_udp();
                 (Some(entry), None, udp)
             } else {
@@ -260,35 +293,51 @@ fn node(
     }
 }
 
-fn pinned(leaves: &[&Leaf]) -> ClientProxyChain {
-    let origins = leaves
-        .iter()
-        .map(|leaf| vec![leaf.origin.clone()])
-        .collect();
-    let udp = leaves.last().unwrap().udp;
+fn pinned(leaves: &[&Leaf]) -> SelectedPath {
+    let origins = leaves.iter().map(|leaf| leaf.origin.clone()).collect();
     let subsequent_hops: Vec<_> = leaves
         .iter()
         .skip(1)
-        .map(|leaf| vec![leaf.proxy.as_ref().unwrap().clone()])
+        .map(|leaf| leaf.proxy.as_ref().unwrap().clone())
         .collect();
-    ClientProxyChain {
-        composition: None,
+    SelectedPath {
         origins,
-        selection: leaves
-            .iter()
-            .find_map(|leaf| leaf.origin.as_ref().map(|origin| origin.selection.clone())),
-        selector_hops: vec![false; leaves.len()],
-        initial_hop: vec![leaves[0].initial.as_ref().unwrap().clone()],
-        initial_hop_next_index: AtomicU32::new(0),
-        subsequent_next_indices: subsequent_hops.iter().map(|_| AtomicU32::new(0)).collect(),
-        subsequent_hops,
-        udp_final_hop_indices: if udp { vec![0] } else { Vec::new() },
-        udp_final_hop_next_index: AtomicU32::new(0),
-        udp_uses_initial_hop: leaves.len() == 1,
+        initial: leaves[0].initial.as_ref().unwrap().clone(),
+        subsequent: subsequent_hops,
     }
 }
 
 impl Node {
+    fn sequence(mut nodes: Vec<Self>) -> Self {
+        if nodes.len() == 1 {
+            nodes.pop().unwrap()
+        } else {
+            Self::Sequence(nodes)
+        }
+    }
+
+    #[cfg(test)]
+    fn pool(mut members: Vec<Self>) -> Self {
+        if members.len() == 1 {
+            return members.pop().unwrap();
+        }
+        let eligible = [
+            (0..members.len()).collect(),
+            members
+                .iter()
+                .enumerate()
+                .filter_map(|(index, member)| member.supports_udp().then_some(index))
+                .collect(),
+        ];
+        Self::Choice {
+            name: String::new(),
+            kind: GroupType::RoundRobin,
+            labels: Vec::new(),
+            members,
+            next: [AtomicU32::new(0), AtomicU32::new(0)],
+            static_members: Some(eligible),
+        }
+    }
     #[cfg(unix)]
     fn visit_tcp_counters(&self, visitor: &mut impl FnMut(&AtomicU32)) {
         match self {
@@ -515,9 +564,79 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_and_probe_routes_select_the_same_paths() {
+        let (forwarding, catalog) = build(
+            json!([
+                {"client_group":"left","client_chain":{"name":"a","address":"192.0.2.1:80","protocol":{"type":"http"}}},
+                {"client_group":"right","client_chain":{"name":"b","address":"192.0.2.2:80","protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}}},
+                {"client_group":"alias","client_chain":"left"},
+                {"client_group":"manual","type":"selector","client_chains":[{"chain":["alias"]},{"chain":["right"]}]},
+                {"client_group":"auto","type":"url-test","url":"http://probe.invalid/","client_chains":[{"chain":["left"]},{"chain":["right"]}]},
+                {"client_group":"out","client_chains":[
+                    {"name":"via","chain":["manual","right"]},
+                    {"chain":["right"]},
+                    {"name":"pooled","chain":[{"pool":["manual","auto"]}]}
+                ]}
+            ]),
+            json!(["out", "out"]),
+        );
+        let hops = catalog.route("out").unwrap().hops.into_vec();
+        let probe = crate::tcp::chain_builder::try_build_client_proxy_chain(
+            OneOrSome::Some(hops.iter().chain(&hops).cloned().collect()),
+            Arc::new(crate::resolver::NativeResolver::new()),
+        )
+        .unwrap();
+        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+        owner.activate(catalog.selection.clone()).unwrap();
+        let selected = |chain: &ClientProxyChain, udp| {
+            chain
+                .select(udp)
+                .map(|path| {
+                    let initial = match path.initial.as_ref() {
+                        InitialHopEntry::Proxy { proxy, .. } => proxy.proxy_location().clone(),
+                        _ => panic!("fixture contains only proxy clients"),
+                    };
+                    let endpoints = std::iter::once(initial)
+                        .chain(
+                            path.subsequent
+                                .iter()
+                                .map(|proxy| proxy.proxy_location().clone()),
+                        )
+                        .collect::<Vec<_>>();
+                    let origins = path
+                        .origins
+                        .iter()
+                        .map(|origin| {
+                            let origin = origin.as_ref().unwrap();
+                            (origin.name.clone(), origin.path.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    (endpoints, origins)
+                })
+                .unwrap()
+        };
+        for member in ["alias", "right", "alias"] {
+            owner.select("manual", member).unwrap();
+            catalog
+                .selection
+                .automatic
+                .record("left", "http://probe.invalid/", Some(10));
+            catalog
+                .selection
+                .automatic
+                .record("right", "http://probe.invalid/", Some(100));
+            for _ in 0..12 {
+                for udp in [false, true] {
+                    assert_eq!(selected(&forwarding, udp), selected(&probe, udp));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mixed_length_selection_pins_the_whole_path_and_fails_udp_closed() {
         let (chain, catalog) = fixture();
-        let tree = chain.composition.as_ref().unwrap();
+        let tree = chain.composition().unwrap();
         let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
         owner.activate(catalog.selection.clone()).unwrap();
         let single = tree.select(false).unwrap();
@@ -530,29 +649,27 @@ mod tests {
         let two = tree.select(true).unwrap();
         assert_eq!(two.num_hops(), 2);
         assert!(two.supports_udp());
-        assert_eq!(two.origin(0, 0).unwrap().name.as_ref(), "entrance");
-        assert_eq!(two.origin(1, 0).unwrap().name.as_ref(), "exit-leaf");
+        assert_eq!(two.origin(0).unwrap().name.as_ref(), "entrance");
+        assert_eq!(two.origin(1).unwrap().name.as_ref(), "exit-leaf");
         for hop in 0..2 {
-            let origin = two.origin(hop, 0).unwrap();
+            let origin = two.origin(hop).unwrap();
             assert_eq!(origin.path[0], ("out".into(), "via-exit".into()));
             assert!(Arc::ptr_eq(&origin.selection, &catalog.selection));
         }
         owner.select("out", "DIRECT").unwrap();
         let direct = tree.select(true).unwrap();
         assert!(direct.is_direct_only());
-        assert_eq!(direct.origin(0, 0).unwrap().name.as_ref(), "DIRECT");
+        assert_eq!(direct.origin(0).unwrap().name.as_ref(), "DIRECT");
         assert_eq!(two.num_hops(), 2);
         assert!(!single.is_direct_only());
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let target: ResolvedLocation = crate::address::NetLocation::from_str("192.0.2.2:80", None)
             .unwrap()
             .into();
-        let before = two
-            .selected_route(&resolver, &[0, 0])
-            .prefix(target.clone());
+        let before = two.selected_route(&resolver).prefix(target.clone());
         owner.select("out", "via-exit").unwrap();
         let again = tree.select(false).unwrap();
-        let after = again.selected_route(&resolver, &[0, 0]).prefix(target);
+        let after = again.selected_route(&resolver).prefix(target);
         assert_eq!(
             before.route_key(),
             after.route_key(),
@@ -573,7 +690,7 @@ mod tests {
                 ]),
                 json!("out"),
             );
-            let tree = chain.composition.as_ref().unwrap();
+            let tree = chain.composition().unwrap();
             let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
             owner.activate(catalog.selection.clone()).unwrap();
             for index in 0..20 {
@@ -584,7 +701,7 @@ mod tests {
                         .unwrap();
                 }
                 let pinned = tree.select(false).unwrap();
-                let InitialHopEntry::Proxy { proxy, .. } = pinned.initial_hop[0].as_ref() else {
+                let InitialHopEntry::Proxy { proxy, .. } = pinned.initial.as_ref() else {
                     panic!()
                 };
                 assert_eq!(
@@ -592,7 +709,7 @@ mod tests {
                     if left { "192.0.2.1:80" } else { "192.0.2.3:80" }
                 );
                 assert_eq!(
-                    pinned.subsequent_hops[0][0].proxy_location().to_string(),
+                    pinned.subsequent[0].proxy_location().to_string(),
                     if left { "192.0.2.2:80" } else { "192.0.2.4:80" }
                 );
             }
@@ -617,7 +734,7 @@ mod tests {
             ]),
             json!("out"),
         );
-        let tree = chain.composition.as_ref().unwrap();
+        let tree = chain.composition().unwrap();
         let Node::Choice {
             static_members: Some(indices),
             ..
@@ -631,7 +748,7 @@ mod tests {
             for (udp, expected) in [(false, index % MEMBERS), (true, (2 * index + 1) % MEMBERS)] {
                 let pinned = tree.select(udp).unwrap();
                 assert_eq!(
-                    pinned.origin(0, 0).unwrap().name.as_ref(),
+                    pinned.origin(0).unwrap().name.as_ref(),
                     format!("member-{expected}")
                 );
             }
@@ -646,8 +763,7 @@ mod tests {
                 json!([dynamic, {"client_group":"out","client_chains":[{"chain":["dynamic"]},{"chain":["direct"]}]}]),
                 json!("out"),
             );
-            let Node::Choice { static_members, .. } = &chain.composition.as_ref().unwrap().root
-            else {
+            let Node::Choice { static_members, .. } = &chain.composition().unwrap().root else {
                 panic!()
             };
             assert_eq!(static_members.is_some(), kind == "url-test", "{kind}");
@@ -671,15 +787,14 @@ mod tests {
         let route = json!(["out", "out"]);
         let select = |chain: &ClientProxyChain| {
             chain
-                .composition
-                .as_ref()
+                .composition()
                 .unwrap()
                 .select(false)
                 .unwrap()
                 .origins
                 .into_iter()
                 .map(|pool| {
-                    let origin = pool.into_iter().next().unwrap().unwrap();
+                    let origin = pool.unwrap();
                     (origin.name, origin.path)
                 })
                 .collect::<Vec<_>>()
@@ -718,7 +833,7 @@ mod tests {
                     {"name":"d","address":"192.0.2.4:80","protocol":{"type":"http"}}
                 ]}, {"address":"192.0.2.5:80","protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}}]),
             );
-            let tree = chain.composition.as_ref().unwrap();
+            let tree = chain.composition().unwrap();
             for index in 0..8 {
                 let expected = if index % 2 == 0 {
                     ["a", "c"]
@@ -730,7 +845,7 @@ mod tests {
                     let before = tree.tcp_selection_indices();
                     let pinned = tree.select(udp).unwrap();
                     for (hop, name) in expected.into_iter().enumerate() {
-                        assert_eq!(pinned.origin(hop, 0).unwrap().name.as_ref(), name);
+                        assert_eq!(pinned.origin(hop).unwrap().name.as_ref(), name);
                     }
                     #[cfg(unix)]
                     if udp {
@@ -750,37 +865,22 @@ mod tests {
             ]}]),
             json!(["out", {"address":"192.0.2.3:80","protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}}]),
         );
-        let tree = chain.composition.as_ref().unwrap();
+        let tree = chain.composition().unwrap();
         let automatic = &catalog.selection.automatic;
         automatic.record("a", "http://192.0.2.1/", Some(100));
         automatic.record("b", "http://192.0.2.1/", Some(120));
         assert_eq!(
-            tree.select(false)
-                .unwrap()
-                .origin(0, 0)
-                .unwrap()
-                .name
-                .as_ref(),
+            tree.select(false).unwrap().origin(0).unwrap().name.as_ref(),
             "a"
         );
         automatic.record("a", "http://192.0.2.1/", Some(120));
         automatic.record("b", "http://192.0.2.1/", Some(100));
         assert_eq!(
-            tree.select(true)
-                .unwrap()
-                .origin(0, 0)
-                .unwrap()
-                .name
-                .as_ref(),
+            tree.select(true).unwrap().origin(0).unwrap().name.as_ref(),
             "b"
         );
         assert_eq!(
-            tree.select(false)
-                .unwrap()
-                .origin(0, 0)
-                .unwrap()
-                .name
-                .as_ref(),
+            tree.select(false).unwrap().origin(0).unwrap().name.as_ref(),
             "a"
         );
     }
@@ -829,12 +929,12 @@ mod tests {
                 ]}]),
                 json!("out"),
             );
-            let composition = chain.composition.as_ref().unwrap();
+            let composition = chain.composition().unwrap();
             let weak = Arc::downgrade(composition);
             let pinned = composition.select(false).unwrap();
             drop(chain);
             assert!(weak.upgrade().is_none());
-            assert_eq!(pinned.origin(0, 0).unwrap().name.as_ref(), "local");
+            assert_eq!(pinned.origin(0).unwrap().name.as_ref(), "local");
 
             let target = crate::address::NetLocation::from_str(
                 &format!("127.0.0.1:{}", listener.local_addr().unwrap().port()),
@@ -873,10 +973,10 @@ mod tests {
         )
         .unwrap();
         for _ in 0..3 {
-            probe.composition.as_ref().unwrap().select(false).unwrap();
+            probe.composition().unwrap().select(false).unwrap();
         }
-        let pinned = chain.composition.as_ref().unwrap().select(false).unwrap();
-        let InitialHopEntry::Proxy { proxy, .. } = pinned.initial_hop[0].as_ref() else {
+        let pinned = chain.composition().unwrap().select(false).unwrap();
+        let InitialHopEntry::Proxy { proxy, .. } = pinned.initial.as_ref() else {
             panic!()
         };
         assert_eq!(proxy.proxy_location().to_string(), "192.0.2.1:80");
@@ -886,8 +986,7 @@ mod tests {
             .record("DIRECT", "http://192.0.2.3/", Some(1));
         assert!(
             chain
-                .composition
-                .as_ref()
+                .composition()
                 .unwrap()
                 .select(false)
                 .unwrap()

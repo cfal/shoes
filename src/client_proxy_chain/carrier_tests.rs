@@ -129,16 +129,25 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
 #[test]
 fn unselected_large_pools_keep_constant_time_round_robin() {
     let events = Arc::new(Mutex::new(Vec::new()));
+    let sockets: Vec<Arc<dyn SocketConnector>> = (0..10_000)
+        .map(|index| Arc::new(Socket(index, events.clone())) as Arc<dyn SocketConnector>)
+        .collect();
     let chain = ClientProxyChain::new(
-        (0..10_000)
-            .map(|index| InitialHopEntry::Direct(Arc::new(Socket(index, events.clone()))))
+        sockets
+            .iter()
+            .cloned()
+            .map(InitialHopEntry::Direct)
             .collect(),
         Vec::new(),
     );
-    assert!(chain.selection.is_none());
     for index in 0..20_000 {
-        assert_eq!(chain.select_indices(false).unwrap(), [index % 10_000]);
-        assert_eq!(chain.select_indices(true).unwrap(), [index % 10_000]);
+        for udp in [false, true] {
+            let path = chain.select(udp).unwrap();
+            assert!(Arc::ptr_eq(
+                path.initial.socket(),
+                &sockets[index % sockets.len()]
+            ));
+        }
     }
 }
 
@@ -380,6 +389,60 @@ async fn redial_replays_exact_selected_prefix_without_round_robin_or_direct_bypa
 }
 
 #[tokio::test]
+async fn linear_tcp_preserves_early_data_boundaries_on_fixed_and_composed_paths() {
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    for composed in [false, true] {
+        for hops in [1, 3] {
+            for early_hop in 0..hops {
+                for early_data in [None, Some(vec![]), Some(vec![1, 2, 3])] {
+                    let calls = Arc::new(Mutex::new(Vec::new()));
+                    let proxy = |hop| {
+                        Box::new(Proxy {
+                            location: NetLocation::from_str(&format!("hop{hop}.test:80"), None)
+                                .unwrap(),
+                            lazy: false,
+                            early_data: (hop == early_hop).then(|| early_data.clone()).flatten(),
+                            calls: calls.clone(),
+                        }) as Box<dyn ProxyConnector>
+                    };
+                    let chain = ClientProxyChain::new(
+                        (0..1 + usize::from(composed))
+                            .map(|index| InitialHopEntry::Proxy {
+                                socket: Arc::new(Socket(index, calls.clone())),
+                                proxy: proxy(0),
+                            })
+                            .collect(),
+                        (1..hops).map(|hop| vec![proxy(hop)]).collect(),
+                    );
+                    assert_eq!(chain.composition().is_some(), composed);
+                    let result = chain
+                        .connect_tcp(
+                            NetLocation::from_str("target.test:80", None)
+                                .unwrap()
+                                .into(),
+                            &resolver,
+                        )
+                        .await;
+                    if early_hop > 0 && early_hop + 1 < hops && early_data.is_some() {
+                        assert_eq!(
+                            result.err().unwrap().kind(),
+                            std::io::ErrorKind::InvalidData
+                        );
+                    } else {
+                        let expected = if early_hop + 1 == hops {
+                            early_data
+                        } else {
+                            None
+                        };
+                        assert_eq!(result.unwrap().early_data, expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn udp_chain_preserves_preparation_order_and_ignores_intermediate_early_data() {
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     for initial in ["direct", "wireguard", "proxy"] {
@@ -472,7 +535,7 @@ async fn pinned_later_endpoint_does_not_replace_the_same_directly_dialed_hostnam
         vec![vec![proxy()]],
     );
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-    let mut route = chain.selected_route(&resolver, &[0, 0]);
+    let mut route = chain.select(false).unwrap().selected_route(&resolver);
     route.pinned_proxies = Some(Arc::new(PinnedProxies {
         endpoints: std::collections::HashMap::from([(
             NetLocation::from_str("same.test:443", None).unwrap(),
@@ -517,10 +580,12 @@ fn pooled_prefix_keys_include_each_selected_connector_identity() {
     );
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let mut keys = std::collections::HashSet::new();
+    let paths = [chain.select(false).unwrap(), chain.select(false).unwrap()];
     for indices in [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0]] {
+        let mut path = paths[indices[0]].clone().into_owned();
+        path.subsequent[0] = paths[indices[1]].subsequent[0].clone();
         let key = || {
-            chain
-                .selected_route(&resolver, &indices)
+            path.selected_route(&resolver)
                 .prefix(NetLocation::from_str("same.test:443", None).unwrap().into())
                 .route_key()
                 .clone()
@@ -549,10 +614,12 @@ fn pooled_prefix_does_not_retain_its_own_proxy() {
         }],
         vec![],
     );
-    let initial = Arc::downgrade(&chain.initial_hop[0]);
+    let initial = Arc::downgrade(&chain.select(false).unwrap().initial);
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let prefix = chain
-        .selected_route(&resolver, &chain.select_indices(false).unwrap())
+        .select(false)
+        .unwrap()
+        .selected_route(&resolver)
         .prefix(
             NetLocation::from_str("xhttp.test:443", None)
                 .unwrap()
