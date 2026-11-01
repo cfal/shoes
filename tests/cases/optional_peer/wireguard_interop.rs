@@ -161,6 +161,268 @@ async fn wireguard_singbox_both_roles_tcp_udp_ipv4_ipv6() -> io::Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "Requires sing-box with WireGuard and gVisor; set SHOES_TEST_SING_BOX_BIN"]
+async fn wireguard_singbox_lazy_whole_path_carrier_tracks_demand_and_reconnects() -> io::Result<()>
+{
+    use bytes::Bytes;
+    use http_body_util::Empty;
+    use hyper::{Request, Response, body::Incoming, server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    use shoes_test_support::socks5::{Socks5UdpAssociation, SocksDestination};
+    use shoes_test_support::test_servers::{
+        start_tcp_stream_echo_server, start_udp_response_server,
+    };
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::{mpsc, oneshot, watch},
+        task::JoinSet,
+        time::timeout,
+    };
+
+    async fn wait_for_lazy_probe(probes: &mut mpsc::UnboundedReceiver<bool>) -> io::Result<()> {
+        timeout(Duration::from_secs(10), async {
+            while !probes.recv().await.expect("probe observer stopped") {}
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "lazy carrier probe did not resume"))
+    }
+
+    async fn expect_idle_probes(probes: &mut mpsc::UnboundedReceiver<bool>) -> io::Result<()> {
+        // Only fresh control requests establish progress in this idle phase.
+        while let Ok(lazy) = probes.try_recv() {
+            assert!(!lazy, "idle carrier activity woke the lazy group");
+        }
+        for _ in 0..5 {
+            assert_eq!(
+                timeout(Duration::from_secs(5), probes.recv())
+                    .await
+                    .map_err(|_| io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "idle control probes stalled"
+                    ))?,
+                Some(false),
+                "idle carrier activity woke the lazy group"
+            );
+        }
+        Ok(())
+    }
+
+    async fn reconnect(
+        reset: &mpsc::UnboundedSender<oneshot::Sender<usize>>,
+        accepted: &mut watch::Receiver<usize>,
+    ) -> io::Result<()> {
+        let (reply, acknowledged) = oneshot::channel();
+        reset
+            .send(reply)
+            .map_err(|_| io::Error::other("carrier reset channel closed"))?;
+        let previous = timeout(Duration::from_secs(5), acknowledged)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "carrier reset was not acknowledged",
+                )
+            })?
+            .map_err(|_| io::Error::other("carrier reset acknowledgement dropped"))?;
+        timeout(
+            Duration::from_secs(5),
+            accepted.wait_for(|count| *count > previous),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "carrier did not reconnect within 5s",
+            )
+        })?
+        .map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    timeout(Duration::from_secs(300), async {
+        let binary = PathBuf::from(
+            std::env::var_os("SHOES_TEST_SING_BOX_BIN").expect("set SHOES_TEST_SING_BOX_BIN"),
+        );
+        for udp in [true, false] {
+            let reservation = std::net::UdpSocket::bind("0.0.0.0:0")?;
+            let peer_port = reservation.local_addr()?.port();
+            let mut ports = PortHelper::new();
+            let (_, prefix_port) = ports.get_localhost_listener_port();
+            let (_, exit_port) = ports.get_localhost_listener_port();
+            let _proxies = start_shoes_server(&serde_yaml::to_string(&json!([
+                {"address":format!("0.0.0.0:{prefix_port}"), "protocol":{"type":"socks"}},
+                {"address":format!("0.0.0.0:{exit_port}"), "protocol":config::vless_protocol(),
+                 "rules":[
+                    {"masks":["192.0.2.200/32", "192.0.2.1/32"], "action":"allow", "override_address":"127.0.0.1:0"}
+                 ]}
+            ])).unwrap())?;
+            ports.wait_for_all_ports().await?;
+            drop(reservation);
+            let _peer = start_singbox_server_with_binary(
+                &singbox_server(peer_port).to_string(), &binary, &[("GOMAXPROCS", "1")],
+            )?;
+
+            let mut fixtures: JoinSet<io::Result<()>> = JoinSet::new();
+            let listener = TcpListener::bind("0.0.0.0:0").await?;
+            let carrier_port = listener.local_addr()?.port();
+            let (reset, mut resets) = mpsc::unbounded_channel::<oneshot::Sender<usize>>();
+            let (connected, mut accepted) = watch::channel(0usize);
+            fixtures.spawn(async move {
+                let mut connections = JoinSet::new();
+                let mut count = 0;
+                loop {
+                    tokio::select! {
+                        incoming = listener.accept() => {
+                            let (mut client, _) = incoming?;
+                            let mut upstream = TcpStream::connect(("127.0.0.1", prefix_port)).await?;
+                            count += 1;
+                            connected.send_replace(count);
+                            connections.spawn(async move {
+                                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                            });
+                        }
+                        reset = resets.recv() => {
+                            let Some(reset) = reset else { return Ok(()); };
+                            connections.shutdown().await;
+                            let _ = reset.send(count);
+                        }
+                        result = connections.join_next(), if !connections.is_empty() => {
+                            result.unwrap().unwrap();
+                        }
+                    }
+                }
+            });
+
+            let listener = TcpListener::bind("0.0.0.0:0").await?;
+            let probe_port = listener.local_addr()?.port();
+            let (observed, mut probes) = mpsc::unbounded_channel();
+            fixtures.spawn(async move {
+                let mut connections = JoinSet::new();
+                loop {
+                    tokio::select! {
+                        incoming = listener.accept() => {
+                            let (stream, _) = incoming?;
+                            let observed = observed.clone();
+                            connections.spawn(async move {
+                                let _ = http1::Builder::new().keep_alive(false).serve_connection(
+                                    TokioIo::new(stream), service_fn(move |request: Request<Incoming>| {
+                                        assert_eq!(request.method(), hyper::Method::HEAD);
+                                        assert!(matches!(request.uri().path(), "/lazy" | "/control"));
+                                        observed.send(request.uri().path() == "/lazy").unwrap();
+                                        std::future::ready(Ok::<_, io::Error>(Response::builder()
+                                            .status(204).body(Empty::<Bytes>::new()).unwrap()))
+                                    }),
+                                ).await;
+                            });
+                        }
+                        result = connections.join_next(), if !connections.is_empty() => {
+                            result.unwrap().unwrap();
+                        }
+                    }
+                }
+            });
+
+            let (_, entry) = ports.get_localhost_listener_port();
+            let mut client = config::client(peer_port);
+            client["client_chains"][0]["address"] = json!(format!("192.0.2.200:{peer_port}"));
+            client["client_chains"][0]["protocol"]["peer_client_chain"] = json!("carrier");
+            let _client = start_shoes_server(&serde_yaml::to_string(&json!([
+                {"client_group":"carrier", "type":"url-test", "lazy":true, "interval":3, "timeout":1000,
+                 "url":format!("http://192.0.2.1:{probe_port}/lazy"), "client_chains":[{"name":"via-exit", "chain":[
+                    {"address":format!("127.0.0.1:{carrier_port}"), "protocol":{"type":"socks"}},
+                    {"address":format!("127.0.0.1:{exit_port}"), "protocol":config::vless_protocol()}
+                 ]}]},
+                {"client_group":"control", "type":"url-test", "lazy":false, "interval":1, "timeout":1000,
+                 "url":format!("http://192.0.2.1:{probe_port}/control"), "client_chains":[
+                    {"address":format!("127.0.0.1:{exit_port}"), "protocol":config::vless_protocol()}
+                 ]},
+                client, config::socks(entry)
+            ])).unwrap())?;
+
+            let scenario = async {
+                ports.wait_for_all_ports().await?;
+                wait_for_lazy_probe(&mut probes).await?;
+                expect_idle_probes(&mut probes).await?;
+                reconnect(&reset, &mut accepted).await?;
+                expect_idle_probes(&mut probes).await?;
+
+                let tcp_echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
+                let udp_echo = start_udp_response_server("0.0.0.0", 0, |payload, source| {
+                    serde_json::to_vec(&(payload, source)).unwrap()
+                }).await?;
+                let target = |port| std::net::SocketAddr::new("198.18.0.1".parse().unwrap(), port);
+                let mut tcp = if udp { None } else {
+                    Some(timeout(Duration::from_secs(10), shoes_test_support::wireguard::connect(
+                        entry, target(tcp_echo.local_addr().port()),
+                    )).await??)
+                };
+                let association = if udp {
+                    Some(timeout(Duration::from_secs(10), Socks5UdpAssociation::connect("127.0.0.1", entry)).await??)
+                } else { None };
+                let mut udp_source = None;
+                for payload in [b"before reconnect".as_slice(), b"after reconnect".as_slice()] {
+                    timeout(Duration::from_secs(10), async {
+                        if let Some(stream) = &mut tcp {
+                            stream.write_all(payload).await?;
+                            let mut received = vec![0; payload.len()];
+                            stream.read_exact(&mut received).await?;
+                            assert_eq!(received, payload);
+                        } else {
+                            loop {
+                                match association.as_ref().unwrap().send_to_with_timeout(
+                                    SocksDestination::Ip(target(udp_echo.local_addr().port())), payload, Duration::from_millis(250),
+                                ).await {
+                                    Ok(response) => {
+                                        let (received, source): (Vec<u8>, std::net::SocketAddr) =
+                                            serde_json::from_slice(&response).map_err(io::Error::other)?;
+                                        if received == payload {
+                                            if let Some(previous) = udp_source {
+                                                assert_eq!(source, previous, "native UDP flow was replaced");
+                                            } else {
+                                                udp_source = Some(source);
+                                            }
+                                            break;
+                                        }
+                                        assert_eq!(received, b"before reconnect");
+                                    }
+                                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {},
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                        }
+                        Ok::<_, io::Error>(())
+                    }).await??;
+                    if payload == b"before reconnect" {
+                        wait_for_lazy_probe(&mut probes).await.map_err(|error| {
+                            io::Error::new(error.kind(), format!("{} demand: {error}", if udp { "UDP" } else { "TCP" }))
+                        })?;
+                        // Setup can touch demand on either side of a scheduler tick.
+                        timeout(Duration::from_secs(20), async {
+                            let mut quiet = 0;
+                            while quiet < 5 {
+                                if probes.recv().await.expect("probe observer stopped") {
+                                    quiet = 0;
+                                } else {
+                                    quiet += 1;
+                                }
+                            }
+                        }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "lazy carrier activity never settled"))?;
+                        reconnect(&reset, &mut accepted).await?;
+                    }
+                }
+                Ok::<_, io::Error>(())
+            };
+            tokio::select! {
+                biased;
+                result = fixtures.join_next() => return Err(io::Error::other(format!("WireGuard fixture stopped: {result:?}"))),
+                result = scenario => result?,
+            }
+        }
+        Ok(())
+    }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "native WireGuard lazy carrier scenario timed out"))?
+}
+
+#[tokio::test]
 #[ignore = "Requires sing-box and a real WireGuard rekey (about two minutes)"]
 async fn wireguard_singbox_tcp_survives_real_rekey_without_psk() -> io::Result<()> {
     run_rekey(false).await
