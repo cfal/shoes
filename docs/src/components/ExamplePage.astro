@@ -1,0 +1,23 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { Code } from '@astrojs/starlight/components';
+import { sourceRef, sourceRefKnown } from '../../metadata.mjs';
+
+interface Props {
+  filename: string;
+  code: string;
+  chinese?: boolean;
+}
+
+const { filename, code, chinese = false } = Astro.props;
+const catalog = chinese ? '/zh-cn/start/examples/' : '/start/examples/';
+---
+
+<StarlightPage frontmatter={{ title: filename, description: chinese ? `shoes 配置示例：${filename}` : `shoes configuration example: ${filename}`, editUrl: false }}>
+  <p><a href={catalog}>{chinese ? '所有示例' : 'All examples'}</a></p>
+  {chinese
+    ? <p>使用前请修改地址、凭据、证书路径和其他部署相关的值。这是完整的源文件，但不保证未经修改即可在你的机器上运行。请阅读文件中的注释了解前置条件，然后对修改后的文件运行 <code>shoes check</code>。</p>
+    : <p>Change addresses, credentials, certificate paths, and other deployment-specific values before use. This is a complete source file, not a guarantee it can run unchanged on your machine. Read its comments for prerequisites, then run <code>shoes check</code> with the adapted file.</p>}
+  <Code code={code} lang="yaml" title={`examples/${filename}`} />
+  {sourceRefKnown && <p><a href={`https://github.com/cfal/shoes/blob/${sourceRef}/examples/${filename}`}>{chinese ? '查看此修订版本的源文件' : 'View source at this revision'}</a></p>}
+</StarlightPage>

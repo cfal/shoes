@@ -1,0 +1,12 @@
+---
+import ExamplePage from '../../../components/ExamplePage.astro';
+import { examples } from '../../../data/examples';
+
+export function getStaticPaths() {
+  return examples.map((example) => ({ params: { name: example.slug }, props: example }));
+}
+
+const { filename, code } = Astro.props;
+---
+
+<ExamplePage filename={filename} code={code} chinese />

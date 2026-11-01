@@ -1,0 +1,26 @@
+---
+title: 配置示例
+description: 直接引用 shoes 源代码中的完整 YAML 配置。
+---
+
+import { examples } from '../../../../data/examples';
+
+每个示例都有自己的页面，提供完整且可复制的 YAML 文件。使用前请修改地址、凭据、证书和其他部署相关的值。修改后运行 `shoes check`。
+
+## 从这里开始
+
+- [本地 SOCKS5 监听器](/zh-cn/start/first-config/)：仅监听回环地址，不需要证书或上游服务。
+- [HTTP 经 SOCKS 转发](/zh-cn/examples/http_through_socks/)：将入站监听器连接到上游代理。
+- [多跳代理链](/zh-cn/examples/multi_hop_chain/)：通过多个上游转发。
+- [本地规则源路由](/zh-cn/examples/rule_sources/)：需要引用的规则文件。
+- [Clash 控制器](/zh-cn/examples/clash_api/)：运行时选择器与控制器配置。
+
+## 验证
+
+Rust 测试会检查所有示例文件的 YAML 解码和规则编译。另有一组在 `src/config/tests.rs` 中列出的示例，会使用仓库中的测试文件执行原生配置准备检查。解析或准备成功，不代表套接字、路由、外部节点或平台特定功能一定能在部署机器上正常工作。
+
+## 所有示例
+
+<ul>
+  {examples.map(({ filename, slug }) => <li><a href={`/zh-cn/examples/${slug}/`}>{filename}</a></li>)}
+</ul>
