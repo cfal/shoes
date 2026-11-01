@@ -378,9 +378,9 @@ mod tests {
             assert_eq!(group.state.lock().incumbent[usize::from(udp)], None);
             assert_eq!(group.choose(&both, udp).as_deref(), Some("a"));
             assert_eq!(group.peek(&only_b, udp).as_deref(), Some("b"));
-            assert!(group.peek(&HashSet::new(), udp).is_none());
             assert_eq!(group.choose(&both, udp).as_deref(), Some("a"));
             assert_eq!(group.choose(&only_b, udp).as_deref(), Some("b"));
+            assert!(group.peek(&HashSet::new(), udp).is_none());
             assert_eq!(group.peek(&both, udp).as_deref(), Some("b"));
         }
     }
