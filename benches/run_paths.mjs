@@ -18,22 +18,23 @@ export function parseSamples(output, name, profile) {
   for (const line of lines.filter(line => line.startsWith('PATH,'))) {
     const fields = line.split(',');
     const [, phase, actual, sample, count, ns] = fields;
+    const iterations = Number(count);
+    const elapsedNs = Number(ns);
     const key = `${phase}/${sample}`;
     if (fields.length !== 6 || actual !== name || !Object.hasOwn(samples, phase)
       || !/^[0-6]$/.test(sample) || seen.has(key)
-      || !Number.isSafeInteger(Number(count)) || Number(count) <= 0
-      || !Number.isFinite(Number(ns)) || Number(ns) <= 0) {
+      || !Number.isSafeInteger(iterations) || iterations <= 0
+      || !Number.isFinite(elapsedNs) || elapsedNs <= 0) {
       throw Error(`invalid sample: ${line}`);
     }
     seen.add(key);
-    samples[phase].push(phase === 'prepare' ? Number(ns) : Number(ns) / Number(count));
+    samples[phase].push(phase === 'prepare' ? elapsedNs : elapsedNs / iterations);
   }
   if (Object.values(samples).some(values => values.length !== 7)) throw Error(`incomplete samples: ${name}`);
   return samples;
 }
 
 function main() {
-
   const [binary, directory, matrix = 'full'] = process.argv.slice(2);
   if (!directory || !['fixed', 'full'].includes(matrix)) {
     throw Error('usage: node benches/run_paths.mjs TEST_BINARY NEW_OUTPUT_DIRECTORY [fixed|full]');
