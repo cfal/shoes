@@ -31,6 +31,8 @@ COMMANDS:
 
 ### Tendns TXT 生成
 
+[Tendns](https://github.com/cfal/tendns) 是一个 Rust 库和 DNS 转发器，可通过普通 DNS TXT 记录发布加密的 A、AAAA 和 CNAME 条目。支持 tendns 的解析器使用共享的发现密钥解密这些记录，并解析发布的名称。
+
 `generate-tendns-txt` 可离线生成加密的 TXT 发布内容，无需 Shoes 配置文件或访问 DNS 服务商。
 请通过 `TENDNS_KEY` 环境变量提供已有的 32 字节发现密钥，使用无填充的 base64url 编码，
 不要通过命令行选项传入密钥。

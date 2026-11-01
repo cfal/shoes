@@ -35,6 +35,11 @@ listeners without waiting for the TCP reload drain.
 
 ### Tendns TXT Generation
 
+[Tendns](https://github.com/cfal/tendns) is a Rust library and DNS forwarder for
+publishing encrypted A, AAAA, and CNAME entries in ordinary DNS TXT records.
+A tendns-aware resolver uses a shared discovery key to decrypt them and resolve
+the published names.
+
 `generate-tendns-txt` creates an encrypted TXT publication offline, without a
 Shoes configuration file or DNS-provider access. Supply an existing 32-byte
 unpadded base64url discovery key through `TENDNS_KEY`, not a command-line option.
