@@ -155,6 +155,10 @@ impl Resolver for TendnsResolver {
                     .to_string()
                     .parse::<std::net::SocketAddrV6>()
                     .is_ok())
+            || (host.contains('%')
+                && format!("[{host}]:0")
+                    .parse::<std::net::SocketAddrV6>()
+                    .is_ok())
         {
             return self.raw.resolve_location(location);
         }

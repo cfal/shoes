@@ -225,6 +225,7 @@ async fn unrelated_native_names_preserve_case_form_order_duplicates_and_scope() 
         "MiXeD",
         "Public.Example.",
         "[fe80::1%42]",
+        "fe80::1%42",
         "192.0.2.7",
         "2001:db8::1",
         "::ffff:192.0.2.7",
@@ -307,6 +308,9 @@ async fn invalid_hostnames_fail_closed_before_native_or_txt_work() {
         "-edge.example.com",
         "my printer.local",
         "my printer.example.com",
+        "fe80::1%",
+        "fe80::1%4294967296",
+        "[fe80::1%42",
     ] {
         let error = adapter.resolve_location(&location(host)).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{host:?}");
@@ -393,6 +397,24 @@ async fn unassociated_and_truncated_txt_responses_fail_closed() {
         assert_eq!(raw.calls.lock().unwrap().len(), 1);
         assert!(raw.lookups.lock().unwrap().is_empty());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn protected_budgets_start_before_the_returned_futures_are_polled() {
+    let raw = Arc::new(Mock::default());
+    parent(&raw, Value::A("192.0.2.7".parse().unwrap()));
+    let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
+    let lookup = adapter.resolve_location(&location("nas.example.com"));
+    let exchange = adapter.exchange(query("nas.example.com.", RecordType::A));
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+
+    for error in [lookup.await.unwrap_err(), exchange.await.unwrap_err()] {
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.get_ref().unwrap().is::<tendns::TimeoutError>());
+    }
+    assert!(raw.calls.lock().unwrap().is_empty());
+    assert!(raw.lookups.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
