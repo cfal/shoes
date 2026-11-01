@@ -1,19 +1,19 @@
 //! Routing output of configuration compilation. These types are not input syntax.
 //!
 //! Source and resolved records are distinct despite sharing their settings layout.
-//! ```compile_fail,E0308
+//! ```compile_fail
 //! use shoes::config::{ClientConfig, resolved::ResolvedClientConfig};
 //! let source: ClientConfig = ResolvedClientConfig::default();
 //! ```
 //!
 //! Resolved output cannot be parsed as configuration.
-//! ```compile_fail,E0277
+//! ```compile_fail
 //! use shoes::config::resolved::ResolvedClientConfig;
 //! let _: ResolvedClientConfig = serde_yaml::from_str("{}").unwrap();
 //! ```
 //!
 //! Carrier routes cannot reintroduce source syntax through a resolved client.
-//! ```compile_fail,E0308
+//! ```compile_fail
 //! use shoes::config::{ClientChain, resolved::ResolvedWireguardClientConfig};
 //! fn replace_carrier(client: &mut ResolvedWireguardClientConfig, source: ClientChain) {
 //!     client.peer_client_chain = Some(source);
@@ -21,7 +21,7 @@
 //! ```
 
 //! Source routes cannot contain resolved choices.
-//! ```compile_fail,E0599
+//! ```compile_fail
 //! use shoes::config::{ClientChainHop, resolved::ResolvedClientChoice};
 //! fn source(choice: ResolvedClientChoice) -> ClientChainHop {
 //!     ClientChainHop::Choice(Box::new(choice))
@@ -29,10 +29,37 @@
 //! ```
 //!
 //! Executable routes cannot contain source chains.
-//! ```compile_fail,E0308
+//! ```compile_fail
 //! use shoes::config::{ClientChain, resolved::ResolvedClientChain};
 //! fn execute(_: ResolvedClientChain) {}
 //! execute(ClientChain::default());
+//! ```
+//!
+//! Valid counterparts verify imports and field access independently of the
+//! rejection tests, which cannot match diagnostic codes on stable Rust.
+//! ```no_run
+//! use shoes::config::{ClientChain, ClientChainHop, ClientConfig, ConfigSelection};
+//! use shoes::config::resolved::{
+//!     ResolvedClientChain, ResolvedClientChoice, ResolvedClientConfig,
+//!     ResolvedClientHop, ResolvedWireguardClientConfig,
+//! };
+//! let _: ClientConfig = ClientConfig::default();
+//! let _: ResolvedClientConfig = ResolvedClientConfig::default();
+//! let _: ClientChain = ClientChain::default();
+//! fn parse_source(yaml: &str) -> Result<ClientConfig, serde_yaml::Error> {
+//!     serde_yaml::from_str(yaml)
+//! }
+//! fn replace_carrier(client: &mut ResolvedWireguardClientConfig, route: ResolvedClientChain) {
+//!     client.peer_client_chain = Some(route);
+//! }
+//! fn source(client: ClientConfig) -> ClientChainHop {
+//!     ClientChainHop::Single(ConfigSelection::Config(client))
+//! }
+//! fn resolved(choice: ResolvedClientChoice) -> ResolvedClientHop {
+//!     ResolvedClientHop::Choice(Box::new(choice))
+//! }
+//! fn execute(_: ResolvedClientChain) {}
+//! execute(ResolvedClientChain::default());
 //! ```
 
 use serde::Serialize;

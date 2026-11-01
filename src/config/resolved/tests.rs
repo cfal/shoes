@@ -138,6 +138,10 @@ fn lowering_preserves_defined_validation_precedence() {
             "direct cannot be used as an inner",
         ),
         (
+            json!([server(json!([{"pool":["missing", invalid_client]}]))]),
+            "direct cannot be used as an inner",
+        ),
+        (
             json!([{"address":"127.0.0.1:0","protocol":{"type":"snell","cipher":"invalid","password":"secret"},
             "rules":[{"masks":"0.0.0.0/0","action":"allow","client_chain":"missing"}]}]),
             "Unknown client group: missing",
