@@ -1,19 +1,19 @@
 //! Routing output of configuration compilation. These types are not input syntax.
 //!
 //! Source and resolved records are distinct despite sharing their settings layout.
-//! ```compile_fail
+//! ```compile_fail,E0308
 //! use shoes::config::{ClientConfig, resolved::ResolvedClientConfig};
 //! let source: ClientConfig = ResolvedClientConfig::default();
 //! ```
 //!
 //! Resolved output cannot be parsed as configuration.
-//! ```compile_fail
+//! ```compile_fail,E0277
 //! use shoes::config::resolved::ResolvedClientConfig;
 //! let _: ResolvedClientConfig = serde_yaml::from_str("{}").unwrap();
 //! ```
 //!
 //! Carrier routes cannot reintroduce source syntax through a resolved client.
-//! ```compile_fail
+//! ```compile_fail,E0308
 //! use shoes::config::{ClientChain, resolved::ResolvedWireguardClientConfig};
 //! fn replace_carrier(client: &mut ResolvedWireguardClientConfig, source: ClientChain) {
 //!     client.peer_client_chain = Some(source);
@@ -21,7 +21,7 @@
 //! ```
 
 //! Source routes cannot contain resolved choices.
-//! ```compile_fail
+//! ```compile_fail,E0599
 //! use shoes::config::{ClientChainHop, resolved::ResolvedClientChoice};
 //! fn source(choice: ResolvedClientChoice) -> ClientChainHop {
 //!     ClientChainHop::Choice(Box::new(choice))
@@ -29,7 +29,7 @@
 //! ```
 //!
 //! Executable routes cannot contain source chains.
-//! ```compile_fail
+//! ```compile_fail,E0308
 //! use shoes::config::{ClientChain, resolved::ResolvedClientChain};
 //! fn execute(_: ResolvedClientChain) {}
 //! execute(ClientChain::default());

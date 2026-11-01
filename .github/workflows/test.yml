@@ -141,6 +141,9 @@ jobs:
     - name: Run local tests
       run: cargo test --workspace --locked --lib --bins --verbose
 
+    - name: Check resolved configuration type contracts
+      run: .github/require-tests.sh cargo test -p shoes --locked --doc config::resolved
+
     - uses: actions/setup-go@v7
       with:
         go-version: '1.27.3'
