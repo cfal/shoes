@@ -64,7 +64,7 @@ protocol:
         client_fingerprints: [string]
         # OR Remote handshake (proxy to real server):
         address: string        # e.g., "google.com:443"
-        client_proxies: [ClientConfig] # Optional proxies for handshake
+        client_chain: ClientChain? # Optional proxy chain for handshake
       protocol: ServerProxyConfig
       override_rules: [RuleConfig]
 

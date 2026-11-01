@@ -9,7 +9,7 @@ description: "shoes 如何组织 YAML 配置条目。"
 
 - [服务端](/zh-cn/config/server/)：代理监听器及其协议栈。
 - [TUN](/zh-cn/config/tun/)：用于透明代理的 IP 数据包设备。
-- [客户端组](/zh-cn/routing/groups/#client-proxy-group)：可重用的上游配置。
+- [客户端组](/zh-cn/routing/groups/#client-group)：可重用的完整上游路径选项。
 - [规则组](/zh-cn/routing/groups/#rule-group)：可重用的路由规则。
 - [规则源组](/zh-cn/routing/groups/#rule-source-group)：可重用的无操作匹配表达式和本地或远程源。
 - [DNS 组](/zh-cn/dns/configuration/)：供多个配置项引用的命名 DNS 配置。
@@ -33,7 +33,7 @@ description: "shoes 如何组织 YAML 配置条目。"
 
 # Client config groups have 'client_group'
 - client_group: my-upstream
-  client_proxy: ...
+  client_chains: ...
 
 # Rule config groups have 'rule_group'
 - rule_group: my-rules

@@ -35,7 +35,9 @@ description: "下载、缓存、刷新和验证远程规则数据。"
       action: allow
 ```
 
-将 `proxy.example.net:1080` 替换为您的代理地址。 `download.client_chain` 接受现有的链、池、内联客户端和组语法。它独立于外部策略的 `client_chain`，后者路由匹配的流量。 `download.client_chain` 和 `download.bootstrap_url` 都是必需的。引导程序可以是 `system`、基于 IP 的 DNS URL 或命名的 DNS 组。目标和代理主机名使用此解析器；失败的刷新路由永远不会回退到直接。自动刷新使用活动生成的 DNS、代理客户端和选择器选项。
+将 `proxy.example.net:1080` 替换为您的代理地址。 `download.client_chain` 接受[链、池、内联客户端和完整路径组语法](/zh-cn/routing/rules/#client-chains)。它独立于外部策略的 `client_chain`，后者路由匹配的流量。 `download.client_chain` 和 `download.bootstrap_url` 都是必需的。引导程序可以是 `system`、基于 IP 的 DNS URL 或命名的 DNS 组。目标和代理主机名使用此解析器；失败的刷新路由永远不会回退到直接。自动刷新使用活动生成的 DNS、代理客户端和选择器选项。
+
+命名组保留其轮询、选择器或 URL 测试策略，并在每次连接尝试中固定一条完整路径。主机名解析出多个地址时，每个地址的连接尝试可能使用不同路径。下述缺失内容引导所适用的更严格限制仍然有效。
 
 所有运行时远程源都使用内存中保留的已编译规则，包括启用磁盘缓存时。重新加载重用 URL 和解码选项不变的源；运行时编译永远不会回退到缓存文件。省略 `global_settings.rule_cache_dir` 以禁用持久性。 shoes 在启动监听器之前下载所需的源。定期刷新仍然适用；下载失败或拒绝候选者会使活动规则保持不变。不会创建缓存、锁定、暂存或临时文件。下载缓冲区在验证和可选的缓存保存后被释放；字节相同的刷新不会重新编译规则。冷启动需要网络访问；当没有持久缓存时，远程中断会阻止启动。 `check` 和 `--dry-run` 保持离线状态，无法验证仅内存远程源。本地文件源仍然需要 `path`。
 

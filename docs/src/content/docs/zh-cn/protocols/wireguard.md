@@ -25,7 +25,7 @@ WireGuard 默认为 32 MiB TCP 内存预算、256 个 TCP 连接、1,024 个 UDP
 
 ```yaml
 - client_group: vpn
-  client_proxies:
+  client_chains:
     - address: "vpn.example:51820"
       protocol:
         type: wireguard
