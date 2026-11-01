@@ -33,6 +33,8 @@ single-entry limit, even for empty entries. Serialization always uses
 
 `default_dns` accepts the same object as a listener's `dns`: a `servers` group
 reference or inline upstreams, and optional `fake_ip` settings.
+A `default_dns` object with omitted or empty `servers` uses the underlying
+system resolver, including when it specifies only fake-IP settings.
 
 ```yaml
 - global_settings:
