@@ -218,8 +218,9 @@ jobs:
         .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi tun:: -- --test-threads=1
 
     - name: Run rootless WireGuard, FFI, and process lifecycle tests
-      run: >-
-        .github/require-tests.sh cargo test -p shoes --locked --lib --test process_contract --features ffi wireguard -- --test-threads=1
+      run: |
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi wireguard -- --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --test process_contract --features ffi wireguard -- --test-threads=1
 
     - name: Run FFI rule-source startup and packet tests
       run: >-
@@ -250,9 +251,9 @@ jobs:
     - name: Run WebSocket unit and configuration tests
       env:
         CARGO_BUILD_JOBS: 1
-      run: >-
-        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi --
-        websocket:: config::validate::tests::websocket_early_data_ --test-threads=1
+      run: |
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi websocket:: -- --test-threads=1
+        .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi config::validate::tests::websocket_early_data_ -- --test-threads=1
 
     - name: Run local WebSocket early-data interoperability tests
       env:
@@ -422,6 +423,13 @@ jobs:
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --lib --features integration-tests
         h2mux::h2mux_server_session::singbox_interop_tests:: -- --test-threads=1
+
+    - name: Run bounded XUDP payload integrity regression
+      if: matrix.name == 'local protocols'
+      run: >-
+        .github/require-tests.sh cargo test -p shoes --locked --features stress-tests
+        --test stress vless_xudp_long_lived::test_content_integrity_varying_sizes
+        -- --exact --test-threads=1
 
     - name: Run native QUIC client interoperability tests
       if: matrix.target == 'optional_peer'

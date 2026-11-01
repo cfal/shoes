@@ -31,10 +31,37 @@ Android or iOS VPN service.
 Clippy's `--all-features` compiles optional tests but does not execute them.
 Likewise, a filtered `cargo test` command that matches zero tests succeeds; check
 the reported test count when renaming modules or changing CI filters.
+The nonzero-test guard checks the aggregate output. Independently required
+targets or filters need separate guarded invocations so one cannot mask another.
+
+Tests that relaunch themselves should use `shoes_test_support::isolated::run_isolated`,
+which requires exactly one passing child test, not just exit status zero. Custom
+namespace or environment launchers can use `assert_one_test_passed` on their
+captured output. Empty-filter and failed-child regressions exercise the guard.
+
+`test_local_server` and `test_local_server_streaming` reject HTTP error responses. Use
+`test_http_with_options` for intentional error-status assertions, and
+`test_local_server_streaming_verified` for bulk-transfer correctness rather than
+the output-discarding throughput helper.
+The curl POST helper kills and reaps its child on stdin write/flush failure;
+the Linux regression uses an isolated fake curl and verifies both `BrokenPipe`
+and cleanup. Cancelling its `spawn_blocking` await is a separate, untested contract.
 
 The unit-test CI job also builds the [pinned AnyTLS reference peer](fixtures/anytls-peer/README.md)
-and explicitly runs its ignored TCP/UoT pooling test. Ordinary library runs do not
-require Go or an external peer binary.
+and explicitly runs its ignored TCP/UoT pooling test. UoT packets are decoded by
+the reference library and delivered to a real loopback UDP endpoint, which checks
+message boundaries and transforms replies. This prevents a symmetric framing bug
+from passing through a byte-stream echo. Ordinary library runs do not require Go
+or an external peer binary.
+
+The shared VLESS/connected-UoT message adapter has focused tests under
+`src/vless/vless_message_stream/tests.rs`: split headers/bodies, truncated EOF,
+coalesced messages, small output-buffer retries, maximum/rejected frame sizes,
+and cancellation under backpressure followed by shutdown flushing. Run them with:
+
+```sh
+cargo test --locked --lib vless::vless_message_stream::tests::
+```
 
 ## Integration Targets
 
@@ -197,6 +224,10 @@ jobs cross-compile the native libraries but do not exercise device VPN lifecycle
 Only selected bounded stress cases run in CI; long-duration and performance tests
 remain explicit opt-ins. Filtered test steps run through
 `.github/require-tests.sh`, which fails a step whose filter selects no tests.
+The local-protocol job explicitly selects the bounded
+`vless_xudp_long_lived::test_content_integrity_varying_sizes` case from the stress
+target; its sustained and burst siblings remain manual. The selected case has a
+whole-test deadline as well as per-reply deadlines.
 
 Retain the existing suite boundaries. Prefer deterministic in-process tests for
 fragmentation, cancellation, credit accounting, and parser rejection; use
