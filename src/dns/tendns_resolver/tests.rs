@@ -221,13 +221,50 @@ async fn private_lookup_uses_selected_raw_txt_and_preserves_the_port() {
 async fn unrelated_native_names_preserve_case_form_order_duplicates_and_scope() {
     let raw = Arc::new(Mock::default());
     let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
-    for host in ["MiXeD", "Public.Example.", "[fe80::1%42]"] {
+    for host in [
+        "MiXeD",
+        "Public.Example.",
+        "[fe80::1%42]",
+        "192.0.2.7",
+        "2001:db8::1",
+        "::ffff:192.0.2.7",
+    ] {
         let location = location(host);
         let addresses = adapter.resolve_location(&location).await.unwrap();
         assert_eq!(addresses, native_addresses(443));
         assert_eq!(raw.lookups.lock().unwrap().last(), Some(&location));
     }
     assert!(raw.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unicode_dot_equivalents_cannot_escape_private_resolution() {
+    for separator in ['\u{3002}', '\u{ff0e}', '\u{ff61}'] {
+        let raw = Arc::new(Mock::default());
+        parent(&raw, Value::A("192.0.2.7".parse().unwrap()));
+        let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
+        let private = location(&format!("nas{separator}example{separator}com{separator}"));
+        assert_eq!(
+            adapter.resolve_location(&private).await.unwrap(),
+            vec!["192.0.2.7:443".parse().unwrap()],
+            "{private}"
+        );
+        assert!(raw.lookups.lock().unwrap().is_empty());
+        {
+            let calls = raw.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0.queries[0].name().to_ascii(), "example.com.");
+            assert_eq!(calls[0].0.queries[0].query_type(), RecordType::TXT);
+        }
+
+        let public = location(&format!("MiXeD{separator}public{separator}"));
+        assert_eq!(
+            adapter.resolve_location(&public).await.unwrap(),
+            native_addresses(443)
+        );
+        assert_eq!(raw.lookups.lock().unwrap().as_slice(), &[public]);
+        assert_eq!(raw.calls.lock().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

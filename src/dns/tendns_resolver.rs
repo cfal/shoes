@@ -149,15 +149,18 @@ impl Resolver for TendnsResolver {
                 ))
             });
         }
-        if host.starts_with('[')
-            && location
-                .to_string()
-                .parse::<std::net::SocketAddrV6>()
-                .is_ok()
+        if host.parse::<std::net::IpAddr>().is_ok()
+            || (host.starts_with('[')
+                && location
+                    .to_string()
+                    .parse::<std::net::SocketAddrV6>()
+                    .is_ok())
         {
             return self.raw.resolve_location(location);
         }
-        let name = match Name::from_str_relaxed(host) {
+        // Normalizes UTS 46 separators before Hickory splits the name into labels.
+        let normalized = host.replace(['\u{3002}', '\u{ff0e}', '\u{ff61}'], ".");
+        let name = match Name::from_str_relaxed(&normalized) {
             Ok(name) => name,
             Err(error) => {
                 // Rejects unparseable names rather than trusting native canonicalization
