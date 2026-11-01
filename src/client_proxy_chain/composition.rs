@@ -686,12 +686,11 @@ mod tests {
     #[tokio::test]
     async fn forwarding_failure_rechecks_only_the_selected_automatic_group() {
         use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::time::{Instant, timeout};
 
-        // A bound, non-listening socket reserves the refusing endpoint without a port race.
-        let refused = tokio::net::TcpSocket::new_v4().unwrap();
-        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let address = refused.local_addr().unwrap().to_string();
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let member =
             |name| json!({"name":name,"chain":[{"address":address,"protocol":{"type":"socks"}}]});
         let (chain, catalog) = build(
@@ -716,15 +715,22 @@ mod tests {
         }
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let target = NetLocation::from_str("192.0.2.1:80", None).unwrap();
-        let error = timeout(
-            Duration::from_secs(5),
-            chain.connect_tcp(target.into(), &resolver),
-        )
+        let peer = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.shutdown().await.unwrap();
+        };
+        let (_, result) = timeout(Duration::from_secs(5), async {
+            tokio::join!(peer, chain.connect_tcp(target.into(), &resolver))
+        })
         .await
-        .unwrap()
-        .err()
-        .expect("reserved endpoint must refuse connections");
-        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        .unwrap();
+        let error = result
+            .err()
+            .expect("peer must close during SOCKS negotiation");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(
             automatic.0["auto"].due_members(now + Duration::from_secs(1)),
             Some(0..2)
