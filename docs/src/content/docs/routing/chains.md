@@ -1,6 +1,6 @@
 ---
 title: "Proxy Chaining"
-description: Shoes proxy chaining configuration.
+description: shoes proxy chaining configuration.
 ---
 
 **Protocol nesting** (wrap one protocol in another):

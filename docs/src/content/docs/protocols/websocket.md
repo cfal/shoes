@@ -1,6 +1,6 @@
 ---
 title: "WebSocket"
-description: Shoes websocket configuration.
+description: shoes websocket configuration.
 ---
 
 **Complete example:** [wss_vmess.yaml](/examples/wss_vmess/). Adapt addresses and secrets before deployment.
@@ -51,8 +51,8 @@ Explicit targets accept at most `max_early_data` decoded bytes.
 Malformed, noncanonical or oversized base64url is rejected before the upgrade.
 Missing or empty early data is allowed. Decoded bytes precede all framed payload.
 
-With `early_data_header_name: Sec-WebSocket-Protocol`, Shoes interoperates with
-Xray's `/ws?ed=2048` client configuration and sing-box's named-header mode. Shoes
+With `early_data_header_name: Sec-WebSocket-Protocol`, shoes interoperates with
+Xray's `/ws?ed=2048` client configuration and sing-box's named-header mode. shoes
 uses explicit fields; do not put `?ed=` in its `matching_path`. Other nonreserved
 HTTP header names are supported for sing-box peers. Names are case-insensitive;
 an explicit carrier cannot also appear in `matching_headers`.
@@ -111,7 +111,7 @@ protocol:
 Early-enabled clients require an explicit `matching_headers.Host` identifying
 the proxy, not the tunneled destination. Omit `early_data_header_name` for
 sing-box path-suffix mode; that mode does not support query strings.
-Sending remains off by default. Default Shoes servers accept standard-header
+Sending remains off by default. Default shoes servers accept standard-header
 early data up to 2048 bytes without additional server configuration; path and
 custom-header carriers require explicit server configuration.
 

@@ -1,6 +1,6 @@
 ---
 title: "Native DNS Freshness"
-description: Shoes native dns freshness configuration.
+description: shoes native dns freshness configuration.
 ---
 
 Omitting a listener's `dns` or leaving `dns.servers` empty uses native OS/NSS
@@ -37,7 +37,7 @@ freshness; `connect_timeout_secs` and `attempts` do not control native caching.
 
 This is a load/freshness trade-off, **not DNS TTL compliance**: the OS lookup API
 does not provide record TTLs. Shorter windows increase OS lookups; disabling the
-Shoes cache cannot bypass caches in the OS, NSS modules, or upstream resolvers.
+shoes cache cannot bypass caches in the OS, NSS modules, or upstream resolvers.
 Native hosts-file/NSS behavior is preserved. New flows can see updated answers
 after expiry; established flows retain their pinned destination. This setting
 controls native hostname lookup caching, not every DNS-related cache. Hickory

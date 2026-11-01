@@ -1,6 +1,6 @@
 ---
 title: "TLS key exchange"
-description: Shoes tls key exchange configuration.
+description: shoes tls key exchange configuration.
 ---
 
 `key_exchange_groups` is an optional, ordered allowlist for ordinary TLS clients,
@@ -19,7 +19,7 @@ null, unknown names, standalone ML-KEM, and `SecP384r1MLKEM1024` are rejected.
 No custom cryptographic implementations are used.
 
 Client QUIC allowlists require a non-direct client at the first chain hop
-(hop 0), where Shoes creates the QUIC transport. Explicit allowlists on direct
+(hop 0), where shoes creates the QUIC transport. Explicit allowlists on direct
 clients or later hops are rejected, including entries resolved from groups or
 pools. Use ordinary TLS in a later hop's `protocol` when that hop needs its own
 hybrid-protected tunnel.

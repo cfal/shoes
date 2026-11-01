@@ -1,6 +1,6 @@
 ---
 title: "NaiveProxy"
-description: Shoes naiveproxy configuration.
+description: shoes naiveproxy configuration.
 ---
 
 **Complete example:** [naiveproxy.yaml](/examples/naiveproxy/). Adapt addresses and secrets before deployment.

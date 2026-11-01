@@ -1,6 +1,6 @@
 ---
 title: "Configuration model"
-description: How Shoes organizes YAML configuration entries.
+description: How shoes organizes YAML configuration entries.
 ---
 
 The field-shape snippets in the reference use placeholders such as `string` and

@@ -1,6 +1,6 @@
 ---
 title: "Shadowsocks"
-description: Shoes shadowsocks configuration.
+description: shoes shadowsocks configuration.
 ---
 
 **Complete example:** [shadowsocks_basic.yaml](/examples/shadowsocks_basic/). Adapt addresses and secrets before deployment.
@@ -44,7 +44,7 @@ separate entries in `client_chain`.
 
 Single-key SS2022 configurations are unchanged. Identity chains are client-only
 and are not supported by `2022-blake3-chacha20-poly1305`. Legacy Shadowsocks
-passwords may still contain literal colons. Shoes does not accept multi-user
+passwords may still contain literal colons. shoes does not accept multi-user
 identity chains in server configurations.
 
 `udp_enabled: true` on the client uses the same identity handshake for SagerNet

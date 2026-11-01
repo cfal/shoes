@@ -1,6 +1,6 @@
 ---
 title: "Vision (XTLS-Vision)"
-description: Shoes vision (xtls-vision) configuration.
+description: shoes vision (xtls-vision) configuration.
 ---
 
 Vision optimizes TLS-in-TLS scenarios by detecting inner TLS traffic and switching to direct mode for zero-copy performance.

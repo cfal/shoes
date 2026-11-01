@@ -1,0 +1,24 @@
+---
+title: 首次配置
+description: 验证并运行本地 SOCKS5 监听器。
+---
+
+import { Code } from '@astrojs/starlight/components';
+import quickstart from '../../../../../../examples/quickstart_socks.yaml?raw';
+
+这个示例仅监听本机回环地址，因此只有同一台机器上的程序可以连接。它不需要证书或外部代理。
+
+在工作目录中创建 `quickstart_socks.yaml`，内容如下：
+
+<Code code={quickstart} lang="yaml" title="quickstart_socks.yaml" />
+
+[安装 shoes](/zh-cn/start/installation/) 后，先验证文件，再启动监听器：
+
+```sh
+shoes check quickstart_socks.yaml
+shoes quickstart_socks.yaml
+```
+
+将支持 SOCKS5 的应用指向 `127.0.0.1:1080`。默认情况下，该监听器允许直接连接。如需接受远程用户，应绑定其他网络接口，并在开放端口前添加身份验证和目标地址规则。参见 [SOCKS5](/zh-cn/protocols/socks5/) 和[规则](/zh-cn/routing/rules/)。
+
+`check` 会验证语法、证书和配置项之间的关系，但不会绑定套接字或执行 DNS 引导网络请求。检查成功不保证监听器能够在当前机器上启动。

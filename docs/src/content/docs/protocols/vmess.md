@@ -1,6 +1,6 @@
 ---
 title: "VMess"
-description: Shoes vmess configuration.
+description: shoes vmess configuration.
 ---
 
 **Complete example:** [vmess.yaml](/examples/vmess/). Adapt addresses and secrets before deployment.

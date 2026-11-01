@@ -6,7 +6,7 @@
 # - attempts: retry count for failed queries
 #
 # With no dns field, or a dns field with omitted or empty servers, destination
-# lookups use the OS resolver. Shoes caches successful results for 60 seconds from
+# lookups use the OS resolver. shoes caches successful results for 60 seconds from
 # lookup completion, across ports, with at most 10,000 cached hosts.
 # This is an application result-age policy, not a DNS record TTL: OS/getaddrinfo
 # lookups do not expose authoritative TTLs and may themselves return OS-cached

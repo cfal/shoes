@@ -1,6 +1,6 @@
 ---
 title: "VLESS"
-description: Shoes vless configuration.
+description: shoes vless configuration.
 ---
 
 **Complete example:** [vless_over_tls.yaml](/examples/vless_over_tls/). Adapt addresses and secrets before deployment.

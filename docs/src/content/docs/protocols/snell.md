@@ -1,6 +1,6 @@
 ---
 title: "Snell v3"
-description: Shoes snell v3 configuration.
+description: shoes snell v3 configuration.
 ---
 
 **Complete example:** [snell.yaml](/examples/snell/). Adapt addresses and secrets before deployment.

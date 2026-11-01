@@ -1,6 +1,6 @@
 ---
 title: "Tips"
-description: Shoes tips configuration.
+description: shoes tips configuration.
 ---
 
 ### Generate Keys

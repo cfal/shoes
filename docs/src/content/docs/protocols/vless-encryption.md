@@ -52,7 +52,7 @@ Ticket state is shared across addresses of one logical listener, not across
 different protocol targets. Reloads reset ticket state; existing streams retain
 their cryptographic state. TLS/REALITY/QUIC resumption is independent.
 
-Rollback requires rolling back configuration as well as the binary: older Shoes
+Rollback requires rolling back configuration as well as the binary: older shoes
 versions silently ignore native encryption fields. Conversely, a previously
 ignored VLESS-level `vision: true` without native encryption now produces a
 migration error instead of silently disabling Vision.

@@ -1,0 +1,38 @@
+---
+title: shoes
+description: 使用 Rust 编写的高性能多协议代理服务器。
+head:
+  - tag: title
+    content: shoes 文档
+sidebar:
+  label: 概览
+---
+
+shoes 是使用 Rust 编写的高性能多协议代理服务器。它可以作为本地 HTTP 或 SOCKS5 代理、接收远程客户端连接，也可以通过一个或多个上游代理转发流量。YAML 配置将监听器、协议栈、路由规则和 DNS 设置组合在同一进程中。
+
+## 开始使用
+
+- [安装](/zh-cn/start/installation/)和[首次配置](/zh-cn/start/first-config/)：运行并验证本地监听器。
+- [配置模型](/zh-cn/start/configuration-model/)：了解配置项、配置组和文件。
+- [示例](/zh-cn/start/examples/)：复制源代码中的完整 YAML。
+- [服务端](/zh-cn/config/server/)和[客户端](/zh-cn/config/client/)：共享字段与传输设置。
+- [协议](/zh-cn/protocols/socks5/)：按协议查看服务端与客户端设置。
+- [规则](/zh-cn/routing/rules/)、[DNS](/zh-cn/dns/configuration/)和 [TUN](/zh-cn/config/tun/)：处理流量。
+
+## shoes 的功能
+
+- **连接不同代理协议。** 独立配置服务端和客户端协议，并在受支持的位置使用 TCP 或 QUIC 传输。
+- **路由与代理链。** 匹配 IP 地址、CIDR 或主机名，构建[多跳代理链](/zh-cn/routing/chains/)，并通过支持负载均衡或健康检查的[可复用配置组](/zh-cn/routing/groups/)选择上游。
+- **管理 TLS 与证书。** 按 SNI 路由、使用证书固定或[双向 TLS](/zh-cn/security/mtls/)，并通过[证书源](/zh-cn/security/certificates/)共享证书，支持文件实时轮换或 ACME 续期。
+- **处理 DNS 与透明代理。** 配置 [DNS 上游](/zh-cn/dns/configuration/)和 [Fake IP 解析](/zh-cn/dns/fake/)，或在 Linux、Android 和 iOS 上使用 [TUN](/zh-cn/config/tun/)。[WireGuard](/zh-cn/protocols/wireguard/)在 Unix 上提供用户态 TCP/UDP 客户端和服务端支持，无需系统 TUN 设备或修改主机路由。
+- **管理运行中的服务。** 共享命名设置、[重新加载配置](/zh-cn/operations/reload/)，并可选用[兼容 Clash 的控制器](/zh-cn/routing/clash-controller/)进行上游选择和连接监控。
+
+## 支持的协议
+
+**代理协议：** [HTTP/HTTPS](/zh-cn/protocols/http/)、[SOCKS5](/zh-cn/protocols/socks5/)、[混合 HTTP/SOCKS5](/zh-cn/protocols/mixed/)、[VMess AEAD](/zh-cn/protocols/vmess/)、[VLESS](/zh-cn/protocols/vless/)、[Shadowsocks](/zh-cn/protocols/shadowsocks/)、[Trojan](/zh-cn/protocols/trojan/)、[Snell v3](/zh-cn/protocols/snell/)、[Hysteria2](/zh-cn/protocols/hysteria2/)、[TUIC v5](/zh-cn/protocols/tuic/)、[AnyTLS](/zh-cn/protocols/anytls/) 和 [NaiveProxy](/zh-cn/protocols/naiveproxy/)。
+
+**传输与封装：** [TLS](/zh-cn/protocols/tls/)、[ShadowTLS v3](/zh-cn/protocols/shadowtls/)、[WebSocket](/zh-cn/protocols/websocket/)、[XHTTP / SplitHTTP](/zh-cn/protocols/xhttp/)、[REALITY](/zh-cn/protocols/reality/)、[XTLS Vision](/zh-cn/protocols/vision/)和 [Sudoku TCP 掩码](/zh-cn/protocols/sudoku/)。[H2MUX](/zh-cn/protocols/h2mux/)为受支持的内部协议提供多路复用。
+
+各协议页面说明客户端和服务端支持情况及组合限制；并非所有协议与传输方式都能组合使用。
+
+本参考文档对应页眉所示的源代码修订版本。开发版文档可能包含尚未发布到正式二进制文件中的功能。

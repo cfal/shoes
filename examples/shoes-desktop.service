@@ -1,5 +1,5 @@
 [Unit]
-Description=Shoes managed desktop proxy
+Description=shoes managed desktop proxy
 After=network-online.target systemd-resolved.service
 Wants=network-online.target
 StartLimitIntervalSec=0
