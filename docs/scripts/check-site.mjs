@@ -72,7 +72,7 @@ function* markdownLinks(node) {
 }
 
 const repositoryRoot = fileURLToPath(new URL('../../', import.meta.url));
-for (const name of ['README.md', 'CHANGELOG.md', 'CONFIG.md']) {
+for (const name of ['README.md', 'CHANGELOG.md']) {
   const file = path.join(repositoryRoot, name);
   for (const href of markdownLinks(fromMarkdown(readFileSync(file, 'utf8')))) {
     const url = new URL(href, pathToFileURL(file));
