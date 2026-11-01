@@ -1,6 +1,6 @@
 ---
 title: "Trojan"
-description: Shoes trojan configuration.
+description: shoes trojan configuration.
 ---
 
 **Complete example:** [trojan_basic.yaml](/examples/trojan_basic/). Adapt addresses and secrets before deployment.

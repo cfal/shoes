@@ -1,6 +1,6 @@
 ---
 title: "Hysteria2"
-description: Shoes hysteria2 configuration.
+description: shoes hysteria2 configuration.
 ---
 
 **Complete example:** [hysteria2.yaml](/examples/hysteria2/). Adapt addresses and secrets before deployment.
@@ -54,7 +54,7 @@ implemented; `up_mbps`, `down_mbps`, and 0-RTT options are rejected.
 Optional `obfs: {type: salamander, password: your-obfs-password}` wraps QUIC
 datagrams with Salamander obfuscation (minimum four password bytes). The peer
 must use the same setting. It adds eight bytes per wire datagram; the minimum
-path UDP payload is therefore 1208 bytes. Shoes' Hysteria2 server does not yet
+path UDP payload is therefore 1208 bytes. shoes' Hysteria2 server does not yet
 implement this option.
 
 Optional port hopping uses a dedicated connection-owned endpoint:

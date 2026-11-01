@@ -1,6 +1,6 @@
 ---
 title: "Client Config"
-description: Shoes client config configuration.
+description: shoes client config configuration.
 ---
 
 Used in rules to specify upstream proxies.

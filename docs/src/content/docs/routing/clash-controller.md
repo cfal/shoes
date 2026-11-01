@@ -1,6 +1,6 @@
 ---
 title: "Clash Controller"
-description: Shoes clash controller configuration.
+description: shoes clash controller configuration.
 ---
 
 The CLI can expose a documented subset of the Clash API. The controller is
@@ -156,14 +156,14 @@ surrounding chain or destination. URL-test groups are not supported by FFI.
 
 Only one `cache_file_path` is allowed across all input files. Its absence disables
 persistence; relative paths resolve against the process working directory.
-The file is Shoes-specific versioned JSON, not a sing-box/Mihomo database. Parent
+The file is shoes-specific versioned JSON, not a sing-box/Mihomo database. Parent
 directories must exist, and Unix cache/lock files must be private. Explicit API
 choices take precedence over `default`, then the first member. Startup/reload
 never save defaults or rewrite YAML. Every accepted selection PUT saves before
 publishing the new choice. Failed saves leave routing unchanged. An error after
 atomic replacement can leave an unacknowledged choice on disk; logs report this
 durability uncertainty. Saved entries for removed groups are retained. Both reads
-and writes are limited to 1 MiB; remove obsolete entries only while Shoes is stopped.
+and writes are limited to 1 MiB; remove obsolete entries only while shoes is stopped.
 
 ## API behavior
 

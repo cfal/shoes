@@ -1,6 +1,6 @@
 ---
 title: "Port Forward"
-description: Shoes port forward configuration.
+description: shoes port forward configuration.
 ---
 
 The field sketches below contain placeholders, not runnable values. Use a complete example when configuring a deployment.

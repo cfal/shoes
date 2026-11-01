@@ -1,6 +1,6 @@
 ---
 title: "Hot Reloading"
-description: Shoes hot reloading configuration.
+description: shoes hot reloading configuration.
 ---
 
 Configuration changes are automatically detected. The CLI also watches referenced
@@ -31,10 +31,10 @@ across generations. New-generation TCP and Unix listeners accept queued
 connections only after activation completes; connections may wait in the kernel
 backlog during that interval.
 
-If activation fails, Shoes stops the candidate services and restores the previous
+If activation fails, shoes stops the candidate services and restores the previous
 configuration, including control state, resource limits, DNS ownership, and
 certificate workers. A successful rollback keeps the process running; if rollback
-also fails, Shoes exits with status 1 rather than serving a partial generation.
+also fails, shoes exits with status 1 rather than serving a partial generation.
 Existing TCP connections begin draining when their old listeners retire, for up
 to `global_settings.reload_grace_secs`. That deadline still applies after rollback.
 TUN, WireGuard, and QUIC services are stopped and restarted; their existing
@@ -44,7 +44,7 @@ Certificate-source file changes and ACME renewal do not trigger this full reload
 They rotate live without replacing listeners or closing QUIC connections; see
 [Certificate Sources](/security/certificates/).
 
-QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. If the previous generation's sockets do not retire within the five-second socket-release guard, Shoes exits with an error rather than announcing a partially ready generation.
+QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. If the previous generation's sockets do not retire within the five-second socket-release guard, shoes exits with an error rather than announcing a partially ready generation.
 
 Candidate QUIC buffer sizes are used during DNS preparation, but `global_settings` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.
 

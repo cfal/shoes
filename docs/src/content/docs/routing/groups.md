@@ -1,6 +1,6 @@
 ---
 title: "Named Groups"
-description: Shoes named groups configuration.
+description: shoes named groups configuration.
 ---
 
 ### Client Proxy Group

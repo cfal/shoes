@@ -1,6 +1,6 @@
 ---
 title: "Named PEMs"
-description: Shoes named pems configuration.
+description: shoes named pems configuration.
 ---
 
 Define certificates once and reference throughout configuration.

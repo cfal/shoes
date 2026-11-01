@@ -1,6 +1,6 @@
 ---
 title: "ShadowTLS"
-description: Shoes shadowtls configuration.
+description: shoes shadowtls configuration.
 ---
 
 **Complete example:** [shadowtls_v3_local_handshake.yaml](/examples/shadowtls_v3_local_handshake/). Adapt addresses and secrets before deployment.

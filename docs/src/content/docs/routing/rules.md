@@ -1,6 +1,6 @@
 ---
 title: "Rules System"
-description: Shoes rules system configuration.
+description: shoes rules system configuration.
 ---
 
 Rules determine how incoming connections are routed.
@@ -305,7 +305,7 @@ label. Literal labels are case-insensitive. Classical providers accept `DOMAIN`,
 may end with `,no-resolve`; destination ports accept `80/443/8000-9000`.
 Other operators/options fail validation. Classical keywords and regexes are
 case-insensitive, with inline regex case overrides preserved. Unlike some Mihomo
-classical paths, Shoes normalizes incoming query names to lowercase.
+classical paths, shoes normalizes incoming query names to lowercase.
 
 Xray geodata uses explicit `format: geosite_dat` or `format: geoip_dat`, with a
 required case-insensitive `code: CN` category selector. GeoSite optionally accepts

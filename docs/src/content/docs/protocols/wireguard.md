@@ -1,6 +1,6 @@
 ---
 title: "WireGuard"
-description: Shoes wireguard configuration.
+description: shoes wireguard configuration.
 ---
 
 **Complete example:** [wireguard_server.yaml](/examples/wireguard_server/). Adapt addresses and secrets before deployment.
@@ -131,13 +131,13 @@ peer_client_chain:
         udp_enabled: true
 ```
 
-The effective path is `Shoes -> peer client chain -> WireGuard peer -> optional
+The effective path is `shoes -> peer client chain -> WireGuard peer -> optional
 inner proxy chain -> destination`. The routing rule still selects WireGuard
 at hop zero. See [the complete detour example](/examples/wireguard_outer_chain/).
 
 Peer chains use the normal inline, named-group and pool syntax. Their final hop
 must support UDP; earlier hops may be TCP-only. VLESS, VMess and compatible
-Shadowsocks/AnyTLS UDP-over-TCP configurations work. Shoes' SOCKS outbound only
+Shadowsocks/AnyTLS UDP-over-TCP configurations work. shoes' SOCKS outbound only
 implements CONNECT, and Trojan outbound UDP is not implemented, so neither can
 be the final UDP hop. Pools select UDP-capable final members. Selection remains
 fixed for the life of an association; reconnection may select another member.
@@ -201,7 +201,7 @@ DNS, not DNS through the not-yet-active tunnel.
 
 This is TCP/UDP proxying, not arbitrary IP routing. Remote destinations see
 the gateway's outgoing proxy connection, not the original client's source
-address. A non-Shoes gateway must provide the required routes and forwarding
+address. A non-shoes gateway must provide the required routes and forwarding
 or NAT for destinations behind it. ICMP forwarding, IP fragment reassembly,
 peer-to-peer IP forwarding, WARP reserved bytes, and
 wg-quick import are not implemented.
@@ -216,7 +216,7 @@ replies should use TCP-based transports. Reduce MTU for constrained underlays;
 automatic path-MTU discovery is not provided.
 Packets received from a peer above the local MTU are also dropped. Configure
 matching MTUs on both sides, including peers whose default is 1420 rather than
-Shoes' 1408; TCP MSS negotiation does not protect UDP traffic.
+shoes' 1408; TCP MSS negotiation does not protect UDP traffic.
 
 Default admission limits are 256 TCP connections, 32 KiB TCP buffers, a
 32 MiB TCP buffer budget, 1024 UDP sessions, 4096 UDP destinations, 64
@@ -224,7 +224,7 @@ destinations per inbound UDP session, and 8 MiB queued UDP payloads.
 UDP forwarding and outbound associations have separate bounded pools.
 Missing or null limit fields use WireGuard defaults rather than the unlimited
 TUN defaults. Packet and command queues are bounded at 64. These budgets
-cover modeled Shoes-owned state, not total process RSS or all GotaTun state.
+cover modeled shoes-owned state, not total process RSS or all GotaTun state.
 
 The TCP buffers bound the advertised receive window and in-flight data across
 the tunnel. A 32 KiB window limits a single flow to roughly 5 Mbit/s at 50 ms RTT
@@ -241,6 +241,6 @@ handshake age, and byte counters. Private keys and PSKs are redacted.
 Preparation failures retain the old configuration. Reload activation stops
 existing tunnel flows and rebuilds endpoints; sessions are not migrated.
 Bind failures during activation trigger rollback to the previous configuration,
-but disconnected tunnel sessions are not restored. If rollback fails, Shoes
+but disconnected tunnel sessions are not restored. If rollback fails, shoes
 exits with status 1. Shutdown waits for buffered UDP tasks to release their
 sockets before rebind. No host route cleanup is necessary.

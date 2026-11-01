@@ -123,7 +123,7 @@ connections, at most 64 H1 connections, and a 60-second idle timeout.
   server request limits must accommodate the effective client POST depth plus
   one reserved head slot in server
   `limits.max_requests_per_session` (31 for the default H2/H3 client depth).
-  Lower the client depth when using a smaller server cap; Shoes does not replay
+  Lower the client depth when using a smaller server cap; shoes does not replay
   refused POSTs. Pool, byte and client request limits may reduce the effective depth.
   Each H2/H3 packet-up session can hold up to the effective POST depth plus one
   download slot in the shared pool (31 slots at the default depth). Delayed ACKs
@@ -154,7 +154,7 @@ connections, at most 64 H1 connections, and a 60-second idle timeout.
   H2 rejects never-admitted excess POSTs with `REFUSED_STREAM`, preserving the
   existing session. The pinned Xray transport can replay these requests with bounded
   backoff; HTTP 503 cannot provide that recovery. Refusal is not an unlimited-stall
-  guarantee or a universal retry mechanism: Shoes does not replay submitted POSTs,
+  guarantee or a universal retry mechanism: shoes does not replay submitted POSTs,
   and Mihomo does not provide Xray's replayable body. H1/H3 per-session overflow
   still terminates the session. Hard limits and inactivity expiry remain backstops,
   not promises of lossless operation under arbitrary overload.

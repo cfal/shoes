@@ -1,6 +1,6 @@
 ---
 title: "AnyTLS"
-description: Shoes anytls configuration.
+description: shoes anytls configuration.
 ---
 
 **Complete example:** [anytls.yaml](/examples/anytls/). Adapt addresses and secrets before deployment.
