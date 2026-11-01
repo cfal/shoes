@@ -295,10 +295,13 @@ pub async fn run_curl(url: &str, options: CurlOptions) -> std::io::Result<Output
             let mut child = cmd.spawn()?;
 
             // Write data to stdin
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(&data)?;
-                stdin.flush()?;
-                // stdin drops here, closing the pipe
+            if let Some(mut stdin) = child.stdin.take()
+                && let Err(error) = stdin.write_all(&data).and_then(|_| stdin.flush())
+            {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
             }
 
             // Wait for completion and collect output
@@ -467,6 +470,83 @@ pub async fn curl_post_https_tls12_via_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_stdin_failure_terminates_and_reaps_curl() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "SHOES_CURL_STDIN_FAILURE_CHILD";
+        const PID: &str = "SHOES_TEST_CURL_PID";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let script = directory.path().join("curl");
+            let pid_file = directory.path().join("pid");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nprintf '%s' \"$$\" > \"$SHOES_TEST_CURL_PID\"\nexec 0<&-\nexec sleep 30\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "curl::tests::post_stdin_failure_terminates_and_reaps_curl",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("SHOES_TEST_CURL_BIN", script)
+                .env(PID, pid_file)
+                .output()
+                .unwrap();
+            crate::isolated::assert_one_test_passed(&output);
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                run_curl(
+                    "http://127.0.0.1/",
+                    CurlOptions::new().post_data(vec![0; 1 << 20]),
+                ),
+            )
+            .await
+        });
+        let elapsed = started.elapsed();
+        let pid: libc::pid_t = std::fs::read_to_string(std::env::var_os(PID).unwrap())
+            .unwrap()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        let wait_error = std::io::Error::last_os_error().raw_os_error();
+        // Cleans up the deliberately persistent fixture even when testing a broken helper.
+        if waited == 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        assert_eq!(
+            result
+                .expect("curl stdin failure stalled")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(!alive, "curl child survived the stdin error");
+        assert_eq!(waited, -1, "curl child was not reaped before helper return");
+        assert_eq!(wait_error, Some(libc::ECHILD));
+        assert!(elapsed < Duration::from_secs(5));
+    }
 
     #[test]
     fn extracts_last_response_status() {
