@@ -355,6 +355,77 @@ async fn wireguard_partial_startup_releases_previously_started_endpoint() {
 }
 
 #[test]
+fn tendns_generator_uses_only_the_environment_key_and_prints_one_txt_value() {
+    use tendns::{
+        names::canonical_name,
+        protocol::{self, Secret, Value},
+        resolver::{Clock, SystemClock},
+    };
+
+    let key = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+    let args = [
+        "generate-tendns-txt",
+        "--name",
+        "example.com",
+        "--entry",
+        "nas:A:192.0.2.7",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+        .args(args)
+        .env("TENDNS_KEY", key)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    let publication = protocol::decrypt(
+        stdout.trim().as_bytes(),
+        &Secret::decode(key).unwrap(),
+        &canonical_name("example.com").unwrap(),
+        SystemClock.now().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(publication.entries.len(), 1);
+    assert_eq!(publication.entries[0].subdomain, "nas");
+    assert_eq!(
+        publication.entries[0].value,
+        Value::A("192.0.2.7".parse().unwrap())
+    );
+    assert!(!stdout.contains(key));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(key));
+    for secret in [None, Some("invalid-key-must-not-appear")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shoes"));
+        command.args(args).env_remove("TENDNS_KEY");
+        if let Some(secret) = secret {
+            command.env("TENDNS_KEY", secret);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("TENDNS_KEY"));
+        if let Some(secret) = secret {
+            assert!(!stderr.contains(secret));
+        }
+    }
+    for invalid in [["--key", key], ["--entry", ":A:192.0.2.7"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .args(args)
+            .args(invalid)
+            .env("TENDNS_KEY", key)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{invalid:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(key));
+    }
+}
+
+#[test]
 fn vless_encryption_generator_prints_only_matched_yaml_credentials() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     for (args, expected_public_lengths, expected_private_lengths) in [
