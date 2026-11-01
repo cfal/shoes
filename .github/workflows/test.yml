@@ -243,6 +243,15 @@ jobs:
         .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi
         rule_updater:: -- --test-threads=1
 
+    - name: Run whole-path routing and consumer tests
+      env:
+        CARGO_BUILD_JOBS: 1
+      run: |
+        for filter in client_proxy_chain:: config::composition_tests:: config::resolved:: control:: dns:: naiveproxy::; do
+          .github/require-tests.sh cargo test -p shoes --locked --lib --features ffi "$filter" -- --test-threads=1
+        done
+        .github/require-tests.sh cargo test -p shoes --locked --test process_contract --features ffi clash_api:: -- --test-threads=1
+
     - name: Run remote-rule process tests
       run: >-
         .github/require-tests.sh cargo test -p shoes --locked --test process_contract --features ffi
