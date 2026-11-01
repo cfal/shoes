@@ -612,20 +612,10 @@ async fn bootstrap_preflights_later_synthetic_endpoints_before_any_download() {
 async fn bootstrap_preflights_managed_system_dns_before_any_download() {
     const CHILD: &str = "SHOES_BOOTSTRAP_PREFLIGHT_TEST";
     if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "rule_updater::tests::bootstrap_preflights_managed_system_dns_before_any_download",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        shoes_test_support::isolated::run_isolated(
+            "rule_updater::tests::bootstrap_preflights_managed_system_dns_before_any_download",
+            CHILD,
+            "1",
         );
         return;
     }

@@ -674,14 +674,11 @@ mod tests {
         const CHILD: &str = "SHOES_RULE_UMASK_TEST";
         let Some(mask) = std::env::var_os(CHILD) else {
             for mask in ["200", "400", "600", "777"] {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "rule_updater::install::tests::new_sidecars_are_private_and_usable_under_restrictive_umasks", "--nocapture"])
-                    .env(CHILD, mask).output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "umask {mask}: {} {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
+                eprintln!("umask {mask}");
+                shoes_test_support::isolated::run_isolated(
+                    "rule_updater::install::tests::new_sidecars_are_private_and_usable_under_restrictive_umasks",
+                    CHILD,
+                    mask,
                 );
             }
             return;

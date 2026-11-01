@@ -1034,16 +1034,11 @@ async fn wireguard_nested_outer_chain_and_reload() {
     use serde_json::{Value, json};
     // Concurrent harness forks can retain even CLOEXEC sockets until exec completes.
     if std::env::var_os("SHOES_WIREGUARD_NESTED_RELOAD_CHILD").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "wireguard::tests::wireguard_nested_outer_chain_and_reload",
-                "--nocapture",
-            ])
-            .env("SHOES_WIREGUARD_NESTED_RELOAD_CHILD", "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        shoes_test_support::isolated::run_isolated(
+            "wireguard::tests::wireguard_nested_outer_chain_and_reload",
+            "SHOES_WIREGUARD_NESTED_RELOAD_CHILD",
+            "1",
+        );
         return;
     }
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -1321,14 +1316,7 @@ async fn wireguard_outer_socket_protection_failure_prevents_binding() {
     const NAME: &str =
         "wireguard::tests::wireguard_outer_socket_protection_failure_prevents_binding";
     if std::env::var_os("SHOES_WIREGUARD_PROTECTION_TEST").is_none() {
-        assert!(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", NAME])
-                .env("SHOES_WIREGUARD_PROTECTION_TEST", "1")
-                .status()
-                .unwrap()
-                .success()
-        );
+        shoes_test_support::isolated::run_isolated(NAME, "SHOES_WIREGUARD_PROTECTION_TEST", "1");
         return;
     }
     crate::tun::set_global_socket_protector(Arc::new(crate::tun::FnSocketProtector::new(|_| {

@@ -87,40 +87,12 @@ async fn closed(stream: &mut TcpStream) {
     }
 }
 
-fn run_isolated(name: &str) {
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("SHOES_RETENTION_CHILD", "1")
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    print!("{stdout}");
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    assert!(
-        output.status.success(),
-        "isolated child failed: {}",
-        output.status
-    );
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.starts_with("test result: ok. 1 passed;")),
-        "isolated child did not run exactly one test"
-    );
-}
-
-#[test]
-#[should_panic(expected = "isolated child did not run exactly one test")]
-fn isolated_child_rejects_empty_filter() {
-    run_isolated("process::retention_tests::nonexistent_test");
-}
-
 #[test]
 fn repeated_setup_cancellation_reload_and_owner_drop_restore_resources() {
     // Global budgets and /proc/self/fd cannot be measured alongside other libtests.
     const NAME: &str = "process::retention_tests::repeated_setup_cancellation_reload_and_owner_drop_restore_resources";
     if std::env::var_os("SHOES_RETENTION_CHILD").is_none() {
-        run_isolated(NAME);
+        shoes_test_support::isolated::run_isolated(NAME, "SHOES_RETENTION_CHILD", "1");
         return;
     }
     tokio::runtime::Builder::new_current_thread()

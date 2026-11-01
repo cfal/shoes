@@ -6,16 +6,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 fn managed_sources_release_listeners_and_storage_on_stop_and_rollback() {
     const CHILD: &str = "SHOES_FFI_CERTIFICATES_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "ffi::common::certificate_tests::managed_sources_release_listeners_and_storage_on_stop_and_rollback", "--nocapture"])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        shoes_test_support::isolated::run_isolated(
+            "ffi::common::certificate_tests::managed_sources_release_listeners_and_storage_on_stop_and_rollback",
+            CHILD,
+            "1",
         );
         return;
     }
@@ -79,16 +73,10 @@ fn managed_sources_release_listeners_and_storage_on_stop_and_rollback() {
 fn file_watches_rotate_embedded_tls_without_restarting_the_instance() {
     const CHILD: &str = "SHOES_FFI_FILE_CERTIFICATES_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "ffi::common::certificate_tests::file_watches_rotate_embedded_tls_without_restarting_the_instance", "--nocapture"])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        shoes_test_support::isolated::run_isolated(
+            "ffi::common::certificate_tests::file_watches_rotate_embedded_tls_without_restarting_the_instance",
+            CHILD,
+            "1",
         );
         return;
     }

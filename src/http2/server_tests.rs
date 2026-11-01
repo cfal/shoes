@@ -660,16 +660,11 @@ fn connect_authority_and_method_validation() {
 async fn admission_permits_are_released_on_reset_and_owner_drop() {
     const CHILD: &str = "SHOES_HTTP2_ADMISSION_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "http2::server::tests::admission_permits_are_released_on_reset_and_owner_drop",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        shoes_test_support::isolated::run_isolated(
+            "http2::server::tests::admission_permits_are_released_on_reset_and_owner_drop",
+            CHILD,
+            "1",
+        );
         return;
     }
     resources::configure(crate::config::GlobalLimits {

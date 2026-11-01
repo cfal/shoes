@@ -670,15 +670,11 @@ async fn heterogeneous_group_retries_truncated_udp_over_configured_tcp() {
 #[tokio::test]
 async fn dns_bootstrap_uses_live_quic_admission_before_activation() {
     if std::env::var_os("SHOES_DNS_ADMISSION_TEST_CHILD").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "dns::builder::tests::dns_bootstrap_uses_live_quic_admission_before_activation",
-            ])
-            .env("SHOES_DNS_ADMISSION_TEST_CHILD", "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        shoes_test_support::isolated::run_isolated(
+            "dns::builder::tests::dns_bootstrap_uses_live_quic_admission_before_activation",
+            "SHOES_DNS_ADMISSION_TEST_CHILD",
+            "1",
+        );
         return;
     }
     let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -726,15 +722,11 @@ async fn dns_bootstrap_uses_live_quic_admission_before_activation() {
 #[tokio::test]
 async fn prepared_dns_chains_use_candidate_quic_windows() {
     if std::env::var_os("SHOES_DNS_CANDIDATE_TEST_CHILD").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "dns::builder::tests::prepared_dns_chains_use_candidate_quic_windows",
-            ])
-            .env("SHOES_DNS_CANDIDATE_TEST_CHILD", "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        shoes_test_support::isolated::run_isolated(
+            "dns::builder::tests::prepared_dns_chains_use_candidate_quic_windows",
+            "SHOES_DNS_CANDIDATE_TEST_CHILD",
+            "1",
+        );
         return;
     }
     let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();

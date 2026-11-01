@@ -2,6 +2,7 @@
 
 pub mod certs;
 pub mod curl;
+pub mod isolated;
 pub mod measure;
 pub mod port_helper;
 pub mod process;

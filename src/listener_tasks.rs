@@ -269,16 +269,11 @@ mod tests {
     async fn quic_reload_disconnects_connections_and_accepts_new_peers() {
         // Concurrent harness forks can retain even CLOEXEC sockets until exec completes.
         if std::env::var_os("SHOES_QUIC_RETIREMENT_TEST_CHILD").is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "listener_tasks::tests::quic_reload_disconnects_connections_and_accepts_new_peers",
-                    "--nocapture",
-                ])
-                .env("SHOES_QUIC_RETIREMENT_TEST_CHILD", "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+            shoes_test_support::isolated::run_isolated(
+                "listener_tasks::tests::quic_reload_disconnects_connections_and_accepts_new_peers",
+                "SHOES_QUIC_RETIREMENT_TEST_CHILD",
+                "1",
+            );
             return;
         }
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();

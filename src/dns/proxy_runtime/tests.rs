@@ -256,16 +256,11 @@ fn run_quic_test_in_child(name: &str) -> bool {
         .unwrap();
         return false;
     }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            &format!("dns::proxy_runtime::tests::{name}"),
-            "--nocapture",
-        ])
-        .env("SHOES_DNS_QUIC_TEST_CHILD", name)
-        .status()
-        .unwrap();
-    assert!(status.success());
+    shoes_test_support::isolated::run_isolated(
+        &format!("dns::proxy_runtime::tests::{name}"),
+        "SHOES_DNS_QUIC_TEST_CHILD",
+        name,
+    );
     true
 }
 
