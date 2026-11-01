@@ -68,6 +68,9 @@ fake_ip:
   transfers, and non-query operations are refused. Synthesized answers are
   unsigned and do not claim DNSSEC authentication.
 
+A `global_settings.default_dns` with `fake_ip` shares one pool across inheriting
+inbounds; see [global settings](/config/global-settings/#default-dns).
+
 Named DNS groups share one pool across every referencing inbound:
 
 ```yaml
@@ -79,8 +82,8 @@ Named DNS groups share one pool across every referencing inbound:
   dns: {servers: shared-fake}
 ```
 
-Inline `fake_ip` creates a private context, even when `servers` references a
-named group. Omit the inline override to share the group's mappings. Combining
+Per-inbound inline `fake_ip` creates a private context, even when `servers`
+references a named group. Omit the inline override to share the group's mappings. Combining
 fake-enabled groups requires an explicit policy on the composed group.
 
 Private context identity uses the server transport and configured listen addresses

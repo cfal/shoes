@@ -3,7 +3,9 @@ title: "DNS配置"
 description: "选择解析器、可重用组、引导程序和代理路由。"
 ---
 
-服务器、WireGuard 监听器或 TUN 条目可以选择内联解析器或命名的 `dns_group`。省略`dns`使用本机系统解析器；请参阅[本机 DNS 新鲜度](/zh-cn/dns/native/) 了解其缓存行为。仅当需要合成地址映射时才使用[Fake DNS](/zh-cn/dns/fake/)。
+服务器、WireGuard 监听器或 TUN 条目可以选择内联解析器或命名的 `dns_group`。省略 `dns` 或将其设为 null 时，若设置了 `global_settings.default_dns` 则继承它，否则使用本机系统解析器；请参阅[本机 DNS 新鲜度](/zh-cn/dns/native/) 了解其缓存行为。仅当需要合成地址映射时才使用[Fake DNS](/zh-cn/dns/fake/)。
+
+显式的 `dns` 对象（包括 `dns: {}`）会替换默认值；优先级和适用范围参见[全局设置](/zh-cn/config/global-settings/#default-dns)。
 
 **完整示例：** [dns_tuning.yaml](/zh-cn/examples/dns_tuning/)。其代理地址和凭据需要特定于部署的值。
 

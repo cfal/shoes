@@ -1,6 +1,6 @@
 ---
 title: Global settings
-description: Process-wide admission limits, remote-rule cache, QUIC buffers, and reload grace periods.
+description: Default DNS, admission limits, remote-rule cache, QUIC buffers, and reload grace periods.
 ---
 
 Use at most one `global_settings` entry across all configuration files. Omitted
@@ -28,6 +28,33 @@ bootstrap, and restart requirements.
 deprecated. Rename it to `global_settings`. Both names count toward the same
 single-entry limit, even for empty entries. Serialization always uses
 `global_settings`.
+
+## Default DNS
+
+`default_dns` accepts the same object as a listener's `dns`: a `servers` group
+reference or inline upstreams, and optional `fake_ip` settings.
+A `default_dns` object with omitted or empty `servers` uses the underlying
+system resolver, including when it specifies only fake-IP settings.
+
+```yaml
+- global_settings:
+    default_dns:
+      servers: secure-dns
+```
+
+Listeners, TUN entries, and WireGuard inbounds with omitted or null `dns` inherit
+this default. An explicit `dns` object replaces it completely, without merging
+fields. In any explicit object, omitted or empty `servers` uses the underlying
+system resolver; it never inherits the default again. `dns: {}` therefore opts
+out. See [native DNS](/dns/native/) for system resolver caching.
+
+An inline default creates one shared resolver group. If it enables fake IPs,
+all inheriting inbounds share one mapping pool and state file, owned by
+`global_settings` independently of listener identities.
+
+Independent DNS bootstrap, rule downloads, ACME, WireGuard peer preparation,
+and controller probes do not inherit this setting. See
+[DNS configuration](/dns/configuration/) for upstream options and bootstrap requirements.
 
 ## Admission caps
 

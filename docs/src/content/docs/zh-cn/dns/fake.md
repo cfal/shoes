@@ -36,6 +36,8 @@ fake_ip:
 - `https_records: forward` 保留 HTTPS/SVCB 答案； `suppress` 为这两种类型返回空的成功答案。转发的地址提示和 ECH 可以绕过基于主机名的路由；压制会牺牲这些能力。
 - 其他记录类型使用真正的上游交换。保留有效的否定/错误答案。多问题查询收到FORMERR； TSIG/SIG(0)、区域传输和非查询操作被拒绝。综合答案未签名，并且不声明 DNSSEC 身份验证。
 
+包含 `fake_ip` 的 `global_settings.default_dns` 会让所有继承它的入站共享一个池；参见[全局设置](/zh-cn/config/global-settings/#default-dns)。
+
 命名的 DNS 组在每个引用入站之间共享一个池：
 
 ```yaml
@@ -47,7 +49,7 @@ fake_ip:
   dns: {servers: shared-fake}
 ```
 
-内联 `fake_ip` 会创建私有上下文，即使 `servers` 引用命名组也是如此。省略内联覆盖以共享组的映射。组合启用假的组需要对组合组制定明确的策略。
+每个入站自身的内联 `fake_ip` 会创建私有上下文，即使 `servers` 引用命名组也是如此。省略内联覆盖以共享组的映射。组合启用假的组需要对组合组制定明确的策略。
 
 私有上下文身份使用服务器传输和配置的侦听地址（包括它们的顺序）或 Unix 套接字路径。 TUN上下文使用`device_name`（省略时为`default`）； WireGuard 上下文使用 [名称/公钥身份](/zh-cn/protocols/wireguard/)。更改这些输入会更改专用池和快照所有权。当所有权必须保留监听器更改或地址重新排序时，请使用命名的 `dns_group`。具有不同所有者的现有状态文件将被拒绝。
 
