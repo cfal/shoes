@@ -195,3 +195,6 @@ impl<S: AsyncStream> AsyncPing for VlessMessageStream<S> {
 }
 
 impl<S: AsyncStream> AsyncMessageStream for VlessMessageStream<S> {}
+
+#[cfg(test)]
+mod tests;
