@@ -1,4 +1,5 @@
 /target
+/benches/results/
 /.workstream-evidence/
 /*.yaml
 *.pem

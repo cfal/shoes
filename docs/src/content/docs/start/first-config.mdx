@@ -1,0 +1,24 @@
+---
+title: First configuration
+description: Validate and run a local SOCKS5 listener.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import quickstart from '../../../../../examples/quickstart_socks.yaml?raw';
+
+This example listens on loopback, so only programs on the same machine can connect. It requires no certificate or external proxy.
+
+Create `quickstart_socks.yaml` in your working directory with this configuration:
+
+<Code code={quickstart} lang="yaml" title="quickstart_socks.yaml" />
+
+With [Shoes installed](/start/installation/), validate the file before starting a listener:
+
+```sh
+shoes check quickstart_socks.yaml
+shoes quickstart_socks.yaml
+```
+
+Point a SOCKS5-capable application at `127.0.0.1:1080`. The listener allows direct connections by default. To accept remote users, bind to another interface and add authentication and destination rules before exposing the port. See [SOCKS5](/protocols/socks5/) and [rules](/routing/rules/).
+
+`check` validates syntax, certificates, and configuration relationships but does not bind sockets or perform DNS bootstrap networking. A successful check does not guarantee that the listener can start on this machine.

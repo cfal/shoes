@@ -1,0 +1,23 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { Code } from '@astrojs/starlight/components';
+import { examples } from '../../data/examples';
+import { sourceRef, sourceRefKnown } from '../../../metadata.mjs';
+
+export function getStaticPaths() {
+  return examples.map((example) => ({ params: { name: example.slug }, props: example }));
+}
+
+const { filename, code } = Astro.props;
+---
+
+<StarlightPage frontmatter={{ title: filename, description: `Shoes configuration example: ${filename}`, editUrl: false }}>
+  <p><a href="/start/examples/">All examples</a></p>
+  <p>
+    Change addresses, credentials, certificate paths, and other deployment-specific values before use.
+    This is a complete source file, not a guarantee it can run unchanged on your machine.
+    Read its comments for prerequisites, then run <code>shoes check</code> with the adapted file.
+  </p>
+  <Code code={code} lang="yaml" title={`examples/${filename}`} />
+  {sourceRefKnown && <p><a href={`https://github.com/cfal/shoes/blob/${sourceRef}/examples/${filename}`}>View source at this revision</a></p>}
+</StarlightPage>
