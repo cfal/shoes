@@ -161,6 +161,23 @@ impl AutomaticGroup {
     pub fn choose(&self, eligible: &HashSet<&str>, udp: bool) -> Option<String> {
         let now = Instant::now();
         let mut state = self.state.lock();
+        let selected = self.select_member(&state, eligible, udp, now);
+        state.incumbent[usize::from(udp)] = selected.clone();
+        selected
+    }
+
+    pub(crate) fn peek(&self, eligible: &HashSet<&str>, udp: bool) -> Option<String> {
+        let now = Instant::now();
+        self.select_member(&self.state.lock(), eligible, udp, now)
+    }
+
+    fn select_member(
+        &self,
+        state: &State,
+        eligible: &HashSet<&str>,
+        udp: bool,
+        now: Instant,
+    ) -> Option<String> {
         let delay = |name: &str| {
             state
                 .samples
@@ -177,7 +194,7 @@ impl AutomaticGroup {
         let incumbent = state.incumbent[usize::from(udp)]
             .as_ref()
             .filter(|name| eligible.contains(name.as_str()));
-        let selected = match (best, incumbent) {
+        match (best, incumbent) {
             (Some((best, best_delay)), Some(current)) => {
                 if delay(current).is_some_and(|delay| {
                     u32::from(delay) <= u32::from(best_delay) + u32::from(self.config.tolerance)
@@ -194,9 +211,7 @@ impl AutomaticGroup {
                 .iter()
                 .find(|name| eligible.contains(name.as_str()))
                 .cloned(),
-        };
-        state.incumbent[usize::from(udp)] = selected.clone();
-        selected
+        }
     }
 
     pub fn health(&self, member: &str) -> &'static str {
@@ -348,6 +363,26 @@ mod tests {
         assert!(group.choose(&HashSet::new(), true).is_none());
         groups.record("a", &group.config.url, Some(150));
         assert_eq!(group.choose(&both, false).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn peeking_with_different_eligibility_preserves_forwarding_incumbents() {
+        let groups = groups();
+        let group = &groups.0["one"];
+        let both = HashSet::from(["a", "b"]);
+        let only_b = HashSet::from(["b"]);
+        groups.record("a", &group.config.url, Some(100));
+        groups.record("b", &group.config.url, Some(140));
+        for udp in [false, true] {
+            assert_eq!(group.peek(&only_b, udp).as_deref(), Some("b"));
+            assert_eq!(group.state.lock().incumbent[usize::from(udp)], None);
+            assert_eq!(group.choose(&both, udp).as_deref(), Some("a"));
+            assert_eq!(group.peek(&only_b, udp).as_deref(), Some("b"));
+            assert!(group.peek(&HashSet::new(), udp).is_none());
+            assert_eq!(group.choose(&both, udp).as_deref(), Some("a"));
+            assert_eq!(group.choose(&only_b, udp).as_deref(), Some("b"));
+            assert_eq!(group.peek(&both, udp).as_deref(), Some("b"));
+        }
     }
 
     #[tokio::test(start_paused = true)]

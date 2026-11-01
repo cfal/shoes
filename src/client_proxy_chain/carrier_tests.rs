@@ -127,6 +127,66 @@ fn url_test_deep_udp_selection_survives_dashboard_reads() {
 }
 
 #[test]
+fn nonterminal_url_test_udp_selection_survives_dashboard_reads() {
+    use serde_json::json;
+
+    let mut validated = crate::config::create_server_configs(
+        serde_json::from_value(json!([
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/",
+             "tolerance":50, "client_chains":[
+                {"chain":[{"name":"http", "address":"127.0.0.1:8000", "protocol":{"type":"http"}}]},
+                {"chain":[{"name":"udp", "address":"127.0.0.1:8001", "protocol":{
+                    "type":"vless", "user_id":"550e8400-e29b-41d4-a716-446655440000"}}]}
+             ]},
+            {"address":"127.0.0.1:1080", "protocol":{"type":"socks"}, "rules":[
+                {"mask":"0.0.0.0/0", "action":"allow", "client_chain":["auto",
+                    {"address":"127.0.0.1:8002", "protocol":{
+                        "type":"vless", "user_id":"550e8400-e29b-41d4-a716-446655440000"}}
+                ]}
+            ]}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let catalog = validated.catalog.take().unwrap();
+    catalog
+        .selection
+        .automatic
+        .record("http", "http://probe.invalid/", Some(100));
+    catalog
+        .selection
+        .automatic
+        .record("udp", "http://probe.invalid/", Some(140));
+    let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
+        panic!()
+    };
+    let crate::config::ResolvedRuleActionConfig::Allow { client_chains, .. } =
+        server.rules.into_vec().remove(0).action
+    else {
+        panic!()
+    };
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let group =
+        crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver.clone())
+            .unwrap();
+    let generation = crate::control::runtime::Generation {
+        id: 1,
+        leaf_udp_support: crate::clash_api::dto::leaf_udp_support(&catalog).unwrap(),
+        catalog,
+        rules: Vec::new(),
+        probes: crate::clash_api::probes::ProbeState::new(resolver, Vec::new()),
+    };
+    let chain = &group.chains[0];
+    assert_eq!(chain.select_indices(true).unwrap(), [0, 0]);
+    for _ in 0..2 {
+        let nodes = crate::clash_api::dto::proxies(&generation);
+        assert_eq!(nodes["proxies"]["auto"]["now"], "http");
+        assert_eq!(nodes["proxies"]["auto"]["udpNow"], "udp");
+        assert_eq!(chain.select_indices(true).unwrap(), [0, 0]);
+    }
+}
+
+#[test]
 fn unselected_large_pools_keep_constant_time_round_robin() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let sockets: Vec<Arc<dyn SocketConnector>> = (0..10_000)

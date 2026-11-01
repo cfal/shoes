@@ -1476,27 +1476,35 @@ async fn url_test_automatic_real_proxy_probes_select_fast_sticky_recovered_membe
         publish_for_api_probes(&service.runtime, &generation).await;
         let members = vec!["a".into(), "b".into()];
         let query = query();
-        let selected_member =
-            || crate::clash_api::dto::proxies(&generation)["proxies"]["auto"]["now"].clone();
+        let eligible = members.iter().map(String::as_str).collect();
+        let select_member = || {
+            let selected = generation.catalog.selection.automatic.0["auto"]
+                .choose(&eligible, false)
+                .unwrap();
+            let displayed =
+                crate::clash_api::dto::proxies(&generation)["proxies"]["auto"]["now"].clone();
+            assert_eq!(displayed, selected);
+            selected
+        };
 
         a_delay.store(250, Relaxed);
         probe_group(&service.runtime, &generation, &members, &query)
             .await
             .unwrap();
-        assert_eq!(selected_member(), "b");
+        assert_eq!(select_member(), "b");
 
         a_delay.store(1, Relaxed);
         b_delay.store(30, Relaxed);
         probe_group(&service.runtime, &generation, &members, &query)
             .await
             .unwrap();
-        assert_eq!(selected_member(), "b");
+        assert_eq!(select_member(), "b");
 
         b_fail.store(true, Relaxed);
         probe_group(&service.runtime, &generation, &members, &query)
             .await
             .unwrap();
-        assert_eq!(selected_member(), "a");
+        assert_eq!(select_member(), "a");
 
         b_fail.store(false, Relaxed);
         b_delay.store(1, Relaxed);
@@ -1504,7 +1512,7 @@ async fn url_test_automatic_real_proxy_probes_select_fast_sticky_recovered_membe
         probe_group(&service.runtime, &generation, &members, &query)
             .await
             .unwrap();
-        assert_eq!(selected_member(), "b");
+        assert_eq!(select_member(), "b");
 
         let mut other = query;
         other.url.set_path("/different");
@@ -1513,7 +1521,7 @@ async fn url_test_automatic_real_proxy_probes_select_fast_sticky_recovered_membe
         probe_group(&service.runtime, &generation, &members, &other)
             .await
             .unwrap();
-        assert_eq!(selected_member(), "b");
+        assert_eq!(select_member(), "b");
         let dto = &crate::clash_api::dto::proxies(&generation)["proxies"]["auto"];
         assert_eq!(dto["type"], "URLTest");
         assert_eq!(dto["health"], "healthy");

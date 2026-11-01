@@ -169,7 +169,8 @@ unfiltered probes.
 All occurrences of a URL-test group share its samples and TCP/UDP incumbents.
 There are no route contexts, per-occurrence probe rounds, or contextual samplers.
 Forwarding and dashboard selection consult the same group state, subject to each
-caller's transport eligibility. Any effective manual selector change clears all
+caller's transport eligibility. Dashboard reads do not change forwarding incumbents.
+Any effective manual selector change clears all
 URL-test samples and incumbents and fences in-flight results, even for unrelated
 groups. Selecting the same effective choice preserves samples. Groups become due
 again, after any active round finishes; no selector dependency graph is maintained.

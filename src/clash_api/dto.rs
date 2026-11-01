@@ -87,7 +87,7 @@ fn automatic_member(
         .filter(|name| !udp || supports_udp(generation, choices, name))
         .map(String::as_str)
         .collect();
-    group.choose(&eligible, udp)
+    group.peek(&eligible, udp)
 }
 
 fn supports_udp(generation: &Generation, choices: &Choices, name: &str) -> bool {
