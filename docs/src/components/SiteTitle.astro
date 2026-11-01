@@ -1,21 +1,26 @@
 ---
 import DefaultSiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
 import { Icon } from '@astrojs/starlight/components';
+import LanguageSelect from 'virtual:starlight/components/LanguageSelect';
 import { docsLabel, sourceRef, sourceRefKnown } from '../../metadata.mjs';
+
+const chinese = Astro.currentLocale === 'zh-CN';
+const repositoryLabel = chinese ? 'GitHub 上的 shoes' : 'shoes on GitHub';
 ---
 
 <div class="site-identity">
   <div class="brand">
     <DefaultSiteTitle />
-    <a class="repository" href="https://github.com/cfal/shoes" aria-label="Shoes on GitHub" title="Shoes on GitHub">
+    <a class="repository" href="https://github.com/cfal/shoes" aria-label={repositoryLabel} title={repositoryLabel}>
       <Icon name="github" size="1.25rem" />
     </a>
+    <div class="mobile-language"><LanguageSelect /></div>
   </div>
-  <div class="docs-version" role="note" aria-label="Documentation version" data-pagefind-ignore>
-    <span title={docsLabel === 'dev' ? 'Unreleased development documentation' : docsLabel}>{docsLabel}</span>
+  <div class="docs-version" role="note" aria-label={chinese ? '文档版本' : 'Documentation version'} data-pagefind-ignore>
+    <span title={docsLabel === 'dev' ? (chinese ? '未发布的开发版文档' : 'Unreleased development documentation') : docsLabel}>{docsLabel}</span>
     {sourceRefKnown
-      ? <a href={`https://github.com/cfal/shoes/commit/${sourceRef}`}>Source {sourceRef.slice(0, 12)}</a>
-      : <span>Source revision unavailable</span>}
+      ? <a href={`https://github.com/cfal/shoes/commit/${sourceRef}`}>{chinese ? '源代码' : 'Source'} {sourceRef.slice(0, 12)}</a>
+      : <span>{chinese ? '源代码版本不可用' : 'Source revision unavailable'}</span>}
   </div>
 </div>
 
@@ -46,6 +51,19 @@ import { docsLabel, sourceRef, sourceRefKnown } from '../../metadata.mjs';
     color: var(--sl-color-text);
   }
   .repository:hover { color: var(--sl-color-text-accent); }
+  .mobile-language {
+    display: inline-flex;
+    align-items: center;
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+  .mobile-language :global(starlight-lang-select label) { --sl-label-icon-size: 1.25rem; }
+  .mobile-language :global(starlight-lang-select select) {
+    width: 2.5rem;
+    color: transparent;
+  }
+  .mobile-language :global(starlight-lang-select .label-icon) { inset-inline-start: 0.625rem; }
+  .mobile-language :global(starlight-lang-select .caret) { display: none; }
   .docs-version {
     color: var(--sl-color-gray-2);
     font-size: 0.75rem;
@@ -54,6 +72,7 @@ import { docsLabel, sourceRef, sourceRefKnown } from '../../metadata.mjs';
   .docs-version a { color: inherit; }
   @media (min-width: 50rem) {
     :global(:root) { --sl-nav-height: 4rem; }
+    .mobile-language { display: none; }
     .site-identity {
       flex-direction: row;
       align-items: center;

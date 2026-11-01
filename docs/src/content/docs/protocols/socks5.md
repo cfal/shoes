@@ -1,6 +1,6 @@
 ---
 title: "SOCKS5"
-description: Shoes socks5 configuration.
+description: shoes socks5 configuration.
 ---
 
 **Complete example:** [socks_basic.yaml](/examples/socks_basic/). Adapt addresses and secrets before deployment.

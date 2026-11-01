@@ -41,17 +41,21 @@ source object works in `rule_source_group.rules`, under `masks` (including
 ```
 
 Replace `proxy.example.net:1080` with your proxy address. `download.client_chain` accepts
-the existing chain, pool, inline-client, and group syntax. It is independent of
+the [chain, pool, inline-client, and whole-path group syntax](/routing/rules/#client-chains). It is independent of
 the outer policy's `client_chain`, which routes matched traffic. Both
 `download.client_chain` and `download.bootstrap_url` are required. Bootstrap may
 be `system`, an IP-based DNS URL, or a named DNS group. Target and proxy hostnames
 use this resolver; failed refresh routing never falls back to direct. Automatic
 refresh uses the active generation's DNS, proxy clients, and selector choices.
+Named groups retain their round-robin, selector, or URL-test policies and pin one
+complete path per connection attempt. Hosts with several resolved addresses may
+try a different path for each address. The stricter missing-content bootstrap
+rules below still apply.
 
 All runtime remote sources use compiled rules retained in memory, including when
 disk caching is enabled. Reloads reuse sources whose URL and decoding options
 are unchanged; runtime compilation never falls back to cache files.
-Omit `global_settings.rule_cache_dir` to disable persistence. Shoes downloads required sources
+Omit `global_settings.rule_cache_dir` to disable persistence. shoes downloads required sources
 before starting listeners. Periodic refresh still applies;
 failed downloads or rejected candidates leave the active rules unchanged. No
 cache, lock, staging, or temporary files are created. Download buffers are released
@@ -68,7 +72,7 @@ older cached rules or require network access.
 Use persistent caching on routers that must restart while the origin is unavailable.
 Its value is relative to the declaring file and fixed for the process lifetime:
 adding, changing, or removing it requires a restart, even without remote sources.
-Remote `path` is optional: when omitted, Shoes generates a stable filename from
+Remote `path` is optional: when omitted, shoes generates a stable filename from
 the URL and decoding options. Explicit remote paths require `rule_cache_dir` and
 must be direct children of that directory. Configuration, local
 rule sources (including aliases), PEMs, sockets, and other state must be outside
@@ -141,7 +145,7 @@ Earlier completed saves remain if a later download, configuration check, or acti
 per-file repair, not a multi-file disk transaction or a promise of activation.
 
 The process refreshes due sources serially, with 10% jitter and capped exponential
-failure backoff. Downloaded sources pass Shoes' actual decoders, compilation budgets,
+failure backoff. Downloaded sources pass shoes' actual decoders, compilation budgets,
 and validation against the active configuration snapshot before replacing retained
 rules. Persistent and nonpersistent sources use this same validation path.
 The initial due time is based on a restored cache's mtime or the initial download

@@ -1,7 +1,11 @@
 ---
 title: "Proxy Chaining"
-description: Shoes proxy chaining configuration.
+description: shoes proxy chaining configuration.
 ---
+
+**Complete examples:** [multi-hop chains](/examples/multi_hop_chain/) and
+[whole-path client groups](/examples/chain_groups/). Adapt addresses and
+credentials before deployment. The fragments below are illustrative.
 
 **Protocol nesting** (wrap one protocol in another):
 
@@ -34,6 +38,6 @@ client_chain:
 
 For `client_chains`, group references, and `pool:` hops, see
 [routing rules](/routing/rules/#client-chains). Define named groups under
-[client proxy groups](/routing/groups/#client-proxy-group); see the
+[client groups](/routing/groups/#client-group); see the
 [controller and selectors](/routing/clash-controller/) page for `selector` and
 `url-test` selection.

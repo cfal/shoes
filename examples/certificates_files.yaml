@@ -1,4 +1,4 @@
-# Renew these files with an external ACME client. No Shoes reload is required.
+# Renew these files with an external ACME client. No shoes reload is required.
 - certificate_source: public
   type: files
   cert: /etc/shoes/certs/fullchain.pem

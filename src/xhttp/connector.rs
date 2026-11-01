@@ -5,7 +5,7 @@ use crate::{
     address::NetLocation,
     async_stream::AsyncStream,
     config::xhttp::{XhttpMode, XhttpVersion, invalid},
-    config::{ClientConfig, ClientProxyConfig, GlobalLimits, Transport},
+    config::{GlobalLimits, ResolvedClientConfig, ResolvedClientProxyConfig, Transport},
     crypto::{CryptoTlsStream, TlsConnection, TlsReadMode},
     resolver::Resolver,
     tcp::tcp_handler::TcpClientHandler,
@@ -70,14 +70,14 @@ impl Security {
     }
 }
 
-pub fn contains(config: &ClientProxyConfig) -> bool {
+pub fn contains(config: &ResolvedClientProxyConfig) -> bool {
     match config {
-        ClientProxyConfig::SudokuMask(config) => contains(&config.protocol),
-        ClientProxyConfig::Xhttp(_) => true,
-        ClientProxyConfig::Tls(tls) => contains(&tls.protocol),
-        ClientProxyConfig::Reality { protocol, .. }
-        | ClientProxyConfig::ShadowTls { protocol, .. } => contains(protocol),
-        ClientProxyConfig::Websocket(ws) => contains(&ws.protocol),
+        ResolvedClientProxyConfig::SudokuMask(config) => contains(&config.protocol),
+        ResolvedClientProxyConfig::Xhttp(_) => true,
+        ResolvedClientProxyConfig::Tls(tls) => contains(&tls.protocol),
+        ResolvedClientProxyConfig::Reality { protocol, .. }
+        | ResolvedClientProxyConfig::ShadowTls { protocol, .. } => contains(protocol),
+        ResolvedClientProxyConfig::Websocket(ws) => contains(&ws.protocol),
         _ => false,
     }
 }
@@ -85,7 +85,7 @@ pub fn contains(config: &ClientProxyConfig) -> bool {
 type ClientTransport = (Arc<Client>, Box<dyn TcpClientHandler>);
 
 pub fn build(
-    config: &ClientConfig,
+    config: &ResolvedClientConfig,
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<Option<ClientTransport>> {
     // DNS preparation can build connectors before candidate limits replace the live policy.
@@ -94,27 +94,27 @@ pub fn build(
 }
 
 pub(crate) fn build_with_limits(
-    config: &ClientConfig,
+    config: &ResolvedClientConfig,
     resolver: Arc<dyn Resolver>,
     global_limits: GlobalLimits,
 ) -> io::Result<Option<ClientTransport>> {
     if !contains(&config.protocol) {
         return Ok(None);
     }
-    crate::sudoku_mask::validate_client(&config.protocol, &config.transport)?;
+    crate::sudoku_mask::validate_resolved_client(&config.protocol, &config.transport)?;
     if config.transport == Transport::Udp {
         return Err(invalid("XHTTP requires TCP or QUIC transport"));
     }
     let mut protocol = &config.protocol;
     let mut masks = Vec::new();
-    while let ClientProxyConfig::SudokuMask(mask) = protocol {
+    while let ResolvedClientProxyConfig::SudokuMask(mask) = protocol {
         masks.push(mask.prepare()?);
         protocol = &mask.protocol;
     }
     let mut outer = protocol.clone();
     let default_sni = config.address.address().hostname().map(str::to_owned);
     let (xhttp, effective_sni, security, tls_alpn, reality) = match &mut outer {
-        ClientProxyConfig::Xhttp(xhttp) => (
+        ResolvedClientProxyConfig::Xhttp(xhttp) => (
             xhttp.clone(),
             match config.quic_settings.as_ref() {
                 Some(q) if !q.sni_hostname.is_unspecified() => q.sni_hostname.clone().into_option(),
@@ -124,8 +124,8 @@ pub(crate) fn build_with_limits(
             None,
             false,
         ),
-        ClientProxyConfig::Tls(tls) => {
-            let ClientProxyConfig::Xhttp(xhttp) = tls.protocol.as_ref() else {
+        ResolvedClientProxyConfig::Tls(tls) => {
+            let ResolvedClientProxyConfig::Xhttp(xhttp) = tls.protocol.as_ref() else {
                 return Err(invalid("XHTTP must be directly inside TLS"));
             };
             if tls.vision {
@@ -181,14 +181,14 @@ pub(crate) fn build_with_limits(
                 false,
             )
         }
-        ClientProxyConfig::Reality {
+        ResolvedClientProxyConfig::Reality {
             protocol,
             sni_hostname,
             vision,
             ..
         } => {
-            let ClientProxyConfig::Xhttp(xhttp) =
-                std::mem::replace(protocol.as_mut(), ClientProxyConfig::PortForward)
+            let ResolvedClientProxyConfig::Xhttp(xhttp) =
+                std::mem::replace(protocol.as_mut(), ResolvedClientProxyConfig::PortForward)
             else {
                 return Err(invalid("XHTTP must be directly inside REALITY"));
             };
@@ -299,7 +299,7 @@ mod tests {
             json!({"type":"xhttp","protocol":mask(json!({"type":"socks"}))}),
         ] {
             for protocol in [protocol.clone(), mask(protocol)] {
-                let config = serde_json::from_value(json!({
+                let config = crate::config::test_support::from_json(json!({
                     "address":"localhost:443","protocol":protocol
                 }))
                 .unwrap();
@@ -316,7 +316,7 @@ mod tests {
     fn ipv6_literal_endpoints_do_not_require_a_host_override() {
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         for transport in ["tcp", "quic"] {
-            let config = serde_json::from_value(json!({
+            let config = crate::config::test_support::from_json(json!({
                 "address": "[::1]:443",
                 "transport": transport,
                 "protocol": {"type": "xhttp", "protocol": {"type": "socks"}}
@@ -364,7 +364,7 @@ mod tests {
                         }
                         _ => protocol,
                     };
-                    let config = serde_json::from_value(json!({
+                    let config = crate::config::test_support::from_json(json!({
                         "address": "localhost:443",
                         "transport": if carrier == "h3" { "quic" } else { "tcp" },
                         "protocol": protocol
@@ -410,13 +410,14 @@ mod tests {
             json!({"type":"xhttp","headers":{"Connection":"keep-alive"},"protocol":{"type":"socks"}}),
             json!({"type":"xhttp","pool":{"max_h1_connections":usize::MAX},"protocol":{"type":"socks"}}),
         ] {
-            let config =
-                serde_json::from_value(json!({"address":"localhost:443","protocol":protocol}))
-                    .unwrap();
+            let config = crate::config::test_support::from_json(
+                json!({"address":"localhost:443","protocol":protocol}),
+            )
+            .unwrap();
             assert!(build(&config, resolver.clone()).is_err());
         }
         for alpn in [json!([]), json!(["h2"]), json!(["h3", "h2"])] {
-            let config = serde_json::from_value(json!({"address":"localhost:443","transport":"quic", "quic_settings":{"alpn_protocols":alpn},"protocol":inner})).unwrap();
+            let config = crate::config::test_support::from_json(json!({"address":"localhost:443","transport":"quic", "quic_settings":{"alpn_protocols":alpn},"protocol":inner})).unwrap();
             assert!(build(&config, resolver.clone()).is_err());
         }
     }

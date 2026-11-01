@@ -718,7 +718,7 @@ async fn vision_udp_small_tls_buffers_keep_the_initial_prefix_in_one_record() {
                 let hop = NetLocation::from_str("localhost:443", None).unwrap();
                 let target = NetLocation::from_str("192.0.2.1:53", None).unwrap();
                 let handler = create_tcp_client_handler(
-                    serde_json::from_value(serde_json::json!({
+                    crate::config::test_support::from_json(serde_json::json!({
                         "type": "tls", "verify": false, "vision": true,
                         "tls_buffer_size": size,
                         "protocol": {

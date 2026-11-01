@@ -42,13 +42,13 @@ pub enum Format {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuleSource {
+pub struct RuleSource<C = crate::config::ClientChain> {
     #[serde(default)]
     pub path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub download: Option<Box<Download>>,
+    pub download: Option<Box<Download<C>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_interval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,10 +63,13 @@ pub struct RuleSource {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Download {
-    pub client_chain: crate::config::ClientChain,
+pub struct Download<C = crate::config::ClientChain> {
+    pub client_chain: C,
     pub bootstrap_url: String,
 }
+
+pub(crate) type ResolvedRuleSource = RuleSource<crate::config::ResolvedClientChain>;
+pub(crate) type ResolvedDownload = Download<crate::config::ResolvedClientChain>;
 
 pub(crate) type MemorySources = std::collections::BTreeMap<PathBuf, Arc<MemorySource>>;
 
@@ -80,7 +83,7 @@ pub(crate) struct MemorySource {
 }
 
 impl MemorySource {
-    pub(crate) fn matches(&self, source: &RuleSource) -> io::Result<bool> {
+    pub(crate) fn matches<C>(&self, source: &RuleSource<C>) -> io::Result<bool> {
         Ok(self.identity == source.content_identity()?)
     }
 
@@ -99,7 +102,7 @@ pub(crate) struct SourceKey {
 }
 
 impl SourceKey {
-    fn new(path: PathBuf, format: Format, source: &RuleSource) -> Self {
+    fn new<C>(path: PathBuf, format: Format, source: &RuleSource<C>) -> Self {
         let mut attributes: Vec<_> = source
             .attributes
             .iter()
@@ -117,7 +120,31 @@ impl SourceKey {
     }
 }
 
-impl RuleSource {
+impl<C> RuleSource<C> {
+    pub(crate) fn map_chain<D>(
+        self,
+        resolve: impl FnOnce(C) -> io::Result<D>,
+    ) -> io::Result<RuleSource<D>> {
+        Ok(RuleSource {
+            path: self.path,
+            url: self.url,
+            download: self
+                .download
+                .map(|download| {
+                    Ok::<_, io::Error>(Box::new(Download {
+                        client_chain: resolve(download.client_chain)?,
+                        bootstrap_url: download.bootstrap_url,
+                    }))
+                })
+                .transpose()?,
+            update_interval: self.update_interval,
+            format: self.format,
+            behavior: self.behavior,
+            code: self.code,
+            attributes: self.attributes,
+        })
+    }
+
     fn content_identity(&self) -> io::Result<blake3::Hash> {
         let identity = serde_json::to_vec(&(
             &self.url,
@@ -127,19 +154,6 @@ impl RuleSource {
             &self.attributes,
         ))?;
         Ok(blake3::hash(&identity))
-    }
-
-    pub(crate) fn from_path(path: PathBuf) -> Self {
-        Self {
-            path,
-            url: None,
-            download: None,
-            update_interval: None,
-            format: None,
-            behavior: None,
-            code: None,
-            attributes: Vec::new(),
-        }
     }
 
     #[cfg(test)]
@@ -241,6 +255,21 @@ fn extension(path: &Path) -> Option<Format> {
         "yaml" | "yml" => Some(Format::MihomoYaml),
         "txt" => Some(Format::MihomoText),
         _ => None,
+    }
+}
+
+impl RuleSource {
+    pub(crate) fn from_path(path: PathBuf) -> Self {
+        Self {
+            path,
+            url: None,
+            download: None,
+            update_interval: None,
+            format: None,
+            behavior: None,
+            code: None,
+            attributes: Vec::new(),
+        }
     }
 }
 
@@ -700,8 +729,8 @@ fn read_file(
     read_data(source, path, SourceInput::File(file), compiler).map(|(_, predicate)| predicate)
 }
 
-pub(crate) fn load_memory(
-    source: &RuleSource,
+pub(crate) fn load_memory<C>(
+    source: &RuleSource<C>,
     bytes: &[u8],
     digest: blake3::Hash,
     retained_bytes: usize,
@@ -729,8 +758,8 @@ enum SourceInput<'a> {
     Memory(&'a [u8]),
 }
 
-fn read_data(
-    source: &RuleSource,
+fn read_data<C>(
+    source: &RuleSource<C>,
     path: PathBuf,
     mut input: SourceInput<'_>,
     compiler: &mut Compiler,

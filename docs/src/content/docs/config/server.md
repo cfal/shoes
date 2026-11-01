@@ -1,6 +1,6 @@
 ---
 title: "Server Config"
-description: Shoes server config configuration.
+description: shoes server config configuration.
 ---
 
 WireGuard servers require one literal UDP address with a nonzero port, or omit

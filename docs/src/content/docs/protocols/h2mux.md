@@ -1,6 +1,6 @@
 ---
 title: "H2MUX"
-description: Shoes h2mux configuration.
+description: shoes h2mux configuration.
 ---
 
 **Complete example:** [h2mux_client.yaml](/examples/h2mux_client/). Adapt addresses and secrets before deployment.

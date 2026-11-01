@@ -1,6 +1,6 @@
 ---
 title: "Sudoku TCP Mask"
-description: Shoes sudoku tcp mask configuration.
+description: shoes sudoku tcp mask configuration.
 ---
 
 `sudoku_mask` is an outer protocol wrapper for both TCP clients and servers. It
@@ -61,7 +61,7 @@ Placement matches Xray, with the root closest to the wire:
   persists for the carrier's lifetime across pooled requests; new carriers start
   with fresh state.
 - Consecutive outer masks compose in nesting order, including at later chain
-  hops and in pools. Xray's public mask list `[A, B]` corresponds to Shoes root `B`
+  hops and in pools. Xray's public mask list `[A, B]` corresponds to shoes root `B`
   containing `A`. Use distinct matching options for each stage.
 
 Existing Vision and NaiveProxy immediate-child constraints still apply inside

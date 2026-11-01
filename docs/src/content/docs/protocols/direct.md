@@ -1,6 +1,6 @@
 ---
 title: "Direct"
-description: Shoes direct configuration.
+description: shoes direct configuration.
 ---
 
 ## Client

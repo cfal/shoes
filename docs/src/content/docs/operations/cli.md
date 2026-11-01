@@ -1,6 +1,6 @@
 ---
 title: "Command Line"
-description: Shoes command line configuration.
+description: shoes command line configuration.
 ---
 
 ```bash

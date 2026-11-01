@@ -1,6 +1,6 @@
 ---
 title: "Fake DNS"
-description: Shoes fake dns configuration.
+description: shoes fake dns configuration.
 ---
 
 Fake DNS is opt-in on a server (including WireGuard) or TUN configuration:
@@ -122,7 +122,7 @@ discovered. Later upstream failures produce DNS failure, not a public-provider f
 UDP and HTTP/3 upstreams remain direct-only; TCP/TLS/HTTPS can use client chains.
 DNS client chains use the configured bootstrap resolver. Downstream proxy
 hostnames remain unresolved when passed through a proxy that supports remote
-name resolution; Shoes cannot inspect addresses resolved by that remote proxy.
+name resolution; shoes cannot inspect addresses resolved by that remote proxy.
 Rule downloads instead pre-resolve downstream proxies through their guarded
 bootstrap resolver.
 UDP truncation retries TCP only when that transport is explicitly configured.

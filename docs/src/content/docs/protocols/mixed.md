@@ -1,6 +1,6 @@
 ---
 title: "Mixed (HTTP + SOCKS5)"
-description: Shoes mixed (http + socks5) configuration.
+description: shoes mixed (http + socks5) configuration.
 ---
 
 **Complete example:** [mixed.yaml](/examples/mixed/). Adapt addresses and secrets before deployment.

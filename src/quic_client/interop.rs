@@ -18,7 +18,7 @@ use crate::{
     address::{Address, NetLocation},
     async_stream::{AsyncMessageStream, AsyncShutdownMessageExt},
     client_proxy_chain::ClientProxyChain,
-    config::ClientChain,
+    config::ResolvedClientChain,
     resolver::{NativeResolver, Resolver},
     tcp::chain_builder::try_build_client_proxy_chain,
 };
@@ -139,7 +139,7 @@ async fn peer_with_options(mut protocol: serde_json::Value, options: PeerOptions
     } else {
         host
     };
-    let chain: ClientChain = serde_json::from_value(json!({
+    let chain: ResolvedClientChain = crate::config::test_support::from_json(json!({
         "address": format!("{endpoint_host}:{port}"),
         "quic_settings": tls,
         "protocol": protocol

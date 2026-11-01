@@ -4,7 +4,7 @@ use base64::Engine;
 use http::{HeaderMap, Method, Request, StatusCode};
 use subtle::ConstantTimeEq;
 
-use crate::config::xhttp::{XhttpClientConfig, XhttpMode, XhttpServerConfig};
+use crate::config::xhttp::{ResolvedXhttpClientConfig, ResolvedXhttpServerConfig, XhttpMode};
 
 const PATH_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
@@ -66,7 +66,7 @@ pub fn sample(range: (u32, u32)) -> u32 {
 }
 
 pub fn request(
-    config: &XhttpClientConfig,
+    config: &ResolvedXhttpClientConfig,
     path: &Path,
     authority: &str,
     secure: bool,
@@ -108,7 +108,7 @@ pub enum Kind {
     Packet(String, u64),
 }
 
-pub fn has_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> bool {
+pub fn has_matching_headers(config: &ResolvedXhttpServerConfig, headers: &HeaderMap) -> bool {
     config.matching_headers.iter().all(|(name, accepted)| {
         let mut values = headers.get_all(name.as_str()).iter();
         let Some(value) = values.next() else {
@@ -130,7 +130,7 @@ fn query_padding(query: &str) -> Option<String> {
 }
 
 pub fn classify(
-    config: &XhttpServerConfig,
+    config: &ResolvedXhttpServerConfig,
     path: &Path,
     request: &Request<()>,
 ) -> Result<Kind, StatusCode> {
@@ -269,10 +269,11 @@ mod tests {
 
     #[test]
     fn classification_uses_decoded_paths() {
-        let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
-            "path": "/t", "host": "front.test", "protocol": {"type": "socks"}
-        }))
-        .unwrap();
+        let config: ResolvedXhttpServerConfig =
+            crate::config::test_support::from_json(serde_json::json!({
+                "path": "/t", "host": "front.test", "protocol": {"type": "socks"}
+            }))
+            .unwrap();
         let path = Path::new(&config.path).unwrap();
         for (uri, matched) in [
             ("/wrong", false),
@@ -302,10 +303,11 @@ mod tests {
 
     #[test]
     fn matching_headers_require_one_exact_value_per_name() {
-        let mut config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
-            "protocol": {"type": "socks"}
-        }))
-        .unwrap();
+        let mut config: ResolvedXhttpServerConfig =
+            crate::config::test_support::from_json(serde_json::json!({
+                "protocol": {"type": "socks"}
+            }))
+            .unwrap();
         assert!(has_matching_headers(&config, &HeaderMap::new()));
         config
             .matching_headers
@@ -339,10 +341,11 @@ mod tests {
 
     #[test]
     fn matching_headers_accept_one_of_the_configured_values() {
-        let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
-            "matching_headers": {"X-Token": ["old", "new"]}, "protocol": {"type": "socks"}
-        }))
-        .unwrap();
+        let config: ResolvedXhttpServerConfig =
+            crate::config::test_support::from_json(serde_json::json!({
+                "matching_headers": {"X-Token": ["old", "new"]}, "protocol": {"type": "socks"}
+            }))
+            .unwrap();
         config.validate().unwrap();
         for (values, matched) in [
             (vec!["old"], true),
@@ -367,18 +370,20 @@ mod tests {
 
     #[test]
     fn padding_acceptance_range_does_not_override_request_header_limit() {
-        let mut server: XhttpServerConfig = serde_json::from_value(serde_json::json!({
-            "host": "front.test", "path": "/upload", "x_padding_bytes": "100-20000",
-            "protocol": {"type": "socks"}
-        }))
-        .unwrap();
+        let mut server: ResolvedXhttpServerConfig =
+            crate::config::test_support::from_json(serde_json::json!({
+                "host": "front.test", "path": "/upload", "x_padding_bytes": "100-20000",
+                "protocol": {"type": "socks"}
+            }))
+            .unwrap();
         server.validate().unwrap();
         let path = Path::new(&server.path).unwrap();
         for padding in [100, 20000] {
-            let client: XhttpClientConfig = serde_json::from_value(serde_json::json!({
-                "x_padding_bytes": padding, "protocol": {"type": "socks"}
-            }))
-            .unwrap();
+            let client: ResolvedXhttpClientConfig =
+                crate::config::test_support::from_json(serde_json::json!({
+                    "x_padding_bytes": padding, "protocol": {"type": "socks"}
+                }))
+                .unwrap();
             let request = request(&client, &path, "front.test", true, "id", None, false).unwrap();
             server.server_max_header_bytes = 0;
             assert_eq!(
@@ -399,7 +404,7 @@ mod tests {
 
     #[test]
     fn default_wire_classification_and_rejections() {
-        let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({"path":"/a%2Fb?q=x", "host":"front.test", "protocol":{"type":"socks"}})).unwrap();
+        let config: ResolvedXhttpServerConfig = crate::config::test_support::from_json(serde_json::json!({"path":"/a%2Fb?q=x", "host":"front.test", "protocol":{"type":"socks"}})).unwrap();
         let path = Path::new(&config.path).unwrap();
         let make = |method: &str, suffix: &str, padding: usize| {
             Request::builder()
@@ -468,17 +473,19 @@ mod tests {
     }
     #[test]
     fn referer_padding_replaces_query_and_accepts_relative_references() {
-        let client: XhttpClientConfig = serde_json::from_value(serde_json::json!({
-            "path": "/t?q=a%2Bb&x_padding=short",
-            "x_padding_bytes": 100,
-            "protocol": {"type": "socks"}
-        }))
-        .unwrap();
-        let server: XhttpServerConfig = serde_json::from_value(serde_json::json!({
-            "path": client.path,
-            "protocol": {"type": "socks"}
-        }))
-        .unwrap();
+        let client: ResolvedXhttpClientConfig =
+            crate::config::test_support::from_json(serde_json::json!({
+                "path": "/t?q=a%2Bb&x_padding=short",
+                "x_padding_bytes": 100,
+                "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+        let server: ResolvedXhttpServerConfig =
+            crate::config::test_support::from_json(serde_json::json!({
+                "path": client.path,
+                "protocol": {"type": "socks"}
+            }))
+            .unwrap();
         let path = Path::new(&client.path).unwrap();
         let mut request = request(&client, &path, "front.test", true, "id", None, false).unwrap();
         assert_eq!(request.uri().query(), Some("q=a%2Bb&x_padding=short"));
@@ -502,11 +509,12 @@ mod tests {
 
     #[test]
     fn streaming_content_type_overrides_custom_header_unless_disabled() {
-        let mut config: XhttpClientConfig = serde_json::from_value(serde_json::json!({
-            "headers":{"Content-Type":"application/octet-stream"},
-            "protocol":{"type":"socks"}
-        }))
-        .unwrap();
+        let mut config: ResolvedXhttpClientConfig =
+            crate::config::test_support::from_json(serde_json::json!({
+                "headers":{"Content-Type":"application/octet-stream"},
+                "protocol":{"type":"socks"}
+            }))
+            .unwrap();
         let path = Path::new("").unwrap();
         for disabled in [false, true] {
             config.no_grpc_header = disabled;

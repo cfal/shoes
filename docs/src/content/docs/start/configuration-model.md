@@ -1,6 +1,6 @@
 ---
 title: "Configuration model"
-description: How Shoes organizes YAML configuration entries.
+description: How shoes organizes YAML configuration entries.
 ---
 
 The field-shape snippets in the reference use placeholders such as `string` and
@@ -11,7 +11,7 @@ A configuration file is a YAML array containing one or more configuration entrie
 
 - [Server](/config/server/): a proxy listener and its protocol stack.
 - [TUN](/config/tun/): an IP packet device for transparent proxying.
-- [Client group](/routing/groups/#client-proxy-group): reusable upstream configurations.
+- [Client group](/routing/groups/#client-group): reusable whole-path upstream choices.
 - [Rule group](/routing/groups/#rule-group): reusable routing rules.
 - [Rule source group](/routing/groups/#rule-source-group): reusable action-free matching expressions and local or remote sources.
 - [DNS group](/dns/configuration/): a named DNS configuration shared by consumers.
@@ -37,7 +37,7 @@ loaded together, so named groups can be referenced across files.
 
 # Client config groups have 'client_group'
 - client_group: my-upstream
-  client_proxy: ...
+  client_chains: ...
 
 # Rule config groups have 'rule_group'
 - rule_group: my-rules

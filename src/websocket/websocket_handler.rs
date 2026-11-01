@@ -152,7 +152,7 @@ mod request_tests {
                 let headers = override_host
                     .map(|host| format!("matching_headers: {{hOsT: '{host}'}}\n"))
                     .unwrap_or_default();
-                let config = serde_yaml::from_str(&format!(
+                let config = crate::config::test_support::from_yaml(&format!(
                     "type: websocket\n{headers}protocol: {{type: noop}}\n"
                 ))
                 .unwrap();

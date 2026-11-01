@@ -1,6 +1,6 @@
 ---
 title: "Certificate Sources"
-description: Shoes certificate sources configuration.
+description: shoes certificate sources configuration.
 ---
 
 Ordinary TLS targets and QUIC listeners can share a named certificate source.
@@ -53,7 +53,7 @@ expired or not-yet-valid certificates and misordered bundles now reject at start
 running file sources stop serving at expiry, including when clients disable
 verification or pin a fingerprint. Renew expired certificates, put bundles in
 leaf-to-issuer order, remove expired cross-signs and certificates outside that chain,
-and synchronize the system clock before starting Shoes. Child-to-issuer signatures
+and synchronize the system clock before starting shoes. Child-to-issuer signatures
 must use algorithms supported by the TLS provider: no SHA-1, and RSA issuer keys
 must be at least 2048 bits. Reissue certificates with unsupported signatures.
 Inline-only pairs retain their previous static behavior.
@@ -96,7 +96,7 @@ Every named TLS target using an ACME source must be covered by its domains.
 There is no issuance based on incoming SNI.
 
 `terms_of_service` is explicit acceptance of that exact URL, not blanket
-acceptance of future terms. Shoes checks the directory's `meta.termsOfService`
+acceptance of future terms. shoes checks the directory's `meta.termsOfService`
 before account operations and refuses a changed URL. Review new terms and
 update the configuration to accept them. If a private CA publishes no terms,
 omit this field; a subsequently advertised terms URL still requires explicit
@@ -106,7 +106,7 @@ binding are not supported in this version.
 HTTP-01 requirements:
 
 - The CA must reach public TCP port 80 for every domain, forwarded to one of the
-  explicit `listen` addresses. Shoes never implicitly binds port 80.
+  explicit `listen` addresses. shoes never implicitly binds port 80.
 - The challenge listener is independent of proxy listeners, so UDP-only QUIC
   deployments can use HTTP-01. A reverse proxy/CDN must forward the exact
   `/.well-known/acme-challenge/` path and original Host header.
@@ -124,10 +124,10 @@ For TLS-ALPN-01, replace the `challenge` mapping with:
   challenge: {type: tls_alpn01}
 ```
 
-The CA must reach public TCP port 443, forwarded to an existing outermost Shoes
+The CA must reach public TCP port 443, forwarded to an existing outermost shoes
 TLS listener covering every configured domain. This is not QUIC, ShadowTLS or
 REALITY validation. An intermediate TLS terminator must pass the handshake
-through, including SNI and ALPN. Shoes only answers the sole offered protocol
+through, including SNI and ALPN. shoes only answers the sole offered protocol
 `acme-tls/1` for a pending configured SNI. The short-lived challenge response
 uses the RFC 8737 critical `acmeIdentifier` extension and never enters the proxy
 handler or replaces the ordinary certificate. Normal ALPN, client authentication,
@@ -138,7 +138,7 @@ Normal handshakes for a source without a certificate fail until issuance
 succeeds; `Servers ready` means listeners are bound, not that ACME has finished.
 A valid cached certificate allows immediate startup during a CA outage.
 
-Shoes persists the account key before registration, account credentials,
+shoes persists the account key before registration, account credentials,
 in-progress orders and CSR keys, and the certificate/key pair in one atomically
 replaced, synced state file. Do not edit it or share it between sources. On Unix,
 the state directory must be owned by the running user with mode 0700, and files
@@ -173,7 +173,7 @@ During deferred polling, pending challenge responses remain
 available until their 10-minute lease expires, the order leaves the pending
 state, or the source is stopped.
 
-CA traffic goes directly through the OS resolver and Shoes' protected TCP socket
+CA traffic goes directly through the OS resolver and shoes' protected TCP socket
 helper, not through proxy rules or the certificate being issued. HTTPS verifies
 the CA hostname and public roots. Optional `ca_cert: /path/to/test-ca.crt`
 replaces those roots for a private CA. Requests have a 30-second total timeout,

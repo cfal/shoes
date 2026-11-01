@@ -1,6 +1,6 @@
 ---
 title: "mTLS (Mutual TLS)"
-description: Shoes mtls (mutual tls) configuration.
+description: shoes mtls (mutual tls) configuration.
 ---
 
 Require client certificates for authentication:

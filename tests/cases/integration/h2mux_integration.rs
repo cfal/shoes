@@ -1487,7 +1487,7 @@ async fn test_h2mux_shoes_client_to_shoes_server() -> Result<(), Box<dyn std::er
   rules:
     - mask: 0.0.0.0/0
       action: allow
-      client_proxies:
+      client_chains:
         - address: "{}:{}"
           protocol:
             type: tls
@@ -1576,7 +1576,7 @@ async fn test_h2mux_client_concurrent_streams() -> Result<(), Box<dyn std::error
   rules:
     - mask: 0.0.0.0/0
       action: allow
-      client_proxies:
+      client_chains:
         - address: "{}:{}"
           protocol:
             type: tls
@@ -1679,7 +1679,7 @@ async fn test_h2mux_shoes_client_to_shoes_server_with_padding()
   rules:
     - mask: 0.0.0.0/0
       action: allow
-      client_proxies:
+      client_chains:
         - address: "{}:{}"
           protocol:
             type: tls
@@ -1786,7 +1786,7 @@ async fn test_h2mux_shoes_client_to_singbox_server() -> Result<(), Box<dyn std::
   rules:
     - mask: 0.0.0.0/0
       action: allow
-      client_proxies:
+      client_chains:
         - address: "{}:{}"
           protocol:
             type: tls
@@ -1875,7 +1875,7 @@ async fn test_h2mux_shoes_client_to_singbox_server_with_padding()
   rules:
     - mask: 0.0.0.0/0
       action: allow
-      client_proxies:
+      client_chains:
         - address: "{}:{}"
           protocol:
             type: tls

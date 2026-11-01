@@ -8,15 +8,17 @@
 - client_group: outbound
   type: selector
   default: us-east
-  client_proxies:
-    - name: us-east
-      address: "us.example.com:1080"
-      protocol:
-        type: socks
-    - name: eu-west
-      address: "eu.example.com:1080"
-      protocol:
-        type: socks
+  client_chains:
+    - chain:
+        - name: us-east
+          address: "us.example.com:1080"
+          protocol:
+            type: socks
+    - chain:
+        - name: eu-west
+          address: "eu.example.com:1080"
+          protocol:
+            type: socks
 
 - name: local-socks
   address: "0.0.0.0:1080"

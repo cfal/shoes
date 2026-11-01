@@ -1,6 +1,6 @@
 ---
 title: "TUIC v5"
-description: Shoes tuic v5 configuration.
+description: shoes tuic v5 configuration.
 ---
 
 **Complete example:** [tuic_v5.yaml](/examples/tuic_v5/). Adapt addresses and secrets before deployment.

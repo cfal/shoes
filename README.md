@@ -3,11 +3,13 @@
 shoes is a high-performance multi-protocol proxy server written in Rust.
 
 Documentation: [shoes-rs.github.io](https://shoes-rs.github.io/) for installation,
-configuration, protocol reference, CLI usage, and complete examples.
+configuration, protocol reference, CLI usage, and complete examples. Available
+in [English](https://shoes-rs.github.io/) and
+[Simplified Chinese](https://shoes-rs.github.io/zh-cn/).
 
 ## Quick start
 
-With Shoes installed, validate and run the loopback-only SOCKS5 example from
+With shoes installed, validate and run the loopback-only SOCKS5 example from
 this checkout:
 
 ```sh
@@ -60,11 +62,11 @@ All server protocols plus:
 - **Snell v3**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
 
 For Clash.Meta/Mihomo legacy Snell clients, use `chacha20-ietf-poly1305` with v1
-or `aes-128-gcm` with v3. Run Shoes v0.3.3 or newer for the corrected 16-byte
+or `aes-128-gcm` with v3. Run shoes v0.3.3 or newer for the corrected 16-byte
 Snell salts. These clients do not offer an AES-256 option. Do not use v2:
-Shoes does not implement Snell v2 connection reuse or its half-close markers.
+shoes does not implement Snell v2 connection reuse or its half-close markers.
 Older Clash.Meta clients fail requests on reused v2 connections.
-Shoes-to-Shoes connections can also use `aes-256-gcm`; both ends must use the
+shoes-to-shoes connections can also use `aes-256-gcm`; both ends must use the
 same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
 
 ## Features
@@ -85,7 +87,7 @@ For advanced access control (IP allowlist/blocklists), see [tobaru](https://gith
 
 ## Installation
 
-Building Shoes requires Rust 1.99.1 or newer. Unix WireGuard builds include
+Building shoes requires Rust 1.99.1 or newer. Unix WireGuard builds include
 MPL-2.0-covered GotaTun code; binary and library distributors must retain
 [the dependency notices and corresponding source information](THIRD_PARTY_NOTICES.md).
 See [dependency maintenance](DEPENDENCIES.md) for protected forks, update
@@ -135,7 +137,7 @@ The `blake3` patch pins our [binary-context fork](https://github.com/cfal/BLAKE3
 rebased onto upstream buffer-alignment and AVX-512 soundness fixes. VLESS Encryption
 requires `derive_key_bytes` for contexts that are not valid UTF-8. Retain the patch
 until a registry release provides equivalent binary-context derivation; validate
-updates against the fork's tests and Shoes' Go-derived VLESS vectors.
+updates against the fork's tests and shoes' Go-derived VLESS vectors.
 
 The `nix` patch pins an [upstream commit](https://github.com/nix-rust/nix/commit/3eae6d68ec6382fef7b38cd58f97458e59a71af9)
 containing [nix #2821](https://github.com/nix-rust/nix/pull/2821) for iOS socket
@@ -147,7 +149,7 @@ It tracks unreleased upstream main after 0.14.0, including the receive-window ar
 see [fork maintenance notes](DEPENDENCIES.md#smoltcp) for provenance and invariants.
 Retain it until adopting a registry release with equivalent loss-recovery fixes.
 When updating the pin, run the fork's `socket::tcp::test::` regressions with Reno
-and CUBIC enabled, plus Shoes' rootless TUN and WireGuard suites.
+and CUBIC enabled, plus shoes' rootless TUN and WireGuard suites.
 
 GitHub releases and checkout builds retain these patches. Crates.io publishing
 remains disabled because Cargo removes workspace patches from published packages.
@@ -271,7 +273,7 @@ docker run --rm --name shoes \
 
 Use `shoes:local` instead to run the checkout build.
 
-Files Shoes writes cannot live in the read-only `/etc/shoes` mount. Give
+Files shoes writes cannot live in the read-only `/etc/shoes` mount. Give
 `cache_file_path`, fake DNS `state_file`, Unix socket listeners, and `--log-file`
 targets absolute paths on a separate writable mount owned by the container
 user. For example, create a private state directory:
@@ -312,7 +314,7 @@ namespace unless host networking is explicitly selected.
 ### WireGuard Kernel Interoperability
 
 Linux kernel peer tests require kernel WireGuard support, network/PID namespaces,
-passwordless sudo, `ip`, `wg`, `unshare`, and `timeout`. They run both Shoes roles
+passwordless sudo, `ip`, `wg`, `unshare`, and `timeout`. They run both shoes roles
 inside isolated namespaces without changing host routes. Coverage includes
 inner IPv4/IPv6 TCP and UDP, TCP half-close, PSK/no-PSK, MTUs 1280/1408, and VLESS
 chaining in both directions. Kernel handshake and byte counters verify that

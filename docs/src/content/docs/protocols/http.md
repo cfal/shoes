@@ -1,6 +1,6 @@
 ---
 title: "HTTP"
-description: Shoes http configuration.
+description: shoes http configuration.
 ---
 
 **Complete example:** [http_proxy_basic.yaml](/examples/http_proxy_basic/). Adapt addresses and secrets before deployment.

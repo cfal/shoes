@@ -1,6 +1,6 @@
 ---
 title: "TUN Config"
-description: Shoes tun config configuration.
+description: shoes tun config configuration.
 ---
 
 TUN (network TUNnel) devices operate at the IP layer (Layer 3), allowing shoes to act as a transparent VPN.
@@ -56,7 +56,7 @@ initialization fails; `false` disables it and `true` requires it at startup.
 Explicit enablement is rejected with `device_fd`, packet-information headers,
 or non-Linux devices. IPv6 continues using ordinary MTU-sized packets.
 
-Devices Shoes creates on iOS and macOS always use four-byte packet-information
+Devices shoes creates on iOS and macOS always use four-byte packet-information
 headers; this cannot be disabled. For a supplied `device_fd`,
 `packet_information` defaults to `true` on iOS/macOS and `false` elsewhere.
 If an iOS or macOS app supplies a header-less FD, including one bridged from
@@ -85,7 +85,7 @@ does not configure routes in the host VPN service.
 
 ### Managed Linux Desktop Capture
 
-`auto_route: true` gives the Shoes process ownership of one nonpersistent TUN,
+`auto_route: true` gives the shoes process ownership of one nonpersistent TUN,
 private routing table, policy rules, nftables table, and optional per-link DNS
 configuration. It captures host-originated TCP/UDP using conntrack-aware output
 marking. Both protocols use the existing TUN engine unless `auto_redirect: true`
@@ -127,7 +127,7 @@ proxy policy before using it as a proxy.
 | `linux.table` | Private route table; default `12000` |
 | `linux.rule_priority` | Policy rule priority; default `12000` |
 | `linux.capture_mark` | Capture bit; default `536870912` (`0x20000000`) |
-| `linux.bypass_mark` | Shoes socket bypass bit; default `1073741824` (`0x40000000`) |
+| `linux.bypass_mark` | shoes socket bypass bit; default `1073741824` (`0x40000000`) |
 | `linux.mark_mask` | Combined reserved bits; default `1610612736` (`0x60000000`) |
 
 Requirements: Linux, `/dev/net/tun`, trusted system `nft` with JSON support, and
@@ -136,28 +136,28 @@ systemd-resolved, `busctl` with JSON support, and authorization to
 configure the owned link. Automatic DNS setup and cleanup are best-effort, with
 bounded helper calls. Missing services, failed namespace checks, and configuration
 errors produce warnings rather than stopping capture. Failed setup may leave
-partial per-link settings until cleanup; system DNS routing through Shoes is not
+partial per-link settings until cleanup; system DNS routing through shoes is not
 guaranteed in that case. Resolver settings are not continuously monitored or
 restored after external changes, and resolver restarts do not stop the proxy.
 Namespace checks assume a standard local system bus whose
 listener and daemon share a PID namespace, with procfs mounted for that namespace;
-resolved must share Shoes' network namespace. Custom bus arrangements should use
-`auto_dns: false`. Restart Shoes to reapply automatic DNS after restarting the
+resolved must share shoes' network namespace. Custom bus arrangements should use
+`auto_dns: false`. Restart shoes to reapply automatic DNS after restarting the
 resolver or system bus. The supplied
 service runs as root with a bounded
-capability set. File capabilities on Shoes alone do not grant privileges to
+capability set. File capabilities on shoes alone do not grant privileges to
 `nft` children or authorize resolved changes.
 
-Use `auto_dns: false` for externally managed DNS. Shoes never rewrites
-`/etc/resolv.conf`. Bootstrap and native resolution use protected Shoes sockets
+Use `auto_dns: false` for externally managed DNS. shoes never rewrites
+`/etc/resolv.conf`. Bootstrap and native resolution use protected shoes sockets
 while managed mode is active; listener bind addresses must be literal IPs.
 Real DNS does not require fake-IP. Automatic DNS requires interception and room
 after each interface address for its adjacent virtual DNS endpoint. Settings are
 published after ingress workers start, without a separate DNS readiness probe.
 The owned link disables DNS-over-TLS, DNSSEC validation, LLMNR, and mDNS;
-upstream encryption and DNS policy belong in Shoes' `dns` configuration.
+upstream encryption and DNS policy belong in shoes' `dns` configuration.
 Cleanup attempts to revert per-link settings on the owned interface, even if
-another manager changed them while Shoes was running. Removing the owned TUN also
+another manager changed them while shoes was running. Removing the owned TUN also
 discards its transient resolver settings. Other links are not changed.
 The managed TUN subnet is reserved for ingress:
 forwarding a connection back to that subnet is rejected, except local DNS handling.
@@ -188,7 +188,7 @@ forwarding. This is host capture, not gateway or container forwarding.
 
 Conflicting tables, priorities, mark reservations, or preceding nonlocal policy
 rules cause startup rejection. Other VPNs and firewall managers require explicit
-coexistence validation; Shoes does not override foreign firewall decisions.
+coexistence validation; shoes does not override foreign firewall decisions.
 REDIRECT also rejects native routes using its virtual peer as a gateway and
 opaque nexthop-object routes. Captured replies carry the capture mark before
 mark-aware reverse-path filtering.
@@ -202,7 +202,7 @@ traffic, but do not disable capture. Failed candidates roll back on the same
 network lease. Unexpected owned routing changes or a missing private firewall
 table cause orderly shutdown. Resolver-setting changes do not.
 
-Shoes exclusively owns its token-named `inet` nftables table, including all of its
+shoes exclusively owns its token-named `inet` nftables table, including all of its
 contents. Do not add rules, chains, or sets to that table: external changes inside
 it are neither audited nor preserved. Cleanup removes the exact owned table even
 if its contents have changed; other tables are left untouched. Connected-network

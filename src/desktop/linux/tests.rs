@@ -26,14 +26,34 @@ fn spec(redirect: bool) -> Spec {
 
 fn validated_configuration(
     config: crate::config::TunConfig,
-) -> io::Result<(crate::config::TunConfig, Spec)> {
+) -> io::Result<(crate::config::ResolvedTunConfig, Spec)> {
     let mut validated =
         crate::config::create_server_configs(vec![crate::config::Config::TunServer(config)])?;
-    let spec = Spec::from_configs(&validated.configs)?.unwrap();
-    let crate::config::Config::TunServer(config) = validated.configs.remove(0) else {
+    let spec = Spec::from_resolved_configs(&validated.configs)?.unwrap();
+    let crate::config::ResolvedConfig::TunServer(config) = validated.configs.remove(0) else {
         unreachable!()
     };
     Ok((config, spec))
+}
+
+fn uncompiled_redirect_configuration() -> crate::config::ResolvedTunConfig {
+    crate::config::test_support::from_json(json!({
+        "device_name":"unused", "rules":[{"masks":"0.0.0.0/0","action":"allow"}]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn redirect_short_circuit_fixture_rejects_selector_construction() {
+    let config = uncompiled_redirect_configuration();
+    let error =
+        crate::tun::proxy_selector(&config, Arc::new(crate::resolver::NativeResolver::new()))
+            .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "routing predicates must be compiled during config preparation"
+    );
 }
 
 #[test]
@@ -654,12 +674,10 @@ async fn kernel_capture() -> io::Result<()> {
         let resolver: Arc<dyn crate::resolver::Resolver> =
             Arc::new(crate::resolver::NativeResolver::new());
         if !redirect {
-            let unexpanded = serde_json::from_value(json!({
-                "device_name":"unused", "rules":"unexpanded-rule"
-            }))?;
+            let uncompiled = uncompiled_redirect_configuration();
             assert!(
                 ingress
-                    .start_redirects(&unexpanded, resolver.clone(), None)?
+                    .start_redirects(&uncompiled, resolver.clone(), None)?
                     .is_empty()
             );
         }
@@ -754,12 +772,12 @@ async fn kernel_capture() -> io::Result<()> {
         }
         session.reconcile().await?;
         let index = session.record.ifindex;
-        session.validate(&[crate::config::Config::TunServer(config.clone())])?;
+        session.validate(&[crate::config::ResolvedConfig::TunServer(config.clone())])?;
         let mut changed = config.clone();
         changed.mtu += 1;
         assert!(
             session
-                .validate(&[crate::config::Config::TunServer(changed)])
+                .validate(&[crate::config::ResolvedConfig::TunServer(changed)])
                 .is_err()
         );
         for task in tasks.drain(..) {

@@ -7,7 +7,7 @@ use crate::option_util::OneOrSome;
 use super::client::ClientConfig;
 use super::dns::DnsConfigGroup;
 use super::global::GlobalSettings;
-use super::rules::RuleConfig;
+use super::rules::{ClientChain, ClientChainHop, RuleConfig};
 use super::selection::ConfigSelection;
 use super::server::ServerConfig;
 use super::tun::TunConfig;
@@ -24,7 +24,102 @@ pub struct ClientConfigGroup {
     pub group_type: GroupType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
-    pub client_proxies: OneOrSome<ConfigSelection<ClientConfig>>,
+    pub client_chains: OneOrSome<ClientGroupMember>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ClientGroupMember {
+    Client(ConfigSelection<ClientConfig>),
+    Chain {
+        name: Option<String>,
+        chain: ClientChain,
+    },
+}
+
+impl From<ConfigSelection<ClientConfig>> for ClientGroupMember {
+    fn from(client: ConfigSelection<ClientConfig>) -> Self {
+        Self::Client(client)
+    }
+}
+
+impl ClientGroupMember {
+    fn from_chain(name: Option<String>, chain: ClientChain) -> Self {
+        // Unnamed single-hop wrappers retain the referenced group or client's identity.
+        if name.is_none() && chain.hops.iter().count() == 1 {
+            let hop = chain.hops.into_vec().pop().unwrap();
+            return match hop {
+                ClientChainHop::Single(client) => Self::Client(client),
+                hop => Self::Chain {
+                    name,
+                    chain: ClientChain {
+                        hops: OneOrSome::One(hop),
+                    },
+                },
+            };
+        }
+        Self::Chain { name, chain }
+    }
+
+    pub(crate) fn into_chain(self) -> ClientChain {
+        match self {
+            Self::Client(client) => ClientChain {
+                hops: OneOrSome::One(ClientChainHop::Single(client)),
+            },
+            Self::Chain { chain, .. } => chain,
+        }
+    }
+
+    pub(crate) fn explicit_name(&self) -> Option<&str> {
+        match self {
+            Self::Client(ConfigSelection::GroupName(name)) => Some(name),
+            Self::Client(ConfigSelection::Config(client)) => client.name.as_deref(),
+            Self::Chain { name, .. } => name.as_deref(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientGroupMember {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        if value
+            .as_mapping()
+            .is_some_and(|map| map.contains_key("chain"))
+        {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Fields {
+                name: Option<String>,
+                chain: OneOrSome<ClientChainHop>,
+            }
+            let fields: Fields = serde_yaml::from_value(value).map_err(D::Error::custom)?;
+            Ok(Self::from_chain(
+                fields.name,
+                ClientChain { hops: fields.chain },
+            ))
+        } else {
+            serde_yaml::from_value(value)
+                .map(|chain| Self::from_chain(None, chain))
+                .map_err(D::Error::custom)
+        }
+    }
+}
+
+impl Serialize for ClientGroupMember {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            Self::Client(client) => map.serialize_entry("chain", &[client])?,
+            Self::Chain { name, chain } => {
+                if let Some(name) = name {
+                    map.serialize_entry("name", name)?;
+                }
+                map.serialize_entry("chain", &chain.hops.iter().collect::<Vec<_>>())?;
+            }
+        }
+        map.end()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -52,13 +147,31 @@ struct RawClientGroup {
     #[serde(rename = "type", default = "default_group_type")]
     kind: String,
     default: Option<String>,
-    #[serde(alias = "client_proxy")]
-    client_proxies: OneOrSome<ConfigSelection<ClientConfig>>,
+    #[serde(
+        default,
+        alias = "client_chain",
+        deserialize_with = "deserialize_present"
+    )]
+    client_chains: Option<OneOrSome<ClientGroupMember>>,
+    #[serde(
+        default,
+        alias = "client_proxy",
+        deserialize_with = "deserialize_present"
+    )]
+    client_proxies: Option<OneOrSome<ConfigSelection<ClientConfig>>>,
     url: Option<String>,
     interval: Option<u64>,
     timeout: Option<u64>,
     tolerance: Option<u16>,
     lazy: Option<bool>,
+}
+
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 fn default_group_type() -> String {
@@ -69,6 +182,26 @@ impl TryFrom<RawClientGroup> for ClientConfigGroup {
     type Error = String;
 
     fn try_from(raw: RawClientGroup) -> Result<Self, Self::Error> {
+        let client_chains = match (raw.client_chains, raw.client_proxies) {
+            (Some(_), Some(_)) => {
+                return Err("cannot specify both client_proxy/client_proxies and client_chain/client_chains in a client group".into());
+            }
+            (Some(chains), None) => chains,
+            (None, Some(proxies)) => {
+                log::warn!(
+                    "client_proxy/client_proxies is deprecated; use client_chain/client_chains. \
+                     Preserve group alternatives with explicit wrappers: [{{chain: [a]}}, {{chain: [b]}}]; \
+                     a bare [a, b] now specifies sequential hops."
+                );
+                match proxies {
+                    OneOrSome::One(proxy) => OneOrSome::One(ClientGroupMember::Client(proxy)),
+                    OneOrSome::Some(proxies) => OneOrSome::Some(
+                        proxies.into_iter().map(ClientGroupMember::Client).collect(),
+                    ),
+                }
+            }
+            (None, None) => return Err("client group requires client_chain/client_chains".into()),
+        };
         let kind = raw.kind.as_str();
         if kind != "selector" && raw.default.is_some() {
             return Err("default is only valid for selector groups".into());
@@ -102,7 +235,7 @@ impl TryFrom<RawClientGroup> for ClientConfigGroup {
             client_group: raw.client_group,
             group_type,
             default: raw.default,
-            client_proxies: raw.client_proxies,
+            client_chains,
         })
     }
 }
@@ -196,7 +329,7 @@ mod group_type_tests {
 
     #[test]
     fn url_test_defaults_and_serialization_use_only_type() {
-        let raw = json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":["direct"]});
+        let raw = json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":["direct"]});
         let group: ClientConfigGroup = serde_json::from_value(raw).unwrap();
         assert_eq!(
             group.group_type,
@@ -218,16 +351,30 @@ mod group_type_tests {
             group.group_type
         );
         let group: ClientConfigGroup =
-            serde_json::from_value(json!({"client_group":"rr", "client_proxies":["direct"]}))
+            serde_json::from_value(json!({"client_group":"rr", "client_chains":["direct"]}))
                 .unwrap();
         assert_eq!(group.group_type, GroupType::RoundRobin);
     }
 
     #[test]
-    fn client_proxy_alias_preserves_canonical_serialization() {
+    fn legacy_group_fields_keep_alternatives_and_serialize_unambiguously() {
+        for field in ["client_proxy", "client_proxies"] {
+            let group: ClientConfigGroup = serde_json::from_value(json!({
+                "client_group": "rr", field: ["a", "b"]
+            }))
+            .unwrap();
+            assert_eq!(group.client_chains.len(), 2);
+            let encoded = serde_json::to_value(&group).unwrap();
+            assert!(encoded.get(field).is_none());
+            let decoded: ClientConfigGroup = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.client_chains.len(), 2);
+            for (member, expected) in decoded.client_chains.iter().zip(["a", "b"]) {
+                assert_eq!(member.explicit_name(), Some(expected));
+            }
+        }
         let group: ClientConfigGroup = serde_json::from_value(json!({
             "client_group": "rr",
-            "client_proxy": ["direct"]
+            "client_chains": ["direct"]
         }))
         .unwrap();
         assert_eq!(group.group_type, GroupType::RoundRobin);
@@ -237,14 +384,14 @@ mod group_type_tests {
             json!({
                 "client_group": "rr",
                 "type": "round-robin",
-                "client_proxies": ["direct"]
+                "client_chains": {"chain": ["direct"]}
             })
         );
     }
 
     #[test]
     fn url_test_rejects_removed_unknown_and_incompatible_group_settings() {
-        let base = json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_proxies":["direct"]});
+        let base = json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":["direct"]});
         for (field, value) in [
             ("strategy", json!("url-test")),
             ("type", json!("urltest")),
@@ -286,7 +433,7 @@ mod group_type_tests {
                 ("strategy", json!(kind)),
             ] {
                 let mut raw =
-                    json!({"client_group":"test", "type":kind, "client_proxies":["direct"]});
+                    json!({"client_group":"test", "type":kind, "client_chains":["direct"]});
                 raw[field] = value;
                 assert!(
                     serde_json::from_value::<ClientConfigGroup>(raw.clone()).is_err(),
@@ -294,9 +441,12 @@ mod group_type_tests {
                 );
             }
         }
-        for members in [json!([]), json!(["direct", "direct"])] {
+        for members in [
+            json!([]),
+            json!([{"chain":["direct"]}, {"chain":["direct"]}]),
+        ] {
             let mut raw = base.clone();
-            raw["client_proxies"] = members;
+            raw["client_chains"] = members;
             let configs = serde_json::from_value(json!([raw]));
             assert!(
                 configs.is_err() || crate::config::create_server_configs(configs.unwrap()).is_err()

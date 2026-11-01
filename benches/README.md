@@ -8,6 +8,7 @@ tests, not shared-runner timing gates.
 - [Sudoku](#sudoku-measurements): codec and stream costs.
 - [Selector](#selector-measurements): routing and cache costs.
 - [Reload](#reload-memory-and-lifetime): memory, descriptor and generation lifetime.
+- [Whole paths](#whole-path-measurements): composition preparation, selection and churn.
 - [Advisory collection](ADVISORY.md): bounded selector/reload collection and comparison.
 
 Keep generated logs, manifests and binaries outside the source tree or in the
@@ -197,3 +198,55 @@ Linux CI gates these correctness and bounded-retention tests. Full daemon live
 heap, asynchronous task counts in the subprocess, mobile devices, and arbitrary
 long-lived generation overlap remain outside these measurements. Other isolated
 tests can reuse the sampling helpers without adding production metrics.
+
+## Whole-Path Measurements
+
+`path_measurement` measures JSON parsing, validation/expansion and connector
+construction together, then selection separately without dialing. Cases cover
+one/four fixed hops, 16-way round-robin, nested selector/URL-test compositions
+with 64/1,024 leaves, 48 nested choices, a 16,000-member selector, and a 64-leaf
+group referenced by 64 rules. URL-test samples are seeded; no probes run here.
+Preparation excludes dropping the result. Selection includes releasing the
+selected path and uses warmed, unchanged manual choices.
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test --locked --release --lib path_measurement --no-run
+PATH_BUILD_COMMAND='CARGO_BUILD_JOBS=1 cargo test --locked --release --lib path_measurement --no-run' \
+PATH_REVISION="$(git rev-parse HEAD)" PATH_PROFILE=release PATH_SOURCE_ROOT="$PWD" \
+node benches/run_paths.mjs TEST_BINARY NEW_OUTPUT_DIRECTORY
+```
+
+The collector pins CPU 2 by default (`BENCH_CPU`), runs three fresh processes
+per case (`BENCH_REPEATS`), and records seven preparation samples and seven
+75-ms selection batches per transport/process. Reported selection extrema and
+medians are batch averages, not individual-flow latency percentiles. It retains
+raw logs, toolchain/build command, source and executable hashes. Use `fixed`
+as the final argument for a pre-feature comparison; its harness needs only
+source/resolved enum-name adaptations, unwrapping resolved `ConfigSelection`
+rules, and `select_indices` instead of `select`.
+Baseline selection measures decisions (indices); candidate selection includes
+path materialization and release. Neither measures the complete per-flow setup.
+Archive both harness versions and use identical profiles/toolchains. Alternate
+baseline/candidate runs on an otherwise idle host with the same exclusive lock.
+Set `PATH_SOURCE_ROOT` to the source tree used for that binary, especially for
+baseline runs. The collector requires `PATH_REVISION` to resolve to that tree's
+`HEAD` and records the full commit ID. It validates the binary's debug-assertions
+metadata against `PATH_PROFILE` and rejects missing or duplicate samples.
+
+Debug builds additionally report thread-local requested Rust heap and allocation
+counts using the existing test allocator. They assert that warmed selection
+retains no allocations and that dropping a prepared result releases its live
+bytes. Debug timings are not performance evidence; release timings use the
+uninstrumented system allocator. Neither measures the daemon's jemalloc arenas,
+TLS handshakes, concurrent selection contention, or network throughput.
+
+The Linux `path_lifecycle_churn_releases_generations_tasks_and_sockets` test runs
+in an isolated child: 12 cycles of four control-generation publications and 16
+selector updates per generation, with real local one/two-hop SOCKS paths and
+automatic probes. Existing streams and retained prefix dialers must keep using
+their selected routes; retired compositions/generations must be released.
+After each cycle, live Tokio tasks, FDs and connection/stream reservations must
+return to baseline within five seconds; reservations stay zero in these
+client-only paths. RSS is informational. This exercises
+control-generation replacement, not listener reload or every pooled protocol;
+run the existing process-retention test alongside it for listener reload/drain.

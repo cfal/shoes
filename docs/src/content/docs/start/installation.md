@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Install Shoes and check which version your configuration targets.
+description: Install shoes and check which version your configuration targets.
 ---
 
 ## Release binaries
