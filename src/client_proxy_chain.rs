@@ -918,3 +918,10 @@ fn register_flow(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "../benches/path_measurement.rs"]
+mod path_measurement;
+
+#[cfg(all(test, target_os = "linux"))]
+mod lifecycle_tests;
