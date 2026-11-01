@@ -260,8 +260,13 @@ fn selectors_preserve_declared_branch_weights_and_duplicate_tickets() {
     assert_eq!(chain.select_indices(true).unwrap(), [5]);
 }
 
-#[test]
-fn udp_selection_rejects_ineligible_member_without_falling_back() {
+#[tokio::test]
+async fn udp_selection_rejects_ineligible_member_without_falling_back() {
+    let tcp_only = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let udp_capable = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    for listener in [&tcp_only, &udp_capable] {
+        listener.set_nonblocking(true).unwrap();
+    }
     let yaml = "
 - client_group: leaves
   type: selector
@@ -279,8 +284,13 @@ fn udp_selection_rejects_ineligible_member_without_falling_back() {
   protocol: {type: socks}
   rules: [{mask: 0.0.0.0/0, action: allow, client_chain: leaves}]
 ";
+    let mut config: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    for (index, listener) in [&tcp_only, &udp_capable].into_iter().enumerate() {
+        config[0]["client_chains"][index]["chain"][0]["address"] =
+            format!("127.0.0.1:{}", listener.local_addr().unwrap().port()).into();
+    }
     let mut validated =
-        crate::config::create_server_configs(serde_yaml::from_str(yaml).unwrap()).unwrap();
+        crate::config::create_server_configs(serde_yaml::from_value(config).unwrap()).unwrap();
     let catalog = validated.catalog.take().unwrap();
     let crate::config::ResolvedConfig::Server(server) = validated.configs.remove(0) else {
         panic!()
@@ -291,11 +301,32 @@ fn udp_selection_rejects_ineligible_member_without_falling_back() {
     };
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let group =
-        crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver).unwrap();
+        crate::tcp::chain_builder::try_build_client_chain_group(client_chains, resolver.clone())
+            .unwrap();
     let chain = &group.chains[0];
     let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
     owner.activate(catalog.selection.clone()).unwrap();
-    assert!(chain.select_indices(true).is_err());
+    assert_eq!(
+        chain.select_indices(true).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        chain.connect_udp_bidirectional(
+            &resolver,
+            NetLocation::from_str("192.0.2.1:53", None).unwrap().into(),
+        ),
+    )
+    .await
+    .unwrap()
+    .err()
+    .expect("selected HTTP branch must reject UDP");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    for listener in [&tcp_only, &udp_capable] {
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
     owner.select("leaves", "udp").unwrap();
     assert_eq!(chain.select_indices(true).unwrap(), [1]);
 }

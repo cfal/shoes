@@ -640,6 +640,68 @@ async fn chain_choices_route_probe_and_restore_as_whole_paths() {
 
     let mut process = fixture.start().await;
     assert_eq!(fixture.selected().await, "via-west");
+    let mut retained = flow(fixture.entry, b'W').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let retained_port = retained.local_addr().unwrap().port().to_string();
+    let before = snapshot["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|connection| connection["metadata"]["sourcePort"] == retained_port)
+        .unwrap();
+    let generation = before["shoesGeneration"].as_u64().unwrap();
+    let live = fixture.config.clone();
+    fixture.outbound_mut()["client_chains"][1]["name"] = json!("via-west-candidate");
+    let partial = available_address();
+    fixture.config.as_array_mut().unwrap().extend([
+        json!({"address":partial.to_string(), "protocol":{"type":"socks"}}),
+        json!({"path":fixture.directory.path().join("missing/listener.sock"), "protocol":{"type":"socks"}}),
+    ]);
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process
+        .wait_for("Reload rejected; previous servers restored")
+        .await;
+    assert_eq!(fixture.selected().await, "via-west");
+    check_flow(&mut retained, b'W').await;
+    let mut restored = flow(fixture.entry, b'W').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    for port in [
+        retained_port,
+        restored.local_addr().unwrap().port().to_string(),
+    ] {
+        let connection = snapshot["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connection| connection["metadata"]["sourcePort"] == port)
+            .unwrap();
+        assert_eq!(connection["shoesGeneration"].as_u64().unwrap(), generation);
+    }
+    assert!(
+        snapshot["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|connection| connection["id"] == before["id"])
+    );
+    drop(std::net::TcpListener::bind(partial).unwrap());
+    let probe = api(
+        fixture.api,
+        "GET",
+        "/proxies/via-west/delay?url=http%3A%2F%2F192.0.2.1%2F&timeout=2000",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(probe.0, 200, "{}", probe.1);
+
+    fixture.config = live;
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process.wait_for("Servers ready").await;
+    assert_eq!(fixture.selected().await, "via-west");
+    check_flow(&mut retained, b'W').await;
+    check_flow(&mut restored, b'W').await;
     flow(fixture.entry, b'W').await;
     fixture
         .config
@@ -676,15 +738,21 @@ async fn chain_choices_route_probe_and_restore_as_whole_paths() {
 #[tokio::test]
 async fn variable_length_udp_choices_pin_associations_and_fail_closed() {
     use shoes_test_support::{
-        socks5::Socks5UdpAssociation, test_servers::start_udp_echo_server_with_suffix,
+        socks5::Socks5UdpAssociation, test_servers::start_udp_response_server,
     };
+    use std::sync::{Arc, Mutex};
+
     let mut fixture = Fixture::new().await;
-    let direct = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"direct")
-        .await
-        .unwrap();
-    let relay = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"relay")
-        .await
-        .unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let endpoint = |name: &'static str| {
+        let received = received.clone();
+        start_udp_response_server("0.0.0.0", 0, move |payload, _| {
+            received.lock().unwrap().push((name, payload.to_vec()));
+            [payload, name.as_bytes()].concat()
+        })
+    };
+    let direct = endpoint("direct").await.unwrap();
+    let relay = endpoint("relay").await.unwrap();
     let target = SocketAddr::from(([127, 0, 0, 1], direct.local_addr().port()));
     let (prefix_reservation, prefix) = reserve_address();
     let (last_reservation, last) = reserve_address();
@@ -748,6 +816,16 @@ async fn variable_length_udp_choices_pin_associations_and_fail_closed() {
         b"fiverelay"
     );
     fixture.stop(&mut process).await;
+    assert_eq!(
+        *received.lock().unwrap(),
+        [
+            ("relay", b"one".to_vec()),
+            ("direct", b"two".to_vec()),
+            ("relay", b"three".to_vec()),
+            ("direct", b"four".to_vec()),
+            ("relay", b"five".to_vec()),
+        ]
+    );
 }
 
 #[tokio::test]

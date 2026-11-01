@@ -360,38 +360,54 @@ async fn inline_sources_reload_and_missing_nested_sources_recover() {
         .unwrap();
     let (listener, address) = reserve_address();
     let (nested_listener, nested_address) = reserve_address();
+    let (client_listener, client_address) = reserve_address();
     let mut config = json!([
         {"address": address.to_string(), "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
          "rules": [{"masks": {"all": [{"path": "list.json"}, {"any_destination": true}]}, "action": "block"},
                    {"masks": "0.0.0.0/0"}]},
         {"address": nested_address.to_string(), "protocol": {"type": "websocket", "targets": [{
             "protocol": {"type": "socks"},
-            "override_rules": [{"masks": {"not": {"path": "list.json"}}, "action": "block"}]
-        }]}}
+            "override_rules": [{"masks": {"not": {"path": "list.json"}}, "action": "block"}, "allow-all-direct"]
+        }]}},
+        {"address": client_address.to_string(),
+         "protocol": {"type": "forward", "target": format!("127.0.0.1:{}", echo.local_addr().port())},
+         "rules": [{"mask": "0.0.0.0/0", "client_chain": {
+            "address": nested_address.to_string(),
+            "protocol": {"type": "websocket", "protocol": {"type": "socks"}}
+         }}]}
     ]);
     std::fs::write(&config_path, config.to_string()).unwrap();
     drop(listener);
     drop(nested_listener);
+    drop(client_listener);
     let mut process = Process::start(&config_path, &[]);
     process.wait_for("Servers ready").await;
     roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    blocked(client_address).await;
     source(&list, true);
     process.wait_for("Servers ready").await;
     blocked(address).await;
+    roundtrip(&mut TcpStream::connect(client_address).await.unwrap()).await;
 
     config[1]["protocol"]["targets"][0]["override_rules"][0]["masks"]["not"]["path"] =
         json!("missing/nested.json");
     std::fs::write(&config_path, config.to_string()).unwrap();
     process.wait_for("Reload rejected").await;
     blocked(address).await;
+    roundtrip(&mut TcpStream::connect(client_address).await.unwrap()).await;
     check_config(&config_path, Some("nested.json"));
     std::fs::create_dir(dir.path().join("missing")).unwrap();
     source(&dir.path().join("missing/nested.json"), false);
     process.wait_for("Servers ready").await;
     blocked(address).await;
+    blocked(client_address).await;
     source(&list, false);
     process.wait_for("Servers ready").await;
     roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    blocked(client_address).await;
+    source(&dir.path().join("missing/nested.json"), true);
+    process.wait_for("Servers ready").await;
+    roundtrip(&mut TcpStream::connect(client_address).await.unwrap()).await;
     process.signal(libc::SIGTERM);
     assert!(process.exit().await.success());
 }
