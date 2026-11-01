@@ -5,6 +5,15 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
+export function validateRevision(root, revision) {
+  const resolve = ref => execFileSync('git', ['-C', root, 'rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], {
+    encoding: 'utf8',
+  }).trim();
+  const commit = resolve(revision);
+  if (commit !== resolve('HEAD')) throw Error('PATH_REVISION must match PATH_SOURCE_ROOT HEAD');
+  return commit;
+}
+
 export function parseSamples(output, name, profile) {
   if (!['release', 'debug'].includes(profile)) throw Error('PATH_PROFILE must be release or debug');
   const lines = output.split('\n');
@@ -44,6 +53,7 @@ function main() {
   }
   if (!['debug', 'release'].includes(process.env.PATH_PROFILE)) throw Error('PATH_PROFILE must be release or debug');
   const root = path.resolve(process.env.PATH_SOURCE_ROOT);
+  const revision = validateRevision(root, process.env.PATH_REVISION);
   const cpu = process.env.BENCH_CPU || '2';
   const repeats = Number(process.env.BENCH_REPEATS || '3');
   if (!Number.isInteger(repeats) || repeats < 1 || repeats > 10) throw Error('BENCH_REPEATS must be 1..10');
@@ -61,7 +71,7 @@ function main() {
   collect('src');
   sources['benches/path_measurement.rs'] = hashFile(path.join(root, 'benches/path_measurement.rs'));
   const manifest = {
-    revision: process.env.PATH_REVISION,
+    revision,
     build: process.env.PATH_BUILD_COMMAND,
     profile: process.env.PATH_PROFILE,
     binary: path.resolve(binary),

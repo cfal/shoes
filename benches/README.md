@@ -229,8 +229,9 @@ path materialization and release. Neither measures the complete per-flow setup.
 Archive both harness versions and use identical profiles/toolchains. Alternate
 baseline/candidate runs on an otherwise idle host with the same exclusive lock.
 Set `PATH_SOURCE_ROOT` to the source tree used for that binary, especially for
-baseline runs. The collector validates the binary's debug-assertions metadata
-against `PATH_PROFILE` and rejects missing or duplicate samples.
+baseline runs. The collector requires `PATH_REVISION` to resolve to that tree's
+`HEAD` and records the full commit ID. It validates the binary's debug-assertions
+metadata against `PATH_PROFILE` and rejects missing or duplicate samples.
 
 Debug builds additionally report thread-local requested Rust heap and allocation
 counts using the existing test allocator. They assert that warmed selection

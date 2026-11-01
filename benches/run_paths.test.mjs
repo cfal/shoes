@@ -1,6 +1,41 @@
 import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
-import { parseSamples } from './run_paths.mjs';
+import { fileURLToPath } from 'node:url';
+import { parseSamples, validateRevision } from './run_paths.mjs';
+
+test('validates revision against the source checkout before collecting measurements', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'path-revision-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const git = (...args) => execFileSync('git', [
+    '-C', root, '-c', 'user.name=Benchmark test', '-c', 'user.email=benchmark@example.invalid',
+    '-c', 'commit.gpgsign=false', ...args,
+  ], { encoding: 'utf8' }).trim();
+  git('init', '--quiet');
+  git('commit', '--quiet', '--allow-empty', '-m', 'baseline');
+  const baseline = git('rev-parse', 'HEAD');
+  git('commit', '--quiet', '--allow-empty', '-m', 'candidate');
+  const candidate = git('rev-parse', 'HEAD');
+  for (const revision of ['HEAD', candidate, candidate.slice(0, 12)]) {
+    assert.equal(validateRevision(root, revision), candidate);
+  }
+  assert.throws(() => validateRevision(root, baseline), /PATH_REVISION must match PATH_SOURCE_ROOT HEAD/);
+
+  const directory = path.join(root, 'measurements');
+  const result = spawnSync(process.execPath, [
+    fileURLToPath(new URL('./run_paths.mjs', import.meta.url)), 'unused-binary', directory,
+  ], {
+    env: { ...process.env, PATH_BUILD_COMMAND: 'test fixture', PATH_PROFILE: 'release',
+      PATH_SOURCE_ROOT: root, PATH_REVISION: baseline },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /PATH_REVISION must match PATH_SOURCE_ROOT HEAD/);
+  assert.equal(fs.existsSync(directory), false);
+});
 
 function output(debug = false) {
   return [
