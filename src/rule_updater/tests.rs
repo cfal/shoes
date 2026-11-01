@@ -2412,9 +2412,9 @@ async fn changed_download_chain_shape_resets_rotation_before_the_next_attempt() 
         let dir = directory();
         let path = dir.path().join("cache.json");
         write_rule(&path, OLD);
-        let refused = tokio::net::TcpSocket::new_v4().unwrap();
-        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let address = refused.local_addr().unwrap().to_string();
+        // Accept-and-close avoids platform-dependent refusal of bound, non-listening ports.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
         let proxy = serde_json::json!({"address":address,"protocol":{"type":"socks"}});
         let pool = serde_json::json!({"pool":[proxy,proxy]});
         let mut source = source("http://127.0.0.1:9/rules.json", &path);
@@ -2434,15 +2434,20 @@ async fn changed_download_chain_shape_resets_rotation_before_the_next_attempt() 
             let item = &mut refresh.scheduled[0];
             // Failed attempts retain rotation indices; changing the number of pools
             // must discard them before the next connection restores its counters.
-            let error = http::download(
-                &item.source,
-                &DnsRegistry::new(),
-                GlobalLimits::default(),
-                Limits::default(),
-                &mut item.download,
-            )
-            .await
-            .unwrap_err();
+            let dns = DnsRegistry::new();
+            let (result, ()) = tokio::join!(
+                http::download(
+                    &item.source,
+                    &dns,
+                    GlobalLimits::default(),
+                    Limits::default(),
+                    &mut item.download,
+                ),
+                async {
+                    drop(listener.accept().await.unwrap());
+                }
+            );
+            let error = result.unwrap_err();
             assert!(
                 error
                     .to_string()
