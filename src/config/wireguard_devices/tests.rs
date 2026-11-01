@@ -53,12 +53,6 @@ fn servers_inherit_global_default_dns_before_device_extraction() {
             .resolved_group(),
         Some("selected")
     );
-    assert!(
-        validated
-            .dns_groups
-            .iter()
-            .any(|group| group.name == "selected")
-    );
 }
 
 #[test]

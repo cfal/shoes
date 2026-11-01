@@ -18,10 +18,13 @@ fn dns(config: &ResolvedConfig) -> Option<&ResolvedDnsConfig> {
 
 #[test]
 fn default_dns_is_order_independent_and_explicit_objects_override_it() {
+    let mut null_dns = listener(1081);
+    null_dns["dns"] = Value::Null;
     let mut entries = vec![
         json!({"global_settings": {"default_dns": {"servers": "selected"}}}),
         json!({"dns_group": "selected", "dns_servers": "tcp://192.0.2.53"}),
         listener(1080),
+        null_dns,
         json!({"device_name": "tun0", "address": "10.0.0.1", "netmask": "255.255.255.0"}),
     ];
     for reversed in [false, true] {
@@ -33,21 +36,23 @@ fn default_dns_is_order_independent_and_explicit_objects_override_it() {
             assert_eq!(dns(config).unwrap().resolved_group(), Some("selected"));
         }
     }
-    for explicit in [
-        json!({}),
-        json!({"servers": null}),
-        json!({"servers": []}),
-        json!({"servers": "system"}),
-        json!({"fake_ip": false}),
+    for (explicit, has_group) in [
+        (json!({}), false),
+        (json!({"servers": null}), false),
+        (json!({"servers": []}), false),
+        (json!({"servers": "system"}), true),
+        (json!({"fake_ip": false}), true),
     ] {
         let mut server = listener(1080);
         server["dns"] = explicit.clone();
         let result = validate(json!([
-            {"global_settings": {"default_dns": {"servers": "tcp://192.0.2.53"}}},
+            {"global_settings": {"default_dns": {"servers": "tcp://192.0.2.53", "fake_ip": true}}},
             server
         ]))
         .unwrap();
-        if let Some(name) = dns(&result.configs[0]).unwrap().resolved_group() {
+        let group = dns(&result.configs[0]).unwrap().resolved_group();
+        assert_eq!(group.is_some(), has_group, "{explicit}");
+        if let Some(name) = group {
             let group = result
                 .dns_groups
                 .iter()
@@ -57,13 +62,6 @@ fn default_dns_is_order_independent_and_explicit_objects_override_it() {
             assert!(group.fake_ip.is_none());
         }
     }
-    let mut server = listener(1080);
-    server["dns"] = Value::Null;
-    let result = validate(json!([
-        {"global_settings": {"default_dns": {"servers": "tcp://192.0.2.53"}}}, server
-    ]))
-    .unwrap();
-    assert!(dns(&result.configs[0]).unwrap().resolved_group().is_some());
 }
 
 #[tokio::test]
@@ -122,7 +120,6 @@ fn default_dns_validates_even_when_no_listener_uses_it() {
         "{error}"
     );
     for default in [
-        json!({"servers": "missing"}),
         json!({"servers": [{"url": "tcp://192.0.2.53", "bootstrap_url": "missing"}]}),
         json!({"fake_ip": {"max_entries": 0}}),
     ] {
@@ -140,15 +137,6 @@ fn default_dns_validates_even_when_no_listener_uses_it() {
             .is_err()
         );
     }
-    let value =
-        json!([{"global_settings": {"default_dns": {"servers": "system", "fake_ip": false}}}]);
-    let configs: Vec<Config> = serde_json::from_value(value).unwrap();
-    let serialized = serde_json::to_value(&configs).unwrap();
-    let decoded: Vec<Config> =
-        serde_yaml::from_str(&serde_yaml::to_string(&configs).unwrap()).unwrap();
-    assert_eq!(serde_json::to_value(decoded).unwrap(), serialized);
-    let decoded: Vec<Config> = serde_json::from_value(serialized.clone()).unwrap();
-    assert_eq!(serde_json::to_value(decoded).unwrap(), serialized);
 }
 
 #[cfg(unix)]

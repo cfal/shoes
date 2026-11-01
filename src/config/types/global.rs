@@ -265,7 +265,7 @@ mod tests {
         for name in ["global_settings", "global_limits"] {
             for cache in ["null", "./cache"] {
                 let yaml = format!(
-                    "- {name}: {{max_connections: 42, reload_grace_secs: 7, rule_cache_dir: {cache}, default_dns: {{servers: system}}}}"
+                    "- {name}: {{max_connections: 42, reload_grace_secs: 7, rule_cache_dir: {cache}, default_dns: {{servers: system, fake_ip: false}}}}"
                 );
                 let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
                 let Config::GlobalSettings(settings) = &configs[0] else {
@@ -286,23 +286,12 @@ mod tests {
                     json[0]["global_settings"]["default_dns"]["servers"],
                     "system"
                 );
-                let decoded: Vec<Config> = serde_json::from_value(json).unwrap();
-                let Config::GlobalSettings(decoded) = &decoded[0] else {
-                    panic!("expected global settings");
-                };
-                assert_eq!(
-                    serde_json::to_value(decoded).unwrap(),
-                    serde_json::to_value(settings).unwrap()
-                );
+                assert_eq!(json[0]["global_settings"]["default_dns"]["fake_ip"], false);
+                let decoded: Vec<Config> = serde_json::from_value(json.clone()).unwrap();
+                assert_eq!(serde_json::to_value(decoded).unwrap(), json);
                 let serialized = serde_yaml::to_string(&configs).unwrap();
                 let decoded: Vec<Config> = serde_yaml::from_str(&serialized).unwrap();
-                let Config::GlobalSettings(decoded) = &decoded[0] else {
-                    panic!("expected global settings");
-                };
-                assert_eq!(
-                    serde_json::to_value(decoded).unwrap(),
-                    serde_json::to_value(settings).unwrap()
-                );
+                assert_eq!(serde_json::to_value(decoded).unwrap(), json);
             }
         }
     }
