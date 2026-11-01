@@ -101,6 +101,7 @@ pub(super) fn create_server_configs_with_memory(
     crate::rule_set::load(&mut all_configs, &mut compiler)?;
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
+    let mut global_default_dns = None;
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<
         String,
@@ -165,6 +166,7 @@ pub(super) fn create_server_configs_with_memory(
                     ));
                 }
                 limits.validate()?;
+                global_default_dns = settings.default_dns;
             }
             Config::ClientConfigGroup(group) => {
                 if raw_client_groups
@@ -294,6 +296,25 @@ pub(super) fn create_server_configs_with_memory(
         )?;
     }
 
+    // Runs after inbound extraction to preserve inline numbering. Normalizing once
+    // gives inherited fake DNS a shared, stable persisted pool owner.
+    extract_inline_dns(
+        &mut global_default_dns,
+        &mut dns_groups,
+        &mut inline_dns_counter,
+        "global_settings",
+        &mut default_dns_groups,
+    )?;
+    for dns in server_configs
+        .iter_mut()
+        .map(|server| &mut server.dns)
+        .chain(tun_configs.iter_mut().map(|tun| &mut tun.dns))
+    {
+        if dns.is_none() {
+            *dns = global_default_dns.clone();
+        }
+    }
+
     // Expand DNS group composition references for ALL groups (named + inline).
     let mut fake_policies = HashMap::new();
     let mut state_files = HashSet::new();
@@ -342,6 +363,11 @@ pub(super) fn create_server_configs_with_memory(
     // Expand and validate DNS specs (client chains, protocol compatibility).
     let mut final_dns_groups: Vec<ExpandedDnsGroup> = Vec::new();
     let group_names: HashSet<&str> = expanded_dns_groups.keys().map(|s| s.as_str()).collect();
+    validate_dns_group_ref(
+        &global_default_dns,
+        &group_names,
+        "global_settings.default_dns",
+    )?;
 
     for name in dns_group_order {
         let specs = expanded_dns_groups.get(&name).unwrap();
@@ -378,7 +404,7 @@ pub(super) fn create_server_configs_with_memory(
             &named_pems,
             global_limits,
         )?;
-        validate_dns_group_ref(&dns, &group_names)?;
+        validate_dns_group_ref(&dns, &group_names, "server config")?;
         result.push(ResolvedConfig::Server(config));
     }
     for config in tun_configs {
@@ -390,7 +416,7 @@ pub(super) fn create_server_configs_with_memory(
             &named_pems,
             global_limits,
         )?;
-        validate_dns_group_ref(&dns, &group_names)?;
+        validate_dns_group_ref(&dns, &group_names, "server config")?;
         result.push(ResolvedConfig::TunServer(config));
     }
     crate::desktop::validate_config(&result)?;
@@ -987,6 +1013,7 @@ fn extract_inline_dns(
 fn validate_dns_group_ref(
     dns: &Option<DnsConfig>,
     group_names: &HashSet<&str>,
+    context: &str,
 ) -> std::io::Result<()> {
     let Some(config) = dns else {
         return Ok(());
@@ -1003,7 +1030,7 @@ fn validate_dns_group_ref(
     {
         if !group_names.contains(group_name) {
             return Err(std::io::Error::other(format!(
-                "unknown dns_group in server config: '{}'",
+                "unknown dns_group in {context}: '{}'",
                 group_name
             )));
         }
@@ -2663,3 +2690,6 @@ fn resolve_dns_binding(dns: Option<DnsConfig>) -> Option<ResolvedDnsConfig> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod default_dns_tests;

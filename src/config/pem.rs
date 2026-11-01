@@ -197,6 +197,11 @@ fn visit_config_pems(config: &mut Config, visitor: &mut PemVisitor<'_>) -> std::
         Ok(())
     })?;
     match config {
+        Config::GlobalSettings(settings) => {
+            if let Some(dns) = &mut settings.default_dns {
+                gather_dns_pem_paths(&mut dns.servers, visitor);
+            }
+        }
         Config::Server(server) => gather_pem_file_paths_from_server_config(server, visitor)?,
         Config::ClientConfigGroup(group) => {
             gather_pem_file_paths_from_client_config_group(group, visitor)
