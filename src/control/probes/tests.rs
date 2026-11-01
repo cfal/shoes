@@ -785,6 +785,64 @@ async fn url_test_waiting_checks_use_current_choices_and_fence_inflight_results(
     service.shutdown().await;
 }
 
+#[tokio::test]
+async fn queued_api_success_uses_admitted_selection_but_cannot_restore_stale_health() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let a = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let b = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = |listener: &tokio::net::TcpListener| format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let catalog = crate::config::create_server_configs(serde_json::from_value(json!([
+            {"client_group":"manual", "type":"selector", "client_chains":[
+                {"chain":[{"name":"a", "address":address(&a), "protocol":{"type":"http"}}]},
+                {"chain":[{"name":"b", "address":address(&b), "protocol":{"type":"http"}}]}
+            ]},
+            {"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chain":"manual"}
+        ])).unwrap()).unwrap().catalog.unwrap();
+        let generation = Arc::new(generation(catalog, Arc::new(crate::resolver::NativeResolver::new())));
+        let mut service = crate::control::runtime::ControlService::new(Default::default()).unwrap();
+        publish_for_api_probes(&service.runtime, &generation).await;
+        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+        owner.activate(generation.catalog.selection.clone()).unwrap();
+        let group = &generation.catalog.selection.automatic.0["auto"];
+        let members = vec!["manual".to_string()];
+        let mut query = query();
+        query.timeout = Duration::from_secs(4);
+        for (attempt, invalidate) in [true, false].into_iter().enumerate() {
+            owner.select("manual", "a").unwrap();
+            let held = service.runtime.probes.acquire_many(PROBE_CONCURRENCY as u32).await.unwrap();
+            let mut batch = Box::pin(probe_group(&service.runtime, &generation, &members, &query));
+            assert!(futures::poll!(&mut batch).is_pending());
+            owner.select("manual", "b").unwrap();
+            drop(held);
+            let serve = async {
+                let (mut stream, _) = b.accept().await.unwrap();
+                for expected in ["CONNECT probe.invalid:80 HTTP/1.1", "HEAD / HTTP/1.1"] {
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(stream.read_u8().await.unwrap());
+                        assert!(header.len() < 8192);
+                    }
+                    assert!(header.starts_with(expected.as_bytes()));
+                    if expected.starts_with("CONNECT") {
+                        stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                    }
+                }
+                if invalidate {
+                    owner.select("manual", "a").unwrap();
+                    owner.select("manual", "b").unwrap();
+                }
+                stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
+            };
+            let (_, result) = tokio::join!(serve, batch);
+            assert!(result.unwrap().contains_key("manual"));
+            assert_eq!(group.health("manual"), if invalidate { "unprobed" } else { "healthy" });
+            assert_eq!(generation.probes.url_history("manual", query.url.as_str()).as_array().unwrap().len(), attempt + 1);
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(20), a.accept()).await.is_err());
+        service.shutdown().await;
+    }).await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn url_test_late_admission_has_a_full_automatic_timeout_but_a_shared_api_deadline() {
     for automatic in [false, true] {
