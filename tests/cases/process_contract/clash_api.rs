@@ -635,6 +635,21 @@ async fn chain_choices_route_probe_and_restore_as_whole_paths() {
     check_flow(&mut old, b'E').await;
     fixture.select("east").await;
     check_flow(&mut chained, b'W').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let source_port = chained.local_addr().unwrap().port().to_string();
+    let retained = snapshot["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["metadata"]["sourcePort"] == source_port
+                && entry["metadata"]["destinationIP"] == "192.0.2.100"
+        })
+        .unwrap();
+    assert_eq!(
+        retained["chains"],
+        json!(["west", "outbound", "prefix-client", "prefix", "outbound"])
+    );
     fixture.select("via-west").await;
     fixture.stop(&mut process).await;
 
@@ -727,9 +742,100 @@ async fn chain_choices_route_probe_and_restore_as_whole_paths() {
         );
     }
     assert_eq!(fixture.selected().await, "via-west");
+    let unavailable_probe = api(
+        fixture.api,
+        "GET",
+        "/proxies/via-west/delay?url=http%3A%2F%2F192.0.2.1%2F&timeout=2000",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(unavailable_probe.0, 503, "{}", unavailable_probe.1);
+    let unavailable_node = api(fixture.api, "GET", "/proxies/via-west", Value::Null)
+        .await
+        .1;
+    assert_eq!(
+        unavailable_node["history"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["delay"],
+        0
+    );
     fixture.select("east").await;
     flow(fixture.entry, b'E').await;
     fixture.stop(&mut process).await;
+}
+
+#[tokio::test]
+async fn rule_level_chains_rotate_udp_payloads_over_only_eligible_paths() {
+    use shoes_test_support::{
+        socks5::Socks5UdpAssociation, test_servers::start_udp_echo_server_with_suffix,
+    };
+    timeout(Duration::from_secs(30), async {
+        let mut fixture = Fixture::new().await;
+        let direct = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"direct")
+            .await
+            .unwrap();
+        let relay = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"relay")
+            .await
+            .unwrap();
+        let target = SocketAddr::from(([127, 0, 0, 1], direct.local_addr().port()));
+        let trap = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let (prefix_reservation, prefix) = reserve_address();
+        let (last_reservation, last) = reserve_address();
+        let protocol =
+            json!({"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000","udp_enabled":true});
+        let entry = fixture
+            .config
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["name"] == "local-socks")
+            .unwrap();
+        entry["rules"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("client_chain");
+        entry["rules"][0]["client_chains"] = json!([
+            ["direct"],
+            [{"address":format!("127.0.0.1:{}", trap.local_addr().unwrap().port()),"protocol":{"type":"http"}}],
+            [{"address":prefix.to_string(),"protocol":{"type":"socks"}},
+             {"address":last.to_string(),"protocol":protocol}]
+        ]);
+        fixture.config.as_array_mut().unwrap().extend([
+            json!({"address":format!("0.0.0.0:{}",prefix.port()),"protocol":{"type":"socks"}}),
+            json!({"address":format!("0.0.0.0:{}",last.port()),"protocol":protocol,"rules":[
+                {"mask":"0.0.0.0/0","action":"allow","override_address":format!("127.0.0.1:{}",relay.local_addr().port())}
+            ]}),
+        ]);
+        drop((prefix_reservation, last_reservation));
+        let mut process = fixture.start().await;
+        let mut retained = Vec::new();
+        for suffix in [b"direct".as_slice(), b"relay", b"direct", b"relay"] {
+            let association = Socks5UdpAssociation::connect("127.0.0.1", fixture.entry.port())
+                .await
+                .unwrap();
+            assert_eq!(
+                association.send_to(target, b"new-").await.unwrap(),
+                [b"new-".as_slice(), suffix].concat()
+            );
+            retained.push((association, suffix));
+        }
+        for (association, suffix) in retained.into_iter().rev() {
+            assert_eq!(
+                association.send_to(target, b"pinned-").await.unwrap(),
+                [b"pinned-".as_slice(), suffix].concat()
+            );
+        }
+        assert!(
+            timeout(Duration::from_millis(20), trap.accept())
+                .await
+                .is_err()
+        );
+        fixture.stop(&mut process).await;
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
