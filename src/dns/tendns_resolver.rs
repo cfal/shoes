@@ -182,9 +182,8 @@ impl Resolver for TendnsResolver {
                 .lookup_ip(name, strategy, deadline, |target, deadline| async move {
                     check_deadline(deadline)?;
                     let location = NetLocation::new(Address::Hostname(target.to_ascii()), port);
-                    let addresses =
-                        tokio::time::timeout_at(deadline, raw.resolve_location(&location))
-                            .await??;
+                    // lookup_ip bounds this fallback with the same deadline.
+                    let addresses = raw.resolve_location(&location).await?;
                     let ips = addresses.iter().map(SocketAddr::ip).collect();
                     *native_addresses = Some(addresses);
                     Ok(ips)

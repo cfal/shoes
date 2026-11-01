@@ -49,13 +49,7 @@ impl Resolver for Mock {
         let delay = self.delay;
         Box::pin(async move {
             tokio::time::sleep(delay).await;
-            let address = SocketAddr::V6(std::net::SocketAddrV6::new(
-                "fe80::1".parse().unwrap(),
-                port,
-                7,
-                42,
-            ));
-            Ok(vec![address, address])
+            Ok(native_addresses(port))
         })
     }
 
@@ -152,11 +146,56 @@ fn location(host: &str) -> NetLocation {
     NetLocation::new(Address::Hostname(host.into()), 443)
 }
 
+fn native_addresses(port: u16) -> Vec<SocketAddr> {
+    let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+        "fe80::1".parse().unwrap(),
+        port,
+        7,
+        42,
+    ));
+    vec![
+        scoped,
+        SocketAddr::new("192.0.2.99".parse().unwrap(), port),
+        SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::2".parse().unwrap(),
+            port,
+            9,
+            43,
+        )),
+        scoped,
+    ]
+}
+
 fn query(host: &str, kind: RecordType) -> Vec<u8> {
     let mut message = Message::query();
     message.metadata.id = 17;
     message.add_query(Query::query(Name::from_ascii(host).unwrap(), kind));
     message.to_vec().unwrap()
+}
+
+#[test]
+fn constructor_rejects_zero_and_excessive_budgets() {
+    for budget in [Duration::ZERO, Duration::from_secs(86_401), Duration::MAX] {
+        let error = TendnsResolver::new(
+            policy(),
+            Arc::new(Mock::default()),
+            IpStrategy::Ipv4AndIpv6,
+            budget,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+    for budget in [Duration::from_nanos(1), Duration::from_secs(86_400)] {
+        assert!(
+            TendnsResolver::new(
+                policy(),
+                Arc::new(Mock::default()),
+                IpStrategy::Ipv4AndIpv6,
+                budget,
+            )
+            .is_ok()
+        );
+    }
 }
 
 #[tokio::test]
@@ -185,13 +224,7 @@ async fn unrelated_native_names_preserve_case_form_order_duplicates_and_scope() 
     for host in ["MiXeD", "Public.Example.", "[fe80::1%42]"] {
         let location = location(host);
         let addresses = adapter.resolve_location(&location).await.unwrap();
-        let expected = SocketAddr::V6(std::net::SocketAddrV6::new(
-            "fe80::1".parse().unwrap(),
-            443,
-            7,
-            42,
-        ));
-        assert_eq!(addresses, vec![expected, expected]);
+        assert_eq!(addresses, native_addresses(443));
         assert_eq!(raw.lookups.lock().unwrap().last(), Some(&location));
     }
     assert!(raw.calls.lock().unwrap().is_empty());
@@ -222,37 +255,15 @@ async fn native_underscore_names_delegate_but_private_names_do_not() {
 }
 
 #[tokio::test]
-async fn empty_hostname_fails_before_native_or_txt_work() {
-    let raw = Arc::new(Mock::default());
-    let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
-    let error = adapter.resolve_location(&location("")).await.unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    assert!(raw.lookups.lock().unwrap().is_empty());
-    assert!(raw.calls.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn presentation_escapes_fail_before_native_or_txt_work() {
+async fn invalid_hostnames_fail_closed_before_native_or_txt_work() {
     let raw = Arc::new(Mock::default());
     let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
     for host in [
+        "",
         "nas.example.com\\",
         "nas.example.com\\1",
         "nas.example.com\\12",
         "public\\.test",
-    ] {
-        let error = adapter.resolve_location(&location(host)).await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{host}");
-    }
-    assert!(raw.lookups.lock().unwrap().is_empty());
-    assert!(raw.calls.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn unparseable_names_fail_closed_before_native_or_txt_work() {
-    let raw = Arc::new(Mock::default());
-    let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
-    for host in [
         "a+b.lan",
         "a+b.example.com",
         "-edge.lan",
@@ -261,34 +272,10 @@ async fn unparseable_names_fail_closed_before_native_or_txt_work() {
         "my printer.example.com",
     ] {
         let error = adapter.resolve_location(&location(host)).await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{host}");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{host:?}");
     }
     assert!(raw.lookups.lock().unwrap().is_empty());
     assert!(raw.calls.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn unclaimed_plain_exchange_keeps_the_underlying_method() {
-    let raw = Arc::new(Mock::default());
-    let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
-    adapter
-        .exchange(query("public.test.", RecordType::A))
-        .await
-        .unwrap();
-    assert_eq!(raw.plain_calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn unclaimed_exchange_keeps_the_callers_longer_deadline() {
-    let raw = Arc::new(Mock::default());
-    let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    adapter
-        .exchange_with_deadline(query("public.test.", RecordType::A), deadline)
-        .await
-        .unwrap();
-    assert_eq!(raw.calls.lock().unwrap()[0].1, deadline);
-    assert_eq!(raw.plain_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -442,28 +429,39 @@ async fn publication_caches_are_isolated_and_completed_addresses_do_not_outlive_
 #[tokio::test]
 async fn external_cname_is_absolute_and_expiry_is_rechecked_after_fallback() {
     for expires in [false, true] {
-        let clock = Arc::new(Clock(AtomicU64::new(100)));
-        let raw = Arc::new(Mock {
-            expire_on_fallback: expires.then_some(clock.clone()),
-            ..Default::default()
-        });
-        parent(&raw, Value::Cname(canonical_name("public.test").unwrap()));
-        let adapter = adapter(raw.clone(), clock);
-        let result = adapter.resolve_location(&location("nas.example.com")).await;
-        assert_eq!(result.is_err(), expires);
-        if !expires {
-            let expected = SocketAddr::V6(std::net::SocketAddrV6::new(
-                "fe80::1".parse().unwrap(),
-                443,
-                7,
-                42,
-            ));
-            assert_eq!(result.unwrap(), vec![expected, expected]);
+        for strategy in [
+            IpStrategy::Ipv4AndIpv6,
+            IpStrategy::Ipv4Only,
+            IpStrategy::Ipv6Only,
+            IpStrategy::Ipv4ThenIpv6,
+            IpStrategy::Ipv6ThenIpv4,
+        ] {
+            let clock = Arc::new(Clock(AtomicU64::new(100)));
+            let raw = Arc::new(Mock {
+                expire_on_fallback: expires.then_some(clock.clone()),
+                ..Default::default()
+            });
+            parent(&raw, Value::Cname(canonical_name("public.test").unwrap()));
+            let mut adapter = adapter(raw.clone(), clock);
+            adapter.strategy = strategy;
+            let result = adapter.resolve_location(&location("nas.example.com")).await;
+            assert_eq!(result.is_err(), expires);
+            if !expires {
+                let native = native_addresses(443);
+                let expected = match strategy {
+                    IpStrategy::Ipv4Only | IpStrategy::Ipv4ThenIpv6 => vec![native[1]],
+                    IpStrategy::Ipv6Only | IpStrategy::Ipv6ThenIpv4 => {
+                        vec![native[0], native[2], native[3]]
+                    }
+                    IpStrategy::Ipv4AndIpv6 => native,
+                };
+                assert_eq!(result.unwrap(), expected, "{strategy:?}");
+            }
+            assert_eq!(
+                raw.lookups.lock().unwrap().as_slice(),
+                &[location("public.test.")]
+            );
         }
-        assert_eq!(
-            raw.lookups.lock().unwrap().as_slice(),
-            &[location("public.test.")]
-        );
     }
 }
 
@@ -502,7 +500,7 @@ async fn fake_ip_answers_precede_tendns_and_outer_guards_check_synthesized_ips()
 }
 
 #[tokio::test(start_paused = true)]
-async fn raw_queries_preserve_unclaimed_bytes_and_validate_private_requests() {
+async fn unclaimed_raw_queries_preserve_bytes_methods_and_deadlines() {
     let raw = Arc::new(Mock::default());
     let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
     let mut request = Message::from_vec(&query("PuBlic.TeSt.", RecordType::TXT)).unwrap();
@@ -516,8 +514,9 @@ async fn raw_queries_preserve_unclaimed_bytes_and_validate_private_requests() {
     encoder.set_name_encoding(NameEncoding::Uncompressed);
     request.emit(&mut encoder).unwrap();
     assert_ne!(Message::from_vec(&bytes).unwrap().to_vec().unwrap(), bytes);
-    let end = Instant::now() + Duration::from_secs(1);
+    let end = Instant::now() + Duration::from_secs(30);
     adapter.exchange(bytes.clone()).await.unwrap();
+    assert_eq!(raw.plain_calls.load(Ordering::SeqCst), 1);
     adapter
         .exchange_with_deadline(bytes.clone(), end)
         .await
@@ -527,11 +526,23 @@ async fn raw_queries_preserve_unclaimed_bytes_and_validate_private_requests() {
         &[bytes.clone(), bytes]
     );
     assert_eq!(raw.calls.lock().unwrap()[1].1, end);
-    let mut request = Message::from_vec(&query("nas.example.com.", RecordType::A)).unwrap();
+    assert_eq!(raw.plain_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn protected_raw_queries_validate_all_questions_and_expired_deadlines() {
+    let raw = Arc::new(Mock::default());
+    let adapter = adapter(raw.clone(), Arc::new(Clock(AtomicU64::new(100))));
+    let mut request = Message::from_vec(&query("public.test.", RecordType::A)).unwrap();
     request.add_query(Query::query(
-        canonical_name("public.test").unwrap(),
+        canonical_name("nas.example.com").unwrap(),
         RecordType::A,
     ));
+    let error = adapter
+        .exchange_with_deadline(request.to_vec().unwrap(), Instant::now())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     let answer = adapter.exchange(request.to_vec().unwrap()).await.unwrap();
     assert_eq!(
         Message::from_vec(&answer).unwrap().metadata.response_code,
@@ -542,7 +553,7 @@ async fn raw_queries_preserve_unclaimed_bytes_and_validate_private_requests() {
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    assert_eq!(raw.calls.lock().unwrap().len(), 2);
+    assert!(raw.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
