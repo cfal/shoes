@@ -60,6 +60,7 @@ mod hysteria2_server;
 mod listener_tasks;
 mod mixed_handler;
 mod naiveproxy;
+mod ntp;
 mod option_util;
 mod port_forward_handler;
 mod prepend_stream;

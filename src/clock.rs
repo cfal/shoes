@@ -19,13 +19,18 @@ impl Clock {
         apply(raw, self.offset_micros.load(Ordering::Relaxed))
     }
 
-    #[cfg(test)]
     pub(crate) fn set_offset(&self, offset_micros: i64) -> io::Result<()> {
         apply(SystemTime::now(), offset_micros)?
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(io::Error::other)?;
         self.offset_micros.store(offset_micros, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            offset_micros: AtomicI64::new(self.offset_micros.load(Ordering::Relaxed)),
+        }
     }
 }
 
@@ -58,10 +63,8 @@ struct Publication {
     clock: Arc<Clock>,
 }
 
-#[cfg(test)]
 pub(crate) struct Published(Arc<Publication>);
 
-#[cfg(test)]
 impl Drop for Published {
     fn drop(&mut self) {
         let mut current = CURRENT.write();
@@ -74,7 +77,6 @@ impl Drop for Published {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn publish(clock: Arc<Clock>) -> Published {
     // Publication identity differs from clock identity when reload reuses a sample.
     let publication = Arc::new(Publication { clock });

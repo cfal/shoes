@@ -8,6 +8,8 @@ pub struct GlobalSettings {
     pub rule_cache_dir: Option<std::path::PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_dns: Option<super::dns::DnsConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ntp: Option<super::ntp::NtpConfig>,
 }
 
 impl<'de> Deserialize<'de> for GlobalSettings {
@@ -25,11 +27,16 @@ impl<'de> Deserialize<'de> for GlobalSettings {
             Some(value) => serde_yaml::from_value(value).map_err(Error::custom)?,
             None => None,
         };
+        let ntp = match fields.remove("ntp") {
+            Some(value) => serde_yaml::from_value(value).map_err(Error::custom)?,
+            None => None,
+        };
         let limits = serde_yaml::from_value(Value::Mapping(fields)).map_err(Error::custom)?;
         Ok(Self {
             limits,
             rule_cache_dir,
             default_dns,
+            ntp,
         })
     }
 }

@@ -1,0 +1,12 @@
+# Opt-in application time correction; never changes the host clock.
+# NTP is unauthenticated. Use a trusted server; an IP avoids bootstrap DNS.
+- global_settings:
+    ntp:
+      server: time.cloudflare.com:123
+      interval_secs: 1800
+      timeout_secs: 5
+
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules: allow-all-direct

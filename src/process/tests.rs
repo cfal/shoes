@@ -1,5 +1,63 @@
 use super::*;
 
+#[tokio::test]
+async fn ntp_initial_sync_precedes_deferred_certificate_binds() {
+    const CHILD: &str = "SHOES_NTP_DEFERRED_BIND_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(
+            "process::tests::ntp_initial_sync_precedes_deferred_certificate_binds",
+            CHILD,
+            "1",
+        );
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let challenge = occupied.local_addr().unwrap();
+    let ntp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let old =
+        serde_json::json!([{"address": challenge.to_string(), "protocol": {"type": "socks"}}]);
+    std::fs::write(&path, old.to_string()).unwrap();
+    let paths = [path.to_str().unwrap().to_owned()];
+    let previous = prepare(&paths, None).await.unwrap();
+    let config = serde_json::json!([
+        {"global_settings": {"ntp": {"server": ntp.local_addr().unwrap().to_string(), "timeout_secs": 1}}},
+        {"certificate_source": "managed", "type": "acme", "domains": ["proxy.test"],
+         "directory_url": "http://127.0.0.1:9/directory", "state_dir": directory.path().join("state"),
+         "challenge": {"type": "http01", "listen": [challenge.to_string()]}},
+        {"address": "127.0.0.1:0", "protocol": {"type": "tls", "default_tls_target": {
+            "certificate_source": "managed", "protocol": {"type": "socks"}}}}
+    ]);
+    std::fs::write(&path, config.to_string()).unwrap();
+    let mut candidate = prepare_tracking(
+        &paths,
+        config::load_config_files(&paths).await.unwrap(),
+        Some(&previous.dns),
+        Some(&previous),
+        &mut |_, _, _| {},
+        &mut None,
+        &crate::desktop::NetworkSession::default(),
+    )
+    .await
+    .unwrap();
+    let mut packet = [0; 48];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), ntp.recv_from(&mut packet))
+            .await
+            .is_err()
+    );
+    let mut running = RunningServers::default();
+    let error = running.start(&mut candidate).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    assert!(error.to_string().contains("HTTP-01 bind"), "{error}");
+    tokio::time::timeout(Duration::from_secs(1), ntp.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    running.shutdown(&[&candidate, &previous]).await.unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn network_reconciliation_does_not_cancel_inflight_refresh() {

@@ -34,6 +34,7 @@ pub struct ValidatedConfigs {
     pub certificates: Vec<std::sync::Arc<crate::certificates::Source>>,
     pub reload_files: Vec<std::path::PathBuf>,
     pub global_limits: GlobalLimits,
+    pub ntp: Option<super::NtpConfig>,
     pub configs: Vec<ResolvedConfig>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
@@ -102,6 +103,7 @@ pub(super) fn create_server_configs_with_memory(
     super::rule_visit::compile(&mut all_configs, &mut compiler)?;
     let mut global_limits = None;
     let mut global_default_dns = None;
+    let mut ntp = None;
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<
         String,
@@ -166,6 +168,10 @@ pub(super) fn create_server_configs_with_memory(
                     ));
                 }
                 limits.validate()?;
+                if let Some(config) = &settings.ntp {
+                    config.validate()?;
+                }
+                ntp = settings.ntp;
                 global_default_dns = settings.default_dns;
             }
             Config::ClientConfigGroup(group) => {
@@ -459,6 +465,7 @@ pub(super) fn create_server_configs_with_memory(
     }
 
     let mut validated = ValidatedConfigs {
+        ntp,
         catalog: None,
         control,
         certificates,
