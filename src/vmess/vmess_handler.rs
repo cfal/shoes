@@ -43,7 +43,7 @@ pub(super) fn unix_time_secs(time: SystemTime) -> std::io::Result<u64> {
 }
 
 fn random_auth_id_timestamp() -> std::io::Result<u64> {
-    let now = unix_time_secs(SystemTime::now())?;
+    let now = unix_time_secs(crate::clock::now()?)?;
     Ok(rand::rng().random_range(
         now.saturating_sub(AUTH_ID_TIME_WINDOW_SECS)..=now.saturating_add(AUTH_ID_TIME_WINDOW_SECS),
     ))
@@ -1274,6 +1274,38 @@ impl VmessTcpClientHandler {
 #[cfg(test)]
 mod header_tests {
     use super::*;
+
+    #[test]
+    fn corrected_clock_drives_generation_and_preserves_replay_high_water() {
+        const CHILD: &str = "SHOES_VMESS_CLOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            shoes_test_support::isolated::run_isolated(
+                "vmess::vmess_handler::header_tests::corrected_clock_drives_generation_and_preserves_replay_high_water",
+                CHILD,
+                "1",
+            );
+            return;
+        }
+        let raw = unix_time_secs(SystemTime::now()).unwrap();
+        let _first = crate::clock::test_offset(600_000_000);
+        assert!(
+            random_auth_id_timestamp().unwrap().abs_diff(raw + 600) <= AUTH_ID_TIME_WINDOW_SECS
+        );
+        let identity = rand::random();
+        let auth_id = rand::random();
+        super::super::replay::admit(identity, auth_id, raw + 600).unwrap();
+        assert!(super::super::replay::admit(identity, auth_id, raw + 600).is_err());
+        let _forward = crate::clock::test_offset(1_200_000_000);
+        assert!(super::super::replay::admit(identity, rand::random(), 0).is_err());
+        let _backward = crate::clock::test_offset(600_000_000);
+        let error = super::super::replay::admit(identity, rand::random(), raw + 600).unwrap_err();
+        assert!(error.to_string().contains("clock rollback"));
+        let _recovered = crate::clock::test_offset(1_200_000_000);
+        let timestamp = crate::clock::unix_seconds().unwrap();
+        let auth_id = rand::random();
+        super::super::replay::admit(identity, auth_id, timestamp).unwrap();
+        assert!(super::super::replay::admit(identity, auth_id, timestamp).is_err());
+    }
 
     #[test]
     fn configured_ciphers_share_one_fallible_parser() {

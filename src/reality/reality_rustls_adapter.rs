@@ -198,10 +198,8 @@ impl rustls::reality::ClientHooks for ClientAuthentication {
         let auth = Zeroizing::new(
             derive_auth_key(&shared, &random[..20], b"REALITY").map_err(|_| crypto_error())?,
         );
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| Error::FailedToGetCurrentTime)?
-            .as_secs() as u32;
+        let timestamp =
+            crate::clock::unix_seconds().map_err(|_| Error::FailedToGetCurrentTime)? as u32;
         let mut plaintext = Zeroizing::new([0; 16]);
         plaintext[..3].copy_from_slice(&[1, 8, 0]);
         plaintext[4..8].copy_from_slice(&timestamp.to_be_bytes());

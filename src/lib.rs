@@ -45,6 +45,7 @@ mod certificates;
 mod clash_api;
 mod client_proxy_chain;
 mod client_proxy_selector;
+mod clock;
 mod control;
 mod copy_bidirectional;
 mod copy_bidirectional_message;

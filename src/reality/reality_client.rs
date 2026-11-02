@@ -30,12 +30,15 @@ impl RealityClientConfig {
         key_log: Arc<dyn rustls::KeyLog>,
     ) -> io::Result<TlsConnection> {
         let (hooks, verifier) = client_authentication(&self, schemes);
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(crypto))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(tls_error)?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth();
+        let mut tls = rustls::ClientConfig::builder_with_details(
+            Arc::new(crypto),
+            crate::clock::time_provider(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(tls_error)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         tls.cert_decompressors.clear();
         tls.key_log = key_log;

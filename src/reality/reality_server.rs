@@ -74,10 +74,7 @@ impl RealityServerConfig {
         }
         if let Some(max_ms) = self.max_time_diff {
             let timestamp = u32::from_be_bytes(metadata[4..8].try_into().unwrap()) as u64;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| io::Error::other("System time error"))?
-                .as_secs();
+            let now = crate::clock::unix_seconds()?;
             if now.abs_diff(timestamp) > max_ms / 1000 {
                 return Err(denied("REALITY timestamp outside allowed window"));
             }
@@ -125,11 +122,14 @@ impl AuthenticatedClientHello {
             vec![certificate.der().clone()],
             Arc::new(RealitySigningKey::new(key)),
         );
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(crypto))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(tls_error)?
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(key)));
+        let config = rustls::ServerConfig::builder_with_details(
+            Arc::new(crypto),
+            crate::clock::time_provider(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(tls_error)?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(key)));
         let expected_hello = prepared.server_hello().to_vec();
         let server =
             rustls::ServerConnection::new_reality(Arc::new(config), prepared).map_err(tls_error)?;
