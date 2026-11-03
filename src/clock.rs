@@ -124,6 +124,7 @@ mod tests {
             epoch
         );
         assert!(clock.set_offset(i64::MIN).is_err());
+        assert_eq!(clock.at(epoch).unwrap(), epoch - Duration::from_micros(1));
         if let Some(limit) = epoch.checked_add(Duration::new(i64::MAX as u64, 999_999_999)) {
             assert!(apply(limit, 1).is_err());
         }

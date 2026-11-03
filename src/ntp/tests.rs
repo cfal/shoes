@@ -1,11 +1,14 @@
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
+type PacketMutation = fn(&mut Vec<u8>);
+
 #[derive(Clone, Copy)]
 enum Reply {
     Offset(i64),
+    DelayedOffset(i64, Duration),
     KissOfDeath([u8; 4]),
-    Mutate(fn(&mut Vec<u8>)),
+    Mutate(PacketMutation),
     Silent,
     WrongSource,
 }
@@ -46,26 +49,23 @@ impl FakeServer {
                     reply[3] = (-20i8) as u8;
                     reply[24..32].copy_from_slice(&request[40..48]);
                     let offset = match mode {
-                        Reply::Offset(seconds) => seconds,
+                        Reply::Offset(seconds) | Reply::DelayedOffset(seconds, _) => seconds,
                         _ => 0,
                     };
-                    // Independent server time makes corrected-client feedback observable.
-                    let raw = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap();
-                    let seconds = (raw.as_secs() as i64 + 2_208_988_800 + offset) as u32;
-                    let fraction = (u64::from(raw.subsec_nanos()) << 32) / 1_000_000_000;
-                    let stamp = ((u64::from(seconds) << 32) | fraction).to_be_bytes();
+                    let stamp = server_timestamp(offset);
                     reply[32..40].copy_from_slice(&stamp);
-                    reply[40..48].copy_from_slice(&stamp);
+                    let transmit = if let Reply::DelayedOffset(_, delay) = mode {
+                        tokio::time::sleep(delay).await;
+                        server_timestamp(offset)
+                    } else {
+                        stamp
+                    };
+                    reply[40..48].copy_from_slice(&transmit);
                     if let Reply::Mutate(mutate) = mode {
                         mutate(&mut reply);
                     }
                     if let Reply::KissOfDeath(code) = mode {
-                        reply[0] = 0xe4;
-                        reply[1] = 0;
-                        reply[12..16].copy_from_slice(&code);
-                        reply[32..48].fill(0);
+                        refusal(&mut reply, code);
                     }
                     if matches!(mode, Reply::WrongSource) {
                         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -100,6 +100,23 @@ impl FakeServer {
     }
 }
 
+fn server_timestamp(offset: i64) -> [u8; 8] {
+    // Independent server time makes corrected-client feedback observable.
+    let raw = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let seconds = (raw.as_secs() as i64 + 2_208_988_800 + offset) as u32;
+    let fraction = (u64::from(raw.subsec_nanos()) << 32) / 1_000_000_000;
+    ((u64::from(seconds) << 32) | fraction).to_be_bytes()
+}
+
+fn refusal(packet: &mut [u8], code: [u8; 4]) {
+    packet[0] = 0xe4;
+    packet[1] = 0;
+    packet[12..16].copy_from_slice(&code);
+    packet[32..48].fill(0);
+}
+
 impl Drop for FakeServer {
     fn drop(&mut self) {
         self.task.abort();
@@ -119,6 +136,45 @@ async fn positive_and_negative_offsets_use_raw_time_on_each_exchange() {
 }
 
 #[tokio::test]
+async fn server_processing_time_does_not_bias_the_offset() {
+    for seconds in [600, -600] {
+        let delay = Duration::from_secs(1);
+        let server = FakeServer::new(Reply::DelayedOffset(seconds, delay)).await;
+        let mut config = server.config();
+        config.timeout_secs = 3;
+        let started = Instant::now();
+        let offset = query(&config, Arc::from([])).await.unwrap();
+        assert!(started.elapsed() >= delay);
+        assert!(offset.abs_diff(seconds * 1_000_000) < 250_000, "{offset}");
+        assert_eq!(server.requests(), 1);
+    }
+}
+
+#[tokio::test]
+async fn silent_addresses_share_the_deadline_without_starving_failover() {
+    for reply in [Reply::Offset(600), Reply::Silent] {
+        let first = FakeServer::new(Reply::Silent).await;
+        let second = FakeServer::new(reply).await;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = timeout_at(
+            deadline + Duration::from_millis(500),
+            query_addresses(&[first.address, second.address], deadline),
+        )
+        .await
+        .expect("address attempts exceeded the shared deadline");
+        if matches!(reply, Reply::Silent) {
+            assert!(
+                matches!(result, Err(QueryError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
+            );
+        } else {
+            assert!(result.unwrap().abs_diff(600_000_000) < 250_000);
+        }
+        assert_eq!(first.requests(), 1);
+        assert_eq!(second.requests(), 1);
+    }
+}
+
+#[tokio::test]
 async fn ntp_exchange_supports_ipv6() {
     let server = FakeServer::bind("[::1]:0", Reply::Offset(600)).await;
     let offset = query(&server.config(), Arc::from([])).await.unwrap();
@@ -127,32 +183,113 @@ async fn ntp_exchange_supports_ipv6() {
 
 #[tokio::test]
 async fn malformed_responses_never_produce_offsets() {
-    let cases: &[fn(&mut Vec<u8>)] = &[
-        |p| {
-            p.truncate(47);
-        },
-        |p| p.resize(49, 0),
-        |p| p.resize(2048, 0),
-        |p| p[24] ^= 1,
-        |p| p[0] = 0x23,
-        |p| p[0] = 4,
-        |p| p[0] = (5 << 3) | 4,
-        |p| p[0] |= 0xc0,
-        |p| p[1] = 16,
-        |p| p[32..40].fill(0),
-        |p| p[40..48].fill(0),
-        |p| p[8..12].copy_from_slice(&(16u32 << 16).to_be_bytes()),
-        |p| {
-            let transmit = u64::from_be_bytes(p[40..48].try_into().unwrap());
-            p[16..24].copy_from_slice(&transmit.wrapping_add(1 << 32).to_be_bytes());
-        },
+    use sntpc::Error::*;
+    let cases: &[(PacketMutation, sntpc::Error)] = &[
+        (|p| p.truncate(47), IncorrectPayload),
+        (|p| p.resize(49, 0), IncorrectPayload),
+        (|p| p.resize(2048, 0), IncorrectPayload),
+        (|p| p[24] ^= 1, IncorrectOriginTimestamp),
+        (|p| p[0] = 0x23, IncorrectMode),
+        (|p| p[0] = 4, IncorrectResponseVersion),
+        (|p| p[0] = (5 << 3) | 4, IncorrectResponseVersion),
+        (|p| p[0] |= 0xc0, UnsynchronizedClock),
+        (|p| p[1] = 16, IncorrectStratumHeaders),
+        (|p| p[32..40].fill(0), InvalidTimestamp),
+        (|p| p[40..48].fill(0), InvalidTimestamp),
+        (
+            |p| p[8..12].copy_from_slice(&(16u32 << 16).to_be_bytes()),
+            ExcessiveRootDistance,
+        ),
+        (
+            |p| {
+                let transmit = u64::from_be_bytes(p[40..48].try_into().unwrap());
+                p[16..24].copy_from_slice(&transmit.wrapping_add(1 << 32).to_be_bytes());
+            },
+            BackwardReferenceTimestamp,
+        ),
     ];
-    for (index, mutate) in cases.iter().enumerate() {
+    for (index, (mutate, expected)) in cases.iter().enumerate() {
         let server = FakeServer::new(Reply::Mutate(*mutate)).await;
+        let error = query(&server.config(), Arc::from([])).await.unwrap_err();
         assert!(
-            query(&server.config(), Arc::from([])).await.is_err(),
+            matches!(error, QueryError::Protocol(actual) if actual == *expected),
+            "case {index}: expected {expected:?}, got {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_refusals_allow_failover_and_keep_polling() {
+    use sntpc::Error::*;
+    let cases: &[(PacketMutation, sntpc::Error)] = &[
+        (
+            |p| {
+                refusal(p, *b"DENY");
+                p[0] = 0xc4;
+            },
+            IncorrectResponseVersion,
+        ),
+        (
+            |p| {
+                refusal(p, *b"DENY");
+                p[0] = 0xec;
+            },
+            IncorrectResponseVersion,
+        ),
+        (
+            |p| {
+                refusal(p, *b"DENY");
+                p[0] = 0xe3;
+            },
+            IncorrectMode,
+        ),
+        (
+            |p| {
+                refusal(p, *b"DENY");
+                p[24] ^= 1;
+            },
+            IncorrectOriginTimestamp,
+        ),
+        (
+            |p| {
+                refusal(p, *b"DENY");
+                p.resize(49, 0);
+            },
+            IncorrectPayload,
+        ),
+    ];
+    for (index, (mutate, expected)) in cases.iter().enumerate() {
+        let first = FakeServer::new(Reply::Mutate(*mutate)).await;
+        let second = FakeServer::new(Reply::Offset(600)).await;
+        let config = first.config();
+        let error = query(&config, Arc::from([])).await.unwrap_err();
+        assert!(
+            matches!(error, QueryError::Protocol(actual) if actual == *expected),
+            "case {index}: expected {expected:?}, got {error:?}"
+        );
+        let prepared = Prepared::new(Some(config.clone()), None);
+        let started = Instant::now();
+        refresh(&config, &prepared.state, Arc::from([])).await;
+        let interval = Duration::from_secs(config.interval_secs);
+        let due = prepared.state.schedule.lock().next.unwrap();
+        assert!(
+            (started + interval..=Instant::now() + interval).contains(&due),
             "case {index}"
         );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let offset = timeout_at(
+            deadline,
+            query_addresses(&[first.address, second.address], deadline),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            offset.abs_diff(600_000_000) < 250_000,
+            "case {index}: {offset}"
+        );
+        assert_eq!(first.requests(), 3);
+        assert_eq!(second.requests(), 1);
     }
 }
 
@@ -210,8 +347,11 @@ async fn lifecycle_reuses_deadlines_retains_offsets_and_restores_publication() {
     let server = FakeServer::new(Reply::Offset(600)).await;
     let prepared = Prepared::new(Some(server.config()), None);
     assert_eq!(server.requests(), 0);
+    let started = Instant::now();
     let mut running = prepared.start(Arc::from([])).await;
     let due = prepared.state.schedule.lock().next;
+    let interval = Duration::from_secs(server.config().interval_secs);
+    assert!((started + interval..=Instant::now() + interval).contains(&due.unwrap()));
     assert!(crate::clock::unix_seconds().unwrap().abs_diff(raw + 600) <= 2);
     let offset = query(&server.config(), Arc::from([])).await.unwrap();
     assert!(
@@ -219,6 +359,7 @@ async fn lifecycle_reuses_deadlines_retains_offsets_and_restores_publication() {
         "corrected-clock feedback: {offset}"
     );
     running.stop().await;
+    assert!(crate::clock::unix_seconds().unwrap().abs_diff(raw + 600) <= 2);
     let same = Prepared::new(Some(server.config()), Some(&prepared));
     let mut replacement = same.start(Arc::from([])).await;
     drop(running);
@@ -289,6 +430,7 @@ async fn worker_refreshes_on_retained_deadline_and_stops_on_drop() {
     })
     .await
     .unwrap();
+    let worker = running.task.as_ref().unwrap().abort_handle();
     drop(running);
     assert!(
         crate::clock::unix_seconds().unwrap().abs_diff(
@@ -298,15 +440,28 @@ async fn worker_refreshes_on_retained_deadline_and_stops_on_drop() {
                 .as_secs()
         ) <= 1
     );
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !worker.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the worker did not cancel its in-flight exchange");
     assert_eq!(server.requests(), 3);
 
     // Reusing the sample must not reuse the previous generation's resolver guards.
-    prepared.state.schedule.lock().next = Some(Instant::now());
+    let forced = Instant::now();
+    prepared.state.schedule.lock().next = Some(forced);
     let mut guarded = same
         .start(vec!["127.0.0.0/8".parse().unwrap()].into())
         .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while prepared.state.schedule.lock().next == Some(forced) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("guarded worker never completed its refresh");
     guarded.stop().await;
     assert_eq!(server.requests(), 3);
 }
@@ -424,6 +579,125 @@ async fn ntp_managed_resolution_failure_does_not_fall_back_to_native() {
         "{error}"
     );
     assert_eq!(server.requests(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn ntp_deadline_cancels_pending_dns_resolution() {
+    const CHILD: &str = "SHOES_NTP_DNS_DEADLINE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(
+            "ntp::tests::ntp_deadline_cancels_pending_dns_resolution",
+            CHILD,
+            "1",
+        );
+        return;
+    }
+    #[derive(Debug)]
+    struct PendingResolver {
+        calls: AtomicUsize,
+        cancelled: Arc<AtomicBool>,
+    }
+    struct Cancelled(Arc<AtomicBool>);
+    impl Drop for Cancelled {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    impl crate::resolver::Resolver for PendingResolver {
+        fn resolve_location(
+            &self,
+            _: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let cancelled = Cancelled(self.cancelled.clone());
+            Box::pin(async move {
+                let _cancelled = cancelled;
+                std::future::pending().await
+            })
+        }
+    }
+    let resolver = Arc::new(PendingResolver {
+        calls: AtomicUsize::new(0),
+        cancelled: Arc::new(AtomicBool::new(false)),
+    });
+    let _policy = crate::socket_policy::SocketPolicy::install(
+        "test0".into(),
+        0x40000000,
+        0x60000000,
+        vec![],
+        resolver.clone(),
+        vec![],
+    )
+    .unwrap();
+    let config = NtpConfig {
+        server: crate::address::NetLocation::from_str("localhost:123", None).unwrap(),
+        interval_secs: 60,
+        timeout_secs: 1,
+    };
+    let started = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(2), query(&config, Arc::from([])))
+        .await
+        .expect("DNS resolution escaped the synchronization deadline");
+    assert!(
+        matches!(result, Err(QueryError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
+    );
+    assert!((Duration::from_secs(1)..=Duration::from_millis(1005)).contains(&started.elapsed()));
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    assert!(resolver.cancelled.load(Ordering::Relaxed));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ntp_resolved_tun_subnet_is_rejected_before_socket_creation() {
+    const CHILD: &str = "SHOES_NTP_TUN_GUARD_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(
+            "ntp::tests::ntp_resolved_tun_subnet_is_rejected_before_socket_creation",
+            CHILD,
+            "1",
+        );
+        return;
+    }
+    #[derive(Debug)]
+    struct Resolved(SocketAddr);
+    impl crate::resolver::Resolver for Resolved {
+        fn resolve_location(
+            &self,
+            _: &crate::address::NetLocation,
+        ) -> crate::resolver::ResolveFuture {
+            Box::pin(std::future::ready(Ok(vec![self.0])))
+        }
+    }
+    let server = FakeServer::new(Reply::Offset(600)).await;
+    let mut config = server.config();
+    config.server = crate::address::NetLocation::from_str("ntp.invalid:123", None).unwrap();
+    #[cfg(feature = "ffi")]
+    let protected = Arc::new(AtomicUsize::new(0));
+    #[cfg(feature = "ffi")]
+    {
+        let calls = protected.clone();
+        crate::tun::set_global_socket_protector(Arc::new(crate::tun::FnSocketProtector::new(
+            move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )));
+    }
+    let _policy = crate::socket_policy::SocketPolicy::install(
+        "test0".into(),
+        0x40000000,
+        0x60000000,
+        vec!["127.0.0.0/8".parse().unwrap()],
+        Arc::new(Resolved(server.address)),
+        vec![],
+    )
+    .unwrap();
+    let error = query(&config, Arc::from([])).await.unwrap_err();
+    assert!(error.to_string().contains("managed TUN subnet"), "{error}");
+    assert_eq!(server.requests(), 0);
+    #[cfg(feature = "ffi")]
+    assert_eq!(protected.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -567,5 +841,20 @@ async fn kiss_of_death_with_zero_timestamps_stops_polling_across_reload() {
         assert!(same.state.schedule.lock().next.is_none());
         assert!(crate::clock::now().unwrap() > SystemTime::now() + Duration::from_secs(599));
         replacement.stop().await;
+        *server.reply.lock() = Reply::Offset(1200);
+        for (index, (interval_secs, timeout_secs)) in [(61, 1), (60, 2)].into_iter().enumerate() {
+            let config = NtpConfig {
+                interval_secs,
+                timeout_secs,
+                ..server.config()
+            };
+            let changed = Prepared::new(Some(config), Some(&same));
+            assert!(!Arc::ptr_eq(&changed.state, &same.state));
+            let mut restarted = changed.start(Arc::from([])).await;
+            assert_eq!(server.requests(), index + 2);
+            assert!(changed.state.schedule.lock().next.is_some());
+            assert!(crate::clock::now().unwrap() > SystemTime::now() + Duration::from_secs(1199));
+            restarted.stop().await;
+        }
     }
 }
