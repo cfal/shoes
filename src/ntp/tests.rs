@@ -123,6 +123,22 @@ impl Drop for FakeServer {
     }
 }
 
+#[test]
+fn ntp_error_messages_distinguish_network_failures_from_invalid_responses() {
+    assert_eq!(
+        QueryError::Protocol(sntpc::Error::Network).to_string(),
+        "NTP socket send/receive failed"
+    );
+    assert_eq!(
+        QueryError::Protocol(sntpc::Error::IncorrectPayload).to_string(),
+        "invalid NTP response: IncorrectPayload"
+    );
+    assert_eq!(
+        QueryError::Io(io::Error::other("socket creation failed")).to_string(),
+        "socket creation failed"
+    );
+}
+
 #[tokio::test]
 async fn positive_and_negative_offsets_use_raw_time_on_each_exchange() {
     for seconds in [600, -600] {

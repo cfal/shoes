@@ -159,6 +159,7 @@ impl fmt::Display for QueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => error.fmt(f),
+            Self::Protocol(sntpc::Error::Network) => f.write_str("NTP socket send/receive failed"),
             Self::Protocol(error) => write!(f, "invalid NTP response: {error:?}"),
         }
     }
