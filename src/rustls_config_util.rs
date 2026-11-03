@@ -408,6 +408,73 @@ mod material_tests {
     use std::io::{Read, Write};
 
     #[test]
+    fn prebuilt_dns_tls_config_uses_positive_and_negative_clock_corrections() {
+        const CHILD: &str = "SHOES_DNS_TLS_CLOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            shoes_test_support::isolated::run_isolated(
+                "rustls_config_util::material_tests::prebuilt_dns_tls_config_uses_positive_and_negative_clock_corrections",
+                CHILD,
+                "1",
+            );
+            return;
+        }
+        use std::time::{Duration, SystemTime};
+        for seconds in [600, -600] {
+            let raw = SystemTime::now();
+            let corrected = if seconds > 0 {
+                raw + Duration::from_secs(600)
+            } else {
+                raw - Duration::from_secs(600)
+            };
+            let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+            params.not_before = (corrected - Duration::from_secs(100)).into();
+            params.not_after = (corrected + Duration::from_secs(100)).into();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            let server = Arc::new(
+                try_create_server_config(
+                    cert.pem().as_bytes(),
+                    key.serialize_pem().as_bytes(),
+                    vec![],
+                    &[],
+                    &[],
+                    &Default::default(),
+                )
+                .unwrap(),
+            );
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.der().clone()).unwrap();
+            let mut client = with_test_roots(roots, create_dns_client_config);
+            client.resumption = rustls::client::Resumption::disabled();
+            let client = Arc::new(client);
+            let pair = || {
+                (
+                    rustls::Connection::Client(
+                        rustls::ClientConnection::new(
+                            client.clone(),
+                            "localhost".try_into().unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                    rustls::Connection::Server(
+                        rustls::ServerConnection::new(server.clone()).unwrap(),
+                    ),
+                )
+            };
+            let (mut c, mut s) = pair();
+            transfer_tls(&mut c, &mut s).unwrap();
+            assert!(transfer_tls(&mut s, &mut c).is_err());
+            let guard = crate::clock::test_offset(seconds * 1_000_000);
+            let (mut c, mut s) = pair();
+            finish_handshake(&mut c, &mut s);
+            drop(guard);
+            let (mut c, mut s) = pair();
+            transfer_tls(&mut c, &mut s).unwrap();
+            assert!(transfer_tls(&mut s, &mut c).is_err());
+        }
+    }
+
+    #[test]
     fn prebuilt_tls_configs_use_corrected_clock_for_both_certificate_roles() {
         const CHILD: &str = "SHOES_TLS_CLOCK_CHILD";
         if std::env::var_os(CHILD).is_none() {
