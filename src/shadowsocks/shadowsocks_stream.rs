@@ -1,7 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::SystemTime;
 
 use aws_lc_rs::aead::{
     Aad, Algorithm, BoundKey, NONCE_LEN, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey,
@@ -378,6 +377,71 @@ mod tests {
             assert!(validate_timestamp(timestamp, 1000).is_err());
         }
         assert!(validate_timestamp(0, 0).is_ok());
+    }
+
+    #[test]
+    fn corrected_clock_reaches_encrypted_request_and_response_headers() {
+        const CHILD: &str = "SHOES_SS2022_CLOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            shoes_test_support::isolated::run_isolated(
+                "shadowsocks::shadowsocks_stream::tests::corrected_clock_reaches_encrypted_request_and_response_headers",
+                CHILD,
+                "1",
+            );
+            return;
+        }
+        let make = |kind| {
+            let (transport, _) = tokio::io::duplex(1);
+            ShadowsocksStream::new(
+                Box::new(transport),
+                kind,
+                &aws_lc_rs::aead::AES_128_GCM,
+                16,
+                Arc::new(Box::new(Blake3Key::new(
+                    vec![0x33; 16].into_boxed_slice(),
+                    16,
+                ))),
+                None,
+            )
+        };
+        let raw = crate::clock::unix_seconds().unwrap();
+        let guard = crate::clock::test_offset(600_000_000);
+        let mut client = make(ShadowsocksStreamType::AEAD2022Client);
+        let mut server = make(ShadowsocksStreamType::AEAD2022Server);
+        client.process_write_header(b"request").unwrap();
+        let wire = client.write_cache[..client.write_cache_end_offset].to_vec();
+        server.unprocessed_buf[..wire.len()].copy_from_slice(&wire);
+        server.unprocessed_end_offset = wire.len();
+        server.process_read_header().unwrap();
+        let timestamp = u64::from_be_bytes(server.unprocessed_buf[17..25].try_into().unwrap());
+        assert!(timestamp.abs_diff(raw + 600) <= 1);
+        server.is_initial_read = false;
+        server.process_write_header(b"response").unwrap();
+        let response = &server.write_cache[..server.write_cache_end_offset];
+        client.unprocessed_buf[..response.len()].copy_from_slice(response);
+        client.unprocessed_end_offset = response.len();
+        client.process_read_header().unwrap();
+        let timestamp = u64::from_be_bytes(client.unprocessed_buf[17..25].try_into().unwrap());
+        assert!(timestamp.abs_diff(raw + 600) <= 1);
+        drop(guard);
+        let mut uncorrected_client = make(ShadowsocksStreamType::AEAD2022Client);
+        // Reuses the request salt with a fresh response decryptor.
+        uncorrected_client.encrypt_iv = client.encrypt_iv.clone();
+        uncorrected_client.unprocessed_buf[..response.len()].copy_from_slice(response);
+        uncorrected_client.unprocessed_end_offset = response.len();
+        let error = uncorrected_client.process_read_header().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("30-second window"), "{error}");
+        let mut uncorrected = make(ShadowsocksStreamType::AEAD2022Server);
+        uncorrected.unprocessed_buf[..wire.len()].copy_from_slice(&wire);
+        uncorrected.unprocessed_end_offset = wire.len();
+        assert!(
+            uncorrected
+                .process_read_header()
+                .unwrap_err()
+                .to_string()
+                .contains("30-second window")
+        );
     }
 
     #[tokio::test]
@@ -789,7 +853,7 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs();
+                let current_time_secs = crate::clock::unix_seconds()?;
                 validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
@@ -842,7 +906,7 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs();
+                let current_time_secs = crate::clock::unix_seconds()?;
                 validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 if let Some(salt_checker) = &self.salt_checker {
@@ -901,6 +965,7 @@ impl ShadowsocksStream {
             ShadowsocksStreamType::AEAD2022Server => {
                 assert!(!self.is_initial_read);
 
+                let timestamp = crate::clock::unix_seconds()?;
                 let decrypt_iv = self.decrypt_iv.take().unwrap();
 
                 self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
@@ -910,7 +975,7 @@ impl ShadowsocksStream {
 
                 // HeaderTypeServerStream = 1
                 response_header[0] = 1;
-                response_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
+                response_header[1..9].copy_from_slice(&timestamp.to_be_bytes());
                 response_header[9..9 + self.salt_len].copy_from_slice(&decrypt_iv);
 
                 let handled_len = std::cmp::min(
@@ -968,7 +1033,7 @@ impl ShadowsocksStream {
 
                 // HeaderTypeClientStream = 0
                 request_header[0] = 0;
-                request_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
+                request_header[1..9].copy_from_slice(&crate::clock::unix_seconds()?.to_be_bytes());
                 request_header[9..11].copy_from_slice(&(buf_len as u16).to_be_bytes());
 
                 self.encrypt_single(&request_header, false)
@@ -1285,11 +1350,6 @@ impl AsyncStream for ShadowsocksStream {
     }
 }
 impl AsyncMessageStream for ShadowsocksStream {}
-
-#[inline]
-fn current_time_secs() -> u64 {
-    SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
-}
 
 fn validate_timestamp(timestamp: u64, now: u64) -> std::io::Result<()> {
     if timestamp.abs_diff(now) > 30 {

@@ -1,6 +1,6 @@
 ---
 title: Global settings
-description: Default DNS, admission limits, remote-rule cache, QUIC buffers, and reload grace periods.
+description: Default DNS, opt-in NTP, admission limits, remote-rule cache, QUIC buffers, and reload grace periods.
 ---
 
 Use at most one `global_settings` entry across all configuration files. Omitted
@@ -52,9 +52,82 @@ An inline default creates one shared resolver group. If it enables fake IPs,
 all inheriting inbounds share one mapping pool and state file, owned by
 `global_settings` independently of listener identities.
 
-Independent DNS bootstrap, rule downloads, ACME, WireGuard peer preparation,
+Independent DNS bootstrap, NTP, rule downloads, ACME, WireGuard peer preparation,
 and controller probes do not inherit this setting. See
 [DNS configuration](/dns/configuration/) for upstream options and bootstrap requirements.
+
+## NTP
+
+Optional application-local clock correction, useful when shoes cannot change the
+host clock. Omit `ntp` or set it to `null` to disable it. Providing the object opts
+in; there is no `enabled` field. Disabled instances send no NTP requests.
+
+```yaml
+- global_settings:
+    ntp:
+      server: time.cloudflare.com:123
+      interval_secs: 1800
+      timeout_secs: 5
+```
+
+| Field | Default | Accepted values |
+| --- | --- | --- |
+| `server` | Required | Nonempty hostname or IP with explicit UDP port, normally `123`; IPv6 uses `[address]:port` |
+| `interval_secs` | 1800 | Integer seconds, 60-86,400 |
+| `timeout_secs` | 5 | Integer seconds, 1-30 |
+
+The application clock is **system time + the last measured signed offset**.
+NTP measurements always use uncorrected system time. shoes never writes the OS
+clock or requires permission to set it. REALITY, VMess, Shadowsocks 2022, and
+rustls certificate validation (including TLS-based DNS and QUIC) use the corrected
+clock. Logs and other protocols retain their existing clocks. Certificate-source
+validity checks (loading, accepting issued certificates, and selecting certificates
+to serve) and renewal scheduling still use the OS clock. An incorrect OS clock can
+therefore reject or suppress a certificate even after NTP synchronization.
+REALITY's `max_time_diff` default and null behavior are unchanged.
+
+One bounded synchronization attempt completes before runtime listeners,
+WireGuard, and TUN start. Its timeout covers DNS and UDP exchange. Failure is
+nonfatal: startup continues with zero offset, or the previous correction after
+an NTP settings change. Refresh failures retain the last offset and retry after
+`interval_secs`. As a conservative policy, `DENY`, `RSTR`, and `RATE` Kiss-of-Death
+responses stop polling until NTP settings change or the service restarts. Other
+stratum-zero responses, such as `INIT` or `STEP`, are discarded without stopping
+address failover or periodic retries. Only plain 48-byte NTP replies are accepted;
+extensions and authentication trailers are not supported.
+
+Traffic goes directly through shoes' protected/policy-aware UDP sockets, not
+proxy chains. Hostnames use native DNS, or managed-TUN bootstrap DNS, independently
+of `default_dns`. Active/retained fake-IP ranges, protected TUN endpoints, and
+managed TUN subnets cannot be NTP destinations. Prefer an IP literal on embedded
+VPN hosts to avoid depending on DNS routed through the VPN itself.
+
+**Limitations and trust:**
+
+- This is unauthenticated UDP NTP, not NTS. The server or an on-path attacker can
+  shift protocol time and TLS certificate validity checks. Use a trusted,
+  reachable server and network.
+- Preparation-time encrypted DNS bootstrap, HTTPS rule downloads, and certificate
+  preparation occur before initial synchronization. An IP-literal NTP server
+  avoids its own DNS dependency, but does not repair these earlier failures.
+  `check` and `--dry-run` validate NTP settings without resolving or querying it.
+- An OS clock step changes application time immediately; the offset is not a
+  replacement clock. Correction waits until the next successful refresh. Avoid
+  combining this feature with another service that steps the OS clock.
+- Backward corrections, including disabling NTP or rollback, can pause VMess
+  inbound authentication until its previous high-water time is reached. The pause
+  can last the entire backward delta, not just the protocol's timestamp window.
+  The replay cache is never reset, even by FFI stop/start in the same process.
+- Shadowsocks 2022's salt cache expires on monotonic time. A sufficiently large
+  backward correction can make an old handshake's timestamp valid again after
+  its cached salt expires. OS clock rollback has the same limitation. Timestamp
+  window widths are unchanged; NTP does not eliminate replay risks from clock steps.
+- Ordinary skew and the 2036 NTP rollover are supported, not arbitrary broken-clock
+  recovery. Raw dates before 1970 fail synchronization; offsets beyond about
+  68 years can be ambiguous. Offsets are not persisted across process restarts.
+
+See [reload behavior](/operations/reload/) and the complete
+[`ntp.yaml` example](/examples/ntp/).
 
 ## Admission caps
 

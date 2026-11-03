@@ -44,6 +44,16 @@ Certificate-source file changes and ACME renewal do not trigger this full reload
 They rotate live without replacing listeners or closing QUIC connections; see
 [Certificate Sources](/security/certificates/).
 
+An unchanged `global_settings.ntp` object reuses its correction, refresh deadline,
+and any server refusal state; unrelated reloads do not repeat synchronization.
+Changed NTP settings perform one bounded attempt during activation, after old
+listeners retire, which can add up to `timeout_secs` to the activation interval.
+Preparation alone sends no NTP requests. Failed activation restores the previous
+clock without another initial query. The candidate clock can briefly affect
+existing connections before rollback; protocol side effects are not transactional.
+Removing NTP restores the OS clock, and shutdown discards the correction. See
+[NTP clock-step and replay limitations](/config/global-settings/#ntp).
+
 QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. If the previous generation's sockets do not retire within the five-second socket-release guard, shoes exits with an error rather than announcing a partially ready generation.
 
 Candidate QUIC buffer sizes are used during DNS preparation, but `global_settings` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.

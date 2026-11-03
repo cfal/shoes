@@ -18,9 +18,10 @@ pub fn try_create_client_config(
     tls13_only: bool,
     key_exchange_groups: &TlsKeyExchangeGroups,
 ) -> std::io::Result<rustls::ClientConfig> {
-    let builder = rustls::ClientConfig::builder_with_provider(crypto_provider_with_groups(
-        key_exchange_groups,
-    ));
+    let builder = rustls::ClientConfig::builder_with_details(
+        crypto_provider_with_groups(key_exchange_groups),
+        crate::clock::time_provider(),
+    );
     let builder = if tls13_only || key_exchange_groups.requires_hybrid() {
         builder.with_protocol_versions(&[&rustls::version::TLS13])
     } else {
@@ -265,7 +266,7 @@ pub(crate) fn with_test_roots<T>(roots: rustls::RootCertStore, build: impl FnOnc
 /// Creates a simple TLS ClientConfig with root CA verification.
 /// Used by hickory-resolver for DoT/DoH connections.
 pub fn create_dns_client_config() -> rustls::ClientConfig {
-    rustls::ClientConfig::builder_with_provider(get_crypto_provider())
+    rustls::ClientConfig::builder_with_details(get_crypto_provider(), crate::clock::time_provider())
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates((*get_root_cert_store()).clone())
@@ -319,9 +320,10 @@ pub fn try_create_server_config_with_source(
         Some(verifier)
     };
 
-    let builder = rustls::ServerConfig::builder_with_provider(crypto_provider_with_groups(
-        key_exchange_groups,
-    ));
+    let builder = rustls::ServerConfig::builder_with_details(
+        crypto_provider_with_groups(key_exchange_groups),
+        crate::clock::time_provider(),
+    );
     let builder = if key_exchange_groups.requires_hybrid() {
         builder.with_protocol_versions(&[&rustls::version::TLS13])
     } else {
@@ -404,6 +406,127 @@ pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<B
 mod material_tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[track_caller]
+    fn connection_pair(
+        client: &Arc<rustls::ClientConfig>,
+        server: &Arc<rustls::ServerConfig>,
+    ) -> (rustls::Connection, rustls::Connection) {
+        (
+            rustls::Connection::Client(
+                rustls::ClientConnection::new(client.clone(), "localhost".try_into().unwrap())
+                    .unwrap(),
+            ),
+            rustls::Connection::Server(rustls::ServerConnection::new(server.clone()).unwrap()),
+        )
+    }
+
+    #[test]
+    fn prebuilt_dns_tls_config_uses_positive_and_negative_clock_corrections() {
+        const CHILD: &str = "SHOES_DNS_TLS_CLOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            shoes_test_support::isolated::run_isolated(
+                "rustls_config_util::material_tests::prebuilt_dns_tls_config_uses_positive_and_negative_clock_corrections",
+                CHILD,
+                "1",
+            );
+            return;
+        }
+        use std::time::{Duration, SystemTime};
+        for seconds in [600, -600] {
+            let raw = SystemTime::now();
+            let corrected = if seconds > 0 {
+                raw + Duration::from_secs(600)
+            } else {
+                raw - Duration::from_secs(600)
+            };
+            let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+            params.not_before = (corrected - Duration::from_secs(100)).into();
+            params.not_after = (corrected + Duration::from_secs(100)).into();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            let server = Arc::new(
+                try_create_server_config(
+                    cert.pem().as_bytes(),
+                    key.serialize_pem().as_bytes(),
+                    vec![],
+                    &[],
+                    &[],
+                    &Default::default(),
+                )
+                .unwrap(),
+            );
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.der().clone()).unwrap();
+            let mut client = with_test_roots(roots, create_dns_client_config);
+            client.resumption = rustls::client::Resumption::disabled();
+            let client = Arc::new(client);
+            let (mut c, mut s) = connection_pair(&client, &server);
+            transfer_tls(&mut c, &mut s).unwrap();
+            assert!(transfer_tls(&mut s, &mut c).is_err());
+            let guard = crate::clock::test_offset(seconds * 1_000_000);
+            let (mut c, mut s) = connection_pair(&client, &server);
+            finish_handshake(&mut c, &mut s);
+            drop(guard);
+            let (mut c, mut s) = connection_pair(&client, &server);
+            transfer_tls(&mut c, &mut s).unwrap();
+            assert!(transfer_tls(&mut s, &mut c).is_err());
+        }
+    }
+
+    #[test]
+    fn prebuilt_tls_configs_use_corrected_clock_for_both_certificate_roles() {
+        const CHILD: &str = "SHOES_TLS_CLOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            shoes_test_support::isolated::run_isolated(
+                "rustls_config_util::material_tests::prebuilt_tls_configs_use_corrected_clock_for_both_certificate_roles",
+                CHILD,
+                "1",
+            );
+            return;
+        }
+        let raw = std::time::SystemTime::now();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.not_before = (raw + std::time::Duration::from_secs(500)).into();
+        params.not_after = (raw + std::time::Duration::from_secs(700)).into();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let pem = cert.pem().into_bytes();
+        let key = key.serialize_pem().into_bytes();
+        let server = Arc::new(
+            try_create_server_config(&pem, &key, vec![pem.clone()], &[], &[], &Default::default())
+                .unwrap(),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = with_test_roots(roots, || {
+            try_create_client_config(
+                true,
+                vec![],
+                vec![],
+                true,
+                Some((key, pem)),
+                false,
+                &Default::default(),
+            )
+            .unwrap()
+        });
+        client.resumption = rustls::client::Resumption::disabled();
+        let client = Arc::new(client);
+        let (mut c, mut s) = connection_pair(&client, &server);
+        transfer_tls(&mut c, &mut s).unwrap();
+        assert!(transfer_tls(&mut s, &mut c).is_err());
+        let guard = crate::clock::test_offset(600_000_000);
+        let (mut c, mut s) = connection_pair(&client, &server);
+        finish_handshake(&mut c, &mut s);
+        assert!(s.peer_certificates().is_some());
+        // The server also resolves time when verifying the client's certificate flight.
+        let (mut c, mut s) = connection_pair(&client, &server);
+        transfer_tls(&mut c, &mut s).unwrap();
+        transfer_tls(&mut s, &mut c).unwrap();
+        drop(guard);
+        assert!(transfer_tls(&mut c, &mut s).is_err());
+    }
 
     #[test]
     fn bundled_roots_exclude_removed_emsign_anchors() {

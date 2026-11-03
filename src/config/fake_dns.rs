@@ -180,6 +180,15 @@ pub(super) fn validate(
         .map(|range| range.parse())
         .collect();
     let pool_ranges = pool_ranges.map_err(io::Error::other)?;
+    if let Some(ntp) = &config.ntp {
+        target(&pool_ranges, &ntp.server, "NTP server")?;
+        if protects_tun_endpoints(&config.configs) {
+            let endpoints: Vec<_> = tun_endpoint_ips(&config.configs)
+                .map(|ip| IpNetwork::from(ip.to_canonical()))
+                .collect();
+            target(&endpoints, &ntp.server, "NTP server")?;
+        }
+    }
     if pool_ranges.is_empty() {
         return Ok(());
     }
@@ -205,6 +214,9 @@ impl ValidatedConfigs {
         ranges: &[IpNetwork],
         selection: Option<&crate::control::selection::SelectionView>,
     ) -> io::Result<()> {
+        if let Some(ntp) = &self.ntp {
+            target(ranges, &ntp.server, "NTP server")?;
+        }
         for source in &self.remote_rules {
             let bootstrap = source
                 .download
@@ -301,6 +313,45 @@ mod tests {
 
     fn validate_yaml(yaml: &str) -> io::Result<ValidatedConfigs> {
         super::super::create_server_configs(serde_yaml::from_str(yaml).map_err(io::Error::other)?)
+    }
+
+    #[test]
+    fn ntp_rejects_active_retained_and_tun_only_synthetic_endpoints() {
+        for endpoint in [
+            "198.18.0.5:123",
+            "[::ffff:198.18.0.5]:123",
+            "[2001:2::5]:123",
+        ] {
+            let mut config = serde_json::json!([
+                {"global_settings": {"ntp": {"server": endpoint}}},
+                {"dns_group": "fake", "dns_servers": "system", "fake_ip": {"ipv6_range": "2001:2::/48"}}
+            ]);
+            let error = validate_yaml(&config.to_string()).err().unwrap();
+            assert!(error.to_string().contains("NTP server"), "{error}");
+            config[1]["fake_ip"] = false.into();
+            let mut validated = validate_yaml(&config.to_string()).unwrap();
+            let ranges = [
+                "198.18.0.0/15".parse().unwrap(),
+                "2001:2::/48".parse().unwrap(),
+            ];
+            assert!(
+                validated
+                    .validate_network_endpoints(&ranges)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("NTP server")
+            );
+        }
+        #[cfg(target_os = "linux")]
+        for endpoint in ["10.233.0.1:123", "[::ffff:10.233.0.1]:123", "[fd73::1]:123"] {
+            let config = serde_json::json!([
+                {"global_settings": {"ntp": {"server": endpoint}}},
+                {"device_name": "shoes0", "auto_route": true, "auto_dns": false,
+                 "addresses": ["10.233.0.1/30", "fd73::1/126"], "bootstrap_dns": ["192.0.2.53:53"]}
+            ]);
+            let error = validate_yaml(&config.to_string()).err().unwrap();
+            assert!(error.to_string().contains("NTP server"), "{error}");
+        }
     }
 
     #[cfg(target_os = "linux")]

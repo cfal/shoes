@@ -216,7 +216,7 @@ pub fn is_service_running() -> bool {
 /// The config YAML must already have device_fd set in the TUN config.
 pub async fn start_from_config(
     config_yaml: &str,
-    shutdown_rx: oneshot::Receiver<()>,
+    mut shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     info!("Parsing config for TUN server");
 
@@ -257,6 +257,7 @@ pub async fn start_from_config(
         configs: validated_configs,
         dns_groups,
         global_limits,
+        ntp,
         ..
     } = validated;
     crate::resources::configure(global_limits)?;
@@ -316,6 +317,13 @@ pub async fn start_from_config(
         std::io::Error::new(std::io::ErrorKind::InvalidData, "No TUN config found")
     })?;
 
+    let prepared_ntp = crate::ntp::Prepared::new(ntp, None);
+    let mut ntp = tokio::select! {
+        biased;
+        _ = &mut shutdown_rx => return Ok(()),
+        running = prepared_ntp.start(dns_registry.forbidden_ranges().to_vec().into()) => running,
+    };
+
     #[cfg(unix)]
     let mut wireguard_running = crate::wireguard::Running::default();
     #[cfg(unix)]
@@ -323,6 +331,7 @@ pub async fn start_from_config(
         .start(&mut dns_registry, &mut wireguard_running)
         .await
     {
+        ntp.stop().await;
         wireguard_running.stop().await;
         if let Err(error) = dns_registry.shutdown_checkpoint().await {
             log::warn!("Final Fake DNS checkpoint failed: {error}");
@@ -338,6 +347,7 @@ pub async fn start_from_config(
         match start_servers(ResolvedConfig::Server(server_config), resolver).await {
             Ok(tasks) => join_handles.0.extend(tasks),
             Err(error) => {
+                ntp.stop().await;
                 join_handles.stop().await;
                 #[cfg(unix)]
                 wireguard_running.stop().await;
@@ -363,6 +373,7 @@ pub async fn start_from_config(
     ));
 
     // Cleanup any servers when TUN stops
+    ntp.stop().await;
     join_handles.stop().await;
     certificates.shutdown().await;
     #[cfg(unix)]
@@ -385,6 +396,10 @@ mod wireguard_tests;
 #[cfg(all(test, unix))]
 #[path = "rule_source_tests.rs"]
 mod rule_source_tests;
+
+#[cfg(all(test, unix))]
+#[path = "ntp_tests.rs"]
+mod ntp_tests;
 
 #[cfg(all(test, unix))]
 mod tests {

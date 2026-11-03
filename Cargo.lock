@@ -2960,6 +2960,7 @@ dependencies = [
  "shake",
  "shoes-test-support",
  "smoltcp",
+ "sntpc",
  "socket2",
  "subtle",
  "tempfile",
@@ -3055,6 +3056,15 @@ dependencies = [
  "libc",
  "log",
  "managed",
+]
+
+[[package]]
+name = "sntpc"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "294278b134cd7d06d7f22eca970aebe38707864c080f66547f9ad26327534af3"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]

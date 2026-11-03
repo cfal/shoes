@@ -17,6 +17,51 @@ thread_local! {
 }
 
 #[test]
+fn prebuilt_acme_tls_configs_track_clock_publication() {
+    const CHILD: &str = "SHOES_ACME_TLS_CLOCK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(
+            "certificates::acme::tests::prebuilt_acme_tls_configs_track_clock_publication",
+            CHILD,
+            "1",
+        );
+        return;
+    }
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut ca = tempfile::NamedTempFile::new().unwrap();
+    ca.write_all(certificate.cert.pem().as_bytes()).unwrap();
+    let providers = [
+        client_tls(None).unwrap().time_provider.clone(),
+        client_tls(Some(ca.path())).unwrap().time_provider.clone(),
+        challenge::tls_config("localhost", &[0; 32])
+            .unwrap()
+            .time_provider
+            .clone(),
+    ];
+    let raw = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let assert_providers = |expected| {
+        for provider in &providers {
+            let actual = provider.current_time().unwrap().as_secs();
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "provider time {actual}, expected {expected} (raw {raw})"
+            );
+        }
+        assert!(now().abs_diff(raw.try_into().unwrap()) <= 1);
+    };
+    let positive = crate::clock::test_offset(600_000_000);
+    assert_providers(raw + 600);
+    let negative = crate::clock::test_offset(-600_000_000);
+    drop(positive);
+    assert_providers(raw - 600);
+    drop(negative);
+    assert_providers(raw);
+}
+
+#[test]
 fn retry_after_parsing_preserves_supported_and_ignored_headers() {
     let mut headers = http::HeaderMap::new();
     assert!(parse_retry_after(&headers).unwrap().is_none());

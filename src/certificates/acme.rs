@@ -74,9 +74,10 @@ pub(super) fn client_tls(ca: Option<&Path>) -> io::Result<Arc<rustls::ClientConf
                 format!("ACME ca_cert '{}': {error}", path.display()),
             )
         })?;
-        config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
+        config = rustls::ClientConfig::builder_with_details(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            crate::clock::time_provider(),
+        )
         .with_safe_default_protocol_versions()
         .map_err(io::Error::other)?
         .with_root_certificates(roots)

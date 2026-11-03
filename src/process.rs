@@ -127,6 +127,7 @@ async fn load_candidate(
 }
 
 struct PreparedServers {
+    ntp: crate::ntp::Prepared,
     #[cfg(target_os = "linux")]
     managed: Option<std::sync::Arc<crate::desktop::Ingress>>,
     cache_lease: Option<std::sync::Arc<CacheLease>>,
@@ -324,6 +325,10 @@ async fn prepare_tracking(
         })
         .collect();
     Ok(PreparedServers {
+        ntp: crate::ntp::Prepared::new(
+            validated.ntp.clone(),
+            previous_servers.map(|previous| &previous.ntp),
+        ),
         #[cfg(target_os = "linux")]
         managed: network.ingress(),
         cache_lease: cache_lease.clone(),
@@ -349,6 +354,7 @@ async fn prepare_tracking(
 
 #[derive(Default)]
 struct RunningServers {
+    ntp: Option<crate::ntp::Running>,
     listeners: Vec<JoinHandle<()>>,
     #[cfg(unix)]
     tun: Vec<JoinHandle<io::Result<()>>>,
@@ -365,6 +371,9 @@ impl RunningServers {
         registries: &[&PreparedServers],
         network: &mut crate::desktop::NetworkSession,
     ) -> io::Result<()> {
+        if let Some(ntp) = &mut self.ntp {
+            ntp.stop().await;
+        }
         let network_result = network.deactivate().await;
         let worker_result = self.shutdown(registries).await;
         match (network_result, worker_result) {
@@ -390,6 +399,7 @@ impl RunningServers {
 
     async fn shutdown(&mut self, registries: &[&PreparedServers]) -> io::Result<()> {
         self.stop().await;
+        self.ntp = None;
         let mut result = Ok(());
         for registry in registries {
             registry.certificates.stop().await;
@@ -404,6 +414,9 @@ impl RunningServers {
     }
 
     async fn stop(&mut self) {
+        if let Some(ntp) = &mut self.ntp {
+            ntp.stop().await;
+        }
         #[cfg(unix)]
         {
             for task in &self.tun {
@@ -426,8 +439,15 @@ impl RunningServers {
     }
 
     async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
-        prepared.certificates.bind_pending().await?;
         resources::configure(prepared.validated.global_limits)?;
+        // Synchronize before retryable binds, including deferred HTTP-01 listeners.
+        self.ntp = Some(
+            prepared
+                .ntp
+                .start(prepared.dns.forbidden_ranges().to_vec().into())
+                .await,
+        );
+        prepared.certificates.bind_pending().await?;
         self.reporter = Some(resources::ResourceReporter::start());
         self.dns_snapshots = Some(prepared.dns.snapshot_task());
         #[cfg(unix)]
@@ -505,21 +525,25 @@ impl RunningServers {
     }
 
     async fn start_retry(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        // Initial synchronization must not consume the listener rebind budget.
+        let mut deadline = None;
         loop {
-            match self.start(prepared).await {
+            let error = match self.start(prepared).await {
                 Ok(()) => return Ok(()),
-                Err(error) => {
-                    self.stop().await;
-                    if error.kind() != io::ErrorKind::AddrInUse
-                        || tokio::time::Instant::now() >= deadline
-                    {
-                        return Err(error);
-                    }
-                    self.quic_retirements.wait().await?;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                Err(error) => error,
+            };
+            self.stop().await;
+            if error.kind() != io::ErrorKind::AddrInUse {
+                return Err(error);
             }
+            let now = tokio::time::Instant::now();
+            let retry_deadline = *deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(3));
+            if now >= retry_deadline {
+                return Err(error);
+            }
+            self.quic_retirements.wait().await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 

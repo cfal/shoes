@@ -50,11 +50,12 @@ pub(super) fn tls_config(domain: &str, digest: &[u8]) -> io::Result<Arc<rustls::
     // The key and certificate were generated together. with_single_cert's generic
     // WebPKI parsing rejects RFC 8737's intentionally critical acmeIdentifier.
     let certified = rustls::sign::CertifiedKey::new(vec![cert.der().clone()], signing_key);
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(io::Error::other)?
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(super::FixedCertificate(Some(Arc::new(certified)))));
+    let mut config =
+        rustls::ServerConfig::builder_with_details(provider, crate::clock::time_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(super::FixedCertificate(Some(Arc::new(certified)))));
     config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
     config.send_tls13_tickets = 0;
     config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});

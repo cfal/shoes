@@ -347,8 +347,59 @@ fn client_hello_carries_authenticated_reality_metadata() {
     aad[39..71].fill(0);
     let metadata = decrypt_session_id(session, &auth, &hello[31..43], &aad).unwrap();
     assert_eq!(metadata[..4], [1, 8, 0, 0]);
+    let timestamp = u32::from_be_bytes(metadata[4..8].try_into().unwrap()) as u64;
+    assert!(timestamp.abs_diff(crate::clock::unix_seconds().unwrap()) <= 1);
     assert_eq!(metadata[8..], short_id);
     sc.authenticate_client_hello(&hello).unwrap();
+}
+
+#[test]
+fn corrected_clock_reaches_authenticated_wire_timestamp_and_server_policy() {
+    const CHILD: &str = "SHOES_REALITY_CLOCK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(
+            "reality::tests::reality_handshake::corrected_clock_reaches_authenticated_wire_timestamp_and_server_policy",
+            CHILD,
+            "1",
+        );
+        return;
+    }
+    use crate::reality::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
+    let raw = crate::clock::unix_seconds().unwrap();
+    let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+    sc.max_time_diff = crate::config::common::default_reality_time_diff();
+    assert_eq!(sc.max_time_diff, Some(60_000));
+    let mut uncorrected = Vec::new();
+    cc.clone()
+        .create_connection()
+        .unwrap()
+        .write_tls(&mut uncorrected)
+        .unwrap();
+    let corrected = crate::clock::test_offset(600_000_000);
+    let mut hello = Vec::new();
+    cc.create_connection()
+        .unwrap()
+        .write_tls(&mut hello)
+        .unwrap();
+    let shares = extract_client_key_shares(&hello).unwrap();
+    let shared =
+        perform_ecdh(&sc.private_key, shares.authentication_public_key().unwrap()).unwrap();
+    let auth = derive_auth_key(&shared, &hello[11..31], b"REALITY").unwrap();
+    let mut aad = hello[5..].to_vec();
+    aad[39..71].fill(0);
+    let metadata = decrypt_session_id(
+        hello[44..76].try_into().unwrap(),
+        &auth,
+        &hello[31..43],
+        &aad,
+    )
+    .unwrap();
+    let timestamp = u32::from_be_bytes(metadata[4..8].try_into().unwrap()) as u64;
+    assert!(timestamp.abs_diff(raw + 600) <= 1);
+    sc.clone().authenticate_client_hello(&hello).unwrap();
+    assert!(sc.clone().authenticate_client_hello(&uncorrected).is_err());
+    drop(corrected);
+    assert!(sc.authenticate_client_hello(&hello).is_err());
 }
 
 #[test]

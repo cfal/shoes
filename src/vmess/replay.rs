@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::OnceLock;
+#[cfg(test)]
 use std::time::SystemTime;
 
 use parking_lot::Mutex;
@@ -17,7 +18,7 @@ pub(super) fn admit(identity: [u8; 16], auth_id: [u8; 16], timestamp: u64) -> io
         identity,
         auth_id,
         timestamp,
-        unix_time_secs(SystemTime::now())?,
+        unix_time_secs(crate::clock::now()?)?,
     )
 }
 

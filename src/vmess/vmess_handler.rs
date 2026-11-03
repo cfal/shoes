@@ -43,7 +43,7 @@ pub(super) fn unix_time_secs(time: SystemTime) -> std::io::Result<u64> {
 }
 
 fn random_auth_id_timestamp() -> std::io::Result<u64> {
-    let now = unix_time_secs(SystemTime::now())?;
+    let now = unix_time_secs(crate::clock::now()?)?;
     Ok(rand::rng().random_range(
         now.saturating_sub(AUTH_ID_TIME_WINDOW_SECS)..=now.saturating_add(AUTH_ID_TIME_WINDOW_SECS),
     ))
@@ -1274,6 +1274,85 @@ impl VmessTcpClientHandler {
 #[cfg(test)]
 mod header_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn corrected_clock_drives_generation_and_preserves_replay_high_water() {
+        const CHILD: &str = "SHOES_VMESS_CLOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            shoes_test_support::isolated::run_isolated(
+                "vmess::vmess_handler::header_tests::corrected_clock_drives_generation_and_preserves_replay_high_water",
+                CHILD,
+                "1",
+            );
+            return;
+        }
+        use tokio::io::AsyncReadExt;
+        let uuid = crate::uuid_util::generate_uuid();
+        let client = VmessTcpClientHandler::new("none", &uuid, true).unwrap();
+        let server = VmessTcpServerHandler::new(
+            "none",
+            &uuid,
+            true,
+            Arc::new(ClientProxySelector::new(vec![])),
+            Arc::new(crate::resolver::NativeResolver::new()),
+        )
+        .unwrap();
+        let raw = unix_time_secs(SystemTime::now()).unwrap();
+        let _first = crate::clock::test_offset(600_000_000);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for udp in [false, true] {
+                let (transport, mut wire) = tokio::io::duplex(4096);
+                let target =
+                    ResolvedLocation::new(NetLocation::from_str("127.0.0.1:443", None).unwrap());
+                let before = unix_time_secs(SystemTime::now()).unwrap();
+                if udp {
+                    client
+                        .setup_client_udp_bidirectional(Box::new(transport), target)
+                        .await
+                        .unwrap();
+                } else {
+                    client
+                        .setup_client_tcp_stream(Box::new(transport), target)
+                        .await
+                        .unwrap();
+                }
+                let mut auth_id = [0; 16];
+                wire.read_exact(&mut auth_id).await.unwrap();
+                let after = unix_time_secs(SystemTime::now()).unwrap();
+                server
+                    .aead_decrypting_key
+                    .decrypt(&mut auth_id, DecryptionContext::None)
+                    .unwrap();
+                assert_eq!(
+                    super::super::crc32::crc32c(&auth_id[..12]),
+                    u32::from_be_bytes(auth_id[12..].try_into().unwrap())
+                );
+                let generated = u64::from_be_bytes(auth_id[..8].try_into().unwrap());
+                let earliest = before + 600 - AUTH_ID_TIME_WINDOW_SECS;
+                let latest = after + 600 + AUTH_ID_TIME_WINDOW_SECS;
+                assert!(
+                    (earliest..=latest).contains(&generated),
+                    "UDP {udp}: timestamp {generated}, expected {earliest}..={latest}"
+                );
+            }
+        })
+        .await
+        .expect("VMess setup did not produce an AuthID");
+        let identity = rand::random();
+        let auth_id = rand::random();
+        super::super::replay::admit(identity, auth_id, raw + 600).unwrap();
+        assert!(super::super::replay::admit(identity, auth_id, raw + 600).is_err());
+        let _forward = crate::clock::test_offset(1_200_000_000);
+        assert!(super::super::replay::admit(identity, rand::random(), 0).is_err());
+        let _backward = crate::clock::test_offset(600_000_000);
+        let error = super::super::replay::admit(identity, rand::random(), raw + 600).unwrap_err();
+        assert!(error.to_string().contains("clock rollback"));
+        let _recovered = crate::clock::test_offset(1_200_000_000);
+        let timestamp = crate::clock::unix_seconds().unwrap();
+        let auth_id = rand::random();
+        super::super::replay::admit(identity, auth_id, timestamp).unwrap();
+        assert!(super::super::replay::admit(identity, auth_id, timestamp).is_err());
+    }
 
     #[test]
     fn configured_ciphers_share_one_fallible_parser() {
