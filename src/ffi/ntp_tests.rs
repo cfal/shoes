@@ -12,6 +12,12 @@ fn raw_seconds() -> u64 {
         .as_secs()
 }
 
+#[track_caller]
+fn assert_system_clock() {
+    let corrected = crate::clock::unix_seconds().unwrap();
+    assert!(corrected.abs_diff(raw_seconds()) <= 1);
+}
+
 #[tokio::test]
 async fn ntp_ffi_cancellation_errors_abort_and_restart_release_the_clock() {
     const CHILD: &str = "SHOES_FFI_NTP_CHILD";
@@ -44,12 +50,7 @@ async fn ntp_ffi_cancellation_errors_abort_and_restart_release_the_clock() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(
-        crate::clock::unix_seconds()
-            .unwrap()
-            .abs_diff(raw_seconds())
-            <= 1
-    );
+    assert_system_clock();
 
     let responder = tokio::spawn(async move {
         loop {
@@ -74,12 +75,7 @@ async fn ntp_ffi_cancellation_errors_abort_and_restart_release_the_clock() {
     );
     let (_shutdown, receiver) = oneshot::channel();
     assert!(start_from_config(&invalid, receiver).await.is_err());
-    assert!(
-        crate::clock::unix_seconds()
-            .unwrap()
-            .abs_diff(raw_seconds())
-            <= 1
-    );
+    assert_system_clock();
 
     for abort in [false, true] {
         let (shutdown, receiver) = oneshot::channel();
@@ -107,23 +103,13 @@ async fn ntp_ffi_cancellation_errors_abort_and_restart_release_the_clock() {
                 .unwrap()
                 .unwrap();
         }
-        assert!(
-            crate::clock::unix_seconds()
-                .unwrap()
-                .abs_diff(raw_seconds())
-                <= 1
-        );
+        assert_system_clock();
     }
     let disabled = format!("- device_fd: {}\n", tun.as_raw_fd());
     let (shutdown, receiver) = oneshot::channel();
     let task = tokio::spawn(async move { start_from_config(&disabled, receiver).await });
     sleep(Duration::from_millis(50)).await;
-    assert!(
-        crate::clock::unix_seconds()
-            .unwrap()
-            .abs_diff(raw_seconds())
-            <= 1
-    );
+    assert_system_clock();
     shutdown.send(()).unwrap();
     task.await.unwrap().unwrap();
     responder.abort();

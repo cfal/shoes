@@ -68,15 +68,15 @@ fn write(path: &Path, config: &Value) {
 }
 
 async fn accepts(address: SocketAddr) -> bool {
-    timeout(Duration::from_secs(2), async {
+    let result = timeout(Duration::from_secs(2), async {
         let mut stream = TcpStream::connect(address).await?;
         stream.write_all(b"clock").await?;
         let mut response = [0; 5];
         stream.read_exact(&mut response).await?;
         Ok::<_, io::Error>(response == *b"clock")
     })
-    .await
-    .is_ok_and(|result| result.unwrap_or(false))
+    .await;
+    matches!(result, Ok(Ok(true)))
 }
 
 #[tokio::test]

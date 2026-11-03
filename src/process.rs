@@ -528,22 +528,22 @@ impl RunningServers {
         // Initial synchronization must not consume the listener rebind budget.
         let mut deadline = None;
         loop {
-            match self.start(prepared).await {
+            let error = match self.start(prepared).await {
                 Ok(()) => return Ok(()),
-                Err(error) => {
-                    self.stop().await;
-                    if error.kind() != io::ErrorKind::AddrInUse
-                        || tokio::time::Instant::now()
-                            >= *deadline.get_or_insert_with(|| {
-                                tokio::time::Instant::now() + Duration::from_secs(3)
-                            })
-                    {
-                        return Err(error);
-                    }
-                    self.quic_retirements.wait().await?;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                Err(error) => error,
+            };
+            self.stop().await;
+            if error.kind() != io::ErrorKind::AddrInUse {
+                return Err(error);
             }
+            let now = tokio::time::Instant::now();
+            let retry_deadline = *deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(3));
+            if now >= retry_deadline {
+                return Err(error);
+            }
+            self.quic_retirements.wait().await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 

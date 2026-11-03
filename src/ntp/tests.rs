@@ -439,8 +439,7 @@ async fn kiss_of_death_with_zero_timestamps_stops_polling_across_reload() {
     }
     for code in [*b"DENY", *b"RATE", *b"RSTR"] {
         let server = FakeServer::new(Reply::KissOfDeath(code)).await;
-        let config = server.config();
-        let prepared = Prepared::new(Some(config.clone()), None);
+        let prepared = Prepared::new(Some(server.config()), None);
         prepared.state.clock.set_offset(600_000_000).unwrap();
         let mut running = prepared.start(Arc::from([])).await;
         assert!(prepared.state.schedule.lock().initialized);

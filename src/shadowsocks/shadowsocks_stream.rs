@@ -845,7 +845,7 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs()?;
+                let current_time_secs = crate::clock::unix_seconds()?;
                 validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
@@ -898,7 +898,7 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs()?;
+                let current_time_secs = crate::clock::unix_seconds()?;
                 validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 if let Some(salt_checker) = &self.salt_checker {
@@ -957,7 +957,7 @@ impl ShadowsocksStream {
             ShadowsocksStreamType::AEAD2022Server => {
                 assert!(!self.is_initial_read);
 
-                let timestamp = current_time_secs()?;
+                let timestamp = crate::clock::unix_seconds()?;
                 let decrypt_iv = self.decrypt_iv.take().unwrap();
 
                 self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
@@ -1025,7 +1025,7 @@ impl ShadowsocksStream {
 
                 // HeaderTypeClientStream = 0
                 request_header[0] = 0;
-                request_header[1..9].copy_from_slice(&current_time_secs()?.to_be_bytes());
+                request_header[1..9].copy_from_slice(&crate::clock::unix_seconds()?.to_be_bytes());
                 request_header[9..11].copy_from_slice(&(buf_len as u16).to_be_bytes());
 
                 self.encrypt_single(&request_header, false)
@@ -1342,11 +1342,6 @@ impl AsyncStream for ShadowsocksStream {
     }
 }
 impl AsyncMessageStream for ShadowsocksStream {}
-
-#[inline]
-fn current_time_secs() -> std::io::Result<u64> {
-    crate::clock::unix_seconds()
-}
 
 fn validate_timestamp(timestamp: u64, now: u64) -> std::io::Result<()> {
     if timestamp.abs_diff(now) > 30 {

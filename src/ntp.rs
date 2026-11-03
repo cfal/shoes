@@ -157,28 +157,29 @@ async fn query(config: &NtpConfig, forbidden: Arc<[IpNetwork]>) -> Result<i64, Q
     timeout_at(deadline, async {
         let resolver = crate::dns::real_only(Arc::new(NativeResolver::new()), forbidden);
         let addresses = resolver.resolve_location(&config.server).await?;
-        let mut error = io::Error::other("NTP server resolved to no usable addresses").into();
+        let mut last_error = io::Error::other("NTP server resolved to no usable addresses").into();
         for (index, peer) in addresses.iter().copied().enumerate() {
             if let Err(rejected) = crate::config::ntp::validate_server_ip(peer.ip())
                 .and_then(|()| crate::socket_policy::check_outbound_address(peer.ip()))
             {
-                error = rejected.into();
+                last_error = rejected.into();
                 continue;
             }
             // Shares the remaining deadline so a blackholed family cannot starve alternatives.
             let remaining = deadline.saturating_duration_since(Instant::now());
             let budget = remaining / u32::try_from(addresses.len() - index).unwrap_or(u32::MAX);
-            let result = timeout_at(Instant::now() + budget, exchange(peer)).await;
+            let result = timeout_at(Instant::now() + budget, exchange(peer))
+                .await
+                .unwrap_or_else(|_| Err(timed_out()));
             match result {
-                Ok(Ok(offset)) => return Ok(offset),
-                Ok(Err(refused @ QueryError::Protocol(sntpc::Error::KissOfDeath(_)))) => {
+                Ok(offset) => return Ok(offset),
+                Err(refused @ QueryError::Protocol(sntpc::Error::KissOfDeath(_))) => {
                     return Err(refused);
                 }
-                Ok(Err(failure)) => error = failure,
-                Err(_) => error = timed_out(),
+                Err(error) => last_error = error,
             }
         }
-        Err(error)
+        Err(last_error)
     })
     .await
     .unwrap_or_else(|_| Err(timed_out()))
@@ -283,13 +284,15 @@ impl NtpUdpSocket for Socket {
     }
 
     async fn recv_from(&self, bytes: &mut [u8]) -> sntpc::Result<(usize, SocketAddr)> {
-        let mut packet = [0; 49];
+        const PACKET_LEN: usize = 48;
+        // The extra byte detects oversized datagrams instead of silently truncating them.
+        let mut packet = [0; PACKET_LEN + 1];
         let count = self
             .socket
             .recv(&mut packet)
             .await
             .map_err(|_| sntpc::Error::Network)?;
-        if count != 48 || bytes.len() != 48 {
+        if count != PACKET_LEN || bytes.len() != PACKET_LEN {
             return Err(sntpc::Error::IncorrectPayload);
         }
         if !(1..=4).contains(&((packet[0] >> 3) & 7)) {
@@ -299,8 +302,8 @@ impl NtpUdpSocket for Socket {
         if packet[1] != 0 && packet[32..40].iter().all(|byte| *byte == 0) {
             return Err(sntpc::Error::InvalidTimestamp);
         }
-        bytes.copy_from_slice(&packet[..48]);
-        Ok((48, self.peer))
+        bytes.copy_from_slice(&packet[..PACKET_LEN]);
+        Ok((PACKET_LEN, self.peer))
     }
 }
 
