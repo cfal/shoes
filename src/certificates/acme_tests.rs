@@ -50,6 +50,7 @@ fn prebuilt_acme_tls_configs_track_clock_publication() {
                 "provider time {actual}, expected {expected} (raw {raw})"
             );
         }
+        assert!(now().abs_diff(raw.try_into().unwrap()) <= 1);
     };
     let positive = crate::clock::test_offset(600_000_000);
     assert_providers(raw + 600);

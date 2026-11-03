@@ -424,6 +424,14 @@ mod tests {
         let timestamp = u64::from_be_bytes(client.unprocessed_buf[17..25].try_into().unwrap());
         assert!(timestamp.abs_diff(raw + 600) <= 1);
         drop(guard);
+        let mut uncorrected_client = make(ShadowsocksStreamType::AEAD2022Client);
+        // Reuses the request salt with a fresh response decryptor.
+        uncorrected_client.encrypt_iv = client.encrypt_iv.clone();
+        uncorrected_client.unprocessed_buf[..response.len()].copy_from_slice(response);
+        uncorrected_client.unprocessed_end_offset = response.len();
+        let error = uncorrected_client.process_read_header().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("30-second window"), "{error}");
         let mut uncorrected = make(ShadowsocksStreamType::AEAD2022Server);
         uncorrected.unprocessed_buf[..wire.len()].copy_from_slice(&wire);
         uncorrected.unprocessed_end_offset = wire.len();
