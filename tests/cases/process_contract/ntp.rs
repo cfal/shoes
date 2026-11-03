@@ -44,7 +44,7 @@ impl TimeServer {
     }
 
     fn settings(&self) -> Value {
-        json!({"server": self.address.to_string(), "interval_secs": 60, "timeout_secs": 1})
+        json!({"server": self.address.to_string(), "interval_secs": 86400, "timeout_secs": 1})
     }
 
     fn requests(&self) -> usize {
@@ -144,6 +144,18 @@ async fn ntp_protocol_time_survives_reload_and_rollback_and_can_be_disabled() {
     assert!(accepts(entry).await);
     assert!(!accepts(raw_entry).await);
 
+    let unavailable = TimeServer::start(None).await;
+    server_config[0]["global_settings"]["ntp"] = unavailable.settings();
+    write(&server_path, &server_config);
+    server.signal(libc::SIGHUP);
+    server.wait_for("Servers ready").await;
+    assert_eq!(unavailable.requests(), 1);
+    assert!(
+        accepts(entry).await,
+        "failed synchronization lost the last correction"
+    );
+    assert!(!accepts(raw_entry).await);
+
     server_config[0]["global_settings"]["ntp"] = Value::Null;
     write(&server_path, &server_config);
     server.signal(libc::SIGHUP);
@@ -206,7 +218,7 @@ async fn ntp_check_dry_run_and_disabled_startup_do_not_query() {
 }
 
 #[tokio::test]
-async fn ntp_startup_failure_is_bounded_and_shutdown_interrupts_initial_sync() {
+async fn ntp_failure_is_bounded_and_shutdown_interrupts_startup_and_reload_sync() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
     let ntp = TimeServer::start(None).await;
@@ -228,6 +240,29 @@ async fn ntp_startup_failure_is_bounded_and_shutdown_interrupts_initial_sync() {
     let mut child = Process::start(&path, &["--no-reload"]);
     timeout(Duration::from_secs(4), async {
         while ntp.requests() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.signal(libc::SIGTERM);
+    assert!(
+        timeout(Duration::from_secs(3), child.exit())
+            .await
+            .unwrap()
+            .success()
+    );
+
+    config[0]["global_settings"]["ntp"] = Value::Null;
+    write(&path, &config);
+    let mut child = Process::start(&path, &["--no-reload"]);
+    child.wait_for("Servers ready").await;
+    config[0]["global_settings"]["ntp"] = ntp.settings();
+    config[0]["global_settings"]["ntp"]["timeout_secs"] = 30.into();
+    write(&path, &config);
+    child.signal(libc::SIGHUP);
+    timeout(Duration::from_secs(4), async {
+        while ntp.requests() < 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
