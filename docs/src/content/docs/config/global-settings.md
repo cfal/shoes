@@ -80,8 +80,11 @@ The application clock is **system time + the last measured signed offset**.
 NTP measurements always use uncorrected system time. shoes never writes the OS
 clock or requires permission to set it. REALITY, VMess, Shadowsocks 2022, and
 rustls certificate validation (including TLS-based DNS and QUIC) use the corrected
-clock. Logs, certificate renewal scheduling, and other protocols retain their
-existing clocks. REALITY's `max_time_diff` default and null behavior are unchanged.
+clock. Logs and other protocols retain their existing clocks. Certificate-source
+validity checks (loading, accepting issued certificates, and selecting certificates
+to serve) and renewal scheduling still use the OS clock. An incorrect OS clock can
+therefore reject or suppress a certificate even after NTP synchronization.
+REALITY's `max_time_diff` default and null behavior are unchanged.
 
 One bounded synchronization attempt completes before runtime listeners,
 WireGuard, and TUN start. Its timeout covers DNS and UDP exchange. Failure is
@@ -124,7 +127,7 @@ VPN hosts to avoid depending on DNS routed through the VPN itself.
   68 years can be ambiguous. Offsets are not persisted across process restarts.
 
 See [reload behavior](/operations/reload/) and the complete
-[`ntp.yaml` example](https://github.com/cfal/shoes/blob/master/examples/ntp.yaml).
+[`ntp.yaml` example](/examples/ntp/).
 
 ## Admission caps
 
