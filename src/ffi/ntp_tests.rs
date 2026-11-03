@@ -1,6 +1,7 @@
 use super::*;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
@@ -52,9 +53,12 @@ async fn ntp_ffi_cancellation_errors_abort_and_restart_release_the_clock() {
         .unwrap();
     assert_system_clock();
 
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
     let responder = tokio::spawn(async move {
         loop {
             let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+            count.fetch_add(1, Ordering::Relaxed);
             let mut response = [0; 48];
             response[0] = 0x24;
             response[1] = 1;
@@ -75,6 +79,7 @@ async fn ntp_ffi_cancellation_errors_abort_and_restart_release_the_clock() {
     );
     let (_shutdown, receiver) = oneshot::channel();
     assert!(start_from_config(&invalid, receiver).await.is_err());
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
     assert_system_clock();
 
     for abort in [false, true] {

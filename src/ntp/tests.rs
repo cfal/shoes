@@ -198,6 +198,23 @@ async fn ntp_exchange_supports_ipv6() {
 }
 
 #[tokio::test]
+async fn ntp_exchange_accepts_legacy_response_versions() {
+    let versions: &[PacketMutation] = &[
+        |packet| packet[0] = (1 << 3) | 4,
+        |packet| packet[0] = (2 << 3) | 4,
+        |packet| packet[0] = (3 << 3) | 4,
+    ];
+    for (index, mutate) in versions.iter().enumerate() {
+        let server = FakeServer::new(Reply::Mutate(*mutate)).await;
+        let offset = query(&server.config(), Arc::from([]))
+            .await
+            .unwrap_or_else(|error| panic!("NTPv{}: {error}", index + 1));
+        assert!(offset.abs_diff(0) < 250_000, "{offset}");
+        assert_eq!(server.requests(), 1);
+    }
+}
+
+#[tokio::test]
 async fn malformed_responses_never_produce_offsets() {
     use sntpc::Error::*;
     let cases: &[(PacketMutation, sntpc::Error)] = &[
@@ -329,7 +346,28 @@ async fn timeout_wrong_source_and_resolved_range_guards() {
     )
     .unwrap();
     assert!(query(&config, ranges).await.is_err());
+    let unspecified = SocketAddr::from(([0, 0, 0, 0], server.address.port()));
+    let error = query_addresses(&[unspecified], Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, QueryError::Io(error) if error.kind() == io::ErrorKind::InvalidInput),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("server must be a unicast address")
+    );
     assert_eq!(server.requests(), 0);
+    let offset = query_addresses(
+        &[unspecified, server.address],
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert!(offset.abs_diff(600_000_000) < 250_000, "{offset}");
+    assert_eq!(server.requests(), 1);
 }
 
 #[test]
@@ -427,8 +465,15 @@ async fn worker_refreshes_on_retained_deadline_and_stops_on_drop() {
     let same = Prepared::new(Some(server.config()), Some(&prepared));
     let mut running = same.start(Arc::from([])).await;
     drop(first);
+    let has_negative_offset = || {
+        let raw = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        crate::clock::unix_seconds().unwrap().abs_diff(raw - 600) <= 2
+    };
     tokio::time::timeout(Duration::from_secs(2), async {
-        while crate::clock::now().unwrap() > SystemTime::now() {
+        while !has_negative_offset() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -437,33 +482,48 @@ async fn worker_refreshes_on_retained_deadline_and_stops_on_drop() {
     assert_eq!(server.requests(), 2);
     running.stop().await;
     *server.reply.lock() = Reply::Silent;
-    prepared.state.schedule.lock().next = Some(Instant::now());
-    let running = same.start(Arc::from([])).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while server.requests() < 3 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    for (index, stop) in [false, true].into_iter().enumerate() {
+        let due = Some(Instant::now());
+        prepared.state.schedule.lock().next = due;
+        let mut running = same.start(Arc::from([])).await;
+        let expected_requests = index + 3;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.requests() < expected_requests {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let worker = running.task.as_ref().unwrap().abort_handle();
+        if stop {
+            tokio::time::timeout(Duration::from_secs(2), running.stop())
+                .await
+                .expect("stopping the worker did not cancel its in-flight exchange");
+            assert!(
+                worker.is_finished(),
+                "stop returned before the worker exited"
+            );
+            assert!(has_negative_offset());
         }
-    })
-    .await
-    .unwrap();
-    let worker = running.task.as_ref().unwrap().abort_handle();
-    drop(running);
-    assert!(
-        crate::clock::unix_seconds().unwrap().abs_diff(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        ) <= 1
-    );
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !worker.is_finished() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("dropping the worker did not cancel its in-flight exchange");
-    assert_eq!(server.requests(), 3);
+        drop(running);
+        assert!(
+            crate::clock::unix_seconds().unwrap().abs_diff(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            ) <= 1
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the worker did not cancel its in-flight exchange");
+        assert_eq!(prepared.state.schedule.lock().next, due);
+        assert_eq!(server.requests(), expected_requests);
+    }
 
     // Reusing the sample must not reuse the previous generation's resolver guards.
     let forced = Instant::now();
@@ -479,7 +539,7 @@ async fn worker_refreshes_on_retained_deadline_and_stops_on_drop() {
     .await
     .expect("guarded worker never completed its refresh");
     guarded.stop().await;
-    assert_eq!(server.requests(), 3);
+    assert_eq!(server.requests(), 4);
 }
 
 #[cfg(all(unix, feature = "ffi"))]
