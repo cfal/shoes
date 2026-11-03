@@ -1288,8 +1288,13 @@ mod header_tests {
         }
         let raw = unix_time_secs(SystemTime::now()).unwrap();
         let _first = crate::clock::test_offset(600_000_000);
+        let generated = random_auth_id_timestamp().unwrap();
+        let after = unix_time_secs(SystemTime::now()).unwrap();
+        let earliest = raw + 600 - AUTH_ID_TIME_WINDOW_SECS;
+        let latest = after + 600 + AUTH_ID_TIME_WINDOW_SECS;
         assert!(
-            random_auth_id_timestamp().unwrap().abs_diff(raw + 600) <= AUTH_ID_TIME_WINDOW_SECS
+            (earliest..=latest).contains(&generated),
+            "timestamp {generated}, expected {earliest}..={latest}"
         );
         let identity = rand::random();
         let auth_id = rand::random();

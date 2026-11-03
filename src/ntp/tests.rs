@@ -852,7 +852,14 @@ async fn kiss_of_death_with_zero_timestamps_stops_polling_across_reload() {
         running.stop().await;
         let mut replacement = same.start(Arc::from([])).await;
         drop(running);
-        tokio::task::yield_now().await;
+        let worker = replacement.task.as_ref().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refused worker did not stop after reload");
         assert_eq!(server.requests(), 1);
         assert!(same.state.schedule.lock().next.is_none());
         assert!(crate::clock::now().unwrap() > SystemTime::now() + Duration::from_secs(599));
