@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use ipnetwork::IpNetwork;
 use parking_lot::Mutex;
-use sntpc::{NtpContext, NtpTimestampGenerator, NtpUdpSocket};
+use sntpc::{KissOfDeathCode, NtpContext, NtpTimestampGenerator, NtpUdpSocket};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
@@ -20,6 +20,7 @@ use crate::resolver::NativeResolver;
 pub(crate) struct Prepared {
     config: Option<NtpConfig>,
     state: Arc<State>,
+    previous_clock: Option<Arc<Clock>>,
 }
 
 struct State {
@@ -40,17 +41,16 @@ impl Prepared {
         {
             return previous.clone();
         }
-        let clock = if config.is_some() {
-            previous
-                .map(|previous| previous.state.clock.snapshot())
-                .unwrap_or_default()
+        let previous_clock = if config.is_some() {
+            previous.map(|previous| previous.state.clock.clone())
         } else {
-            Clock::default()
+            None
         };
         Self {
             config,
+            previous_clock,
             state: Arc::new(State {
-                clock: Arc::new(clock),
+                clock: Arc::new(Clock::default()),
                 schedule: Mutex::new(Schedule::default()),
             }),
         }
@@ -60,6 +60,10 @@ impl Prepared {
         if let Some(config) = &self.config {
             let initialized = self.state.schedule.lock().initialized;
             if !initialized {
+                // Preparation overlaps the old worker; inherit its final sample after retirement.
+                if let Some(previous) = &self.previous_clock {
+                    self.state.clock.copy_offset_from(previous);
+                }
                 refresh(config, &self.state, forbidden.clone()).await;
             }
         }
@@ -109,10 +113,7 @@ async fn refresh(config: &NtpConfig, state: &State, forbidden: Arc<[IpNetwork]>)
         state.clock.set_offset(offset)?;
         Ok(offset)
     });
-    let refused = matches!(
-        result,
-        Err(QueryError::Protocol(sntpc::Error::KissOfDeath(_)))
-    );
+    let refused = result.as_ref().is_err_and(QueryError::is_refusal);
     match result {
         Ok(offset) => log::info!("NTP {}: updated clock offset to {offset} us", config.server),
         Err(error) => log::warn!(
@@ -137,6 +138,17 @@ enum QueryError {
     Protocol(sntpc::Error),
 }
 
+impl QueryError {
+    fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Protocol(sntpc::Error::KissOfDeath(
+                KissOfDeathCode::Deny | KissOfDeathCode::Rstr | KissOfDeathCode::Rate
+            ))
+        )
+    }
+}
+
 impl From<io::Error> for QueryError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
@@ -157,32 +169,34 @@ async fn query(config: &NtpConfig, forbidden: Arc<[IpNetwork]>) -> Result<i64, Q
     timeout_at(deadline, async {
         let resolver = crate::dns::real_only(Arc::new(NativeResolver::new()), forbidden);
         let addresses = resolver.resolve_location(&config.server).await?;
-        let mut last_error = io::Error::other("NTP server resolved to no usable addresses").into();
-        for (index, peer) in addresses.iter().copied().enumerate() {
-            if let Err(rejected) = crate::config::ntp::validate_server_ip(peer.ip())
-                .and_then(|()| crate::socket_policy::check_outbound_address(peer.ip()))
-            {
-                last_error = rejected.into();
-                continue;
-            }
-            // Shares the remaining deadline so a blackholed family cannot starve alternatives.
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let budget = remaining / u32::try_from(addresses.len() - index).unwrap_or(u32::MAX);
-            let result = timeout_at(Instant::now() + budget, exchange(peer))
-                .await
-                .unwrap_or_else(|_| Err(timed_out()));
-            match result {
-                Ok(offset) => return Ok(offset),
-                Err(refused @ QueryError::Protocol(sntpc::Error::KissOfDeath(_))) => {
-                    return Err(refused);
-                }
-                Err(error) => last_error = error,
-            }
-        }
-        Err(last_error)
+        query_addresses(&addresses, deadline).await
     })
     .await
     .unwrap_or_else(|_| Err(timed_out()))
+}
+
+async fn query_addresses(addresses: &[SocketAddr], deadline: Instant) -> Result<i64, QueryError> {
+    let mut last_error = io::Error::other("NTP server resolved to no usable addresses").into();
+    for (index, peer) in addresses.iter().copied().enumerate() {
+        if let Err(rejected) = crate::config::ntp::validate_server_ip(peer.ip())
+            .and_then(|()| crate::socket_policy::check_outbound_address(peer.ip()))
+        {
+            last_error = rejected.into();
+            continue;
+        }
+        // Shares the remaining deadline so a blackholed family cannot starve alternatives.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let budget = remaining / u32::try_from(addresses.len() - index).unwrap_or(u32::MAX);
+        let result = timeout_at(Instant::now() + budget, exchange(peer))
+            .await
+            .unwrap_or_else(|_| Err(timed_out()));
+        match result {
+            Ok(offset) => return Ok(offset),
+            Err(error) if error.is_refusal() => return Err(error),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 fn timed_out() -> QueryError {

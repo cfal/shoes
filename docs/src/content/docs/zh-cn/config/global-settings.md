@@ -51,13 +51,13 @@ description: "默认 DNS、可选 NTP、准入限制、远程规则缓存、QUIC
 
 | 字段 | 默认值 | 有效值 |
 | --- | --- | --- |
-| `server` | 必填 | 主机名或 IP，必须显式指定 UDP 端口，通常为 `123`；IPv6 使用 `[address]:port` |
+| `server` | 必填 | 非空主机名或 IP，必须显式指定 UDP 端口，通常为 `123`；IPv6 使用 `[address]:port` |
 | `interval_secs` | 1800 | 整数秒，60-86,400 |
 | `timeout_secs` | 5 | 整数秒，1-30 |
 
 应用时钟为 **系统时间 + 最近一次测得的有符号偏移量**。NTP 测量始终使用未经校正的系统时间。shoes 不会写入系统时钟，也不需要设置时间的权限。REALITY、VMess、Shadowsocks 2022 和 rustls 证书验证（包括基于 TLS 的 DNS 和 QUIC）使用校正后的时间。日志、证书续订调度及其他协议保持现有时钟。REALITY 的 `max_time_diff` 默认值和 null 语义不变。
 
-运行时监听器、WireGuard 和 TUN 启动前，会完成一次有超时限制的同步尝试，超时包含 DNS 解析和 UDP 交换。失败不会阻止启动：首次启动使用零偏移，修改 NTP 配置时保留之前的校正值。刷新失败也保留最近的偏移，并在 `interval_secs` 后重试。收到服务器的 Kiss-of-Death 拒绝响应后，停止轮询，直到修改 NTP 配置或重启服务。仅接受普通的 48 字节 NTP 响应，不支持扩展字段或认证尾部。
+运行时监听器、WireGuard 和 TUN 启动前，会完成一次有超时限制的同步尝试，超时包含 DNS 解析和 UDP 交换。失败不会阻止启动：首次启动使用零偏移，修改 NTP 配置时保留之前的校正值。刷新失败也保留最近的偏移，并在 `interval_secs` 后重试。作为保守策略，收到 `DENY`、`RSTR` 或 `RATE` Kiss-of-Death 响应后，停止轮询，直到修改 NTP 配置或重启服务。其他 stratum 为零的响应（如 `INIT` 或 `STEP`）会被丢弃，但不会阻止尝试其他地址或定期重试。仅接受普通的 48 字节 NTP 响应，不支持扩展字段或认证尾部。
 
 NTP 通过 shoes 的受保护、遵循路由策略的 UDP 套接字直接发送，不经过代理链。主机名使用原生 DNS，或受管 TUN 的引导 DNS，不继承 `default_dns`。当前或保留的 Fake IP 地址池、受保护的 TUN 端点和受管 TUN 子网不能用作 NTP 目的地。嵌入式 VPN 环境建议使用 IP 地址，避免依赖经过 VPN 自身的 DNS。
 

@@ -72,7 +72,7 @@ in; there is no `enabled` field. Disabled instances send no NTP requests.
 
 | Field | Default | Accepted values |
 | --- | --- | --- |
-| `server` | Required | Hostname or IP with explicit UDP port, normally `123`; IPv6 uses `[address]:port` |
+| `server` | Required | Nonempty hostname or IP with explicit UDP port, normally `123`; IPv6 uses `[address]:port` |
 | `interval_secs` | 1800 | Integer seconds, 60-86,400 |
 | `timeout_secs` | 5 | Integer seconds, 1-30 |
 
@@ -87,8 +87,10 @@ One bounded synchronization attempt completes before runtime listeners,
 WireGuard, and TUN start. Its timeout covers DNS and UDP exchange. Failure is
 nonfatal: startup continues with zero offset, or the previous correction after
 an NTP settings change. Refresh failures retain the last offset and retry after
-`interval_secs`. A server Kiss-of-Death response stops polling until NTP settings
-change or the service restarts. Only plain 48-byte NTP replies are accepted;
+`interval_secs`. As a conservative policy, `DENY`, `RSTR`, and `RATE` Kiss-of-Death
+responses stop polling until NTP settings change or the service restarts. Other
+stratum-zero responses, such as `INIT` or `STEP`, are discarded without stopping
+address failover or periodic retries. Only plain 48-byte NTP replies are accepted;
 extensions and authentication trailers are not supported.
 
 Traffic goes directly through shoes' protected/policy-aware UDP sockets, not

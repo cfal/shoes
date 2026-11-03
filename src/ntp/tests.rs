@@ -427,6 +427,119 @@ async fn ntp_managed_resolution_failure_does_not_fall_back_to_native() {
 }
 
 #[tokio::test]
+async fn ntp_changed_settings_inherit_the_last_active_sample() {
+    const CHILD: &str = "SHOES_NTP_INHERIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(
+            "ntp::tests::ntp_changed_settings_inherit_the_last_active_sample",
+            CHILD,
+            "1",
+        );
+        return;
+    }
+    for reply in [Reply::KissOfDeath(*b"DENY"), Reply::Mutate(|p| p[24] ^= 1)] {
+        let server = FakeServer::new(Reply::Offset(600)).await;
+        let previous = Prepared::new(Some(server.config()), None);
+        let mut old = previous.start(Arc::from([])).await;
+        let changed = FakeServer::new(reply).await;
+        let candidate = Prepared::new(Some(changed.config()), Some(&previous));
+        assert!(!Arc::ptr_eq(&candidate.state.clock, &previous.state.clock));
+        *server.reply.lock() = Reply::Offset(1200);
+        refresh(&server.config(), &previous.state, Arc::from([])).await;
+        old.stop().await;
+        let raw = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut running = candidate.start(Arc::from([])).await;
+        assert!(crate::clock::unix_seconds().unwrap().abs_diff(raw + 1200) <= 2);
+        running.stop().await;
+        candidate.state.clock.set_offset(1_800_000_000).unwrap();
+        let mut retry = candidate.start(Arc::from([])).await;
+        drop(running);
+        assert!(crate::clock::unix_seconds().unwrap().abs_diff(raw + 1800) <= 2);
+        assert_eq!(changed.requests(), 1, "bind retry repeated synchronization");
+        retry.stop().await;
+        let mut rollback = previous.start(Arc::from([])).await;
+        drop(retry);
+        assert!(crate::clock::unix_seconds().unwrap().abs_diff(raw + 1200) <= 2);
+        assert_eq!(server.requests(), 2, "rollback repeated synchronization");
+        rollback.stop().await;
+        drop(rollback);
+        drop(old);
+    }
+}
+
+#[tokio::test]
+async fn ntp_status_codes_control_address_failover() {
+    for (code, refused) in [
+        (*b"DENY", true),
+        (*b"RSTR", true),
+        (*b"RATE", true),
+        (*b"INIT", false),
+        (*b"STEP", false),
+        (*b"X123", false),
+    ] {
+        let first = FakeServer::new(Reply::KissOfDeath(code)).await;
+        let second = FakeServer::new(Reply::Offset(600)).await;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result = timeout_at(
+            deadline,
+            query_addresses(&[first.address, second.address], deadline),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.requests(), 1);
+        if refused {
+            assert!(matches!(
+                result,
+                Err(QueryError::Protocol(sntpc::Error::KissOfDeath(_)))
+            ));
+            assert_eq!(second.requests(), 0);
+        } else {
+            assert!(result.unwrap().abs_diff(600_000_000) < 250_000);
+            assert_eq!(second.requests(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn ntp_non_refusal_codes_retain_samples_and_retry_after_reload() {
+    const CHILD: &str = "SHOES_NTP_STATUS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(
+            "ntp::tests::ntp_non_refusal_codes_retain_samples_and_retry_after_reload",
+            CHILD,
+            "1",
+        );
+        return;
+    }
+    for code in [*b"INIT", *b"STEP", *b"X123"] {
+        let server = FakeServer::new(Reply::KissOfDeath(code)).await;
+        let prepared = Prepared::new(Some(server.config()), None);
+        prepared.state.clock.set_offset(600_000_000).unwrap();
+        let mut running = prepared.start(Arc::from([])).await;
+        assert!(prepared.state.schedule.lock().next.is_some());
+        assert!(crate::clock::now().unwrap() > SystemTime::now() + Duration::from_secs(599));
+        running.stop().await;
+        *server.reply.lock() = Reply::Offset(1200);
+        prepared.state.schedule.lock().next = Some(Instant::now());
+        let same = Prepared::new(Some(server.config()), Some(&prepared));
+        let mut replacement = same.start(Arc::from([])).await;
+        drop(running);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while crate::clock::now().unwrap() < SystemTime::now() + Duration::from_secs(1199) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(server.requests(), 2);
+        replacement.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn kiss_of_death_with_zero_timestamps_stops_polling_across_reload() {
     const CHILD: &str = "SHOES_NTP_KOD_CHILD";
     if std::env::var_os(CHILD).is_none() {

@@ -27,10 +27,11 @@ impl Clock {
         Ok(())
     }
 
-    pub(crate) fn snapshot(&self) -> Self {
-        Self {
-            offset_micros: AtomicI64::new(self.offset_micros.load(Ordering::Relaxed)),
-        }
+    pub(crate) fn copy_offset_from(&self, previous: &Self) {
+        self.offset_micros.store(
+            previous.offset_micros.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 }
 
