@@ -27,6 +27,9 @@ impl NtpConfig {
         if self.server.port() == 0 {
             return Err(invalid("server port must be nonzero"));
         }
+        if self.server.address().hostname().is_some_and(str::is_empty) {
+            return Err(invalid("server host must be nonempty"));
+        }
         if !(60..=86400).contains(&self.interval_secs) {
             return Err(invalid("interval_secs must be in 60..=86400"));
         }
@@ -90,6 +93,7 @@ mod tests {
     fn ntp_rejects_invalid_config_without_network_access() {
         for fields in [
             "{}",
+            "{server: ':123'}",
             "{server: 'time.example'}",
             "{server: '127.0.0.1:0'}",
             "{server: '0.0.0.0:123'}",
