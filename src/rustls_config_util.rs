@@ -407,6 +407,20 @@ mod material_tests {
     use super::*;
     use std::io::{Read, Write};
 
+    #[track_caller]
+    fn connection_pair(
+        client: &Arc<rustls::ClientConfig>,
+        server: &Arc<rustls::ServerConfig>,
+    ) -> (rustls::Connection, rustls::Connection) {
+        (
+            rustls::Connection::Client(
+                rustls::ClientConnection::new(client.clone(), "localhost".try_into().unwrap())
+                    .unwrap(),
+            ),
+            rustls::Connection::Server(rustls::ServerConnection::new(server.clone()).unwrap()),
+        )
+    }
+
     #[test]
     fn prebuilt_dns_tls_config_uses_positive_and_negative_clock_corrections() {
         const CHILD: &str = "SHOES_DNS_TLS_CLOCK_CHILD";
@@ -447,28 +461,14 @@ mod material_tests {
             let mut client = with_test_roots(roots, create_dns_client_config);
             client.resumption = rustls::client::Resumption::disabled();
             let client = Arc::new(client);
-            let pair = || {
-                (
-                    rustls::Connection::Client(
-                        rustls::ClientConnection::new(
-                            client.clone(),
-                            "localhost".try_into().unwrap(),
-                        )
-                        .unwrap(),
-                    ),
-                    rustls::Connection::Server(
-                        rustls::ServerConnection::new(server.clone()).unwrap(),
-                    ),
-                )
-            };
-            let (mut c, mut s) = pair();
+            let (mut c, mut s) = connection_pair(&client, &server);
             transfer_tls(&mut c, &mut s).unwrap();
             assert!(transfer_tls(&mut s, &mut c).is_err());
             let guard = crate::clock::test_offset(seconds * 1_000_000);
-            let (mut c, mut s) = pair();
+            let (mut c, mut s) = connection_pair(&client, &server);
             finish_handshake(&mut c, &mut s);
             drop(guard);
-            let (mut c, mut s) = pair();
+            let (mut c, mut s) = connection_pair(&client, &server);
             transfer_tls(&mut c, &mut s).unwrap();
             assert!(transfer_tls(&mut s, &mut c).is_err());
         }
@@ -513,24 +513,15 @@ mod material_tests {
         });
         client.resumption = rustls::client::Resumption::disabled();
         let client = Arc::new(client);
-        let pair = || {
-            (
-                rustls::Connection::Client(
-                    rustls::ClientConnection::new(client.clone(), "localhost".try_into().unwrap())
-                        .unwrap(),
-                ),
-                rustls::Connection::Server(rustls::ServerConnection::new(server.clone()).unwrap()),
-            )
-        };
-        let (mut c, mut s) = pair();
+        let (mut c, mut s) = connection_pair(&client, &server);
         transfer_tls(&mut c, &mut s).unwrap();
         assert!(transfer_tls(&mut s, &mut c).is_err());
         let guard = crate::clock::test_offset(600_000_000);
-        let (mut c, mut s) = pair();
+        let (mut c, mut s) = connection_pair(&client, &server);
         finish_handshake(&mut c, &mut s);
         assert!(s.peer_certificates().is_some());
         // The server also resolves time when verifying the client's certificate flight.
-        let (mut c, mut s) = pair();
+        let (mut c, mut s) = connection_pair(&client, &server);
         transfer_tls(&mut c, &mut s).unwrap();
         transfer_tls(&mut s, &mut c).unwrap();
         drop(guard);

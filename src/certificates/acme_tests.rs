@@ -42,33 +42,22 @@ fn prebuilt_acme_tls_configs_track_clock_publication() {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    let assert_providers = |expected| {
+        for provider in &providers {
+            let actual = provider.current_time().unwrap().as_secs();
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "provider time {actual}, expected {expected} (raw {raw})"
+            );
+        }
+    };
     let positive = crate::clock::test_offset(600_000_000);
-    for provider in &providers {
-        assert!(
-            provider
-                .current_time()
-                .unwrap()
-                .as_secs()
-                .abs_diff(raw + 600)
-                <= 1
-        );
-    }
+    assert_providers(raw + 600);
     let negative = crate::clock::test_offset(-600_000_000);
     drop(positive);
-    for provider in &providers {
-        assert!(
-            provider
-                .current_time()
-                .unwrap()
-                .as_secs()
-                .abs_diff(raw - 600)
-                <= 1
-        );
-    }
+    assert_providers(raw - 600);
     drop(negative);
-    for provider in &providers {
-        assert!(provider.current_time().unwrap().as_secs().abs_diff(raw) <= 1);
-    }
+    assert_providers(raw);
 }
 
 #[test]
