@@ -577,6 +577,7 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
             .enable_all()
             .build()?
             .block_on(async {
+                readonly_ipv6_configuration().await?;
                 owned_tun_ipv6_setting().await?;
                 redirect_loopback_changes().await?;
                 let mut daemons = resolved_fixture().await?;
@@ -643,6 +644,30 @@ fn host_ipv6_settings() -> io::Result<Vec<String>> {
         .map(|name| std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6")))
         .into_iter()
         .collect()
+}
+
+async fn readonly_ipv6_configuration() -> io::Result<()> {
+    const DEFAULT: &str = "/proc/sys/net/ipv6/conf/default/disable_ipv6";
+    let inherited = std::fs::read_to_string(DEFAULT)?;
+    std::fs::write(DEFAULT, "0")?;
+    let mut spec = spec(false);
+    spec.addresses.retain(ipnetwork::IpNetwork::is_ipv6);
+    spec.routes.retain(ipnetwork::IpNetwork::is_ipv6);
+    let mut session = Session::prepare(spec).await?;
+    run("mount", &["--bind", "/proc/sys", "/proc/sys"])?;
+    run("mount", &["-o", "remount,bind,ro", "/proc/sys"])?;
+    assert_eq!(
+        std::fs::write(DEFAULT, "0").unwrap_err().raw_os_error(),
+        Some(libc::EROFS),
+    );
+    let result = session.prepare_network().await;
+    run("umount", &["/proc/sys"])?;
+    std::fs::write(DEFAULT, inherited)?;
+    result?;
+    session.activate().await?;
+    session.reconcile().await?;
+    session.close().await?;
+    Ok(())
 }
 
 async fn owned_tun_ipv6_setting() -> io::Result<()> {
