@@ -23,27 +23,16 @@ pub(crate) fn cache_file(path: &Path, lease: Option<&CacheLease>) -> io::Result<
 }
 
 pub(crate) fn create_cache_directory(directory: &Path) -> io::Result<()> {
-    (|| {
-        match std::fs::DirBuilder::new().mode(0o700).create(directory) {
-            Ok(()) => {
-                let metadata = directory.symlink_metadata()?;
-                if !metadata.is_dir() || metadata.mode() & 0o700 != 0o700 {
-                    return Err(invalid(
-                        "new directory lacks owner access or was replaced; create it with install -d -m 700 before starting Shoes",
-                    ));
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-        Ok(())
-    })()
-    .map_err(|error: io::Error| {
-        io::Error::new(
-            error.kind(),
-            format!("rule_cache_dir {}: {error}", directory.display()),
-        )
-    })
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("rule_cache_dir {}: {error}", directory.display()),
+            )
+        })
 }
 
 #[derive(Debug)]
@@ -502,10 +491,8 @@ fn checked_path(path: &Path) -> io::Result<(File, std::ffi::OsString)> {
 }
 
 fn check_directory(metadata: &Metadata) -> io::Result<()> {
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
-        return Err(invalid(
-            "destination directory must be owned by current user and not group- or world-writable",
-        ));
+    if metadata.mode() & 0o002 != 0 {
+        return Err(invalid("destination directory must not be world-writable"));
     }
     Ok(())
 }
@@ -572,16 +559,36 @@ mod tests {
 
     #[test]
     fn cache_directory_creation_preserves_existing_modes_and_contextualizes_errors() {
+        const CHILD: &str = "SHOES_RULE_DIRECTORY_CREATION_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            shoes_test_support::isolated::run_isolated(
+                "rule_updater::install::tests::cache_directory_creation_preserves_existing_modes_and_contextualizes_errors",
+                CHILD,
+                "1",
+            );
+            return;
+        }
+        unsafe { libc::umask(0o022) };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let missing = root.join("missing/cache");
-        let error = create_cache_directory(&missing).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        create_cache_directory(&missing).unwrap();
+        create_cache_directory(&missing).unwrap();
+        for path in [&root.join("missing"), &missing] {
+            assert_eq!(path.metadata().unwrap().mode() & 0o777, 0o700);
+        }
+        cache_lease(&missing).unwrap();
+
+        let obstruction = root.join("file");
+        std::fs::write(&obstruction, b"not a directory").unwrap();
+        let blocked = obstruction.join("cache");
+        let error = create_cache_directory(&blocked).unwrap_err();
         assert!(error.to_string().contains("rule_cache_dir"), "{error}");
         assert!(
-            error.to_string().contains(missing.to_str().unwrap()),
+            error.to_string().contains(blocked.to_str().unwrap()),
             "{error}"
         );
+        assert_eq!(std::fs::read(&obstruction).unwrap(), b"not a directory");
 
         let target = root.join("target");
         std::fs::create_dir(&target).unwrap();
@@ -592,6 +599,72 @@ mod tests {
         create_cache_directory(&alias).unwrap();
         assert!(cache_lease(&alias).is_err());
         assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o500);
+    }
+
+    #[test]
+    fn non_owned_directory_can_be_opened_for_cache_paths() {
+        let root = Path::new("/");
+        let metadata = root.metadata().unwrap();
+        let (directory, _) = checked_path(&root.join("shoes-cache-ownership-probe")).unwrap();
+        assert_eq!(directory.metadata().unwrap().uid(), metadata.uid());
+    }
+
+    #[test]
+    fn group_writable_directories_support_leased_reads_and_installs() {
+        const CHILD: &str = "SHOES_RULE_DIRECTORY_ACCESS_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            // Concurrent test subprocesses can otherwise inherit the update lock between installs.
+            shoes_test_support::isolated::run_isolated(
+                "rule_updater::install::tests::group_writable_directories_support_leased_reads_and_installs",
+                CHILD,
+                "1",
+            );
+            return;
+        }
+        unsafe { libc::umask(0o022) };
+        for mode in [0o770, 0o2770, 0o3770] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap().join("cache");
+            create_cache_directory(&root).unwrap();
+            let owner = (unsafe { libc::geteuid() } == 0).then_some(65534);
+            // An inherited group outside the user's memberships can make chmod strip setgid.
+            std::os::unix::fs::chown(&root, owner, Some(unsafe { libc::getegid() })).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            create_cache_directory(&root).unwrap();
+            let lease = Arc::new(cache_lease(&root).unwrap());
+            let path = root.join("rules.json");
+            for bytes in [b"first".as_slice(), b"second"] {
+                let mut install = Install::open_with_lease(&path, Some(lease.clone())).unwrap();
+                install.file.write_all(bytes).unwrap();
+                assert_eq!(
+                    install.finish(blake3::hash(bytes)).unwrap(),
+                    Outcome::Updated
+                );
+                let mut contents = Vec::new();
+                cache_file(&path, Some(&lease))
+                    .unwrap()
+                    .read_to_end(&mut contents)
+                    .unwrap();
+                assert_eq!(contents, bytes);
+                assert_eq!(path.metadata().unwrap().mode() & 0o777, 0o600);
+                assert_eq!(install.lock.metadata().unwrap().mode() & 0o777, 0o600);
+            }
+            assert_eq!(root.metadata().unwrap().mode() & 0o7777, mode);
+            assert_eq!(lease.lock.metadata().unwrap().mode() & 0o777, 0o600);
+            for unsafe_mode in [0o777, 0o1777, 0o757] {
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(unsafe_mode))
+                    .unwrap();
+                assert!(
+                    lease
+                        .check()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("world-writable")
+                );
+                assert!(cache_file(&path, Some(&lease)).is_err());
+                assert!(Install::open_with_lease(&path, Some(lease.clone())).is_err());
+            }
+        }
     }
 
     #[test]

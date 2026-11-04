@@ -64,7 +64,7 @@ A cold start requires network access; a remote outage prevents startup when
 there is no persistent cache. `check` and `--dry-run` remain offline and cannot
 validate memory-only remote sources. Local file sources still require `path`.
 
-`global_settings.rule_cache_dir` enables best-effort persistence in one private managed directory
+`global_settings.rule_cache_dir` enables best-effort persistence in one managed directory
 across all config files. Valid downloads remain usable even when saving fails.
 Cache-save failures are logged; the next successful download retries saving,
 including byte-identical downloads. Until a save succeeds, a restart may restore
@@ -79,11 +79,15 @@ rule sources (including aliases), PEMs, sockets, and other state must be outside
 it. ACME state directories cannot contain or be contained by the cache directory.
 On Linux, `/run/shoes` is reserved for managed-TUN ownership and recovery files;
 use a separate cache directory, such as `/run/shoes/rule-cache`, instead.
-The directory must be owned by the running user and not group- or world-writable
-(for example, create it with `install -d -m 700 cache`). Cache files must be owned,
-regular, singly linked, not group- or world-writable, and have no setuid, setgid,
-or sticky mode bits. Symlinks in any path component
-and `..` traversal are rejected. `owner.lock`, `.shoes-update.lock`, and
+The directory need not be owned by the running user: read, write, and search access
+may come from owner permissions, group permissions, or ACLs. World-writable cache
+directories are rejected. Trust the directory owner and anyone able to write to
+it or its parents: they can remove or replace entries, including rolling back
+previously saved rules. Use a separate cache directory for each Shoes user account.
+Cache files and sidecars must still belong to the running user. Cache files must
+be regular, singly linked, not group- or world-writable, and have no setuid, setgid,
+or sticky mode bits. Lease acquisition and cache I/O reject symlinks in any path
+component and `..` traversal. `owner.lock`, `.shoes-update.lock`, and
 `.shoes-update.tmp` sidecars are reserved. The daemon holds an exclusive directory
 lease; another daemon cannot use the same directory concurrently.
 Replacing the directory or `owner.lock` invalidates the lease; subsequent runtime
@@ -131,11 +135,17 @@ instance's own listeners; indirect dependencies can fail at the download deadlin
 Candidate and retained Fake-IP ranges remain excluded from download destinations,
 proxy hops, and bootstrap DNS.
 
-When configured, startup creates the final cache directory if missing, then acquires its lease.
-The parent directory must already exist. Creation respects the process umask and
-never repairs permissions. If owner access is missing, create the directory with
-`install -d -m 700 cache` before starting. Reload reuses the lease and does not
-recreate a removed root.
+When configured, startup creates the cache directory and any missing parents,
+then acquires its lease. Each new directory uses mode `0700`, subject to the process
+umask; existing ownership and permissions are unchanged. Startup needs read and
+search access to the cache directory and must be able to create or open `owner.lock`
+for reading and writing. With an existing usable lease file, startup can succeed
+without directory write access, but cache saves then fail and are logged.
+Directories created before a failure may remain.
+Creation resolves paths normally, so it may create missing descendants through a
+symlink before lease acquisition rejects that path. For group or ACL access, or a
+restrictive umask, prepare the directory with suitable permissions before starting.
+Reload reuses the lease and does not recreate a removed root.
 
 Declarations and all required bootstrap routes are preflighted before fetching.
 Sources are downloaded and decoder-validated serially, retained in memory, and
