@@ -21,6 +21,7 @@ mod guard;
 mod hickory_resolver;
 mod hosts;
 mod message;
+mod network;
 mod parsed;
 mod proxy_runtime;
 mod stream;

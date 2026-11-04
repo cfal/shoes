@@ -46,7 +46,7 @@ pub(crate) fn controlled(endpoints: &[SocketAddr]) -> io::Result<Arc<dyn Resolve
             NameServerConfig::new(endpoint.ip(), true, connections.to_vec())
         })
         .collect();
-    Ok(Arc::new(
+    Ok(super::network::scoped(Arc::new(
         super::hickory_resolver::HickoryResolver::build_with_ns_configs(
             servers,
             chain,
@@ -54,7 +54,7 @@ pub(crate) fn controlled(endpoints: &[SocketAddr]) -> io::Result<Arc<dyn Resolve
             Default::default(),
             "managed bootstrap".to_owned(),
         )?,
-    ))
+    )))
 }
 
 #[cfg(test)]

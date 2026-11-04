@@ -265,7 +265,7 @@ impl TunUdpManager {
 
         let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
 
-        let handle = tokio::spawn(session_task(
+        let handle = crate::network_tasks::spawn(session_task(
             peer_addr,
             rx,
             self.response_tx.clone(),
@@ -392,7 +392,7 @@ async fn session_task(
                     };
 
                     let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
-                    let handle = tokio::spawn(destination_task(
+                    let handle = crate::network_tasks::spawn(destination_task(
                         peer_addr,
                         source_addr,
                         stream,

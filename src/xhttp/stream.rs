@@ -535,10 +535,12 @@ impl Tasks {
             tokio::select! { biased; _ = cancel.cancelled() => {}, _ = future => {} }
         };
         if crate::control::url_test::is_background() {
-            self.tracker
-                .spawn(crate::control::url_test::BACKGROUND.scope((), task));
+            crate::network_tasks::spawn(
+                self.tracker
+                    .track_future(crate::control::url_test::BACKGROUND.scope((), task)),
+            );
         } else {
-            self.tracker.spawn(task);
+            crate::network_tasks::spawn(self.tracker.track_future(task));
         }
     }
     pub async fn wait(&self) {

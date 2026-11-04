@@ -34,7 +34,7 @@ async fn start_quic_server(
     )? {
         let resolver = resolver.clone();
         let server_handler = server_handler.clone();
-        let join_handle = tokio::spawn(async move {
+        let join_handle = crate::network_tasks::spawn(async move {
             let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
             loop {
                 let conn = tokio::select! {
@@ -104,7 +104,7 @@ async fn process_connection(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         let peer = connection.remote_address();
-        tasks.spawn(async move {
+        crate::network_tasks::spawn_in(&mut tasks, async move {
             if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream, peer).await {
                 error!("Failed to process streams: {e}");
             }
@@ -260,7 +260,7 @@ pub async fn start_quic_servers(
             }
             for endpoint in endpoints {
                 let service = service.clone();
-                handles.push(tokio::spawn(async move {
+                handles.push(crate::network_tasks::spawn(async move {
                     let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
                     loop {
                         let incoming = tokio::select! {

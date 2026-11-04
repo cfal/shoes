@@ -118,7 +118,7 @@ impl ListenerTasks {
     }
 
     pub fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
-        self.tasks.spawn(future);
+        crate::network_tasks::spawn_in(&mut self.tasks, future);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -137,12 +137,12 @@ impl Drop for ListenerTasks {
         if self.tasks.is_empty() || self.grace.is_zero() {
             return;
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         let mut tasks = std::mem::take(&mut self.tasks);
         let deadline = tokio::time::Instant::now() + self.grace;
-        runtime.spawn(async move {
+        crate::network_tasks::spawn(async move {
             let drained = tokio::time::timeout_at(deadline, async {
                 while let Some(result) = tasks.join_next().await {
                     if let Err(error) = result {

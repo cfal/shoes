@@ -109,11 +109,14 @@ pub(super) fn start(
             incoming: incoming.clone(),
             drops: drops.clone(),
         };
-        workers.spawn(crate::control::url_test::BACKGROUND.scope((), worker.run()));
+        crate::network_tasks::spawn_in(
+            &mut workers,
+            crate::control::url_test::BACKGROUND.scope((), worker.run()),
+        );
     }
     drop(incoming);
     let shutdown = cancel.clone();
-    tokio::spawn(async move {
+    crate::network_tasks::spawn(async move {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {},
