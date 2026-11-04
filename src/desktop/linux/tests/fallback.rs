@@ -1,5 +1,5 @@
 use super::*;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -15,14 +15,12 @@ struct Flow {
 
 impl Flow {
     async fn connect(target: SocketAddr, source: Option<IpAddr>) -> io::Result<Self> {
-        let bind = SocketAddr::new(
-            source.unwrap_or_else(|| {
-                if target.is_ipv6() { "::" } else { "0.0.0.0" }
-                    .parse()
-                    .unwrap()
-            }),
-            0,
-        );
+        let ip = match source {
+            Some(ip) => ip,
+            None if target.is_ipv6() => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        };
+        let bind = SocketAddr::new(ip, 0);
         let tcp = if target.is_ipv6() {
             tokio::net::TcpSocket::new_v6()?
         } else {

@@ -160,7 +160,7 @@ impl Session {
         .await?;
         self.record.firewall_pending = true;
         self.journal.save(&self.record)?;
-        command::nft(self.journal.lease(), &self.nft, self.firewall_policy(false)).await?;
+        command::run(self.journal.lease(), &self.nft, &["-j", "-f", "-"], &bytes).await?;
         check_firewall(self.journal.lease(), &self.nft, &self.record).await?;
         routes::configure(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
         Ok(())
@@ -302,8 +302,13 @@ impl Session {
         remove_routing(&self.handle, &self.record, &mut errors).await;
         self.ingress = None;
         if self.record.firewall_pending {
-            match remove_detached_firewall(&self.handle, &self.nft, &self.journal, &self.record)
-                .await
+            match remove_detached_firewall(
+                &self.handle,
+                self.journal.lease(),
+                &self.nft,
+                &self.record,
+            )
+            .await
             {
                 Ok(()) => self.record.firewall_pending = false,
                 Err(error) => errors.push(error.to_string()),
@@ -389,8 +394,8 @@ async fn quiesce_firewall(
 
 async fn remove_detached_firewall(
     handle: &Handle,
+    lease: BorrowedFd<'_>,
     executable: &str,
-    journal: &Journal,
     record: &Record,
 ) -> io::Result<()> {
     // An alias change does not prove the original interface stopped receiving traffic.
@@ -402,7 +407,7 @@ async fn remove_detached_firewall(
             "managed TUN still exists; retaining its egress guard",
         ));
     }
-    remove_firewall(journal.lease(), executable, record).await
+    remove_firewall(lease, executable, record).await
 }
 
 async fn remove_link(handle: &Handle, record: &Record) -> io::Result<()> {
@@ -451,7 +456,7 @@ async fn recover(handle: &Handle, nft: &str, journal: &Journal, record: &Record)
     }
     remove_routing(handle, record, &mut errors).await;
     if record.firewall_pending
-        && let Err(error) = remove_detached_firewall(handle, nft, journal, record).await
+        && let Err(error) = remove_detached_firewall(handle, journal.lease(), nft, record).await
     {
         errors.push(error.to_string());
     }

@@ -18,7 +18,7 @@ use rtnetlink::{Handle, IpVersion, LinkUnspec, RouteMessageBuilder};
 use super::spec::{Spec, invalid};
 
 const PROTOCOL: RouteProtocol = RouteProtocol::Other(233);
-pub(super) const FALLBACK_PRIORITY: u32 = 32768;
+const FALLBACK_PRIORITY: u32 = 32768;
 
 pub(super) async fn request<T>(
     future: impl std::future::Future<Output = Result<T, rtnetlink::Error>>,
@@ -509,9 +509,12 @@ pub(super) async fn configure(
 
 pub(super) async fn remove_rules(handle: &Handle, spec: &Spec) -> io::Result<()> {
     for ipv6 in families(spec) {
-        let expected = [rule(spec, ipv6), fallback_rule(spec, ipv6)];
+        let expected_rules = [rule(spec, ipv6), fallback_rule(spec, ipv6)];
         for actual in rules(handle, ipv6).await? {
-            if expected.iter().any(|expected| same_rule(&actual, expected)) {
+            if expected_rules
+                .iter()
+                .any(|expected| same_rule(&actual, expected))
+            {
                 request(handle.rule().del(actual).execute()).await?;
             } else if references_reservation(&actual, spec) {
                 return Err(io::Error::other(
@@ -558,12 +561,16 @@ pub(super) async fn check(handle: &Handle, spec: &Spec, index: u32, alias: &str)
     for ipv6 in [false, true] {
         let configured = families(spec).any(|family| family == ipv6);
         let rules = rules(handle, ipv6).await?;
-        let expected = configured_rules(spec, ipv6);
+        let expected_rules = configured_rules(spec, ipv6);
         for actual in &rules {
             if configured {
                 check_precedence(actual, spec)?;
             }
-            if !configured || !expected.iter().any(|expected| same_rule(actual, expected)) {
+            if !configured
+                || !expected_rules
+                    .iter()
+                    .any(|expected| same_rule(actual, expected))
+            {
                 check_mark_reservation(actual, spec)?;
             }
         }
@@ -574,8 +581,8 @@ pub(super) async fn check(handle: &Handle, spec: &Spec, index: u32, alias: &str)
             .iter()
             .filter(|rule| references_reservation(rule, spec))
             .collect();
-        if reserved.len() != expected.len()
-            || expected.iter().any(|expected| {
+        if reserved.len() != expected_rules.len()
+            || expected_rules.iter().any(|expected| {
                 reserved
                     .iter()
                     .filter(|actual| same_rule(actual, expected))

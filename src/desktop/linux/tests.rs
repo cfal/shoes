@@ -256,21 +256,13 @@ fn managed_fallback_rule_is_local_zero_mark_and_dump_stable() {
     let spec = spec(false);
     for ipv6 in [false, true] {
         let expected = routes::fallback_rule(&spec, ipv6);
-        assert!(
-            expected
-                .attributes
-                .contains(&RuleAttribute::Priority(32768))
-        );
-        assert!(
-            expected
-                .attributes
-                .contains(&RuleAttribute::Iifname("lo".into()))
-        );
-        assert!(
-            expected
-                .attributes
-                .contains(&RuleAttribute::FwMask(u32::MAX))
-        );
+        for attribute in [
+            RuleAttribute::Priority(32768),
+            RuleAttribute::Iifname("lo".into()),
+            RuleAttribute::FwMask(u32::MAX),
+        ] {
+            assert!(expected.attributes.contains(&attribute), "{attribute:?}");
+        }
         assert!(
             !expected
                 .attributes
@@ -444,8 +436,6 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
             .block_on(async {
                 let mut session = Session::prepare(spec(false)).await?;
                 session.prepare_network().await?;
-                session.record.firewall_pending = true;
-                session.journal.save(&session.record)?;
                 let batch = serde_json::to_vec(&nft::replace(
                     &session.record.table(), session.firewall_policy(true),
                 ))?;
