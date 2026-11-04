@@ -95,6 +95,7 @@ struct SelectedPath {
     initial: Arc<InitialHopEntry>,
     subsequent: Vec<Arc<dyn ProxyConnector>>,
     origins: Vec<Option<MemberOrigin>>,
+    // Leading groups per origin omitted only from reporting; policy ancestry stays intact.
     shared_groups: Vec<usize>,
 }
 
@@ -392,13 +393,13 @@ impl SelectedPath {
     }
 
     fn route_names(&self) -> Vec<String> {
-        self.origins
-            .iter()
-            .zip(&self.shared_groups)
-            .rev()
-            .filter_map(|(origin, shared)| Some(origin.as_ref()?.chains(*shared)))
-            .flatten()
-            .collect()
+        let mut names = Vec::new();
+        for (origin, &shared_groups) in self.origins.iter().zip(&self.shared_groups).rev() {
+            if let Some(origin) = origin {
+                names.extend(origin.chains(shared_groups));
+            }
+        }
+        names
     }
 
     #[cfg(test)]

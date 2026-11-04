@@ -299,10 +299,10 @@ fn node(
 }
 
 fn pinned(leaves: &[SelectedLeaf<'_>]) -> SelectedPath {
-    let origins = leaves
+    let (origins, shared_groups) = leaves
         .iter()
-        .map(|selected| selected.leaf.origin.clone())
-        .collect();
+        .map(|selected| (selected.leaf.origin.clone(), selected.shared_groups))
+        .unzip();
     let subsequent_hops: Vec<_> = leaves
         .iter()
         .skip(1)
@@ -310,10 +310,7 @@ fn pinned(leaves: &[SelectedLeaf<'_>]) -> SelectedPath {
         .collect();
     SelectedPath {
         origins,
-        shared_groups: leaves
-            .iter()
-            .map(|selected| selected.shared_groups)
-            .collect(),
+        shared_groups,
         initial: leaves[0].leaf.initial.as_ref().unwrap().clone(),
         subsequent: subsequent_hops,
     }
@@ -801,8 +798,9 @@ mod tests {
                 path.subsequent[0].proxy_location().to_string(),
                 "192.0.2.1:443"
             );
+            let names = path.route_names();
             assert_eq!(
-                path.route_names(),
+                names,
                 [
                     "client-2-1",
                     "DIRECT",
@@ -811,8 +809,8 @@ mod tests {
                     "a1-selected"
                 ]
             );
-            for name in path.route_names() {
-                assert!(catalog.nodes.contains_key(&name), "{name}");
+            for name in &names {
+                assert!(catalog.nodes.contains_key(name), "{name}");
             }
         }
     }
