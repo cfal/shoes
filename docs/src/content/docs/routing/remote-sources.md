@@ -137,8 +137,11 @@ proxy hops, and bootstrap DNS.
 
 When configured, startup creates the cache directory and any missing parents,
 then acquires its lease. Each new directory uses mode `0700`, subject to the process
-umask; existing ownership and permissions are unchanged. Insufficient filesystem
-access still prevents startup, and directories created before a failure may remain.
+umask; existing ownership and permissions are unchanged. Startup needs read and
+search access to the cache directory and must be able to create or open `owner.lock`
+for reading and writing. With an existing usable lease file, startup can succeed
+without directory write access, but cache saves then fail and are logged.
+Directories created before a failure may remain.
 Creation resolves paths normally, so it may create missing descendants through a
 symlink before lease acquisition rejects that path. For group or ACL access, or a
 restrictive umask, prepare the directory with suitable permissions before starting.
