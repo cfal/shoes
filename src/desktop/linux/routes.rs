@@ -423,6 +423,21 @@ pub(super) async fn configure(
     index: u32,
     alias: &str,
 ) -> io::Result<()> {
+    if spec.addresses.iter().any(IpNetwork::is_ipv6) {
+        std::fs::write(
+            format!("/proc/sys/net/ipv6/conf/{}/disable_ipv6", spec.name),
+            "0",
+        )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to enable IPv6 on managed TUN {}: {error}",
+                    spec.name
+                ),
+            )
+        })?;
+    }
     request(
         handle
             .link()

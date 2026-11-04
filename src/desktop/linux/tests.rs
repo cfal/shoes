@@ -516,59 +516,94 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
             args.extend(arguments);
             run("ip", &args)?;
         }
+        let disabled = std::env::var("SHOES_MANAGED_IPV6_DEFAULT_DISABLED").unwrap();
+        std::fs::write("/proc/sys/net/ipv6/conf/default/disable_ipv6", disabled)?;
+        let ipv6_settings = host_ipv6_settings()?;
         return tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(async {
                 let mut daemons = resolved_fixture().await?;
+                owned_tun_ipv6_setting().await?;
                 let result =
                     tokio::time::timeout(Duration::from_secs(90), kernel_capture()).await?;
                 for child in &mut daemons {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                 }
+                assert_eq!(host_ipv6_settings()?, ipv6_settings);
                 result
             });
     }
-    let output = std::process::Command::new("sudo")
-        .args([
-            "-n",
-            "--",
-            "timeout",
-            "--kill-after=5s",
-            "120s",
-            "unshare",
-            "--net",
-            "--mount",
-            "--propagation",
-            "private",
-            "--pid",
-            "--mount-proc",
-            "--fork",
-            "--kill-child",
-            "--",
-            "env",
-        ])
-        .arg(format!("{PARENT}={}", namespace.display()))
-        .arg(format!(
-            "{MOUNT}={}",
-            std::fs::read_link("/proc/self/ns/mnt")?.display()
-        ))
-        .args(
-            std::env::var("SHOES_RESOLVED_ROOT")
-                .ok()
-                .map(|root| format!("SHOES_RESOLVED_ROOT={root}")),
-        )
-        .arg(std::env::current_exe()?)
-        .args(KERNEL_TEST_ARGS)
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("test result: ok. 1 passed;"),
-        "managed kernel test failed: {}\n{stdout}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for disabled in ["0", "1"] {
+        let output = std::process::Command::new("sudo")
+            .args([
+                "-n",
+                "--",
+                "timeout",
+                "--kill-after=5s",
+                "120s",
+                "unshare",
+                "--net",
+                "--mount",
+                "--propagation",
+                "private",
+                "--pid",
+                "--mount-proc",
+                "--fork",
+                "--kill-child",
+                "--",
+                "env",
+            ])
+            .arg(format!("{PARENT}={}", namespace.display()))
+            .arg(format!("SHOES_MANAGED_IPV6_DEFAULT_DISABLED={disabled}"))
+            .arg(format!(
+                "{MOUNT}={}",
+                std::fs::read_link("/proc/self/ns/mnt")?.display()
+            ))
+            .args(
+                std::env::var("SHOES_RESOLVED_ROOT")
+                    .ok()
+                    .map(|root| format!("SHOES_RESOLVED_ROOT={root}")),
+            )
+            .arg(std::env::current_exe()?)
+            .args(KERNEL_TEST_ARGS)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "managed kernel test failed (default.disable_ipv6={disabled}): {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn host_ipv6_settings() -> io::Result<Vec<String>> {
+    ["all", "default", "lo", "native0"]
+        .map(|name| std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6")))
+        .into_iter()
+        .collect()
+}
+
+async fn owned_tun_ipv6_setting() -> io::Result<()> {
+    let inherited = std::fs::read_to_string("/proc/sys/net/ipv6/conf/default/disable_ipv6")?;
+    for ipv6 in [false, true] {
+        let mut spec = spec(false);
+        if !ipv6 {
+            spec.addresses.retain(ipnetwork::IpNetwork::is_ipv4);
+            spec.routes.retain(ipnetwork::IpNetwork::is_ipv4);
+        }
+        let mut session = Session::prepare(spec).await?;
+        session.prepare_network().await?;
+        assert_eq!(
+            std::fs::read_to_string("/proc/sys/net/ipv6/conf/shoes0/disable_ipv6")?.trim(),
+            if ipv6 { "0" } else { inherited.trim() },
+        );
+        session.close().await?;
+        assert!(!std::path::Path::new("/proc/sys/net/ipv6/conf/shoes0").exists());
+    }
     Ok(())
 }
 

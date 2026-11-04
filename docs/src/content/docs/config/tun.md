@@ -168,6 +168,11 @@ For explicitly IPv4-only capture, configure only an IPv4 address and
 `route_address: [0.0.0.0/0]`; IPv6
 then remains native. This is not an IPv6 blocking policy.
 
+When IPv6 is configured, shoes enables it on the owned TUN before assigning
+addresses, even if the interface inherits `net.ipv6.conf.default.disable_ipv6=1`.
+It does not change `all`, `default`, loopback, or physical-interface IPv6 settings.
+IPv4-only configurations leave the TUN's inherited IPv6 setting unchanged.
+
 Loopback, local destinations, multicast, broadcast, link-local destinations,
 and connected networks remain native. DNS to connected networks is intercepted
 unless explicitly excluded. Replies to inbound services remain native. Existing
