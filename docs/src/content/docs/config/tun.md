@@ -162,8 +162,22 @@ discards its transient resolver settings. Other links are not changed.
 The managed TUN subnet is reserved for ingress:
 forwarding a connection back to that subnet is rejected, except local DNS handling.
 
-The initial route must exist before OUTPUT capture, so every configured family
-requires an underlying main-table default route without source or TOS constraints.
+Native default routes are not required for startup or capture. A late policy
+rule at priority `32768` sends locally originated, unmarked traffic without an
+earlier native route through the TUN for classification. IPv4-only or IPv6-only
+underlays can therefore carry both destination families through a suitable
+proxy. Protected Shoes outbounds never use this fallback: DIRECT connections
+and the transport to a proxy still require native connectivity in their own
+family. Explicit native unreachable, prohibit, and blackhole routes remain
+effective.
+
+Native routes can disappear or return without restarting capture. Connections
+started without a native route use the TUN's address as their source; existing
+captured flows retain their classification when connectivity changes. This does
+not guarantee recovery of sockets whose source address disappeared or whose
+connection attempt already failed. Traffic excluded from capture is dropped
+if its only route is the fallback, rather than being sent to a proxy.
+
 For explicitly IPv4-only capture, configure only an IPv4 address and
 `route_address: [0.0.0.0/0]`; IPv6
 then remains native. This is not an IPv6 blocking policy.
@@ -200,7 +214,8 @@ Foreign-marked traffic is left to existing policy. Unsupported protocols remain
 native; ICMP handling is the existing synthetic echo behavior, not remote ICMP
 forwarding. This is host capture, not gateway or container forwarding.
 
-Conflicting tables, priorities, mark reservations, or preceding nonlocal policy
+Conflicting tables, priorities (including the fixed fallback priority `32768`),
+mark reservations, or preceding nonlocal policy
 rules cause startup rejection. Other VPNs and firewall managers require explicit
 coexistence validation; shoes does not override foreign firewall decisions.
 REDIRECT also rejects native routes using its virtual peer as a gateway and
@@ -223,7 +238,12 @@ if its contents have changed; other tables are left untouched. Connected-network
 sets are updated atomically through nftables and cached in memory, not journaled
 as firewall snapshots.
 
-Shutdown removes capture and attempts DNS cleanup before retiring ingress.
+A TUN egress guard is installed before its routes become usable. Activation
+atomically enables classification; deactivation atomically returns to a
+drop-only policy and attempts DNS cleanup. Only authorized captured traffic
+can leave through the TUN while active. Shutdown removes owned routing and the
+owned interface before removing the guard, so unselected traffic cannot enter
+the TUN during preparation or teardown.
 SIGKILL cannot run cleanup: the service's `ExecStopPost` invokes
 `shoes cleanup-tun`, and the next managed startup also reconciles stale state.
 Recovery uses a private namespace-scoped journal under `/run/shoes` to track
@@ -237,8 +257,7 @@ Outstanding helper processes retain the namespace lock, so recovery fails rather
 than racing a helper that could still commit. The service terminates remaining
 helpers before `ExecStopPost`; standalone operators must let them finish or stop
 them before retrying cleanup.
-The service retries without a start-rate limit, including while a configured
-family is waiting for its underlying default route. Read failures during
+The service retries without a start-rate limit. Read failures during
 reconciliation currently trigger cleanup and a supervised restart, not in-place
 repair. Cleanup errors retain the journal for retry. Until the owned table is
 removed, stale TCP REDIRECT rules can continue to reject connections.
