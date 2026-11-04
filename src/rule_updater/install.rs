@@ -559,6 +559,16 @@ mod tests {
 
     #[test]
     fn cache_directory_creation_preserves_existing_modes_and_contextualizes_errors() {
+        const CHILD: &str = "SHOES_RULE_DIRECTORY_CREATION_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            shoes_test_support::isolated::run_isolated(
+                "rule_updater::install::tests::cache_directory_creation_preserves_existing_modes_and_contextualizes_errors",
+                CHILD,
+                "1",
+            );
+            return;
+        }
+        unsafe { libc::umask(0o022) };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let missing = root.join("missing/cache");
@@ -611,13 +621,14 @@ mod tests {
             );
             return;
         }
+        unsafe { libc::umask(0o022) };
         for mode in [0o770, 0o2770, 0o3770] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap().join("cache");
             create_cache_directory(&root).unwrap();
-            if unsafe { libc::geteuid() } == 0 {
-                std::os::unix::fs::chown(&root, Some(65534), None).unwrap();
-            }
+            let owner = (unsafe { libc::geteuid() } == 0).then_some(65534);
+            // An inherited group outside the user's memberships can make chmod strip setgid.
+            std::os::unix::fs::chown(&root, owner, Some(unsafe { libc::getegid() })).unwrap();
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
             create_cache_directory(&root).unwrap();
             let lease = Arc::new(cache_lease(&root).unwrap());
