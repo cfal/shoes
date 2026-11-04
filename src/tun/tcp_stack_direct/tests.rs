@@ -841,6 +841,58 @@ async fn default_admission_preserves_bursts_beyond_old_queue_and_socket_caps() {
 }
 
 #[tokio::test]
+async fn stack_retirement_resets_established_connections() {
+    for ipv6 in [false, true] {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        let mut accepted = stack.take_tcp_rx().unwrap();
+        let packet = |ack: Option<u32>| {
+            let builder = if ipv6 {
+                etherparse::PacketBuilder::ipv6(
+                    "fd00::2".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+                    "fd01::1".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+                    64,
+                )
+            } else {
+                etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+            };
+            let builder = builder.tcp(10001, 443, if ack.is_some() { 102 } else { 101 }, 4096);
+            let builder = match ack {
+                Some(ack) => builder.ack(ack),
+                None => builder.syn(),
+            };
+            let mut bytes = Vec::new();
+            builder.write(&mut bytes, b"").unwrap();
+            bytes
+        };
+        let mut buf = [0; 1500];
+        peer.send(&packet(None)).unwrap();
+        let length = peer.recv(&mut buf).unwrap();
+        let offset = if ipv6 { 40 } else { 20 };
+        let syn_ack = TcpPacket::new_checked(&buf[offset..length]).unwrap();
+        peer.send(&packet(Some(
+            (syn_ack.seq_number().0 as u32).wrapping_add(1),
+        )))
+        .unwrap();
+        let incoming = tokio::time::timeout(Duration::from_secs(1), accepted.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(stack);
+        loop {
+            let length = peer
+                .recv(&mut buf)
+                .expect("retired stack did not reset the application");
+            if TcpPacket::new_checked(&buf[offset..length]).unwrap().rst() {
+                break;
+            }
+        }
+        drop(incoming);
+    }
+}
+
+#[tokio::test]
 async fn abandoned_connection_sends_reset_before_releasing_socket() {
     use std::os::unix::net::UnixDatagram;
     use tokio::io::AsyncReadExt;
