@@ -519,20 +519,33 @@ async fn config_edits_during_bootstrap_survive_watch_rebuilds() {
 }
 
 #[tokio::test]
-async fn startup_bootstraps_before_listeners_and_respects_root_ownership() {
+async fn startup_creates_nested_caches_before_listeners_and_holds_the_lease() {
     let dir = directory();
     let path = dir.path().join("config.yaml");
-    let root = dir.path().join("cache");
-    std::fs::remove_dir(&root).unwrap();
+    let root = dir.path().join("missing/nested/cache");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = available_address();
-    write_config(
+    let mut value = write_config(
         &path,
         address,
         address,
         &format!("http://{}/rules.json", listener.local_addr().unwrap()),
         "7d",
     );
+    value[0]["global_settings"]["rule_cache_dir"] = serde_json::json!("missing/nested/cache");
+    value[1]["rules"][0]["path"] = serde_json::json!("missing/nested/cache/rules.json");
+    std::fs::write(&path, value.to_string()).unwrap();
+    let dry_run = command(&path, &["--dry-run"]).await;
+    let check = Command::new(env!("CARGO_BIN_EXE_shoes"))
+        .args(["check", "-t", "1"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    for output in [dry_run, check] {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("offline checks never download"));
+    }
+    assert!(!dir.path().join("missing").exists());
     let mut child = Process::start(&path, &[]);
     let pending = request(&listener).await;
     assert!(TcpStream::connect(address).await.is_err());
@@ -552,6 +565,10 @@ async fn startup_bootstraps_before_listeners_and_respects_root_ownership() {
 #[tokio::test]
 async fn restrictive_umasks_require_explicit_cache_directory_setup() {
     use std::os::unix::process::CommandExt;
+    // Root can bypass the filesystem access checks exercised here.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
     for mask in [0o200, 0o400, 0o600, 0o777] {
         let dir = directory();
         let root = dir.path().join("cache");
@@ -582,7 +599,13 @@ async fn restrictive_umasks_require_explicit_cache_directory_setup() {
             Process::from_child(command.spawn().unwrap())
         };
         let mut child = start();
-        child.wait_for("install -d -m 700").await;
+        child
+            .wait_for(&format!(
+                "rule_cache_dir {}: {}",
+                root.display(),
+                std::io::Error::from_raw_os_error(libc::EACCES),
+            ))
+            .await;
         assert!(!child.exit().await.success());
         let mode = std::fs::metadata(&root).unwrap().mode() & 0o777;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
