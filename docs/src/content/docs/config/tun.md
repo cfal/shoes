@@ -120,7 +120,7 @@ proxy policy before using it as a proxy.
 | `auto_redirect` | Uses kernel TCP REDIRECT; requires `auto_route`; default `false` |
 | `addresses` | One local CIDR per family; cannot combine with manual `address`, `netmask`, `destination`, or supplied FDs |
 | `route_address` | Captured destination CIDRs; default `[0.0.0.0/0, '::/0']` |
-| `route_exclude_address` | Explicit destination exclusions, including DNS; default empty |
+| `route_exclude_address` | Explicit destination exclusions, including DNS except automatic DNS endpoints; default empty |
 | `bootstrap_dns` | Required literal real DNS socket addresses, never a loopback stub or TUN subnet |
 | `auto_dns` | Attempts to publish transient systemd-resolved settings on the owned link; default `true` |
 | `dns_hijack` | Intercepts TCP/UDP port 53; defaults `true` when managed, otherwise follows fake-IP policy |
@@ -160,7 +160,8 @@ Cleanup attempts to revert per-link settings on the owned interface, even if
 another manager changed them while shoes was running. Removing the owned TUN also
 discards its transient resolver settings. Other links are not changed.
 Automatically published virtual DNS endpoints remain reachable over TCP/UDP
-port 53 even when `route_address` or `route_exclude_address` omits their subnet.
+port 53 even when `route_address` omits their subnet or `route_exclude_address`
+covers it.
 The managed TUN subnet is reserved for ingress:
 forwarding a connection back to that subnet is rejected, except local DNS handling.
 

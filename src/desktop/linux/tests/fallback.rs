@@ -451,6 +451,12 @@ async fn virtual_dns() -> io::Result<()> {
                 vec!["10.0.0.0/8".parse().unwrap(), "fc00::/7".parse().unwrap()];
             let (config, spec) = validated_configuration(config)?;
             let selected_v6 = spec.routes.iter().any(ipnetwork::IpNetwork::is_ipv6);
+            if !selected_v6 {
+                run(
+                    "ip",
+                    &["-6", "rule", "add", "priority", "32768", "table", "main"],
+                )?;
+            }
             let mut session = Session::prepare(spec).await?;
             session.prepare_network().await?;
             let mut tasks = Vec::new();
@@ -508,6 +514,11 @@ async fn virtual_dns() -> io::Result<()> {
             }
             session.close().await?;
             if !selected_v6 {
+                assert!(run("ip", &["-6", "rule", "show"])?.contains("32768:"));
+                run(
+                    "ip",
+                    &["-6", "rule", "del", "priority", "32768", "table", "main"],
+                )?;
                 run("ip", &["-6", "route", "add", "default", "via", "fd00:1::2"])?;
             }
         }

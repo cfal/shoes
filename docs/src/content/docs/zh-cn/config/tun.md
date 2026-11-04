@@ -97,7 +97,7 @@ shoes 在 iOS 和 macOS 上创建的设备始终使用四字节数据包信息�
 | `auto_redirect` | 使用内核TCP REDIRECT；需要 `auto_route`；默认`false` |
 | `addresses` | 每个家庭一台本地CIDR；不能与手动 `address`、`netmask`、`destination` 或随附的 FD 结合使用 |
 | `route_address` | 捕获的目标 CIDR；默认`[0.0.0.0/0, '::/0']` |
-| `route_exclude_address` | 明确的目的地排除，包括DNS；默认为空 |
+| `route_exclude_address` | 明确的目的地排除，包括 DNS，但自动 DNS 端点除外；默认为空 |
 | `bootstrap_dns` | 必需的文字真实 DNS 套接字地址，绝不是环回存根或 TUN 子网 |
 | `auto_dns` | 尝试在拥有的链接上发布暂时的 systemd 解析的设置；默认`true` |
 | `dns_hijack` | 拦截TCP/UDP端口53；管理时默认为 `true`，否则遵循 fake-IP 策略 |

@@ -191,7 +191,9 @@ fn managed_firewall_omits_unavailable_redirect_families_not_capture() {
 
 #[test]
 fn managed_firewall_schema_preserves_masks_and_reply_exemption() {
-    let spec = spec(true);
+    let mut spec = spec(true);
+    spec.auto_dns = true;
+    spec.dns_hijack = true;
     let policy = nft::install(
         &spec,
         "shoes_test",
