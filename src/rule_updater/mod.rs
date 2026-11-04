@@ -16,6 +16,11 @@ use tokio::time::{Instant, timeout};
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(test)]
+tokio::task_local! {
+    static CACHE_SAVE_ENTERED: Arc<tokio::sync::Notify>;
+}
+
 #[derive(Clone, Copy)]
 struct Limits {
     connect: Duration,
@@ -115,6 +120,11 @@ async fn save_cache<C>(
     digest: blake3::Hash,
     lease: Option<Arc<CacheLease>>,
 ) {
+    #[cfg(test)]
+    if let Ok(entered) = CACHE_SAVE_ENTERED.try_with(Clone::clone) {
+        entered.notify_one();
+        std::future::pending::<()>().await;
+    }
     if let Err(error) = Install::save(&source.path, bytes, digest, lease).await {
         log::warn!(
             "Remote rule cache not saved for {}: {error}; validated rules remain available in memory",
@@ -183,11 +193,14 @@ async fn refresh_source(
         let mut candidate = memory.clone();
         candidate.insert(source.path.clone(), loaded.clone());
         validate_memory(configs.to_vec(), candidate).await?;
-        memory.insert(source.path.clone(), loaded.clone());
     }
     if crate::rule_set::cache_directory(configs)?.is_some() {
         // Identical downloads also retry persistence after a previous cache failure.
         save_cache(source, bytes, loaded.digest, lease).await;
+    }
+    // Publication and its reload notification must have no cancellation point between them.
+    if changed {
+        memory.insert(source.path.clone(), loaded);
     }
     Ok(changed)
 }
