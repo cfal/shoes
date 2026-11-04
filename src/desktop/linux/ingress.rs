@@ -2,6 +2,12 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
+use futures::TryStreamExt;
+use rtnetlink::Handle;
+use rtnetlink::packet_route::{
+    address::{AddressAttribute, AddressFlags, AddressHeaderFlags},
+    link::LinkFlags,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
@@ -18,9 +24,14 @@ pub(crate) struct Ingress {
 }
 
 impl Ingress {
-    pub(super) fn new(spec: &Spec, device: crate::tun::RetainedDevice) -> io::Result<Self> {
+    pub(super) async fn new(
+        spec: &Spec,
+        device: crate::tun::RetainedDevice,
+        handle: &Handle,
+    ) -> io::Result<Self> {
         let mut listeners = Vec::new();
         if spec.redirect {
+            let available = loopback_available(handle).await?;
             for ipv6 in super::routes::families(spec) {
                 let address = SocketAddr::new(
                     if ipv6 {
@@ -30,10 +41,10 @@ impl Ingress {
                     },
                     0,
                 );
-                let listener = if ipv6 && !ipv6_loopback_enabled()? {
+                let listener = if !available[usize::from(ipv6)] {
                     Err(io::Error::new(
                         io::ErrorKind::AddrNotAvailable,
-                        "IPv6 is disabled on loopback",
+                        "loopback address is not usable on an active loopback interface",
                     ))
                 } else {
                     crate::socket_util::new_tcp_listener(address, 1024, None)
@@ -72,11 +83,18 @@ impl Ingress {
         Ok(ports)
     }
 
-    pub(super) fn check_redirects(&self) -> io::Result<()> {
-        if self.ports()?[1].is_some() && !ipv6_loopback_enabled()? {
-            return Err(io::Error::other(
-                "IPv6 loopback was disabled while TCP REDIRECT was configured; restart managed capture to use the TUN engine",
-            ));
+    pub(super) async fn check_redirects(&self, handle: &Handle) -> io::Result<()> {
+        if self.listeners.is_empty() {
+            return Ok(());
+        }
+        let available = loopback_available(handle).await?;
+        for (family, port) in self.ports()?.into_iter().enumerate() {
+            if port.is_some() && !available[family] {
+                return Err(io::Error::other(format!(
+                    "IPv{} loopback is unavailable while TCP REDIRECT is configured; restart managed capture to use the TUN engine",
+                    if family == 0 { 4 } else { 6 },
+                )));
+            }
         }
         Ok(())
     }
@@ -133,16 +151,47 @@ impl Ingress {
     }
 }
 
-fn ipv6_loopback_enabled() -> io::Result<bool> {
-    // Nonlocal binding can succeed even when loopback cannot deliver IPv6 packets.
-    std::fs::read_to_string("/proc/sys/net/ipv6/conf/lo/disable_ipv6")
-        .map(|value| value.trim() == "0")
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to read IPv6 loopback state: {error}"),
-            )
-        })
+async fn loopback_available(handle: &Handle) -> io::Result<[bool; 2]> {
+    // Nonlocal binding can succeed without an address or a local delivery route.
+    let Some(link) = super::routes::link(handle, "lo").await? else {
+        return Ok([false; 2]);
+    };
+    if !link
+        .header
+        .flags
+        .contains(LinkFlags::Up | LinkFlags::Loopback)
+    {
+        return Ok([false; 2]);
+    }
+    let addresses = super::routes::request(
+        handle
+            .address()
+            .get()
+            .set_link_index_filter(link.header.index)
+            .execute()
+            .try_collect::<Vec<_>>(),
+    )
+    .await?;
+    let mut available = [false; 2];
+    for address in addresses {
+        if address.header.flags.intersects(AddressHeaderFlags::Tentative | AddressHeaderFlags::Dadfailed)
+            || address.attributes.iter().any(|attribute| {
+                matches!(attribute, AddressAttribute::Flags(flags) if flags.intersects(AddressFlags::Tentative | AddressFlags::Dadfailed))
+            })
+        {
+            continue;
+        }
+        for attribute in address.attributes {
+            if let AddressAttribute::Address(ip) | AddressAttribute::Local(ip) = attribute {
+                match ip {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST) => available[0] = true,
+                    IpAddr::V6(Ipv6Addr::LOCALHOST) => available[1] = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(available)
 }
 
 async fn serve(

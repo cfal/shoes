@@ -177,9 +177,10 @@ TCP REDIRECT requires usable loopback for each accelerated family. If a loopback
 address is unavailable at startup, or IPv6 is disabled on loopback, shoes warns
 and uses the TUN TCP engine for that family instead. Traffic remains captured;
 other families can still use REDIRECT. This choice is retained across reloads;
-restart shoes after restoring loopback to enable acceleration. Disabling IPv6
-loopback while IPv6 REDIRECT is active causes reconciliation to fail and the
-managed session to shut down.
+restart shoes after restoring loopback to enable acceleration. Losing loopback
+connectivity for an accelerated family, through address removal, IPv6 disablement,
+or taking the interface down, causes reconciliation to fail and the managed
+session to shut down.
 
 Loopback, local destinations, multicast, broadcast, link-local destinations,
 and connected networks remain native. DNS to connected networks is intercepted

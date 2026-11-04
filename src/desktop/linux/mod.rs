@@ -146,9 +146,9 @@ impl Session {
         .await?;
         self.record.ifindex = Some(index);
         self.journal.save(&self.record)?;
-        let ingress = self
-            .ingress
-            .insert(Arc::new(Ingress::new(&self.record.spec, device)?));
+        let ingress = self.ingress.insert(Arc::new(
+            Ingress::new(&self.record.spec, device, &self.handle).await?,
+        ));
         self.redirect_ports = ingress.ports()?;
         self.on_link = routes::on_link(&self.handle, index).await?;
         routes::configure(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
@@ -194,7 +194,11 @@ impl Session {
             &self.record.alias(),
         )
         .await?;
-        self.ingress.as_ref().unwrap().check_redirects()?;
+        self.ingress
+            .as_ref()
+            .unwrap()
+            .check_redirects(&self.handle)
+            .await?;
         self.record.firewall_pending = true;
         self.journal.save(&self.record)?;
         command::nft(self.journal.lease(), &self.nft, self.firewall_policy()).await?;
@@ -230,7 +234,11 @@ impl Session {
             crate::socket_policy::check_dns_endpoint(endpoint.ip())?;
         }
         routes::check(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
-        self.ingress.as_ref().unwrap().check_redirects()?;
+        self.ingress
+            .as_ref()
+            .unwrap()
+            .check_redirects(&self.handle)
+            .await?;
         check_firewall(self.journal.lease(), &self.nft, &self.record).await?;
         let networks = routes::on_link(&self.handle, index).await?;
         if networks != self.on_link {
