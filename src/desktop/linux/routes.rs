@@ -518,7 +518,7 @@ pub(super) async fn remove_rules(handle: &Handle, spec: &Spec) -> io::Result<()>
                 request(handle.rule().del(actual).execute()).await?;
             } else if references_reservation(&actual, spec) {
                 return Err(io::Error::other(
-                    "managed TUN rule was changed externally; refusing to remove it",
+                    "managed TUN policy rule is changed or conflicting; refusing to remove it",
                 ));
             }
         }
@@ -591,7 +591,7 @@ pub(super) async fn check(handle: &Handle, spec: &Spec, index: u32, alias: &str)
             })
         {
             return Err(io::Error::other(
-                "managed TUN policy rule disappeared or changed",
+                "managed TUN policy rules are missing, changed, or conflicting",
             ));
         }
         let routes = dump(handle, ipv6).await?;

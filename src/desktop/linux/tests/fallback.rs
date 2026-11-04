@@ -175,6 +175,33 @@ async fn ownership() -> io::Result<()> {
             &[family, "rule", "del", "priority", "32768", "table", "main"],
         )?;
 
+        let mut session = Session::prepare(spec(false)).await?;
+        session.prepare_network().await?;
+        session.activate().await?;
+        run(
+            "ip",
+            &[family, "rule", "add", "priority", "32768", "table", "main"],
+        )?;
+        let error = session.reconcile().await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "managed TUN policy rules are missing, changed, or conflicting"
+        );
+        let error = session.close().await.unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "managed TUN policy rule is changed or conflicting; refusing to remove it"
+            ),
+            "{error}"
+        );
+        assert!(session.journal.load()?.is_some());
+        run(
+            "ip",
+            &[family, "rule", "del", "priority", "32768", "table", "main"],
+        )?;
+        session.close().await?;
+        drop(session);
+
         for change in ["missing", "additional", "changed"] {
             let mut session = Session::prepare(spec(false)).await?;
             session.prepare_network().await?;

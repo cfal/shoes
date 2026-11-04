@@ -3086,7 +3086,7 @@ async fn route_ownership_failures() -> io::Result<()> {
             )?;
             let expected_errors = concat!(
                 "managed TUN routing table was changed externally; refusing to forget it; ",
-                "managed TUN rule was changed externally; refusing to remove it",
+                "managed TUN policy rule is changed or conflicting; refusing to remove it",
             );
             if !orphan {
                 let retained = session.ingress().unwrap();
