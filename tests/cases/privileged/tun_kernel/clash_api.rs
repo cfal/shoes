@@ -145,7 +145,7 @@ async fn whole_path_selector_pins_kernel_tcp_and_udp_flows() {
                         && flow["metadata"]["sourcePort"] == source
                         && flow["metadata"]["destinationPort"] == destination
                 }).unwrap();
-                assert_eq!(flow["chains"], json!(["exit", "outbound", "prefix", "outbound"]));
+                assert_eq!(flow["chains"], json!(["exit", "prefix", "outbound"]));
             }
         }
     }).await.unwrap();

@@ -46,9 +46,13 @@ impl MemberOrigin {
             .collect()
     }
 
-    pub fn chains(&self) -> impl Iterator<Item = String> + '_ {
-        std::iter::once(self.name.to_string())
-            .chain(self.path.iter().rev().map(|(group, _)| group.clone()))
+    pub fn chains(&self, shared_groups: usize) -> impl Iterator<Item = String> + '_ {
+        std::iter::once(self.name.to_string()).chain(
+            self.path[shared_groups..]
+                .iter()
+                .rev()
+                .map(|(group, _)| group.clone()),
+        )
     }
 }
 

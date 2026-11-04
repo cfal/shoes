@@ -95,6 +95,7 @@ struct SelectedPath {
     initial: Arc<InitialHopEntry>,
     subsequent: Vec<Arc<dyn ProxyConnector>>,
     origins: Vec<Option<MemberOrigin>>,
+    shared_groups: Vec<usize>,
 }
 
 impl std::fmt::Debug for ClientProxyChain {
@@ -168,6 +169,7 @@ impl ClientProxyChain {
             plan: ChainPlan::Fixed(SelectedPath {
                 initial: Arc::new(initial),
                 subsequent: subsequent.into_iter().map(Arc::from).collect(),
+                shared_groups: vec![0; origins.len()],
                 origins,
             }),
         }
@@ -392,9 +394,10 @@ impl SelectedPath {
     fn route_names(&self) -> Vec<String> {
         self.origins
             .iter()
+            .zip(&self.shared_groups)
             .rev()
+            .filter_map(|(origin, shared)| Some(origin.as_ref()?.chains(*shared)))
             .flatten()
-            .flat_map(MemberOrigin::chains)
             .collect()
     }
 
