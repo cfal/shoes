@@ -173,6 +173,14 @@ addresses, even if the interface inherits `net.ipv6.conf.default.disable_ipv6=1`
 It does not change `all`, `default`, loopback, or physical-interface IPv6 settings.
 IPv4-only configurations leave the TUN's inherited IPv6 setting unchanged.
 
+TCP REDIRECT requires usable loopback for each accelerated family. If a loopback
+address is unavailable at startup, or IPv6 is disabled on loopback, shoes warns
+and uses the TUN TCP engine for that family instead. Traffic remains captured;
+other families can still use REDIRECT. This choice is retained across reloads;
+restart shoes after restoring loopback to enable acceleration. Disabling IPv6
+loopback while IPv6 REDIRECT is active causes reconciliation to fail and the
+managed session to shut down.
+
 Loopback, local destinations, multicast, broadcast, link-local destinations,
 and connected networks remain native. DNS to connected networks is intercepted
 unless explicitly excluded. Replies to inbound services remain native. Existing

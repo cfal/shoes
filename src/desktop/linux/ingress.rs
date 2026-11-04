@@ -30,9 +30,31 @@ impl Ingress {
                     },
                     0,
                 );
-                listeners.push(Arc::new(crate::socket_util::new_tcp_listener(
-                    address, 1024, None,
-                )?));
+                let listener = if ipv6 && !ipv6_loopback_enabled()? {
+                    Err(io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "IPv6 is disabled on loopback",
+                    ))
+                } else {
+                    crate::socket_util::new_tcp_listener(address, 1024, None)
+                };
+                match listener {
+                    Ok(listener) => listeners.push(Arc::new(listener)),
+                    Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => {
+                        log::warn!(
+                            "Managed TCP REDIRECT on {address} unavailable: {error}; IPv{} TCP remains captured through the TUN engine",
+                            if ipv6 { 6 } else { 4 },
+                        );
+                    }
+                    Err(error) => {
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "failed to bind managed TCP REDIRECT listener on {address}: {error}"
+                            ),
+                        ));
+                    }
+                }
             }
         }
         Ok(Self {
@@ -48,6 +70,15 @@ impl Ingress {
             ports[usize::from(address.is_ipv6())] = Some(address.port());
         }
         Ok(ports)
+    }
+
+    pub(super) fn check_redirects(&self) -> io::Result<()> {
+        if self.ports()?[1].is_some() && !ipv6_loopback_enabled()? {
+            return Err(io::Error::other(
+                "IPv6 loopback was disabled while TCP REDIRECT was configured; restart managed capture to use the TUN engine",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn tcp_admission(config: &ResolvedTunConfig) -> Option<Arc<Semaphore>> {
@@ -100,6 +131,18 @@ impl Ingress {
             })
             .collect())
     }
+}
+
+fn ipv6_loopback_enabled() -> io::Result<bool> {
+    // Nonlocal binding can succeed even when loopback cannot deliver IPv6 packets.
+    std::fs::read_to_string("/proc/sys/net/ipv6/conf/lo/disable_ipv6")
+        .map(|value| value.trim() == "0")
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to read IPv6 loopback state: {error}"),
+            )
+        })
 }
 
 async fn serve(

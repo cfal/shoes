@@ -154,6 +154,44 @@ fn managed_configuration_accepts_at_most_one_address_per_family() {
 }
 
 #[test]
+fn managed_firewall_omits_unavailable_redirect_families_not_capture() {
+    for ports in [[Some(12345), None], [None, Some(12346)], [None, None]] {
+        let policy = nft::install(&spec(true), "shoes_test", "token", &[], ports);
+        let rules: Vec<_> = policy["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|command| command["add"].get("rule"))
+            .collect();
+        let redirected: Vec<_> = rules
+            .iter()
+            .filter(|rule| rule["chain"] == "redirect")
+            .collect();
+        assert_eq!(redirected.len(), ports.iter().flatten().count());
+        for (ipv6, port) in ports.into_iter().enumerate() {
+            let family = if ipv6 == 0 { "ip" } else { "ip6" };
+            assert_eq!(
+                redirected.iter().any(|rule| rule["expr"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|expr| expr["match"]["left"]["rt"]["family"] == family)),
+                port.is_some(),
+            );
+            assert!(rules.iter().any(|rule| {
+                rule["comment"] == "token:selected-address"
+                    && rule["expr"][0]["match"]["left"]["payload"]["protocol"] == family
+            }));
+        }
+        assert_eq!(
+            rules.iter().filter(|rule| rule["chain"] == "guard").count(),
+            2 * redirected.len(),
+        );
+        assert!(rules.iter().any(|rule| rule["comment"] == "token:mark"));
+    }
+}
+
+#[test]
 fn managed_firewall_schema_preserves_masks_and_reply_exemption() {
     let spec = spec(true);
     let policy = nft::install(
@@ -518,13 +556,30 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
         }
         let disabled = std::env::var("SHOES_MANAGED_IPV6_DEFAULT_DISABLED").unwrap();
         std::fs::write("/proc/sys/net/ipv6/conf/default/disable_ipv6", disabled)?;
+        let loopback_disabled = std::env::var("SHOES_MANAGED_IPV6_LOOPBACK_DISABLED").unwrap();
+        std::fs::write(
+            "/proc/sys/net/ipv6/conf/lo/disable_ipv6",
+            &loopback_disabled,
+        )?;
+        if loopback_disabled == "1" {
+            let addresses: serde_json::Value =
+                serde_json::from_str(&run("ip", &["-6", "-j", "addr", "show", "lo"])?)?;
+            assert!(
+                addresses
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|link| { link["addr_info"].as_array().unwrap().is_empty() })
+            );
+        }
         let ipv6_settings = host_ipv6_settings()?;
         return tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(async {
-                let mut daemons = resolved_fixture().await?;
                 owned_tun_ipv6_setting().await?;
+                redirect_loopback_changes().await?;
+                let mut daemons = resolved_fixture().await?;
                 let result =
                     tokio::time::timeout(Duration::from_secs(90), kernel_capture()).await?;
                 for child in &mut daemons {
@@ -535,7 +590,7 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
                 result
             });
     }
-    for disabled in ["0", "1"] {
+    for (disabled, loopback_disabled) in [("0", "0"), ("1", "0"), ("0", "1"), ("1", "1")] {
         let output = std::process::Command::new("sudo")
             .args([
                 "-n",
@@ -558,6 +613,9 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
             .arg(format!("{PARENT}={}", namespace.display()))
             .arg(format!("SHOES_MANAGED_IPV6_DEFAULT_DISABLED={disabled}"))
             .arg(format!(
+                "SHOES_MANAGED_IPV6_LOOPBACK_DISABLED={loopback_disabled}"
+            ))
+            .arg(format!(
                 "{MOUNT}={}",
                 std::fs::read_link("/proc/self/ns/mnt")?.display()
             ))
@@ -572,7 +630,7 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success() && stdout.contains("test result: ok. 1 passed;"),
-            "managed kernel test failed (default.disable_ipv6={disabled}): {}\n{stdout}\n{}",
+            "managed kernel test failed (default.disable_ipv6={disabled}, lo.disable_ipv6={loopback_disabled}): {}\n{stdout}\n{}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
@@ -604,6 +662,70 @@ async fn owned_tun_ipv6_setting() -> io::Result<()> {
         session.close().await?;
         assert!(!std::path::Path::new("/proc/sys/net/ipv6/conf/shoes0").exists());
     }
+    Ok(())
+}
+
+async fn redirect_loopback_changes() -> io::Result<()> {
+    const LOOPBACK: &str = "/proc/sys/net/ipv6/conf/lo/disable_ipv6";
+    const NONLOCAL: &str = "/proc/sys/net/ipv6/ip_nonlocal_bind";
+    let original = std::fs::read_to_string(LOOPBACK)?;
+    let nonlocal = std::fs::read_to_string(NONLOCAL)?;
+    for active in [false, true] {
+        std::fs::write(LOOPBACK, "0")?;
+        let mut session = Session::prepare(spec(true)).await?;
+        session.prepare_network().await?;
+        assert!(session.redirect_ports.iter().all(Option::is_some));
+        if active {
+            session.activate().await?;
+        }
+        std::fs::write(LOOPBACK, "1")?;
+        let error = if active {
+            session.reconcile().await.unwrap_err()
+        } else {
+            session.activate().await.unwrap_err()
+        };
+        assert!(
+            error.to_string().contains("IPv6 loopback was disabled"),
+            "{error}"
+        );
+        session.close().await?;
+        assert!(session.journal.load()?.is_none());
+        assert_no_owned_firewall()?;
+    }
+    std::fs::write(NONLOCAL, "1")?;
+    let listener = tokio::net::TcpListener::bind("[::1]:0").await?;
+    drop(listener);
+    let mut session = Session::prepare(spec(true)).await?;
+    session.prepare_network().await?;
+    let ports = session.redirect_ports;
+    assert!(ports[0].is_some() && ports[1].is_none());
+    std::fs::write(LOOPBACK, "0")?;
+    session.activate().await?;
+    session.reconcile().await?;
+    assert_eq!(
+        session.redirect_ports, ports,
+        "fallback remains fixed until restart"
+    );
+    session.close().await?;
+    drop(session);
+    std::fs::write(NONLOCAL, "0")?;
+
+    run("ip", &["-6", "addr", "del", "::1/128", "dev", "lo"])?;
+    let error = tokio::net::TcpListener::bind("[::1]:0").await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+    let mut session = Session::prepare(spec(true)).await?;
+    session.prepare_network().await?;
+    assert!(session.redirect_ports[0].is_some() && session.redirect_ports[1].is_none());
+    session.activate().await?;
+    session.reconcile().await?;
+    session.close().await?;
+    run(
+        "ip",
+        &["-6", "addr", "add", "::1/128", "dev", "lo", "nodad"],
+    )?;
+    std::fs::write(NONLOCAL, nonlocal)?;
+    std::fs::write(LOOPBACK, original)?;
+    assert_no_owned_firewall()?;
     Ok(())
 }
 
@@ -705,6 +827,13 @@ async fn kernel_capture() -> io::Result<()> {
         let (config, spec) = validated_configuration(serde_json::from_value(config)?)?;
         let mut session = Session::prepare(spec).await?;
         session.prepare_network().await?;
+        assert_eq!(session.redirect_ports[0].is_some(), redirect);
+        assert_eq!(
+            session.redirect_ports[1].is_some(),
+            redirect
+                && std::fs::read_to_string("/proc/sys/net/ipv6/conf/lo/disable_ipv6")?.trim()
+                    == "0",
+        );
         let ingress = session.ingress().unwrap();
         let resolver: Arc<dyn crate::resolver::Resolver> =
             Arc::new(crate::resolver::NativeResolver::new());
@@ -1427,10 +1556,14 @@ async fn managed_dns_egress(redirect: bool, ipv6: bool) -> io::Result<()> {
             .map(|(_, tcp)| *tcp)
             .collect();
         assert_eq!(seen, transports);
-        if redirect && tcp_client {
-            assert!(
-                redirect_counts(&session).await?[usize::from(ipv6)] > counts[usize::from(ipv6)]
-            );
+        if tcp_client {
+            let family = usize::from(ipv6);
+            let after = redirect_counts(&session).await?;
+            if session.redirect_ports[family].is_some() {
+                assert!(after[family] > counts[family]);
+            } else {
+                assert_eq!(after[family], 0, "DNS fallback must not traverse REDIRECT");
+            }
         }
     }
     session.deactivate().await?;
@@ -1832,23 +1965,41 @@ async fn redirect_dual_stack_limit(
         .is_err(),
         "TUN admitted TCP while REDIRECT held the only permit",
     );
-    let mut second = tokio::net::TcpStream::connect(("fd00:2::2", port)).await?;
-    let _ = second.write_all(b"two").await;
-    assert!(
-        !matches!(tokio::time::timeout(Duration::from_secs(2), second.read(&mut bytes)).await?, Ok(n) if n > 0),
-        "{}",
-        run(
-            "nft",
-            &["-j", "list", "table", "inet", &session.record.table()]
-        )?
-    );
+    if session.redirect_ports[1].is_some() {
+        let mut second = tokio::net::TcpStream::connect(("fd00:2::2", port)).await?;
+        let _ = second.write_all(b"two").await;
+        assert!(
+            !matches!(tokio::time::timeout(Duration::from_secs(2), second.read(&mut bytes)).await?, Ok(n) if n > 0),
+            "{}",
+            run(
+                "nft",
+                &["-j", "list", "table", "inet", &session.record.table()]
+            )?
+        );
+    } else {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::net::TcpStream::connect(("fd00:2::2", port)),
+            )
+            .await
+            .is_err(),
+            "IPv6 TUN admitted TCP while IPv4 REDIRECT held the only permit"
+        );
+    }
     first.write_all(b"one").await?;
     tokio::time::timeout(Duration::from_secs(3), first.read_exact(&mut bytes)).await??;
     let after = redirect_counts(session).await?;
-    assert!(
-        after[0] > before[0] && after[1] > before[1],
-        "both flows must traverse REDIRECT: {before:?} -> {after:?}"
-    );
+    for ipv6 in 0..2 {
+        if session.redirect_ports[ipv6].is_some() {
+            assert!(
+                after[ipv6] > before[ipv6],
+                "flow must traverse REDIRECT: {before:?} -> {after:?}"
+            );
+        } else {
+            assert_eq!(after[ipv6], 0, "fallback must not traverse REDIRECT");
+        }
+    }
     socket2::SockRef::from(&first).set_linger(Some(Duration::ZERO))?;
     drop(first);
     drop(
