@@ -719,8 +719,11 @@ async fn owned_tun_ipv6_setting() -> io::Result<()> {
 async fn redirect_loopback_changes() -> io::Result<()> {
     const LOOPBACK: &str = "/proc/sys/net/ipv6/conf/lo/disable_ipv6";
     const NONLOCAL: &str = "/proc/sys/net/ipv6/ip_nonlocal_bind";
+    const NONLOCAL4: &str = "/proc/sys/net/ipv4/ip_nonlocal_bind";
     let original = std::fs::read_to_string(LOOPBACK)?;
     let nonlocal = std::fs::read_to_string(NONLOCAL)?;
+    let nonlocal4 = std::fs::read_to_string(NONLOCAL4)?;
+    std::fs::write(NONLOCAL4, "1")?;
     for (change, active) in [
         ("disable", false),
         ("disable", true),
@@ -728,6 +731,8 @@ async fn redirect_loopback_changes() -> io::Result<()> {
         ("remove", true),
         ("down", false),
         ("down", true),
+        ("remove4", false),
+        ("remove4", true),
     ] {
         run("ip", &["link", "set", "lo", "up"])?;
         std::fs::write(LOOPBACK, "0")?;
@@ -749,6 +754,10 @@ async fn redirect_loopback_changes() -> io::Result<()> {
             "down" => {
                 run("ip", &["link", "set", "lo", "down"])?;
             }
+            "remove4" => {
+                run("ip", &["addr", "del", "127.0.0.1/8", "dev", "lo"])?;
+                drop(tokio::net::TcpListener::bind("127.0.0.1:0").await?);
+            }
             _ => unreachable!(),
         }
         let error = if active {
@@ -760,9 +769,24 @@ async fn redirect_loopback_changes() -> io::Result<()> {
             error.to_string().contains("loopback is unavailable"),
             "{error}"
         );
+        if change == "remove4" {
+            assert!(error.to_string().starts_with("IPv4 loopback"), "{error}");
+        }
         session.close().await?;
         assert!(session.journal.load()?.is_none());
         assert_no_owned_firewall()?;
+        if change == "remove4" {
+            drop(session);
+            let mut fallback = Session::prepare(spec(true)).await?;
+            fallback.prepare_network().await?;
+            assert!(fallback.redirect_ports[0].is_none() && fallback.redirect_ports[1].is_some());
+            fallback.activate().await?;
+            fallback.reconcile().await?;
+            let counters = redirect_counts(&fallback).await?;
+            assert!(counters[0].is_none() && counters[1].is_some());
+            fallback.close().await?;
+            run("ip", &["addr", "add", "127.0.0.1/8", "dev", "lo"])?;
+        }
     }
     run("ip", &["link", "set", "lo", "up"])?;
     std::fs::write(LOOPBACK, "1")?;
@@ -798,6 +822,8 @@ async fn redirect_loopback_changes() -> io::Result<()> {
         &["-6", "addr", "add", "::1/128", "dev", "lo", "nodad"],
     )?;
     std::fs::write(NONLOCAL, nonlocal)?;
+    assert_eq!(std::fs::read_to_string(NONLOCAL4)?.trim(), "1");
+    std::fs::write(NONLOCAL4, nonlocal4)?;
     std::fs::write(LOOPBACK, original)?;
     assert_no_owned_firewall()?;
     Ok(())
