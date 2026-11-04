@@ -174,11 +174,19 @@ async fn loopback_available(handle: &Handle) -> io::Result<[bool; 2]> {
     .await?;
     let mut available = [false; 2];
     for address in addresses {
-        if address.header.flags.intersects(AddressHeaderFlags::Tentative | AddressHeaderFlags::Dadfailed)
-            || address.attributes.iter().any(|attribute| {
-                matches!(attribute, AddressAttribute::Flags(flags) if flags.intersects(AddressFlags::Tentative | AddressFlags::Dadfailed))
-            })
+        if address
+            .header
+            .flags
+            .intersects(AddressHeaderFlags::Tentative | AddressHeaderFlags::Dadfailed)
         {
+            continue;
+        }
+        if address.attributes.iter().any(|attribute| match attribute {
+            AddressAttribute::Flags(flags) => {
+                flags.intersects(AddressFlags::Tentative | AddressFlags::Dadfailed)
+            }
+            _ => false,
+        }) {
             continue;
         }
         for attribute in address.attributes {

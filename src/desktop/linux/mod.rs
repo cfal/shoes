@@ -146,9 +146,8 @@ impl Session {
         .await?;
         self.record.ifindex = Some(index);
         self.journal.save(&self.record)?;
-        let ingress = self.ingress.insert(Arc::new(
-            Ingress::new(&self.record.spec, device, &self.handle).await?,
-        ));
+        let ingress = Ingress::new(&self.record.spec, device, &self.handle).await?;
+        let ingress = self.ingress.insert(Arc::new(ingress));
         self.redirect_ports = ingress.ports()?;
         self.on_link = routes::on_link(&self.handle, index).await?;
         routes::configure(&self.handle, &self.record.spec, index, &self.record.alias()).await?;

@@ -168,16 +168,12 @@ fn managed_firewall_omits_unavailable_redirect_families_not_capture() {
             .filter(|rule| rule["chain"] == "redirect")
             .collect();
         assert_eq!(redirected.len(), ports.iter().flatten().count());
-        for (ipv6, port) in ports.into_iter().enumerate() {
-            let family = if ipv6 == 0 { "ip" } else { "ip6" };
-            assert_eq!(
-                redirected.iter().any(|rule| rule["expr"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|expr| expr["match"]["left"]["rt"]["family"] == family)),
-                port.is_some(),
-            );
+        for (family, port) in ["ip", "ip6"].into_iter().zip(ports) {
+            let has_redirect = redirected
+                .iter()
+                .flat_map(|rule| rule["expr"].as_array().unwrap())
+                .any(|expr| expr["match"]["left"]["rt"]["family"] == family);
+            assert_eq!(has_redirect, port.is_some());
             assert!(rules.iter().any(|rule| {
                 rule["comment"] == "token:selected-address"
                     && rule["expr"][0]["match"]["left"]["payload"]["protocol"] == family
@@ -569,7 +565,7 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .all(|link| { link["addr_info"].as_array().unwrap().is_empty() })
+                    .all(|link| link["addr_info"].as_array().unwrap().is_empty())
             );
         }
         let ipv6_settings = host_ipv6_settings()?;
@@ -791,8 +787,7 @@ async fn redirect_loopback_changes() -> io::Result<()> {
     run("ip", &["link", "set", "lo", "up"])?;
     std::fs::write(LOOPBACK, "1")?;
     std::fs::write(NONLOCAL, "1")?;
-    let listener = tokio::net::TcpListener::bind("[::1]:0").await?;
-    drop(listener);
+    drop(tokio::net::TcpListener::bind("[::1]:0").await?);
     let mut session = Session::prepare(spec(true)).await?;
     session.prepare_network().await?;
     let ports = session.redirect_ports;
@@ -2094,14 +2089,14 @@ async fn redirect_dual_stack_limit(
     first.write_all(b"one").await?;
     tokio::time::timeout(Duration::from_secs(3), first.read_exact(&mut bytes)).await??;
     let after = redirect_counts(session).await?;
-    for ipv6 in 0..2 {
-        if session.redirect_ports[ipv6].is_some() {
+    for family in 0..2 {
+        if session.redirect_ports[family].is_some() {
             assert!(
-                after[ipv6].unwrap() > before[ipv6].unwrap(),
+                after[family].unwrap() > before[family].unwrap(),
                 "flow must traverse REDIRECT: {before:?} -> {after:?}"
             );
         } else {
-            assert_eq!(after[ipv6], None, "fallback must have no REDIRECT rule");
+            assert_eq!(after[family], None, "fallback must have no REDIRECT rule");
         }
     }
     socket2::SockRef::from(&first).set_linger(Some(Duration::ZERO))?;

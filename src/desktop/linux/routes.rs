@@ -425,13 +425,7 @@ pub(super) async fn configure(
 ) -> io::Result<()> {
     if spec.addresses.iter().any(IpNetwork::is_ipv6) {
         let path = format!("/proc/sys/net/ipv6/conf/{}/disable_ipv6", spec.name);
-        let enable = || -> io::Result<()> {
-            if std::fs::read_to_string(&path)?.trim() != "0" {
-                std::fs::write(&path, "0")?;
-            }
-            Ok(())
-        };
-        enable().map_err(|error| {
+        let context = |error: io::Error| {
             io::Error::new(
                 error.kind(),
                 format!(
@@ -439,7 +433,10 @@ pub(super) async fn configure(
                     spec.name
                 ),
             )
-        })?;
+        };
+        if std::fs::read_to_string(&path).map_err(context)?.trim() != "0" {
+            std::fs::write(&path, "0").map_err(context)?;
+        }
     }
     request(
         handle
