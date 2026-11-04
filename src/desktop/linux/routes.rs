@@ -138,6 +138,18 @@ pub(super) fn fallback_rule(spec: &Spec, ipv6: bool) -> RuleMessage {
     message
 }
 
+fn has_fallback(spec: &Spec, ipv6: bool) -> bool {
+    spec.routes.iter().any(|route| route.is_ipv6() == ipv6)
+}
+
+fn configured_rules(spec: &Spec, ipv6: bool) -> Vec<RuleMessage> {
+    let mut rules = vec![rule(spec, ipv6)];
+    if has_fallback(spec, ipv6) {
+        rules.push(fallback_rule(spec, ipv6));
+    }
+    rules
+}
+
 pub(super) fn same_rule(actual: &RuleMessage, expected: &RuleMessage) -> bool {
     let mut actual = actual.clone();
     let mut expected = expected.clone();
@@ -174,9 +186,10 @@ pub(super) async fn preflight(handle: &Handle, spec: &Spec) -> io::Result<()> {
         for rule in rules(handle, ipv6).await? {
             if configured {
                 check_precedence(&rule, spec)?;
-                if rule
-                    .attributes
-                    .contains(&RuleAttribute::Priority(FALLBACK_PRIORITY))
+                if has_fallback(spec, ipv6)
+                    && rule
+                        .attributes
+                        .contains(&RuleAttribute::Priority(FALLBACK_PRIORITY))
                 {
                     return Err(invalid(
                         "managed TUN fallback priority 32768 is already in use; stop the conflicting routing manager",
@@ -247,9 +260,10 @@ pub(super) fn check_mark_reservation(rule: &RuleMessage, spec: &Spec) -> io::Res
 fn references_reservation(rule: &RuleMessage, spec: &Spec) -> bool {
     rule.attributes
         .contains(&RuleAttribute::Priority(spec.linux.rule_priority))
-        || rule
-            .attributes
-            .contains(&RuleAttribute::Priority(FALLBACK_PRIORITY))
+        || (has_fallback(spec, rule.header.family == AddressFamily::Inet6)
+            && rule
+                .attributes
+                .contains(&RuleAttribute::Priority(FALLBACK_PRIORITY)))
         || rule
             .attributes
             .contains(&RuleAttribute::Table(spec.linux.table))
@@ -484,7 +498,7 @@ pub(super) async fn configure(
                 .execute(),
         )
         .await?;
-        for rule in [rule(spec, ipv6), fallback_rule(spec, ipv6)] {
+        for rule in configured_rules(spec, ipv6) {
             let mut add = handle.rule().add();
             *add.message_mut() = rule;
             request(add.execute()).await?;
@@ -544,7 +558,7 @@ pub(super) async fn check(handle: &Handle, spec: &Spec, index: u32, alias: &str)
     for ipv6 in [false, true] {
         let configured = families(spec).any(|family| family == ipv6);
         let rules = rules(handle, ipv6).await?;
-        let expected = [rule(spec, ipv6), fallback_rule(spec, ipv6)];
+        let expected = configured_rules(spec, ipv6);
         for actual in &rules {
             if configured {
                 check_precedence(actual, spec)?;

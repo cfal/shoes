@@ -185,6 +185,23 @@ pub(super) fn install(
             json!({"return": null}),
         ],
     );
+    if spec.auto_dns {
+        // Published resolver endpoints remain reachable with split routes and exclusions.
+        for address in spec.dns_addresses().expect("validated automatic DNS peers") {
+            let family = if address.is_ipv6() { "ip6" } else { "ip" };
+            for protocol in ["tcp", "udp"] {
+                rule(
+                    "output",
+                    "virtual-dns",
+                    vec![
+                        matches(payload(family, "daddr"), "==", json!(address)),
+                        matches(payload(protocol, "dport"), "==", json!(53)),
+                        json!({"goto": {"target": "capture"}}),
+                    ],
+                );
+            }
+        }
+    }
     for (family, reserved) in [
         (
             "ip",
@@ -290,6 +307,7 @@ pub(super) fn install(
         "capture",
         "not-tcp-establishment",
         vec![
+            matches(masked(ct("mark"), mask), "!=", json!(capture)),
             matches(
                 json!({"&": [payload("tcp", "flags"), ["syn", "ack"]]}),
                 "!=",

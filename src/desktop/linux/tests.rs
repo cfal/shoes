@@ -1722,6 +1722,10 @@ async fn resolved_integration(udp_limit: usize, redirect: bool) -> io::Result<()
     let mut config = configuration(redirect);
     config.dns_hijack = Some(true);
     config.auto_dns = Some(true);
+    if udp_limit == 1 {
+        config.route_address = vec!["198.51.100.0/24".parse().unwrap()];
+    }
+    config.route_exclude_address = vec!["10.0.0.0/8".parse().unwrap(), "fc00::/7".parse().unwrap()];
     config.resource_limits.max_udp_destinations = Some(udp_limit);
     config.resource_limits.max_tcp_connections = Some(1);
     let (config, spec) = validated_configuration(config)?;

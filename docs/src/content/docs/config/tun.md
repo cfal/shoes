@@ -159,11 +159,14 @@ upstream encryption and DNS policy belong in shoes' `dns` configuration.
 Cleanup attempts to revert per-link settings on the owned interface, even if
 another manager changed them while shoes was running. Removing the owned TUN also
 discards its transient resolver settings. Other links are not changed.
+Automatically published virtual DNS endpoints remain reachable over TCP/UDP
+port 53 even when `route_address` or `route_exclude_address` omits their subnet.
 The managed TUN subnet is reserved for ingress:
 forwarding a connection back to that subnet is rejected, except local DNS handling.
 
 Native default routes are not required for startup or capture. A late policy
-rule at priority `32768` sends locally originated, unmarked traffic without an
+rule at priority `32768`, only for families selected by `route_address`, sends
+locally originated, unmarked traffic without an
 earlier native route through the TUN for classification. IPv4-only or IPv6-only
 underlays can therefore carry both destination families through a suitable
 proxy. Protected Shoes outbounds never use this fallback: DIRECT connections

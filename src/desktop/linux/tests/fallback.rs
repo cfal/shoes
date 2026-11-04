@@ -59,6 +59,7 @@ impl Flow {
 pub(super) async fn proxy_delivery() -> io::Result<()> {
     ownership().await?;
     noncapture().await?;
+    virtual_dns().await?;
     let mut echoes = Vec::new();
     let mut targets = Vec::new();
     for address in TARGETS {
@@ -359,6 +360,8 @@ async fn noncapture() -> io::Result<()> {
         for (address, port, mark) in [
             (addresses[1], 30002, 0),
             (addresses[2], 30002, 0),
+            (addresses[1], 30002, capture),
+            (addresses[2], 30002, capture),
             (addresses[0], 30003, 0),
             (addresses[0], 30003, capture),
             (addresses[0], 30002, capture | 7),
@@ -417,7 +420,7 @@ async fn noncapture() -> io::Result<()> {
         .as_u64()
         .unwrap();
     assert!(
-        dropped >= 12,
+        dropped >= 16,
         "noncapture cases did not reach the egress guard: {dropped}"
     );
     assert_eq!(redirect_counts(&session).await?, before);
@@ -426,6 +429,88 @@ async fn noncapture() -> io::Result<()> {
     run("nft", &["delete", "table", "inet", "fallback_probe"])?;
     for (family, gateway) in NATIVE {
         run("ip", &[family, "route", "add", "default", "via", gateway])?;
+    }
+    Ok(())
+}
+
+async fn virtual_dns() -> io::Result<()> {
+    for redirect in [false, true] {
+        for routes in [
+            vec!["198.51.100.0/24"],
+            vec!["198.51.100.0/24", "fd00:2::/64"],
+            vec!["0.0.0.0/0", "::/0"],
+        ] {
+            let mut config = configuration(redirect);
+            config.auto_dns = Some(true);
+            config.dns_hijack = Some(true);
+            config.route_address = routes
+                .into_iter()
+                .map(|route| route.parse().unwrap())
+                .collect();
+            config.route_exclude_address =
+                vec!["10.0.0.0/8".parse().unwrap(), "fc00::/7".parse().unwrap()];
+            let (config, spec) = validated_configuration(config)?;
+            let selected_v6 = spec.routes.iter().any(ipnetwork::IpNetwork::is_ipv6);
+            let mut session = Session::prepare(spec).await?;
+            session.prepare_network().await?;
+            let mut tasks = Vec::new();
+            session
+                .ingress()
+                .unwrap()
+                .start(
+                    &config,
+                    Arc::new(crate::resolver::NativeResolver::new()),
+                    None,
+                    &mut tasks,
+                )
+                .await?;
+            session.activate().await?;
+            assert_eq!(
+                routes::rules(&session.handle, true)
+                    .await?
+                    .iter()
+                    .any(|rule| routes::same_rule(
+                        rule,
+                        &routes::fallback_rule(&session.record.spec, true)
+                    )),
+                selected_v6
+            );
+            if !selected_v6 {
+                run("ip", &["-6", "route", "del", "default"])?;
+                let socket = UdpSocket::bind("[::]:0").await?;
+                assert_eq!(
+                    socket
+                        .send_to(b"not-selected", "[fd00:3::2]:9")
+                        .await
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::ENETUNREACH)
+                );
+            }
+            dns_ready(&session.record).await?;
+            for address in session.record.spec.dns_addresses()? {
+                let socket = UdpSocket::bind(if address.is_ipv6() {
+                    "[::]:0"
+                } else {
+                    "0.0.0.0:0"
+                })
+                .await?;
+                assert!(socket.send_to(b"not-dns", (address, 54)).await.is_err());
+                socket2::SockRef::from(&socket).set_mark(session.record.spec.linux.bypass_mark)?;
+                assert!(socket.send_to(b"protected", (address, 53)).await.is_err());
+            }
+            session.reconcile().await?;
+            session.deactivate().await?;
+            quiescent_capture_rejected(&session).await?;
+            for task in tasks {
+                task.abort();
+                let _ = task.await;
+            }
+            session.close().await?;
+            if !selected_v6 {
+                run("ip", &["-6", "route", "add", "default", "via", "fd00:1::2"])?;
+            }
+        }
     }
     Ok(())
 }
