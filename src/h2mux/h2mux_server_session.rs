@@ -145,7 +145,7 @@ impl H2MuxServerSession {
 
         // Spawn acceptor task with idle timeout monitoring
         let is_closed_clone = Arc::clone(&is_closed);
-        let driver = tokio::spawn(async move {
+        let driver = crate::network_tasks::spawn(async move {
             Self::accept_loop(connection, inbound_tx, is_closed_clone, activity).await;
         });
 
@@ -188,7 +188,7 @@ impl H2MuxServerSession {
                         Some(Ok((request, respond))) => {
                             let inbound_tx = inbound_tx.clone();
                             let slots = slots.clone();
-                            tasks.spawn(async move {
+                            crate::network_tasks::spawn_in(&mut tasks, async move {
                                 if let Err(e) = Self::handle_stream(request, respond, inbound_tx, slots).await {
                                     debug!("H2MuxServerSession: stream error: {}", e);
                                 }
@@ -227,7 +227,7 @@ impl H2MuxServerSession {
                                     Ok((request, respond)) => {
                                         let inbound_tx = inbound_tx.clone();
                                         let slots = slots.clone();
-                                        tasks.spawn(async move {
+                                        crate::network_tasks::spawn_in(&mut tasks, async move {
                                             if let Err(e) = Self::handle_stream(request, respond, inbound_tx, slots).await {
                                                 debug!("H2MuxServerSession: stream error during drain: {}", e);
                                             }
@@ -367,7 +367,7 @@ where
         };
         let Some(inbound) = inbound else { break };
         let fut = handler(inbound);
-        tasks.spawn(async move {
+        crate::network_tasks::spawn_in(&mut tasks, async move {
             if let Err(e) = fut.await {
                 debug!("H2MUX stream handler error: {}", e);
             }
@@ -415,7 +415,7 @@ where
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
 
-        tasks.spawn(async move {
+        crate::network_tasks::spawn_in(&mut tasks, async move {
             if let Err(e) =
                 handle_h2mux_stream(inbound, udp_enabled, proxy_selector, resolver).await
             {

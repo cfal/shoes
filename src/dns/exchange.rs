@@ -323,7 +323,7 @@ fn connection_setup(
     deadline: tokio::time::Instant,
 ) -> Connection {
     // A losing query must not cancel a shared handshake. Dropping its cache owner still does.
-    let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+    let task = tokio_util::task::AbortOnDropHandle::new(crate::network_tasks::spawn(async move {
         tokio::time::timeout_at(deadline, future)
             .await
             .map_err(|_| {

@@ -20,6 +20,7 @@ pub mod fake_ip;
 mod guard;
 mod hickory_resolver;
 mod message;
+mod network;
 mod parsed;
 mod proxy_runtime;
 mod stream;

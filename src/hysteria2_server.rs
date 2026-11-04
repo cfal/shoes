@@ -272,7 +272,7 @@ impl UdpSession {
 
         let send_socket = client_socket.clone();
         let cancel_token = session_cancel_token.clone();
-        let task = tokio::spawn(async move {
+        let task = crate::network_tasks::spawn(async move {
             if let Err(e) = run_udp_remote_to_local_loop(
                 session_id,
                 connection,
@@ -541,7 +541,7 @@ async fn run_tcp_loop(
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         let peer = connection.remote_address();
-        tasks.spawn(async move {
+        crate::network_tasks::spawn_in(&mut tasks, async move {
             let _permit = permit;
             if let Err(e) = process_tcp_stream(
                 client_proxy_selector,
@@ -865,7 +865,7 @@ pub async fn start_hysteria2_server(
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let hysteria2_password = hysteria2_password.clone();
-        let join_handle = tokio::spawn(async move {
+        let join_handle = crate::network_tasks::spawn(async move {
             let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
             loop {
                 let conn = tokio::select! {

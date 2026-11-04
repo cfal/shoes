@@ -46,7 +46,7 @@ impl CommandWriter {
         // Dropping a partial command sends FIN, which peers treat as a fatal
         // protocol error. Once admitted, finish independently of caller cancellation.
         // The permit bounds detached writers; connection closure releases them.
-        tokio::spawn(async move {
+        crate::network_tasks::spawn(async move {
             let _permit = permit;
             stream.write_all(&bytes).await?;
             stream.finish()?;

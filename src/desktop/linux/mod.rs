@@ -7,6 +7,7 @@ mod routes;
 pub(crate) mod spec;
 #[cfg(test)]
 mod tests;
+mod underlay;
 
 use std::io;
 use std::os::fd::BorrowedFd;
@@ -37,7 +38,9 @@ pub(crate) struct Session {
     _connection: AbortOnDropHandle<()>,
     _events: AbortOnDropHandle<()>,
     changes: tokio::sync::mpsc::Receiver<()>,
+    underlay: Arc<underlay::Monitor>,
     reconcile_after: tokio::time::Instant,
+    poll_at: tokio::time::Instant,
 }
 
 impl Session {
@@ -56,8 +59,15 @@ impl Session {
         .map_err(io::Error::other)?;
         let connection = AbortOnDropHandle::new(tokio::spawn(connection));
         let (changed, changes) = tokio::sync::mpsc::channel(1);
+        let underlay = Arc::new(underlay::Monitor::default());
+        let monitor = underlay.clone();
         let events = AbortOnDropHandle::new(tokio::spawn(async move {
-            while events.next().await.is_some() {
+            while let Some((message, _)) = events.next().await {
+                if let rtnetlink::packet_core::NetlinkPayload::InnerMessage(message) =
+                    message.payload
+                {
+                    monitor.event(&message);
+                }
                 let _ = changed.try_send(());
             }
         }));
@@ -119,7 +129,9 @@ impl Session {
             _connection: connection,
             _events: events,
             changes,
+            underlay,
             reconcile_after: tokio::time::Instant::now(),
+            poll_at: tokio::time::Instant::now() + Duration::from_secs(10),
         })
     }
 
@@ -170,6 +182,10 @@ impl Session {
         self.ingress.clone()
     }
 
+    pub(crate) fn spec(&self) -> &Spec {
+        &self.record.spec
+    }
+
     fn firewall_policy(&self, active: bool) -> serde_json::Value {
         nft::install(
             &self.record.spec,
@@ -179,15 +195,6 @@ impl Session {
             self.redirect_ports,
             active,
         )
-    }
-
-    pub(crate) fn validate(&self, configs: &[crate::config::ResolvedConfig]) -> io::Result<()> {
-        if Spec::from_resolved_configs(configs)?.as_ref() != Some(&self.record.spec) {
-            return Err(spec::invalid(
-                "managed TUN topology changes require a restart",
-            ));
-        }
-        Ok(())
     }
 
     pub(crate) async fn activate(&mut self) -> io::Result<()> {
@@ -221,20 +228,39 @@ impl Session {
             }
         }
         self.active = true;
+        self.underlay.initialize(
+            underlay::snapshot(
+                &self.handle,
+                self.record.ifindex.unwrap(),
+                self.record.spec.linux.bypass_mark,
+            )
+            .await?,
+        );
         Ok(())
     }
 
     pub(crate) async fn changed(&mut self) {
         tokio::time::sleep_until(self.reconcile_after).await;
         tokio::select! {
-            _ = self.changes.recv() => {},
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+            _ = self.changes.recv() => {
+                self.poll_at = tokio::time::Instant::now() + Duration::from_millis(250);
+                tokio::time::sleep_until(self.poll_at).await;
+            },
+            _ = tokio::time::sleep_until(self.poll_at) => {},
         }
     }
 
-    pub(crate) async fn reconcile(&mut self) -> io::Result<()> {
+    pub(crate) fn available(&self) -> bool {
+        self.underlay.available()
+    }
+
+    pub(crate) fn refresh_bootstrap(&self) -> io::Result<()> {
+        self._policy.refresh_bootstrap()
+    }
+
+    pub(crate) async fn reconcile(&mut self) -> io::Result<bool> {
         if !self.active {
-            return Ok(());
+            return Ok(false);
         }
         while self.changes.try_recv().is_ok() {}
         let index = self.record.ifindex.unwrap();
@@ -259,7 +285,10 @@ impl Session {
             self.on_link = networks;
         }
         self.reconcile_after = tokio::time::Instant::now() + Duration::from_secs(1);
-        Ok(())
+        self.poll_at = tokio::time::Instant::now() + Duration::from_secs(10);
+        Ok(self.underlay.update(
+            underlay::snapshot(&self.handle, index, self.record.spec.linux.bypass_mark).await?,
+        ))
     }
 
     pub(crate) async fn deactivate(&mut self) -> io::Result<()> {

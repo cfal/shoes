@@ -153,7 +153,7 @@ async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result
         None,
         &mut |_, _, _| {},
         &mut None,
-        &crate::desktop::NetworkSession::default(),
+        &crate::desktop::NetworkSession::default().topology(),
     )
     .await
 }
@@ -165,7 +165,7 @@ async fn prepare_tracking(
     previous_servers: Option<&PreparedServers>,
     discovered: &mut DiscoverDependencies<'_>,
     control: &mut Option<crate::control::runtime::ControlService>,
-    network: &crate::desktop::NetworkSession,
+    network: &crate::desktop::NetworkTopology,
 ) -> io::Result<PreparedServers> {
     let mut cache_lease = previous_servers.and_then(|previous| previous.cache_lease.clone());
     let (mut validated, snapshot, memory) = load_candidate(
@@ -264,7 +264,7 @@ async fn prepare_tracking(
     dns::check_interception(&validated.configs, &validated.dns_groups).await?;
     let protect_tun_endpoints = config::protects_tun_endpoints(&validated.configs);
     let mut dns = dns::build_dns_registry_for_runtime(
-        std::mem::take(&mut validated.dns_groups),
+        validated.dns_groups.clone(),
         validated.global_limits,
         previous,
         &synthetic_endpoints,
@@ -366,6 +366,75 @@ struct RunningServers {
 }
 
 impl RunningServers {
+    async fn pause_network(
+        &mut self,
+        prepared: &mut PreparedServers,
+        control: Option<&crate::control::runtime::ControlService>,
+        lifetime: &crate::network_tasks::NetworkTasks,
+    ) -> io::Result<()> {
+        if let (Some(control), Some(generation)) = (control, &prepared.generation) {
+            control.runtime.begin_activation(generation).await?;
+        }
+        #[cfg(unix)]
+        self.wireguard.cancel();
+        lifetime.cancel();
+        self.stop().await;
+        lifetime.wait().await;
+        prepared.tcp.defer_admission();
+        prepared.dns = prepared.dns.retained_state();
+        self.quic_retirements.wait().await
+    }
+
+    async fn reconnect(
+        &mut self,
+        prepared: &mut PreparedServers,
+        network: &mut crate::desktop::NetworkSession,
+    ) -> io::Result<()> {
+        self.rebuild_network(prepared, network).await?;
+        self.start_retry(prepared).await?;
+        prepared.certificates.start().await;
+        Ok(())
+    }
+
+    async fn rebuild_network(
+        &mut self,
+        prepared: &mut PreparedServers,
+        network: &mut crate::desktop::NetworkSession,
+    ) -> io::Result<()> {
+        network.refresh_bootstrap()?;
+        let endpoints: Vec<_> =
+            crate::config::tun_endpoint_ips(&prepared.validated.configs).collect();
+        prepared.dns = dns::build_dns_registry_for_runtime(
+            prepared.validated.dns_groups.clone(),
+            prepared.validated.global_limits,
+            Some(&prepared.dns),
+            &endpoints,
+            config::protects_tun_endpoints(&prepared.validated.configs),
+        )
+        .await?;
+        #[cfg(unix)]
+        match tokio::time::timeout(Duration::from_secs(3), prepared.wireguard.refresh_peers()).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::warn!(
+                    "WireGuard peer refresh incomplete; retaining unresolved peer endpoints: {error}"
+                )
+            }
+            Err(_) => {
+                log::warn!("WireGuard peer refresh timed out; retaining unresolved peer endpoints")
+            }
+        }
+        if let Some(generation) = &prepared.generation {
+            generation.probes.reset_network(
+                prepared.dns.get_or_create_default(),
+                prepared.dns.forbidden_ranges().to_vec(),
+            );
+            generation.catalog.selection.automatic.choices_changed();
+        }
+        Ok(())
+    }
+
     async fn shutdown_network(
         &mut self,
         registries: &[&PreparedServers],
@@ -829,14 +898,21 @@ async fn run_inner(
         _ = shutdown.recv() => return Ok(()),
         result = config::load_config_files(&paths) => result?,
     };
-    *network = crate::desktop::NetworkSession::prepare(&configs).await?;
+    let mut lifetime = crate::network_tasks::NetworkLifetime::default();
+    *network = lifetime
+        .scope(crate::desktop::NetworkSession::prepare(&configs))
+        .await?;
+    if !network.monitors_underlay() {
+        lifetime = crate::network_tasks::NetworkLifetime::untracked();
+    }
     let mut discovered = |paths: &[PathBuf], recovery: &[PathBuf], root: Option<&Path>| {
         watches.discovered(paths, recovery, root)
     };
+    let topology = network.topology();
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = prepare_tracking(&paths, configs, None, None, &mut discovered, control, network) => result?,
+        result = lifetime.scope(prepare_tracking(&paths, configs, None, None, &mut discovered, control, &topology)) => result?,
     };
     network.prepare_network().await?;
     #[cfg(target_os = "linux")]
@@ -857,7 +933,7 @@ async fn run_inner(
     tokio::select! {
         biased;
         _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
-        result = running.start(&mut prepared) => if let Err(error) = result {
+        result = lifetime.scope(running.start(&mut prepared)) => if let Err(error) = result {
             let _ = running.shutdown_network(&[&prepared], network).await;
             return Err(error);
         },
@@ -879,11 +955,17 @@ async fn run_inner(
         )));
     }
     println!("Servers ready");
+    let mut reconnecting = false;
+    let mut pending_reload = false;
+    let mut force_network_reset = false;
+    let mut retry_at = tokio::time::Instant::now();
     loop {
+        let can_retry = reconnecting && network.available();
         enum Change {
             Shutdown,
             TunFailure(io::Error),
             Reload { debounce: bool },
+            Reconnect,
         }
         let change = wait_with_reconciliation(
             async {
@@ -891,21 +973,112 @@ async fn run_inner(
                     biased;
                     _ = shutdown.recv() => Change::Shutdown,
                     error = running.tun_failure() => Change::TunFailure(error),
+                    _ = std::future::ready(()), if force_network_reset => Change::Reconnect,
                     _ = reload.recv() => Change::Reload { debounce: false },
-                    _ = remote_rule_change(&mut prepared) => Change::Reload { debounce: false },
+                    _ = lifetime.scope(remote_rule_change(&mut prepared)), if !reconnecting => Change::Reload { debounce: false },
                     _ = watches.changed(&mut changes) => Change::Reload { debounce: true },
+                    _ = tokio::time::sleep_until(retry_at), if can_retry => Change::Reconnect,
+                    _ = std::future::ready(()), if pending_reload && !reconnecting => Change::Reload { debounce: false },
                 }
             },
             network,
         )
         .await;
         let debounce = match change {
-            Ok(Change::Shutdown) => return running.shutdown_network(&[&prepared], network).await,
-            Ok(Change::TunFailure(error)) => {
+            Ok(Some(Change::Shutdown)) => {
+                return running.shutdown_network(&[&prepared], network).await;
+            }
+            Ok(Some(Change::TunFailure(error))) => {
                 let _ = running.shutdown_network(&[&prepared], network).await;
                 return Err(error);
             }
-            Ok(Change::Reload { debounce }) => debounce,
+            Ok(Some(Change::Reload { debounce })) => {
+                if reconnecting {
+                    pending_reload = true;
+                    force_network_reset = network.available();
+                    continue;
+                }
+                pending_reload = false;
+                debounce
+            }
+            Ok(None) | Ok(Some(Change::Reconnect)) => {
+                force_network_reset = false;
+                if !reconnecting {
+                    log::info!("Underlay changed; retiring network workers");
+                }
+                // A rejected recovery reload may have rebuilt transports without starting workers.
+                if let Err(error) = running
+                    .pause_network(&mut prepared, control.as_ref(), &lifetime)
+                    .await
+                {
+                    let _ = running.shutdown_network(&[&prepared], network).await;
+                    return Err(error);
+                }
+                if !reconnecting && !network.available() {
+                    println!("Network unavailable; waiting for underlay");
+                }
+                reconnecting = true;
+                if !network.available() {
+                    continue;
+                }
+                lifetime = crate::network_tasks::NetworkLifetime::default();
+                let mut result = tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
+                    result = tokio::time::timeout(Duration::from_secs(10), lifetime.scope(async {
+                        if pending_reload {
+                            // Restore rollback state without requiring the old listeners to bind.
+                            running.rebuild_network(&mut prepared, network).await
+                        } else {
+                            running.reconnect(&mut prepared, network).await
+                        }
+                    })) => result.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "network recovery timed out"))),
+                };
+                // Ownership failures remain terminal, unlike transient worker startup errors.
+                match network.reconcile().await {
+                    Err(error) => {
+                        let _ = running.shutdown_network(&[&prepared], network).await;
+                        return Err(error);
+                    }
+                    Ok(changed) if changed || !network.available() => {
+                        result = Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "underlay changed during recovery",
+                        ));
+                    }
+                    Ok(_) => {}
+                }
+                match result {
+                    Ok(()) if pending_reload => {
+                        pending_reload = false;
+                        false
+                    }
+                    Ok(()) => {
+                        if let Some(control) = control.as_ref()
+                            && let Err(error) = control.runtime.resume().await
+                        {
+                            let _ = running.shutdown_network(&[&prepared], network).await;
+                            return Err(error);
+                        }
+                        prepared.tcp.activate();
+                        reconnecting = false;
+                        println!("Network reconnected");
+                        continue;
+                    }
+                    Err(error) => {
+                        log::warn!("Network recovery deferred: {error}");
+                        if let Err(error) = running
+                            .pause_network(&mut prepared, control.as_ref(), &lifetime)
+                            .await
+                        {
+                            let _ = running.shutdown_network(&[&prepared], network).await;
+                            return Err(error);
+                        }
+                        retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
+                        continue;
+                    }
+                }
+            }
             Err(error) => {
                 let cleanup = running.shutdown_network(&[&prepared], network).await;
                 return Err(io::Error::other(format!(
@@ -914,15 +1087,31 @@ async fn run_inner(
             }
         };
         if debounce {
-            tokio::select! {
+            let settled = tokio::select! {
                 biased;
                 _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
                 error = running.tun_failure() => {
                     let _ = running.shutdown_network(&[&prepared], network).await;
                     return Err(error);
                 },
-                _ = reload.recv() => {}
-                _ = watches.debounce(&mut changes) => {}
+                result = wait_with_reconciliation(async {
+                    tokio::select! {
+                        _ = reload.recv() => {},
+                        _ = watches.debounce(&mut changes) => {},
+                    }
+                }, network) => result,
+            };
+            match settled {
+                Ok(Some(())) => {}
+                Ok(None) => {
+                    pending_reload = true;
+                    force_network_reset = true;
+                    continue;
+                }
+                Err(error) => {
+                    let _ = running.shutdown_network(&[&prepared], network).await;
+                    return Err(error);
+                }
             }
         }
         while changes.try_recv().is_ok() {}
@@ -934,6 +1123,7 @@ async fn run_inner(
         let mut discovered = |paths: &[PathBuf], recovery: &[PathBuf], root: Option<&Path>| {
             watches.discovered(paths, recovery, root)
         };
+        let topology = network.topology();
         let candidate = tokio::select! {
             biased;
             _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
@@ -941,10 +1131,22 @@ async fn run_inner(
                 let _ = running.shutdown_network(&[&prepared], network).await;
                 return Err(error);
             },
-            result = async {
+            result = wait_with_reconciliation(async {
                 let configs = config::load_config_files(&paths).await?;
-                prepare_tracking(&paths, configs, Some(&prepared.dns), Some(&prepared), &mut discovered, control, network).await
-            } => result,
+                lifetime.scope(prepare_tracking(&paths, configs, Some(&prepared.dns), Some(&prepared), &mut discovered, control, &topology)).await
+            }, network) => result,
+        };
+        let candidate = match candidate {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                pending_reload = true;
+                force_network_reset = true;
+                continue;
+            }
+            Err(error) => {
+                let _ = running.shutdown_network(&[&prepared], network).await;
+                return Err(error);
+            }
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
@@ -993,15 +1195,31 @@ async fn run_inner(
         let result = tokio::select! {
             biased;
             _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
-            result = running.activate(&mut candidate, control.as_ref()) => result,
+            result = lifetime.scope(running.activate(&mut candidate, control.as_ref())) => result,
         };
         if let Err(error) = result {
             let rollback = tokio::select! {
                 biased;
                 _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
-                result = running.rollback(&mut prepared, &mut candidate, control.as_ref()) => result,
+                result = lifetime.scope(running.rollback(&mut prepared, &mut candidate, control.as_ref())) => result,
             };
             if let Err(rollback) = rollback {
+                if reconnecting {
+                    eprintln!(
+                        "Reload rejected; previous servers unavailable, recovery continues: {error}; rollback: {rollback}"
+                    );
+                    if let Err(error) = running
+                        .pause_network(&mut prepared, control.as_ref(), &lifetime)
+                        .await
+                    {
+                        let _ = running
+                            .shutdown_network(&[&prepared, &candidate], network)
+                            .await;
+                        return Err(error);
+                    }
+                    retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
+                    continue;
+                }
                 let cleanup = running
                     .shutdown_network(&[&prepared, &candidate], network)
                     .await;
@@ -1010,11 +1228,19 @@ async fn run_inner(
                 )));
             }
             eprintln!("Reload rejected; previous servers restored: {error}");
+            if reconnecting {
+                reconnecting = false;
+                println!("Network reconnected");
+            }
             continue;
         }
         watches.activated(&candidate.validated.reload_files);
         let mut retired = std::mem::replace(&mut prepared, candidate);
         retired.certificates.shutdown().await;
+        if reconnecting {
+            reconnecting = false;
+            println!("Network reconnected");
+        }
         println!("Servers ready");
     }
 }
@@ -1022,15 +1248,17 @@ async fn run_inner(
 async fn wait_with_reconciliation<T>(
     change: impl std::future::Future<Output = T>,
     network: &mut crate::desktop::NetworkSession,
-) -> io::Result<T> {
+) -> io::Result<Option<T>> {
     tokio::pin!(change);
     loop {
         tokio::select! {
             biased;
-            result = &mut change => return Ok(result),
+            result = &mut change => return Ok(Some(result)),
             _ = network.changed() => {
                 // Retain in-flight refreshes and finish network mutations before handling reload/shutdown.
-                network.reconcile().await?;
+                if network.reconcile().await? {
+                    return Ok(None);
+                }
             }
         }
     }

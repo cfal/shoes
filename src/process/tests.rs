@@ -37,7 +37,7 @@ async fn ntp_initial_sync_precedes_deferred_certificate_binds() {
         Some(&previous),
         &mut |_, _, _| {},
         &mut None,
-        &crate::desktop::NetworkSession::default(),
+        &crate::desktop::NetworkSession::default().topology(),
     )
     .await
     .unwrap();
@@ -98,7 +98,7 @@ async fn network_reconciliation_does_not_cancel_inflight_refresh() {
                 request.push(stream.read_u8().await.unwrap());
             }
             for _ in 0..3 {
-                events.send(()).await.unwrap();
+                events.send(None).await.unwrap();
                 reconciled.recv().await.unwrap();
             }
             stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes()).await.unwrap();
@@ -106,10 +106,360 @@ async fn network_reconciliation_does_not_cancel_inflight_refresh() {
             std::future::pending::<()>().await;
         };
         tokio::select! {
-            result = wait_with_reconciliation(remote_rule_change(&mut prepared), &mut network) => result.unwrap(),
+            result = wait_with_reconciliation(remote_rule_change(&mut prepared), &mut network) => result.unwrap().unwrap(),
             _ = fixture => unreachable!(),
         }
         assert_eq!(std::fs::read(path).unwrap(), body);
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn underlay_change_interrupts_the_wait_without_consuming_a_reload() {
+    let (events, receiver) = mpsc::channel(1);
+    let (ack, _reconciled) = mpsc::channel(1);
+    let mut network = crate::desktop::NetworkSession::with_test_events(receiver, ack);
+    events.send(Some(true)).await.unwrap();
+    assert!(
+        wait_with_reconciliation(std::future::pending::<()>(), &mut network)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_start() {
+    const NAME: &str = "process::tests::reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_start";
+    const CHILD: &str = "SHOES_RECONNECT_LOOP_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        shoes_test_support::isolated::assert_one_test_passed(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("Reload rejected; previous servers unavailable, recovery continues:")
+        );
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn greet(address: std::net::SocketAddr) -> tokio::net::TcpStream {
+        loop {
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
+                stream.write_all(&[5, 1, 0]).await.unwrap();
+                let mut reply = [0; 2];
+                stream.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply, [5, 0]);
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let unix = directory.path().join("listener.sock");
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = first.local_addr().unwrap();
+        let added = second.local_addr().unwrap();
+        let mut config = vec![
+            serde_json::json!({"address":address.to_string(), "protocol":{"type":"socks"}}),
+            serde_json::json!({"path":unix, "protocol":{"type":"socks"}}),
+        ];
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        drop((first, second));
+        let (events, receiver) = mpsc::channel(1);
+        let (ack, mut reconciled) = mpsc::channel(1);
+        let network = crate::desktop::NetworkSession::with_test_events(receiver, ack);
+        let process = crate::desktop::TEST_NETWORK.scope(
+            std::cell::RefCell::new(Some(network)),
+            Box::pin(run(vec![path.to_string_lossy().into_owned()], false, true)),
+        );
+        tokio::pin!(process);
+        let fixture = async {
+            let mut live = greet(address).await;
+            events.send(Some(false)).await.unwrap();
+            reconciled.recv().await.unwrap();
+            assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
+            config.push(
+                serde_json::json!({"address":added.to_string(), "protocol":{"type":"socks"}}),
+            );
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert_eq!(
+                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
+                0
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(tokio::net::TcpStream::connect(added).await.is_err());
+            events.send(Some(true)).await.unwrap();
+            let mut live = greet(added).await;
+
+            events.send(Some(false)).await.unwrap();
+            assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
+            std::fs::remove_file(&unix).unwrap();
+            std::fs::create_dir(&unix).unwrap();
+            events.send(Some(true)).await.unwrap();
+            // A non-AddrInUse startup error must keep retrying while reload remains usable.
+            tokio::time::sleep(Duration::from_millis(2300)).await;
+            let mut queued = tokio::net::TcpStream::connect(address).await.unwrap();
+            queued.write_all(&[5, 1, 0]).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), queued.read_u8())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
+                0
+            );
+            // An unchanged reload fails activation and rollback, but must not end recovery.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), queued.read_u8())
+                    .await
+                    .is_err()
+            );
+            config.remove(1);
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert_eq!(
+                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
+                0
+            );
+            assert_eq!(queued.read_u8().await.unwrap(), 5);
+            assert_eq!(queued.read_u8().await.unwrap(), 0);
+            assert!(unix.is_dir());
+            let mut live = greet(added).await;
+            events.send(Some(false)).await.unwrap();
+            assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
+            assert_eq!(
+                unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) },
+                0
+            );
+        };
+        tokio::select! {
+            result = &mut process => panic!("process exited before recovery: {result:?}"),
+            _ = fixture => {},
+        }
+        process.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reconnect_restarts_certificate_workers_retired_by_a_rejected_candidate() {
+    const NAME: &str =
+        "process::tests::reconnect_restarts_certificate_workers_retired_by_a_rejected_candidate";
+    const CHILD: &str = "SHOES_RECONNECT_CERTIFICATE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(NAME, CHILD, "1");
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn challenge(address: std::net::SocketAddr) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: proxy.test\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 404 "));
+        })
+        .await
+        .unwrap();
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    std::fs::write(&path, serde_json::json!([
+        {"certificate_source":"managed", "type":"acme", "domains":["proxy.test"],
+         "directory_url":"http://127.0.0.1:9/directory", "state_dir":directory.path().join("state"),
+         "challenge":{"type":"http01", "listen":[address.to_string()]}},
+        {"address":"127.0.0.1:0", "protocol":{"type":"socks"}}
+    ]).to_string()).unwrap();
+    drop(reserved);
+    let old = crate::network_tasks::NetworkLifetime::default();
+    let mut prepared = old
+        .scope(prepare(&[path.to_string_lossy().into_owned()], None))
+        .await
+        .unwrap();
+    let mut running = RunningServers::default();
+    old.scope(running.activate(&mut prepared, None))
+        .await
+        .unwrap();
+    challenge(address).await;
+
+    // Candidate retirement can stop the accepted certificate workers before rollback fails.
+    prepared
+        .certificates
+        .retire_unused(&Default::default())
+        .await;
+    running
+        .pause_network(&mut prepared, None, &old)
+        .await
+        .unwrap();
+    let fresh = crate::network_tasks::NetworkLifetime::default();
+    fresh
+        .scope(running.reconnect(
+            &mut prepared,
+            &mut crate::desktop::NetworkSession::default(),
+        ))
+        .await
+        .unwrap();
+    challenge(address).await;
+    running.shutdown(&[&prepared]).await.unwrap();
+}
+
+#[tokio::test]
+async fn network_reset_keeps_controller_generation_and_explicit_selection() {
+    const CHILD: &str = "SHOES_RECONNECT_CONTROL_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(
+            "process::tests::network_reset_keeps_controller_generation_and_explicit_selection",
+            CHILD,
+            "1",
+        );
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    std::fs::write(
+        &path,
+        serde_json::json!([
+            {"client_group":"chosen", "type":"selector", "client_chains":[
+                {"chain":[{"name":"first", "protocol":{"type":"direct"}}]},
+                {"chain":[{"name":"second", "protocol":{"type":"direct"}}]}
+            ]},
+            {"address":"127.0.0.1:0", "protocol":{"type":"socks"}}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let paths = [path.to_string_lossy().into_owned()];
+    let configs = config::load_config_files(&paths).await.unwrap();
+    let mut control = None;
+    let mut network = crate::desktop::NetworkSession::default();
+    let old = crate::network_tasks::NetworkLifetime::default();
+    let mut prepared = old
+        .scope(prepare_tracking(
+            &paths,
+            configs,
+            None,
+            None,
+            &mut |_, _, _| {},
+            &mut control,
+            &network.topology(),
+        ))
+        .await
+        .unwrap();
+    let mut control = control.unwrap();
+    let generation = prepared.generation.clone().unwrap();
+    control.runtime.publish(generation.clone()).await.unwrap();
+    control.runtime.resume().await.unwrap();
+    control
+        .runtime
+        .select(generation.id, "chosen".into(), "second".into())
+        .await
+        .unwrap();
+    let selection = generation.catalog.selection.snapshot();
+    let mut running = RunningServers::default();
+    old.scope(running.start(&mut prepared)).await.unwrap();
+    running
+        .pause_network(&mut prepared, Some(&control), &old)
+        .await
+        .unwrap();
+    let fresh = crate::network_tasks::NetworkLifetime::default();
+    fresh
+        .scope(running.reconnect(&mut prepared, &mut network))
+        .await
+        .unwrap();
+    control.runtime.resume().await.unwrap();
+    prepared.tcp.activate();
+    assert!(std::sync::Arc::ptr_eq(
+        &generation,
+        &control.runtime.generation().unwrap()
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &selection,
+        &generation.catalog.selection.snapshot()
+    ));
+    assert_eq!(selection["chosen"], "second");
+    running
+        .pause_network(&mut prepared, Some(&control), &fresh)
+        .await
+        .unwrap();
+    running.shutdown(&[&prepared]).await.unwrap();
+    control.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnect_uses_memory_and_cancels_current_and_draining_connections() {
+    const NAME: &str =
+        "process::tests::reconnect_uses_memory_and_cancels_current_and_draining_connections";
+    const CHILD: &str = "SHOES_RECONNECT_PROCESS_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(NAME, CHILD, "1");
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0).await.unwrap();
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = reserved.local_addr().unwrap();
+        let reserved_socks = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks = reserved_socks.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        std::fs::write(&path, serde_json::json!([
+            {"global_settings": {"reload_grace_secs":300}},
+            {"address":listen.to_string(), "protocol":{"type":"forward", "target":echo.local_addr().to_string()}},
+            {"address":socks.to_string(), "protocol":{"type":"socks"}}
+        ]).to_string()).unwrap();
+        drop((reserved, reserved_socks));
+        let mut lifetime = crate::network_tasks::NetworkLifetime::default();
+        let mut prepared = lifetime.scope(prepare(&[path.to_string_lossy().into_owned()], None)).await.unwrap();
+        let mut running = RunningServers::default();
+        lifetime.scope(running.start(&mut prepared)).await.unwrap();
+        let mut draining = tokio::net::TcpStream::connect(listen).await.unwrap();
+        draining.write_all(b"before").await.unwrap();
+        let mut bytes = [0; 6];
+        draining.read_exact(&mut bytes).await.unwrap();
+        running.stop().await;
+        lifetime.scope(running.start(&mut prepared)).await.unwrap();
+        draining.write_all(b"reload").await.unwrap();
+        draining.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"reload");
+        let mut pending = tokio::net::TcpStream::connect(socks).await.unwrap();
+        pending.write_all(&[5]).await.unwrap();
+        let mut current = tokio::net::TcpStream::connect(listen).await.unwrap();
+        current.write_all(b"active").await.unwrap();
+        current.read_exact(&mut bytes).await.unwrap();
+        std::fs::write(&path, "invalid: [").unwrap();
+        running.pause_network(&mut prepared, None, &lifetime).await.unwrap();
+        for stream in [&mut draining, &mut pending, &mut current] {
+            let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut [0])).await
+                .expect("network reset waited for ordinary reload grace");
+            assert!(matches!(result, Ok(0)) || result.is_err(), "{result:?}");
+        }
+        lifetime = crate::network_tasks::NetworkLifetime::default();
+        lifetime.scope(running.reconnect(&mut prepared, &mut crate::desktop::NetworkSession::default()))
+            .await.unwrap();
+        prepared.tcp.activate();
+        let mut fresh = tokio::net::TcpStream::connect(listen).await.unwrap();
+        fresh.write_all(b"fresh!").await.unwrap();
+        fresh.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"fresh!");
+        running.pause_network(&mut prepared, None, &lifetime).await.unwrap();
     }).await.unwrap();
 }
 

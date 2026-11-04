@@ -71,7 +71,7 @@ impl Pool {
         let (sender, result) = watch::channel(None);
         let slots = Arc::downgrade(&self.slots);
         let key = dialer.route_key().clone();
-        let task = tokio::spawn(async move {
+        let task = crate::network_tasks::spawn(async move {
             let result = tokio::time::timeout(SETUP_TIMEOUT, Generation::open(dialer, protocol))
                 .await
                 .unwrap_or_else(|_| {
@@ -162,28 +162,31 @@ impl Generation {
                 generation.udp_enabled = config.udp_enabled;
                 generation
                     .tasks
-                    .push(AbortOnDropHandle::new(tokio::spawn(tuic::heartbeat(
-                        generation.connection().clone(),
-                        config.heartbeat_interval_secs,
-                    ))));
+                    .push(AbortOnDropHandle::new(crate::network_tasks::spawn(
+                        tuic::heartbeat(
+                            generation.connection().clone(),
+                            config.heartbeat_interval_secs,
+                        ),
+                    )));
                 let (sender, receiver) = tokio::sync::mpsc::channel(64);
                 generation.dissociate = Some(sender);
                 generation
                     .tasks
-                    .push(AbortOnDropHandle::new(tokio::spawn(tuic::dissociate_loop(
-                        commands.clone(),
-                        receiver,
-                    ))));
+                    .push(AbortOnDropHandle::new(crate::network_tasks::spawn(
+                        tuic::dissociate_loop(commands.clone(), receiver),
+                    )));
                 generation.commands = Some(commands);
             }
         }
         generation
             .tasks
-            .push(AbortOnDropHandle::new(tokio::spawn(udp::receive(
-                generation.connection().clone(),
-                generation.registry.clone(),
-                matches!(generation.protocol, Protocol::Tuic(_)),
-            ))));
+            .push(AbortOnDropHandle::new(crate::network_tasks::spawn(
+                udp::receive(
+                    generation.connection().clone(),
+                    generation.registry.clone(),
+                    matches!(generation.protocol, Protocol::Tuic(_)),
+                ),
+            )));
         generation.initialized = true;
         Ok(generation)
     }
@@ -198,7 +201,7 @@ impl Drop for Generation {
         self.registry.lock().close();
         if self.initialized
             && self.connection().close_reason().is_none()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+            && tokio::runtime::Handle::try_current().is_ok()
         {
             // Retiring a route must not discard FIN/data already accepted by
             // Quinn. One bounded drain task per generation retains its endpoint
@@ -206,7 +209,7 @@ impl Drop for Generation {
             let connection = self.connection().clone();
             let endpoint = self.carrier._endpoint.clone();
             let tasks = std::mem::take(&mut self.tasks);
-            runtime.spawn(async move {
+            crate::network_tasks::spawn(async move {
                 let _ = tokio::time::timeout(Duration::from_secs(3), connection.closed()).await;
                 connection.close(0u32.into(), b"client retired");
                 drop((tasks, endpoint));

@@ -1,4 +1,5 @@
 use super::*;
+mod reconnect;
 use serde_json::json;
 
 mod fallback;
@@ -430,6 +431,17 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
     const PARENT: &str = "SHOES_MANAGED_PARENT_NETNS";
     const MOUNT: &str = "SHOES_MANAGED_PARENT_MOUNTNS";
     let namespace = std::fs::read_link("/proc/self/ns/net")?;
+    if std::env::var_os("SHOES_MANAGED_PEER_ECHO").is_some() {
+        assert_ne!(namespace.as_os_str(), std::env::var_os(PARENT).unwrap());
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/mnt")?.as_os_str(),
+            std::env::var_os(MOUNT).unwrap()
+        );
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(reconnect::echo());
+    }
     if std::env::var_os("SHOES_ORPHAN_HELPER").is_some() {
         assert_ne!(namespace.as_os_str(), std::env::var_os(PARENT).unwrap());
         return tokio::runtime::Builder::new_current_thread().enable_all().build()?
@@ -586,7 +598,7 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
                 }
                 let mut daemons = resolved_fixture().await?;
                 let result =
-                    tokio::time::timeout(Duration::from_secs(90), kernel_capture()).await?;
+                    tokio::time::timeout(Duration::from_secs(180), kernel_capture()).await?;
                 for child in &mut daemons {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
@@ -620,7 +632,7 @@ fn managed_kernel_capture_and_cleanup() -> io::Result<()> {
                 "--",
                 "timeout",
                 "--kill-after=5s",
-                "120s",
+                "210s",
                 "unshare",
                 "--net",
                 "--mount",
@@ -1032,11 +1044,15 @@ async fn kernel_capture() -> io::Result<()> {
         }
         session.reconcile().await?;
         let index = session.record.ifindex;
-        session.validate(&[crate::config::ResolvedConfig::TunServer(config.clone())])?;
+        let topology = crate::desktop::NetworkTopology {
+            spec: Some(session.spec().clone()),
+            ingress: session.ingress(),
+        };
+        topology.validate(&[crate::config::ResolvedConfig::TunServer(config.clone())])?;
         let mut changed = config.clone();
         changed.mtu += 1;
         assert!(
-            session
+            topology
                 .validate(&[crate::config::ResolvedConfig::TunServer(changed)])
                 .is_err()
         );
@@ -1088,6 +1104,9 @@ async fn kernel_capture() -> io::Result<()> {
             io::Error::other(format!(
                 "managed process recovery (redirect={redirect}): {error}"
             ))
+        })?;
+        reconnect::handover(redirect).await.map_err(|error| {
+            io::Error::other(format!("handover (redirect={redirect}): {error}"))
         })?;
     }
     orphan_helper_recovery().await?;

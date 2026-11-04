@@ -22,6 +22,21 @@ pub(crate) struct SocketPolicy(());
 
 #[cfg(target_os = "linux")]
 impl SocketPolicy {
+    pub(crate) fn refresh_bootstrap(&self) -> io::Result<()> {
+        let endpoints = bootstrap_endpoints()
+            .ok_or_else(|| io::Error::other("managed socket policy disappeared"))?;
+        let bootstrap = crate::dns::controlled_bootstrap(&endpoints)?;
+        let old = {
+            let mut current = POLICY.write();
+            let policy = current
+                .as_mut()
+                .ok_or_else(|| io::Error::other("managed socket policy disappeared"))?;
+            std::mem::replace(&mut policy.bootstrap, bootstrap)
+        };
+        drop(old);
+        Ok(())
+    }
+
     pub(crate) fn install(
         interface: String,
         bypass_mark: u32,

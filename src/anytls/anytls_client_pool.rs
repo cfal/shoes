@@ -80,10 +80,10 @@ impl SessionPool {
     ) {
         // Each checkout opens exactly one stream; only its idempotent terminal
         // transition may release it. Idle sessions have no active streams.
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             session.close();
             return;
-        };
+        }
         if self.options.disable_reuse || !session.is_reusable() {
             session.close();
             return;
@@ -98,17 +98,16 @@ impl SessionPool {
             let weak = Arc::downgrade(self);
             let check_interval = interval(self.options.idle_session_check_interval_secs);
             state.reaper = Some(
-                runtime
-                    .spawn(async move {
-                        loop {
-                            tokio::time::sleep(check_interval).await;
-                            let Some(pool) = weak.upgrade() else { return };
-                            if !pool.reap() {
-                                return;
-                            }
+                crate::network_tasks::spawn(async move {
+                    loop {
+                        tokio::time::sleep(check_interval).await;
+                        let Some(pool) = weak.upgrade() else { return };
+                        if !pool.reap() {
+                            return;
                         }
-                    })
-                    .abort_handle(),
+                    }
+                })
+                .abort_handle(),
             );
         }
     }

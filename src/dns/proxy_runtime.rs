@@ -30,6 +30,7 @@ pub struct ProxyRuntimeProvider {
     quic_binder: ProxyQuicBinder,
     /// Timeout for establishing connections to DNS upstreams.
     connect_timeout: Duration,
+    network: Option<crate::network_tasks::NetworkTasks>,
 }
 
 impl ProxyRuntimeProvider {
@@ -49,6 +50,7 @@ impl ProxyRuntimeProvider {
             bootstrap_resolver,
             quic_binder,
             connect_timeout,
+            network: crate::network_tasks::NetworkTasks::current(),
         }
     }
 
@@ -65,11 +67,18 @@ impl ProxyRuntimeProvider {
 
 /// Spawn handle for tokio runtime.
 #[derive(Clone, Default)]
-pub struct TokioSpawnHandle;
+pub struct TokioSpawnHandle(Option<crate::network_tasks::NetworkTasks>);
 
 impl Spawn for TokioSpawnHandle {
     fn spawn_bg(&mut self, future: impl Future<Output = ()> + Send + 'static) {
-        tokio::spawn(future);
+        match &self.0 {
+            Some(network) => {
+                network.spawn(future);
+            }
+            None => {
+                crate::network_tasks::spawn(future);
+            }
+        }
     }
 }
 
@@ -83,7 +92,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
     type Tcp = ProxiedTcp;
 
     fn create_handle(&self) -> Self::Handle {
-        TokioSpawnHandle
+        TokioSpawnHandle(self.network.clone())
     }
 
     fn connect_tcp(

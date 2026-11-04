@@ -19,7 +19,8 @@ const LISTENER_CLOSE_GRACE: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 struct ListenerRuntime {
     endpoint_started: AtomicBool,
-    retired: CancellationToken,
+    retired: Option<CancellationToken>,
+    network: Option<crate::network_tasks::NetworkTasks>,
 }
 
 impl Runtime for ListenerRuntime {
@@ -31,12 +32,29 @@ impl Runtime for ListenerRuntime {
         // Quinn 0.11 spawns the endpoint driver synchronously before exposing the
         // endpoint. Later spawns are connection drivers; recheck this on upgrades.
         if self.endpoint_started.swap(true, Ordering::Relaxed) {
-            quinn::TokioRuntime.spawn(future);
+            match &self.network {
+                Some(network) => {
+                    network.spawn_completion(future);
+                }
+                None => quinn::TokioRuntime.spawn(future),
+            }
             return;
         }
-        let mut driver = AbortOnDropHandle::new(tokio::spawn(future));
-        let retired = self.retired.clone();
-        tokio::spawn(async move {
+        if self.retired.is_none() {
+            match &self.network {
+                Some(network) => {
+                    network.spawn(future);
+                }
+                None => quinn::TokioRuntime.spawn(future),
+            }
+            return;
+        }
+        let mut driver = AbortOnDropHandle::new(match &self.network {
+            Some(network) => network.spawn(future),
+            None => tokio::spawn(future),
+        });
+        let retired = self.retired.clone().unwrap();
+        let supervisor = async move {
             tokio::select! {
                 _ = &mut driver => {},
                 _ = async {
@@ -46,7 +64,15 @@ impl Runtime for ListenerRuntime {
             }
             // Dropping the endpoint driver closes its connection-event channels.
             // Connection drivers then terminate and wake application waiters.
-        });
+        };
+        match &self.network {
+            Some(network) => {
+                network.spawn(supervisor);
+            }
+            None => {
+                tokio::spawn(supervisor);
+            }
+        }
     }
 
     fn wrap_udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
@@ -116,15 +142,24 @@ impl QuicEndpoint {
             let retired = CancellationToken::new();
             let runtime = ListenerRuntime {
                 endpoint_started: AtomicBool::new(false),
-                retired: retired.clone(),
+                retired: Some(retired.clone()),
+                network: crate::network_tasks::NetworkTasks::current(),
             };
             (Arc::new(runtime), Some(retired.drop_guard()))
         } else {
-            (Arc::new(quinn::TokioRuntime), None)
+            (
+                Arc::new(ListenerRuntime {
+                    endpoint_started: AtomicBool::new(false),
+                    retired: None,
+                    network: crate::network_tasks::NetworkTasks::current(),
+                }),
+                None,
+            )
         };
         let socket = MemorySocket {
             inner: socket,
             endpoint_memory: None,
+            cancelled: None,
             _release: release,
         };
         quinn::Endpoint::new_with_abstract_socket(
@@ -222,6 +257,9 @@ pub(crate) fn socket_with_memory(
     Ok(Arc::new(MemorySocket {
         inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
         endpoint_memory: Some(memory),
+        // Hickory owns its Quinn runtime; retire its driver through the socket instead.
+        cancelled: crate::network_tasks::NetworkTasks::current()
+            .map(|network| parking_lot::Mutex::new(Box::pin(network.cancelled.cancelled_owned()))),
         _release: None,
     }))
 }
@@ -230,6 +268,8 @@ pub(crate) fn socket_with_memory(
 struct MemorySocket {
     inner: Arc<dyn AsyncUdpSocket>,
     endpoint_memory: Option<BudgetPermit>,
+    cancelled:
+        Option<parking_lot::Mutex<Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>>>,
     // Field order signals retirement only after the native socket has been dropped.
     _release: Option<oneshot::Sender<()>>,
 }
@@ -265,6 +305,14 @@ impl AsyncUdpSocket for MemorySocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        if let Some(cancelled) = &self.cancelled
+            && cancelled.lock().as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "DNS QUIC network retired",
+            )));
+        }
         self.inner.poll_recv(cx, bufs, meta)
     }
 

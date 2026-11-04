@@ -337,7 +337,7 @@ impl XhttpServer {
                 continue;
             };
             let state = self.state.clone();
-            requests.spawn(async move {
+            crate::network_tasks::spawn_in(&mut requests, async move {
                 let _request_permit = request_permit;
                 let Ok(Ok((mut request, stream))) = tokio::time::timeout(
                     Duration::from_secs(state.config.limits.setup_timeout_secs),
@@ -1262,7 +1262,7 @@ impl State {
                 continue;
             };
             let state = self.clone();
-            requests.spawn(async move {
+            crate::network_tasks::spawn_in(&mut requests, async move {
                 let _request_permit = request_permit;
                 let (parts, body) = request.into_parts();
                 let mut request = Request::from_parts(parts, ());

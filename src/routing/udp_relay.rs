@@ -44,7 +44,7 @@ impl UdpRelay {
             output,
             peer,
         };
-        let task = tokio::spawn(async move {
+        let task = crate::network_tasks::spawn(async move {
             let _ = run_udp_routing(
                 ServerStream::Targeted(Box::new(stream)),
                 selector,
@@ -198,6 +198,33 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> {
             Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
         }
+    }
+
+    #[tokio::test]
+    async fn network_reset_retires_relay_even_while_its_handle_survives() {
+        let network = crate::network_tasks::NetworkLifetime::default();
+        let resolver: Arc<dyn Resolver> = Arc::new(NoHostnameResolver);
+        let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![crate::address::NetLocationMask::from("0.0.0.0/0").unwrap()],
+            ConnectAction::new_allow(
+                None,
+                crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
+            ),
+        )]));
+        let relay = network
+            .scope(async { UdpRelay::new(selector, resolver, None).unwrap() })
+            .await;
+        network.cancel();
+        network.wait().await;
+        assert!(relay.recv().await.is_err());
+        assert!(
+            relay
+                .send_to(
+                    Bytes::new(),
+                    NetLocation::from_str("192.0.2.1:53", None).unwrap()
+                )
+                .is_err()
+        );
     }
 
     #[tokio::test]

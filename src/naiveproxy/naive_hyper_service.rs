@@ -68,6 +68,32 @@ mod fallback_tests {
     use super::*;
 
     #[tokio::test]
+    async fn executor_propagates_network_retirement_to_descendants() {
+        let network = crate::network_tasks::NetworkLifetime::default();
+        let tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let executor = ConnectionExecutor(Arc::downgrade(&tasks));
+        let marker = Arc::new(());
+        let retained = marker.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        network
+            .scope(async {
+                hyper::rt::Executor::execute(&executor, async move {
+                    assert!(crate::network_tasks::NetworkTasks::current().is_some());
+                    crate::network_tasks::spawn(async move {
+                        let _retained = retained;
+                        ready.send(()).unwrap();
+                        std::future::pending::<()>().await;
+                    });
+                });
+            })
+            .await;
+        started.await.unwrap();
+        network.cancel();
+        network.wait().await;
+        assert_eq!(Arc::strong_count(&marker), 1);
+    }
+
+    #[tokio::test]
     async fn connection_executor_cancels_children_without_a_reference_cycle() {
         let tasks = Arc::new(Mutex::new(JoinSet::new()));
         let executor = ConnectionExecutor(Arc::downgrade(&tasks));
@@ -185,7 +211,7 @@ where
         if let Some(tasks) = self.0.upgrade() {
             let mut tasks = tasks.lock();
             while tasks.try_join_next().is_some() {}
-            tasks.spawn(async move {
+            crate::network_tasks::spawn_in(&mut tasks, async move {
                 let _ = future.await;
             });
         }
