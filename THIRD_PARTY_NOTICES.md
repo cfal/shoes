@@ -97,22 +97,29 @@ https://github.com/gcc-mirror/gcc/blob/b71f1de6e9cf7181a288c0f39f9b1ef6580cf5c8/
 
 ## WireGuard Source
 
-Unix builds, including Android and iOS libraries, link the published crates.io
-GotaTun 0.10.3 from upstream commit
-`c541472b40ec489ba7bdfd048512e89e556c7a3c`, an implementation of the WireGuard
-protocol. GotaTun is copyright Mullvad VPN AB
-and incorporates work copyright Cloudflare, Inc. Its source files are covered
+Unix builds, including Android and iOS libraries, link GotaTun 0.10.3, an
+implementation of the WireGuard protocol, from a fork with AmneziaWG and Phobos
+obfuscation (AYastrebov/gotatun). GotaTun is copyright Mullvad VPN AB and
+incorporates work copyright Cloudflare, Inc. Its source files are covered
 by the Mozilla Public License 2.0 and the notices reproduced in
 `licenses/MPL-2.0.txt` and `licenses/gotatun-CLOUDFLARE.txt`.
 
-The unmodified corresponding source is available at:
+The corresponding source, including the fork's modifications, is the revision
+recorded in `Cargo.lock`, available at:
 
+- https://github.com/AYastrebov/gotatun/tree/a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b
+- https://github.com/AYastrebov/gotatun/archive/a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b.tar.gz
+
+The fork is based on upstream GotaTun after the 0.10.3 release. The upstream
+commit it branches from, and the 0.10.3 release commit, are available at:
+
+- https://github.com/mullvad/gotatun/tree/5454dacddcbbd046105242e2fa70b494bc2248a7
 - https://github.com/mullvad/gotatun/tree/c541472b40ec489ba7bdfd048512e89e556c7a3c
 - https://github.com/mullvad/gotatun/archive/c541472b40ec489ba7bdfd048512e89e556c7a3c.tar.gz
 
 Recipients may obtain, modify, and redistribute the covered source under the
-MPL 2.0. Shoes does not modify GotaTun's source. Shoes' own source remains under
-its existing MIT license. Distributors of modified GotaTun builds must also
+MPL 2.0. Shoes itself does not modify GotaTun's source; the fork above does.
+Shoes' own source remains under its existing MIT license. Distributors of modified GotaTun builds must also
 provide the corresponding modified covered source and retain these notices.
 Embedding a Shoes static or dynamic library does not remove these obligations.
 

@@ -167,21 +167,23 @@ class ReleaseNoticesTests(unittest.TestCase):
         gotatun_packages = [p for p in metadata["packages"] if p["name"] == "gotatun"]
         self.assertEqual(len(gotatun_packages), 1)
         gotatun = gotatun_packages[0]
-        self.assertEqual(gotatun["source"], "registry+https://github.com/rust-lang/crates.io-index")
-        gotatun_root = Path(gotatun["manifest_path"]).parent
-        vcs = json.loads((gotatun_root / ".cargo_vcs_info.json").read_text())
-        self.assertEqual(vcs["path_in_vcs"], "gotatun")
-        revision = vcs["git"]["sha1"]
+        # MPL corresponding source must name the locked fork revision, not a moving branch.
+        repository, revision = (gotatun["source"] or "")[len("git+"):].split("#", 1)
+        repository = repository.split("?", 1)[0]
+        self.assertEqual(repository, "https://github.com/AYastrebov/gotatun")
         self.assertRegex(revision, r"^[0-9a-f]{40}$")
-        self.assertEqual(revision, "c541472b40ec489ba7bdfd048512e89e556c7a3c")
+        self.assertEqual(revision, "a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b")
         source_notice = (NOTICES.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
         for required in [
             f"GotaTun {gotatun['version']}",
-            f"https://github.com/mullvad/gotatun/tree/{revision}",
-            f"https://github.com/mullvad/gotatun/archive/{revision}.tar.gz",
+            f"{repository}/tree/{revision}",
+            f"{repository}/archive/{revision}.tar.gz",
+            # The upstream commit the fork branches from, and the upstream release it contains.
+            "https://github.com/mullvad/gotatun/tree/5454dacddcbbd046105242e2fa70b494bc2248a7",
+            "https://github.com/mullvad/gotatun/tree/c541472b40ec489ba7bdfd048512e89e556c7a3c",
         ]:
             self.assertIn(required, source_notice)
-        # The published archive omits the repository-root licenses at this revision.
+        # Bundled copies of the repository-root licenses at this revision.
         for bundled, checksum in [
             ("MPL-2.0.txt", "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04"),
             ("gotatun-CLOUDFLARE.txt", "6dbef24708bad8c727bd80cca58ba8aa1637cdcb2cc6e9a31ea49235717e9391"),
