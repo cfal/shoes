@@ -433,3 +433,58 @@ async fn stalled_write_reconnects_without_replaying_old_queue() {
     drop(receiver);
     released.await.unwrap();
 }
+
+#[tokio::test]
+async fn detour_on_connect_runs_for_every_association() {
+    timeout(Duration::from_secs(5), async {
+        let (opened, mut connections) = mpsc::unbounded_channel();
+        let chain = Arc::new(ClientProxyChain::new(
+            vec![InitialHopEntry::Direct(Arc::new(Socket {
+                index: 0,
+                opened,
+                hang: false,
+            }))],
+            vec![],
+        ));
+        let target: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let hook_sender = Arc::new(std::sync::OnceLock::<Sender>::new());
+        // Phobos asks the device for an initiation here, so a send from the hook must go out.
+        let on_connect: ConnectHook = Arc::new({
+            let calls = calls.clone();
+            let hook_sender = hook_sender.clone();
+            move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                hook_sender
+                    .get()
+                    .unwrap()
+                    .send_to(Packet::copy_from(b"from hook"), target)
+                    .unwrap();
+            }
+        });
+        let drops = Arc::new(AtomicU64::new(0));
+        let (sender, receiver, released) = start(
+            "hook".into(),
+            chain,
+            Arc::new(NativeResolver::new()),
+            [target].into_iter(),
+            drops.clone(),
+            MAX_DATAGRAM,
+            Some(on_connect),
+        );
+        assert!(hook_sender.set(sender).is_ok());
+        let (_, _, stream) = connections.recv().await.unwrap();
+        let mut first = VlessMessageStream::new(stream);
+        assert_eq!(read(&mut first).await, b"from hook");
+        drop(first);
+        let (_, _, stream) = connections.recv().await.unwrap();
+        let mut second = VlessMessageStream::new(stream);
+        assert_eq!(read(&mut second).await, b"from hook");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(receiver);
+        released.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
