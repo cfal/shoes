@@ -158,6 +158,21 @@ async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result
     .await
 }
 
+async fn build_runtime_dns(
+    validated: &ValidatedConfigs,
+    previous: Option<&DnsRegistry>,
+) -> io::Result<DnsRegistry> {
+    let endpoints: Vec<_> = config::tun_endpoint_ips(&validated.configs).collect();
+    dns::build_dns_registry_for_runtime(
+        validated.dns_groups.clone(),
+        validated.global_limits,
+        previous,
+        &endpoints,
+        config::protects_tun_endpoints(&validated.configs),
+    )
+    .await
+}
+
 async fn prepare_tracking(
     paths: &[String],
     configs: Vec<Config>,
@@ -259,29 +274,21 @@ async fn prepare_tracking(
         }
         server.bind_location = BindLocation::Address(OneOrSome::Some(resolved));
     }
-    let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated.configs).collect();
     validated.refresh_catalog()?;
     dns::check_interception(&validated.configs, &validated.dns_groups).await?;
-    let protect_tun_endpoints = config::protects_tun_endpoints(&validated.configs);
-    let mut dns = dns::build_dns_registry_for_runtime(
-        validated.dns_groups.clone(),
-        validated.global_limits,
-        previous,
-        &synthetic_endpoints,
-        protect_tun_endpoints,
-    )
-    .await
-    .map_err(|error| {
-        let live = resources::limits().quic_memory_bytes;
-        let candidate = validated.global_limits.quic_memory_bytes;
-        if live == candidate {
-            error
-        } else {
-            io::Error::new(error.kind(), format!(
-                "{error}; DNS preparation uses the live QUIC cap {live:?}, not the candidate cap {candidate:?}"
-            ))
-        }
-    })?;
+    let mut dns = build_runtime_dns(&validated, previous)
+        .await
+        .map_err(|error| {
+            let live = resources::limits().quic_memory_bytes;
+            let candidate = validated.global_limits.quic_memory_bytes;
+            if live == candidate {
+                error
+            } else {
+                io::Error::new(error.kind(), format!(
+                    "{error}; DNS preparation uses the live QUIC cap {live:?}, not the candidate cap {candidate:?}"
+                ))
+            }
+        })?;
     let certificates = match previous_servers {
         Some(previous) => {
             crate::certificates::Registry::prepare_with_retiring(
@@ -393,16 +400,7 @@ impl RunningServers {
         // Rejected activation may have published candidate limits and clock.
         self.configure_runtime(prepared).await?;
         network.refresh_bootstrap()?;
-        let endpoints: Vec<_> =
-            crate::config::tun_endpoint_ips(&prepared.validated.configs).collect();
-        prepared.dns = dns::build_dns_registry_for_runtime(
-            prepared.validated.dns_groups.clone(),
-            prepared.validated.global_limits,
-            Some(&prepared.dns),
-            &endpoints,
-            config::protects_tun_endpoints(&prepared.validated.configs),
-        )
-        .await?;
+        prepared.dns = build_runtime_dns(&prepared.validated, Some(&prepared.dns)).await?;
         #[cfg(unix)]
         match tokio::time::timeout(Duration::from_secs(3), prepared.wireguard.refresh_peers()).await
         {
@@ -1131,8 +1129,12 @@ async fn run_inner(
                 lifetime.scope(prepare_tracking(&paths, configs, Some(&prepared.dns), Some(&prepared), &mut discovered, control, &topology)).await
             }, network) => result,
         };
-        let candidate = match candidate {
-            Ok(Some(candidate)) => candidate,
+        let mut candidate = match candidate {
+            Ok(Some(Ok(candidate))) => candidate,
+            Ok(Some(Err(error))) => {
+                report_reload_rejection(&error, reconnecting);
+                continue;
+            }
             Ok(None) => {
                 pending_reload = true;
                 force_network_reset = true;
@@ -1141,13 +1143,6 @@ async fn run_inner(
             Err(error) => {
                 let _ = running.shutdown_network(&[&prepared], network).await;
                 return Err(error);
-            }
-        };
-        let mut candidate = match candidate {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                report_reload_rejection(&error, reconnecting);
-                continue;
             }
         };
         candidate.tcp = match TcpListeners::prepare(
@@ -1193,7 +1188,7 @@ async fn run_inner(
             result = lifetime.scope(running.activate(&mut candidate, control.as_ref())) => result,
         };
         if let Err(error) = result {
-            let restore = async {
+            let fallback = async {
                 running
                     .discard_candidate(&mut prepared, &mut candidate)
                     .await?;
@@ -1205,12 +1200,12 @@ async fn run_inner(
                     running.activate(&mut prepared, control.as_ref()).await
                 }
             };
-            let restored = tokio::select! {
+            let fallback_result = tokio::select! {
                 biased;
                 _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
-                result = lifetime.scope(restore) => result,
+                result = lifetime.scope(fallback) => result,
             };
-            if let Err(restore) = restored {
+            if let Err(fallback_error) = fallback_result {
                 let operation = if reconnecting {
                     "recovery cleanup"
                 } else {
@@ -1220,7 +1215,7 @@ async fn run_inner(
                     .shutdown_network(&[&prepared, &candidate], network)
                     .await;
                 return Err(io::Error::other(format!(
-                    "Reload activation failed: {error}; {operation} failed: {restore}; shutdown: {cleanup:?}"
+                    "Reload activation failed: {error}; {operation} failed: {fallback_error}; shutdown: {cleanup:?}"
                 )));
             }
             if reconnecting {

@@ -1,5 +1,21 @@
 use super::*;
 
+#[cfg(unix)]
+async fn wait_for_socks(address: std::net::SocketAddr) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    loop {
+        if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
+            stream.write_all(&[5, 1, 0]).await.unwrap();
+            let mut reply = [0; 2];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, 0]);
+            return stream;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn ntp_initial_sync_precedes_deferred_certificate_binds() {
     const CHILD: &str = "SHOES_NTP_DEFERRED_BIND_CHILD";
@@ -155,19 +171,6 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn greet(address: std::net::SocketAddr) -> tokio::net::TcpStream {
-        loop {
-            if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
-                stream.write_all(&[5, 1, 0]).await.unwrap();
-                let mut reply = [0; 2];
-                stream.read_exact(&mut reply).await.unwrap();
-                assert_eq!(reply, [5, 0]);
-                return stream;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
     tokio::time::timeout(Duration::from_secs(20), async {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
@@ -191,7 +194,7 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
         );
         tokio::pin!(process);
         let fixture = async {
-            let mut live = greet(address).await;
+            let mut live = wait_for_socks(address).await;
             events.send(Some(false)).await.unwrap();
             reconciled.recv().await.unwrap();
             assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
@@ -206,7 +209,7 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(tokio::net::TcpStream::connect(added).await.is_err());
             events.send(Some(true)).await.unwrap();
-            let mut live = greet(added).await;
+            let mut live = wait_for_socks(added).await;
 
             events.send(Some(false)).await.unwrap();
             assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
@@ -219,7 +222,7 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
             tokio::time::sleep(Duration::from_millis(100)).await;
             events.send(Some(true)).await.unwrap();
             // Recovery must retry the accepted config without another reload of the rejected file.
-            let mut live = greet(added).await;
+            let mut live = wait_for_socks(added).await;
             config.pop();
 
             events.send(Some(false)).await.unwrap();
@@ -266,7 +269,7 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
             assert_eq!(queued.read_u8().await.unwrap(), 5);
             assert_eq!(queued.read_u8().await.unwrap(), 0);
             assert!(unix.is_dir());
-            let mut live = greet(added).await;
+            let mut live = wait_for_socks(added).await;
             events.send(Some(false)).await.unwrap();
             assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
             assert_eq!(
@@ -300,21 +303,8 @@ async fn reconnect_respects_dns_deadlines_and_remains_shutdown_cancellable() {
         Arc,
         atomic::{AtomicU64, Ordering},
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     use tokio_util::task::AbortOnDropHandle;
-
-    async fn greet(address: std::net::SocketAddr) -> tokio::net::TcpStream {
-        loop {
-            if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
-                stream.write_all(&[5, 1, 0]).await.unwrap();
-                let mut reply = [0; 2];
-                stream.read_exact(&mut reply).await.unwrap();
-                assert_eq!(reply, [5, 0]);
-                return stream;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
 
     for repair_reload in [false, true] {
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -375,7 +365,7 @@ async fn reconnect_respects_dns_deadlines_and_remains_shutdown_cancellable() {
             );
             tokio::pin!(process);
             let fixture = async {
-                let mut live = greet(address).await;
+                let mut live = wait_for_socks(address).await;
                 while requests.try_recv().is_ok() {}
                 events.send(Some(false)).await.unwrap();
                 assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
@@ -393,7 +383,7 @@ async fn reconnect_respects_dns_deadlines_and_remains_shutdown_cancellable() {
                 }
                 let mut live = tokio::time::timeout(
                     Duration::from_secs(if repair_reload { 3 } else { 15 }),
-                    greet(if repair_reload { added } else { address }),
+                    wait_for_socks(if repair_reload { added } else { address }),
                 ).await.expect("recovery cancelled a valid slow DNS bootstrap");
                 if repair_reload {
                     assert!(requests.try_recv().is_err(), "repair rebuilt the broken accepted DNS config");
