@@ -151,6 +151,7 @@ fn policy_and_source_groups_are_explicit_and_roundtrip() {
         "rule_source_group: files\nrule: [{domain: [example.com]}, {path: b, format: srs}]",
         "rule_source_group: files\nrules: {all: [{domain_suffix: [example.com]}, {destination_port: [443]}]}",
         "rule_source_group: files\nrules: [a.srs, {masks: example.com}]",
+        "rule_source_group: files\nrules: [{rule_source_group: other}]",
     ] {
         let group: RuleSourceGroup = serde_yaml::from_str(yaml).unwrap();
         assert!(!group.rules.is_empty());
@@ -170,10 +171,7 @@ fn policy_and_source_groups_are_explicit_and_roundtrip() {
         ),
         ("[{path: a.srs, action: block}]", "unknown field `action`"),
         ("[{path: a.srs, fromat: srs}]", "unknown field `fromat`"),
-        (
-            "[{rule_group: other}]",
-            "use masks: {rule_source_group: name}",
-        ),
+        ("[{rule_group: other}]", "use {rule_source_group: name}"),
     ] {
         let result = serde_yaml::from_str::<RuleSourceGroup>(&format!(
             "rule_source_group: x\nrules: {rules}"
