@@ -242,8 +242,11 @@ Both IP families are monitored. A
 complete outage pauses forwarding until an underlay returns; temporary recovery
 failures are retried without removing capture. Recovery rebuilds DNS and proxy
 transports from the accepted in-memory configuration, not from edited files.
+DNS bootstrap uses the configured lookup deadlines; slow or unbounded lookups
+can delay recovery, but shutdown remains cancellable.
 Explicit reloads wait while offline and can replace a configuration that prevents
-workers from restarting once an underlay is available.
+workers from restarting once an underlay is available, without first rebuilding
+the accepted DNS configuration.
 The TUN, REDIRECT ports, fake-IP mappings, and explicit selector choices remain
 owned and retained. WireGuard peer hostnames are refreshed best-effort; a failed
 refresh retains the previous endpoints rather than blocking unrelated workers. Old flows,
