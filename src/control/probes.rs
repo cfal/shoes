@@ -66,12 +66,7 @@ impl ProbeState {
 
     pub fn new(resolver: Arc<dyn Resolver>, forbidden: Vec<ipnetwork::IpNetwork>) -> Self {
         Self {
-            transports: Mutex::new(Arc::new(ProbeTransports {
-                connectors: Mutex::new(HashMap::new()),
-                resolver,
-                forbidden,
-                network: crate::network_tasks::NetworkTasks::current(),
-            })),
+            transports: Mutex::new(Arc::new(ProbeTransports::new(resolver, forbidden))),
             history: Mutex::new(HashMap::new()),
             full_budget_attempts: Mutex::new(HashMap::new()),
         }
@@ -82,8 +77,8 @@ impl ProbeState {
         resolver: Arc<dyn Resolver>,
         forbidden: Vec<ipnetwork::IpNetwork>,
     ) {
-        let replacement = Self::new(resolver, forbidden);
-        *self.transports.lock() = replacement.transports.into_inner();
+        let replacement = Arc::new(ProbeTransports::new(resolver, forbidden));
+        *self.transports.lock() = replacement;
         self.full_budget_attempts.lock().clear();
     }
 
@@ -187,6 +182,15 @@ impl ProbeState {
 }
 
 impl ProbeTransports {
+    fn new(resolver: Arc<dyn Resolver>, forbidden: Vec<ipnetwork::IpNetwork>) -> Self {
+        Self {
+            connectors: Mutex::new(HashMap::new()),
+            resolver,
+            forbidden,
+            network: crate::network_tasks::NetworkTasks::current(),
+        }
+    }
+
     fn connector(&self, catalog: &Catalog, name: &str) -> io::Result<Arc<ClientChainGroup>> {
         if let Some(connector) = self.connectors.lock().get(name) {
             return Ok(connector.clone());

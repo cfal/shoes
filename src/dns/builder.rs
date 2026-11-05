@@ -96,13 +96,10 @@ pub struct DnsRegistry {
 }
 
 impl DnsRegistry {
-    pub(crate) fn retained_state(&self) -> Self {
-        Self {
-            limits: self.limits,
-            forbidden: self.forbidden.clone(),
-            pools: self.pools.clone(),
-            ..Self::new()
-        }
+    pub(crate) fn retire_network(&mut self) {
+        self.groups = Default::default();
+        self.system_groups = Default::default();
+        self.default_resolver = None;
     }
 
     #[cfg(unix)]

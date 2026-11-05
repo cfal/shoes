@@ -556,16 +556,23 @@ async fn fake_context_reload_sharing_disable_and_reenable_keep_pool_identity() {
 #[tokio::test]
 async fn network_rebuild_retires_resolvers_but_keeps_live_fake_ip_pools() {
     let old = crate::network_tasks::NetworkLifetime::default();
-    let registry = old
+    let mut registry = old
         .scope(build_dns_registry(fake_groups(true)))
         .await
         .unwrap();
     let resolver = registry.get_by_name("fake").unwrap();
     let context = resolver.fake_dns_context().unwrap();
     let ip = context.allocate("network.test", false).unwrap();
-    let retained = registry.retained_state();
+    old.scope(async {
+        registry.get_or_create_default();
+    })
+    .await;
     old.cancel();
     old.wait().await;
+    registry.retire_network();
+    assert!(registry.groups.is_empty());
+    assert!(registry.system_groups.is_empty());
+    assert!(registry.default_resolver.is_none());
     assert_eq!(
         resolver
             .resolve_location(
@@ -581,7 +588,7 @@ async fn network_rebuild_retires_resolvers_but_keeps_live_fake_ip_pools() {
         .scope(build_dns_registry_reusing(
             fake_groups(true),
             registry.limits,
-            Some(&retained),
+            Some(&registry),
         ))
         .await
         .unwrap();
