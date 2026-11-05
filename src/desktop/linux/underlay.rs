@@ -172,20 +172,47 @@ fn matches_path(
 }
 
 fn usable_addresses(addresses: &[AddressMessage], index: u32, ipv6: bool) -> BTreeSet<IpAddr> {
-    addresses.iter().filter(|address| {
-        address.header.index == index
-            && !address.header.flags.intersects(AddressHeaderFlags::Tentative | AddressHeaderFlags::Dadfailed)
-            && !address.attributes.iter().any(|attribute| matches!(attribute,
-                AddressAttribute::Flags(flags) if flags.intersects(AddressFlags::Tentative | AddressFlags::Dadfailed)))
-    }).filter_map(|address| {
-        address.attributes.iter().find_map(|attribute| match attribute {
-            AddressAttribute::Local(ip) => Some(*ip),
-            _ => None,
-        }).or_else(|| address.attributes.iter().find_map(|attribute| match attribute {
-            AddressAttribute::Address(ip) => Some(*ip),
-            _ => None,
-        }))
-    }).filter(|ip| ip.is_ipv6() == ipv6 && !ip.is_loopback() && !ip.is_unspecified()).collect()
+    let mut usable = BTreeSet::new();
+    for address in addresses {
+        if address.header.index != index
+            || address
+                .header
+                .flags
+                .intersects(AddressHeaderFlags::Tentative | AddressHeaderFlags::Dadfailed)
+        {
+            continue;
+        }
+        if address.attributes.iter().any(|attribute| {
+            matches!(attribute, AddressAttribute::Flags(flags)
+                if flags.intersects(AddressFlags::Tentative | AddressFlags::Dadfailed))
+        }) {
+            continue;
+        }
+        let local = address
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                AddressAttribute::Local(ip) => Some(*ip),
+                _ => None,
+            });
+        let ip = local.or_else(|| {
+            address
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    AddressAttribute::Address(ip) => Some(*ip),
+                    _ => None,
+                })
+        });
+        if let Some(ip) = ip
+            && ip.is_ipv6() == ipv6
+            && !ip.is_loopback()
+            && !ip.is_unspecified()
+        {
+            usable.insert(ip);
+        }
+    }
+    usable
 }
 
 pub(super) async fn snapshot(handle: &Handle, owned_index: u32, mark: u32) -> io::Result<Snapshot> {
@@ -451,5 +478,33 @@ mod tests {
             .attributes
             .push(AddressAttribute::Flags(AddressFlags::Dadfailed));
         assert!(usable_addresses(&[address], 2, true).is_empty());
+    }
+
+    #[test]
+    fn local_address_takes_precedence_even_when_unusable() {
+        let local = "192.0.2.1".parse().unwrap();
+        let mut address = AddressMessage::default();
+        address.header.index = 2;
+        address.attributes = vec![
+            AddressAttribute::Address("192.0.2.2".parse().unwrap()),
+            AddressAttribute::Local(local),
+        ];
+        assert_eq!(
+            usable_addresses(&[address.clone()], 2, false),
+            [local].into()
+        );
+        assert!(usable_addresses(&[address.clone()], 2, true).is_empty());
+        address.attributes.reverse();
+        assert_eq!(
+            usable_addresses(&[address.clone()], 2, false),
+            [local].into()
+        );
+        for ip in ["0.0.0.0", "127.0.0.1", "::", "::1", "2001:db8::1"] {
+            address.attributes[0] = AddressAttribute::Local(ip.parse().unwrap());
+            assert!(
+                usable_addresses(&[address.clone()], 2, false).is_empty(),
+                "{ip}"
+            );
+        }
     }
 }

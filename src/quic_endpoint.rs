@@ -23,6 +23,18 @@ struct ListenerRuntime {
     network: Option<crate::network_tasks::NetworkTasks>,
 }
 
+impl ListenerRuntime {
+    fn spawn_tracked(
+        &self,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        match &self.network {
+            Some(network) => network.spawn(future),
+            None => tokio::spawn(future),
+        }
+    }
+}
+
 impl Runtime for ListenerRuntime {
     fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
         quinn::TokioRuntime.new_timer(deadline)
@@ -40,21 +52,12 @@ impl Runtime for ListenerRuntime {
             }
             return;
         }
-        if self.retired.is_none() {
-            match &self.network {
-                Some(network) => {
-                    network.spawn(future);
-                }
-                None => quinn::TokioRuntime.spawn(future),
-            }
+        let driver = self.spawn_tracked(future);
+        let Some(retired) = self.retired.clone() else {
             return;
-        }
-        let mut driver = AbortOnDropHandle::new(match &self.network {
-            Some(network) => network.spawn(future),
-            None => tokio::spawn(future),
-        });
-        let retired = self.retired.clone().unwrap();
-        let supervisor = async move {
+        };
+        let mut driver = AbortOnDropHandle::new(driver);
+        self.spawn_tracked(async move {
             tokio::select! {
                 _ = &mut driver => {},
                 _ = async {
@@ -64,15 +67,7 @@ impl Runtime for ListenerRuntime {
             }
             // Dropping the endpoint driver closes its connection-event channels.
             // Connection drivers then terminate and wake application waiters.
-        };
-        match &self.network {
-            Some(network) => {
-                network.spawn(supervisor);
-            }
-            None => {
-                tokio::spawn(supervisor);
-            }
-        }
+        });
     }
 
     fn wrap_udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
@@ -138,24 +133,13 @@ impl QuicEndpoint {
         memory_bytes: usize,
         release: Option<oneshot::Sender<()>>,
     ) -> io::Result<Self> {
-        let (runtime, retirement): (Arc<dyn Runtime>, _) = if release.is_some() {
-            let retired = CancellationToken::new();
-            let runtime = ListenerRuntime {
-                endpoint_started: AtomicBool::new(false),
-                retired: Some(retired.clone()),
-                network: crate::network_tasks::NetworkTasks::current(),
-            };
-            (Arc::new(runtime), Some(retired.drop_guard()))
-        } else {
-            (
-                Arc::new(ListenerRuntime {
-                    endpoint_started: AtomicBool::new(false),
-                    retired: None,
-                    network: crate::network_tasks::NetworkTasks::current(),
-                }),
-                None,
-            )
-        };
+        let retired = release.is_some().then(CancellationToken::new);
+        let runtime = Arc::new(ListenerRuntime {
+            endpoint_started: AtomicBool::new(false),
+            retired: retired.clone(),
+            network: crate::network_tasks::NetworkTasks::current(),
+        });
+        let retirement = retired.map(CancellationToken::drop_guard);
         let socket = MemorySocket {
             inner: socket,
             endpoint_memory: None,

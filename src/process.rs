@@ -381,7 +381,7 @@ impl RunningServers {
         self.stop().await;
         lifetime.wait().await;
         prepared.tcp.defer_admission();
-        prepared.dns = prepared.dns.retained_state();
+        prepared.dns.retire_network();
         self.quic_retirements.wait().await
     }
 
@@ -978,7 +978,6 @@ async fn run_inner(
                     _ = lifetime.scope(remote_rule_change(&mut prepared)), if !reconnecting => Change::Reload { debounce: false },
                     _ = watches.changed(&mut changes) => Change::Reload { debounce: true },
                     _ = tokio::time::sleep_until(retry_at), if can_retry => Change::Reconnect,
-                    _ = std::future::ready(()), if pending_reload && !reconnecting => Change::Reload { debounce: false },
                 }
             },
             network,
@@ -998,7 +997,6 @@ async fn run_inner(
                     force_network_reset = network.available();
                     continue;
                 }
-                pending_reload = false;
                 debounce
             }
             Ok(None) | Ok(Some(Change::Reconnect)) => {

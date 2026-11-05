@@ -27,7 +27,7 @@ pub(crate) struct NetworkTasks {
 }
 
 #[derive(Default)]
-pub(crate) struct NetworkLifetime(pub NetworkTasks);
+pub(crate) struct NetworkLifetime(NetworkTasks);
 
 impl NetworkLifetime {
     pub fn untracked() -> Self {
@@ -82,19 +82,24 @@ impl NetworkTasks {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        let (id, future) = self.clone().guard(future);
+        let task = self.tracker.spawn(future);
+        self.attach(id, task.abort_handle());
+        task
+    }
+
+    fn guard<F: Future>(self, future: F) -> (u64, impl Future<Output = F::Output>) {
         let registration = self.register();
         let id = registration.id;
-        let context = self.clone();
         let cancelled = self.cancelled.clone();
-        let task = self.tracker.spawn(CURRENT.scope(context, async move {
+        let future = CURRENT.scope(self, async move {
             let _registration = registration;
             if cancelled.is_cancelled() {
                 std::future::pending::<()>().await;
             }
             future.await
-        }));
-        self.attach(id, task.abort_handle());
-        task
+        });
+        (id, future)
     }
 
     fn register(&self) -> Registration {
@@ -161,19 +166,8 @@ where
     let Some(context) = NetworkTasks::current() else {
         return tasks.spawn(future);
     };
-    let registration = context.register();
-    let id = registration.id;
-    let cancelled = context.cancelled.clone();
-    let task = tasks.spawn(context.tracker.track_future(CURRENT.scope(
-        context.clone(),
-        async move {
-            let _registration = registration;
-            if cancelled.is_cancelled() {
-                std::future::pending::<()>().await;
-            }
-            future.await
-        },
-    )));
+    let (id, future) = context.clone().guard(future);
+    let task = tasks.spawn(context.tracker.track_future(future));
     context.attach(id, task.clone());
     task
 }
