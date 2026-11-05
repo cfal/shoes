@@ -401,6 +401,8 @@ impl RunningServers {
         prepared: &mut PreparedServers,
         network: &mut crate::desktop::NetworkSession,
     ) -> io::Result<()> {
+        // Rejected activation may have published candidate limits and clock.
+        self.configure_runtime(prepared).await?;
         network.refresh_bootstrap()?;
         let endpoints: Vec<_> =
             crate::config::tun_endpoint_ips(&prepared.validated.configs).collect();
@@ -507,15 +509,20 @@ impl RunningServers {
         self.dns_snapshots = None;
     }
 
-    async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
+    async fn configure_runtime(&mut self, prepared: &PreparedServers) -> io::Result<()> {
         resources::configure(prepared.validated.global_limits)?;
-        // Synchronize before retryable binds, including deferred HTTP-01 listeners.
         self.ntp = Some(
             prepared
                 .ntp
                 .start(prepared.dns.forbidden_ranges().to_vec().into())
                 .await,
         );
+        Ok(())
+    }
+
+    async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
+        // Synchronize before retryable binds, including deferred HTTP-01 listeners.
+        self.configure_runtime(prepared).await?;
         prepared.certificates.bind_pending().await?;
         self.reporter = Some(resources::ResourceReporter::start());
         self.dns_snapshots = Some(prepared.dns.snapshot_task());
@@ -639,6 +646,7 @@ impl RunningServers {
         previous: &mut PreparedServers,
         candidate: &mut PreparedServers,
         control: Option<&crate::control::runtime::ControlService>,
+        recovery_network: Option<&mut crate::desktop::NetworkSession>,
     ) -> io::Result<()> {
         self.stop().await;
         candidate
@@ -659,6 +667,9 @@ impl RunningServers {
             log::warn!("Rejected candidate Fake DNS checkpoint failed: {error}");
         }
         previous.tcp.defer_admission();
+        if let Some(network) = recovery_network {
+            self.rebuild_network(previous, network).await?;
+        }
         self.activate(previous, control).await
     }
 }
@@ -1023,14 +1034,14 @@ async fn run_inner(
                 let mut result = tokio::select! {
                     biased;
                     _ = shutdown.recv() => return running.shutdown_network(&[&prepared], network).await,
-                    result = tokio::time::timeout(Duration::from_secs(10), lifetime.scope(async {
+                    result = lifetime.scope(async {
                         if pending_reload {
-                            // Restore rollback state without requiring the old listeners to bind.
-                            running.rebuild_network(&mut prepared, network).await
+                            // Repair must not depend on the accepted DNS configuration recovering.
+                            network.refresh_bootstrap()
                         } else {
                             running.reconnect(&mut prepared, network).await
                         }
-                    })) => result.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "network recovery timed out"))),
+                    }) => result,
                 };
                 // Ownership failures remain terminal, unlike transient worker startup errors.
                 match network.reconcile().await {
@@ -1149,7 +1160,7 @@ async fn run_inner(
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
             Err(error) => {
-                eprintln!("Reload rejected; current servers retained: {error}");
+                report_reload_rejection(&error, reconnecting);
                 continue;
             }
         };
@@ -1160,14 +1171,14 @@ async fn run_inner(
         ) {
             Ok(listeners) => listeners,
             Err(error) => {
-                eprintln!("Reload rejected; current servers retained: {error}");
+                report_reload_rejection(&error, reconnecting);
                 continue;
             }
         };
         if let (Some(control), Some(generation)) = (control.as_ref(), candidate.generation.as_ref())
             && let Err(error) = control.runtime.begin_activation(generation).await
         {
-            eprintln!("Reload rejected; current servers retained: {error}");
+            report_reload_rejection(&error, reconnecting);
             continue;
         }
         let retirement = async {
@@ -1199,7 +1210,7 @@ async fn run_inner(
             let rollback = tokio::select! {
                 biased;
                 _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
-                result = lifetime.scope(running.rollback(&mut prepared, &mut candidate, control.as_ref())) => result,
+                result = lifetime.scope(running.rollback(&mut prepared, &mut candidate, control.as_ref(), reconnecting.then_some(&mut *network))) => result,
             };
             if let Err(rollback) = rollback {
                 if reconnecting {
@@ -1241,6 +1252,15 @@ async fn run_inner(
         }
         println!("Servers ready");
     }
+}
+
+fn report_reload_rejection(error: &io::Error, reconnecting: bool) {
+    let status = if reconnecting {
+        "workers unavailable, recovery continues"
+    } else {
+        "current servers retained"
+    };
+    eprintln!("Reload rejected; {status}: {error}");
 }
 
 async fn wait_with_reconciliation<T>(

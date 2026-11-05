@@ -143,6 +143,10 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
             String::from_utf8_lossy(&output.stderr)
                 .contains("Reload rejected; previous servers unavailable, recovery continues:")
         );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("Reload rejected; workers unavailable, recovery continues:")
+        );
         return;
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -214,6 +218,17 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
                     .await
                     .is_err()
             );
+            std::fs::write(&path, "invalid: [").unwrap();
+            assert_eq!(
+                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
+                0
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), queued.read_u8())
+                    .await
+                    .is_err()
+            );
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
             assert_eq!(
                 unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
                 0
@@ -249,6 +264,138 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
     })
     .await
     .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reconnect_respects_dns_deadlines_and_remains_shutdown_cancellable() {
+    const NAME: &str =
+        "process::tests::reconnect_respects_dns_deadlines_and_remains_shutdown_cancellable";
+    const CHILD: &str = "SHOES_RECONNECT_DNS_DEADLINE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(NAME, CHILD, "1");
+        return;
+    }
+    use hickory_resolver::proto::op::Message;
+    use hickory_resolver::proto::rr::{RData, Record, RecordType, rdata};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::task::AbortOnDropHandle;
+
+    async fn greet(address: std::net::SocketAddr) -> tokio::net::TcpStream {
+        loop {
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(address).await {
+                stream.write_all(&[5, 1, 0]).await.unwrap();
+                let mut reply = [0; 2];
+                stream.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply, [5, 0]);
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    for repair_reload in [false, true] {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let dns = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let dns_address = dns.local_addr().unwrap();
+            let delay = Arc::new(AtomicU64::new(0));
+            let response_delay = delay.clone();
+            let (requested, mut requests) = mpsc::unbounded_channel();
+            let _dns = AbortOnDropHandle::new(tokio::spawn(async move {
+                let mut responses = tokio::task::JoinSet::new();
+                let mut bytes = [0; 1500];
+                loop {
+                    let (length, peer) = tokio::select! {
+                        result = dns.recv_from(&mut bytes) => result.unwrap(),
+                        _ = responses.join_next(), if !responses.is_empty() => continue,
+                    };
+                    let mut reply = Message::from_vec(&bytes[..length]).unwrap().into_response();
+                    assert_eq!(reply.queries[0].query_type, RecordType::A);
+                    reply.add_answer(Record::from_rdata(
+                        reply.queries[0].name().clone(),
+                        300,
+                        RData::A(rdata::A::new(127, 0, 0, 1)),
+                    ));
+                    let bytes = reply.to_vec().unwrap();
+                    let socket = dns.clone();
+                    let delay = Duration::from_secs(response_delay.load(Ordering::Relaxed));
+                    requested.send(()).unwrap();
+                    responses.spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        socket.send_to(&bytes, peer).await.unwrap();
+                    });
+                }
+            }));
+            let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = reserved.local_addr().unwrap();
+            let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let added = second.local_addr().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.json");
+            let mut config = vec![
+                serde_json::json!({"dns_group":"bootstrap", "dns_servers":[{
+                    "url":format!("udp://{dns_address}"), "timeout_secs":20,
+                    "ip_strategy":"ipv4_only", "attempts":1
+                }]}),
+                serde_json::json!({"dns_group":"upstream", "dns_servers":[{
+                    "url":"udp://upstream.test", "bootstrap_url":"bootstrap"
+                }]}),
+                serde_json::json!({"address":address.to_string(), "protocol":{"type":"socks"}}),
+            ];
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            drop((reserved, second));
+            let (events, receiver) = mpsc::channel(1);
+            let (ack, _reconciled) = mpsc::channel(1);
+            let network = crate::desktop::NetworkSession::with_test_events(receiver, ack);
+            let process = crate::desktop::TEST_NETWORK.scope(
+                std::cell::RefCell::new(Some(network)),
+                Box::pin(run(vec![path.to_string_lossy().into_owned()], false, true)),
+            );
+            tokio::pin!(process);
+            let fixture = async {
+                let mut live = greet(address).await;
+                while requests.try_recv().is_ok() {}
+                events.send(Some(false)).await.unwrap();
+                assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
+                if repair_reload {
+                    config.drain(..2);
+                    config.push(serde_json::json!({"address":added.to_string(), "protocol":{"type":"socks"}}));
+                    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+                    assert_eq!(unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) }, 0);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                delay.store(if repair_reload { 60 } else { 11 }, Ordering::Relaxed);
+                events.send(Some(true)).await.unwrap();
+                if !repair_reload {
+                    requests.recv().await.unwrap();
+                }
+                let mut live = tokio::time::timeout(
+                    Duration::from_secs(if repair_reload { 3 } else { 15 }),
+                    greet(if repair_reload { added } else { address }),
+                ).await.expect("recovery cancelled a valid slow DNS bootstrap");
+                if repair_reload {
+                    assert!(requests.try_recv().is_err(), "repair rebuilt the broken accepted DNS config");
+                }
+                if !repair_reload {
+                    events.send(Some(false)).await.unwrap();
+                    assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
+                    delay.store(60, Ordering::Relaxed);
+                    events.send(Some(true)).await.unwrap();
+                    requests.recv().await.unwrap();
+                }
+                assert_eq!(unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) }, 0);
+            };
+            tokio::select! {
+                result = &mut process => panic!("process exited before recovery: {result:?}"),
+                _ = fixture => {},
+            }
+            tokio::time::timeout(Duration::from_secs(3), process).await.unwrap().unwrap();
+        }).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -318,6 +465,110 @@ async fn reconnect_restarts_certificate_workers_retired_by_a_rejected_candidate(
         .unwrap();
     challenge(address).await;
     running.shutdown(&[&prepared]).await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_rollback_restores_runtime_before_dns_bootstrap() {
+    const NAME: &str = "process::tests::recovery_rollback_restores_runtime_before_dns_bootstrap";
+    const CHILD: &str = "SHOES_RECOVERY_ROLLBACK_RUNTIME_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        shoes_test_support::isolated::run_isolated(NAME, CHILD, "1");
+        return;
+    }
+    use hickory_resolver::proto::{
+        op::Message,
+        rr::{RData, Record, rdata},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::task::AbortOnDropHandle;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_address = dns.local_addr().unwrap();
+        let (observed, mut observations) = mpsc::unbounded_channel();
+        let _dns = AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut bytes = [0; 1500];
+            loop {
+                let (length, peer) = dns.recv_from(&mut bytes).await.unwrap();
+                // Bootstrap transports consume live admission and the published TLS clock.
+                observed.send((
+                    resources::try_quic_memory(2).is_some(),
+                    crate::clock::now().unwrap().duration_since(std::time::SystemTime::now()).unwrap_or_default(),
+                )).unwrap();
+                let mut reply = Message::from_vec(&bytes[..length]).unwrap().into_response();
+                reply.add_answer(Record::from_rdata(
+                    reply.queries[0].name().clone(), 300,
+                    RData::A(rdata::A::new(127, 0, 0, 1)),
+                ));
+                dns.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+            }
+        }));
+        let ntp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ntp_address = ntp.local_addr().unwrap();
+        let ntp_reply = tokio::spawn(async move {
+            let mut request = [0; 48];
+            let (_, peer) = ntp.recv_from(&mut request).await.unwrap();
+            let mut response = [0; 48];
+            response[0] = 0x24;
+            response[1] = 1;
+            response[3] = (-20i8) as u8;
+            response[24..32].copy_from_slice(&request[40..48]);
+            let timestamp = (u64::from_be_bytes(request[40..48].try_into().unwrap())
+                + (86_400u64 << 32)).to_be_bytes();
+            response[32..40].copy_from_slice(&timestamp);
+            response[40..48].copy_from_slice(&timestamp);
+            ntp.send_to(&response, peer).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        let paths = [path.to_string_lossy().into_owned()];
+        std::fs::write(&path, serde_json::json!([
+            {"dns_group":"bootstrap", "dns_servers":[{
+                "url":format!("udp://{dns_address}"), "ip_strategy":"ipv4_only", "attempts":1
+            }]},
+            {"dns_group":"upstream", "dns_servers":[{
+                "url":"udp://upstream.test", "bootstrap_url":"bootstrap"
+            }]},
+            {"address":address.to_string(), "protocol":{"type":"socks"}, "dns":{"servers":"upstream"}}
+        ]).to_string()).unwrap();
+        drop(reserved);
+        let old = crate::network_tasks::NetworkLifetime::default();
+        let mut previous = old.scope(prepare(&paths, None)).await.unwrap();
+        let mut running = RunningServers::default();
+        old.scope(running.activate(&mut previous, None)).await.unwrap();
+        assert!(observations.recv().await.unwrap().0);
+        running.pause_network(&mut previous, None, &old).await.unwrap();
+
+        std::fs::write(&path, serde_json::json!([
+            {"global_settings":{"quic_memory_bytes":1,
+                "ntp":{"server":ntp_address.to_string(), "timeout_secs":1}}},
+            {"path":directory.path(), "protocol":{"type":"socks"}}
+        ]).to_string()).unwrap();
+        let fresh = crate::network_tasks::NetworkLifetime::default();
+        let mut candidate = fresh.scope(prepare(&paths, Some(&previous.dns))).await.unwrap();
+        fresh.scope(running.activate(&mut candidate, None)).await.unwrap_err();
+        ntp_reply.await.unwrap();
+        assert_eq!(resources::limits().quic_memory_bytes, Some(1));
+        assert!(crate::clock::now().unwrap() > std::time::SystemTime::now() + Duration::from_secs(86_399));
+        fresh.scope(running.rollback(
+            &mut previous, &mut candidate, None,
+            Some(&mut crate::desktop::NetworkSession::default()),
+        )).await.unwrap();
+        let (admitted, offset) = observations.recv().await.unwrap();
+        assert!(admitted, "rollback bootstrap used the rejected QUIC limit");
+        assert!(offset < Duration::from_secs(1), "rollback bootstrap used the rejected clock: {offset:?}");
+        assert!(previous.dns.get_by_name("upstream").is_some());
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(&[5, 1, 0]).await.unwrap();
+        let mut reply = [0; 2];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [5, 0]);
+        running.pause_network(&mut previous, None, &fresh).await.unwrap();
+        running.shutdown(&[&previous, &candidate]).await.unwrap();
+    }).await.unwrap();
 }
 
 #[tokio::test]
@@ -659,7 +910,7 @@ async fn rejected_or_cancelled_activation_does_not_admit_candidate_dns_flows() {
             } else {
                 // Covers failure after listener startup but before activation commits.
                 running
-                    .rollback(&mut previous, &mut candidate, None)
+                    .rollback(&mut previous, &mut candidate, None, None)
                     .await
                     .unwrap();
             }
