@@ -1,3 +1,4 @@
+mod address_watch;
 mod detour;
 mod io;
 #[cfg(test)]
@@ -520,6 +521,12 @@ impl PreparedEndpoint {
                 config.mtu,
             );
         }
+        // Only the direct path needs a watcher; a detour reconnects through `on_connect`.
+        let watch_targets: Vec<SocketAddr> = if phobos.is_some() && outer_chain.is_none() {
+            peers.iter().filter_map(|peer| peer.endpoint).collect()
+        } else {
+            Vec::new()
+        };
         let builder = DeviceBuilder::new()
             .with_private_key(StaticSecret::from(config.private_key.0))
             .with_peers(peers)
@@ -540,8 +547,7 @@ impl PreparedEndpoint {
             Some(amnezia) => builder.with_amnezia(amnezia.to_gotatun()?),
             None => builder,
         };
-        // The handle stays available for a direct-path watcher reporting local address changes.
-        let (mut device, _phobos_handle) = match phobos {
+        let (mut device, phobos_handle) = match phobos {
             Some(phobos) => {
                 let (udp, handle) = PhobosUdpFactory::new(udp, phobos)
                     .map_err(|error| startup_error(error.into()))?;
@@ -565,6 +571,7 @@ impl PreparedEndpoint {
         });
         let connector = self.connector.clone();
         let name = config.id.clone();
+        let bind_interface = config.bind_interface.clone();
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
         let task = tokio::spawn(async move {
@@ -573,6 +580,16 @@ impl PreparedEndpoint {
             if let Some((selector, resolver)) = inbound {
                 inbound_udp_count = Some(spawn_inbound(
                     &mut tasks, &mut stack, selector, resolver, limits,
+                ));
+            }
+            if let Some(handle) = phobos_handle.filter(|_| !watch_targets.is_empty()) {
+                tasks.spawn(address_watch::run(
+                    watch_targets,
+                    address_watch::OsProbe {
+                        interface: bind_interface,
+                    },
+                    address_watch::WATCH_INTERVAL,
+                    move || handle.address_changed(),
                 ));
             }
             let mut report = tokio::time::interval(std::time::Duration::from_secs(60));
