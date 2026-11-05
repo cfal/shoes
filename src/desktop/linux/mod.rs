@@ -146,13 +146,11 @@ impl Session {
         .await?;
         self.record.ifindex = Some(index);
         self.journal.save(&self.record)?;
-        let ingress = self
-            .ingress
-            .insert(Arc::new(Ingress::new(&self.record.spec, device)?));
+        let ingress = Ingress::new(&self.record.spec, device, &self.handle).await?;
+        let ingress = self.ingress.insert(Arc::new(ingress));
         self.redirect_ports = ingress.ports()?;
         self.on_link = routes::on_link(&self.handle, index).await?;
-        routes::configure(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
-        let bytes = command::encode_nft(self.firewall_policy())?;
+        let bytes = command::encode_nft(self.firewall_policy(false))?;
         command::run(
             self.journal.lease(),
             &self.nft,
@@ -160,6 +158,11 @@ impl Session {
             &bytes,
         )
         .await?;
+        self.record.firewall_pending = true;
+        self.journal.save(&self.record)?;
+        command::run(self.journal.lease(), &self.nft, &["-j", "-f", "-"], &bytes).await?;
+        check_firewall(self.journal.lease(), &self.nft, &self.record).await?;
+        routes::configure(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
         Ok(())
     }
 
@@ -167,13 +170,14 @@ impl Session {
         self.ingress.clone()
     }
 
-    fn firewall_policy(&self) -> serde_json::Value {
+    fn firewall_policy(&self, active: bool) -> serde_json::Value {
         nft::install(
             &self.record.spec,
             &self.record.table(),
             &self.record.token,
             &self.on_link,
             self.redirect_ports,
+            active,
         )
     }
 
@@ -194,9 +198,18 @@ impl Session {
             &self.record.alias(),
         )
         .await?;
-        self.record.firewall_pending = true;
-        self.journal.save(&self.record)?;
-        command::nft(self.journal.lease(), &self.nft, self.firewall_policy()).await?;
+        self.ingress
+            .as_ref()
+            .unwrap()
+            .check_redirects(&self.handle)
+            .await?;
+        check_firewall(self.journal.lease(), &self.nft, &self.record).await?;
+        command::nft(
+            self.journal.lease(),
+            &self.nft,
+            nft::replace(&self.record.table(), self.firewall_policy(true)),
+        )
+        .await?;
         check_firewall(self.journal.lease(), &self.nft, &self.record).await?;
         if let Some(resolved) = &self.resolved {
             self.record.dns_pending = true;
@@ -229,6 +242,11 @@ impl Session {
             crate::socket_policy::check_dns_endpoint(endpoint.ip())?;
         }
         routes::check(&self.handle, &self.record.spec, index, &self.record.alias()).await?;
+        self.ingress
+            .as_ref()
+            .unwrap()
+            .check_redirects(&self.handle)
+            .await?;
         check_firewall(self.journal.lease(), &self.nft, &self.record).await?;
         let networks = routes::on_link(&self.handle, index).await?;
         if networks != self.on_link {
@@ -249,11 +267,16 @@ impl Session {
             return Ok(());
         }
         let mut errors = Vec::new();
-        if self.record.firewall_pending {
-            match remove_firewall(self.journal.lease(), &self.nft, &self.record).await {
-                Ok(()) => self.record.firewall_pending = false,
-                Err(error) => errors.push(error.to_string()),
-            }
+        if self.record.firewall_pending
+            && let Err(error) = quiesce_firewall(
+                self.journal.lease(),
+                &self.nft,
+                &self.record,
+                self.redirect_ports,
+            )
+            .await
+        {
+            errors.push(error.to_string());
         }
         if self.record.dns_pending
             && let Some(resolved) = &self.resolved
@@ -278,6 +301,19 @@ impl Session {
         }
         remove_routing(&self.handle, &self.record, &mut errors).await;
         self.ingress = None;
+        if self.record.firewall_pending {
+            match remove_detached_firewall(
+                &self.handle,
+                self.journal.lease(),
+                &self.nft,
+                &self.record,
+            )
+            .await
+            {
+                Ok(()) => self.record.firewall_pending = false,
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
         if errors.is_empty() {
             self.journal.clear()?;
             self.started = false;
@@ -336,6 +372,44 @@ async fn remove_firewall(
     Ok(())
 }
 
+async fn quiesce_firewall(
+    lease: BorrowedFd<'_>,
+    executable: &str,
+    record: &Record,
+    redirect_ports: [Option<u16>; 2],
+) -> io::Result<()> {
+    let mut policy = nft::install(
+        &record.spec,
+        &record.table(),
+        &record.token,
+        &[],
+        redirect_ports,
+        false,
+    );
+    if firewall_exists(lease, executable, record).await? {
+        policy = nft::replace(&record.table(), policy);
+    }
+    command::nft(lease, executable, policy).await
+}
+
+async fn remove_detached_firewall(
+    handle: &Handle,
+    lease: BorrowedFd<'_>,
+    executable: &str,
+    record: &Record,
+) -> io::Result<()> {
+    // An alias change does not prove the original interface stopped receiving traffic.
+    if routes::link(handle, &record.spec.name)
+        .await?
+        .is_some_and(|link| record.ifindex == Some(link.header.index))
+    {
+        return Err(io::Error::other(
+            "managed TUN still exists; retaining its egress guard",
+        ));
+    }
+    remove_firewall(lease, executable, record).await
+}
+
 async fn remove_link(handle: &Handle, record: &Record) -> io::Result<()> {
     let Some(link) = routes::link(handle, &record.spec.name).await? else {
         return Ok(());
@@ -366,7 +440,7 @@ async fn remove_routing(handle: &Handle, record: &Record, errors: &mut Vec<Strin
 async fn recover(handle: &Handle, nft: &str, journal: &Journal, record: &Record) -> io::Result<()> {
     let mut errors = Vec::new();
     if record.firewall_pending
-        && let Err(error) = remove_firewall(journal.lease(), nft, record).await
+        && let Err(error) = quiesce_firewall(journal.lease(), nft, record, [None, None]).await
     {
         errors.push(error.to_string());
     }
@@ -381,6 +455,11 @@ async fn recover(handle: &Handle, nft: &str, journal: &Journal, record: &Record)
         }
     }
     remove_routing(handle, record, &mut errors).await;
+    if record.firewall_pending
+        && let Err(error) = remove_detached_firewall(handle, journal.lease(), nft, record).await
+    {
+        errors.push(error.to_string());
+    }
     failures(errors)?;
     journal.clear()
 }

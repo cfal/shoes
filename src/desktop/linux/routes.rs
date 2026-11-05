@@ -18,6 +18,7 @@ use rtnetlink::{Handle, IpVersion, LinkUnspec, RouteMessageBuilder};
 use super::spec::{Spec, invalid};
 
 const PROTOCOL: RouteProtocol = RouteProtocol::Other(233);
+const FALLBACK_PRIORITY: u32 = 32768;
 
 pub(super) async fn request<T>(
     future: impl std::future::Future<Output = Result<T, rtnetlink::Error>>,
@@ -124,6 +125,31 @@ pub(super) fn rule(spec: &Spec, ipv6: bool) -> RuleMessage {
     message
 }
 
+pub(super) fn fallback_rule(spec: &Spec, ipv6: bool) -> RuleMessage {
+    let mut message = rule(spec, ipv6);
+    // The kernel omits FRA_FWMARK when zero; the full mask still matches only zero.
+    message.attributes = vec![
+        RuleAttribute::Table(spec.linux.table),
+        RuleAttribute::Priority(FALLBACK_PRIORITY),
+        RuleAttribute::Iifname("lo".into()),
+        RuleAttribute::FwMask(u32::MAX),
+        RuleAttribute::Protocol(PROTOCOL),
+    ];
+    message
+}
+
+fn has_fallback(spec: &Spec, ipv6: bool) -> bool {
+    spec.routes.iter().any(|route| route.is_ipv6() == ipv6)
+}
+
+fn configured_rules(spec: &Spec, ipv6: bool) -> Vec<RuleMessage> {
+    let mut rules = vec![rule(spec, ipv6)];
+    if has_fallback(spec, ipv6) {
+        rules.push(fallback_rule(spec, ipv6));
+    }
+    rules
+}
+
 pub(super) fn same_rule(actual: &RuleMessage, expected: &RuleMessage) -> bool {
     let mut actual = actual.clone();
     let mut expected = expected.clone();
@@ -160,6 +186,15 @@ pub(super) async fn preflight(handle: &Handle, spec: &Spec) -> io::Result<()> {
         for rule in rules(handle, ipv6).await? {
             if configured {
                 check_precedence(&rule, spec)?;
+                if has_fallback(spec, ipv6)
+                    && rule
+                        .attributes
+                        .contains(&RuleAttribute::Priority(FALLBACK_PRIORITY))
+                {
+                    return Err(invalid(
+                        "managed TUN fallback priority 32768 is already in use; stop the conflicting routing manager",
+                    ));
+                }
                 if references_reservation(&rule, spec) {
                     return Err(invalid(
                         "managed TUN rule priority or routing table is already referenced",
@@ -192,27 +227,8 @@ pub(super) async fn preflight(handle: &Handle, spec: &Spec) -> io::Result<()> {
         if configured && routes.iter().any(|route| table(route) == spec.linux.table) {
             return Err(invalid("managed TUN routing table is not empty"));
         }
-        if configured && !routes.iter().any(native_default) {
-            return Err(invalid(
-                "managed TUN requires an underlying main-table default route without source or TOS constraints for each configured IP family",
-            ));
-        }
     }
     Ok(())
-}
-
-pub(super) fn native_default(route: &RouteMessage) -> bool {
-    table(route) == 254
-        && route.header.kind == RouteType::Unicast
-        && route.header.destination_prefix_length == 0
-        && route.header.source_prefix_length == 0
-        && route.header.tos == 0
-        && !route.attributes.iter().any(|attribute| {
-            matches!(
-                attribute,
-                RouteAttribute::Source(_) | RouteAttribute::Iif(_) | RouteAttribute::Mark(_)
-            )
-        })
 }
 
 pub(super) fn check_mark_reservation(rule: &RuleMessage, spec: &Spec) -> io::Result<()> {
@@ -244,6 +260,10 @@ pub(super) fn check_mark_reservation(rule: &RuleMessage, spec: &Spec) -> io::Res
 fn references_reservation(rule: &RuleMessage, spec: &Spec) -> bool {
     rule.attributes
         .contains(&RuleAttribute::Priority(spec.linux.rule_priority))
+        || (has_fallback(spec, rule.header.family == AddressFamily::Inet6)
+            && rule
+                .attributes
+                .contains(&RuleAttribute::Priority(FALLBACK_PRIORITY)))
         || rule
             .attributes
             .contains(&RuleAttribute::Table(spec.linux.table))
@@ -423,6 +443,21 @@ pub(super) async fn configure(
     index: u32,
     alias: &str,
 ) -> io::Result<()> {
+    if spec.addresses.iter().any(IpNetwork::is_ipv6) {
+        let path = format!("/proc/sys/net/ipv6/conf/{}/disable_ipv6", spec.name);
+        let context = |error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to enable IPv6 on managed TUN {}: {error}",
+                    spec.name
+                ),
+            )
+        };
+        if std::fs::read_to_string(&path).map_err(context)?.trim() != "0" {
+            std::fs::write(&path, "0").map_err(context)?;
+        }
+    }
     request(
         handle
             .link()
@@ -463,22 +498,27 @@ pub(super) async fn configure(
                 .execute(),
         )
         .await?;
-        let mut add = handle.rule().add();
-        *add.message_mut() = rule(spec, ipv6);
-        request(add.execute()).await?;
+        for rule in configured_rules(spec, ipv6) {
+            let mut add = handle.rule().add();
+            *add.message_mut() = rule;
+            request(add.execute()).await?;
+        }
     }
     Ok(())
 }
 
 pub(super) async fn remove_rules(handle: &Handle, spec: &Spec) -> io::Result<()> {
     for ipv6 in families(spec) {
-        let expected = rule(spec, ipv6);
+        let expected_rules = [rule(spec, ipv6), fallback_rule(spec, ipv6)];
         for actual in rules(handle, ipv6).await? {
-            if same_rule(&actual, &expected) {
+            if expected_rules
+                .iter()
+                .any(|expected| same_rule(&actual, expected))
+            {
                 request(handle.rule().del(actual).execute()).await?;
             } else if references_reservation(&actual, spec) {
                 return Err(io::Error::other(
-                    "managed TUN rule was changed externally; refusing to remove it",
+                    "managed TUN policy rule is changed or conflicting; refusing to remove it",
                 ));
             }
         }
@@ -521,12 +561,16 @@ pub(super) async fn check(handle: &Handle, spec: &Spec, index: u32, alias: &str)
     for ipv6 in [false, true] {
         let configured = families(spec).any(|family| family == ipv6);
         let rules = rules(handle, ipv6).await?;
-        let expected = rule(spec, ipv6);
+        let expected_rules = configured_rules(spec, ipv6);
         for actual in &rules {
             if configured {
                 check_precedence(actual, spec)?;
             }
-            if !configured || !same_rule(actual, &expected) {
+            if !configured
+                || !expected_rules
+                    .iter()
+                    .any(|expected| same_rule(actual, expected))
+            {
                 check_mark_reservation(actual, spec)?;
             }
         }
@@ -537,9 +581,17 @@ pub(super) async fn check(handle: &Handle, spec: &Spec, index: u32, alias: &str)
             .iter()
             .filter(|rule| references_reservation(rule, spec))
             .collect();
-        if reserved.len() != 1 || !same_rule(reserved[0], &expected) {
+        if reserved.len() != expected_rules.len()
+            || expected_rules.iter().any(|expected| {
+                reserved
+                    .iter()
+                    .filter(|actual| same_rule(actual, expected))
+                    .count()
+                    != 1
+            })
+        {
             return Err(io::Error::other(
-                "managed TUN policy rule disappeared or changed",
+                "managed TUN policy rules are missing, changed, or conflicting",
             ));
         }
         let routes = dump(handle, ipv6).await?;
