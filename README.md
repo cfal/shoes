@@ -52,7 +52,7 @@ All server protocols plus:
 - **Sudoku TCP mask** (Xray FinalMask-compatible, composable client/server wrapper; [configuration](https://shoes-rs.github.io/protocols/sudoku/))
 
 ### TUN/VPN Mode
-- **WireGuard** - Userspace TCP/UDP server and client protocols using GotaTun, without root, an OS TUN, or host route changes (Unix only). See [WireGuard configuration](https://shoes-rs.github.io/protocols/wireguard/).
+- **WireGuard** - Userspace TCP/UDP server and client protocols using GotaTun, without root, an OS TUN, or host route changes (Unix only). Optional AmneziaWG 2.0/3.0/3.1 obfuscation on servers and clients, and a Phobos client. See [WireGuard configuration](https://shoes-rs.github.io/protocols/wireguard/).
 - **TUN device support** - Layer 3 VPN for transparent proxying
 - Supported platforms: Linux, Android, iOS
 

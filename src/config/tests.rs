@@ -176,7 +176,7 @@ fn tcp_settings_reject_unknown_fields_for_servers_and_clients() {
 
 #[tokio::test]
 async fn representative_examples_pass_native_validation() {
-    for example in [
+    let portable = [
         "quickstart_socks.yaml",
         "socks_basic.yaml",
         "snell.yaml",
@@ -188,7 +188,17 @@ async fn representative_examples_pass_native_validation() {
         "url_test.yaml",
         "rule_sources.yaml",
         "rule_conditions.yaml",
-    ] {
+    ];
+    // WireGuard is Unix only, so its examples fail validation elsewhere.
+    #[cfg(unix)]
+    let wireguard = [
+        "amneziawg_server.yaml",
+        "amneziawg_client.yaml",
+        "phobos_client.yaml",
+    ];
+    #[cfg(not(unix))]
+    let wireguard: [&str; 0] = [];
+    for example in portable.into_iter().chain(wireguard) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples")
             .join(example);
@@ -205,6 +215,9 @@ async fn representative_examples_pass_native_validation() {
             crate::control::validation::validate_resources(&validated)
                 .unwrap_or_else(|error| panic!("{example}: {error}"));
         }
-        assert!(!validated.configs.is_empty(), "{example}");
+        assert!(
+            !validated.configs.is_empty() || !validated.wireguard_endpoints.is_empty(),
+            "{example}"
+        );
     }
 }

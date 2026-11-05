@@ -1,0 +1,32 @@
+# AmneziaWG 3.0 server. Demonstration keys only: generate new keys before deployment.
+# The amnezia block applies to every peer, and clients must use the same values.
+- address: "0.0.0.0:51820"
+  protocol:
+    type: wireguard
+    wireguard_name: amnezia-gateway
+    private_key: "KSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSk="
+    addresses: ["10.78.0.1/32"]
+    peers:
+      - public_key: "B6r/Pp/BZydVRPTDpqF82Dfy7G54zYpXsePfs8wDWnY="
+        allowed_ips: ["10.78.0.2/32"]
+    amnezia:
+      jc: 3
+      jmin: 40
+      jmax: 70
+      s1: 15
+      s2: 18
+      s3: 20
+      s4: 23
+      h1: "100000-100100"
+      h2: "200000-200100"
+      h3: "300000-300100"
+      h4: "400000-400100"
+      i1: "<b 0xc0ffee><r 16><t>"
+      header_protection_key: "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+      content_padding_addition: "0-32"
+      rekey_after_time: "110-130"
+  rules:
+    - masks: ["127.0.0.0/8", "::1/128", "169.254.0.0/16", "fe80::/10"]
+      action: block
+    - masks: ["0.0.0.0/0", "::/0"]
+      action: allow
