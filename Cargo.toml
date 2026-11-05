@@ -209,7 +209,7 @@ tempfile = "*"
 tokio-rustls = "*"
 
 [target.'cfg(unix)'.dependencies]
-gotatun = { version = "*", default-features = false, features = ["device", "aws-lc-rs"] }
+gotatun = { git = "https://github.com/AYastrebov/gotatun", rev = "2c0310622178217168e2c26be2ae913be76efe4f", default-features = false, features = ["device", "aws-lc-rs", "amnezia", "phobos"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.24"

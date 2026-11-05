@@ -86,15 +86,21 @@ class ReleaseNoticesTests(unittest.TestCase):
         metadata = json.loads(subprocess.check_output([
             "cargo", "metadata", *cargo_options, "--format-version", "1",
         ]))
-        gotatun_versions = [p["version"] for p in metadata["packages"] if p["name"] == "gotatun"]
-        self.assertEqual(len(gotatun_versions), 1)
-        version = gotatun_versions[0]
+        gotatun = [p for p in metadata["packages"] if p["name"] == "gotatun"]
+        self.assertEqual(len(gotatun), 1)
+        version = gotatun[0]["version"]
         source_notice = (NOTICES.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
-        for required in [
+        required_links = [
             f"GotaTun {version},",
             f"https://crates.io/api/v1/crates/gotatun/{version}/download",
             f"https://github.com/mullvad/gotatun/tree/v{version}",
-        ]:
+        ]
+        source = gotatun[0]["source"] or ""
+        if source.startswith("git+"):
+            # MPL corresponding source must name the locked revision, not a moving branch.
+            repository, revision = source[len("git+"):].split("#", 1)
+            required_links.append(f"{repository.split('?', 1)[0]}/tree/{revision}")
+        for required in required_links:
             self.assertIn(required, source_notice)
         bundle = (NOTICES.ROOT / "licenses/dependencies.txt").read_text()
         original_notices = {

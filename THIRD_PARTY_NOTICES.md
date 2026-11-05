@@ -68,19 +68,27 @@ invokes it before uploading tarballs. Do not remove the bundle when redistributi
 ## WireGuard Source
 
 Unix builds, including Android and iOS libraries, link GotaTun 0.10.2, an
-implementation of the WireGuard protocol. GotaTun is copyright Mullvad VPN AB
-and incorporates work copyright Cloudflare, Inc. Its source files are covered
+implementation of the WireGuard protocol, from a fork with AmneziaWG and Phobos
+obfuscation (AYastrebov/gotatun). GotaTun is copyright Mullvad VPN AB and
+incorporates work copyright Cloudflare, Inc. Its source files are covered
 by the Mozilla Public License 2.0 and the notices reproduced in
 `licenses/MPL-2.0.txt` and `licenses/gotatun-CLOUDFLARE.txt`.
 
-The unmodified corresponding source is available at:
+The corresponding source, including the fork's modifications, is the revision
+recorded in `Cargo.lock`, available at:
 
+- https://github.com/AYastrebov/gotatun/tree/2c0310622178217168e2c26be2ae913be76efe4f
+
+The fork is based on upstream GotaTun after the 0.10.2 release. The upstream
+commit it branches from, and the 0.10.2 release, are available at:
+
+- https://github.com/mullvad/gotatun/tree/16937ec6219afbece5aa69ece91f41e12d04d3c5
 - https://crates.io/api/v1/crates/gotatun/0.10.2/download
 - https://github.com/mullvad/gotatun/tree/v0.10.2
 
 Recipients may obtain, modify, and redistribute the covered source under the
-MPL 2.0. Shoes does not modify GotaTun's source. Shoes' own source remains under
-its existing MIT license. Distributors of modified GotaTun builds must also
+MPL 2.0. Shoes itself does not modify GotaTun's source; the fork above does.
+Shoes' own source remains under its existing MIT license. Distributors of modified GotaTun builds must also
 provide the corresponding modified covered source and retain these notices.
 Embedding a Shoes static or dynamic library does not remove these obligations.
 
