@@ -60,6 +60,7 @@ pub(super) fn install(
     owner: &str,
     on_link: &[IpNetwork],
     redirect: [Option<u16>; 2],
+    active: bool,
 ) -> Value {
     let mut commands = vec![json!({"create": {"table": {"family": "inet", "name": table}}})];
     for (name, hook) in [
@@ -69,6 +70,7 @@ pub(super) fn install(
         ("redirect", Some(("nat", "output", -100))),
         ("guard", Some(("filter", "input", -10))),
         ("prerouting", Some(("filter", "prerouting", -175))),
+        ("egress", Some(("filter", "postrouting", 0))),
     ] {
         let mut chain = json!({"family": "inet", "table": table, "name": name});
         if let Some((kind, hook, priority)) = hook {
@@ -105,6 +107,20 @@ pub(super) fn install(
     let mask = spec.linux.mark_mask;
     let capture = spec.linux.capture_mark;
     let bypass = spec.linux.bypass_mark;
+    // POSTROUTING sees the final device after mark/NAT rerouting. Missing conntrack
+    // metadata must fall through to the drop, not authorize fallback traffic.
+    rule(
+        "egress",
+        "authorized-egress",
+        vec![
+            matches(meta("oifname"), "==", json!(spec.name)),
+            matches(meta("mark"), "==", json!(capture)),
+            matches(masked(ct("mark"), mask), "==", json!(capture)),
+            matches(ct("direction"), "==", json!("original")),
+            json!({"return": null}),
+        ],
+    );
+    rule("egress", "uncaptured-egress", drop_tun_egress(spec));
     // Mark-aware reverse-path filters must find the private route for replies injected by the TUN.
     rule(
         "prerouting",
@@ -169,6 +185,23 @@ pub(super) fn install(
             json!({"return": null}),
         ],
     );
+    if spec.auto_dns {
+        // Published resolver endpoints remain reachable with split routes and exclusions.
+        for address in spec.dns_addresses().expect("validated automatic DNS peers") {
+            let family = if address.is_ipv6() { "ip6" } else { "ip" };
+            for protocol in ["tcp", "udp"] {
+                rule(
+                    "output",
+                    "virtual-dns",
+                    vec![
+                        matches(payload(family, "daddr"), "==", json!(address)),
+                        matches(payload(protocol, "dport"), "==", json!(53)),
+                        json!({"goto": {"target": "capture"}}),
+                    ],
+                );
+            }
+        }
+    }
     for (family, reserved) in [
         (
             "ip",
@@ -274,6 +307,7 @@ pub(super) fn install(
         "capture",
         "not-tcp-establishment",
         vec![
+            matches(masked(ct("mark"), mask), "!=", json!(capture)),
             matches(
                 json!({"&": [payload("tcp", "flags"), ["syn", "ack"]]}),
                 "!=",
@@ -354,7 +388,34 @@ pub(super) fn install(
             );
         }
     }
+    if !active {
+        for chain in ["output", "redirect", "prerouting", "egress"] {
+            commands.push(json!({"flush": {"chain": {
+                "family": "inet", "table": table, "name": chain
+            }}}));
+        }
+        commands.push(json!({"add": {"rule": {
+            "family": "inet", "table": table, "chain": "egress",
+            "expr": drop_tun_egress(spec), "comment": format!("{owner}:uncaptured-egress")
+        }}}));
+    }
     json!({"nftables": commands})
+}
+
+fn drop_tun_egress(spec: &Spec) -> Vec<Value> {
+    vec![
+        matches(meta("oifname"), "==", json!(spec.name)),
+        json!({"counter": null}),
+        json!({"drop": null}),
+    ]
+}
+
+pub(super) fn replace(table: &str, mut policy: Value) -> Value {
+    policy["nftables"].as_array_mut().unwrap().insert(
+        0,
+        json!({"delete": {"table": {"family": "inet", "name": table}}}),
+    );
+    policy
 }
 
 pub(super) fn update_onlink(table: &str, networks: &[IpNetwork]) -> Value {
