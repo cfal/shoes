@@ -267,12 +267,14 @@ mod tests {
         let ResolvedConfig::Server(server) = &validated.configs[0] else {
             panic!()
         };
-        let expected = [json!({"masks": "example.com"}), conditions];
-        assert_eq!(projected.len(), expected.len());
-        for ((rule, projection), expected) in server.rules.iter().zip(&projected).zip(expected) {
-            let payload = expected.to_string();
-            let expected = format!("entry (root): {payload}");
-            assert_eq!(projection["payload"], expected);
+        let payloads = [
+            json!({"masks": "example.com"}).to_string(),
+            conditions.to_string(),
+        ];
+        assert_eq!(projected.len(), payloads.len());
+        for ((rule, projection), payload) in server.rules.iter().zip(&projected).zip(payloads) {
+            let labeled_payload = format!("entry (root): {payload}");
+            assert_eq!(projection["payload"], labeled_payload);
             let description = rule.criteria.description.as_ref().unwrap();
             assert_eq!(description.payload, payload);
             let flow = description.context.as_ref().unwrap().register(
@@ -284,7 +286,7 @@ mod tests {
                 &description.payload,
                 Default::default(),
             );
-            assert_eq!(flow.entry.rule_payload, expected);
+            assert_eq!(flow.entry.rule_payload, labeled_payload);
         }
     }
 

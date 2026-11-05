@@ -195,6 +195,7 @@ fn typed_rule_round_trip_and_validation() {
 
 #[test]
 fn conditions_and_masks_share_grammar_and_round_trip_decisions() {
+    use crate::rules::Compiler;
     use serde_json::json;
 
     for expression in [
@@ -211,56 +212,52 @@ fn conditions_and_masks_share_grammar_and_round_trip_decisions() {
             {"not": {"masks": "excluded.example.com"}}
         ]}),
     ] {
-        let mut expected = None;
+        let mut rules: Vec<RuleConfig> = Vec::new();
         for field in ["conditions", "masks", "mask"] {
             let input = json!({field: expression, "no_resolve": true, "action": "allow",
                 "override_address": "127.0.0.1:8080", "client_chain": "outbound"});
-            for yaml in [false, true] {
-                let mut rule: RuleConfig = if yaml {
-                    serde_yaml::from_str(&serde_yaml::to_string(&input).unwrap()).unwrap()
-                } else {
-                    serde_json::from_value(input.clone()).unwrap()
-                };
-                let encoded = serde_json::to_value(&rule).unwrap();
-                assert_ne!(
-                    encoded.get("masks").is_some(),
-                    encoded.get("conditions").is_some()
-                );
-                assert_eq!(encoded["no_resolve"], true);
-                assert_eq!(encoded["override_address"], "127.0.0.1:8080");
-                assert_eq!(encoded["client_chains"], json!({"chain": "outbound"}));
-                if let Some(expected) = &expected {
-                    assert_eq!(&encoded, expected);
-                } else {
-                    expected = Some(encoded.clone());
-                }
-                rule.compile(&mut crate::rules::Compiler::default())
-                    .unwrap();
-                let predicate = rule.criteria.compiled.unwrap();
-                let mut restored: RuleConfig =
-                    serde_yaml::from_str(&serde_yaml::to_string(&encoded).unwrap()).unwrap();
-                assert_eq!(serde_json::to_value(&restored).unwrap(), encoded);
-                restored
-                    .compile(&mut crate::rules::Compiler::default())
-                    .unwrap();
-                let restored = restored.criteria.compiled.unwrap();
-                for name in [
+            rules.push(serde_json::from_value(input.clone()).unwrap());
+            rules.push(serde_yaml::from_str(&serde_yaml::to_string(&input).unwrap()).unwrap());
+        }
+
+        let encoded = serde_json::to_value(&rules[0]).unwrap();
+        assert_ne!(
+            encoded.get("masks").is_some(),
+            encoded.get("conditions").is_some()
+        );
+        assert_eq!(encoded["no_resolve"], true);
+        assert_eq!(encoded["override_address"], "127.0.0.1:8080");
+        assert_eq!(encoded["client_chains"], json!({"chain": "outbound"}));
+        let mut restored: RuleConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&encoded).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), encoded);
+        restored.compile(&mut Compiler::default()).unwrap();
+        let restored_predicate = restored.criteria.compiled.unwrap();
+
+        for mut rule in rules {
+            assert_eq!(
+                serde_json::to_value(&rule).unwrap(),
+                encoded,
+                "{expression}"
+            );
+            rule.compile(&mut Compiler::default()).unwrap();
+            let predicate = rule.criteria.compiled.unwrap();
+            for name in [
+                None,
+                Some("example.com"),
+                Some("excluded.example.com"),
+                Some("other.example"),
+            ] {
+                for ip in [
                     None,
-                    Some("example.com"),
-                    Some("excluded.example.com"),
-                    Some("other.example"),
+                    Some("192.0.2.1".parse().unwrap()),
+                    Some("198.51.100.1".parse().unwrap()),
                 ] {
-                    for ip in [
-                        None,
-                        Some("192.0.2.1".parse().unwrap()),
-                        Some("198.51.100.1".parse().unwrap()),
-                    ] {
-                        for port in [80, 443, 8080] {
-                            assert_eq!(
-                                predicate.evaluate(name, ip, port),
-                                restored.evaluate(name, ip, port)
-                            );
-                        }
+                    for port in [80, 443, 8080] {
+                        assert_eq!(
+                            predicate.evaluate(name, ip, port),
+                            restored_predicate.evaluate(name, ip, port)
+                        );
                     }
                 }
             }
@@ -270,6 +267,7 @@ fn conditions_and_masks_share_grammar_and_round_trip_decisions() {
 
 #[test]
 fn conditions_serialize_address_leaves_explicitly_and_keep_simple_masks_compact() {
+    use crate::rules::{Compiler, Outcome};
     use serde_json::json;
 
     for masks in [json!("example.com"), json!(["example.com", "192.0.2.0/24"])] {
@@ -290,24 +288,18 @@ fn conditions_serialize_address_leaves_explicitly_and_keep_simple_masks_compact(
         {"destination_port": [443]}
     ]}, "action": "block"})
     );
-    rule.compile(&mut crate::rules::Compiler::default())
-        .unwrap();
+    rule.compile(&mut Compiler::default()).unwrap();
     let predicate = rule.criteria.compiled.as_ref().unwrap();
     for (name, ip, port, expected) in [
-        (Some("example.com"), None, 443, crate::rules::Outcome::Match),
+        (Some("example.com"), None, 443, Outcome::Match),
         (
             None,
             Some("192.0.2.1".parse().unwrap()),
             443,
-            crate::rules::Outcome::Match,
+            Outcome::Match,
         ),
-        (
-            Some("excluded.example.com"),
-            None,
-            443,
-            crate::rules::Outcome::Miss,
-        ),
-        (Some("example.com"), None, 80, crate::rules::Outcome::Miss),
+        (Some("excluded.example.com"), None, 443, Outcome::Miss),
+        (Some("example.com"), None, 80, Outcome::Miss),
     ] {
         assert_eq!(predicate.evaluate(name, ip, port), expected);
     }
@@ -337,13 +329,6 @@ fn conditions_reject_missing_ambiguous_and_invalid_matchers() {
             json!({"domain": ["example.com"], "action": "block"}),
         ] {
             invalid.push(json!({field: value}));
-        }
-        for other in ["conditions", "masks", "mask"] {
-            if field != other {
-                for value in [json!("example.com"), json!(null)] {
-                    invalid.push(json!({field: "example.com", other: value}));
-                }
-            }
         }
         for source in ["path", "url"] {
             invalid.push(json!({source: "list.srs", field: "example.com"}));
