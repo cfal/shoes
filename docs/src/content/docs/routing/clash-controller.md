@@ -68,6 +68,17 @@ Selection changes affect new flows only; existing streams, UDP destinations,
 DNS connections, and WireGuard associations remain pinned until reopened.
 Optional client and server/TUN `name` fields provide stable dashboard identities.
 Generated anonymous names are stable only for unchanged definition sites.
+Unnamed inline clients appear as `client-N-M` catalog identities, except direct
+clients with neither `address` nor `bind_interface`, which appear as `DIRECT`. Set
+`name` on each client for readable labels; naming its enclosing chain does not
+rename its constituent clients.
+
+Connection `chains` lists selected clients in reverse hop order (last hop first),
+with their enclosing groups following them. A group enclosing several hops is
+reported once after those hops; independently repeated group references remain
+repeated. This is a selection trace, not a list of network connections. An initial
+`DIRECT` stage followed by a proxy opens the connection to that proxy, not to the
+final destination.
 
 Automatic selection does not require a controller listener or a cache file:
 see the [URL-test example](/examples/url_test/) for a complete file.

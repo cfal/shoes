@@ -648,7 +648,7 @@ async fn chain_choices_route_probe_and_restore_as_whole_paths() {
         .unwrap();
     assert_eq!(
         retained["chains"],
-        json!(["west", "outbound", "prefix-client", "prefix", "outbound"])
+        json!(["west", "prefix-client", "prefix", "outbound"])
     );
     fixture.select("via-west").await;
     fixture.stop(&mut process).await;
@@ -691,6 +691,10 @@ async fn chain_choices_route_probe_and_restore_as_whole_paths() {
             .find(|connection| connection["metadata"]["sourcePort"] == port)
             .unwrap();
         assert_eq!(connection["shoesGeneration"].as_u64().unwrap(), generation);
+        assert_eq!(
+            connection["chains"],
+            json!(["west", "prefix-client", "prefix", "outbound"])
+        );
     }
     assert!(
         connections
@@ -863,8 +867,8 @@ async fn variable_length_udp_choices_pin_associations_and_fail_closed() {
         json!({"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000","udp_enabled":true});
     fixture.outbound_mut()["client_chains"] = json!([
         {"name":"east","chain":[
-            {"address":prefix.to_string(),"protocol":{"type":"socks"}},
-            {"address":last.to_string(),"protocol":protocol}
+            {"name":"udp-prefix","address":prefix.to_string(),"protocol":{"type":"socks"}},
+            {"name":"udp-exit","address":last.to_string(),"protocol":protocol}
         ]},
         {"name":"west","protocol":{"type":"direct"}},
         {"name":"tcp-only","address":"192.0.2.1:80","protocol":{"type":"http"}}
@@ -881,6 +885,23 @@ async fn variable_length_udp_choices_pin_associations_and_fail_closed() {
         .await
         .unwrap();
     assert_eq!(chained.send_to(target, b"one").await.unwrap(), b"onerelay");
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let source_port = chained.socket().local_addr().unwrap().port().to_string();
+    let flow = snapshot["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|flow| {
+            flow["metadata"]["network"] == "udp"
+                && flow["metadata"]["sourcePort"] == source_port
+                && flow["metadata"]["inboundName"] == "local-socks"
+        })
+        .unwrap();
+    assert_eq!(
+        flow["chains"],
+        json!(["udp-exit", "udp-prefix", "outbound"])
+    );
+    let chained_id = flow["id"].clone();
     fixture.select("west").await;
     let direct = Socks5UdpAssociation::connect("127.0.0.1", fixture.entry.port())
         .await
@@ -918,6 +939,23 @@ async fn variable_length_udp_choices_pin_associations_and_fail_closed() {
         chained.send_to(target, b"five").await.unwrap(),
         b"fiverelay"
     );
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let flows = snapshot["connections"].as_array().unwrap();
+    let retained = flows.iter().find(|flow| flow["id"] == chained_id).unwrap();
+    assert_eq!(
+        retained["chains"],
+        json!(["udp-exit", "udp-prefix", "outbound"])
+    );
+    let source_port = direct.socket().local_addr().unwrap().port().to_string();
+    let native = flows
+        .iter()
+        .find(|flow| {
+            flow["metadata"]["network"] == "udp"
+                && flow["metadata"]["sourcePort"] == source_port
+                && flow["metadata"]["inboundName"] == "local-socks"
+        })
+        .unwrap();
+    assert_eq!(native["chains"], json!(["west", "outbound"]));
     fixture.stop(&mut process).await;
     assert_eq!(
         *received.lock().unwrap(),

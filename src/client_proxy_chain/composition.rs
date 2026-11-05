@@ -13,6 +13,11 @@ struct Leaf {
     udp: bool,
 }
 
+struct SelectedLeaf<'a> {
+    leaf: &'a Leaf,
+    shared_groups: usize,
+}
+
 enum Node {
     Client(Leaf),
     Sequence(Vec<Node>),
@@ -293,16 +298,20 @@ fn node(
     }
 }
 
-fn pinned(leaves: &[&Leaf]) -> SelectedPath {
-    let origins = leaves.iter().map(|leaf| leaf.origin.clone()).collect();
+fn pinned(leaves: &[SelectedLeaf<'_>]) -> SelectedPath {
+    let (origins, shared_groups) = leaves
+        .iter()
+        .map(|selected| (selected.leaf.origin.clone(), selected.shared_groups))
+        .unzip();
     let subsequent_hops: Vec<_> = leaves
         .iter()
         .skip(1)
-        .map(|leaf| leaf.proxy.as_ref().unwrap().clone())
+        .map(|selected| selected.leaf.proxy.as_ref().unwrap().clone())
         .collect();
     SelectedPath {
         origins,
-        initial: leaves[0].initial.as_ref().unwrap().clone(),
+        shared_groups,
+        initial: leaves[0].leaf.initial.as_ref().unwrap().clone(),
         subsequent: subsequent_hops,
     }
 }
@@ -438,14 +447,17 @@ impl Node {
         &'a self,
         require_udp: bool,
         selection: &Selection<'_>,
-        leaves: &mut Vec<&'a Leaf>,
+        leaves: &mut Vec<SelectedLeaf<'a>>,
     ) -> io::Result<()> {
         match self {
             Self::Client(leaf) => {
                 if require_udp && !leaf.udp {
                     return Err(unsupported());
                 }
-                leaves.push(leaf);
+                leaves.push(SelectedLeaf {
+                    leaf,
+                    shared_groups: 0,
+                });
             }
             Self::Sequence(nodes) => {
                 if !self.eligible(require_udp, selection.choices) {
@@ -463,57 +475,72 @@ impl Node {
                 next,
                 static_eligible_indices,
             } => {
-                if let Some(eligible) = static_eligible_indices {
+                let selected = if let Some(eligible) = static_eligible_indices {
                     let eligible = &eligible[usize::from(require_udp)];
                     if eligible.is_empty() {
                         return Err(unsupported());
                     }
-                    let selected = eligible[next[usize::from(selection.udp_flow)]
-                        .fetch_add(1, Ordering::Relaxed)
+                    eligible[next[usize::from(selection.udp_flow)].fetch_add(1, Ordering::Relaxed)
                         as usize
-                        % eligible.len()];
-                    return members[selected].select(require_udp, selection, leaves);
-                }
-                let eligible: Vec<_> = members
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, member)| {
-                        ((*kind != GroupType::Selector
-                            || selection.choices.get(name) == Some(&labels[index]))
-                            && member.eligible(require_udp, selection.choices))
-                        .then_some(index)
-                    })
-                    .collect();
-                if eligible.is_empty() {
-                    return Err(unsupported());
-                }
-                let selected = match kind {
-                    GroupType::UrlTest(_) => {
-                        let view = selection.view.ok_or_else(unsupported)?;
-                        let names = eligible
-                            .iter()
-                            .map(|index| labels[*index].as_str())
-                            .collect();
-                        let selected = view
-                            .automatic
-                            .0
-                            .get(name)
-                            .ok_or_else(unsupported)?
-                            .choose(&names, selection.udp_flow)
-                            .ok_or_else(unsupported)?;
-                        eligible
-                            .into_iter()
-                            .find(|index| labels[*index] == selected)
-                            .unwrap()
+                        % eligible.len()]
+                } else {
+                    let eligible: Vec<_> = members
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, member)| {
+                            ((*kind != GroupType::Selector
+                                || selection.choices.get(name) == Some(&labels[index]))
+                                && member.eligible(require_udp, selection.choices))
+                            .then_some(index)
+                        })
+                        .collect();
+                    if eligible.is_empty() {
+                        return Err(unsupported());
                     }
-                    _ => {
-                        eligible[next[usize::from(selection.udp_flow)]
-                            .fetch_add(1, Ordering::Relaxed)
-                            as usize
-                            % eligible.len()]
+                    match kind {
+                        GroupType::UrlTest(_) => {
+                            let view = selection.view.ok_or_else(unsupported)?;
+                            let names = eligible
+                                .iter()
+                                .map(|index| labels[*index].as_str())
+                                .collect();
+                            let selected = view
+                                .automatic
+                                .0
+                                .get(name)
+                                .ok_or_else(unsupported)?
+                                .choose(&names, selection.udp_flow)
+                                .ok_or_else(unsupported)?;
+                            eligible
+                                .into_iter()
+                                .find(|index| labels[*index] == selected)
+                                .unwrap()
+                        }
+                        _ => {
+                            eligible[next[usize::from(selection.udp_flow)]
+                                .fetch_add(1, Ordering::Relaxed)
+                                as usize
+                                % eligible.len()]
+                        }
                     }
                 };
+                let start = leaves.len();
                 members[selected].select(require_udp, selection, leaves)?;
+                if !name.is_empty() {
+                    // A choice occurrence reports its ancestry on its first tracked hop only.
+                    // Separate occurrences retain their names, even with identical paths.
+                    let mut reported = false;
+                    for selected in &mut leaves[start..] {
+                        if let Some(depth) = selected.leaf.origin.as_ref().and_then(|origin| {
+                            origin.path.iter().position(|(group, _)| group == name)
+                        }) {
+                            if reported {
+                                selected.shared_groups = selected.shared_groups.max(depth + 1);
+                            }
+                            reported = true;
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -611,7 +638,7 @@ mod tests {
                             (origin.name.clone(), origin.path.clone())
                         })
                         .collect::<Vec<_>>();
-                    (endpoints, origins)
+                    (endpoints, origins, path.route_names())
                 })
                 .unwrap()
         };
@@ -653,10 +680,10 @@ mod tests {
         assert!(two.supports_udp());
         assert_eq!(two.origin(0).unwrap().name.as_ref(), "entrance");
         assert_eq!(two.origin(1).unwrap().name.as_ref(), "exit-leaf");
-        let names = two.route_names();
-        assert_eq!(names.first().unwrap(), "exit-leaf");
-        assert_eq!(names.last().unwrap(), "out");
-        assert!(names.iter().any(|name| name == "entrance"));
+        assert_eq!(
+            two.route_names(),
+            ["exit-leaf", "exit", "entrance", "entry", "out"]
+        );
         for hop in 0..2 {
             let origin = two.origin(hop).unwrap();
             assert_eq!(origin.path[0], ("out".into(), "via-exit".into()));
@@ -681,6 +708,153 @@ mod tests {
             after.route_key(),
             "reselecting a path must retain its carrier identities"
         );
+    }
+
+    #[test]
+    fn route_names_preserve_nested_aliases_and_repeated_group_occurrences() {
+        for kind in ["round-robin", "selector", "url-test"] {
+            let leaf = |name| {
+                json!({
+                    "name":name, "address":"192.0.2.1:443",
+                    "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}
+                })
+            };
+            let mut config = json!([
+                {"clash_api_address":"127.0.0.1:0","secret":"test"},
+                {"client_group":"a","client_chain":leaf("first")},
+                {"client_group":"b","client_chain":leaf("second")},
+                {"client_group":"inner","type":kind,"client_chains":[{"name":"via","chain":["a","b"]}]},
+                {"client_group":"alias","client_chain":"inner"},
+                {"client_group":"outer","type":kind,"client_chains":[{"name":"twice","chain":["alias","alias"]}]},
+                {"client_group":"pooled","client_chain":{"chain":[{"pool":["alias"]}]}},
+                {"client_group":"mixed","type":kind,"client_chains":[{"name":"pool-and-leaf","chain":["pooled","a"]}]},
+                {"client_group":"fixed-alias","client_chain":"a"}
+            ]);
+            if kind == "url-test" {
+                for group in config.as_array_mut().unwrap() {
+                    if group["type"] == kind {
+                        group["url"] = json!("http://192.0.2.9/");
+                    }
+                }
+            }
+            for (route, expected) in [
+                (
+                    json!("alias"),
+                    vec!["second", "b", "first", "a", "inner", "alias"],
+                ),
+                (
+                    json!(["alias", "alias"]),
+                    vec![
+                        "second", "b", "first", "a", "inner", "alias", "second", "b", "first", "a",
+                        "inner", "alias",
+                    ],
+                ),
+                (
+                    json!("outer"),
+                    vec![
+                        "second", "b", "first", "a", "inner", "alias", "second", "b", "first", "a",
+                        "inner", "alias", "outer",
+                    ],
+                ),
+                (
+                    json!("mixed"),
+                    vec![
+                        "first", "a", "second", "b", "first", "a", "inner", "alias", "pooled",
+                        "mixed",
+                    ],
+                ),
+                (
+                    json!(["fixed-alias", "fixed-alias"]),
+                    vec!["first", "a", "fixed-alias", "first", "a", "fixed-alias"],
+                ),
+            ] {
+                let (chain, _) = build(config.clone(), route.clone());
+                for udp in [false, true] {
+                    let path = chain.select(udp).unwrap();
+                    assert_eq!(path.route_names(), expected, "{kind}, {route}, UDP={udp}");
+                    assert_eq!(path.origins.len(), path.num_hops());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn route_names_keep_direct_stage_and_anonymous_catalog_identity() {
+        let (chain, catalog) = build(
+            json!([
+                {"client_group":"a1-entrypoint","client_chain":"direct"},
+                {"client_group":"a1-reality-vision-vless","client_chain":["a1-entrypoint",
+                    {"address":"192.0.2.1:443","protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}}
+                ]},
+                {"client_group":"a1-selected","type":"selector","client_chain":"a1-reality-vision-vless"}
+            ]),
+            json!("a1-selected"),
+        );
+        for udp in [false, true] {
+            let path = chain.select(udp).unwrap();
+            assert_eq!(path.num_hops(), 2);
+            assert!(matches!(path.initial.as_ref(), InitialHopEntry::Direct(_)));
+            assert_eq!(
+                path.subsequent[0].proxy_location().to_string(),
+                "192.0.2.1:443"
+            );
+            let names = path.route_names();
+            assert_eq!(
+                names,
+                [
+                    "client-2-1",
+                    "DIRECT",
+                    "a1-entrypoint",
+                    "a1-reality-vision-vless",
+                    "a1-selected"
+                ]
+            );
+            for name in &names {
+                assert!(catalog.nodes.contains_key(name), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn route_names_ignore_untracked_leaves_without_losing_shared_ancestry() {
+        fn clear_origins(node: &mut Node, names: &[&str]) {
+            match node {
+                Node::Client(leaf) => {
+                    if leaf
+                        .origin
+                        .as_ref()
+                        .is_some_and(|origin| names.contains(&origin.name.as_ref()))
+                    {
+                        leaf.origin = None;
+                    }
+                }
+                Node::Sequence(nodes) | Node::Choice { members: nodes, .. } => {
+                    for node in nodes {
+                        clear_origins(node, names);
+                    }
+                }
+            }
+        }
+        for (untracked, expected) in [
+            (vec!["entrance"], vec!["exit-leaf", "exit", "out"]),
+            (vec!["exit-leaf"], vec!["entrance", "entry", "out"]),
+            (vec!["entrance", "exit-leaf"], vec![]),
+        ] {
+            let (mut chain, catalog) = fixture();
+            let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+            owner.activate(catalog.selection.clone()).unwrap();
+            owner.select("out", "via-exit").unwrap();
+            let ChainPlan::Composed(tree) = &mut chain.plan else {
+                panic!()
+            };
+            clear_origins(&mut Arc::get_mut(tree).unwrap().root, &untracked);
+            for udp in [false, true] {
+                let path = chain.select(udp).unwrap();
+                assert_eq!(path.num_hops(), 2);
+                assert_eq!(path.origins.len(), 2);
+                assert_eq!(path.route_names(), expected);
+            }
+        }
     }
 
     #[tokio::test]
