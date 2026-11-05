@@ -120,7 +120,7 @@ cannot reference other policy groups.
 
 ### Rule source group
 
-Source groups are referenced inside a policy's `masks`, so the policy supplies
+Source groups are referenced inside a policy's `conditions` or `masks`, so the policy supplies
 the action. They may reference other source groups, but not policy groups.
 See [local rule sources](/routing/rules/#local-rule-sources) and
 [remote rule sources](/routing/remote-sources/) for formats, refresh, and caching.

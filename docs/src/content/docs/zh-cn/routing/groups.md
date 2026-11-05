@@ -85,4 +85,4 @@ description: "shoes 命名组配置。"
 <a id="rule-source-group"></a>
 ### 规则源组
 
-源组在策略的 `masks` 内部引用，因此策略提供操作。它们可能引用其他源组，但不引用策略组。有关格式、刷新和缓存的信息，请参阅[本地规则源](/zh-cn/routing/rules/#local-rule-sources) 和[远程规则源](/zh-cn/routing/remote-sources/)。
+源组在策略的 `conditions` 或 `masks` 内部引用，因此策略提供操作。它们可能引用其他源组，但不引用策略组。有关格式、刷新和缓存的信息，请参阅[本地规则源](/zh-cn/routing/rules/#local-rule-sources) 和[远程规则源](/zh-cn/routing/remote-sources/)。

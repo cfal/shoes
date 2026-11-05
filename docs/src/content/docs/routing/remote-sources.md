@@ -8,9 +8,10 @@ continue to work without network access. The example below uses placeholder
 URLs and is illustrative, not a ready-to-run configuration.
 
 Use `url` to load a remote source. Persistent caching is optional. The same
-source object works in `rule_source_group.rules`, under `masks` (including
+source object works in `rule_source_group.rules`, under `conditions`/`masks` (including
 `all`/`any`/`not`), or flat alongside `action` in a policy group's rules, a server's
-`rules`, or supported `override_rules`. A flat source cannot also specify `masks`.
+`rules`, or supported `override_rules`. A flat source cannot also specify
+`conditions`, `masks`, or `mask`.
 
 ```yaml
 - global_settings:

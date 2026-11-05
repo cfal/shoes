@@ -25,15 +25,39 @@ HTTP 检验在任何目标端口接受来源形式请求 (`GET /path HTTP/1.1`) 
 SNI和主机是客户端控制的，不是经过身份验证的身份或域防火墙。将强制 IP 拒绝规则放在主机名允许之前。使用 ECH，只有可见的外部名称可用，而不是加密的内部主机名。对于假 DNS 流，该外部名称优先于主机名规则的恢复主机名。当路由必须遵循恢复的名称时禁用 `sniff`，或者为 ECH 公共名称配置规则。
 
 ### 规则配置
+
+以下为示意结构（匹配字段必须且只能选择一个）：
+
 ```yaml
 rules:
-  - masks: Mask | [Mask]      # Strings, typed predicates, file sources, or group references
+  - conditions: Expression   # Or masks: Expression (mask is also accepted)
     no_resolve: boolean?      # Default false; known IPs still participate
     action: allow | block     # Default allow
     # For action: allow
     override_address: string?  # Optional address override
     client_chain: ClientChain | [ClientChain]  # Proxy chain(s) for routing
 ```
+
+`conditions` 是通用匹配表达式。顶层 `masks` 及其别名 `mask` 仍完整支持字符串、列表、类型化谓词、规则源和布尔表达式，不产生弃用警告。同一条规则不能同时指定这些字段。平铺的 `path`/`url` 规则源也是受支持的简写，但不能与上述匹配字段组合。省略所有匹配字段会报错，不会自动匹配所有目标；请显式使用 `{any_destination: true}`。
+
+在表达式内，`masks` 是地址叶子，接受单个掩码字符串或非空字符串列表（OR）。它使用与顶层地址掩码相同的 IP/CIDR、主机名和可选端口语法。其他谓词通过显式 `all`（AND）、`any`（OR）和 `not` 组合；同一对象不能包含多个谓词键。
+
+```yaml
+rules:
+  - masks: [example.com, "192.0.2.0/24"]
+    action: allow
+  - conditions:
+      all:
+        - masks: [example.net, "198.51.100.0/24"]
+        - destination_port: [443]
+    action: allow
+  - conditions: {any_destination: true}
+    action: block
+```
+
+两种顶层形式使用同一匹配引擎，保持首个匹配规则优先、DNS 行为和规则源发现机制不变。`action`、`client_chain`、`override_address` 和 `no_resolve` 仍属于规则级选项，而不是谓词。此语法不增加 `network` 或应用层 `protocol` 匹配。
+
+配置序列化将纯地址表达式输出为顶层 `masks`，保留标量或列表形式。其他表达式输出为 `conditions`，其中地址叶子显式包装在 `masks` 中。不保留输入字段的拼写，但匹配行为保持不变。现有配置无需迁移。请参阅完整的 [conditions 示例](/zh-cn/examples/rule_conditions/)。
 
 <a id="client-chains"></a>
 ### 客户端链
@@ -119,22 +143,22 @@ masks:
 
 ### 类型化目标谓词
 
-`masks` 接受旧字符串、类型化谓词、文件源和无操作组引用。列表使用 OR 将其条目组合起来。谓词对象包含一个运算符：`all`、`any`、`not` 或叶子。相同的形式在 `all`/`any`/`not` 内递归工作；字符串始终保留旧掩码，而不是组名称或路径。类型化叶子内的列表是替代方案。
+`conditions` 和 `masks` 接受旧字符串、类型化谓词、文件源和无操作组引用。列表使用 OR 将其条目组合起来。谓词对象包含一个运算符：`all`、`any`、`not` 或叶子。相同的形式在 `all`/`any`/`not` 内递归工作；字符串始终保留旧掩码，而不是组名称或路径。类型化叶子内的列表是替代方案。
 
 将混合的旧版掩码和导入的组保留在一个 OR 列表中：将它们拆分为单独的策略可以更改排序的 DNS 评估。
 
 ```yaml
 rules:
-  - masks:
+  - conditions:
       all:
         - domain_suffix: [example.com]
         - destination_port: [443]
     action: allow
-  - masks: { any_destination: true }
+  - conditions: { any_destination: true }
     action: block
 ```
 
-叶子：`domain`（精确）、`domain_suffix`（顶点和后代）、`subdomains`（仅限后代）、`domain_pattern`（`*` 匹配一个标签）、`domain_keyword`、`domain_regex`、`ip_cidr`、`destination_port`、 `destination_port_range`（包括`"8000:9000"`）和`any_destination: true`。本机域文字和关键字不区分大小写。正则表达式是非锚定的并且区分大小写，除非它们启用大小写折叠；不支持反向引用、环视和非 ASCII 模式。键入的端口为 1-65535。空集不匹配任何内容；空的 `all`/`any` 节点将被拒绝。
+叶子：`masks`（地址简写）、`domain`（精确）、`domain_suffix`（顶点和后代）、`subdomains`（仅限后代）、`domain_pattern`（`*` 匹配一个标签）、`domain_keyword`、`domain_regex`、`ip_cidr`、`destination_port`、 `destination_port_range`（包括`"8000:9000"`）和`any_destination: true`。本机域文字和关键字不区分大小写。正则表达式是非锚定的并且区分大小写，除非它们启用大小写折叠；不支持反向引用、环视和非 ASCII 模式。键入的端口为 1-65535。空集不匹配任何内容；空的 `all`/`any` 节点及空的 `masks` 列表将被拒绝。
 
 政策仍采用先匹配的顺序。在一个策略内，已知的 OR 匹配或 AND 未命中可以避免 DNS，无论谓词顺序如何。较早的未解决的策略不能被较晚的域规则绕过。 IP 谓词使用选定的本地 DNS 答案，将其固定以进行直接拨号；查找失败会中止路由。在此固定之后，直接多地址回退将被禁用。主机名转发代理协议仍可能在出口处独立解析。
 
@@ -145,7 +169,7 @@ rules:
 <a id="local-rule-sources"></a>
 ### 本地规则源
 
-声明一个包含匹配表达式和文件路径的无操作 `rule_source_group`，或者在 `masks` 下或与 `action` 一起加载内联文件。在重新加载停止现有监听器之前，在验证期间读取和编译源，包括 `--dry-run`。无效来源拒绝该候选人。自动重新加载监视导入的文件和配置。可解析的被拒绝的候选者会监视其源路径，因此创建或修复丢失的文件可以恢复，而无需再次进行配置编辑。活动源将持续受到监视，直至替代源激活。 `--no-reload` 禁用自动完全重新加载； SIGHUP 仍会重新加载，并且实时服务器证书轮换仍保持启用状态。已建立的连接将保留其原始规则，直至耗尽。新的路由缓存属于新的配置；假DNS池单独保存。
+声明一个包含匹配表达式和文件路径的无操作 `rule_source_group`，或者在 `conditions`/`masks` 下或与 `action` 一起加载内联文件。在重新加载停止现有监听器之前，在验证期间读取和编译源，包括 `--dry-run`。无效来源拒绝该候选人。自动重新加载监视导入的文件和配置。可解析的被拒绝的候选者会监视其源路径，因此创建或修复丢失的文件可以恢复，而无需再次进行配置编辑。活动源将持续受到监视，直至替代源激活。 `--no-reload` 禁用自动完全重新加载； SIGHUP 仍会重新加载，并且实时服务器证书轮换仍保持启用状态。已建立的连接将保留其原始规则，直至耗尽。新的路由缓存属于新的配置；假DNS池单独保存。
 
 ```yaml
 - rule_source_group: blocked
@@ -187,7 +211,7 @@ rules:
     action: block
 ```
 
-源组或它们的条目在一起，包括本机谓词、`all`、`any`、`not`、源组引用和文件源。源是组 `rules` 内的路径字符串，或者是具有 `path` 和可选 `format`、`behavior`、`code` 和 `attributes` 的对象。 `masks`下的内联源需要对象形式；掩码字符串始终是 IP/CIDR/主机名。例如，`masks: blocked` 匹配该主机名，而不是上面的组。任何文件系统或名称存在启发式都不会改变这一点。
+源组或它们的条目在一起，包括本机谓词、`all`、`any`、`not`、源组引用和文件源。源是组 `rules` 内的路径字符串，或者是具有 `path` 和可选 `format`、`behavior`、`code` 和 `attributes` 的对象。`conditions`/`masks` 下的内联源需要对象形式；掩码字符串始终是 IP/CIDR/主机名。例如，`masks: blocked` 匹配该主机名，而不是上面的组。任何文件系统或名称存在启发式都不会改变这一点。
 
 操作和路由选项属于引用策略，而不是源。省略`action`仍然表示`allow`；不采取任何行动的团体并不意味着封锁。源对象拒绝操作字段，并且不能与谓词运算符混合。具有相同规范路径和解码选项的源共享一组编译集，包括跨命名组和内联使用。 DAT 代码和属性名称不区分大小写；属性顺序和重复项不影响共享。对于 MRS，省略和显式提供的 `behavior` 值使用单独的缓存条目。每一代最多接受 1,024 个不同的来源。
 

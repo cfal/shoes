@@ -6,7 +6,7 @@
 
 - rule_group: standard
   rules:
-    - masks: {rule_source_group: imported}
+    - conditions: {rule_source_group: imported}
       action: block
     - masks: ["192.168.0.0/16", "internal.example"]
       action: allow
@@ -15,7 +15,7 @@
   protocol: {type: socks}
   rules:
     - standard
-    - masks:
+    - conditions:
         all:
           - path: ../tests/fixtures/rule_sets/mihomo-ip.mrs
           - destination_port: [443]

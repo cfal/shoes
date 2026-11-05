@@ -61,15 +61,54 @@ for hostname rules. Disable `sniff` when routing must follow the restored name,
 or configure rules for the ECH public names.
 
 ### Rule Config
+
+Illustrative schema (choose exactly one matching field):
+
 ```yaml
 rules:
-  - masks: Mask | [Mask]      # Strings, typed predicates, file sources, or group references
+  - conditions: Expression   # Or masks: Expression (mask is also accepted)
     no_resolve: boolean?      # Default false; known IPs still participate
     action: allow | block     # Default allow
     # For action: allow
     override_address: string?  # Optional address override
     client_chain: ClientChain | [ClientChain]  # Proxy chain(s) for routing
 ```
+
+`conditions` is the general-purpose matching expression. Top-level `masks` and
+its `mask` alias remain fully supported without deprecation warnings, including
+strings, lists, typed predicates, sources, and boolean expressions. Do not specify
+more than one of these fields in a rule. A flat `path`/`url` rule source is another
+supported shorthand, but cannot be combined with any of them. Omitting all matching
+fields is an error, not a catch-all; use `{any_destination: true}` explicitly.
+
+Inside an expression, `masks` is an address leaf accepting one mask string or a
+nonempty list of mask strings (OR). It supports the same IP/CIDR, hostname, and
+optional port syntax as top-level address masks. For other predicates, use explicit
+`all` (AND), `any` (OR), and `not`; multiple predicate keys in one object are invalid.
+
+```yaml
+rules:
+  - masks: [example.com, "192.0.2.0/24"]
+    action: allow
+  - conditions:
+      all:
+        - masks: [example.net, "198.51.100.0/24"]
+        - destination_port: [443]
+    action: allow
+  - conditions: {any_destination: true}
+    action: block
+```
+
+Both outer forms use the same matcher, including first-match order, DNS behavior,
+and source discovery. `action`, `client_chain`, `override_address`, and `no_resolve`
+remain rule-level options, not predicates. This syntax does not add `network` or
+application `protocol` matching.
+
+Config serialization emits plain address expressions as top-level `masks`, preserving
+scalar/list shape. Other expressions serialize under `conditions`, with address
+leaves explicitly wrapped in `masks`. Input spelling is not preserved, but matching
+behavior is. Existing configs need no migration. See the complete
+[conditions example](/examples/rule_conditions/).
 
 ### Client Chains
 
@@ -166,7 +205,7 @@ masks:
 
 ### Typed Destination Predicates
 
-`masks` accepts legacy strings, typed predicates, file sources, and action-free
+`conditions` and `masks` accept legacy strings, typed predicates, file sources, and action-free
 group references. A list combines its entries with OR. Predicate objects contain
 one operator: `all`, `any`, `not`, or a leaf. The same forms work recursively inside
 `all`/`any`/`not`; strings always remain legacy masks, never group names or paths.
@@ -177,23 +216,23 @@ separate policies can change ordered DNS evaluation.
 
 ```yaml
 rules:
-  - masks:
+  - conditions:
       all:
         - domain_suffix: [example.com]
         - destination_port: [443]
     action: allow
-  - masks: { any_destination: true }
+  - conditions: { any_destination: true }
     action: block
 ```
 
-Leaves: `domain` (exact), `domain_suffix` (apex and descendants), `subdomains`
+Leaves: `masks` (address shorthand), `domain` (exact), `domain_suffix` (apex and descendants), `subdomains`
 (descendants only), `domain_pattern` (`*` matches one label), `domain_keyword`,
 `domain_regex`, `ip_cidr`, `destination_port`, `destination_port_range`
 (inclusive `"8000:9000"`), and `any_destination: true`. Native domain literals
 and keywords are case-insensitive. Regexes are unanchored and case-sensitive
 unless they enable case folding; backreferences, lookaround and non-ASCII
 patterns are unsupported. Typed ports are 1-65535. Empty sets match nothing;
-empty `all`/`any` nodes are rejected.
+empty `all`/`any` nodes and empty `masks` lists are rejected.
 
 Policies still use first-match order. Inside one policy, a known OR match or AND
 miss can avoid DNS, regardless of predicate order. An earlier unresolved policy
@@ -222,7 +261,7 @@ root dot and lowercases ASCII without changing the dial target.
 ### Local Rule Sources
 
 Declare an action-free `rule_source_group` containing matching expressions and file
-paths, or load a file inline under `masks` or alongside `action`. Sources are read
+paths, or load a file inline under `conditions`/`masks` or alongside `action`. Sources are read
 and compiled during validation, including `--dry-run`,
 before a reload stops existing listeners. Invalid sources reject the candidate.
 Automatic reload watches imported files as well as configs. A parseable rejected
@@ -276,7 +315,7 @@ rules:
 Source groups OR their entries together, including native predicates, `all`,
 `any`, `not`, source-group references, and file sources. A source is a path string inside a group's
 `rules`, or an object with `path` and optional `format`, `behavior`, `code`, and
-`attributes`. Inline sources under `masks` require the object form; a mask string
+`attributes`. Inline sources under `conditions`/`masks` require the object form; a mask string
 is always an IP/CIDR/hostname. For example, `masks: blocked` matches that hostname,
 not the group above. No filesystem or name-existence heuristic changes this.
 

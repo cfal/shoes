@@ -5,7 +5,7 @@ description: "下载、缓存、刷新和验证远程规则数据。"
 
 远程源是可选的。 [本地来源](/zh-cn/routing/rules/#local-rule-sources) 在没有网络访问的情况下继续工作。下面的示例使用占位符 URL，仅供说明，而不是可立即运行的配置。
 
-使用 `url` 加载远程源。持久缓存是可选的。相同的源对象在 `rule_source_group.rules`、`masks`（包括 `all`/`any`/`not`）下工作，或者与策略组规则中的 `action`、服务器的 `rules` 或支持的 `override_rules` 并排。平面源也不能指定 `masks`。
+使用 `url` 加载远程源。持久缓存是可选的。相同的源对象在 `rule_source_group.rules`、`conditions`/`masks`（包括 `all`/`any`/`not`）下工作，或者与策略组规则中的 `action`、服务器的 `rules` 或支持的 `override_rules` 并排。平铺的规则源不能同时指定 `conditions`、`masks` 或 `mask`。
 
 ```yaml
 - global_settings:
