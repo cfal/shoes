@@ -363,6 +363,37 @@ fn conditions_reject_missing_ambiguous_and_invalid_matchers() {
 }
 
 #[test]
+fn conditions_field_diagnostics_identify_conflicting_spellings() {
+    use serde_json::json;
+
+    for field in ["conditions", "masks", "mask"] {
+        for other in ["conditions", "masks", "mask"] {
+            if field == other {
+                continue;
+            }
+            for value in [json!("example.com"), json!(null)] {
+                let input = json!({field: "example.com", other: value});
+                let errors = [
+                    serde_json::from_value::<RuleConfig>(input.clone())
+                        .unwrap_err()
+                        .to_string(),
+                    serde_yaml::from_str::<RuleConfig>(&serde_yaml::to_string(&input).unwrap())
+                        .unwrap_err()
+                        .to_string(),
+                ];
+                for error in errors {
+                    assert!(
+                        error
+                            .contains("a rule must specify only one of conditions, masks, or mask"),
+                        "{input}: {error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn test_rule_config_serialization() {
     let original = create_test_rule_config();
     let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");

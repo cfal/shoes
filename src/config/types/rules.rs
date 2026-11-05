@@ -288,13 +288,19 @@ impl<'de> Deserialize<'de> for RuleConfig {
                 "a policy rule requires a mapping with conditions, masks, or a source",
             ));
         };
+        let matching_fields = ["conditions", "masks", "mask"]
+            .iter()
+            .filter(|key| fields.contains_key(**key))
+            .count();
+        if matching_fields > 1 {
+            return Err(D::Error::custom(
+                "a rule must specify only one of conditions, masks, or mask",
+            ));
+        }
         if fields.contains_key("path") || fields.contains_key("url") {
-            if ["conditions", "masks", "mask"]
-                .iter()
-                .any(|key| fields.contains_key(*key))
-            {
+            if matching_fields != 0 {
                 return Err(D::Error::custom(
-                    "a flat rule source cannot also specify conditions or masks",
+                    "a flat rule source cannot also specify conditions, masks, or mask",
                 ));
             }
             let mut source = serde_json::Map::new();

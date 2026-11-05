@@ -93,7 +93,18 @@ impl Expression {
                 }
                 let (field, value) = fields.into_iter().next().unwrap();
                 match field.as_str() {
-                    "masks" => decode(value).map(Self::Legacy),
+                    "masks" => {
+                        let valid = value.is_string()
+                            || value.as_array().is_some_and(|values| {
+                                !values.is_empty() && values.iter().all(Value::is_string)
+                            });
+                        if !valid {
+                            return Err(invalid(
+                                "a masks leaf requires a mask string or a nonempty list of mask strings; combine other predicates with all/any/not",
+                            ));
+                        }
+                        decode(value).map(Self::Legacy)
+                    }
                     "any_destination" => decode(value).map(Self::AnyDestination),
                     "domain" => decode(value).map(Self::Domain),
                     "domain_suffix" => decode(value).map(Self::DomainSuffix),
@@ -185,6 +196,26 @@ mod tests {
             let error = Expression::from_config(value).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn mask_leaf_diagnostics_describe_the_accepted_shapes() {
+        for value in [
+            json!([]),
+            json!(null),
+            json!(false),
+            json!(5),
+            json!({"domain": ["example.com"]}),
+            json!(["example.com", {"destination_port": [443]}]),
+            json!(["example.com", 5]),
+        ] {
+            let error = Expression::from_config(json!({"all": [{"masks": value}]})).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "a masks leaf requires a mask string or a nonempty list of mask strings; combine other predicates with all/any/not"
+            );
         }
     }
 
