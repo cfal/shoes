@@ -680,7 +680,7 @@ fn carrier_mtu_checks_single_hop_choice_members() {
                 single,
             ])),
         };
-        let result = validate_carrier_chain_mtu(&choice, 1280);
+        let result = validate_carrier_chain_mtu(&choice, 1280, 0);
         if mtu < 1360 {
             let error = result.unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -694,7 +694,7 @@ fn carrier_mtu_checks_single_hop_choice_members() {
         let choice = ClientChain {
             hops: OneOrSome::One(super::super::composition::pool_choice(vec![multiple])),
         };
-        validate_carrier_chain_mtu(&choice, 1280).unwrap();
+        validate_carrier_chain_mtu(&choice, 1280, 0).unwrap();
     }
 }
 
@@ -895,4 +895,263 @@ fn old_endpoint_forms_and_client_peer_lists_are_rejected() {
         invalid["protocol"][field] = json!([]);
         assert!(validate(copies(invalid)).is_err(), "accepted {field}");
     }
+}
+
+fn amnezia(s4: u32) -> Value {
+    json!({
+        "jc": 3, "jmin": 40, "jmax": 70, "s1": 15, "s2": 18, "s3": 20, "s4": s4,
+        "h1": "100000-100100", "h2": "200000-200100",
+        "h3": "300000-300100", "h4": "400000-400100",
+    })
+}
+
+fn phobos(masking: Option<&str>) -> Value {
+    let mut phobos = json!({"key": "a-shared-phobos-secret"});
+    if let Some(masking) = masking {
+        phobos["masking"] = json!(masking);
+    }
+    phobos
+}
+
+fn client_with(field: &str, value: Value) -> Value {
+    let mut client = client();
+    client["protocol"][field] = value;
+    client
+}
+
+fn server_with(field: &str, value: Value) -> Value {
+    let mut server = server();
+    server["protocol"][field] = value;
+    server
+}
+
+/// One client group holding `client`, used by a socks inbound.
+fn single(client: Value) -> Value {
+    json!([
+        {"client_group": "one", "client_chains": [client]},
+        {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
+         "rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": ["one"]}]},
+    ])
+}
+
+fn client_mtu(configs: Value) -> io::Result<u16> {
+    Ok(validate(configs)?.wireguard_endpoints[0].mtu)
+}
+
+#[test]
+fn plain_wireguard_serialises_without_new_fields() {
+    let mut validated = validate(single(client())).unwrap();
+    validated
+        .visit_clients(&mut |client| {
+            if let ResolvedClientProxyConfig::Wireguard(config) = &client.protocol {
+                let text = serde_yaml::to_string(&**config).unwrap();
+                for key in ["amnezia", "phobos", "mtu"] {
+                    assert!(!text.contains(key), "{key} in {text}");
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(validated.wireguard_endpoints[0].mtu, 1408);
+    let server_device = &validate(json!([server()])).unwrap().wireguard_endpoints[0];
+    assert!(server_device.amnezia.is_none() && server_device.phobos.is_none());
+    assert_eq!(server_device.mtu, 1408);
+}
+
+#[test]
+fn amnezia_default_mtu_subtracts_s4() {
+    let amnezia_client = client_with("amnezia", amnezia(23));
+    assert_eq!(client_mtu(single(amnezia_client.clone())).unwrap(), 1385);
+    let mut explicit = amnezia_client;
+    explicit["protocol"]["mtu"] = json!(1400);
+    assert_eq!(client_mtu(single(explicit)).unwrap(), 1400);
+    let server = server_with("amnezia", amnezia(23));
+    assert_eq!(client_mtu(json!([server])).unwrap(), 1385);
+}
+
+#[test]
+fn phobos_default_mtu_subtracts_masking() {
+    for (masking, expected) in [
+        (Some("stun"), 1384),
+        (Some("media"), 1396),
+        (Some("none"), 1408),
+        (None, 1408),
+    ] {
+        let configs = single(client_with("phobos", phobos(masking)));
+        assert_eq!(client_mtu(configs).unwrap(), expected, "{masking:?}");
+    }
+}
+
+#[test]
+fn large_s4_clamps_mtu_to_1280() {
+    let configs = single(client_with("amnezia", amnezia(200)));
+    assert_eq!(client_mtu(configs).unwrap(), 1280);
+}
+
+#[test]
+fn explicit_mtu_range_unchanged() {
+    for mtu in [1279, 1421] {
+        let mut client = client_with("amnezia", amnezia(23));
+        client["protocol"]["mtu"] = json!(mtu);
+        let error = validate(single(client)).err().unwrap().to_string();
+        assert!(error.contains("between 1280 and 1420"), "{error}");
+    }
+}
+
+#[test]
+fn amnezia_and_phobos_rejected_together() {
+    let mut client = client_with("amnezia", amnezia(23));
+    client["protocol"]["phobos"] = phobos(None);
+    let error = validate(single(client)).err().unwrap().to_string();
+    assert!(error.contains("mutually exclusive"), "{error}");
+}
+
+#[test]
+fn huge_overhead_with_both_blocks_reports_exclusion_without_overflow() {
+    let mut client = client_with("amnezia", amnezia(u32::from(u16::MAX)));
+    client["protocol"]["phobos"] = phobos(Some("stun"));
+    let error = validate(single(client)).err().unwrap().to_string();
+    assert!(error.contains("mutually exclusive"), "{error}");
+}
+
+#[test]
+fn phobos_on_server_rejected() {
+    let error = validate(json!([server_with("phobos", phobos(None))]))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("client-only"), "{error}");
+    assert!(!error.contains("a-shared-phobos-secret"), "{error}");
+    let parsed: Vec<crate::config::Config> = serde_yaml::from_str(
+        &serde_yaml::to_string(&json!([server_with("phobos", phobos(None))])).unwrap(),
+    )
+    .unwrap();
+    let debug = format!("{parsed:?}");
+    assert!(debug.contains("phobos: Some"), "{debug}");
+    assert!(!debug.contains("a-shared-phobos-secret"), "{debug}");
+}
+
+#[test]
+fn bad_amnezia_values_fail_config_load() {
+    let mut overlapping = amnezia(23);
+    overlapping["h2"] = overlapping["h1"].clone();
+    for configs in [
+        json!([server_with("amnezia", overlapping.clone())]),
+        single(client_with("amnezia", overlapping)),
+    ] {
+        assert!(validate(configs).is_err());
+    }
+    let bad_phobos = client_with(
+        "phobos",
+        json!({"key": "a-shared-phobos-secret", "masking": "bogus"}),
+    );
+    assert!(validate(single(bad_phobos)).is_err());
+}
+
+#[test]
+fn plain_amnezia_blocks_behave_as_no_block() {
+    let plain_blocks = [
+        json!({}),
+        json!({"jc": 0, "s4": 0, "content_padding_addition": 0}),
+    ];
+    for block in plain_blocks {
+        let client = client_with("amnezia", block.clone());
+        let validated = validate(single(client.clone())).unwrap();
+        let endpoint = &validated.wireguard_endpoints[0];
+        assert!(endpoint.amnezia.is_none(), "{block}");
+        assert_eq!(endpoint.mtu, 1408, "{block}");
+        let server = validate(json!([server_with("amnezia", block.clone())])).unwrap();
+        assert!(server.wireguard_endpoints[0].amnezia.is_none(), "{block}");
+        // Shares a device with a plain copy instead of reporting differing settings.
+        validate(copies(client.clone())).unwrap();
+        let mut with_phobos = client;
+        with_phobos["protocol"]["phobos"] = phobos(Some("stun"));
+        let validated = validate(single(with_phobos)).unwrap();
+        assert!(validated.wireguard_endpoints[0].phobos.is_some(), "{block}");
+    }
+    let real = validate(single(client_with("amnezia", amnezia(23)))).unwrap();
+    assert!(real.wireguard_endpoints[0].amnezia.is_some());
+}
+
+#[test]
+fn device_sharing_rejects_differing_obfuscation() {
+    let error = validate(copies(client_with("amnezia", amnezia(23))))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("conflicting WireGuard client settings"),
+        "{error}"
+    );
+}
+
+/// Two client groups, one client each, both used by a socks inbound.
+fn pair(first: Value, second: Value) -> Value {
+    json!([
+        {"client_group": "one", "client_chains": [first]},
+        {"client_group": "two", "client_chains": [second]},
+        {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
+         "rules": [{"masks": "0.0.0.0/0", "action": "allow",
+                    "client_chain": [{"pool": ["one", "two"]}]}]},
+    ])
+}
+
+#[test]
+fn equivalent_amnezia_spellings_share_a_device() {
+    let mut written = amnezia(23);
+    written["h1"] = json!("5");
+    written["h2"] = json!("200000");
+    let mut spelled = written.clone();
+    // A number for a one-value range, and defaults written out.
+    spelled["h1"] = json!(5);
+    spelled["h2"] = json!("200000-200000");
+    spelled["content_padding_addition"] = json!(0);
+    spelled["random_trailers"] = json!(false);
+    let validated = validate(pair(
+        client_with("amnezia", written.clone()),
+        client_with("amnezia", spelled),
+    ))
+    .unwrap();
+    assert_eq!(validated.wireguard_endpoints.len(), 1);
+
+    let mut different = written.clone();
+    different["h1"] = json!(6);
+    let error = validate(pair(
+        client_with("amnezia", written),
+        client_with("amnezia", different),
+    ))
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        error.contains("conflicting WireGuard client settings"),
+        "{error}"
+    );
+}
+
+#[test]
+fn invalid_amnezia_next_to_phobos_reports_the_amnezia_error() {
+    let mut overlapping = amnezia(23);
+    overlapping["h2"] = overlapping["h1"].clone();
+    let mut client = client_with("amnezia", overlapping);
+    client["protocol"]["phobos"] = phobos(None);
+    let error = validate(single(client)).err().unwrap().to_string();
+    assert!(error.contains("WireGuard amnezia:"), "{error}");
+    assert!(!error.contains("mutually exclusive"), "{error}");
+}
+
+#[test]
+fn only_a_derived_mtu_counts_as_clamped() {
+    let derived = validate(single(client_with("amnezia", amnezia(200)))).unwrap();
+    assert_eq!(derived.wireguard_endpoints[0].mtu, 1280);
+    assert!(derived.wireguard_endpoints[0].mtu_clamped);
+
+    let mut explicit = client_with("amnezia", amnezia(200));
+    explicit["protocol"]["mtu"] = json!(1280);
+    let explicit = validate(single(explicit)).unwrap();
+    assert_eq!(explicit.wireguard_endpoints[0].mtu, 1280);
+    assert!(!explicit.wireguard_endpoints[0].mtu_clamped);
+
+    let roomy = validate(single(client_with("amnezia", amnezia(23)))).unwrap();
+    assert!(!roomy.wireguard_endpoints[0].mtu_clamped);
 }
