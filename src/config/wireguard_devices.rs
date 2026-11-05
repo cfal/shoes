@@ -39,11 +39,29 @@ impl ClientRegistry {
         // The leaf's placement chooses this device; only its carriers affect device identity.
         settings.control = None;
         let mut selection_paths = Vec::new();
+        let mut amnezia_settings = Vec::new();
         visit_client(&mut settings, &mut |carrier| {
             if let ResolvedClientProxyConfig::Wireguard(config) = &mut carrier.protocol
                 && let Some(chain) = &mut config.peer_client_chain
             {
                 normalize_round_robin_names(chain);
+            }
+            if let ResolvedClientProxyConfig::Wireguard(config) = &mut carrier.protocol {
+                // An explicit default MTU and an omitted one are the same device.
+                config.mtu = Some(super::types::wireguard::effective_mtu(
+                    config.mtu,
+                    config.obfuscation_overhead(),
+                ));
+                // Compares what the device will run, so `h1: 5` and `h1: "5"` are one setting.
+                // An invalid block stays as written and is reported by device validation.
+                if let Some(parsed) = config
+                    .amnezia
+                    .as_ref()
+                    .and_then(|amnezia| amnezia.to_gotatun().ok())
+                {
+                    amnezia_settings.push(parsed.to_uapi_lines());
+                    config.amnezia = None;
+                }
             }
             selection_paths.push(
                 carrier
@@ -65,7 +83,7 @@ impl ClientRegistry {
             Ok(())
         })?;
         // Serialization excludes generation-local IDs and prepared connectors.
-        let settings = serde_yaml::to_value((settings, selection_paths))
+        let settings = serde_yaml::to_value((settings, selection_paths, amnezia_settings))
             .map_err(|_| invalid("cannot compare WireGuard client settings"))?;
         let ResolvedClientProxyConfig::Wireguard(config) = &mut client.protocol else {
             unreachable!("checked WireGuard protocol")
@@ -207,18 +225,25 @@ fn validate_carrier_mtu(device: &WireguardDeviceConfig) -> io::Result<()> {
     let Some(chain) = &device.peer_client_chain else {
         return Ok(());
     };
-    validate_carrier_chain_mtu(chain, device.mtu)
+    validate_carrier_chain_mtu(chain, device.mtu, device.steady_overhead())
 }
 
-fn validate_carrier_chain_mtu(chain: &super::ResolvedClientChain, mtu: u16) -> io::Result<()> {
+fn validate_carrier_chain_mtu(
+    chain: &super::ResolvedClientChain,
+    mtu: u16,
+    overhead: u16,
+) -> io::Result<()> {
     if chain.hops.iter().count() != 1 {
         return Ok(());
     }
     let check = |client: &ResolvedClientConfig| {
         if let ResolvedClientProxyConfig::Wireguard(carrier) = &client.protocol {
             // IPv6 UDP plus WireGuard header, tag and worst-case padding.
-            let required = mtu.next_multiple_of(16) + 80;
-            if carrier.mtu < required {
+            // Wider than u16: the fork puts no upper bound on the padding sizes.
+            let required = u32::from(mtu.next_multiple_of(16)) + 80 + u32::from(overhead);
+            let carrier_mtu =
+                super::types::wireguard::effective_mtu(carrier.mtu, carrier.obfuscation_overhead());
+            if u32::from(carrier_mtu) < required {
                 return Err(invalid(format!(
                     "WireGuard peer_client_chain requires carrier MTU >= {required}"
                 )));
@@ -229,7 +254,7 @@ fn validate_carrier_chain_mtu(chain: &super::ResolvedClientChain, mtu: u16) -> i
     match chain.hops.iter().next().unwrap() {
         ResolvedClientHop::Choice(choice) => {
             for member in &choice.members {
-                validate_carrier_chain_mtu(member, mtu)?;
+                validate_carrier_chain_mtu(member, mtu, overhead)?;
             }
             Ok(())
         }

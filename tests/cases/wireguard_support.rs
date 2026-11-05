@@ -68,3 +68,31 @@ pub fn socks(port: u16) -> Value {
         }],
     })
 }
+
+/// An `amnezia` block for `version` ("2.0", "3.0" or "3.1").
+// Only some of the test crates that include this file use it.
+#[allow(dead_code)]
+pub fn amnezia_profile(version: &str) -> Value {
+    let mut profile = json!({
+        "jc": 3, "jmin": 40, "jmax": 70,
+        "s1": 15, "s2": 18, "s3": 20, "s4": 23,
+        "h1": "100000-100100", "h2": "200000-200100",
+        "h3": "300000-300100", "h4": "400000-400100",
+        "i1": "<b 0xc0ffee><r 16><t>",
+    });
+    let extra = profile.as_object_mut().expect("profile is an object");
+    if version != "2.0" {
+        extra.insert("header_protection_key".into(), json!("1a".repeat(32)));
+        extra.insert("content_padding_addition".into(), json!("0-32"));
+        extra.insert("rekey_after_time".into(), json!("110-130"));
+    }
+    if version == "3.1" {
+        extra.insert("random_trailers".into(), json!(true));
+        extra.insert("disable_cookies".into(), json!(true));
+    }
+    assert!(
+        ["2.0", "3.0", "3.1"].contains(&version),
+        "unknown profile {version}"
+    );
+    profile
+}
