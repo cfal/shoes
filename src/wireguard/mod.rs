@@ -13,7 +13,8 @@ mod tests;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use gotatun::{
-    device::{DeviceBuilder, Peer},
+    device::{Device, DeviceBuilder, Peer, configure::PeerStats},
+    phobos::{PhobosHandle, PhobosUdpFactory},
     x25519::{PublicKey, StaticSecret},
 };
 use ipnetwork::IpNetwork;
@@ -22,7 +23,7 @@ use std::{
     collections::HashMap,
     fmt, io as stdio,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, OnceLock, atomic::Ordering},
 };
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -340,6 +341,39 @@ impl Prepared {
     }
 }
 
+/// The device over shoes' sockets, or over the Phobos client wrapping them.
+enum WireguardDevice {
+    Plain(Device<(io::Factory, io::IpSink, io::IpSource)>),
+    Phobos(Device<(PhobosUdpFactory<io::Factory>, io::IpSink, io::IpSource)>),
+}
+
+impl WireguardDevice {
+    async fn wait(&mut self) {
+        match self {
+            Self::Plain(device) => device.wait().await,
+            Self::Phobos(device) => device.wait().await,
+        }
+    }
+
+    async fn peers(&self) -> Vec<PeerStats> {
+        match self {
+            Self::Plain(device) => device.peers().await,
+            Self::Phobos(device) => device.peers().await,
+        }
+    }
+
+    async fn stop(self) {
+        match self {
+            Self::Plain(device) => device.stop().await,
+            Self::Phobos(device) => device.stop().await,
+        }
+    }
+}
+
+fn startup_error(error: gotatun::device::Error) -> stdio::Error {
+    stdio::Error::other(format!("WireGuard device startup failed: {error}"))
+}
+
 struct EndpointRuntime {
     cancel: CancellationToken,
     task: JoinHandle<()>,
@@ -439,6 +473,22 @@ impl PreparedEndpoint {
         let resolver = self.outer_resolver.clone();
         // Rebuilding after preflight gives each start fresh pool indices and handler lifetimes.
         let outer_chain = self.build_outer_chain()?;
+        let phobos = config
+            .phobos
+            .as_ref()
+            .map(|phobos| phobos.to_gotatun())
+            .transpose()?;
+        // The detour starts before the factory that yields the handle; first connects are
+        // covered by the device's bind.
+        let reconnected = Arc::new(OnceLock::<PhobosHandle>::new());
+        let on_connect = phobos.is_some().then(|| {
+            let reconnected = reconnected.clone();
+            Arc::new(move || {
+                if let Some(handle) = reconnected.get() {
+                    handle.address_changed();
+                }
+            }) as detour::ConnectHook
+        });
         let (udp, released, peers) = if let Some(chain) = &outer_chain {
             let peers = self.peers_for_socket(None)?;
             let (sender, receiver, released) = detour::start(
@@ -452,7 +502,7 @@ impl PreparedEndpoint {
                 } else {
                     detour::MAX_DATAGRAM
                 },
-                None,
+                on_connect,
             );
             log::info!("WireGuard endpoint {} using peer_client_chain", config.id);
             (io::Factory::detour(sender, receiver), released, peers)
@@ -471,7 +521,6 @@ impl PreparedEndpoint {
             );
         }
         let builder = DeviceBuilder::new()
-            .with_udp(udp)
             .with_private_key(StaticSecret::from(config.private_key.0))
             .with_peers(peers)
             .with_ip_pair(
@@ -491,9 +540,25 @@ impl PreparedEndpoint {
             Some(amnezia) => builder.with_amnezia(amnezia.to_gotatun()?),
             None => builder,
         };
-        let mut device = builder.build().await.map_err(|error| {
-            stdio::Error::other(format!("WireGuard device startup failed: {error}"))
-        })?;
+        // The handle stays available for a direct-path watcher reporting local address changes.
+        let (mut device, _phobos_handle) = match phobos {
+            Some(phobos) => {
+                let (udp, handle) = PhobosUdpFactory::new(udp, phobos)
+                    .map_err(|error| startup_error(error.into()))?;
+                let _ = reconnected.set(handle.clone());
+                let device = builder
+                    .with_udp(udp)
+                    .with_phobos_handle(handle.clone())
+                    .build()
+                    .await
+                    .map_err(startup_error)?;
+                (WireguardDevice::Phobos(device), Some(handle))
+            }
+            None => {
+                let device = builder.with_udp(udp).build().await.map_err(startup_error)?;
+                (WireguardDevice::Plain(device), None)
+            }
+        };
         *self.connector.active.lock() = Some(ActiveEndpoint {
             handle: stack.handle.clone(),
             carrier: outer_chain,

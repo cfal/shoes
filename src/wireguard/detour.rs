@@ -177,11 +177,12 @@ impl Worker {
                         self.name,
                         self.target
                     );
+                    let (outgoing, mut queued) = mpsc::channel(QUEUE_CAPACITY);
+                    *self.destination.lock() = Some(outgoing);
+                    // After the queue is installed, so a send the hook triggers is not dropped.
                     if let Some(on_connect) = &self.on_connect {
                         on_connect();
                     }
-                    let (outgoing, mut queued) = mpsc::channel(QUEUE_CAPACITY);
-                    *self.destination.lock() = Some(outgoing);
                     let started = Instant::now();
                     let error = self.relay(stream.as_mut(), &mut queued).await;
                     // Removing the sender under the enqueue lock isolates failed associations.
