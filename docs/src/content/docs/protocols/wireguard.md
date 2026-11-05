@@ -244,3 +244,96 @@ Bind failures during activation trigger rollback to the previous configuration,
 but disconnected tunnel sessions are not restored. If rollback fails, shoes
 exits with status 1. Shutdown waits for buffered UDP tasks to release their
 sockets before rebind. No host route cleanup is necessary.
+
+## AmneziaWG
+
+AmneziaWG 2.0, 3.0 and 3.1 are configured with an `amnezia` block inside
+`protocol`, on servers and clients. It is off by default, and a config without
+the block, or with a block that sets nothing beyond plain WireGuard, behaves as
+plain WireGuard. Values are checked by the GotaTun fork's port of amneziawg-go's
+parser and validator, so a profile that works there is accepted here.
+See the [server](/examples/amneziawg_server/) and
+[client](/examples/amneziawg_client/) examples; their demonstration keys must be replaced.
+
+```yaml
+amnezia:
+  jc: 3
+  jmin: 40
+  jmax: 70
+  s1: 15
+  s2: 18
+  s3: 20
+  s4: 23
+  h1: "100000-100100"
+  h2: "200000-200100"
+  h3: "300000-300100"
+  h4: "400000-400100"
+  i1: "<b 0xc0ffee><r 16><t>"
+  header_protection_key: "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+  content_padding_addition: "0-32"
+  rekey_after_time: "110-130"
+```
+
+Both ends must use the same values. A server has one `amnezia` block, which
+applies to all of its peers; per-peer blocks are not supported.
+
+| Key | Version | Meaning |
+| --- | --- | --- |
+| `jc`, `jmin`, `jmax` | 2.0 | Number of junk packets before a handshake and their size range |
+| `s1`, `s2`, `s3`, `s4` | 2.0 | Random bytes prepended to initiation, response, cookie and transport packets |
+| `h1`, `h2`, `h3`, `h4` | 2.0 | Message type values; a number or a non-overlapping `lo-hi` range |
+| `i1` to `i5` | 2.0 | Custom signature packets sent before a handshake, written as tag chains such as `<b 0xc0ffee><r 16><t>` |
+| `header_protection_key` | 3.0 | 32-byte key as 64 hex characters or base64; with it set, `s1` to `s4` must be at least 12 |
+| `content_padding_addition` | 3.0 | Number or `lo-hi` range of zero bytes added to transport packets |
+| `rekey_after_time`, `rekey_timeout`, `reject_after_time`, `keepalive_timeout`, `max_handshake_attempts` | 3.0 | Number or `lo-hi` range that randomizes the timer; `0` keeps the WireGuard default |
+| `random_trailers`, `disable_cookies` | 3.1 | Booleans |
+
+Values from a `.conf` file map to the same names in lower-case snake_case: `Jc`
+becomes `jc`, `S1` becomes `s1`, `H1` becomes `h1`, `I1` becomes `i1`,
+`HeaderProtectionKey` becomes `header_protection_key` and `ContentPaddingAddition`
+becomes `content_padding_addition`. Ranges keep the `lo-hi` text form and should be
+quoted. Every key that takes a number or a range (`h1` to `h4`, `content_padding_addition`
+and the 3.0 timers) also accepts a plain number. Unknown keys are
+rejected. The per-peer keepalive range is not supported yet; use the ordinary
+`persistent_keepalive` seconds.
+
+## Phobos
+
+Phobos hides WireGuard datagrams behind a key-derived XOR keystream, a random
+tail and optional STUN or RTP framing. shoes implements the client side only,
+for a WireGuard server that sits behind a Phobos proxy. There is no Phobos server.
+See the [client example](/examples/phobos_client/).
+
+```yaml
+phobos:
+  key: "demonstration-phobos-key"
+  masking: stun
+```
+
+| Key | Meaning |
+| --- | --- |
+| `key` | Required shared key. It must be a quoted YAML string; an unquoted number is rejected |
+| `masking` | `none` (default), `stun`, `media`, `auto` or `tls`. `auto` and `tls` frame nothing on UDP and behave like `none` |
+| `max_dummy` | Upper bound of the random tail on transport and cookie packets |
+| `obfuscate_bytes` | Number of leading bytes covered by the keystream |
+| `media_pt`, `media_ssrc`, `media_clock` | RTP header fields used by `media` masking |
+
+`amnezia` and `phobos` are mutually exclusive on one client, because Phobos
+needs the first bytes of each WireGuard message to stay as plain WireGuard
+writes them. A server with a `phobos` block is rejected.
+
+When the Phobos peer is reached directly, shoes checks every 2 seconds which
+local address the OS would use toward each peer. If it changes, for example
+after a Wi-Fi to cellular switch, or if the route disappears and comes back,
+the client re-handshakes. When `peer_client_chain` is used, the client
+re-handshakes each time the detour reconnects.
+
+## MTU with obfuscation
+
+Obfuscation adds bytes to every packet. Without an explicit `mtu`, shoes uses
+`1408` minus the per-packet overhead: `s4` for AmneziaWG, and 24 (`stun`) or 12
+(`media`) for Phobos masking. The result is clamped to at least 1280, with a
+warning when the clamp applies. An explicit `mtu` is used as written and must be
+in 1280-1420. `content_padding_addition` and `random_trailers` need no extra
+room: padding only fills packets up to the tunnel MTU and never grows a
+full-size packet.
