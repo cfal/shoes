@@ -1,6 +1,10 @@
 mod detour;
 mod io;
 #[cfg(test)]
+mod obfuscation_tests;
+/// Junk, handshake and padded packets vary in size, so a detour accepts any UDP payload.
+const OBFUSCATED_MAX_DATAGRAM: usize = 65535;
+#[cfg(test)]
 #[path = "../../tests/cases/wireguard_support.rs"]
 pub(crate) mod test_support;
 #[cfg(test)]
@@ -443,6 +447,12 @@ impl PreparedEndpoint {
                 resolver,
                 peers.iter().map(|peer| peer.endpoint.unwrap()),
                 stack.drops.clone(),
+                if config.amnezia.is_some() || config.phobos.is_some() {
+                    OBFUSCATED_MAX_DATAGRAM
+                } else {
+                    detour::MAX_DATAGRAM
+                },
+                None,
             );
             log::info!("WireGuard endpoint {} using peer_client_chain", config.id);
             (io::Factory::detour(sender, receiver), released, peers)
@@ -453,7 +463,14 @@ impl PreparedEndpoint {
             log::info!("WireGuard endpoint {} listening on {local}", config.id);
             (udp, released, peers)
         };
-        let mut device = DeviceBuilder::new()
+        if config.mtu_clamped {
+            log::warn!(
+                "WireGuard endpoint {} MTU clamped to {} because obfuscation overhead is large",
+                config.id,
+                config.mtu,
+            );
+        }
+        let builder = DeviceBuilder::new()
             .with_udp(udp)
             .with_private_key(StaticSecret::from(config.private_key.0))
             .with_peers(peers)
@@ -468,12 +485,15 @@ impl PreparedEndpoint {
                     receiver: stack.output.take().unwrap(),
                     mtu: config.mtu,
                 },
-            )
-            .build()
-            .await
-            .map_err(|error| {
-                stdio::Error::other(format!("WireGuard device startup failed: {error}"))
-            })?;
+            );
+        #[cfg(unix)]
+        let builder = match &config.amnezia {
+            Some(amnezia) => builder.with_amnezia(amnezia.to_gotatun()?),
+            None => builder,
+        };
+        let mut device = builder.build().await.map_err(|error| {
+            stdio::Error::other(format!("WireGuard device startup failed: {error}"))
+        })?;
         *self.connector.active.lock() = Some(ActiveEndpoint {
             handle: stack.handle.clone(),
             carrier: outer_chain,

@@ -30,19 +30,23 @@ use crate::{
 
 const QUEUE_CAPACITY: usize = 64;
 // The supported inner MTU is at most 1420, plus WireGuard padding, header and tag.
-const MAX_DATAGRAM: usize = 2048;
+// Obfuscated devices pass a larger limit because junk and handshake messages vary in size.
+pub(super) const MAX_DATAGRAM: usize = 2048;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 const STABLE_ASSOCIATION: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Called each time an outer association is established.
+pub(super) type ConnectHook = Arc<dyn Fn() + Send + Sync>;
 type Destination = Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>;
 
 #[derive(Clone)]
 pub(super) struct Sender {
     destinations: Arc<HashMap<SocketAddr, Destination>>,
     drops: Arc<AtomicU64>,
+    max_datagram: usize,
 }
 
 pub(super) struct Receiver {
@@ -59,7 +63,7 @@ impl Sender {
             )
         })?;
         let outgoing = destination.lock();
-        let sent = packet.len() <= MAX_DATAGRAM
+        let sent = packet.len() <= self.max_datagram
             && outgoing
                 .as_ref()
                 .is_some_and(|queue| queue.try_send(packet.to_vec()).is_ok());
@@ -90,6 +94,8 @@ pub(super) fn start(
     resolver: Arc<dyn Resolver>,
     targets: impl Iterator<Item = SocketAddr>,
     drops: Arc<AtomicU64>,
+    max_datagram: usize,
+    on_connect: Option<ConnectHook>,
 ) -> (Sender, Receiver, oneshot::Receiver<()>) {
     let cancel = CancellationToken::new();
     let (incoming, received) = mpsc::channel(QUEUE_CAPACITY);
@@ -110,6 +116,8 @@ pub(super) fn start(
             destination,
             incoming: incoming.clone(),
             drops: drops.clone(),
+            max_datagram,
+            on_connect: on_connect.clone(),
         };
         workers.spawn(crate::control::url_test::BACKGROUND.scope((), worker.run()));
     }
@@ -130,6 +138,7 @@ pub(super) fn start(
         Sender {
             destinations: Arc::new(destinations),
             drops,
+            max_datagram,
         },
         Receiver {
             incoming: received,
@@ -147,6 +156,8 @@ struct Worker {
     destination: Destination,
     incoming: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     drops: Arc<AtomicU64>,
+    max_datagram: usize,
+    on_connect: Option<ConnectHook>,
 }
 
 impl Worker {
@@ -166,6 +177,9 @@ impl Worker {
                         self.name,
                         self.target
                     );
+                    if let Some(on_connect) = &self.on_connect {
+                        on_connect();
+                    }
                     let (outgoing, mut queued) = mpsc::channel(QUEUE_CAPACITY);
                     *self.destination.lock() = Some(outgoing);
                     let started = Instant::now();
@@ -224,7 +238,7 @@ impl Worker {
                         return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
                     }
                     if !bytes.is_empty()
-                        && (bytes.len() > MAX_DATAGRAM
+                        && (bytes.len() > self.max_datagram
                             || self
                                 .incoming
                                 .try_send((bytes.to_vec(), self.target))

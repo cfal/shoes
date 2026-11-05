@@ -111,6 +111,8 @@ async fn url_test_idle_reconnects_do_not_activate_lazy_groups() {
         Arc::new(NativeResolver::new()),
         ["127.0.0.1:51820".parse().unwrap()].into_iter(),
         Arc::new(AtomicU64::new(0)),
+        MAX_DATAGRAM,
+        None,
     );
     for _ in 0..20 {
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -191,6 +193,7 @@ async fn bounded_queues_drop_offline_oversize_and_unknown_targets() {
     let sender = Sender {
         destinations: Arc::new(HashMap::from([(target, destination.clone())])),
         drops: drops.clone(),
+        max_datagram: MAX_DATAGRAM,
     };
     sender
         .send_to(Packet::copy_from(b"offline"), target)
@@ -226,6 +229,7 @@ fn disconnected_queue_cannot_receive_or_replay_packets() {
     let sender = Sender {
         destinations: Arc::new(HashMap::from([(target, destination.clone())])),
         drops: drops.clone(),
+        max_datagram: MAX_DATAGRAM,
     };
     sender.send_to(Packet::copy_from(b"old"), target).unwrap();
     let mut slot = destination.lock();
@@ -281,6 +285,8 @@ async fn associations_preserve_messages_isolate_peers_reconnect_and_release() {
             Arc::new(NativeResolver::new()),
             [targets[0], targets[0], targets[1]].into_iter(),
             drops.clone(),
+            MAX_DATAGRAM,
+            None,
         );
         assert_eq!(sender.destinations.len(), 2);
         let mut peers = HashMap::new();
@@ -376,6 +382,8 @@ async fn stalled_connect_is_bounded_and_cancellation_joins_workers() {
         Arc::new(NativeResolver::new()),
         [target].into_iter(),
         Arc::new(AtomicU64::new(0)),
+        MAX_DATAGRAM,
+        None,
     );
     let (_, _, mut first) = connections.recv().await.unwrap();
     tokio::time::advance(IO_TIMEOUT + MIN_BACKOFF).await;
@@ -406,6 +414,8 @@ async fn stalled_write_reconnects_without_replaying_old_queue() {
         Arc::new(NativeResolver::new()),
         [target].into_iter(),
         drops.clone(),
+        MAX_DATAGRAM,
+        None,
     );
     let (_, _, _blocked) = connections.recv().await.unwrap();
     for _ in 0..3 {
