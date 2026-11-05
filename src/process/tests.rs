@@ -141,11 +141,15 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
         shoes_test_support::isolated::assert_one_test_passed(&output);
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("Reload rejected; previous servers unavailable, recovery continues:")
+                .contains("Reload rejected; recovery will retry previous configuration:")
         );
         assert!(
             String::from_utf8_lossy(&output.stderr)
                 .contains("Reload rejected; workers unavailable, recovery continues:")
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr)
+                .contains("Reload rejected; previous servers restored:")
         );
         return;
     }
@@ -206,6 +210,20 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
 
             events.send(Some(false)).await.unwrap();
             assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
+            config.push(serde_json::json!({"path":directory.path(), "protocol":{"type":"socks"}}));
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert_eq!(
+                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
+                0
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            events.send(Some(true)).await.unwrap();
+            // Recovery must retry the accepted config without another reload of the rejected file.
+            let mut live = greet(added).await;
+            config.pop();
+
+            events.send(Some(false)).await.unwrap();
+            assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
             std::fs::remove_file(&unix).unwrap();
             std::fs::create_dir(&unix).unwrap();
             events.send(Some(true)).await.unwrap();
@@ -233,7 +251,7 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
                 unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
                 0
             );
-            // An unchanged reload fails activation and rollback, but must not end recovery.
+            // An unchanged reload fails activation, but must not end recovery.
             assert!(
                 tokio::time::timeout(Duration::from_secs(1), queued.read_u8())
                     .await
@@ -446,7 +464,7 @@ async fn reconnect_restarts_certificate_workers_retired_by_a_rejected_candidate(
         .unwrap();
     challenge(address).await;
 
-    // Candidate retirement can stop the accepted certificate workers before rollback fails.
+    // Candidate retirement can stop accepted certificate workers before candidate activation fails.
     prepared
         .certificates
         .retire_unused(&Default::default())
@@ -469,9 +487,9 @@ async fn reconnect_restarts_certificate_workers_retired_by_a_rejected_candidate(
 
 #[cfg(unix)]
 #[tokio::test]
-async fn recovery_rollback_restores_runtime_before_dns_bootstrap() {
-    const NAME: &str = "process::tests::recovery_rollback_restores_runtime_before_dns_bootstrap";
-    const CHILD: &str = "SHOES_RECOVERY_ROLLBACK_RUNTIME_TEST";
+async fn recovery_retry_restores_runtime_before_dns_bootstrap() {
+    const NAME: &str = "process::tests::recovery_retry_restores_runtime_before_dns_bootstrap";
+    const CHILD: &str = "SHOES_RECOVERY_RETRY_RUNTIME_TEST";
     if std::env::var_os(CHILD).is_none() {
         shoes_test_support::isolated::run_isolated(NAME, CHILD, "1");
         return;
@@ -553,20 +571,27 @@ async fn recovery_rollback_restores_runtime_before_dns_bootstrap() {
         ntp_reply.await.unwrap();
         assert_eq!(resources::limits().quic_memory_bytes, Some(1));
         assert!(crate::clock::now().unwrap() > std::time::SystemTime::now() + Duration::from_secs(86_399));
-        fresh.scope(running.rollback(
-            &mut previous, &mut candidate, None,
-            Some(&mut crate::desktop::NetworkSession::default()),
-        )).await.unwrap();
-        let (admitted, offset) = observations.recv().await.unwrap();
-        assert!(admitted, "rollback bootstrap used the rejected QUIC limit");
-        assert!(offset < Duration::from_secs(1), "rollback bootstrap used the rejected clock: {offset:?}");
-        assert!(previous.dns.get_by_name("upstream").is_some());
+        fresh.scope(running.discard_candidate(&mut previous, &mut candidate)).await.unwrap();
+        running.pause_network(&mut previous, None, &fresh).await.unwrap();
+        assert!(previous.dns.get_by_name("upstream").is_none());
+        assert!(observations.try_recv().is_err(), "candidate cleanup rebuilt accepted DNS");
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream.write_all(&[5, 1, 0]).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), stream.read_u8()).await.is_err());
+
+        let retry = crate::network_tasks::NetworkLifetime::default();
+        retry.scope(running.reconnect(
+            &mut previous, &mut crate::desktop::NetworkSession::default(),
+        )).await.unwrap();
+        previous.tcp.activate();
+        let (admitted, offset) = observations.recv().await.unwrap();
+        assert!(admitted, "recovery bootstrap used the rejected QUIC limit");
+        assert!(offset < Duration::from_secs(1), "recovery bootstrap used the rejected clock: {offset:?}");
+        assert!(previous.dns.get_by_name("upstream").is_some());
         let mut reply = [0; 2];
         stream.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply, [5, 0]);
-        running.pause_network(&mut previous, None, &fresh).await.unwrap();
+        running.pause_network(&mut previous, None, &retry).await.unwrap();
         running.shutdown(&[&previous, &candidate]).await.unwrap();
     }).await.unwrap();
 }
@@ -910,9 +935,10 @@ async fn rejected_or_cancelled_activation_does_not_admit_candidate_dns_flows() {
             } else {
                 // Covers failure after listener startup but before activation commits.
                 running
-                    .rollback(&mut previous, &mut candidate, None, None)
+                    .discard_candidate(&mut previous, &mut candidate)
                     .await
                     .unwrap();
+                running.activate(&mut previous, None).await.unwrap();
             }
             drop(candidate);
             assert!(resolver.upgrade().is_none());

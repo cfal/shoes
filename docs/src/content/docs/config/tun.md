@@ -231,7 +231,7 @@ promised.
 Reload retains the interface, capture, and redirect listener identities. Managed
 TUN topology configuration changes require restart and are rejected before retiring live workers.
 Ordinary worker reloads can reset existing connections and briefly interrupt
-traffic, but do not disable capture. Failed candidates roll back on the same
+traffic, but do not disable capture. Failed ordinary reloads roll back on the same
 network lease. Unexpected owned routing changes or a missing private firewall
 table cause orderly shutdown. Resolver-setting changes do not.
 
@@ -247,6 +247,10 @@ can delay recovery, but shutdown remains cancellable.
 Explicit reloads wait while offline and can replace a configuration that prevents
 workers from restarting once an underlay is available, without first rebuilding
 the accepted DNS configuration.
+If activation of a recovery reload fails, its workers are cleaned up and forwarding
+remains paused. Recovery schedules the accepted configuration for another attempt
+after two seconds, rather than immediately rolling back or re-reading the rejected
+file. Cleanup and network ownership failures still cause shutdown.
 The TUN, REDIRECT ports, fake-IP mappings, and explicit selector choices remain
 owned and retained. WireGuard peer hostnames are refreshed best-effort; a failed
 refresh retains the previous endpoints rather than blocking unrelated workers. Old flows,
