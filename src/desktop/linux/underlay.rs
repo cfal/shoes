@@ -8,7 +8,7 @@ use rtnetlink::packet_route::{
     RouteNetlinkMessage,
     address::{AddressAttribute, AddressFlags, AddressHeaderFlags, AddressMessage},
     link::{LinkAttribute, LinkFlags},
-    route::{RouteAddress, RouteAttribute, RouteMessage, RouteVia},
+    route::{RouteAddress, RouteAttribute, RouteFlags, RouteMessage, RouteVia},
 };
 use rtnetlink::{Handle, RouteMessageBuilder};
 
@@ -226,7 +226,7 @@ pub(super) async fn snapshot(handle: &Handle, owned_index: u32, mark: u32) -> io
             continue;
         }
         // Read-only lookups select the kernel's actual next hop and source. No probe is sent.
-        let query = if ipv6 {
+        let mut query = if ipv6 {
             RouteMessageBuilder::<Ipv6Addr>::new()
                 .destination_prefix("2606:4700:4700::1111".parse().unwrap(), 128)
                 .mark(mark)
@@ -237,6 +237,8 @@ pub(super) async fn snapshot(handle: &Handle, owned_index: u32, mark: u32) -> io
                 .mark(mark)
                 .build()
         };
+        // IPv4 otherwise reports table 254 even when policy routing selects another table.
+        query.header.flags.insert(RouteFlags::LookupTable);
         let mut response = handle.route().get(query).execute();
         let lookup = response.try_next();
         let route = match tokio::time::timeout(std::time::Duration::from_secs(10), lookup).await {

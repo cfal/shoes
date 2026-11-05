@@ -1,6 +1,44 @@
 use super::*;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+pub(super) async fn policy_table_is_not_a_native_path() -> io::Result<()> {
+    let (connection, handle, _) = rtnetlink::new_connection().map_err(io::Error::other)?;
+    let _connection = AbortOnDropHandle::new(tokio::spawn(connection));
+    let mark = spec(false).linux.bypass_mark;
+    assert!(underlay::snapshot(&handle, 0, mark).await?.available());
+    let mark_text = mark.to_string();
+    for (family, gateway) in [("-4", "192.0.2.2"), ("-6", "fd00:1::2")] {
+        run(
+            "ip",
+            &[
+                family, "route", "add", "table", "100", "default", "via", gateway,
+            ],
+        )?;
+        run(
+            "ip",
+            &[
+                family, "rule", "add", "priority", "32000", "fwmark", &mark_text, "table", "100",
+            ],
+        )?;
+    }
+    let selected = underlay::snapshot(&handle, 0, mark).await;
+    for family in ["-4", "-6"] {
+        run(
+            "ip",
+            &[
+                family, "rule", "del", "priority", "32000", "fwmark", &mark_text, "table", "100",
+            ],
+        )?;
+        run("ip", &[family, "route", "flush", "table", "100"])?;
+    }
+    assert!(
+        !selected?.available(),
+        "policy-table route reported as a native default path"
+    );
+    assert!(underlay::snapshot(&handle, 0, mark).await?.available());
+    Ok(())
+}
+
 pub(super) async fn echo() -> io::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for address in ["198.51.100.2:19123", "[fd00:2::2]:19123"] {
