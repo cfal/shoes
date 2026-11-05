@@ -390,17 +390,6 @@ impl RunningServers {
         prepared: &mut PreparedServers,
         network: &mut crate::desktop::NetworkSession,
     ) -> io::Result<()> {
-        self.rebuild_network(prepared, network).await?;
-        self.start_retry(prepared).await?;
-        prepared.certificates.start().await;
-        Ok(())
-    }
-
-    async fn rebuild_network(
-        &mut self,
-        prepared: &mut PreparedServers,
-        network: &mut crate::desktop::NetworkSession,
-    ) -> io::Result<()> {
         // Rejected activation may have published candidate limits and clock.
         self.configure_runtime(prepared).await?;
         network.refresh_bootstrap()?;
@@ -434,6 +423,8 @@ impl RunningServers {
             );
             generation.catalog.selection.automatic.choices_changed();
         }
+        self.start_retry(prepared).await?;
+        prepared.certificates.start().await;
         Ok(())
     }
 
@@ -641,12 +632,10 @@ impl RunningServers {
         Ok(())
     }
 
-    async fn rollback(
+    async fn discard_candidate(
         &mut self,
         previous: &mut PreparedServers,
         candidate: &mut PreparedServers,
-        control: Option<&crate::control::runtime::ControlService>,
-        recovery_network: Option<&mut crate::desktop::NetworkSession>,
     ) -> io::Result<()> {
         self.stop().await;
         candidate
@@ -667,10 +656,7 @@ impl RunningServers {
             log::warn!("Rejected candidate Fake DNS checkpoint failed: {error}");
         }
         previous.tcp.defer_admission();
-        if let Some(network) = recovery_network {
-            self.rebuild_network(previous, network).await?;
-        }
-        self.activate(previous, control).await
+        Ok(())
     }
 }
 
@@ -1015,7 +1001,7 @@ async fn run_inner(
                 if !reconnecting {
                     log::info!("Underlay changed; retiring network workers");
                 }
-                // A rejected recovery reload may have rebuilt transports without starting workers.
+                // Rejected repair preparation can leave work in the current lifetime.
                 if let Err(error) = running
                     .pause_network(&mut prepared, control.as_ref(), &lifetime)
                     .await
@@ -1207,39 +1193,41 @@ async fn run_inner(
             result = lifetime.scope(running.activate(&mut candidate, control.as_ref())) => result,
         };
         if let Err(error) = result {
-            let rollback = tokio::select! {
-                biased;
-                _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
-                result = lifetime.scope(running.rollback(&mut prepared, &mut candidate, control.as_ref(), reconnecting.then_some(&mut *network))) => result,
-            };
-            if let Err(rollback) = rollback {
+            let restore = async {
+                running
+                    .discard_candidate(&mut prepared, &mut candidate)
+                    .await?;
                 if reconnecting {
-                    eprintln!(
-                        "Reload rejected; previous servers unavailable, recovery continues: {error}; rollback: {rollback}"
-                    );
-                    if let Err(error) = running
+                    running
                         .pause_network(&mut prepared, control.as_ref(), &lifetime)
                         .await
-                    {
-                        let _ = running
-                            .shutdown_network(&[&prepared, &candidate], network)
-                            .await;
-                        return Err(error);
-                    }
-                    retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
-                    continue;
+                } else {
+                    running.activate(&mut prepared, control.as_ref()).await
                 }
+            };
+            let restored = tokio::select! {
+                biased;
+                _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
+                result = lifetime.scope(restore) => result,
+            };
+            if let Err(restore) = restored {
+                let operation = if reconnecting {
+                    "recovery cleanup"
+                } else {
+                    "rollback"
+                };
                 let cleanup = running
                     .shutdown_network(&[&prepared, &candidate], network)
                     .await;
                 return Err(io::Error::other(format!(
-                    "Reload activation failed: {error}; rollback failed: {rollback}; shutdown: {cleanup:?}"
+                    "Reload activation failed: {error}; {operation} failed: {restore}; shutdown: {cleanup:?}"
                 )));
             }
-            eprintln!("Reload rejected; previous servers restored: {error}");
             if reconnecting {
-                reconnecting = false;
-                println!("Network reconnected");
+                eprintln!("Reload rejected; recovery will retry previous configuration: {error}");
+                retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
+            } else {
+                eprintln!("Reload rejected; previous servers restored: {error}");
             }
             continue;
         }
