@@ -838,6 +838,7 @@ async fn redirect_loopback_changes() -> io::Result<()> {
 }
 
 async fn kernel_capture() -> io::Result<()> {
+    reconnect::policy_table_is_not_a_native_path().await?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     run("nft", &["add", "table", "inet", "strict_rpf"])?;
     run(
