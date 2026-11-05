@@ -141,6 +141,9 @@ pub(super) async fn handover(redirect: bool) -> io::Result<()> {
             "link", "add", "native1", "type", "veth", "peer", "name", "remote1",
         ],
     )?;
+    for name in ["native1", "remote1"] {
+        std::fs::write(format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6"), "0")?;
+    }
     run("ip", &["link", "set", "remote1", "netns", "peer"])?;
     for args in [
         vec!["link", "set", "native1", "up"],
