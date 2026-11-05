@@ -75,7 +75,7 @@ impl Expression {
             Value::String(_) => decode(value).map(Self::Legacy),
             Value::Array(values) => {
                 if values.is_empty() {
-                    return Err(invalid("masks cannot be empty"));
+                    return Err(invalid("rule expression list cannot be empty"));
                 }
                 if values.iter().all(Value::is_string) {
                     return decode(Value::Array(values)).map(Self::Legacy);
@@ -88,11 +88,12 @@ impl Expression {
             Value::Object(fields) => {
                 if fields.len() != 1 {
                     return Err(invalid(
-                        "a masks object requires exactly one predicate or a path",
+                        "a rule expression object requires exactly one predicate or a source",
                     ));
                 }
                 let (field, value) = fields.into_iter().next().unwrap();
                 match field.as_str() {
+                    "masks" => decode(value).map(Self::Legacy),
                     "any_destination" => decode(value).map(Self::AnyDestination),
                     "domain" => decode(value).map(Self::Domain),
                     "domain_suffix" => decode(value).map(Self::DomainSuffix),
@@ -110,11 +111,11 @@ impl Expression {
                     "all" => Self::parse_children(decode(value)?, depth).map(Self::All),
                     "any" => Self::parse_children(decode(value)?, depth).map(Self::Any),
                     "not" => Self::parse_config(value, depth + 1).map(|p| Self::Not(Box::new(p))),
-                    _ => Err(invalid(format!("unknown masks field: {field}"))),
+                    _ => Err(invalid(format!("unknown rule predicate: {field}"))),
                 }
             }
             _ => Err(invalid(
-                "masks requires a mask string, predicate object, or nonempty list",
+                "a rule expression requires a mask string, predicate object, or nonempty list",
             )),
         }
     }
@@ -159,7 +160,7 @@ mod tests {
     #[test]
     fn composite_errors_preserve_list_context_and_child_order() {
         for (value, message) in [
-            (json!([]), "masks cannot be empty"),
+            (json!([]), "rule expression list cannot be empty"),
             (
                 json!({"all": []}),
                 "all/any requires at least one predicate",
@@ -178,7 +179,7 @@ mod tests {
             ),
             (
                 json!({"any": [{"unknown": true}, false]}),
-                "unknown masks field: unknown",
+                "unknown rule predicate: unknown",
             ),
         ] {
             let error = Expression::from_config(value).unwrap_err();

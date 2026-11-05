@@ -42,6 +42,56 @@ fn check_config(path: &Path, error: Option<&str>) {
 }
 
 #[tokio::test]
+async fn conditions_preserve_routing_order_and_reject_ambiguous_reloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("0.0.0.0", 0)
+        .await
+        .unwrap();
+    let (reservation, address) = reserve_address();
+    let conditions = json!({"all": [
+        {"masks": ["example.com", "192.0.2.0/24"]},
+        {"destination_port": [443]},
+        {"not": {"masks": "excluded.example.com"}}
+    ]});
+    let mut config = json!([
+        {"address": address.to_string(),
+         "protocol": {"type": "forward", "target": "192.0.2.1:443"},
+         "rules": [
+            {"conditions": conditions, "override_address": format!("127.0.0.1:{}", echo.local_addr().port())},
+            {"masks": "0.0.0.0/0", "action": "block"}
+         ]}
+    ]);
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    check_config(&config_path, None);
+    drop(reservation);
+    let mut process = Process::start(&config_path, &[]);
+    process.wait_for("Servers ready").await;
+    let mut established = TcpStream::connect(address).await.unwrap();
+    roundtrip(&mut established).await;
+
+    config[0]["rules"][0]["masks"] = json!("198.51.100.0/24");
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    process.wait_for("Reload rejected").await;
+    check_config(&config_path, Some("invalid rules"));
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    roundtrip(&mut established).await;
+
+    config[0]["rules"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("masks");
+    config[0]["rules"][0]["conditions"]["all"][1]["destination_port"] = json!([80]);
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    process.wait_for("Servers ready").await;
+    blocked(address).await;
+    roundtrip(&mut established).await;
+    drop(established);
+    process.signal(libc::SIGTERM);
+    assert!(process.exit().await.success());
+}
+
+#[tokio::test]
 async fn binary_sources_route_inline_and_named_and_reject_corrupt_reloads() {
     let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("0.0.0.0", 0)
         .await

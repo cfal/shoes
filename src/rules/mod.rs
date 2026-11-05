@@ -44,7 +44,7 @@ pub enum Expression {
     PortRanges(Vec<(u16, u16)>),
     #[serde(skip)]
     Never,
-    #[serde(untagged)]
+    #[serde(rename = "masks")]
     Legacy(crate::option_util::OneOrSome<crate::address::NetLocationMask>),
     #[serde(untagged)]
     Source(crate::rule_set::RuleSource),

@@ -247,6 +247,47 @@ pub fn attach(
 mod tests {
     use super::*;
 
+    #[test]
+    fn mask_conditions_have_explicit_controller_and_connection_payloads() {
+        use serde_json::json;
+
+        let conditions = json!({"all": [
+            {"masks": ["example.net", "192.0.2.0/24"]},
+            {"destination_port": [443]}
+        ]});
+        let configs = serde_json::from_value(json!([
+            {"clash_api_address": "127.0.0.1:0", "secret": "test"},
+            {"name": "entry", "address": "127.0.0.1:0", "protocol": {"type": "socks"},
+             "rules": [{"masks": "example.com"}, {"conditions": conditions}]}
+        ]))
+        .unwrap();
+        let mut validated = crate::config::create_server_configs(configs).unwrap();
+        let registry = Arc::new(FlowRegistry::default());
+        let projected = attach(&mut validated, 1, Some(registry)).unwrap();
+        let ResolvedConfig::Server(server) = &validated.configs[0] else {
+            panic!()
+        };
+        let expected = [json!({"masks": "example.com"}), conditions];
+        assert_eq!(projected.len(), expected.len());
+        for ((rule, projection), expected) in server.rules.iter().zip(&projected).zip(expected) {
+            let payload = expected.to_string();
+            let expected = format!("entry (root): {payload}");
+            assert_eq!(projection["payload"], expected);
+            let description = rule.criteria.description.as_ref().unwrap();
+            assert_eq!(description.payload, payload);
+            let flow = description.context.as_ref().unwrap().register(
+                "tcp",
+                &crate::address::NetLocation::from_str("example.com:443", None)
+                    .unwrap()
+                    .into(),
+                Vec::new(),
+                &description.payload,
+                Default::default(),
+            );
+            assert_eq!(flow.entry.rule_payload, expected);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn remote_rule_and_connection_projections_omit_delivery_secrets() {
