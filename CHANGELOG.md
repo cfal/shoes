@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- XHTTP H1 split-mode clients now establish their two carrier connections concurrently, retaining atomic connection admission and cancellation on setup failure.
+
 - XHTTP H1 packet-up clients without application byte caps now collect one bounded successor POST while waiting for the previous acknowledgement instead of accumulating only an input pipe of data. HTTP/1 pipelining and pacing are unchanged. Explicit byte caps retain the previous ACK gating to avoid staging data into memory needed by a download before its ACK.
 
 - Updated ML-KEM to 0.3.4 for secret-key debug redaction, constant-time equality/reduction hardening, and improved zeroization. Updated the BLAKE2 and Linux netlink dependencies while retaining protocol formats, maintained forks, and existing Rust/mobile platform requirements.

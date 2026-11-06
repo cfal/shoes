@@ -367,16 +367,21 @@ impl Client {
                         .clone()
                         .try_acquire_many_owned(count)
                         .map_err(|_| crate::resources::exhausted())?;
-                    for _ in 0..count {
-                        lanes.push(Lease {
-                            carrier: self.dial(&dialer).await?,
-                            reservation: None,
-                            _permit: SlotPermit {
-                                _permit: permit.split(1).unwrap(),
-                                slot: None,
-                            },
-                        });
-                    }
+                    lanes = futures::future::try_join_all((0..count).map(|_| {
+                        let permit = SlotPermit {
+                            _permit: permit.split(1).unwrap(),
+                            slot: None,
+                        };
+                        let dialer = &dialer;
+                        async move {
+                            Ok::<_, io::Error>(Lease {
+                                carrier: self.dial(dialer).await?,
+                                reservation: None,
+                                _permit: permit,
+                            })
+                        }
+                    }))
+                    .await?;
                 } else {
                     for _ in 0..count {
                         lanes.push(self.lease(&dialer, true).await?);

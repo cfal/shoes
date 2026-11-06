@@ -1819,6 +1819,59 @@ async fn h1_capped_upload_leaves_existing_headroom_for_download_before_ack() {
 }
 
 #[tokio::test]
+async fn h1_split_lanes_dial_concurrently_and_release_admission_on_failure() {
+    #[derive(Debug)]
+    struct PairedDialer {
+        inner: Dialer,
+        barrier: tokio::sync::Barrier,
+        fail: bool,
+    }
+    #[async_trait]
+    impl CarrierDialer for PairedDialer {
+        fn route_key(&self) -> &RouteKey {
+            &self.inner.key
+        }
+        async fn open_stream(&self) -> io::Result<Box<dyn AsyncStream>> {
+            let leader = self.barrier.wait().await.is_leader();
+            if self.fail {
+                if leader {
+                    return Err(io::ErrorKind::ConnectionRefused.into());
+                }
+                std::future::pending::<()>().await;
+            }
+            self.inner.open_stream().await
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let peer = H1PacketPeer::new().await;
+        let config = serde_json::from_value(serde_json::json!({
+            "pool": {"max_h1_connections": 2}, "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        let client = configured_client(config, XhttpVersion::H1, XhttpMode::PacketUp);
+        for fail in [true, false] {
+            let dialer = Arc::new(PairedDialer {
+                inner: Dialer {
+                    address: peer.address,
+                    key: RouteKey(vec![1]),
+                    opens: AtomicUsize::new(0),
+                },
+                barrier: tokio::sync::Barrier::new(2),
+                fail,
+            });
+            let result = client.open(dialer.clone()).await;
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(
+                dialer.inner.opens.load(Ordering::Relaxed),
+                if fail { 0 } else { 2 }
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn url_test_pooled_h2_sessions_record_carrier_demand() {
     use crate::{
         address::ResolvedLocation,
