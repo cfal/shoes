@@ -84,14 +84,25 @@ Shadowsocks and NaiveProxy tests. Verify the final published full SHA with
 
 ### GotaTun
 
-Published 0.10.3 replaces the upstream git patch. Its archive identifies
-[`c541472b40ec489ba7bdfd048512e89e556c7a3c`](https://github.com/mullvad/gotatun/tree/c541472b40ec489ba7bdfd048512e89e556c7a3c),
-not the different main-branch commit also declaring 0.10.3. Both session and
-cookie counters retain [#221](https://github.com/mullvad/gotatun/pull/221)'s
-conditional portable-atomic fallback. The published crate folds the git-only
-`gotatun-crypto` and `gotatun-packet` packages back into the main crate; Shoes'
-packet, transport and X25519 APIs remain compatible. AWS-LC and device features
-are unchanged, as are Shoes' own conditional atomic imports.
+GotaTun is a direct git dependency, not a workspace patch: `AYastrebov/gotatun`
+adds AmneziaWG and Phobos obfuscation, pinned at
+[`a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b`](https://github.com/AYastrebov/gotatun/tree/a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b),
+on top of upstream main commit
+[`5454dacddcbbd046105242e2fa70b494bc2248a7`](https://github.com/mullvad/gotatun/tree/5454dacddcbbd046105242e2fa70b494bc2248a7).
+That commit declares 0.10.3 and contains everything in the published 0.10.3
+archive, which identifies
+[`c541472b40ec489ba7bdfd048512e89e556c7a3c`](https://github.com/mullvad/gotatun/tree/c541472b40ec489ba7bdfd048512e89e556c7a3c)
+on a release branch. Both session and cookie counters retain
+[#221](https://github.com/mullvad/gotatun/pull/221)'s conditional
+portable-atomic fallback. Unlike the published crate, main keeps
+`gotatun-crypto` and `gotatun-packet` as separate packages, so both appear in
+`Cargo.lock` and the dependency notices. AWS-LC and device features are
+unchanged, as are Shoes' own conditional atomic imports; the fork adds the
+`amnezia` and `phobos` features. Preserve the repository and full revision the
+same way as the workspace patches, and keep the revision in
+[the notices](THIRD_PARTY_NOTICES.md) and the notice tests in step with
+`Cargo.toml`. Statements below about GotaTun's transitive families apply to the
+fork as well.
 
 The TAI64N base changes from `2^62 + 37` to wireguard-go's `2^62 + 10`.
 The same-key handoff regression keeps a reference responder alive across Shoes
@@ -100,9 +111,9 @@ timestamp lead could expire. Existing both-role/rekey tests alone cannot detect
 this difference. A recent old-version initiation can temporarily delay a fast
 upgrade against retained responder replay state.
 
-The published archive omits its repository-root license files. Corresponding
-source URLs use its VCS metadata; offline notice tests pin the verified upstream
-MPL and Cloudflare license hashes. Retain both bundled texts.
+Corresponding source URLs name the locked fork revision; offline notice tests
+pin it together with the verified upstream MPL and Cloudflare license hashes,
+which the fork's repository-root license files match. Retain both bundled texts.
 
 ### Hickory
 
