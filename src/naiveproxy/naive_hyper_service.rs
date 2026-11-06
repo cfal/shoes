@@ -649,7 +649,7 @@ mod sniff_tests {
         use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             for fixed in [false, true] {
-                for case in [UdpCase::Dns, UdpCase::Tls, UdpCase::Http] {
+                for case in UdpCase::ALL {
                     let mut tasks = JoinSet::new();
                     let fixture = UdpFixture::new(case, &mut tasks).await;
                     let mode = if fixed {
@@ -888,11 +888,14 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
 
             if is_connect == 1 {
                 let peer = stream.peer_addr();
-                let uot_v2_stream = UotV2Stream::new(stream);
+                let mut uot_v2_stream =
+                    crate::routing::ingress::PeekMessageStream::new(UotV2Stream::new(stream));
+                let prepared =
+                    crate::routing::ingress::PreparedUdp::new(&proxy_selector, destination)?;
 
-                let route = crate::util::timeout_stream_setup(crate::routing::ingress::route_udp(
+                let route = crate::util::timeout_stream_setup(prepared.route(
+                    &mut uot_v2_stream,
                     &proxy_selector,
-                    destination,
                     &resolver,
                 ))
                 .await
@@ -906,7 +909,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                 let setup =
                     crate::util::timeout_stream_setup(route.with_source(peer).connect(&resolver))
                         .await?;
-                return run_udp_copy(Box::new(uot_v2_stream), setup.stream, false, false).await;
+                return run_udp_copy(uot_v2_stream, setup.stream, false, false).await;
             } else {
                 // V2 non-connect mode (same as V1)
                 let uot_stream = UotV1ServerStream::new_uot(stream);

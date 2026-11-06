@@ -20,7 +20,7 @@ use crate::dns::DnsContext;
 use crate::resolver::{Resolver, resolve_location};
 #[cfg(test)]
 use crate::rules::Compiler;
-use crate::rules::{Outcome, Predicate, domain};
+use crate::rules::{Outcome, Predicate, Traffic, domain};
 
 /// Cache key for routing decisions.
 /// We cache based on the destination address and port.
@@ -225,10 +225,11 @@ const CACHE_RULE_THRESHOLD: usize = 16;
 pub struct ClientProxySelector {
     rules: Vec<ConnectRule>,
     /// LRU cache for routing decisions. Speeds up repeated lookups for the same destination.
-    /// None when caching is disabled; DNS-dependent and sniffed routes bypass it.
+    /// Traffic-dependent rules disable it; DNS-dependent and sniffed routes bypass it.
     cache: Option<RoutingCache>,
     has_ip_rules: bool,
     has_hostname_rules: bool,
+    has_protocol_rules: bool,
     sniff_enabled: bool,
     tracks_flows: bool,
     notes_registry: Option<Arc<FlowRegistry>>,
@@ -257,6 +258,7 @@ pub(crate) struct PreparedDestination {
     wire_destination: NetLocation,
     connection_target: ResolvedLocation,
     source: DestinationSource,
+    pub(crate) traffic: Traffic,
 }
 
 impl PreparedDestination {
@@ -269,6 +271,7 @@ impl PreparedDestination {
                 .hostname()
                 .map(str::to_owned),
             fake_dns: self.is_fake_dns(),
+            sniff_protocol: self.traffic.protocol,
             ..Default::default()
         }
     }
@@ -306,13 +309,22 @@ impl ClientProxySelector {
         Self::with_options_and_cache_size(rules, force_cache, RoutingCache::DEFAULT_CAPACITY)
     }
 
-    /// A zero capacity disables caching. DNS-dependent and sniffed decisions always bypass it.
+    /// A zero capacity or traffic-dependent rules disable caching.
+    /// DNS-dependent and sniffed decisions always bypass it.
     pub fn with_options_and_cache_size(
         rules: Vec<ConnectRule>,
         force_cache: bool,
         cache_capacity: usize,
     ) -> Self {
-        let cache = if cache_capacity != 0 && (force_cache || rules.len() > CACHE_RULE_THRESHOLD) {
+        let has_protocol_rules = rules
+            .iter()
+            .any(|rule| rule.predicate.dependencies.protocol);
+        let traffic_dependent =
+            has_protocol_rules || rules.iter().any(|rule| rule.predicate.dependencies.network);
+        let cache = if !traffic_dependent
+            && cache_capacity != 0
+            && (force_cache || rules.len() > CACHE_RULE_THRESHOLD)
+        {
             Some(RoutingCache::new(cache_capacity))
         } else {
             None
@@ -341,6 +353,7 @@ impl ClientProxySelector {
             cache,
             has_ip_rules,
             has_hostname_rules,
+            has_protocol_rules,
             sniff_enabled: false,
             tracks_flows,
             notes_registry,
@@ -448,6 +461,7 @@ impl ClientProxySelector {
                 wire_destination,
                 connection_target: NetLocation::new(Address::Hostname(name), addr.port()).into(),
                 source: DestinationSource::FakeDns,
+                traffic: Traffic::TCP,
             }));
         }
         self.validate_real_target(&location)?;
@@ -460,11 +474,16 @@ impl ClientProxySelector {
             wire_destination,
             connection_target: location,
             source,
+            traffic: Traffic::TCP,
         }))
     }
 
     pub(crate) fn should_sniff(&self, target: &PreparedDestination) -> bool {
         self.sniff_enabled && self.has_hostname_rules && target.is_sniffable()
+    }
+
+    pub(crate) fn has_protocol_rules(&self) -> bool {
+        self.has_protocol_rules
     }
 
     pub(crate) fn fake_dns_enabled(&self) -> bool {
@@ -484,10 +503,15 @@ impl ClientProxySelector {
                     "sniffed hostname requires a prepared IP-origin destination",
                 ));
             }
-            self.judge_uncached(target.connection_target, resolver, Some(name))
-                .await?
+            self.judge_uncached(
+                target.connection_target,
+                resolver,
+                Some(name),
+                target.traffic,
+            )
+            .await?
         } else {
-            self.judge_ordinary(target.connection_target, resolver)
+            self.judge_ordinary(target.connection_target, resolver, target.traffic)
                 .await?
         };
         if let ConnectDecision::Allow {
@@ -520,6 +544,15 @@ impl ClientProxySelector {
             );
             if let Some(hostname) = hostname {
                 notes.event(Phase::Routing, format_args!("sniff hint {hostname}"));
+            }
+            if self.has_protocol_rules && target.traffic.network == crate::rules::Network::Udp {
+                notes.event(
+                    Phase::Routing,
+                    format_args!(
+                        "UDP protocol {}",
+                        target.traffic.protocol.map_or("unknown", |p| p.as_str())
+                    ),
+                );
             }
         }
         let routed = self.judge_prepared(target, hostname, resolver).await?;
@@ -577,19 +610,20 @@ impl ClientProxySelector {
         &'a self,
         location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
+        traffic: Traffic,
     ) -> std::io::Result<ConnectDecision<'a>> {
         // DNS-dependent decisions must validate the address used for this connection,
         // not a hostname-only decision from a previous resolution.
         let dns_dependent = location.location().address().hostname().is_some() && self.has_ip_rules;
         if dns_dependent {
-            return self.judge_uncached(location, resolver, None).await;
+            return self.judge_uncached(location, resolver, None, traffic).await;
         }
 
         // If caching is disabled, go directly to rule matching
         let cache = match &self.cache {
             Some(c) => c,
             None => {
-                return self.judge_uncached(location, resolver, None).await;
+                return self.judge_uncached(location, resolver, None, traffic).await;
             }
         };
 
@@ -601,7 +635,7 @@ impl ClientProxySelector {
 
         // Slow path: full rule matching (may resolve and update the location)
         let mut location = location;
-        match match_rule(&self.rules, &mut location, resolver, None).await? {
+        match match_rule(&self.rules, &mut location, resolver, None, traffic).await? {
             Some(rule_index) => {
                 // Cache the result
                 cache.insert(location.location(), CachedDecision::Allow(rule_index));
@@ -622,9 +656,10 @@ impl ClientProxySelector {
         location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
         hostname: Option<&str>,
+        traffic: Traffic,
     ) -> std::io::Result<ConnectDecision<'a>> {
         let mut location = location;
-        match match_rule(&self.rules, &mut location, resolver, hostname).await? {
+        match match_rule(&self.rules, &mut location, resolver, hostname, traffic).await? {
             Some(rule_index) => Ok(self.rules[rule_index].action.to_decision(location)),
             None => Ok(ConnectDecision::Block),
         }
@@ -693,6 +728,7 @@ async fn match_rule(
     location: &mut ResolvedLocation,
     resolver: &Arc<dyn Resolver>,
     sniffed_hostname: Option<&str>,
+    traffic: Traffic,
 ) -> std::io::Result<Option<usize>> {
     let name = sniffed_hostname
         .or_else(|| location.address().hostname())
@@ -705,7 +741,9 @@ async fn match_rule(
         .map(|a| a.ip().to_canonical());
     let port = location.location().port();
     for (rule_index, rule) in rules.iter().enumerate() {
-        let mut outcome = rule.predicate.evaluate(name.as_deref(), ip, port);
+        let mut outcome =
+            rule.predicate
+                .evaluate_with_traffic(name.as_deref(), ip, port, Some(traffic));
         if outcome == (Outcome::Unknown { may_resolve: true }) && !rule.no_resolve {
             // Resolve the connection target, never the routing hint, and pin this answer.
             ip = Some(
@@ -714,7 +752,9 @@ async fn match_rule(
                     .ip()
                     .to_canonical(),
             );
-            outcome = rule.predicate.evaluate(name.as_deref(), ip, port);
+            outcome =
+                rule.predicate
+                    .evaluate_with_traffic(name.as_deref(), ip, port, Some(traffic));
             debug_assert!(!matches!(outcome, Outcome::Unknown { .. }));
         }
         if outcome == Outcome::Match {

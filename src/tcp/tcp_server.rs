@@ -11,7 +11,7 @@ use tokio::time::timeout;
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use super::tcp_server_handler_factory::create_tcp_server_handler;
 
-use crate::async_stream::{AsyncMessageStream, AsyncStream};
+use crate::async_stream::{AsyncFlushMessage, AsyncMessageStream, AsyncStream};
 use crate::config::{BindLocation, ResolvedConfig, ResolvedServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
@@ -313,30 +313,40 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
         }
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
-            stream: mut server_stream,
-            need_initial_flush: server_need_initial_flush,
+            stream: server_stream,
+            need_initial_flush: mut server_need_initial_flush,
             proxy_selector,
         } => {
+            let mut server_stream = crate::routing::ingress::PeekMessageStream::new(server_stream);
             let setup = crate::util::timeout_stream_setup(async {
-                crate::routing::ingress::connect_udp(
-                    &proxy_selector,
-                    remote_location,
-                    &resolver,
-                    source,
-                )
-                .await
-                .map_err(|error| {
-                    if crate::routing::ingress::is_policy_block(&error) {
-                        std::io::Error::new(
-                            std::io::ErrorKind::ConnectionRefused,
-                            "Blocked bidirectional udp forward",
-                        )
-                    } else {
-                        error
-                    }
-                })
+                let prepared =
+                    crate::routing::ingress::PreparedUdp::new(&proxy_selector, remote_location)?;
+                if prepared.needs_sniff(&proxy_selector) && server_need_initial_flush {
+                    futures::future::poll_fn(|cx| {
+                        std::pin::Pin::new(&mut server_stream).poll_flush_message(cx)
+                    })
+                    .await?;
+                    server_need_initial_flush = false;
+                }
+                prepared
+                    .route(&mut server_stream, &proxy_selector, &resolver)
+                    .await?
+                    .with_source(source)
+                    .connect(&resolver)
+                    .await
+                    .map(|setup| setup.stream)
             })
-            .await;
+            .await
+            .map_err(|error| {
+                if crate::routing::ingress::is_policy_block(&error) {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Blocked bidirectional udp forward",
+                    )
+                } else {
+                    error
+                }
+            });
             let client_stream = match setup {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -394,9 +404,9 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
 /// After the copy completes (whether successfully or with an error), both streams
 /// are shut down to ensure proper cleanup and FIN frames are sent.
 #[inline]
-pub async fn run_udp_copy(
-    mut server_stream: Box<dyn AsyncMessageStream>,
-    mut client_stream: Box<dyn AsyncMessageStream>,
+pub async fn run_udp_copy<S: AsyncMessageStream, C: AsyncMessageStream>(
+    mut server_stream: S,
+    mut client_stream: C,
     server_need_initial_flush: bool,
     client_need_initial_flush: bool,
 ) -> std::io::Result<()> {

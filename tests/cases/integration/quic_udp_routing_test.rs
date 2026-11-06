@@ -35,7 +35,7 @@ async fn check_proxy_routing(
     type: vless
     user_id: {UUID}
   rules:
-    - mask: 0.0.0.0/0
+    - conditions: {{all: [{{network: udp}}, {{protocol: stun}}]}}
       action: allow
       override_address: "127.0.0.1:{echo_port}"
 - address: "0.0.0.0:{quic_port}"
@@ -50,7 +50,7 @@ async fn check_proxy_routing(
     password: routing-test
 {credentials}
   rules:
-    - mask: 0.0.0.0/0
+    - conditions: {{protocol: [stun, dtls]}}
       action: allow
       client_chain:
         - address: "127.0.0.1:{downstream_port}"
@@ -84,6 +84,15 @@ async fn check_proxy_routing(
     ports.wait_for_all_ports().await?;
 
     let association = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
+    let stun = [
+        0, 1, 0, 0, 0x21, 0x12, 0xa4, 0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    assert!(
+        association
+            .send_to(requested_target, &stun)
+            .await?
+            .starts_with(&stun)
+    );
     for sequence in 0..3 {
         let payload = format!("{protocol}-routed-{sequence}");
         let reply = association

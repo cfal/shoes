@@ -5,6 +5,31 @@ description: "shoes 规则系统配置。"
 
 规则决定传入连接的路由方式。
 
+### UDP 协议路由
+
+`network` 匹配逻辑传输层 `tcp` 或 `udp`，不是外层代理传输。`protocol` 根据流的首个内部 UDP 数据报识别 `stun` 或 `dtls`。两者接受单值或备选值列表，并通过 `all`、`any`、`not` 组合；未知值会导致配置校验失败。
+
+```yaml
+rules:
+  - conditions:
+      all:
+        - network: udp
+        - protocol: [stun, dtls]
+    client_chain: calls
+  - conditions: {any_destination: true}
+    client_chain: main
+```
+
+客户端组必须预先定义。完整配置见 [UDP 协议路由示例](/zh-cn/examples/udp_protocol_routing/)。当监听器的任意规则包含 `protocol` 条件时自动检测，包括规则源组中的条件；不依赖 `sniff: true`、主机名规则、IP 目标或标准端口。`sniff` 仍仅控制 TCP 主机名检测，本地 DNS 拦截仍优先。
+
+每个 UDP 流或目的地只选路一次，后续 DTLS、媒体和 TURN ChannelData 保持同一路径，不逐包重新选路。支持 TUN/WireGuard、多目标 UDP、XUDP、QUIC 代理关联及固定目标 UDP 流。固定目标模式最多等待 300 毫秒读取一个完整数据报，最大 65,535 字节；部分帧保留供后续转发。需要先回复成功的协议会提前回复，此后阻止或连接失败只关闭流，不再回复第二个状态。其他路径使用已有的首包，不等待更多数据报。所有数据报保持原样。
+
+未知、格式错误或超时的数据没有协议标签，按普通规则处理。此时 `protocol: stun` 不匹配，而 `not: {protocol: stun}` 匹配，包括 TCP；可配合 `network: udp` 限制范围。读取错误或 EOF 终止流。检测不更改目的地址，网络或协议条件不会复用仅按目的地址缓存的决策。
+
+检测以 sing-box 实现为参考，并加强长度校验：STUN 检查现代 magic cookie、类型位、对齐的完整长度和属性边界；经典 DTLS 检查类型、`FE FF`/`FE FD` 版本及连续记录长度。不单独识别 DTLS CID 和 DTLS 1.3 加密统一头，但其初始明文握手可通过经典格式识别。
+
+这不是完整 WebRTC 识别或防泄漏策略。标签可伪造，TURN-over-TLS、其他对等流和中途捕获的流可能无法识别；不同目的地不会因此共享 NAT 映射或出口。通话建议选用附近的单一原生 UDP 出口，TCP 承载在丢包时可能发生队头阻塞。连接元数据的 `sniffProtocol` 显示识别结果，不改变原有代理 `type` 字段。启用 UDP 协议检测时，连接记录显示协议标签或 `unknown`；未启用时不记录协议检测结果。
+
 <a id="tls-sni-路由"></a>
 
 <a id="tcp-hostname-sniffing"></a>
@@ -55,7 +80,7 @@ rules:
     action: block
 ```
 
-两种顶层形式使用同一匹配引擎，保持首个匹配规则优先、DNS 行为和规则源发现机制不变。`action`、`client_chain`、`override_address` 和 `no_resolve` 仍属于规则级选项，而不是谓词。此语法不增加 `network` 或应用层 `protocol` 匹配。
+两种顶层形式使用同一匹配引擎，保持首个匹配规则优先、DNS 行为和规则源发现机制不变。`action`、`client_chain`、`override_address` 和 `no_resolve` 仍属于规则级选项，而不是谓词。`network` 和应用层 `protocol` 属于匹配谓词。
 
 配置序列化将纯地址表达式输出为顶层 `masks`，保留标量或列表形式。其他表达式输出为 `conditions`，其中地址叶子显式包装在 `masks` 中。不保留输入字段的拼写，但匹配行为保持不变。现有配置无需迁移。请参阅完整的 [conditions 示例](/zh-cn/examples/rule_conditions/)。
 
@@ -158,7 +183,7 @@ rules:
     action: block
 ```
 
-叶子：`masks`（地址简写）、`domain`（精确）、`domain_suffix`（顶点和后代）、`subdomains`（仅限后代）、`domain_pattern`（`*` 匹配一个标签）、`domain_keyword`、`domain_regex`、`ip_cidr`、`destination_port`、 `destination_port_range`（包括`"8000:9000"`）和`any_destination: true`。本机域文字和关键字不区分大小写。正则表达式是非锚定的并且区分大小写，除非它们启用大小写折叠；不支持反向引用、环视和非 ASCII 模式。键入的端口为 1-65535。空集不匹配任何内容；空的 `all`/`any` 节点及空的 `masks` 列表将被拒绝。
+叶子：`masks`（地址简写）、`domain`（精确）、`domain_suffix`（顶点和后代）、`subdomains`（仅限后代）、`domain_pattern`（`*` 匹配一个标签）、`domain_keyword`、`domain_regex`、`ip_cidr`、`destination_port`、 `destination_port_range`（包括`"8000:9000"`）、`network`、`protocol` 和 `any_destination: true`。本机域文字和关键字不区分大小写。正则表达式是非锚定的并且区分大小写，除非它们启用大小写折叠；不支持反向引用、环视和非 ASCII 模式。键入的端口为 1-65535。空集不匹配任何内容；空的 `all`/`any` 节点及空的 `masks` 列表将被拒绝。
 
 政策仍采用先匹配的顺序。在一个策略内，已知的 OR 匹配或 AND 未命中可以避免 DNS，无论谓词顺序如何。较早的未解决的策略不能被较晚的域规则绕过。 IP 谓词使用选定的本地 DNS 答案，将其固定以进行直接拨号；查找失败会中止路由。在此固定之后，直接多地址回退将被禁用。主机名转发代理协议仍可能在出口处独立解析。
 

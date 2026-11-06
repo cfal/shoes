@@ -1175,7 +1175,7 @@ impl<'a> UdpRouter<'a> {
     /// Start session creation
     #[inline]
     fn start_session_creation(&mut self, cx: &mut Context<'_>, packet: InboundPacket, data: &[u8]) {
-        let prepared = match self.selector.prepare(packet.destination.clone().into()) {
+        let mut prepared = match self.selector.prepare(packet.destination.clone().into()) {
             Ok(target) => target,
             Err(error) => {
                 debug!(
@@ -1185,8 +1185,10 @@ impl<'a> UdpRouter<'a> {
                 return;
             }
         };
-        let cache_policy_failure =
-            matches!(&prepared, IngressTarget::Forward(target) if !target.is_fake_dns());
+        super::ingress::classify_target(&self.selector, &mut prepared, data);
+        // The destination alone cannot cache a block that depends on the first datagram.
+        let cache_policy_failure = !self.selector.has_protocol_rules()
+            && matches!(&prepared, IngressTarget::Forward(target) if !target.is_fake_dns());
         if cache_policy_failure && self.blocked.get(&packet.destination).is_some() {
             return;
         }
