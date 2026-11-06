@@ -114,7 +114,7 @@ async fn fake_dns_udp_modes() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     timeout(Duration::from_secs(10), async {
         for fixed in [false, true] {
-            for case in [UdpCase::Dns, UdpCase::Tls, UdpCase::Http] {
+            for case in UdpCase::ALL {
                 let mut tasks = tokio::task::JoinSet::new();
                 let fixture = UdpFixture::new(case, &mut tasks).await;
                 let mode = if fixed {
@@ -179,6 +179,71 @@ impl TcpServerHandler for Handler {
             initial_remote_data: Some(b"request".to_vec().into_boxed_slice()),
         })
     }
+}
+
+impl AsyncPing for tokio::io::BufStream<Box<dyn AsyncStream>> {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+impl AsyncStream for tokio::io::BufStream<Box<dyn AsyncStream>> {}
+
+#[derive(Debug)]
+struct BufferedUdpHandler {
+    selector: Arc<ClientProxySelector>,
+    target: NetLocation,
+}
+
+#[async_trait]
+impl TcpServerHandler for BufferedUdpHandler {
+    async fn setup_server_stream(
+        &self,
+        stream: Box<dyn AsyncStream>,
+    ) -> io::Result<TcpServerSetupResult> {
+        let mut stream = tokio::io::BufStream::new(stream);
+        stream.write_all(b"ready").await?;
+        Ok(TcpServerSetupResult::BidirectionalUdp {
+            remote_location: self.target.clone(),
+            stream: Box::new(crate::vless::VlessMessageStream::new(stream)),
+            need_initial_flush: true,
+            proxy_selector: self.selector.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn udp_sniff_flushes_buffered_success_before_waiting_for_a_packet() {
+    use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
+    use tokio::io::AsyncReadExt;
+    timeout(Duration::from_secs(5), async {
+        let mut tasks = tokio::task::JoinSet::new();
+        let fixture = UdpFixture::new(UdpCase::Stun, &mut tasks).await;
+        let handler = Arc::new(BufferedUdpHandler {
+            selector: fixture.selector.clone(),
+            target: fixture.target.clone(),
+        });
+        let (server, mut peer) = tokio::io::duplex(8192);
+        let _handler = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(process_stream(
+            server,
+            handler,
+            fixture.resolver.clone(),
+        )));
+        let mut status = [0; 5];
+        peer.read_exact(&mut status).await.unwrap();
+        assert_eq!(&status, b"ready");
+        peer.write_all(&fixture.request(PacketMode::Fixed))
+            .await
+            .unwrap();
+        fixture.read_reply(&mut peer, PacketMode::Fixed).await;
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[derive(Debug)]

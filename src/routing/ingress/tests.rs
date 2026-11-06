@@ -9,6 +9,57 @@ use hickory_resolver::proto::rr::{Name, RecordType};
 use std::pin::Pin;
 use tokio::io::ReadBuf;
 
+#[derive(Debug)]
+struct FailedUdpConnector;
+
+#[async_trait::async_trait]
+impl crate::tcp::socket_connector::SocketConnector for FailedUdpConnector {
+    async fn connect(
+        &self,
+        _: &Arc<dyn Resolver>,
+        _: &crate::address::ResolvedLocation,
+    ) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
+        unreachable!()
+    }
+
+    async fn connect_udp_bidirectional(
+        &self,
+        _: &Arc<dyn Resolver>,
+        _: crate::address::ResolvedLocation,
+    ) -> io::Result<Box<dyn AsyncMessageStream>> {
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "test UDP dial failure",
+        ))
+    }
+
+    fn bind_interface(&self) -> Option<&str> {
+        None
+    }
+}
+
+pub(crate) fn protocol_failure_selector(blocked: bool) -> Arc<ClientProxySelector> {
+    use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
+    let predicate = crate::rules::Compiler::default()
+        .compile(crate::rules::Expression::Protocol(vec![if blocked {
+            crate::rules::Protocol::Dtls
+        } else {
+            crate::rules::Protocol::Stun
+        }]))
+        .unwrap();
+    Arc::new(ClientProxySelector::new(vec![ConnectRule::compiled(
+        predicate,
+        false,
+        ConnectAction::new_allow(
+            None,
+            ClientChainGroup::new(vec![ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Arc::new(FailedUdpConnector))],
+                vec![],
+            )]),
+        ),
+    )]))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum PacketMode {
     Fixed,
@@ -62,6 +113,23 @@ pub(crate) enum UdpCase {
     Dns,
     Tls,
     Http,
+    Stun,
+    Dtls,
+    StunHostname,
+}
+
+impl UdpCase {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Dns,
+        Self::Tls,
+        Self::Http,
+        Self::Stun,
+        Self::Dtls,
+        Self::StunHostname,
+    ];
+    pub(crate) fn classified(self) -> bool {
+        matches!(self, Self::Stun | Self::Dtls | Self::StunHostname)
+    }
 }
 
 pub(crate) struct UdpFixture {
@@ -81,6 +149,8 @@ impl UdpFixture {
             UdpCase::Dns => query(RecordType::A),
             UdpCase::Tls => crate::sniff::tests::hello(&rustls::version::TLS13, true),
             UdpCase::Http => crate::sniff::tests::http_request(),
+            UdpCase::Stun | UdpCase::StunHostname => crate::sniff::udp::tests::stun_packet(),
+            UdpCase::Dtls => crate::sniff::udp::tests::dtls_packet(),
         };
         let mut rules = Vec::new();
         let target = if dns {
@@ -99,14 +169,32 @@ impl UdpFixture {
                 assert_eq!(&bytes[..len], expected);
                 socket.send_to(&bytes[..len], peer).await.unwrap();
             });
-            rules.push(ConnectRule::new(
-                vec![NetLocationMask::from("restored.example").unwrap()],
+            let mut conditions = vec![
+                serde_json::json!({"domain": ["restored.example"]}),
+                serde_json::json!({"network": "udp"}),
+            ];
+            if case.classified() {
+                conditions.push(serde_json::json!({"protocol": if case == UdpCase::Dtls { "dtls" } else { "stun" }}));
+            }
+            let predicate = crate::rules::Compiler::default()
+                .compile(
+                    crate::rules::Expression::from_config(serde_json::json!({"all": conditions}))
+                        .unwrap(),
+                )
+                .unwrap();
+            rules.push(ConnectRule::compiled(
+                predicate,
+                false,
                 ConnectAction::new_allow(
                     Some(destination),
                     crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
                 ),
             ));
-            NetLocation::from_ip_addr(context.allocate("restored.example", false).unwrap(), 443)
+            if case == UdpCase::StunHostname {
+                NetLocation::from_str("restored.example:443", None).unwrap()
+            } else {
+                NetLocation::from_ip_addr(context.allocate("restored.example", false).unwrap(), 443)
+            }
         };
         // The same TLS or HTTP bytes over TCP would select this block.
         rules.insert(
@@ -118,7 +206,7 @@ impl UdpFixture {
         );
         let selector = Arc::new(
             ClientProxySelector::new(rules)
-                .with_sniff(true)
+                .with_sniff(!case.classified())
                 .with_fake_dns_context(Some(context))
                 .unwrap(),
         );

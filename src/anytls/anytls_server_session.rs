@@ -946,46 +946,84 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        let route = match setup_timeout(crate::routing::ingress::route_udp(
+        let prepared =
+            match crate::routing::ingress::PreparedUdp::new(&self.proxy_provider, destination) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = self
+                        .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
+                        .await;
+                    return Err(error);
+                }
+            };
+        let optimistic = prepared.needs_sniff(&self.proxy_provider);
+        if optimistic {
+            self.send_synack(stream_id, None).await?;
+        }
+        let mut server_stream =
+            crate::routing::ingress::PeekMessageStream::new(VlessMessageStream::new(&mut stream));
+        let route = match setup_timeout(prepared.route(
+            &mut server_stream,
             &self.proxy_provider,
-            destination,
             &self.resolver,
         ))
         .await
         {
             Ok(route) => route.with_source(self.peer),
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                let _ = self
-                    .send_synack(stream_id, Some("UDP blocked by rules"))
-                    .await;
+                if !optimistic {
+                    let _ = self
+                        .send_synack(stream_id, Some("UDP blocked by rules"))
+                        .await;
+                } else {
+                    drop(server_stream);
+                    self.finish_failed_udp(&mut stream).await;
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "UDP blocked by rules",
                 ));
             }
             Err(error) => {
-                let _ = self
-                    .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
-                    .await;
+                if !optimistic {
+                    let _ = self
+                        .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
+                        .await;
+                } else {
+                    drop(server_stream);
+                    self.finish_failed_udp(&mut stream).await;
+                }
                 return Err(error);
             }
         };
         let setup = match setup_timeout(route.connect(&self.resolver)).await {
             Ok(setup) => setup,
             Err(error) => {
-                let _ = self
-                    .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
-                    .await;
+                if !optimistic {
+                    let _ = self
+                        .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
+                        .await;
+                } else {
+                    drop(server_stream);
+                    self.finish_failed_udp(&mut stream).await;
+                }
                 return Err(error);
             }
         };
         let flow = setup.stream.flow().cloned();
-        let synack = self.send_synack(stream_id, None);
+        let synack = async {
+            if !optimistic {
+                self.send_synack(stream_id, None).await
+            } else {
+                Ok(())
+            }
+        };
         tokio::pin!(synack);
         tokio::select! {
             result = &mut synack => result?,
             _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => {
                 drop(setup.stream);
+                drop(server_stream);
                 stream.close_read();
                 // A partially written shared control frame must finish before FIN.
                 let _ = synack.await;
@@ -995,7 +1033,6 @@ impl AnyTlsSession {
         }
         let mut client_stream = setup.stream;
         let (result, cancelled) = {
-            let mut server_stream = VlessMessageStream::new(&mut stream);
             let result = crate::control::tracked_stream::during_flow(
                 flow.as_deref(),
                 copy_bidirectional_message(&mut server_stream, &mut client_stream, false, false),
@@ -1013,12 +1050,24 @@ impl AnyTlsSession {
             };
             (result, cancelled)
         };
+        drop(server_stream);
         if cancelled {
             drop(client_stream);
             stream.close_read();
             cancelled_fin(&mut stream).await;
         }
         result
+    }
+
+    async fn finish_failed_udp(&self, stream: &mut AnyTlsStream) {
+        stream.close_read();
+        if !matches!(
+            tokio::time::timeout(CONTROL_FRAME_TIMEOUT, stream.shutdown()).await,
+            Ok(Ok(()))
+        ) {
+            // Drop cannot reliably queue FIN on a saturated server channel.
+            self.close_state();
+        }
     }
 
     /// Handle UoT multi-destination mode (V1 and V2 non-connect)

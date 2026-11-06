@@ -13,6 +13,79 @@ use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[tokio::test]
+async fn raw_fd_udp_protocol_routes_and_media_stays_on_selected_outbound() {
+    use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+    use crate::rules::{Compiler, Expression};
+    timeout(TEST_TIMEOUT, async {
+        let (wire, tun) = UnixDatagram::pair().unwrap();
+        wire.set_nonblocking(true).unwrap();
+        let wire = AsyncDatagram::from_std(wire).unwrap();
+        let config = TunServerConfig::new()
+            .raw_fd(tun.as_raw_fd())
+            .close_fd_on_drop(false);
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let calls = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ordinary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut compiler = Compiler::default();
+        let mut rules = Vec::new();
+        for (condition, socket) in [
+            (
+                serde_json::json!({"all": [{"network": "udp"}, {"protocol": ["stun", "dtls"]}]}),
+                &calls,
+            ),
+            (serde_json::json!({"network": "udp"}), &ordinary),
+        ] {
+            rules.push(ConnectRule::compiled(
+                compiler
+                    .compile(Expression::from_config(condition).unwrap())
+                    .unwrap(),
+                false,
+                ConnectAction::new_allow(
+                    Some(crate::address::NetLocation::from_ip_addr(
+                        "127.0.0.1".parse().unwrap(),
+                        socket.local_addr().unwrap().port(),
+                    )),
+                    crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
+                ),
+            ));
+        }
+        let selector = Arc::new(ClientProxySelector::with_options(rules, true));
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(run_tun_server(
+            config,
+            selector,
+            resolver,
+            shutdown_rx,
+        )));
+        let target = "192.0.2.1:443".parse().unwrap();
+        for (port, initial, socket) in [
+            (12001, crate::sniff::udp::tests::stun_packet(), &calls),
+            (12002, crate::sniff::udp::tests::dtls_packet(), &calls),
+            (12003, b"unknown".to_vec(), &ordinary),
+        ] {
+            let source = SocketAddr::from(([10, 23, 0, 2], port));
+            let mut mapped = None;
+            for payload in [initial.as_slice(), b"media", b""] {
+                wire.send(&request(source, target, payload, false))
+                    .await
+                    .unwrap();
+                let mut received = [0; 4096];
+                let (n, peer) = socket.recv_from(&mut received).await.unwrap();
+                assert_eq!(&received[..n], payload);
+                assert_eq!(*mapped.get_or_insert(peer), peer);
+                socket.send_to(payload, peer).await.unwrap();
+                let n = wire.recv(&mut received).await.unwrap();
+                check_reply(&received[..n], target, source, payload, false);
+            }
+        }
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 fn packet_information(ipv6: bool) -> [u8; 4] {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let protocol = if ipv6 { libc::AF_INET6 } else { libc::AF_INET } as u32;

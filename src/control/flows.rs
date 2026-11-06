@@ -45,6 +45,7 @@ pub struct FlowInfo {
     pub original: Option<NetLocation>,
     pub restored_host: Option<String>,
     pub sniff_host: Option<String>,
+    pub sniff_protocol: Option<crate::rules::Protocol>,
     pub fake_dns: bool,
     pub notes: Option<Arc<ConnectionNotes>>,
 }
@@ -63,6 +64,7 @@ pub struct FlowMetadata {
     pub destination_port: String,
     pub host: String,
     pub sniff_host: String,
+    pub sniff_protocol: String,
     pub dns_mode: String,
     pub inbound_name: String,
     pub process: String,
@@ -173,6 +175,7 @@ impl FlowContext {
                     .restored_host
                     .unwrap_or_else(|| hostname.unwrap_or("").to_owned()),
                 sniff_host: info.sniff_host.unwrap_or_default(),
+                sniff_protocol: info.sniff_protocol.map_or("", |p| p.as_str()).into(),
                 remote_destination: destination.to_string(),
                 shoes_original_destination: info
                     .original
@@ -413,6 +416,40 @@ mod tests {
         });
         assert!(registry.snapshot(0).connections.is_empty());
     }
+    #[test]
+    fn sniffed_udp_protocol_is_separate_from_inbound_proxy_type() {
+        let context = FlowContext {
+            registry: Arc::new(FlowRegistry::default()),
+            generation: 1,
+            inbound: "local".into(),
+            scope: "default".into(),
+            protocol: "Socks5".into(),
+        };
+        for protocol in [
+            None,
+            Some(crate::rules::Protocol::Stun),
+            Some(crate::rules::Protocol::Dtls),
+        ] {
+            let guard = context.register(
+                "udp",
+                &NetLocation::from_str("192.0.2.1:443", None).unwrap().into(),
+                vec!["DIRECT".into()],
+                "calls",
+                FlowInfo {
+                    sniff_protocol: protocol,
+                    ..Default::default()
+                },
+            );
+            let metadata = serde_json::to_value(&guard.entry.metadata).unwrap();
+            assert_eq!(metadata["network"], "udp");
+            assert_eq!(metadata["type"], "Socks5");
+            assert_eq!(
+                metadata["sniffProtocol"],
+                protocol.map_or("", |p| p.as_str())
+            );
+        }
+    }
+
     #[test]
     fn metadata_keeps_wire_restored_sniffed_and_effective_targets_separate() {
         let context = FlowContext {

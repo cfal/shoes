@@ -82,7 +82,7 @@ async fn fake_dns_udp_modes() {
     use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
     timeout(Duration::from_secs(10), async {
         for fixed in [false, true] {
-            for case in [UdpCase::Dns, UdpCase::Tls, UdpCase::Http] {
+            for case in UdpCase::ALL {
                 let mut tasks = tokio::task::JoinSet::new();
                 let fixture = UdpFixture::new(case, &mut tasks).await;
                 let mode = if fixed {
@@ -410,6 +410,105 @@ async fn sniff_failures_send_one_synack_then_fin() {
             })
             .await
             .unwrap();
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_optimistic_failures_wait_for_fin_or_close_the_session() {
+    for failure in ["block", "dial", "read"] {
+        for drain in [true, false] {
+            let (transport, mut peer) = duplex(8192);
+            let session = AnyTlsSession::new_server_with_initial_data(
+                transport,
+                PaddingFactory::default_factory(),
+                Arc::new(crate::resolver::NativeResolver),
+                crate::routing::ingress::tests::protocol_failure_selector(failure == "block"),
+                true,
+                "test".into(),
+                None,
+            );
+            session.peer_version.store(2, Ordering::Relaxed);
+            while session.outgoing_tx.capacity() > 0 {
+                session
+                    .outgoing_tx
+                    .try_send((2, Bytes::from_static(b"sibling")))
+                    .unwrap();
+            }
+            let (sender, receiver) = mpsc::channel(1);
+            let stream = AnyTlsStream::new(
+                1,
+                receiver,
+                session.outgoing_tx.clone(),
+                session.is_closed.clone(),
+            );
+            let handler = session.clone();
+            let forwarding = tokio::spawn(async move {
+                handler
+                    .handle_uot_v2_connect(
+                        stream,
+                        NetLocation::from_str("192.0.2.1:443", None).unwrap(),
+                    )
+                    .await
+            });
+            let status = read_frame(&mut peer).await;
+            assert_eq!(status.encode(), Frame::control(Command::SynAck, 1).encode());
+            let payload = if failure == "read" {
+                vec![0, 20, 0]
+            } else {
+                crate::routing::ingress::tests::PacketMode::Fixed.packet(
+                    &NetLocation::from_str("192.0.2.1:443", None).unwrap(),
+                    &crate::sniff::udp::tests::stun_packet(),
+                )
+            };
+            sender.send(Bytes::from(payload)).await.unwrap();
+            if failure == "read" {
+                sender.send(Bytes::new()).await.unwrap();
+            }
+            sender.closed().await;
+            tokio::task::yield_now().await;
+            assert!(
+                !forwarding.is_finished(),
+                "FIN must wait for capacity: {failure}"
+            );
+            if drain {
+                let mut outgoing = session.outgoing_rx.lock().await;
+                loop {
+                    let (id, data) = outgoing.recv().await.unwrap();
+                    if id == 1 {
+                        assert!(data.is_empty());
+                        break;
+                    }
+                    assert_eq!(id, 2);
+                }
+            } else {
+                tokio::time::advance(CONTROL_FRAME_TIMEOUT).await;
+            }
+            let error = forwarding.await.unwrap().unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if failure == "read" {
+                    io::ErrorKind::UnexpectedEof
+                } else {
+                    io::ErrorKind::ConnectionRefused
+                }
+            );
+            assert_eq!(session.is_closed(), !drain);
+            if drain {
+                assert!(
+                    session.outgoing_rx.lock().await.try_recv().is_err(),
+                    "duplicate FIN"
+                );
+                session.send_synack(2, None).await.unwrap();
+                assert_eq!(
+                    read_frame(&mut peer).await.encode(),
+                    Frame::control(Command::SynAck, 2).encode()
+                );
+            }
+            drop(session);
+            let mut extra = Vec::new();
+            peer.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty(), "second response after optimistic success");
         }
     }
 }

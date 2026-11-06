@@ -7,6 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{Instant, timeout_at};
 
 mod http;
+pub(crate) mod udp;
 
 pub(crate) const SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
 const MAX_INSPECTED_BYTES: usize = 64 * 1024;

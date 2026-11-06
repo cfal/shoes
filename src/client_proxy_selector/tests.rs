@@ -22,6 +22,96 @@ fn prepared(selector: &ClientProxySelector, location: &str) -> PreparedDestinati
 }
 
 #[tokio::test]
+async fn traffic_rules_do_not_share_destination_cache_or_resolve_on_network_miss() {
+    use crate::rules::{Expression, Network, Protocol};
+    let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+    for condition in [
+        serde_json::json!({"network": "udp"}),
+        serde_json::json!({"protocol": "stun"}),
+        serde_json::json!({"not": {"not": {"protocol": "stun"}}}),
+    ] {
+        let mut compiler = Compiler::default();
+        compiler.source_groups.insert(
+            "traffic".into(),
+            Expression::from_config(condition.clone()).unwrap(),
+        );
+        let predicate = compiler
+            .compile(Expression::RuleSourceGroup("traffic".into()))
+            .unwrap();
+        let selector = ClientProxySelector::with_options(
+            vec![
+                ConnectRule::compiled(predicate, false, ConnectAction::Block),
+                allow_rule(vec!["0.0.0.0/0"]),
+            ],
+            true,
+        );
+        assert!(!selector.is_cache_enabled());
+        assert_eq!(
+            selector.has_protocol_rules(),
+            condition.get("network").is_none()
+        );
+        for _ in 0..2 {
+            for traffic in [
+                Traffic::TCP,
+                Traffic::UDP,
+                Traffic {
+                    network: Network::Udp,
+                    protocol: Some(Protocol::Stun),
+                },
+                Traffic {
+                    network: Network::Udp,
+                    protocol: Some(Protocol::Dtls),
+                },
+            ] {
+                let mut target = prepared(&selector, "unresolved.example:443");
+                target.traffic = traffic;
+                let blocked = if condition.get("network").is_some() {
+                    traffic.network == Network::Udp
+                } else {
+                    traffic.protocol == Some(Protocol::Stun)
+                };
+                assert_eq!(
+                    matches!(
+                        selector
+                            .judge_prepared(target, None, &resolver)
+                            .await
+                            .unwrap()
+                            .decision,
+                        ConnectDecision::Block
+                    ),
+                    blocked
+                );
+            }
+        }
+        assert_eq!(selector.cache_size(), 0);
+    }
+    let predicate = Compiler::default()
+        .compile(
+            Expression::from_config(
+                serde_json::json!({"all": [{"ip_cidr": ["10.0.0.0/8"]}, {"network": "udp"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let selector = ClientProxySelector::new(vec![
+        ConnectRule::compiled(predicate, false, ConnectAction::Block),
+        allow_rule(vec!["0.0.0.0/0"]),
+    ]);
+    assert!(matches!(
+        selector
+            .judge(
+                NetLocation::from_str("unresolved.example:443", None)
+                    .unwrap()
+                    .into(),
+                &resolver
+            )
+            .await
+            .unwrap(),
+        ConnectDecision::Allow { .. }
+    ));
+}
+
+#[tokio::test]
 async fn same_policy_can_avoid_dns_but_later_policy_cannot() {
     let no_dns: Arc<dyn Resolver> = Arc::new(NoDns);
     let location = NetLocation::from_str("allowed.example:443", None).unwrap();
@@ -1911,7 +2001,7 @@ async fn test_selector_judge_uncached() {
 
     // Use judge_uncached - should NOT populate cache
     let decision = selector
-        .judge_uncached(location.into(), &resolver, None)
+        .judge_uncached(location.into(), &resolver, None, Traffic::TCP)
         .await
         .unwrap();
     match decision {
