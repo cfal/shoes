@@ -1599,6 +1599,196 @@ struct H1PacketPeer {
     _tasks: Tasks,
 }
 
+async fn h2_download_peer(
+    mode: XhttpMode,
+) -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<h2::SendStream<Bytes>>,
+    Tasks,
+) {
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+    let (send, received) = tokio::sync::mpsc::unbounded_channel();
+    let tasks = Tasks::new();
+    tasks.spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let send = send.clone();
+            connections.spawn(async move {
+                let mut connection = h2::server::handshake(socket).await.unwrap();
+                let mut uploads = tokio::task::JoinSet::new();
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    if request.method() == http::Method::GET || mode == XhttpMode::StreamOne {
+                        let body = respond.send_response(Response::new(()), false).unwrap();
+                        if send.send(body).is_err() {
+                            break;
+                        }
+                    } else {
+                        uploads.spawn(async move {
+                            let mut body = request.into_body();
+                            while let Some(Ok(bytes)) = body.data().await {
+                                body.flow_control().release_capacity(bytes.len()).unwrap();
+                            }
+                            let _ = respond.send_response(Response::new(()), true);
+                        });
+                    }
+                }
+            });
+        }
+    });
+    (address, received, tasks)
+}
+
+#[tokio::test]
+async fn h2_paused_downloads_leave_credit_for_an_admitted_session() {
+    for mode in [
+        XhttpMode::PacketUp,
+        XhttpMode::StreamUp,
+        XhttpMode::StreamOne,
+    ] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (address, mut responses, _peer) = h2_download_peer(mode).await;
+            let config = serde_json::from_value(serde_json::json!({
+                "pool": {"max_connections": 1, "h2_receive_admission": true}, "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            let client = configured_client(config, XhttpVersion::H2, mode);
+            let dialer = Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            });
+            let mut paused = Vec::new();
+            let mut senders = Vec::new();
+            for _ in 0..15 {
+                paused.push(client.open(dialer.clone()).await.unwrap());
+                let mut send = responses.recv().await.unwrap();
+                let mut data = Bytes::from(vec![42; 4 * 1024 * 1024]);
+                // Send a full stream window using assigned credit, without a timing guess.
+                send.reserve_capacity(data.len());
+                while !data.is_empty() {
+                    let capacity = if send.capacity() == 0 {
+                        futures::future::poll_fn(|cx| send.poll_capacity(cx))
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    } else {
+                        send.capacity()
+                    };
+                    send.send_data(data.split_to(capacity.min(data.len())), false)
+                        .unwrap();
+                }
+                senders.push(send);
+            }
+            let mut probe = client.open(dialer.clone()).await.unwrap();
+            let mut send = responses.recv().await.unwrap();
+            send.send_data(Bytes::from_static(b"ok"), false).unwrap();
+            let mut reply = [0; 2];
+            probe.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"ok");
+            assert_eq!(dialer.opens.load(Ordering::Relaxed), 1);
+            assert!(client.open(dialer.clone()).await.is_err());
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn h2_download_admission_is_opt_in_even_with_small_byte_caps() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (address, mut responses, _peer) = h2_download_peer(XhttpMode::StreamOne).await;
+        let config = serde_json::from_value(serde_json::json!({
+            "limits": {"max_buffered_bytes": 1048576},
+            "pool": {"max_connections": 1}, "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        let client = configured_client(config, XhttpVersion::H2, XhttpMode::StreamOne);
+        let dialer = Arc::new(Dialer {
+            address,
+            key: RouteKey(vec![1]),
+            opens: AtomicUsize::new(0),
+        });
+        let mut streams = Vec::new();
+        let mut senders = Vec::new();
+        for _ in 0..20 {
+            streams.push(client.open(dialer.clone()).await.unwrap());
+            senders.push(responses.recv().await.unwrap());
+        }
+        senders
+            .last_mut()
+            .unwrap()
+            .send_data(Bytes::from_static(b"ok"), false)
+            .unwrap();
+        let mut reply = [0; 2];
+        streams
+            .last_mut()
+            .unwrap()
+            .read_exact(&mut reply)
+            .await
+            .unwrap();
+        assert_eq!(&reply, b"ok");
+        assert_eq!(dialer.opens.load(Ordering::Relaxed), 1);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn h2_download_admission_spills_refuses_and_recovers_without_blocking_uploads() {
+    for mode in [
+        XhttpMode::PacketUp,
+        XhttpMode::StreamUp,
+        XhttpMode::StreamOne,
+    ] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (address, mut responses, _peer) = h2_download_peer(mode).await;
+            let config = serde_json::from_value(serde_json::json!({
+                "limits": {"h2_stream_window_bytes": 65535, "h2_connection_window_bytes": 65535},
+                "sc_min_posts_interval_ms": 1,
+                "pool": {"max_connections": 2, "h2_receive_admission": true}, "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            let client = configured_client(config, XhttpVersion::H2, mode);
+            let dialer = Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            });
+            let mut first = client.open(dialer.clone()).await.unwrap();
+            let mut first_send = responses.recv().await.unwrap();
+            first_send
+                .send_data(Bytes::from(vec![42; 256 * 1024]), false)
+                .unwrap();
+            let second = client.open(dialer.clone()).await.unwrap();
+            let _second_send = responses.recv().await.unwrap();
+            assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+            assert!(client.open(dialer.clone()).await.is_err());
+            if mode != XhttpMode::StreamOne {
+                first.write_all(&[7; 128 * 1024]).await.unwrap();
+                first.shutdown().await.unwrap();
+            }
+            drop(first);
+            let mut replacement = loop {
+                match client.open(dialer.clone()).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            };
+            let mut send = responses.recv().await.unwrap();
+            send.send_data(Bytes::from_static(b"ok"), false).unwrap();
+            let mut reply = [0; 2];
+            replacement.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"ok");
+            assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+            drop(second);
+        })
+        .await
+        .unwrap();
+    }
+}
+
 impl H1PacketPeer {
     async fn new() -> Self {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();

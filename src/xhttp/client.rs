@@ -8,7 +8,7 @@ use tokio::{
 };
 
 use super::{
-    carrier::{Carrier, Reservation, Timeouts},
+    carrier::{Carrier, ReceiveGuard, Reservation, Timeouts},
     connector::Security,
     stream::{Activity, Body, Event, Memory, Reader, Stream, Tasks, UploadSignal, pipe},
     wire::{self, Path},
@@ -57,7 +57,8 @@ impl Drop for SlotPermit {
 struct Lease {
     carrier: Arc<Carrier>,
     reservation: Option<Reservation>,
-    _permit: SlotPermit,
+    download: Option<OwnedSemaphorePermit>,
+    _permit: Arc<SlotPermit>,
 }
 
 #[derive(Default)]
@@ -80,7 +81,7 @@ impl Lease {
     async fn request(
         &mut self,
         client: &Client,
-        request: Request<Body>,
+        mut request: Request<Body>,
         memory: Memory,
         tasks: &Tasks,
         packet: bool,
@@ -108,6 +109,11 @@ impl Lease {
         } else {
             Timeouts::headers(client.header_timeout())
         };
+        if let Some(download) = self.download.take() {
+            request
+                .extensions_mut()
+                .insert(ReceiveGuard::new((download, self._permit.clone())));
+        }
         self.carrier
             .request_reserved(request, memory, tasks, timeouts, reservation)
             .await
@@ -224,7 +230,7 @@ impl Client {
                         stream,
                         self.version,
                         header_limit,
-                        self.config.limits.h2_windows(),
+                        self.config.limits.h2_client_windows(),
                     )
                     .await
                 }
@@ -233,7 +239,12 @@ impl Client {
         .await?
     }
 
-    async fn lease(&self, dialer: &Arc<dyn CarrierDialer>, allow_dial: bool) -> io::Result<Lease> {
+    async fn lease(
+        &self,
+        dialer: &Arc<dyn CarrierDialer>,
+        allow_dial: bool,
+        download: bool,
+    ) -> io::Result<Lease> {
         let (slot, permit) = {
             let mut slots = self.slots.lock();
             let idle = Duration::from_secs(self.config.pool.idle_timeout_secs);
@@ -248,17 +259,26 @@ impl Client {
                 let Ok(Some(reservation)) = carrier.try_reserve() else {
                     continue;
                 };
+                let download = if download {
+                    let Ok(permit) = carrier.admit_download() else {
+                        continue;
+                    };
+                    permit
+                } else {
+                    None
+                };
                 return Ok(Lease {
                     carrier: carrier.clone(),
                     reservation: Some(reservation),
-                    _permit: SlotPermit {
+                    download,
+                    _permit: Arc::new(SlotPermit {
                         _permit: slot
                             .requests
                             .clone()
                             .try_acquire_owned()
                             .map_err(|_| crate::resources::exhausted())?,
                         slot: Some(slot.clone()),
-                    },
+                    }),
                 });
             }
             if !allow_dial {
@@ -286,14 +306,14 @@ impl Client {
                 limit,
                 last_used: parking_lot::Mutex::new(tokio::time::Instant::now()),
             });
-            let permit = SlotPermit {
+            let permit = Arc::new(SlotPermit {
                 _permit: slot
                     .requests
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| crate::resources::exhausted())?,
                 slot: Some(slot.clone()),
-            };
+            });
             slots.push(slot.clone());
             (slot, permit)
         };
@@ -305,11 +325,17 @@ impl Client {
             let reservation = carrier
                 .try_reserve()?
                 .ok_or_else(crate::resources::exhausted)?;
+            let download = if download {
+                carrier.admit_download()?
+            } else {
+                None
+            };
             // Publish only after the initializer owns its stream credit.
             assert!(slot.carrier.set(carrier.clone()).is_ok());
             Ok(Lease {
                 carrier,
                 reservation: Some(reservation),
+                download,
                 _permit: permit,
             })
         }
@@ -368,23 +394,31 @@ impl Client {
                         .try_acquire_many_owned(count)
                         .map_err(|_| crate::resources::exhausted())?;
                     lanes = futures::future::try_join_all((0..count).map(|_| {
-                        let permit = SlotPermit {
+                        let permit = Arc::new(SlotPermit {
                             _permit: permit.split(1).unwrap(),
                             slot: None,
-                        };
+                        });
                         let dialer = &dialer;
                         async move {
                             Ok::<_, io::Error>(Lease {
                                 carrier: self.dial(dialer).await?,
                                 reservation: None,
+                                download: None,
                                 _permit: permit,
                             })
                         }
                     }))
                     .await?;
                 } else {
-                    for _ in 0..count {
-                        lanes.push(self.lease(&dialer, true).await?);
+                    for index in 0..count {
+                        lanes.push(
+                            self.lease(
+                                &dialer,
+                                true,
+                                index == 0 && self.config.pool.h2_receive_admission,
+                            )
+                            .await?,
+                        );
                     }
                 }
                 let download = lanes.remove(0);
@@ -766,8 +800,10 @@ impl Client {
                                 let _allocation = gate.lock().await;
                                 if lane.carrier.closed() {
                                     drop(lane);
-                                    lane = self.lease(&dialer, true).await?;
-                                } else if let Ok(replacement) = self.lease(&dialer, true).await {
+                                    lane = self.lease(&dialer, true, false).await?;
+                                } else if let Ok(replacement) =
+                                    self.lease(&dialer, true, false).await
+                                {
                                     // No request has been sent; another session may own this carrier's credit.
                                     lane = replacement;
                                 }
@@ -819,7 +855,7 @@ impl Client {
     async fn packet_lane(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Lease> {
         let gate = self.route_gate(dialer.route_key());
         let _allocation = gate.lock().await;
-        self.lease(dialer, true).await
+        self.lease(dialer, true, false).await
     }
 }
 
@@ -964,14 +1000,14 @@ mod tests {
                 key: RouteKey(vec![1]),
                 opens: std::sync::atomic::AtomicUsize::new(0),
             });
-            let initialized = client.lease(&dialer, true).await;
+            let initialized = client.lease(&dialer, true, true).await;
             if exhausted {
                 assert!(initialized.is_err());
                 assert!(client.slots.lock().is_empty());
             } else {
                 let lane = initialized.unwrap();
                 assert!(lane.reservation.is_some());
-                assert!(client.lease(&dialer, true).await.is_err());
+                assert!(client.lease(&dialer, true, true).await.is_err());
                 let slots = client.slots.lock();
                 assert_eq!(slots.len(), 1);
                 assert_eq!(slots[0].active(), 1);
@@ -1045,8 +1081,8 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let download = client.lease(&route, true).await.unwrap();
-            let upload = client.lease(&route, true).await.unwrap();
+            let download = client.lease(&route, true, true).await.unwrap();
+            let upload = client.lease(&route, true, false).await.unwrap();
             let retired = Arc::downgrade(&upload.carrier);
             let memory = Memory::new(client.memory.clone(), Some(65536));
             let (mut writer, reader) = pipe(memory.clone());

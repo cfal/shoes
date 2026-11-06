@@ -2,10 +2,9 @@
 
 ## Unreleased
 
-- XHTTP H1 split-mode clients now establish their two carrier connections concurrently, retaining atomic connection admission and cancellation on setup failure.
-
 - XHTTP H1 packet-up clients without application byte caps now collect one bounded successor POST while waiting for the previous acknowledgement instead of accumulating only an input pipe of data. HTTP/1 pipelining and pacing are unchanged. Explicit byte caps retain the previous ACK gating to avoid staging data into memory needed by a download before its ACK.
-
+- Raised the XHTTP H2 client connection receive-window default to 64 MiB (servers retain 8 MiB), improving headroom for concurrent downloads without changing the 4 MiB stream default. Added opt-in `pool.h2_receive_admission` to limit downloads to the connection/stream window ratio: 16 per carrier with default windows, up to 48 across the default pool. Byte-budget clamps can reduce this to one per carrier. Admission remains disabled by default because lingering packet-up download tails retain slots and can exhaust them during ordinary connection churn. Without it, larger windows mitigate but do not eliminate paused-reader stalls; application-global memory exhaustion can still backpressure sessions.
+- XHTTP H1 split-mode clients now establish their two carrier connections concurrently, retaining atomic connection admission and cancellation on setup failure.
 - Updated ML-KEM to 0.3.4 for secret-key debug redaction, constant-time equality/reduction hardening, and improved zeroization. Updated the BLAKE2 and Linux netlink dependencies while retaining protocol formats, maintained forks, and existing Rust/mobile platform requirements.
 - Added `conditions` for general-purpose routing expressions, including nested `masks` address leaves. Existing top-level `masks`/`mask` syntax remains supported without warnings. Config serialization keeps plain address expressions under `masks` and emits other expressions under `conditions`; controller rule and connection diagnostics now explicitly wrap address leaves in `masks`. See [rule configuration](https://shoes-rs.github.io/routing/rules/#rule-config).
 - Added opt-in `global_settings.ntp` for application-local time correction using unauthenticated NTP. It adjusts protocol timestamps and rustls certificate validation with an offset, never writes the OS clock, and retains samples across unchanged reloads; see [NTP settings and limitations](https://shoes-rs.github.io/config/global-settings/#ntp).
