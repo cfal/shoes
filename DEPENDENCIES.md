@@ -134,6 +134,61 @@ cargo-llvm-cov 0.9.1 were already current. Keep peer hashes, frozen Shoes
 baselines, fixture-generation provenance and historical benchmark evidence
 unchanged when refreshing tooling.
 
+## November 2026 Refresh
+
+The November 6 inventory checks direct, development and transitive dependencies
+against non-yanked stable releases. The refresh advances Shoes' BLAKE2 requirement
+to 0.11 and rtnetlink to 0.24, and takes ML-KEM 0.3.4, log 0.4.35, mime 0.3.18, cc 1.11.0,
+crc32fast 1.5.4, ctutils 0.4.8, module-lattice 0.2.4, notify-types 2.2.0,
+netlink-packet-route 0.34, netlink-proto 0.14.1, utf8_iter 1.1/utf_types 1.0,
+and wasm-bindgen 0.2.130/js-sys 0.3.107. All protected cfal repositories and
+full revisions remain unchanged, including Hickory; the publishing guard remains.
+
+[ML-KEM 0.3.4](https://github.com/RustCrypto/KEMs/releases/tag/ml-kem%2Fv0.3.4)
+hardens secret-key formatting, comparisons, reduction and zeroization. Its XOF
+sampling optimization must preserve the committed cross-language vectors.
+[BLAKE2 0.11](https://github.com/RustCrypto/hashes/blob/blake2-v0.11.0/blake2/CHANGELOG.md)
+uses digest 0.11, defaults to `alloc` instead of `std`, and removes its old SIMD
+implementation. Salamander still hashes password followed by salt with unkeyed
+BLAKE2b-256; full digest vectors cover compression-block boundaries.
+GotaTun still requires BLAKE2 0.10 and the older RustCrypto families, so both
+BLAKE2 versions are intentional. Its crypto-common 0.1.7 requires exactly
+generic-array 0.14.7, blocking even the newer 0.14.9 patch release.
+
+[rtnetlink 0.24](https://github.com/rust-netlink/rtnetlink/releases/tag/v0.24.0)
+updates route/link parsing and netlink error handling. Strict kernel checking
+remains opt-in; Shoes retains its existing connection construction, request
+timeouts and reconciliation. Its nix 0.31 requirement removes the older 0.30
+registry copy: Linux rtnetlink now selects the existing upstream git pin too,
+enabling its `mount,process,sched,signal` features in the Linux cross-build matrix.
+Published nix 0.31.3 still fails the actual iOS feature set with
+libc 0.2.191; the unchanged upstream git pin passes that isolated compile check.
+Parking_lot 0.13 remains blocked by the Android seccomp issue described above.
+The rtnetlink and netlink-proto licenses now use standard MIT text with contributor
+attribution instead of their previous modified-MIT bug-reporting condition;
+the checksummed clarifications and generated notices retain the new originals.
+
+AWS-LC, Quinn, Tokio, rcgen, instant-acme, GotaTun, tun, tendns and the remaining
+eligible direct Rust dependencies were already current. Newer incompatible
+transitive families remain constrained by their parents, not forced through
+patches or fork edits. Prereleases are not stable upgrade candidates.
+
+Documentation uses Astro 7.4.7, Starlight 0.42.9 and linkedom 0.18.15, with
+compatible transitive updates and Node 26 LTS, matching the other Node jobs.
+Vite retains rolldown 1.2 while Astro also accepts 1.3; Starlight retains satteri
+0.10 while Astro requires 0.11. These parent constraints explain the duplicate
+families and their platform-specific native/WASM packages.
+Sitemap retains `@types/node` 24 despite the Node 26 build runtime; the shared
+type package also satisfies Vite and `@types/sax` without another major copy.
+Stable rolldown 1.3.0 requires optional WASM emnapi 2.0.0-beta.2 exactly; that
+upstream transitive pin is not a direct prerelease upgrade or a forced override.
+Pinned Actions advance Docker login to 4.8.0, release creation to 3.0.4 and build
+provenance to 4.2.2. File-subject attestation keeps the existing permissions;
+registry storage-record permissions are unnecessary. Artifact names, inputs,
+architectures, credentials policy and peer baselines are unchanged.
+Rust 1.99.1, Go 1.27.3, cargo-about 0.9.3, cargo-ndk 4.1.2, cbindgen 0.29.4,
+cargo-llvm-cov 0.9.1 and cross 0.2.5 remain current.
+
 ## Validation
 
 Use [the test guide](tests/README.md) and current workflows for exact commands.

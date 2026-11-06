@@ -1,5 +1,6 @@
 use super::*;
 use shoes_test_support::process::spawn_privileged_process;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -17,20 +18,27 @@ fn start_filtered_server(
     config_file.flush()?;
     let log = File::create(directory.join("server.log"))?;
     let stderr = log.try_clone()?;
+    let executable = std::env::current_exe()?;
+    let mut config_env = OsString::from("SHOES_TEST_OFFLOAD_CONFIG=");
+    config_env.push(config_file.path());
+    let mut result_env = OsString::from("SHOES_TEST_OFFLOAD_RESULT=");
+    result_env.push(directory.join("exit"));
     let guard = spawn_privileged_process(
-        &std::env::current_exe()?,
+        Path::new("/usr/bin/env"),
         "offload-filtered-shoes",
         |command| {
+            // Explicit assignments survive sudo implementations that ignore -E.
             command
+                .arg(config_env)
+                .arg(format!("SHOES_TEST_OFFLOAD_IOCTL={request}"))
+                .arg(result_env)
+                .arg(executable)
                 .args([
                     "--exact",
                     "tun_kernel::offload_failure::filtered_server",
                     "--ignored",
                     "--nocapture",
                 ])
-                .env("SHOES_TEST_OFFLOAD_CONFIG", config_file.path())
-                .env("SHOES_TEST_OFFLOAD_IOCTL", request.to_string())
-                .env("SHOES_TEST_OFFLOAD_RESULT", directory.join("exit"))
                 .stdout(Stdio::from(log))
                 .stderr(Stdio::from(stderr));
         },

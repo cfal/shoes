@@ -168,6 +168,36 @@ mod tests {
         assert_eq!(wire[0], 1);
     }
 
+    #[test]
+    fn key_matches_blake2b_256_at_block_boundaries() {
+        // Matches Go's blake2b.Sum256(password || salt), not keyed BLAKE2 or truncation.
+        let salt = [0, 1, 2, 3, 4, 5, 6, 7];
+        for (length, expected) in [
+            (
+                4,
+                "82cfc0da318bf7df292252caf279cc2745976b5ec7a7159ac0a99a2e324480fd",
+            ),
+            (
+                120,
+                "8e749c3a841d4cd8e51bfe851e3b4c601b86616dd8370e519218c986749e4b03",
+            ),
+            (
+                121,
+                "197256e932bfd3e67648765d2ee9629f42878492d956c540615fa9b3ed58971c",
+            ),
+            (
+                248,
+                "4d6e52065ab48cfb903e6c0ac0a9789767d576ba240d431b145754bd7bd6b2ae",
+            ),
+        ] {
+            let actual: String = key(&"p".repeat(length), &salt)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(actual, expected, "password length {length}");
+        }
+    }
+
     fn wire(data: &[u8]) -> Vec<u8> {
         let mut wire = vec![1; 8];
         wire.extend_from_slice(data);

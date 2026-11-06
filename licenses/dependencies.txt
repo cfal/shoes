@@ -667,7 +667,7 @@ Repository: https://github.com/jhpratt/deranged
 License: Apache License 2.0 (Apache-2.0)
 Package: cmov 0.5.4
 Repository: https://github.com/RustCrypto/utils
-Package: ctutils 0.4.6
+Package: ctutils 0.4.8
 Repository: https://github.com/RustCrypto/utils
 Package: lru-slab 0.1.3
 Repository: https://github.com/Ralith/lru-slab
@@ -677,8 +677,10 @@ Package: sntpc 0.11.0
 Repository: https://github.com/vpetrigo/sntpc
 Package: tinyvec 1.13.3
 Repository: https://github.com/Lokathor/tinyvec
-Package: utf8_iter 1.0.4
+Package: utf8_iter 1.1.0
 Repository: https://github.com/hsivonen/utf8_iter
+Package: utf_types 1.0.0
+Repository: https://github.com/hsivonen/utf_types
 Package: zeroize 1.9.1
 Repository: https://github.com/RustCrypto/utils
 Package: zeroize_derive 1.5.0
@@ -2893,7 +2895,7 @@ Repository: https://github.com/achanda/ipnetwork
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: crc32fast 1.5.3
+Package: crc32fast 1.5.4
 Repository: https://github.com/srijs/rust-crc32fast
 Package: env_filter 0.1.4
 Repository: https://github.com/rust-cli/env_logger
@@ -4788,7 +4790,7 @@ limitations under the License.
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: notify-types 2.1.0
+Package: notify-types 2.2.0
 Repository: https://github.com/notify-rs/notify.git
 
                               Apache License
@@ -5436,7 +5438,7 @@ Package: blocking 1.7.0
 Repository: https://github.com/smol-rs/blocking
 Package: bumpalo 3.20.3
 Repository: https://github.com/fitzgen/bumpalo
-Package: cc 1.10.0
+Package: cc 1.11.0
 Repository: https://github.com/rust-lang/cc-rs
 Package: cfg-if 1.0.5
 Repository: https://github.com/rust-lang/cfg-if
@@ -5512,15 +5514,15 @@ Package: itertools 0.14.0
 Repository: https://github.com/rust-itertools/itertools
 Package: jobserver 0.1.35
 Repository: https://github.com/rust-lang/jobserver-rs
-Package: js-sys 0.3.106
+Package: js-sys 0.3.107
 Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
 Package: lazy_static 1.5.1
 Repository: https://github.com/rust-lang-nursery/lazy-static.rs
 Package: lock_api 0.4.14
 Repository: https://github.com/Amanieu/parking_lot
-Package: log 0.4.34
+Package: log 0.4.35
 Repository: https://github.com/rust-lang/log
-Package: mime 0.3.17
+Package: mime 0.3.18
 Repository: https://github.com/hyperium/mime
 Package: num-bigint 0.4.8
 Repository: https://github.com/rust-num/num-bigint
@@ -5606,13 +5608,13 @@ Package: wasi 0.11.1+wasi-snapshot-preview1
 Repository: https://github.com/bytecodealliance/wasi
 Package: wasip2 1.0.4+wasi-0.2.12
 Repository: https://github.com/bytecodealliance/wasi-rs
-Package: wasm-bindgen-macro-support 0.2.129
+Package: wasm-bindgen-macro-support 0.2.130
 Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support
-Package: wasm-bindgen-macro 0.2.129
+Package: wasm-bindgen-macro 0.2.130
 Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro
-Package: wasm-bindgen-shared 0.2.129
+Package: wasm-bindgen-shared 0.2.130
 Repository: https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
-Package: wasm-bindgen 0.2.129
+Package: wasm-bindgen 0.2.130
 Repository: https://github.com/wasm-bindgen/wasm-bindgen
 Package: wit-bindgen 0.57.1
 Repository: https://github.com/bytecodealliance/wit-bindgen
@@ -6240,6 +6242,8 @@ limitations under the License.
 License: Apache License 2.0 (Apache-2.0)
 Package: blake2 0.10.6
 Repository: https://github.com/RustCrypto/hashes
+Package: blake2 0.11.0
+Repository: https://github.com/RustCrypto/hashes
 Package: block-buffer 0.10.4
 Repository: https://github.com/RustCrypto/utils
 Package: block-buffer 0.12.1
@@ -6276,9 +6280,9 @@ Package: keccak 0.2.2
 Repository: https://github.com/RustCrypto/sponges
 Package: md-5 0.11.0
 Repository: https://github.com/RustCrypto/hashes
-Package: ml-kem 0.3.3
+Package: ml-kem 0.3.4
 Repository: https://github.com/RustCrypto/KEMs
-Package: module-lattice 0.2.3
+Package: module-lattice 0.2.4
 Repository: https://github.com/RustCrypto/KEMs
 Package: opaque-debug 0.3.1
 Repository: https://github.com/RustCrypto/utils
@@ -10925,6 +10929,99 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 License: MIT License (MIT)
+Package: netlink-packet-route 0.34.0
+Repository: https://github.com/rust-netlink/netlink-packet-route
+
+Copyright (c) The netlink-packet-route Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+License: MIT License (MIT)
+Package: netlink-proto 0.14.1
+Repository: https://github.com/rust-netlink/netlink-proto
+
+Copyright (c) The netlink-proto Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+License: MIT License (MIT)
+Package: rtnetlink 0.24.0
+Repository: https://github.com/rust-netlink/rtnetlink
+
+Copyright (c) The rtnetlink Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+License: MIT License (MIT)
 Package: synstructure 0.13.2
 Repository: https://github.com/mystor/synstructure
 Package: synstructure 0.14.0
@@ -11333,12 +11430,8 @@ DEALINGS IN THE SOFTWARE.
 License: MIT License (MIT)
 Package: netlink-packet-core 0.9.0
 Repository: https://github.com/rust-netlink/netlink-packet-core
-Package: netlink-proto 0.13.0
-Repository: https://github.com/rust-netlink/netlink-proto
 Package: netlink-sys 0.9.0
 Repository: https://github.com/rust-netlink/netlink-sys
-Package: rtnetlink 0.23.0
-Repository: https://github.com/rust-netlink/rtnetlink
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
@@ -11359,29 +11452,6 @@ and urls are either replaced with the contact information of the parties
 responsible for the changes, or removed entirely.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-License: MIT License (MIT)
-Package: netlink-packet-route 0.33.0
-Repository: https://github.com/rust-netlink/netlink-packet-route
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files (the “Software”), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
@@ -11425,8 +11495,6 @@ THE SOFTWARE.
 
 License: MIT License (MIT)
 Package: nix 0.31.3
-Repository: https://github.com/nix-rust/nix
-Package: nix 0.30.1
 Repository: https://github.com/nix-rust/nix
 
 The MIT License (MIT)
