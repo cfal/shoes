@@ -187,6 +187,7 @@ async fn representative_examples_pass_native_validation() {
         "clash_api.yaml",
         "url_test.yaml",
         "rule_sources.yaml",
+        "rule_conditions.yaml",
     ] {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("examples")

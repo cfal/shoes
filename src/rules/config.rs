@@ -75,7 +75,7 @@ impl Expression {
             Value::String(_) => decode(value).map(Self::Legacy),
             Value::Array(values) => {
                 if values.is_empty() {
-                    return Err(invalid("masks cannot be empty"));
+                    return Err(invalid("rule expression list cannot be empty"));
                 }
                 if values.iter().all(Value::is_string) {
                     return decode(Value::Array(values)).map(Self::Legacy);
@@ -88,11 +88,23 @@ impl Expression {
             Value::Object(fields) => {
                 if fields.len() != 1 {
                     return Err(invalid(
-                        "a masks object requires exactly one predicate or a path",
+                        "a rule expression object requires exactly one predicate or a source",
                     ));
                 }
                 let (field, value) = fields.into_iter().next().unwrap();
                 match field.as_str() {
+                    "masks" => {
+                        let valid = value.is_string()
+                            || value.as_array().is_some_and(|values| {
+                                !values.is_empty() && values.iter().all(Value::is_string)
+                            });
+                        if !valid {
+                            return Err(invalid(
+                                "a masks leaf requires a mask string or a nonempty list of mask strings; combine other predicates with all/any/not",
+                            ));
+                        }
+                        decode(value).map(Self::Legacy)
+                    }
                     "any_destination" => decode(value).map(Self::AnyDestination),
                     "domain" => decode(value).map(Self::Domain),
                     "domain_suffix" => decode(value).map(Self::DomainSuffix),
@@ -105,16 +117,16 @@ impl Expression {
                     "destination_port_range" => decode(value).map(Self::DestinationPortRange),
                     "rule_source_group" => decode(value).map(Self::RuleSourceGroup),
                     "rule_group" => Err(invalid(
-                        "masks rule_group was renamed; use masks: {rule_source_group: name} and declare the group with rule_source_group",
+                        "rule_group predicate was renamed; use {rule_source_group: name} and declare the group with rule_source_group",
                     )),
                     "all" => Self::parse_children(decode(value)?, depth).map(Self::All),
                     "any" => Self::parse_children(decode(value)?, depth).map(Self::Any),
                     "not" => Self::parse_config(value, depth + 1).map(|p| Self::Not(Box::new(p))),
-                    _ => Err(invalid(format!("unknown masks field: {field}"))),
+                    _ => Err(invalid(format!("unknown rule predicate: {field}"))),
                 }
             }
             _ => Err(invalid(
-                "masks requires a mask string, predicate object, or nonempty list",
+                "a rule expression requires a mask string, predicate object, or nonempty list",
             )),
         }
     }
@@ -159,7 +171,7 @@ mod tests {
     #[test]
     fn composite_errors_preserve_list_context_and_child_order() {
         for (value, message) in [
-            (json!([]), "masks cannot be empty"),
+            (json!([]), "rule expression list cannot be empty"),
             (
                 json!({"all": []}),
                 "all/any requires at least one predicate",
@@ -178,12 +190,50 @@ mod tests {
             ),
             (
                 json!({"any": [{"unknown": true}, false]}),
-                "unknown masks field: unknown",
+                "unknown rule predicate: unknown",
             ),
         ] {
             let error = Expression::from_config(value).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn mask_leaf_diagnostics_describe_the_accepted_shapes() {
+        for value in [
+            json!([]),
+            json!(null),
+            json!(false),
+            json!(5),
+            json!({"domain": ["example.com"]}),
+            json!(["example.com", {"destination_port": [443]}]),
+            json!(["example.com", 5]),
+        ] {
+            let error = Expression::from_config(json!({"all": [{"masks": value}]})).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "a masks leaf requires a mask string or a nonempty list of mask strings; combine other predicates with all/any/not"
+            );
+        }
+    }
+
+    #[test]
+    fn renamed_rule_group_hint_works_in_every_expression_position() {
+        for form in ["direct", "list", "all", "any", "not"] {
+            let wrap = |predicate| match form {
+                "direct" => predicate,
+                "list" => json!([predicate]),
+                "not" => json!({"not": predicate}),
+                operator => json!({operator: [predicate]}),
+            };
+            let error = Expression::from_config(wrap(json!({"rule_group": "other"}))).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "rule_group predicate was renamed; use {rule_source_group: name} and declare the group with rule_source_group"
+            );
+            Expression::from_config(wrap(json!({"rule_source_group": "other"}))).unwrap();
         }
     }
 

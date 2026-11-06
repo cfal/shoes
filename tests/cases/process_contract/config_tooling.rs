@@ -35,6 +35,36 @@ fn legacy_global_limits_warns_but_canonical_settings_do_not() {
 }
 
 #[test]
+fn conditions_and_existing_mask_forms_validate_without_deprecation_warnings() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("conditions.yaml");
+    std::fs::write(
+        &path,
+        r#"- address: '127.0.0.1:0'
+  protocol: {type: socks}
+  rules:
+    - masks: example.com
+    - masks: [example.com, '192.0.2.0/24']
+    - mask: {domain_suffix: [example.com]}
+    - masks: {all: [{domain_suffix: [example.com]}, {destination_port: [443]}]}
+    - conditions: {all: [{masks: [example.com, '192.0.2.0/24']}, {destination_port: [443]}]}
+"#,
+    )
+    .unwrap();
+    for mode in ["check", "--dry-run"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .env("RUST_LOG", "warn")
+            .args([mode, "-t", "1"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{mode}: {diagnostic}");
+        assert!(!diagnostic.contains("deprecated"), "{mode}: {diagnostic}");
+    }
+}
+
+#[test]
 fn check_diagnostic_paths_accept_display_and_debug_formats() {
     for path in [
         r"C:\tmp\nested.yaml",

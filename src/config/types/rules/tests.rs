@@ -126,7 +126,10 @@ fn legacy_masks_keep_scalar_and_list_serialization() {
     let error = serde_yaml::from_str::<RuleConfig>("masks: []\naction: invalid")
         .unwrap_err()
         .to_string();
-    assert!(error.contains("masks cannot be empty"), "{error}");
+    assert!(
+        error.contains("rule expression list cannot be empty"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -187,6 +190,191 @@ fn typed_rule_round_trip_and_validation() {
             serde_yaml::from_str::<RuleConfig>(input).is_err(),
             "{input}"
         );
+    }
+}
+
+#[test]
+fn conditions_and_masks_share_grammar_and_round_trip_decisions() {
+    use crate::rules::Compiler;
+    use serde_json::json;
+
+    for expression in [
+        json!("example.com:443"),
+        json!(["example.com", "192.0.2.0/24"]),
+        json!({"masks": ["example.com", "192.0.2.0/24"]}),
+        json!({"domain": ["example.com"]}),
+        json!({"ip_cidr": ["192.0.2.0/24"]}),
+        json!({"all": [{"domain_suffix": ["example.com"]}, {"destination_port": [443]}]}),
+        json!(["example.com", {"not": {"destination_port": [80]}}]),
+        json!({"all": [
+            {"masks": ["example.com", "192.0.2.0/24"]},
+            {"any": [{"destination_port": [443]}, {"destination_port_range": ["8000:9000"]}]},
+            {"not": {"masks": "excluded.example.com"}}
+        ]}),
+    ] {
+        let mut rules: Vec<RuleConfig> = Vec::new();
+        for field in ["conditions", "masks", "mask"] {
+            let input = json!({field: expression, "no_resolve": true, "action": "allow",
+                "override_address": "127.0.0.1:8080", "client_chain": "outbound"});
+            rules.push(serde_json::from_value(input.clone()).unwrap());
+            rules.push(serde_yaml::from_str(&serde_yaml::to_string(&input).unwrap()).unwrap());
+        }
+
+        let encoded = serde_json::to_value(&rules[0]).unwrap();
+        assert_ne!(
+            encoded.get("masks").is_some(),
+            encoded.get("conditions").is_some()
+        );
+        assert_eq!(encoded["no_resolve"], true);
+        assert_eq!(encoded["override_address"], "127.0.0.1:8080");
+        assert_eq!(encoded["client_chains"], json!({"chain": "outbound"}));
+        let mut restored: RuleConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&encoded).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), encoded);
+        restored.compile(&mut Compiler::default()).unwrap();
+        let restored_predicate = restored.criteria.compiled.unwrap();
+
+        for mut rule in rules {
+            assert_eq!(
+                serde_json::to_value(&rule).unwrap(),
+                encoded,
+                "{expression}"
+            );
+            rule.compile(&mut Compiler::default()).unwrap();
+            let predicate = rule.criteria.compiled.unwrap();
+            for name in [
+                None,
+                Some("example.com"),
+                Some("excluded.example.com"),
+                Some("other.example"),
+            ] {
+                for ip in [
+                    None,
+                    Some("192.0.2.1".parse().unwrap()),
+                    Some("198.51.100.1".parse().unwrap()),
+                ] {
+                    for port in [80, 443, 8080] {
+                        assert_eq!(
+                            predicate.evaluate(name, ip, port),
+                            restored_predicate.evaluate(name, ip, port)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn conditions_serialize_address_leaves_explicitly_and_keep_simple_masks_compact() {
+    use crate::rules::{Compiler, Outcome};
+    use serde_json::json;
+
+    for masks in [json!("example.com"), json!(["example.com", "192.0.2.0/24"])] {
+        let rule: RuleConfig =
+            serde_json::from_value(json!({"conditions": {"masks": masks}})).unwrap();
+        assert_eq!(
+            serde_json::to_value(rule).unwrap(),
+            json!({"masks": masks, "action": "allow"})
+        );
+    }
+    let mut rule: RuleConfig = serde_json::from_value(json!({"mask": {"all": [
+        ["example.com", "192.0.2.0/24"], {"not": "excluded.example.com"}, {"destination_port": [443]}
+    ]}, "action": "block"})).unwrap();
+    assert_eq!(
+        serde_json::to_value(&rule).unwrap(),
+        json!({"conditions": {"all": [
+        {"masks": ["example.com", "192.0.2.0/24"]}, {"not": {"masks": "excluded.example.com"}},
+        {"destination_port": [443]}
+    ]}, "action": "block"})
+    );
+    rule.compile(&mut Compiler::default()).unwrap();
+    let predicate = rule.criteria.compiled.as_ref().unwrap();
+    for (name, ip, port, expected) in [
+        (Some("example.com"), None, 443, Outcome::Match),
+        (
+            None,
+            Some("192.0.2.1".parse().unwrap()),
+            443,
+            Outcome::Match,
+        ),
+        (Some("excluded.example.com"), None, 443, Outcome::Miss),
+        (Some("example.com"), None, 80, Outcome::Miss),
+    ] {
+        assert_eq!(predicate.evaluate(name, ip, port), expected);
+    }
+    assert!(serde_json::to_value(rule).is_err());
+}
+
+#[test]
+fn conditions_reject_missing_ambiguous_and_invalid_matchers() {
+    use serde_json::json;
+
+    let mut invalid = vec![json!({}), json!({"action": "allow"})];
+    for field in ["conditions", "masks", "mask"] {
+        for value in [
+            json!(null),
+            json!(false),
+            json!([]),
+            json!({}),
+            json!({"all": []}),
+            json!({"any": []}),
+            json!({"unknown": true}),
+            json!({"masks": []}),
+            json!({"masks": null}),
+            json!({"masks": false}),
+            json!({"masks": {"domain": ["example.com"]}}),
+            json!({"masks": ["example.com", {"destination_port": [443]}]}),
+            json!({"masks": "example.com", "destination_port": [443]}),
+            json!({"domain": ["example.com"], "action": "block"}),
+        ] {
+            invalid.push(json!({field: value}));
+        }
+        for source in ["path", "url"] {
+            invalid.push(json!({source: "list.srs", field: "example.com"}));
+            invalid.push(json!({source: "list.srs", field: null}));
+        }
+    }
+    for input in invalid {
+        assert!(
+            serde_json::from_value::<RuleConfig>(input.clone()).is_err(),
+            "{input}"
+        );
+        assert!(
+            serde_yaml::from_str::<RuleConfig>(&serde_yaml::to_string(&input).unwrap()).is_err(),
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn conditions_field_diagnostics_identify_conflicting_spellings() {
+    use serde_json::json;
+
+    for field in ["conditions", "masks", "mask"] {
+        for other in ["conditions", "masks", "mask"] {
+            if field == other {
+                continue;
+            }
+            for value in [json!("example.com"), json!(null)] {
+                let input = json!({field: "example.com", other: value});
+                let errors = [
+                    serde_json::from_value::<RuleConfig>(input.clone())
+                        .unwrap_err()
+                        .to_string(),
+                    serde_yaml::from_str::<RuleConfig>(&serde_yaml::to_string(&input).unwrap())
+                        .unwrap_err()
+                        .to_string(),
+                ];
+                for error in errors {
+                    assert!(
+                        error
+                            .contains("a rule must specify only one of conditions, masks, or mask"),
+                        "{input}: {error}"
+                    );
+                }
+            }
+        }
     }
 }
 

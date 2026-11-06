@@ -93,9 +93,11 @@ built-in names. `rule` is an alias for `rules`; either accepts one item directly
 or a nonempty list.
 
 Policy groups are referenced from `rules` or `override_rules`, preserving order,
-actions, and routing options. Source groups are referenced only with
-`masks: {rule_source_group: name}`, with the caller's action. Cross-kind references are
-errors: actions are never discarded or invented. Source groups can reference
+actions, and routing options. Source groups are referenced using a
+`{rule_source_group: name}` predicate, directly or inside `all`/`any`/`not`.
+In a policy, the predicate belongs under `conditions` or `masks`, and the policy
+supplies the action. Cross-kind references are errors: actions are never discarded
+or invented. Source groups can reference
 other source groups; cycles and excessive nesting are rejected. Policy groups
 cannot reference other policy groups.
 
@@ -120,7 +122,7 @@ cannot reference other policy groups.
 
 ### Rule source group
 
-Source groups are referenced inside a policy's `masks`, so the policy supplies
+Source groups are referenced inside a policy's `conditions` or `masks`, so the policy supplies
 the action. They may reference other source groups, but not policy groups.
 See [local rule sources](/routing/rules/#local-rule-sources) and
 [remote rule sources](/routing/remote-sources/) for formats, refresh, and caching.

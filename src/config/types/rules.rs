@@ -264,8 +264,8 @@ impl<'de> Deserialize<'de> for RuleConfig {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct RuleConfigTemp {
-            #[serde(alias = "mask")]
-            masks: serde_json::Value,
+            #[serde(alias = "masks", alias = "mask")]
+            conditions: serde_json::Value,
             #[serde(default)]
             no_resolve: bool,
             // Action fields (from RuleActionConfig)
@@ -285,13 +285,22 @@ impl<'de> Deserialize<'de> for RuleConfig {
         let mut value = serde_json::Value::deserialize(deserializer)?;
         let Some(fields) = value.as_object_mut() else {
             return Err(D::Error::custom(
-                "a policy rule requires a mapping with masks or a source",
+                "a policy rule requires a mapping with conditions, masks, or a source",
             ));
         };
+        let matching_fields = ["conditions", "masks", "mask"]
+            .iter()
+            .filter(|key| fields.contains_key(**key))
+            .count();
+        if matching_fields > 1 {
+            return Err(D::Error::custom(
+                "a rule must specify only one of conditions, masks, or mask",
+            ));
+        }
         if fields.contains_key("path") || fields.contains_key("url") {
-            if fields.contains_key("masks") || fields.contains_key("mask") {
+            if matching_fields != 0 {
                 return Err(D::Error::custom(
-                    "a flat rule source cannot also specify masks",
+                    "a flat rule source cannot also specify conditions, masks, or mask",
                 ));
             }
             let mut source = serde_json::Map::new();
@@ -309,11 +318,11 @@ impl<'de> Deserialize<'de> for RuleConfig {
                     source.insert(key.into(), value);
                 }
             }
-            fields.insert("masks".into(), serde_json::Value::Object(source));
+            fields.insert("conditions".into(), serde_json::Value::Object(source));
         }
         let temp: RuleConfigTemp = serde_json::from_value(value).map_err(D::Error::custom)?;
 
-        let expression = Expression::from_config(temp.masks).map_err(D::Error::custom)?;
+        let expression = Expression::from_config(temp.conditions).map_err(D::Error::custom)?;
         let criteria = RuleCriteria {
             description: None,
             expression,
@@ -371,7 +380,7 @@ impl<C: Serialize> Serialize for RuleRecord<C> {
             ));
         }
 
-        // Count fields: masks + action fields
+        // Count fields: conditions/masks + action fields
         let action_field_count = match &self.action {
             RuleActionRecord::Block => 1, // action
             RuleActionRecord::Allow {
@@ -398,7 +407,7 @@ impl<C: Serialize> Serialize for RuleRecord<C> {
             expression => {
                 // Direct YAML enum serialization emits tags, not predicate mappings.
                 map.serialize_entry(
-                    "masks",
+                    "conditions",
                     &serde_json::to_value(expression).map_err(serde::ser::Error::custom)?,
                 )?;
             }

@@ -137,6 +137,7 @@ fn policy_and_source_groups_are_explicit_and_roundtrip() {
     for yaml in [
         "rule_group: policies\nrules: [{masks: example.com}]",
         "rule_group: policies\nrule: {mask: example.com, action: block}",
+        "rule_group: policies\nrules: [{conditions: {masks: example.com}, action: block}]",
     ] {
         let group: RuleConfigGroup = serde_yaml::from_str(yaml).unwrap();
         assert!(group.rules.iter().next().is_some());
@@ -149,6 +150,8 @@ fn policy_and_source_groups_are_explicit_and_roundtrip() {
         "rule_source_group: files\nrule: a.srs",
         "rule_source_group: files\nrule: [{domain: [example.com]}, {path: b, format: srs}]",
         "rule_source_group: files\nrules: {all: [{domain_suffix: [example.com]}, {destination_port: [443]}]}",
+        "rule_source_group: files\nrules: [a.srs, {masks: example.com}]",
+        "rule_source_group: files\nrules: [{rule_source_group: other}]",
     ] {
         let group: RuleSourceGroup = serde_yaml::from_str(yaml).unwrap();
         assert!(!group.rules.is_empty());
@@ -158,17 +161,17 @@ fn policy_and_source_groups_are_explicit_and_roundtrip() {
     }
     for (rules, error) in [
         ("[]", "cannot be empty"),
-        ("[a.srs, {masks: example.com}]", "unknown masks field"),
+        (
+            "[a.srs, {conditions: example.com}]",
+            "unknown rule predicate",
+        ),
         (
             "[{domain: [example.com], action: block}]",
             "exactly one predicate",
         ),
         ("[{path: a.srs, action: block}]", "unknown field `action`"),
         ("[{path: a.srs, fromat: srs}]", "unknown field `fromat`"),
-        (
-            "[{rule_group: other}]",
-            "use masks: {rule_source_group: name}",
-        ),
+        ("[{rule_group: other}]", "use {rule_source_group: name}"),
     ] {
         let result = serde_yaml::from_str::<RuleSourceGroup>(&format!(
             "rule_source_group: x\nrules: {rules}"
@@ -177,6 +180,31 @@ fn policy_and_source_groups_are_explicit_and_roundtrip() {
     }
     let error = serde_yaml::from_str::<Config>("rule_set: old\npath: a.srs").unwrap_err();
     assert!(error.to_string().contains("replaced by rule_source_group"));
+}
+
+#[test]
+fn source_group_mask_leaf_round_trips_without_becoming_a_file() {
+    use crate::rules::{Compiler, Outcome};
+
+    let group: RuleSourceGroup =
+        serde_yaml::from_str("rule_source_group: addresses\nrules: {masks: example.com}").unwrap();
+    let encoded = serde_json::to_value(&group).unwrap();
+    assert_eq!(
+        encoded["rules"][0],
+        serde_json::json!({"masks": "example.com"})
+    );
+    let group: RuleSourceGroup = serde_json::from_value(encoded).unwrap();
+    let predicate = Compiler::default()
+        .compile(group.rules.into_iter().next().unwrap())
+        .unwrap();
+    assert_eq!(
+        predicate.evaluate(Some("sub.example.com"), None, 443),
+        Outcome::Match
+    );
+    assert_eq!(
+        predicate.evaluate(Some("other.example"), None, 443),
+        Outcome::Miss
+    );
 }
 
 #[test]

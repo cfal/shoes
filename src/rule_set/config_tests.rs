@@ -136,6 +136,7 @@ fn flat_sources_are_policy_shorthand_not_source_groups() {
     for value in [
         json!({"path": "list.json", "masks": {"domain": ["example.com"]}}),
         json!({"path": "list.json", "mask": "example.com"}),
+        json!({"path": "list.json", "conditions": {"domain": ["example.com"]}}),
         json!({"path": "list.json", "typo": true}),
     ] {
         assert!(serde_json::from_value::<RuleConfig>(value).is_err());
@@ -380,9 +381,15 @@ fn group_names_are_unique_and_cross_kind_references_fail() {
 
 #[test]
 fn every_rule_location_anchors_discovers_and_compiles_inline_sources() {
+    for field in ["masks", "conditions"] {
+        check_rule_locations(field);
+    }
+}
+
+fn check_rule_locations(field: &str) {
     let dir = tempfile::tempdir().unwrap();
     let rule = |name: &str| {
-        json!({"masks": {"all": [
+        json!({field: {"all": [
             {"path": format!("{name}.json")}, {"not": {"domain": ["excluded.example"]}}
         ]}})
     };
@@ -412,6 +419,7 @@ fn every_rule_location_anchors_discovers_and_compiles_inline_sources() {
             }}
         }}
     ])).unwrap();
+    configs = serde_yaml::from_str(&serde_yaml::to_string(&configs).unwrap()).unwrap();
     let names = [
         "default",
         "group",

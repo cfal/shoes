@@ -1,0 +1,15 @@
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: ["192.168.0.0/16", "10.0.0.0/8"]
+      client_chain:
+        protocol: {type: direct}
+    - conditions:
+        all:
+          - masks: [example.com, "192.0.2.0/24"]
+          - destination_port: [80, 443]
+          - not: {domain: [private.example.com]}
+      client_chain:
+        protocol: {type: direct}
+    - conditions: {any_destination: true}
+      action: block
