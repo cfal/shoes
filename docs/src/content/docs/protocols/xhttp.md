@@ -135,7 +135,10 @@ connections, at most 64 H1 connections, and a 60-second idle timeout.
   either client bound backpressures the local writer. Pool limits may constrain
   concurrency further. H1 keeps one ACK-gated POST on a reusable upload connection,
   plus the download connection; it does not open opportunistic upload connections
-  or use raw HTTP/1 pipelining. Use H2/H3 for high-latency packet-up throughput.
+  or use raw HTTP/1 pipelining. Without an application byte cap it collects one
+  bounded successor POST while waiting for the ACK. Explicit global or session
+  byte caps retain ACK-gated collection so lookahead cannot occupy memory needed
+  by download data preceding the ACK. Use H2/H3 for pipelined packet-up throughput.
   Unsent bytes remain subject to any configured byte budgets;
   successfully transmitted bodies are not retained while awaiting ACKs.
   Outstanding POST payload sizes also count against a separate logical credit

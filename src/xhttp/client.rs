@@ -588,6 +588,9 @@ impl Client {
                 .sc_max_each_post_bytes
                 .bounds((1_000_000, 1_000_000), false)?,
         ) as usize;
+        // With a shared byte cap, staging can consume space needed by a download before its ACK.
+        let h1_lookahead =
+            self.version == XhttpVersion::H1 && self.config.limits.session_byte_limit().is_none();
         let concurrency = if self.version == XhttpVersion::H1 {
             1
         } else {
@@ -605,8 +608,9 @@ impl Client {
         let mut sequence = 0u64;
         let mut next_post_at = tokio::time::Instant::now();
         loop {
-            while inflight.len() >= concurrency
-                || sequence - window.next >= self.config.packet_pipeline_depth as u64
+            while !h1_lookahead
+                && (inflight.len() >= concurrency
+                    || sequence - window.next >= self.config.packet_pipeline_depth as u64)
             {
                 idle_lane.get_or_insert(window.acknowledge(inflight.next().await.unwrap()?));
             }
@@ -653,18 +657,33 @@ impl Client {
                         }
                         event = match reader.receiver.try_recv() {
                             Ok(event) => Some(event),
-                            Err(_) if tokio::time::Instant::now() < next_post_at => loop {
-                                tokio::select! {
-                                    biased;
-                                    _ = tokio::time::sleep_until(next_post_at) => break None,
-                                    done = inflight.next(), if !inflight.is_empty() => {
-                                        idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
+                            Err(_)
+                                if tokio::time::Instant::now() < next_post_at
+                                    || h1_lookahead && !inflight.is_empty() =>
+                            {
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        done = inflight.next(), if !inflight.is_empty() => {
+                                            idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
+                                            if tokio::time::Instant::now() >= next_post_at {
+                                                break None;
+                                            }
+                                        }
+                                        _ = tokio::time::sleep_until(next_post_at),
+                                            if !h1_lookahead || inflight.is_empty() => break None,
+                                        event = reader.receiver.recv() => break event,
                                     }
-                                    event = reader.receiver.recv() => break event,
                                 }
-                            },
+                            }
                             Err(_) => None,
                         };
+                    }
+                    // H1 stages one bounded successor while its existing lane awaits the ACK.
+                    if self.version == XhttpVersion::H1 {
+                        while let Some(result) = inflight.next().await {
+                            idle_lane.get_or_insert(window.acknowledge(result?));
+                        }
                     }
                     loop {
                         tokio::select! {
