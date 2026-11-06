@@ -14,7 +14,7 @@ use std::{
     future::Future,
     io::{self, Write},
     net::{IpAddr, SocketAddr},
-    process::Command,
+    process::{Command, Stdio},
     time::Duration,
 };
 use tokio::{
@@ -50,6 +50,26 @@ fn wg(args: &[&str]) -> io::Result<String> {
         std::env::var_os("SHOES_TEST_WG_BIN").unwrap_or_else(|| "wg".into()),
         args,
     )
+}
+
+fn wg_with_input(args: &[&str], input: &[u8]) -> io::Result<()> {
+    // Uses wg-quick's pipe pattern without requiring access to temporary files.
+    let mut child =
+        Command::new(std::env::var_os("SHOES_TEST_WG_BIN").unwrap_or_else(|| "wg".into()))
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+    let written = child.stdin.take().unwrap().write_all(input);
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "wg {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    written
 }
 
 fn isolated_test(name: &str, cases: impl Future<Output = io::Result<()>>) -> io::Result<()> {
@@ -160,22 +180,21 @@ impl KernelPeer {
         } = config;
         run("ip", &["link", "add", name, "type", "wireguard"])?;
         let peer = Self { name };
-        let mut file = tempfile::NamedTempFile::new()?;
+        let mut contents = Vec::new();
         writeln!(
-            file,
+            contents,
             "[Interface]\nPrivateKey={}\n[Peer]\nPublicKey={}\nAllowedIPs={}",
             config::key(local_key_seed),
             config::public(peer_key_seed),
             routes.join(",")
         )?;
         if psk {
-            writeln!(file, "PresharedKey={}", config::key(43))?;
+            writeln!(contents, "PresharedKey={}", config::key(43))?;
         }
         if let Some(endpoint) = endpoint {
-            writeln!(file, "Endpoint={endpoint}")?;
+            writeln!(contents, "Endpoint={endpoint}")?;
         }
-        file.flush()?;
-        wg(&["setconf", name, file.path().to_str().unwrap()])?;
+        wg_with_input(&["setconf", name, "/dev/stdin"], &contents)?;
         run("ip", &["link", "set", name, "mtu", &mtu.to_string(), "up"])?;
         for (family, address, route) in [
             ("-4", addresses[0], routes[0]),
@@ -208,18 +227,17 @@ impl KernelPeer {
     }
 
     fn set_preshared_key(&self, peer_key_seed: u8, psk_seed: u8) -> io::Result<()> {
-        let mut file = tempfile::NamedTempFile::new()?;
-        writeln!(file, "{}", config::key(psk_seed))?;
-        file.flush()?;
-        wg(&[
-            "set",
-            self.name,
-            "peer",
-            &config::public(peer_key_seed),
-            "preshared-key",
-            file.path().to_str().unwrap(),
-        ])?;
-        Ok(())
+        wg_with_input(
+            &[
+                "set",
+                self.name,
+                "peer",
+                &config::public(peer_key_seed),
+                "preshared-key",
+                "/dev/stdin",
+            ],
+            format!("{}\n", config::key(psk_seed)).as_bytes(),
+        )
     }
 
     fn counters(&self) -> io::Result<[u64; 2]> {
