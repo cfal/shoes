@@ -545,7 +545,7 @@ impl ClientProxySelector {
             if let Some(hostname) = hostname {
                 notes.event(Phase::Routing, format_args!("sniff hint {hostname}"));
             }
-            if target.traffic.network == crate::rules::Network::Udp {
+            if self.has_protocol_rules && target.traffic.network == crate::rules::Network::Udp {
                 notes.event(
                     Phase::Routing,
                     format_args!(

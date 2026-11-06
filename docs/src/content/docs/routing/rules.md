@@ -65,7 +65,8 @@ introduce head-of-line blocking under loss. Traffic must enter shoes for these r
 to apply. This is not a complete WebRTC blocking or IP-leak prevention policy.
 
 Connection metadata exposes the detected label as `sniffProtocol`, independently
-of the inbound proxy `type`; connection notes record the label or `unknown`.
+of the inbound proxy `type`. When UDP classification is enabled, connection notes
+record the label or `unknown`; no protocol note is emitted when classification is disabled.
 
 <a id="tls-sni-routing"></a>
 

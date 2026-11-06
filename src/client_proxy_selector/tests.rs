@@ -22,6 +22,108 @@ fn prepared(selector: &ClientProxySelector, location: &str) -> PreparedDestinati
 }
 
 #[tokio::test]
+async fn network_conditions_match_tcp_and_transport_alternatives() {
+    use crate::rules::Expression;
+    let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+    for (condition, tcp_allowed, udp_allowed) in [
+        (serde_json::json!({"network": "tcp"}), true, false),
+        (serde_json::json!({"network": "udp"}), false, true),
+        (serde_json::json!({"network": ["tcp", "udp"]}), true, true),
+    ] {
+        let mut rule = allow_rule(vec!["0.0.0.0/0"]);
+        rule.predicate = Compiler::default()
+            .compile(Expression::from_config(condition).unwrap())
+            .unwrap();
+        let selector = ClientProxySelector::with_options(vec![rule], true);
+        assert!(!selector.is_cache_enabled());
+        let tcp = selector
+            .judge_prepared(
+                prepared(&selector, "unresolved.example:443"),
+                None,
+                &resolver,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            matches!(tcp.decision, ConnectDecision::Allow { .. }),
+            tcp_allowed
+        );
+        let mut target = prepared(&selector, "unresolved.example:443");
+        target.traffic = Traffic::UDP;
+        let udp = selector
+            .judge_prepared(target, None, &resolver)
+            .await
+            .unwrap();
+        assert_eq!(
+            matches!(udp.decision, ConnectDecision::Allow { .. }),
+            udp_allowed
+        );
+    }
+}
+
+#[tokio::test]
+async fn udp_protocol_notes_require_classification() {
+    use crate::rules::{Expression, Network, Protocol};
+    let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+    let registry = FlowRegistry::new(true);
+    for protocol_rules in [false, true] {
+        let condition = if protocol_rules {
+            Expression::Protocol(vec![Protocol::Stun, Protocol::Dtls])
+        } else {
+            Expression::Network(vec![Network::Udp])
+        };
+        let predicate = Compiler::default().compile(condition).unwrap();
+        let selector = ClientProxySelector::new(vec![ConnectRule::compiled(
+            predicate,
+            false,
+            ConnectAction::Block,
+        )]);
+        for traffic in [
+            Traffic::TCP,
+            Traffic::UDP,
+            Traffic {
+                network: Network::Udp,
+                protocol: Some(Protocol::Stun),
+            },
+            Traffic {
+                network: Network::Udp,
+                protocol: Some(Protocol::Dtls),
+            },
+        ] {
+            let notes = registry.start_notes().unwrap();
+            let mut target = prepared(&selector, "unresolved.example:443");
+            target.traffic = traffic;
+            selector
+                .judge_prepared_with_notes(target, None, &resolver, Some(&notes))
+                .await
+                .unwrap();
+            let snapshot = serde_json::to_value(notes.snapshot()).unwrap();
+            let messages: Vec<_> = snapshot
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|note| note["text"].as_str())
+                .filter(|text| text.starts_with("UDP protocol "))
+                .collect();
+            if protocol_rules && traffic.network == Network::Udp {
+                assert_eq!(
+                    messages,
+                    [format!(
+                        "UDP protocol {}",
+                        traffic.protocol.map_or("unknown", Protocol::as_str)
+                    )]
+                );
+            } else {
+                assert!(
+                    messages.is_empty(),
+                    "classification was not enabled for {traffic:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn traffic_rules_do_not_share_destination_cache_or_resolve_on_network_miss() {
     use crate::rules::{Expression, Network, Protocol};
     let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
