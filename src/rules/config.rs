@@ -182,18 +182,18 @@ mod tests {
     fn traffic_conditions_parse_compose_and_round_trip() {
         use crate::rules::{Compiler, Network, Outcome, Protocol, Traffic};
         for field in ["conditions", "masks"] {
-            let mut rule: crate::config::RuleConfig = serde_json::from_value(json!({
+            let rule: crate::config::RuleConfig = serde_json::from_value(json!({
                 field: {"all": [{"network": "udp"}, {"protocol": ["stun", "dtls"]}]}
             }))
             .unwrap();
             let encoded = serde_json::to_value(&rule).unwrap();
-            let restored: crate::config::RuleConfig = serde_json::from_value(encoded).unwrap();
+            let mut restored: crate::config::RuleConfig = serde_json::from_value(encoded).unwrap();
             assert_eq!(
                 serde_json::to_value(&rule).unwrap(),
-                serde_json::to_value(restored).unwrap()
+                serde_json::to_value(&restored).unwrap()
             );
-            rule.compile(&mut Compiler::default()).unwrap();
-            let predicate = rule.criteria.compiled.unwrap();
+            restored.compile(&mut Compiler::default()).unwrap();
+            let predicate = restored.criteria.compiled.unwrap();
             assert!(predicate.dependencies.network && predicate.dependencies.protocol);
             for (traffic, expected) in [
                 (Traffic::TCP, Outcome::Miss),

@@ -115,6 +115,11 @@ async fn fake_dns_udp_modes() {
                     let magic = NetLocation::from_str(UOT_V2_MAGIC_ADDRESS, Some(0)).unwrap();
                     let mut header = crate::socks_handler::write_location_to_vec(&magic).unwrap();
                     header.extend(fixture.uot_header(fixed));
+                    let eager =
+                        fixed && id == 2 && matches!(case, UdpCase::Dtls | UdpCase::StunHostname);
+                    if eager {
+                        header.extend(fixture.request(mode));
+                    }
                     peer.write_all(&Frame::data(id, Bytes::from(header)).encode())
                         .await
                         .unwrap();
@@ -129,11 +134,13 @@ async fn fake_dns_udp_modes() {
                     assert_eq!(&status, &Frame::control(Command::SynAck, id).encode()[..]);
                     // The second stream proves the session survives; DNS supports repeated queries.
                     if id == 2 || case == UdpCase::Dns {
-                        peer.write_all(
-                            &Frame::data(id, Bytes::from(fixture.request(mode))).encode(),
-                        )
-                        .await
-                        .unwrap();
+                        if !eager {
+                            peer.write_all(
+                                &Frame::data(id, Bytes::from(fixture.request(mode))).encode(),
+                            )
+                            .await
+                            .unwrap();
+                        }
                         let mut reply = Vec::new();
                         loop {
                             peer.read_exact(&mut status).await.unwrap();
@@ -479,7 +486,11 @@ async fn udp_failures_without_sniffing_distinguish_policy_blocks_from_dial_error
 
 #[tokio::test(start_paused = true)]
 async fn udp_optimistic_failures_wait_for_fin_or_close_the_session() {
-    for failure in ["block", "dial", "read"] {
+    for (failure, kind) in [
+        ("block", io::ErrorKind::ConnectionRefused),
+        ("dial", io::ErrorKind::PermissionDenied),
+        ("read", io::ErrorKind::UnexpectedEof),
+    ] {
         for drain in [true, false] {
             let (transport, mut peer) = duplex(8192);
             let session = AnyTlsSession::new_server_with_initial_data(
@@ -534,34 +545,33 @@ async fn udp_optimistic_failures_wait_for_fin_or_close_the_session() {
                 !forwarding.is_finished(),
                 "FIN must wait for capacity: {failure}"
             );
+            let finishing = tokio::time::Instant::now();
+            if drain {
+                assert_eq!(session.outgoing_rx.lock().await.try_recv().unwrap().0, 2);
+            }
+            let error = forwarding.await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), kind, "{failure}: {error}");
+            assert_eq!(session.is_closed(), !drain);
+            assert_eq!(
+                finishing.elapsed(),
+                if drain {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(5)
+                }
+            );
             if drain {
                 let mut outgoing = session.outgoing_rx.lock().await;
                 loop {
-                    let (id, data) = outgoing.recv().await.unwrap();
+                    let (id, data) = outgoing.try_recv().unwrap();
                     if id == 1 {
                         assert!(data.is_empty());
                         break;
                     }
                     assert_eq!(id, 2);
                 }
-            } else {
-                tokio::time::advance(CONTROL_FRAME_TIMEOUT).await;
-            }
-            let error = forwarding.await.unwrap().unwrap_err();
-            assert_eq!(
-                error.kind(),
-                if failure == "read" {
-                    io::ErrorKind::UnexpectedEof
-                } else {
-                    io::ErrorKind::ConnectionRefused
-                }
-            );
-            assert_eq!(session.is_closed(), !drain);
-            if drain {
-                assert!(
-                    session.outgoing_rx.lock().await.try_recv().is_err(),
-                    "duplicate FIN"
-                );
+                assert!(outgoing.try_recv().is_err(), "duplicate FIN");
+                drop(outgoing);
                 session.send_synack(2, None).await.unwrap();
                 assert_eq!(
                     read_frame(&mut peer).await.encode(),

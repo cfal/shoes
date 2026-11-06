@@ -214,6 +214,75 @@ async fn traffic_rules_do_not_share_destination_cache_or_resolve_on_network_miss
 }
 
 #[tokio::test]
+async fn protocol_match_survives_dns_reevaluation_and_misses_skip_resolution() {
+    use crate::rules::{Expression, Network, Protocol};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug, Default)]
+    struct Lookup(AtomicUsize);
+    impl Resolver for Lookup {
+        fn resolve_location(&self, location: &NetLocation) -> crate::resolver::ResolveFuture {
+            assert_eq!(location.to_string(), "unresolved.example:443");
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(vec!["192.0.2.9:443".parse().unwrap()]) })
+        }
+    }
+    let mut rule = allow_rule(vec!["0.0.0.0/0"]);
+    rule.predicate = Compiler::default()
+        .compile(Expression::All(vec![
+            Expression::IpCidr(vec!["192.0.2.0/24".into()]),
+            Expression::Network(vec![Network::Udp]),
+            Expression::Protocol(vec![Protocol::Stun]),
+        ]))
+        .unwrap();
+    let selector = ClientProxySelector::with_options(vec![rule], true);
+    for (traffic, allowed) in [
+        (Traffic::TCP, false),
+        (Traffic::UDP, false),
+        (
+            Traffic {
+                network: Network::Udp,
+                protocol: Some(Protocol::Dtls),
+            },
+            false,
+        ),
+        (
+            Traffic {
+                network: Network::Udp,
+                protocol: Some(Protocol::Stun),
+            },
+            true,
+        ),
+    ] {
+        let lookup = Arc::new(Lookup::default());
+        let resolver: Arc<dyn Resolver> = lookup.clone();
+        let mut target = prepared(&selector, "unresolved.example:443");
+        target.traffic = traffic;
+        let routed = selector
+            .judge_prepared(target, None, &resolver)
+            .await
+            .unwrap();
+        assert_eq!(lookup.0.load(Ordering::Relaxed), usize::from(allowed));
+        assert_eq!(
+            matches!(routed.decision, ConnectDecision::Allow { .. }),
+            allowed
+        );
+        if let ConnectDecision::Allow {
+            remote_location, ..
+        } = routed.decision
+        {
+            assert_eq!(
+                remote_location.location().to_string(),
+                "unresolved.example:443"
+            );
+            assert_eq!(
+                remote_location.resolved_addr(),
+                Some("192.0.2.9:443".parse().unwrap())
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn same_policy_can_avoid_dns_but_later_policy_cannot() {
     let no_dns: Arc<dyn Resolver> = Arc::new(NoDns);
     let location = NetLocation::from_str("allowed.example:443", None).unwrap();

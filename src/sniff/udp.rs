@@ -111,7 +111,7 @@ pub(crate) mod tests {
         packet[3] = 8;
         packet.extend_from_slice(&[0x80, 0xff, 0, 1, 42, 255, 255, 255]);
         assert_eq!(classify(&packet), Some(Protocol::Stun));
-        for (index, value) in [(0, 0x40), (4, 0), (3, 7), (23, 5)] {
+        for (index, value) in [(0, 0x40), (0, 0x80), (4, 0), (3, 7), (23, 5)] {
             let mut invalid = packet.clone();
             invalid[index] = value;
             assert_eq!(classify(&invalid), None);

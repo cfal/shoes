@@ -226,7 +226,7 @@ async fn udp_sniff_flushes_buffered_success_before_waiting_for_a_packet() {
             target: fixture.target.clone(),
         });
         let (server, mut peer) = tokio::io::duplex(8192);
-        let _handler = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(process_stream(
+        let forwarding = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(process_stream(
             server,
             handler,
             fixture.resolver.clone(),
@@ -238,8 +238,65 @@ async fn udp_sniff_flushes_buffered_success_before_waiting_for_a_packet() {
             .await
             .unwrap();
         fixture.read_reply(&mut peer, PacketMode::Fixed).await;
+        peer.shutdown().await.unwrap();
+        forwarding.await.unwrap().unwrap();
         while let Some(result) = tasks.join_next().await {
             result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn udp_sniff_failures_close_after_buffered_success_without_another_response() {
+    use crate::routing::ingress::tests::{PacketMode, protocol_failure_selector};
+    use tokio::io::AsyncReadExt;
+    timeout(Duration::from_secs(5), async {
+        for (failure, kind, message) in [
+            (
+                "block",
+                io::ErrorKind::ConnectionRefused,
+                "Blocked bidirectional udp forward",
+            ),
+            (
+                "dial",
+                io::ErrorKind::PermissionDenied,
+                "test UDP dial failure",
+            ),
+            ("read", io::ErrorKind::UnexpectedEof, ""),
+        ] {
+            let target = NetLocation::from_str("192.0.2.1:443", None).unwrap();
+            let selector = protocol_failure_selector(failure == "block");
+            let handler = Arc::new(BufferedUdpHandler {
+                selector,
+                target: target.clone(),
+            });
+            let (server, mut peer) = tokio::io::duplex(8192);
+            let forwarding = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                process_stream(server, handler, Arc::new(crate::resolver::NativeResolver)),
+            ));
+            let mut status = [0; 5];
+            peer.read_exact(&mut status).await.unwrap();
+            assert_eq!(&status, b"ready");
+            if failure == "read" {
+                peer.write_all(&[0, 20, 0]).await.unwrap();
+                peer.shutdown().await.unwrap();
+            } else {
+                peer.write_all(
+                    &PacketMode::Fixed.packet(&target, &crate::sniff::udp::tests::stun_packet()),
+                )
+                .await
+                .unwrap();
+            }
+            let mut extra = Vec::new();
+            peer.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty(), "second response after success: {failure}");
+            let error = forwarding.await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), kind, "{failure}: {error}");
+            if failure != "read" {
+                assert_eq!(error.to_string(), message);
+            }
         }
     })
     .await
@@ -1216,6 +1273,21 @@ impl SocketConnector for PendingConnector {
     fn bind_interface(&self) -> Option<&str> {
         None
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fixed_udp_protocol_read_errors_do_not_fall_back_to_routing() {
+    let handler = Arc::new(UdpHandler {
+        remote: NetLocation::from_str("192.0.2.1:443", None).unwrap(),
+        selector: crate::routing::ingress::tests::protocol_failure_selector(false),
+        marker: Arc::new(()),
+        shutdowns: Arc::new(AtomicUsize::new(0)),
+    });
+    let (stream, _peer) = tokio::io::duplex(64);
+    let error = process_stream(stream, handler, Arc::new(PendingResolver))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
 }
 
 #[tokio::test(start_paused = true)]

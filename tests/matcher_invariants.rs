@@ -1,5 +1,90 @@
 use shoes::rules::{Compiler, Expression, Outcome};
 
+#[test]
+fn traffic_sets_and_composites_match_membership_with_and_without_traffic() {
+    use shoes::rules::{Network, Protocol, Traffic};
+    for networks in [
+        vec![],
+        vec![Network::Tcp],
+        vec![Network::Udp],
+        vec![Network::Tcp, Network::Udp, Network::Tcp],
+    ] {
+        for protocols in [
+            vec![],
+            vec![Protocol::Stun],
+            vec![Protocol::Dtls],
+            vec![Protocol::Stun, Protocol::Dtls, Protocol::Stun],
+        ] {
+            let network = Expression::Network(networks.clone());
+            let protocol = Expression::Protocol(protocols.clone());
+            for (expression, union, inverted) in [
+                (
+                    Expression::All(vec![network.clone(), protocol.clone()]),
+                    false,
+                    false,
+                ),
+                (
+                    Expression::Any(vec![network.clone(), protocol.clone()]),
+                    true,
+                    false,
+                ),
+                (
+                    Expression::Not(Box::new(Expression::Any(vec![network, protocol]))),
+                    true,
+                    true,
+                ),
+            ] {
+                let mut compiler = Compiler::default();
+                let group = compiler.compile(expression).unwrap();
+                compiler.groups.insert("traffic".into(), group);
+                let predicate = compiler
+                    .compile(Expression::RuleSourceGroup("traffic".into()))
+                    .unwrap();
+                if !networks.is_empty() && !protocols.is_empty() {
+                    assert!(predicate.dependencies.network);
+                    assert!(predicate.dependencies.protocol);
+                }
+                for traffic in [
+                    None,
+                    Some(Traffic::TCP),
+                    Some(Traffic::UDP),
+                    Some(Traffic {
+                        network: Network::Udp,
+                        protocol: Some(Protocol::Stun),
+                    }),
+                    Some(Traffic {
+                        network: Network::Udp,
+                        protocol: Some(Protocol::Dtls),
+                    }),
+                ] {
+                    let network_matches = traffic.is_some_and(|t| networks.contains(&t.network));
+                    let protocol_matches = traffic
+                        .and_then(|t| t.protocol)
+                        .is_some_and(|p| protocols.contains(&p));
+                    let matches = if union {
+                        network_matches || protocol_matches
+                    } else {
+                        network_matches && protocol_matches
+                    };
+                    let expected = if matches != inverted {
+                        Outcome::Match
+                    } else {
+                        Outcome::Miss
+                    };
+                    assert_eq!(
+                        predicate.evaluate_with_traffic(None, None, 443, traffic),
+                        expected,
+                        "networks={networks:?}, protocols={protocols:?}, union={union}, inverted={inverted}, traffic={traffic:?}"
+                    );
+                    if traffic.is_none() {
+                        assert_eq!(predicate.evaluate(None, None, 443), expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Fixed generator and seed make failures independent of rand crate versions.
 fn next_port(state: &mut u64) -> u16 {
     *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);

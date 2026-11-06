@@ -142,7 +142,9 @@ mod tests {
             let (mut peer, server) = tokio::io::duplex(1024);
             let mut stream = PeekMessageStream::new(VlessMessageStream::new(server));
             peer.write_all(&wire[..split]).await.unwrap();
+            let started = tokio::time::Instant::now();
             assert_eq!(stream.peek().await.unwrap(), None);
+            assert_eq!(started.elapsed(), std::time::Duration::from_millis(300));
             peer.write_all(&wire[split..]).await.unwrap();
             assert_eq!(read(&mut stream).await, packet);
             assert_eq!(read(&mut stream).await, [1, 2, 3]);
@@ -200,6 +202,7 @@ mod tests {
             peer.write_all(&prefix).await.unwrap();
             drop(peer);
             let mut stream = PeekMessageStream::new(VlessMessageStream::new(server));
+            assert!(stream.read_message_eof_on_empty());
             assert_eq!(
                 stream.peek().await.unwrap_err().kind(),
                 io::ErrorKind::UnexpectedEof

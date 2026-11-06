@@ -655,7 +655,7 @@ mod tests {
                     let mut bytes = StreamRequest::udp(fixture.target.clone(), packet_addr)
                         .encode()
                         .unwrap();
-                    let response_gated = !packet_addr && case.classified();
+                    let response_gated = !packet_addr && case == UdpCase::Stun;
                     if !response_gated {
                         bytes.extend(fixture.request(mode));
                     }
@@ -740,7 +740,11 @@ mod tests {
                 peer.flush().await.unwrap();
                 assert_eq!(
                     handler.await.unwrap().unwrap_err().kind(),
-                    io::ErrorKind::ConnectionRefused
+                    if blocked {
+                        io::ErrorKind::ConnectionRefused
+                    } else {
+                        io::ErrorKind::PermissionDenied
+                    }
                 );
                 let mut extra = Vec::new();
                 let _ = peer.read_to_end(&mut extra).await;
