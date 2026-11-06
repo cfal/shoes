@@ -5,6 +5,68 @@ description: shoes rules system configuration.
 
 Rules determine how incoming connections are routed.
 
+### UDP Protocol Routing
+
+`network` matches the logical transport (`tcp` or `udp`), not the outer proxy
+carrier. `protocol` matches `stun` or `dtls` in the first inner UDP datagram.
+Both accept a scalar or list of alternatives; unknown values reject the config.
+They compose with other predicates through `all`, `any`, and `not`.
+
+```yaml
+rules:
+  - conditions:
+      all:
+        - network: udp
+        - protocol: [stun, dtls]
+    client_chain: calls
+  - conditions: {any_destination: true}
+    client_chain: main
+```
+
+The named groups must exist. See the complete
+[UDP protocol routing example](/examples/udp_protocol_routing/).
+Classification runs automatically when any rule on the listener contains a `protocol`
+predicate, including inside rule source groups. It does not require `sniff: true`,
+hostname rules, an IP-literal target, or a standard STUN port. The existing `sniff`
+setting remains specific to TCP hostname inspection. Local DNS interception still
+takes precedence over routing rules.
+
+The route is selected once per UDP flow/destination. Subsequent DTLS, media, or
+TURN ChannelData on that flow retains the selected outbound; packets are not
+individually rerouted. This applies to TUN/WireGuard, multi-destination UDP and
+XUDP, QUIC proxy associations, and fixed-target UDP-over-stream modes.
+Fixed-target modes wait at most 300 ms for one complete datagram (up to 65,535
+bytes); partial framing remains buffered for forwarding. Required success replies
+are sent before waiting, so a later block or setup failure closes the stream
+instead of sending a second status. Other UDP paths already have the first packet
+and do not wait for additional packets. Captured datagrams are replayed unchanged.
+
+Unknown, malformed, or timed-out packets have no protocol label and follow ordinary
+ordered rules. `protocol: stun` then misses; `not: {protocol: stun}` matches, including
+on TCP. Use `network: udp` to restrict such negation. Read errors/EOF terminate the
+stream. Protocol classification never changes the destination. Network/protocol
+rules bypass destination-only decision caches; active flows remain pinned.
+
+Detection follows the sing-box
+[STUN](https://github.com/SagerNet/sing-box/blob/0af5fae7c47d09682e4e53a077a58d9d463f524f/common/sniff/stun.go)
+and [DTLS](https://github.com/SagerNet/sing-box/blob/0af5fae7c47d09682e4e53a077a58d9d463f524f/common/sniff/dtls.go)
+sniffers with stricter structural checks:
+STUN requires the modern magic cookie, valid type bits, exact aligned message
+length, and bounded padded attributes. Classic DTLS records require recognized
+content types, version `FE FF` or `FE FD`, and complete lengths, including concatenated
+records. DTLS CID records and DTLS 1.3 encrypted unified headers are not independently
+classified; initial DTLS 1.3 plaintext handshakes can still match classic framing.
+
+These are spoofable protocol hints, not proof of WebRTC or authenticated identity.
+Encrypted TURN-over-TLS, unrelated peer flows, and flows observed midstream can
+remain unclassified. Separate STUN/peer destinations do not gain shared NAT mappings
+or exit affinity. For calls, prefer one nearby UDP-capable exit; a TCP carrier can
+introduce head-of-line blocking under loss. Traffic must enter shoes for these rules
+to apply. This is not a complete WebRTC blocking or IP-leak prevention policy.
+
+Connection metadata exposes the detected label as `sniffProtocol`, independently
+of the inbound proxy `type`; connection notes record the label or `unknown`.
+
 <a id="tls-sni-routing"></a>
 
 ### TCP Hostname Sniffing
@@ -101,8 +163,8 @@ rules:
 
 Both outer forms use the same matcher, including first-match order, DNS behavior,
 and source discovery. `action`, `client_chain`, `override_address`, and `no_resolve`
-remain rule-level options, not predicates. This syntax does not add `network` or
-application `protocol` matching.
+remain rule-level options, not predicates. `network` and application `protocol`
+are matching predicates, not rule-level options.
 
 Config serialization emits plain address expressions as top-level `masks`, preserving
 scalar/list shape. Other expressions serialize under `conditions`, with address
@@ -203,7 +265,7 @@ masks:
 - `allow-all-direct` - Allow all connections, direct routing
 - `block-all` - Block all connections
 
-### Typed Destination Predicates
+### Typed Predicates
 
 `conditions` and `masks` accept legacy strings, typed predicates, file sources, and action-free
 group references. A list combines its entries with OR. Predicate objects contain
@@ -228,7 +290,7 @@ rules:
 Leaves: `masks` (address shorthand), `domain` (exact), `domain_suffix` (apex and descendants), `subdomains`
 (descendants only), `domain_pattern` (`*` matches one label), `domain_keyword`,
 `domain_regex`, `ip_cidr`, `destination_port`, `destination_port_range`
-(inclusive `"8000:9000"`), and `any_destination: true`. Native domain literals
+(inclusive `"8000:9000"`), `network`, `protocol`, and `any_destination: true`. Native domain literals
 and keywords are case-insensitive. Regexes are unanchored and case-sensitive
 unless they enable case folding; backreferences, lookaround and non-ASCII
 patterns are unsupported. Typed ports are 1-65535. Empty sets match nothing;
