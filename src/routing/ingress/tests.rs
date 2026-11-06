@@ -4,13 +4,14 @@ use crate::client_proxy_selector::{ConnectAction, ConnectRule};
 use crate::dns::DnsContext;
 use crate::dns::fake_ip::FakeIpOptions;
 use crate::resolver::{DnsExchangeFuture, ResolveFuture};
+use crate::rules::{Compiler, Expression, Network, Protocol};
 use hickory_resolver::proto::op::{Message, Query, ResponseCode};
 use hickory_resolver::proto::rr::{Name, RecordType};
 use std::pin::Pin;
 use tokio::io::ReadBuf;
 
 #[derive(Debug)]
-struct FailedUdpConnector;
+struct FailedUdpConnector(io::ErrorKind);
 
 #[async_trait::async_trait]
 impl crate::tcp::socket_connector::SocketConnector for FailedUdpConnector {
@@ -27,10 +28,7 @@ impl crate::tcp::socket_connector::SocketConnector for FailedUdpConnector {
         _: &Arc<dyn Resolver>,
         _: crate::address::ResolvedLocation,
     ) -> io::Result<Box<dyn AsyncMessageStream>> {
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "test UDP dial failure",
-        ))
+        Err(io::Error::new(self.0, "test UDP dial failure"))
     }
 
     fn bind_interface(&self) -> Option<&str> {
@@ -39,21 +37,31 @@ impl crate::tcp::socket_connector::SocketConnector for FailedUdpConnector {
 }
 
 pub(crate) fn protocol_failure_selector(blocked: bool) -> Arc<ClientProxySelector> {
-    use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
-    let predicate = crate::rules::Compiler::default()
-        .compile(crate::rules::Expression::Protocol(vec![if blocked {
-            crate::rules::Protocol::Dtls
+    udp_failure_selector(
+        Expression::Protocol(vec![if blocked {
+            Protocol::Dtls
         } else {
-            crate::rules::Protocol::Stun
-        }]))
-        .unwrap();
+            Protocol::Stun
+        }]),
+        io::ErrorKind::ConnectionRefused,
+    )
+}
+
+pub(crate) fn udp_failure_selector(
+    condition: Expression,
+    dial_error: io::ErrorKind,
+) -> Arc<ClientProxySelector> {
+    use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
+    let predicate = Compiler::default().compile(condition).unwrap();
     Arc::new(ClientProxySelector::new(vec![ConnectRule::compiled(
         predicate,
         false,
         ConnectAction::new_allow(
             None,
             ClientChainGroup::new(vec![ClientProxyChain::new(
-                vec![InitialHopEntry::Direct(Arc::new(FailedUdpConnector))],
+                vec![InitialHopEntry::Direct(Arc::new(FailedUdpConnector(
+                    dial_error,
+                )))],
                 vec![],
             )]),
         ),
@@ -170,17 +178,19 @@ impl UdpFixture {
                 socket.send_to(&bytes[..len], peer).await.unwrap();
             });
             let mut conditions = vec![
-                serde_json::json!({"domain": ["restored.example"]}),
-                serde_json::json!({"network": "udp"}),
+                Expression::Domain(vec!["restored.example".into()]),
+                Expression::Network(vec![Network::Udp]),
             ];
             if case.classified() {
-                conditions.push(serde_json::json!({"protocol": if case == UdpCase::Dtls { "dtls" } else { "stun" }}));
+                let protocol = if case == UdpCase::Dtls {
+                    Protocol::Dtls
+                } else {
+                    Protocol::Stun
+                };
+                conditions.push(Expression::Protocol(vec![protocol]));
             }
-            let predicate = crate::rules::Compiler::default()
-                .compile(
-                    crate::rules::Expression::from_config(serde_json::json!({"all": conditions}))
-                        .unwrap(),
-                )
+            let predicate = Compiler::default()
+                .compile(Expression::All(conditions))
                 .unwrap();
             rules.push(ConnectRule::compiled(
                 predicate,

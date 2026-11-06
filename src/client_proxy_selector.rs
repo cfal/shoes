@@ -225,7 +225,7 @@ const CACHE_RULE_THRESHOLD: usize = 16;
 pub struct ClientProxySelector {
     rules: Vec<ConnectRule>,
     /// LRU cache for routing decisions. Speeds up repeated lookups for the same destination.
-    /// None when caching is disabled; DNS-dependent and sniffed routes bypass it.
+    /// Traffic-dependent rules disable it; DNS-dependent and sniffed routes bypass it.
     cache: Option<RoutingCache>,
     has_ip_rules: bool,
     has_hostname_rules: bool,
@@ -309,7 +309,8 @@ impl ClientProxySelector {
         Self::with_options_and_cache_size(rules, force_cache, RoutingCache::DEFAULT_CAPACITY)
     }
 
-    /// A zero capacity disables caching. DNS-dependent and sniffed decisions always bypass it.
+    /// A zero capacity or traffic-dependent rules disable caching.
+    /// DNS-dependent and sniffed decisions always bypass it.
     pub fn with_options_and_cache_size(
         rules: Vec<ConnectRule>,
         force_cache: bool,

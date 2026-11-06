@@ -415,6 +415,69 @@ async fn sniff_failures_send_one_synack_then_fin() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn udp_failures_without_sniffing_distinguish_policy_blocks_from_dial_errors() {
+    use crate::rules::Expression;
+    for (condition, kind, message) in [
+        (
+            Expression::Never,
+            io::ErrorKind::ConnectionRefused,
+            "UDP blocked by rules",
+        ),
+        (
+            Expression::AnyDestination(true),
+            io::ErrorKind::PermissionDenied,
+            "UDP connect failed: test UDP dial failure",
+        ),
+    ] {
+        let (transport, mut peer) = duplex(8192);
+        let session = AnyTlsSession::new_server_with_initial_data(
+            transport,
+            PaddingFactory::default_factory(),
+            Arc::new(crate::resolver::NativeResolver),
+            crate::routing::ingress::tests::udp_failure_selector(
+                condition,
+                io::ErrorKind::PermissionDenied,
+            ),
+            true,
+            "test".into(),
+            None,
+        );
+        session.peer_version.store(2, Ordering::Relaxed);
+        let (_sender, receiver) = mpsc::channel(1);
+        let stream = AnyTlsStream::new(
+            1,
+            receiver,
+            session.outgoing_tx.clone(),
+            session.is_closed.clone(),
+        );
+        let error = timeout(
+            Duration::from_secs(5),
+            session.handle_uot_v2_connect(
+                stream,
+                NetLocation::from_str("192.0.2.1:443", None).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), kind);
+        let status = read_frame(&mut peer).await;
+        assert_eq!(status.cmd, Command::SynAck);
+        assert_eq!(status.stream_id, 1);
+        assert_eq!(status.data.as_ref(), message.as_bytes());
+        assert_eq!(
+            session.outgoing_rx.lock().await.try_recv().unwrap(),
+            (1, Bytes::new())
+        );
+        assert!(!session.is_closed());
+        drop(session);
+        let mut extra = Vec::new();
+        peer.read_to_end(&mut extra).await.unwrap();
+        assert!(extra.is_empty(), "second status after failure SYNACK");
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn udp_optimistic_failures_wait_for_fin_or_close_the_session() {
     for failure in ["block", "dial", "read"] {
         for drain in [true, false] {

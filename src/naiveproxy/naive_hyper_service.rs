@@ -909,7 +909,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                 let setup =
                     crate::util::timeout_stream_setup(route.with_source(peer).connect(&resolver))
                         .await?;
-                return run_udp_copy(Box::new(uot_v2_stream), setup.stream, false, false).await;
+                return run_udp_copy(uot_v2_stream, setup.stream, false, false).await;
             } else {
                 // V2 non-connect mode (same as V1)
                 let uot_stream = UotV1ServerStream::new_uot(stream);

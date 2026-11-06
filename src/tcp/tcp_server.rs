@@ -355,7 +355,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                 }
             };
             run_udp_copy(
-                Box::new(server_stream),
+                server_stream,
                 client_stream,
                 server_need_initial_flush,
                 false,

@@ -149,12 +149,7 @@ pub(crate) async fn connect_udp(
     resolver: &Arc<dyn Resolver>,
     source: Option<std::net::SocketAddr>,
 ) -> io::Result<Box<dyn AsyncMessageStream>> {
-    let target = selector.prepare(destination.into())?;
-    Ok(
-        connect_prepared_udp(selector, target, resolver, false, source)
-            .await?
-            .stream,
-    )
+    connect_udp_packet(selector, destination, resolver, source, &[]).await
 }
 
 pub(crate) async fn connect_prepared_udp(

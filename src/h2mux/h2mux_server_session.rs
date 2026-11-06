@@ -551,7 +551,6 @@ async fn handle_h2mux_udp(
     let peer = stream.peer;
     if optimistic {
         timeout_stream_setup(async {
-            use tokio::io::AsyncWriteExt;
             // An empty write emits status; write_all(&[]) would skip poll_write.
             let _written = stream.write(&[]).await?;
             stream.flush().await
