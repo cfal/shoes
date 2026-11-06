@@ -86,10 +86,11 @@ pool fills. This is opt-in because packet-up download tails retain admission
 after local upload EOF, reducing churn capacity. Paused-download library tests
 require independent progress for admitted sessions. Server upload pressure and
 application-global byte-budget exhaustion can still retain shared credit; those
-pressure tests require recovery after consumption resumes. Attached out-of-window POSTs wait for their
-predecessors subject to packet inactivity. Normal pressure fixtures leave aggregate
-and per-session request caps unlimited; client pipeline depth, transport flow
-control and the 250-request per-connection limit still constrain concurrency.
+pressure tests require recovery after consumption resumes. Attached out-of-window
+POSTs wait for their predecessors subject to packet inactivity. Normal pressure
+fixtures leave aggregate and per-session request caps unlimited; client pipeline
+depth, transport flow control and the 250-request per-connection limit still
+constrain concurrency.
 The explicit 128-request Xray H2 case covers per-session refusal and recovery.
 Deterministic GOAWAY, credit starvation, timeout races, and memory-release ordering
 remain covered by the XHTTP library tests.

@@ -1592,13 +1592,6 @@ async fn h1_waiting_packet_ack_does_not_consume_another_sessions_connections() {
     .unwrap();
 }
 
-struct H1PacketPeer {
-    address: SocketAddr,
-    packets: tokio::sync::mpsc::Receiver<(Bytes, tokio::sync::oneshot::Sender<Body>)>,
-    downloads: tokio::sync::mpsc::Receiver<super::stream::Writer>,
-    _tasks: Tasks,
-}
-
 async fn h2_download_peer(
     mode: XhttpMode,
 ) -> (
@@ -1787,6 +1780,13 @@ async fn h2_download_admission_spills_refuses_and_recovers_without_blocking_uplo
         .await
         .unwrap();
     }
+}
+
+struct H1PacketPeer {
+    address: SocketAddr,
+    packets: tokio::sync::mpsc::Receiver<(Bytes, tokio::sync::oneshot::Sender<Body>)>,
+    downloads: tokio::sync::mpsc::Receiver<super::stream::Writer>,
+    _tasks: Tasks,
 }
 
 impl H1PacketPeer {
