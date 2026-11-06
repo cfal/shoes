@@ -9,11 +9,11 @@
     "check": "npm run build && node scripts/check-site.mjs"
   },
   "dependencies": {
-    "@astrojs/starlight": "0.42.8",
-    "astro": "7.4.4"
+    "@astrojs/starlight": "0.42.9",
+    "astro": "7.4.7"
   },
   "devDependencies": {
-    "linkedom": "0.18.14",
+    "linkedom": "0.18.15",
     "mdast-util-from-markdown": "2.1.0"
   }
 }
