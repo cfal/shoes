@@ -7,7 +7,7 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub use compile::Compiler;
 use domain::{DomainKind, Names};
@@ -19,6 +19,46 @@ pub(crate) const MAX_STRING_BYTES: usize = 64 * 1024;
 
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Network {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    Stun,
+    Dtls,
+}
+
+impl Protocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stun => "stun",
+            Self::Dtls => "dtls",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Traffic {
+    pub network: Network,
+    pub protocol: Option<Protocol>,
+}
+
+impl Traffic {
+    pub const TCP: Self = Self {
+        network: Network::Tcp,
+        protocol: None,
+    };
+    pub const UDP: Self = Self {
+        network: Network::Udp,
+        protocol: None,
+    };
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -34,6 +74,8 @@ pub enum Expression {
     IpCidr(Vec<String>),
     DestinationPort(Vec<u16>),
     DestinationPortRange(Vec<String>),
+    Network(Vec<Network>),
+    Protocol(Vec<Protocol>),
     RuleSourceGroup(String),
     All(Vec<Expression>),
     Any(Vec<Expression>),
@@ -119,6 +161,8 @@ impl Outcome {
 pub struct Dependencies {
     pub hostname: bool,
     pub ip: bool,
+    pub network: bool,
+    pub protocol: bool,
 }
 
 #[derive(Debug)]
@@ -136,6 +180,8 @@ pub(crate) enum Kind {
     Regex(regex_automata::meta::Regex),
     Ips(IpRanges, bool),
     Ports(Box<[(u16, u16)]>),
+    Networks(u8),
+    Protocols(u8),
     ByPort(Box<[(u16, Arc<Predicate>)]>),
     Any(Box<[Arc<Predicate>]>),
     All(Box<[Arc<Predicate>]>),
@@ -159,7 +205,7 @@ impl Predicate {
                     children.iter().map(|p| p.retained_bytes() + 8).sum()
                 }
                 Kind::Not(p) => p.retained_bytes(),
-                Kind::Constant(_) => 0,
+                Kind::Constant(_) | Kind::Networks(_) | Kind::Protocols(_) => 0,
             }
     }
 
@@ -200,6 +246,14 @@ impl Predicate {
                 ip: true,
                 ..Dependencies::default()
             },
+            Kind::Networks(_) => Dependencies {
+                network: true,
+                ..Dependencies::default()
+            },
+            Kind::Protocols(_) => Dependencies {
+                protocol: true,
+                ..Dependencies::default()
+            },
             Kind::Not(p) => p.dependencies,
             Kind::Any(ps) | Kind::All(ps) => Self::union(ps.iter().map(|p| p.dependencies)),
             Kind::ByPort(ps) => Self::union(ps.iter().map(|(_, p)| p.dependencies)),
@@ -216,6 +270,8 @@ impl Predicate {
         values.fold(Dependencies::default(), |a, b| Dependencies {
             hostname: a.hostname || b.hostname,
             ip: a.ip || b.ip,
+            network: a.network || b.network,
+            protocol: a.protocol || b.protocol,
         })
     }
 
@@ -224,8 +280,22 @@ impl Predicate {
     }
 
     pub fn evaluate(&self, name: Option<&str>, ip: Option<IpAddr>, port: u16) -> Outcome {
+        self.evaluate_with_traffic(name, ip, port, None)
+    }
+
+    pub fn evaluate_with_traffic(
+        &self,
+        name: Option<&str>,
+        ip: Option<IpAddr>,
+        port: u16,
+        traffic: Option<Traffic>,
+    ) -> Outcome {
         let matched = match &self.kind {
             Kind::Constant(value) => *value,
+            Kind::Networks(values) => traffic.is_some_and(|t| values & (1 << t.network as u8) != 0),
+            Kind::Protocols(values) => traffic
+                .and_then(|t| t.protocol)
+                .is_some_and(|p| values & (1 << p as u8) != 0),
             Kind::Domains(names, kind) => name.is_some_and(|name| names.matches(name, *kind)),
             Kind::Keywords(keywords) => name.is_some_and(|name| keywords.is_match(name)),
             Kind::Regex(regex) => name.is_some_and(|name| regex.is_match(name.as_bytes())),
@@ -249,16 +319,24 @@ impl Predicate {
                     unrestricted
                         .into_iter()
                         .chain(selected)
-                        .map(|p| p.evaluate(name, ip, port)),
+                        .map(|p| p.evaluate_with_traffic(name, ip, port, traffic)),
                 );
             }
             Kind::Any(children) => {
-                return Outcome::any(children.iter().map(|p| p.evaluate(name, ip, port)));
+                return Outcome::any(
+                    children
+                        .iter()
+                        .map(|p| p.evaluate_with_traffic(name, ip, port, traffic)),
+                );
             }
             Kind::All(children) => {
-                return Outcome::all(children.iter().map(|p| p.evaluate(name, ip, port)));
+                return Outcome::all(
+                    children
+                        .iter()
+                        .map(|p| p.evaluate_with_traffic(name, ip, port, traffic)),
+                );
             }
-            Kind::Not(p) => return p.evaluate(name, ip, port).negate(),
+            Kind::Not(p) => return p.evaluate_with_traffic(name, ip, port, traffic).negate(),
         };
         if matched {
             Outcome::Match
