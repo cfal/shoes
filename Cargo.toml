@@ -194,6 +194,7 @@ tokio = { version = "*", features = [
     "time",
 ] }
 tokio-util = { version = "*", features = ["time", "io", "rt"] }
+tracing = { version = "0.1", default-features = false, features = ["release_max_level_info"] }
 tun = { version = "*", features = ["async"] }
 url = "*"
 uuid = "1"
