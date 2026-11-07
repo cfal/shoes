@@ -11,10 +11,10 @@ fn hosts_compose_with_local_then_reference_order_precedence() {
     let validated = validate(
         r#"
 - dns_group: first
-  hosts: {same.test: 192.0.2.1, first.test: 192.0.2.10}
+  hosts: {same.test: [192.0.2.1, '2001:db8::1'], first.test: 192.0.2.10}
   dns_servers: system
 - dns_group: second
-  hosts: {same.test: 192.0.2.2, second.test: 192.0.2.20}
+  hosts: {same.test: ['2001:db8::2', 192.0.2.2], second.test: 192.0.2.20}
   dns_servers: udp://192.0.2.53
 - dns_group: composed
   dns_servers: [first, second]
@@ -29,22 +29,21 @@ fn hosts_compose_with_local_then_reference_order_precedence() {
 "#,
     )
     .unwrap();
-    for (name, expected) in [
-        ("first", "192.0.2.1"),
-        ("second", "192.0.2.2"),
-        ("composed", "192.0.2.1"),
-        ("override", "192.0.2.3"),
-        ("__inline_dns_0", "192.0.2.4"),
-    ] {
+    let cases: &[(&str, &[&str])] = &[
+        ("first", &["192.0.2.1", "2001:db8::1"]),
+        ("second", &["2001:db8::2", "192.0.2.2"]),
+        ("composed", &["192.0.2.1", "2001:db8::1"]),
+        ("override", &["192.0.2.3"]),
+        ("__inline_dns_0", &["192.0.2.4"]),
+    ];
+    for &(name, expected) in cases {
         let group = validated
             .dns_groups
             .iter()
             .find(|group| group.name == name)
             .unwrap();
-        assert_eq!(
-            group.hosts.lookup("same.test").unwrap()[0],
-            expected.parse::<IpAddr>().unwrap()
-        );
+        let expected: Vec<IpAddr> = expected.iter().map(|ip| ip.parse().unwrap()).collect();
+        assert_eq!(group.hosts.lookup("same.test").unwrap(), expected);
         if name == "composed" || name == "override" || name == "__inline_dns_0" {
             assert_eq!(group.specs.len(), 2);
             assert!(group.hosts.lookup("first.test").is_some());
