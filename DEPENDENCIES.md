@@ -19,13 +19,72 @@ The workspace patches in `Cargo.toml` are required by checkout/release builds:
   oversized buffered frames from their declared lengths and skips unknown-frame
   payloads incrementally. The fork also defaults the local decoded-header limit
   to 64 KiB. Used by both Shoes and Hickory through h3/h3-quinn.
-- `cfal/hickory-dns`: connection-close recovery and healthy-upstream failover.
+- `cfal/hickory-dns`: connection-close recovery, healthy-upstream failover and
+  bounded TCP/DoT receive progress.
 - `cfal/smoltcp`: TUN/WireGuard TCP retransmission ACK sequencing.
 
 Preserve each repository and full revision unless explicitly updating that fork.
 Check every resolved consumer, especially Quinn, tokio-rustls, hyper-rustls,
 rustls-platform-verifier, Hickory and Shoes; absence of unused-patch warnings is
 not sufficient. Keep `publish = false` while workspace patches remain.
+
+### Hickory
+
+The stable base remains [v0.26.3](https://github.com/hickory-dns/hickory-dns/releases/tag/v0.26.3),
+[`bd37cafbdd86112a6da32878f8c9bab22e14377e`](https://github.com/hickory-dns/hickory-dns/commit/bd37cafbdd86112a6da32878f8c9bab22e14377e).
+As of November 7, 2026, this is the latest non-yanked stable release of
+`hickory-net`, `hickory-proto` and `hickory-resolver`; all three published crate
+archives identify that exact source commit. The release branch has newer,
+unreleased commits despite still declaring 0.26.3; main is 0.27.0-alpha.1.
+Neither is a published stable upgrade.
+
+The maintained series is pinned at
+[`14df4ec4d6c501e23d7815cecd7f556b1cece4a1`](https://github.com/cfal/hickory-dns/commit/14df4ec4d6c501e23d7815cecd7f556b1cece4a1)
+on `shoes/0.26.3-multiplexer-wakeup-20261107-1794067200053000`.
+It retains both original commits from `fix/0.26-closed-transport-failover`,
+including the previous Shoes pin
+[`3fa0a0e3ebd9df778256f18e9264f70d284d31c0`](https://github.com/cfal/hickory-dns/commit/3fa0a0e3ebd9df778256f18e9264f70d284d31c0)
+as an ancestor. Existing published branches and tags remain intact. The fork's
+default branch does not carry the complete series; discover published refs
+before choosing a maintenance source.
+
+The additional patch backports upstream
+[`a14d6027eca8a1cdcc3ef1d5d2deeafed21175b0`](https://github.com/hickory-dns/hickory-dns/commit/a14d6027eca8a1cdcc3ef1d5d2deeafed21175b0):
+count received messages rather than their zero-based index, so consuming the
+100-message receive budget schedules another poll. The budget itself is
+unchanged. Shoes retains the 32-request per-connection limit, so this is not a
+normal high-concurrency lookup failure. A buffered burst of unsolicited or stale
+responses can nevertheless hide a valid answer behind that limit. Local,
+certificate-verified DoT regressions reproduce timeouts in both hostname lookup
+and raw exchange with 100 unsolicited responses, while 0 and 99 are controls.
+The backport lets both paths finish without another query, reconnect or retry.
+
+The original series backports upstream #3861's typed `ConnectionClosed` design
+and adds narrowly scoped H3 recovery. Disconnected exchange channels are not
+`Busy`; genuine queue pressure still is. H3 body errors retain their type,
+remote whole-connection `ApplicationClose` is recognized alongside existing
+clean-close handling, and stream-level `H3_REQUEST_CANCELLED` remains distinct.
+The pool preserves healthy pending siblings and meaningful exhausted-pool
+errors. The existing reused/fresh/repeated-close reconnect budgets remain
+unchanged. Upstream merging #3861 does not supersede the complete H3 additions.
+Neither this work nor external DNS successes establish the cause of Cloudflare's
+original application close.
+
+The multiplexer backport leaves package versions, public APIs, features,
+Rust 1.88 minimum, platform support, server scoring and negative-response policy
+unchanged. In particular, the
+unreleased SERVFAIL retry change and connection-setup SRTT changes are not
+included. Keep the resolver/net/proto pins together and verify tendns also uses
+the fork proto, with no split registry/git types. Preserve the shared rustls and
+h3/h3-quinn fork graph and the publishing guard.
+
+Future refreshes must retain the closed-exchange, H3 body/classification,
+pool-failover, error-precedence and exact reconnect-count regressions. Run the
+standalone production check `cargo check -p hickory-net --locked --features
+h3-aws-lc-rs` as well as tests: H3's test-only backend feature can hide production
+compilation errors. Test Shoes' high-level hostname resolver and separate raw
+exchange path, including buffered-response progress, deadlines, configured
+routing and H3 socket-memory teardown.
 
 ### smoltcp
 
