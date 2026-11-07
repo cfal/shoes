@@ -3,6 +3,83 @@ use crate::resources::Budget;
 use tokio::io::AsyncReadExt;
 
 #[tokio::test]
+async fn h2_download_count_fits_platform_semaphore_bounds() {
+    let (client, peer) = tokio::io::duplex(4096);
+    let tasks = Tasks::new();
+    tasks.spawn(async move {
+        let mut connection = h2::server::handshake(peer).await.unwrap();
+        while connection.accept().await.is_some() {}
+    });
+    let carrier = Carrier::tcp_with_windows(Box::new(client), XhttpVersion::H2, 8192, (1, 1 << 30))
+        .await
+        .unwrap();
+    let Sender::H2 { downloads, .. } = &carrier.sender else {
+        unreachable!()
+    };
+    assert_eq!(
+        downloads.available_permits(),
+        (1 << 30).min(tokio::sync::Semaphore::MAX_PERMITS)
+    );
+}
+
+#[tokio::test]
+async fn h2_receive_guard_returns_polled_and_queued_credit_before_admission() {
+    struct CheckCredit {
+        flow: h2::FlowControl,
+        remaining: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for CheckCredit {
+        fn drop(&mut self) {
+            self.remaining
+                .store(self.flow.used_capacity(), Ordering::SeqCst);
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (client, peer) = tokio::io::duplex(4096);
+        let tasks = Tasks::new();
+        tasks.spawn(async move {
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let mut streams = Vec::new();
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                let mut send = respond.send_response(Response::new(()), false).unwrap();
+                send.send_data(Bytes::from_static(b"polled"), false)
+                    .unwrap();
+                send.send_data(Bytes::from_static(b"queued"), false)
+                    .unwrap();
+                streams.push((request, send));
+            }
+        });
+        let (mut sender, connection) = h2::client::handshake(client).await.unwrap();
+        tasks.spawn(async move {
+            let _ = connection.await;
+        });
+        let (response, _upload) = sender
+            .send_request(Request::get("http://localhost/").body(()).unwrap(), false)
+            .unwrap();
+        let mut stream = response.await.unwrap().into_body();
+        let data = stream.data().await.unwrap().unwrap();
+        assert_eq!(data.as_ref(), b"polled");
+        while stream.flow_control().used_capacity() < 12 {
+            tokio::task::yield_now().await;
+        }
+        let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let guard = ReceiveGuard::new(CheckCredit {
+            flow: stream.flow_control().clone(),
+            remaining: remaining.clone(),
+        });
+        // Live upload and flow-control handles prevent last-reference cleanup.
+        drop(H2Body {
+            stream,
+            in_flight: data.len(),
+            _guard: Some(guard),
+        });
+        assert_eq!(remaining.load(Ordering::SeqCst), 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn h2_readiness_and_established_receive_preserve_transport_causes() {
     use crate::http2::transport::tests::{cases, peer};
     tokio::time::timeout(Duration::from_secs(5), async {

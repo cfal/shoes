@@ -56,6 +56,8 @@ mod tls_hybrid;
 mod tuic;
 #[path = "cases/integration/tuic_udp_integration.rs"]
 mod tuic_udp;
+#[path = "cases/integration/udp_protocol_routing.rs"]
+mod udp_protocol_routing;
 #[path = "cases/integration/vless_integration.rs"]
 mod vless;
 #[path = "cases/integration/vless_xudp_integration.rs"]

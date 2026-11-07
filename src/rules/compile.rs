@@ -101,6 +101,22 @@ impl Compiler {
                 return Err(invalid("any_destination must be true"));
             }
             Expression::Never => Kind::Constant(false),
+            Expression::Network(values) => {
+                self.charge(values.len(), values.len())?;
+                Kind::Networks(
+                    values
+                        .into_iter()
+                        .fold(0, |mask, value| mask | (1 << value as u8)),
+                )
+            }
+            Expression::Protocol(values) => {
+                self.charge(values.len(), values.len())?;
+                Kind::Protocols(
+                    values
+                        .into_iter()
+                        .fold(0, |mask, value| mask | (1 << value as u8)),
+                )
+            }
             p @ (Expression::Domain(_)
             | Expression::DomainSuffix(_)
             | Expression::Subdomains(_)) => return self.visit_child(p, depth),

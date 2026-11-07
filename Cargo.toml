@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.3.6"
+version = "0.3.7"
 publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
 rust-version = "1.99.1"
@@ -32,7 +32,7 @@ hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e
 # Includes nix-rust/nix#2821 for iOS socket feature compatibility.
 nix = { git = "https://github.com/nix-rust/nix", rev = "3eae6d68ec6382fef7b38cd58f97458e59a71af9" }
 # Preserves TCP ACK sequences during retransmission.
-smoltcp = { git = "https://github.com/cfal/smoltcp", rev = "042e568bfa39d0f111a23a4718ec257e474fd1e7" }
+smoltcp = { git = "https://github.com/cfal/smoltcp", rev = "7ef43e497f575cb0340a43e4f414f0f0b8760bf6" }
 
 [lib]
 name = "shoes"

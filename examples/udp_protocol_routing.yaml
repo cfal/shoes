@@ -1,0 +1,25 @@
+# Detected call flows use direct UDP; other traffic uses the configured upstream.
+# HTTP proxy settings alone do not capture a browser's WebRTC UDP traffic.
+- client_group: calls
+  client_chain:
+    protocol: {type: direct}
+
+- client_group: main
+  client_chain:
+    address: "proxy.example.com:1080"
+    protocol: {type: socks}
+
+- address: "0.0.0.0:1080"
+  protocol:
+    type: socks
+    username: "proxy-user"
+    password: "replace-this-password"
+    udp_enabled: true
+  rules:
+    - conditions:
+        all:
+          - network: udp
+          - protocol: [stun, dtls]
+      client_chain: calls
+    - conditions: {any_destination: true}
+      client_chain: main

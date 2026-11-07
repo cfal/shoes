@@ -8,10 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends cmake && \
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=1
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY tests/support/ tests/support/
 COPY src/ src/
 
+ARG SHOES_RELEASE_TAG=
+ARG SHOES_BUILD_REVISION=
 RUN cargo build --locked --release --bin shoes
 
 FROM debian:bookworm-slim AS runtime

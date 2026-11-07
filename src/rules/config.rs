@@ -115,6 +115,8 @@ impl Expression {
                     "ip_cidr" => decode(value).map(Self::IpCidr),
                     "destination_port" => decode(value).map(Self::DestinationPort),
                     "destination_port_range" => decode(value).map(Self::DestinationPortRange),
+                    "network" => decode_alternatives(value).map(Self::Network),
+                    "protocol" => decode_alternatives(value).map(Self::Protocol),
                     "rule_source_group" => decode(value).map(Self::RuleSourceGroup),
                     "rule_group" => Err(invalid(
                         "rule_group predicate was renamed; use {rule_source_group: name} and declare the group with rule_source_group",
@@ -163,10 +165,86 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> io::Result<T> {
     serde_json::from_value(value).map_err(|e| invalid(e.to_string()))
 }
 
+fn decode_alternatives<T: serde::de::DeserializeOwned>(value: Value) -> io::Result<Vec<T>> {
+    if value.is_string() {
+        decode(value).map(|value| vec![value])
+    } else {
+        decode(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn traffic_conditions_parse_compose_and_round_trip() {
+        use crate::rules::{Compiler, Network, Outcome, Protocol, Traffic};
+        for field in ["conditions", "masks"] {
+            let rule: crate::config::RuleConfig = serde_json::from_value(json!({
+                field: {"all": [{"network": "udp"}, {"protocol": ["stun", "dtls"]}]}
+            }))
+            .unwrap();
+            let encoded = serde_json::to_value(&rule).unwrap();
+            let mut restored: crate::config::RuleConfig = serde_json::from_value(encoded).unwrap();
+            assert_eq!(
+                serde_json::to_value(&rule).unwrap(),
+                serde_json::to_value(&restored).unwrap()
+            );
+            restored.compile(&mut Compiler::default()).unwrap();
+            let predicate = restored.criteria.compiled.unwrap();
+            assert!(predicate.dependencies.network && predicate.dependencies.protocol);
+            for (traffic, expected) in [
+                (Traffic::TCP, Outcome::Miss),
+                (Traffic::UDP, Outcome::Miss),
+                (
+                    Traffic {
+                        network: Network::Udp,
+                        protocol: Some(Protocol::Stun),
+                    },
+                    Outcome::Match,
+                ),
+                (
+                    Traffic {
+                        network: Network::Udp,
+                        protocol: Some(Protocol::Dtls),
+                    },
+                    Outcome::Match,
+                ),
+            ] {
+                assert_eq!(
+                    predicate.evaluate_with_traffic(None, None, 443, Some(traffic)),
+                    expected
+                );
+            }
+        }
+        let mut compiler = Compiler::default();
+        let predicate = compiler
+            .compile(Expression::from_config(json!({"not": {"protocol": "stun"}})).unwrap())
+            .unwrap();
+        assert_eq!(
+            predicate.evaluate_with_traffic(None, None, 1, Some(Traffic::UDP)),
+            Outcome::Match
+        );
+        for value in [
+            json!({"network": "quic"}),
+            json!({"protocol": "webrtc"}),
+            json!({"protocol": ["stun", "typo"]}),
+            json!({"network": null}),
+            json!({"protocol": false}),
+        ] {
+            assert!(Expression::from_config(value).is_err());
+        }
+        for value in [json!({"network": []}), json!({"protocol": []})] {
+            let expression = Expression::from_config(value).unwrap();
+            let predicate = compiler.compile(expression).unwrap();
+            assert_eq!(
+                predicate.evaluate_with_traffic(None, None, 1, Some(Traffic::UDP)),
+                Outcome::Miss
+            );
+        }
+    }
 
     #[test]
     fn composite_errors_preserve_list_context_and_child_order() {

@@ -8,6 +8,70 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision, Ingress
 use crate::control::connection_notes::{self, Phase};
 use crate::resolver::{Resolver, resolve_location};
 
+mod peek;
+pub(crate) use peek::PeekMessageStream;
+
+pub(crate) struct PreparedUdp {
+    target: IngressTarget,
+}
+
+impl PreparedUdp {
+    pub(crate) fn new(
+        selector: &ClientProxySelector,
+        destination: NetLocation,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            target: selector.prepare(destination.into())?,
+        })
+    }
+
+    pub(crate) fn needs_sniff(&self, selector: &ClientProxySelector) -> bool {
+        selector.has_protocol_rules() && matches!(self.target, IngressTarget::Forward(_))
+    }
+
+    pub(crate) async fn route<'a, S: AsyncMessageStream>(
+        mut self,
+        inbound: &mut PeekMessageStream<S>,
+        selector: &'a ClientProxySelector,
+        resolver: &Arc<dyn Resolver>,
+    ) -> io::Result<UdpRoute<'a>> {
+        if self.needs_sniff(selector)
+            && let IngressTarget::Forward(target) = &mut self.target
+        {
+            target.traffic.protocol = inbound.peek().await?;
+        }
+        route_prepared_udp(selector, self.target, resolver, false).await
+    }
+}
+
+pub(crate) fn classify_target(
+    selector: &ClientProxySelector,
+    target: &mut IngressTarget,
+    packet: &[u8],
+) {
+    if selector.has_protocol_rules()
+        && let IngressTarget::Forward(target) = target
+    {
+        target.traffic.protocol = crate::sniff::udp::classify(packet);
+    }
+}
+
+pub(crate) async fn connect_udp_packet(
+    selector: &ClientProxySelector,
+    destination: NetLocation,
+    resolver: &Arc<dyn Resolver>,
+    source: Option<std::net::SocketAddr>,
+    packet: &[u8],
+) -> io::Result<Box<dyn AsyncMessageStream>> {
+    let mut target = selector.prepare(destination.into())?;
+    classify_target(selector, &mut target, packet);
+    Ok(
+        connect_prepared_udp(selector, target, resolver, false, source)
+            .await?
+            .stream,
+    )
+}
+
 pub(crate) struct UdpSetup {
     pub stream: Box<dyn AsyncMessageStream>,
     pub reply_identity: NetLocation,
@@ -63,6 +127,7 @@ impl UdpRoute<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn route_udp<'a>(
     selector: &'a ClientProxySelector,
     destination: NetLocation,
@@ -77,18 +142,14 @@ pub(crate) async fn route_udp<'a>(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn connect_udp(
     selector: &ClientProxySelector,
     destination: NetLocation,
     resolver: &Arc<dyn Resolver>,
     source: Option<std::net::SocketAddr>,
 ) -> io::Result<Box<dyn AsyncMessageStream>> {
-    let target = selector.prepare(destination.into())?;
-    Ok(
-        connect_prepared_udp(selector, target, resolver, false, source)
-            .await?
-            .stream,
-    )
+    connect_udp_packet(selector, destination, resolver, source, &[]).await
 }
 
 pub(crate) async fn connect_prepared_udp(
@@ -129,7 +190,10 @@ async fn route_prepared_udp<'a>(
                 reply_identity,
             }));
         }
-        IngressTarget::Forward(target) => target,
+        IngressTarget::Forward(mut target) => {
+            target.traffic.network = crate::rules::Network::Udp;
+            target
+        }
     };
     let mut info = if selector.tracks_flows() {
         target.flow_info()

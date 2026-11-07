@@ -11,7 +11,8 @@ OPTIONS:
   -l, --log-file PATH  Log to a file; repeatable ("-" means stderr)
   -d, --dry-run        Validate config and certificates without starting listeners
   --no-reload          Disable automatic reloads on file changes
-  -V, --version        Print version information
+  -V                   Print the short version
+  --version            Print version, target, and compiler
 
 COMMANDS:
   check <config.yaml>                            Alias for --dry-run
@@ -32,6 +33,27 @@ SIGHUP reloads configuration even with `--no-reload`; SIGINT/SIGTERM stop
 listeners without waiting for the TCP reload drain.
 
 `check` and `--dry-run` exit with status 0 for valid configuration and 1 for errors. They do not open listeners, create a file watcher, or perform DNS bootstrap networking. Runtime failures such as unavailable bind addresses remain possible after a successful check.
+
+### Build Information
+
+Include `shoes --version` (or `shoes version`) output in bug reports. For example:
+
+```text
+shoes 0.3.6+gabc123456789
+target: x86_64-unknown-linux-musl
+compiler: rustc 1.99.1 (58cf8f9c3 2026-10-13)
+```
+
+`shoes -V` prints only the first line. Official release builds omit the commit
+suffix; other builds include the first 12 hexadecimal digits of the source
+commit. `.dirty` indicates staged or unstaged changes to tracked files at build
+time; untracked files are not counted. `+unknown` means no revision was available.
+All fields are embedded during compilation, not read from the current directory.
+
+The target identifies the architecture, operating system, and ABI, including
+`linux-musl` versus `linux-gnu`. It does not identify the runtime libc version.
+The compiler field reports the compiler actually used, not the minimum supported
+Rust version. See [installation](/start/installation/) for build metadata inputs.
 
 ### Tendns TXT Generation
 

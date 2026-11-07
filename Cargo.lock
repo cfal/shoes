@@ -2891,7 +2891,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shoes"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "aho-corasick",
  "android_logger",
@@ -3042,7 +3042,7 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 [[package]]
 name = "smoltcp"
 version = "0.14.0"
-source = "git+https://github.com/cfal/smoltcp?rev=042e568bfa39d0f111a23a4718ec257e474fd1e7#042e568bfa39d0f111a23a4718ec257e474fd1e7"
+source = "git+https://github.com/cfal/smoltcp?rev=7ef43e497f575cb0340a43e4f414f0f0b8760bf6#7ef43e497f575cb0340a43e4f414f0f0b8760bf6"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",

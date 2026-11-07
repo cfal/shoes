@@ -1132,15 +1132,29 @@ async fn check_alias_and_validation_exit_codes() {
     std::fs::remove_file(&path).unwrap();
     let mut child = Process::start(&path, &[]);
     assert_eq!(child.exit().await.code(), Some(1));
-    let version = Command::new(env!("CARGO_BIN_EXE_shoes"))
-        .arg("version")
-        .output()
-        .unwrap();
-    assert!(version.status.success());
-    assert_eq!(
-        String::from_utf8(version.stdout).unwrap().trim(),
-        concat!("shoes ", env!("CARGO_PKG_VERSION"))
+}
+
+#[test]
+fn version_commands_report_embedded_build_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let short = format!("shoes {}\n", env!("SHOES_VERSION"));
+    let long = format!(
+        "{short}target: {}\ncompiler: {}\n",
+        env!("SHOES_TARGET"),
+        env!("SHOES_COMPILER")
     );
+    for (argument, expected) in [("-V", &short), ("--version", &long), ("version", &long)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .arg(argument)
+            .current_dir(directory.path())
+            .env("SHOES_RELEASE_TAG", "v0.0.0")
+            .env("SHOES_BUILD_REVISION", "not-a-runtime-setting")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), *expected);
+    }
 }
 
 #[tokio::test]

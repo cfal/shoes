@@ -28,7 +28,8 @@ fn print_usage_and_exit(arg0: String) -> ! {
         "    global_settings.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
     );
     eprintln!("    QUIC connections disconnect immediately on reload.");
-    eprintln!("    -V, --version        Print version information and exit");
+    eprintln!("    -V                   Print the short version and exit");
+    eprintln!("    --version            Print version, target, and compiler and exit");
     eprintln!();
     eprintln!("RESOURCE LIMITS:");
     eprintln!("    Optional YAML entry: - global_settings: {{ max_connections: 1024 }}");
@@ -122,8 +123,14 @@ fn run() -> i32 {
             }
             "--dry-run" | "-d" => dry_run = true,
             "--no-reload" => no_reload = true,
-            "--version" | "-V" => {
-                println!("shoes {}", env!("CARGO_PKG_VERSION"));
+            "-V" => {
+                println!("shoes {}", env!("SHOES_VERSION"));
+                return 0;
+            }
+            "--version" => {
+                println!("shoes {}", env!("SHOES_VERSION"));
+                println!("target: {}", env!("SHOES_TARGET"));
+                println!("compiler: {}", env!("SHOES_COMPILER"));
                 return 0;
             }
             other => {

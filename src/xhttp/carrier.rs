@@ -25,6 +25,33 @@ type H3Sender = h3::client::SendRequest<super::h3::Opener, Bytes>;
 
 pub struct Reservation(Option<super::h3::Bidi>);
 
+#[derive(Clone)]
+pub(super) struct ReceiveGuard {
+    _owner: Arc<dyn Send + Sync>,
+}
+
+impl ReceiveGuard {
+    pub fn new(owner: impl Send + Sync + 'static) -> Self {
+        Self {
+            _owner: Arc::new(owner),
+        }
+    }
+}
+
+struct H2Body {
+    stream: h2::RecvStream,
+    in_flight: usize,
+    // Field order returns receive credit before the guard releases admission.
+    _guard: Option<ReceiveGuard>,
+}
+
+impl Drop for H2Body {
+    fn drop(&mut self) {
+        // RecvStream drops queued DATA, but not a polled chunk blocked on our pipe.
+        let _ = self.stream.flow_control().release_capacity(self.in_flight);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Timeouts {
     headers: Duration,
@@ -84,6 +111,7 @@ enum Sender {
     H2 {
         sender: h2::client::SendRequest<Bytes>,
         errors: TransportErrors,
+        downloads: Arc<tokio::sync::Semaphore>,
     },
     H3 {
         sender: H3Sender,
@@ -137,6 +165,7 @@ impl Carrier {
         } else {
             let errors = TransportErrors::default();
             let (sender, mut connection) = h2::client::Builder::new()
+                .enable_push(false)
                 .initial_window_size(stream_window)
                 .initial_connection_window_size(connection_window)
                 .max_header_list_size(header_limit as u32)
@@ -154,7 +183,14 @@ impl Carrier {
             ping.ping(h2::Ping::opaque())
                 .await
                 .map_err(|error| errors.map(error))?;
-            Sender::H2 { sender, errors }
+            Sender::H2 {
+                sender,
+                errors,
+                downloads: Arc::new(tokio::sync::Semaphore::new(
+                    ((connection_window / stream_window) as usize)
+                        .min(tokio::sync::Semaphore::MAX_PERMITS),
+                )),
+            }
         };
         Ok(Arc::new(Self {
             sender,
@@ -222,6 +258,17 @@ impl Carrier {
             Sender::H1(_) => 1,
             Sender::H2 { sender, .. } => limit.min(sender.current_max_send_streams()),
             Sender::H3 { .. } => limit,
+        }
+    }
+
+    pub fn admit_download(&self) -> io::Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        match &self.sender {
+            Sender::H2 { downloads, .. } => downloads
+                .clone()
+                .try_acquire_owned()
+                .map(Some)
+                .map_err(|_| crate::resources::exhausted()),
+            _ => Ok(None),
         }
     }
 
@@ -353,7 +400,8 @@ impl Carrier {
                 });
                 Response::from_parts(parts, reader)
             }
-            Sender::H2 { sender, errors } => {
+            Sender::H2 { sender, errors, .. } => {
+                let receive_guard = request.extensions_mut().remove::<ReceiveGuard>();
                 let (parts, body) = request.into_parts();
                 let empty = hyper::body::Body::is_end_stream(&body);
                 let streaming = matches!(&body, Body::Stream { .. });
@@ -406,6 +454,11 @@ impl Carrier {
                     })?;
                 guard.disarm();
                 let (parts, incoming) = response.into_parts();
+                let incoming = H2Body {
+                    stream: incoming,
+                    in_flight: 0,
+                    _guard: receive_guard,
+                };
                 let carrier = self.clone();
                 let errors = errors.clone();
                 tasks.spawn(async move {
@@ -548,21 +601,29 @@ pub async fn receive_hyper(
 }
 
 pub async fn receive_h2(body: h2::RecvStream, writer: Writer) {
-    receive_h2_with_errors(body, writer, &TransportErrors::default()).await;
+    receive_h2_with_errors(
+        H2Body {
+            stream: body,
+            in_flight: 0,
+            _guard: None,
+        },
+        writer,
+        &TransportErrors::default(),
+    )
+    .await;
 }
 
-async fn receive_h2_with_errors(
-    mut body: h2::RecvStream,
-    mut writer: Writer,
-    errors: &TransportErrors,
-) {
+async fn receive_h2_with_errors(mut body: H2Body, mut writer: Writer, errors: &TransportErrors) {
     let result: io::Result<()> = async {
-        while let Some(data) = body.data().await {
+        while let Some(data) = body.stream.data().await {
             let data = data.map_err(|error| errors.map(error))?;
+            body.in_flight = data.len();
             writer.write_all(&data).await?;
-            body.flow_control()
+            body.stream
+                .flow_control()
                 .release_capacity(data.len())
                 .map_err(|error| errors.map(error))?;
+            body.in_flight = 0;
         }
         writer.shutdown().await
     }

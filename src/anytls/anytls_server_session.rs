@@ -937,8 +937,6 @@ impl AnyTlsSession {
     }
 
     /// Handle UoT V2 Connect Mode (single destination)
-    ///
-    /// Uses connect_udp for proper proxy chaining support.
     async fn handle_uot_v2_connect(
         &self,
         mut stream: AnyTlsStream,
@@ -946,46 +944,68 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        let route = match setup_timeout(crate::routing::ingress::route_udp(
+        let prepared =
+            match crate::routing::ingress::PreparedUdp::new(&self.proxy_provider, destination) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.fail_udp(&mut stream, false, &format!("UDP connect failed: {error}"))
+                        .await;
+                    return Err(error);
+                }
+            };
+        let optimistic = prepared.needs_sniff(&self.proxy_provider);
+        if optimistic {
+            self.send_synack(stream_id, None).await?;
+        }
+        let mut server_stream =
+            crate::routing::ingress::PeekMessageStream::new(VlessMessageStream::new(&mut stream));
+        // Only routing permission errors are policy blocks; dial errors retain their kind.
+        let setup = match setup_timeout(prepared.route(
+            &mut server_stream,
             &self.proxy_provider,
-            destination,
             &self.resolver,
         ))
         .await
         {
-            Ok(route) => route.with_source(self.peer),
+            Ok(route) => setup_timeout(route.with_source(self.peer).connect(&self.resolver)).await,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                let _ = self
-                    .send_synack(stream_id, Some("UDP blocked by rules"))
+                drop(server_stream);
+                self.fail_udp(&mut stream, optimistic, "UDP blocked by rules")
                     .await;
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "UDP blocked by rules",
                 ));
             }
-            Err(error) => {
-                let _ = self
-                    .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
-                    .await;
-                return Err(error);
-            }
+            Err(error) => Err(error),
         };
-        let setup = match setup_timeout(route.connect(&self.resolver)).await {
+        let setup = match setup {
             Ok(setup) => setup,
             Err(error) => {
-                let _ = self
-                    .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
-                    .await;
+                drop(server_stream);
+                self.fail_udp(
+                    &mut stream,
+                    optimistic,
+                    &format!("UDP connect failed: {error}"),
+                )
+                .await;
                 return Err(error);
             }
         };
         let flow = setup.stream.flow().cloned();
-        let synack = self.send_synack(stream_id, None);
+        let synack = async {
+            if !optimistic {
+                self.send_synack(stream_id, None).await
+            } else {
+                Ok(())
+            }
+        };
         tokio::pin!(synack);
         tokio::select! {
             result = &mut synack => result?,
             _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => {
                 drop(setup.stream);
+                drop(server_stream);
                 stream.close_read();
                 // A partially written shared control frame must finish before FIN.
                 let _ = synack.await;
@@ -994,31 +1014,43 @@ impl AnyTlsSession {
             }
         }
         let mut client_stream = setup.stream;
-        let (result, cancelled) = {
-            let mut server_stream = VlessMessageStream::new(&mut stream);
-            let result = crate::control::tracked_stream::during_flow(
-                flow.as_deref(),
-                copy_bidirectional_message(&mut server_stream, &mut client_stream, false, false),
-            )
-            .await;
-            let cancelled = tokio::select! {
-                biased;
-                _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => true,
-                _ = async {
-                    futures::join!(
-                        crate::util::shutdown_message_stream(&mut server_stream),
-                        crate::util::shutdown_message_stream(&mut client_stream),
-                    );
-                } => false,
-            };
-            (result, cancelled)
+        let result = crate::control::tracked_stream::during_flow(
+            flow.as_deref(),
+            copy_bidirectional_message(&mut server_stream, &mut client_stream, false, false),
+        )
+        .await;
+        let cancelled = tokio::select! {
+            biased;
+            _ = crate::control::tracked_stream::wait_cancel(flow.as_deref()) => true,
+            _ = async {
+                futures::join!(
+                    crate::util::shutdown_message_stream(&mut server_stream),
+                    crate::util::shutdown_message_stream(&mut client_stream),
+                );
+            } => false,
         };
+        drop(server_stream);
         if cancelled {
             drop(client_stream);
             stream.close_read();
             cancelled_fin(&mut stream).await;
         }
         result
+    }
+
+    async fn fail_udp(&self, stream: &mut AnyTlsStream, optimistic: bool, message: &str) {
+        if !optimistic {
+            let _ = self.send_synack(stream.id(), Some(message)).await;
+            return;
+        }
+        stream.close_read();
+        if !matches!(
+            tokio::time::timeout(CONTROL_FRAME_TIMEOUT, stream.shutdown()).await,
+            Ok(Ok(()))
+        ) {
+            // Drop cannot reliably queue FIN on a saturated server channel.
+            self.close_state();
+        }
     }
 
     /// Handle UoT multi-destination mode (V1 and V2 non-connect)

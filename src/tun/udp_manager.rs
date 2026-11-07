@@ -366,8 +366,8 @@ async fn session_task(
                     };
                     let setup = tokio::time::timeout(
                         WRITE_TIMEOUT,
-                        crate::routing::ingress::connect_udp(
-                            &proxy_selector, dest.clone(), &resolver, Some(peer_addr),
+                        crate::routing::ingress::connect_udp_packet(
+                            &proxy_selector, dest.clone(), &resolver, Some(peer_addr), &packet.payload,
                         ),
                     )
                     .await

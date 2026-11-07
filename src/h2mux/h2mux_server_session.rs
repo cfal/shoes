@@ -546,26 +546,40 @@ async fn handle_h2mux_udp(
 ) -> io::Result<()> {
     debug!("H2MUX UDP fixed: {}", destination);
 
-    let route = match timeout_stream_setup(crate::routing::ingress::route_udp(
-        &proxy_selector,
-        destination,
-        &resolver,
-    ))
-    .await
-    {
-        Ok(route) => route.with_source(stream.peer),
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            reject_h2mux_stream(&mut stream, "Connection blocked by rules").await;
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "UDP connection blocked by rules",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
+    let prepared = crate::routing::ingress::PreparedUdp::new(&proxy_selector, destination)?;
+    let optimistic = prepared.needs_sniff(&proxy_selector);
+    let peer = stream.peer;
+    if optimistic {
+        timeout_stream_setup(async {
+            // An empty write emits status; write_all(&[]) would skip poll_write.
+            let _written = stream.write(&[]).await?;
+            stream.flush().await
+        })
+        .await?;
+    }
+    let mut server_stream =
+        crate::routing::ingress::PeekMessageStream::new(VlessMessageStream::new(&mut stream));
+    let route =
+        match timeout_stream_setup(prepared.route(&mut server_stream, &proxy_selector, &resolver))
+            .await
+        {
+            Ok(route) => route.with_source(peer),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                drop(server_stream);
+                if optimistic {
+                    shutdown_stream(&mut stream).await;
+                } else {
+                    reject_h2mux_stream(&mut stream, "Connection blocked by rules").await;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "UDP connection blocked by rules",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
     let setup = timeout_stream_setup(route.connect(&resolver)).await?;
-    let server_stream = VlessMessageStream::new(Box::new(stream));
-    run_udp_copy(Box::new(server_stream), setup.stream, false, false).await
+    run_udp_copy(server_stream, setup.stream, false, false).await
 }
 
 /// Handle UDP stream with per-packet addressing (packet_addr mode)
@@ -613,7 +627,7 @@ mod tests {
         use crate::routing::ingress::tests::{PacketMode, UdpCase, UdpFixture};
         timeout(Duration::from_secs(10), async {
             for packet_addr in [false, true] {
-                for case in [UdpCase::Dns, UdpCase::Tls, UdpCase::Http] {
+                for case in UdpCase::ALL {
                     let mut tasks = JoinSet::new();
                     let fixture = UdpFixture::new(case, &mut tasks).await;
                     let mode = if packet_addr {
@@ -641,7 +655,10 @@ mod tests {
                     let mut bytes = StreamRequest::udp(fixture.target.clone(), packet_addr)
                         .encode()
                         .unwrap();
-                    bytes.extend(fixture.request(mode));
+                    let response_gated = !packet_addr && case == UdpCase::Stun;
+                    if !response_gated {
+                        bytes.extend(fixture.request(mode));
+                    }
                     send.send_data(Bytes::from(bytes), false).unwrap();
                     let inbound = server.accept().await.unwrap();
                     assert_eq!(inbound.request.packet_addr, packet_addr);
@@ -661,11 +678,77 @@ mod tests {
                         peer.read_u8().await.unwrap(),
                         super::super::h2mux_protocol::STATUS_SUCCESS
                     );
+                    if response_gated {
+                        peer.write_all(&fixture.request(mode)).await.unwrap();
+                    }
                     fixture.read_reply(&mut peer, mode).await;
                     while let Some(result) = tasks.join_next().await {
                         result.unwrap();
                     }
                 }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_optimistic_failures_close_without_a_second_status() {
+        use crate::routing::ingress::tests::{PacketMode, protocol_failure_selector};
+        timeout(Duration::from_secs(5), async {
+            for blocked in [true, false] {
+                let target = NetLocation::from_str("192.0.2.1:443", None).unwrap();
+                let (mut peer, server) = tokio::io::duplex(8192);
+                SessionRequest::new(MuxProtocol::H2Mux, false)
+                    .write(&mut peer)
+                    .await
+                    .unwrap();
+                let (client, server) =
+                    tokio::join!(h2::client::handshake(peer), H2MuxServerSession::new(server));
+                let (mut client, connection) = client.unwrap();
+                let mut server = server.unwrap();
+                let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+                let request = http::Request::builder()
+                    .method("CONNECT")
+                    .uri("mux.example:443")
+                    .body(())
+                    .unwrap();
+                let (response, mut send) = client.send_request(request, false).unwrap();
+                send.send_data(
+                    Bytes::from(StreamRequest::udp(target.clone(), false).encode().unwrap()),
+                    false,
+                )
+                .unwrap();
+                let inbound = server.accept().await.unwrap();
+                let handler =
+                    tokio_util::task::AbortOnDropHandle::new(tokio::spawn(handle_h2mux_stream(
+                        inbound,
+                        true,
+                        protocol_failure_selector(blocked),
+                        Arc::new(crate::resolver::NativeResolver),
+                    )));
+                let mut peer = H2MuxStream::new(send, response.await.unwrap().into_body());
+                assert_eq!(
+                    peer.read_u8().await.unwrap(),
+                    super::super::h2mux_protocol::STATUS_SUCCESS
+                );
+                peer.write_all(
+                    &PacketMode::Fixed.packet(&target, &crate::sniff::udp::tests::stun_packet()),
+                )
+                .await
+                .unwrap();
+                peer.flush().await.unwrap();
+                assert_eq!(
+                    handler.await.unwrap().unwrap_err().kind(),
+                    if blocked {
+                        io::ErrorKind::ConnectionRefused
+                    } else {
+                        io::ErrorKind::PermissionDenied
+                    }
+                );
+                let mut extra = Vec::new();
+                let _ = peer.read_to_end(&mut extra).await;
+                assert!(extra.is_empty(), "second status after optimistic success");
             }
         })
         .await
