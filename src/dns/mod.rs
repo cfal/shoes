@@ -19,6 +19,7 @@ mod exchange;
 pub mod fake_ip;
 mod guard;
 mod hickory_resolver;
+mod hosts;
 mod message;
 mod parsed;
 mod proxy_runtime;
@@ -34,6 +35,26 @@ mod tendns_resolver;
 pub(crate) use bootstrap::controlled as controlled_bootstrap;
 pub(crate) use builder::check_interception;
 pub use context::{DnsContext, FakeDnsResolver};
+pub use hosts::StaticHosts;
+
+pub(crate) fn canonical_hostname(name: &str) -> Option<String> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() || name.len() > 253 || name.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    if !name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.as_bytes()[0].is_ascii_alphanumeric()
+            && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
 
 pub(crate) use guard::{SyntheticDnsAnswer, real_only};
 

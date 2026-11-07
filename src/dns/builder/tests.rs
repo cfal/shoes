@@ -207,6 +207,7 @@ async fn dns_whole_path_choices_pin_connections_and_reselect_on_reconnect() {
 
 fn fake_groups(enabled: bool) -> Vec<ExpandedDnsGroup> {
     vec![ExpandedDnsGroup {
+        hosts: Default::default(),
         name: "fake".into(),
         specs: vec![make_spec("system")],
         fake_ip: enabled.then(FakeIpOptions::default),

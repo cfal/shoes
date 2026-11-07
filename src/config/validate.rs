@@ -352,9 +352,14 @@ pub(super) fn create_server_configs_with_memory(
                     })
                 })
         {
+            let message = if group.hosts.is_empty() {
+                "DNS composition referencing a fake IP group requires an explicit fake_ip policy; reference the group directly to share its pool"
+            } else {
+                "DNS composition or inline hosts overlay referencing a fake IP group requires an explicit fake_ip policy for a separate context; to share its pool, put hosts on the referenced group and reference it without an overlay"
+            };
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "DNS composition referencing a fake IP group requires an explicit fake_ip policy; reference the group directly to share its pool",
+                message,
             ));
         }
         fake_policies.insert(name.clone(), policy);
@@ -376,15 +381,16 @@ pub(super) fn create_server_configs_with_memory(
     )?;
 
     for name in dns_group_order {
-        let specs = expanded_dns_groups.get(&name).unwrap();
+        let group = expanded_dns_groups.get(&name).unwrap();
         let expanded_specs = expand_dns_specs(
-            specs,
+            &group.specs,
             &client_groups,
             &named_pems,
             &group_names,
             global_limits,
         )?;
         final_dns_groups.push(ExpandedDnsGroup {
+            hosts: group.hosts.clone(),
             fake_ip: fake_policies.remove(&name).flatten(),
             use_default_resolver: default_dns_groups.contains(&name),
             name,
@@ -865,11 +871,15 @@ fn topological_sort(dependencies: &HashMap<String, Vec<String>>) -> std::io::Res
     Ok(result)
 }
 
-/// Phase 1: Expand DNS group composition references.
-/// Returns a map of group name to flat list of server specs (no group references).
+struct ComposedDnsGroup {
+    specs: Vec<DnsServerSpec>,
+    hosts: crate::dns::StaticHosts,
+}
+
+/// Expands DNS group references and inherits static hosts in reference order.
 fn expand_dns_groups_composition(
     dns_groups: HashMap<String, DnsConfigGroup>,
-) -> std::io::Result<HashMap<String, Vec<DnsServerSpec>>> {
+) -> std::io::Result<HashMap<String, ComposedDnsGroup>> {
     // Build composition dependency graph and validate references
     let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -906,19 +916,23 @@ fn expand_dns_groups_composition(
     })?;
 
     // Expand in topological order
-    let mut expanded: HashMap<String, Vec<DnsServerSpec>> = HashMap::new();
+    let mut expanded: HashMap<String, ComposedDnsGroup> = HashMap::new();
 
     for name in order {
         let group = dns_groups.get(&name).unwrap();
-        let specs: Vec<DnsServerSpec> = group
-            .dns_servers
-            .iter()
-            .flat_map(|spec| match spec.as_group_ref() {
-                Some(ref_name) => expanded.get(ref_name).unwrap().clone(),
-                None => vec![spec.clone()],
-            })
-            .collect();
-        expanded.insert(name, specs);
+        let mut hosts = group.hosts.clone();
+        let mut specs = Vec::new();
+        for spec in group.dns_servers.iter() {
+            match spec.as_group_ref() {
+                Some(ref_name) => {
+                    let referenced = expanded.get(ref_name).unwrap();
+                    hosts.inherit(&referenced.hosts);
+                    specs.extend_from_slice(&referenced.specs);
+                }
+                None => specs.push(spec.clone()),
+            }
+        }
+        expanded.insert(name, ComposedDnsGroup { specs, hosts });
     }
 
     Ok(expanded)
@@ -927,13 +941,14 @@ fn expand_dns_groups_composition(
 /// Phase 2: Topological sort on expanded DNS groups based on bootstrap_url dependencies.
 /// Returns groups in order such that bootstrap dependencies come before dependents.
 fn topological_sort_dns_groups_by_bootstrap(
-    expanded_groups: &HashMap<String, Vec<DnsServerSpec>>,
+    expanded_groups: &HashMap<String, ComposedDnsGroup>,
 ) -> std::io::Result<Vec<String>> {
     // Build dependency graph: for each group, collect which groups it references via bootstrap_url
     let dependencies: HashMap<String, Vec<String>> = expanded_groups
         .iter()
-        .map(|(group_name, specs)| {
-            let deps: Vec<String> = specs
+        .map(|(group_name, group)| {
+            let deps: Vec<String> = group
+                .specs
                 .iter()
                 .filter_map(|spec| spec.bootstrap_url())
                 .filter(|url| expanded_groups.contains_key(*url))
@@ -967,7 +982,7 @@ fn extract_inline_dns(
     };
 
     // Empty means use default resolver - nothing to extract
-    if config.servers.is_empty() && config.fake_ip.is_none() {
+    if config.servers.is_empty() && config.fake_ip.is_none() && config.hosts.is_empty() {
         config.servers = NoneOrSome::None;
         return Ok(());
     }
@@ -976,6 +991,7 @@ fn extract_inline_dns(
     if let NoneOrSome::One(spec) = &config.servers
         && spec.as_group_ref().is_some()
         && config.fake_ip.is_none()
+        && config.hosts.is_empty()
     {
         return Ok(());
     }
@@ -1000,6 +1016,7 @@ fn extract_inline_dns(
     }
 
     let group = DnsConfigGroup {
+        hosts: std::mem::take(&mut config.hosts),
         fake_ip: config.fake_ip.take(),
         dns_group: generated_name.clone(),
         dns_servers: if servers.is_empty() {
@@ -2700,3 +2717,6 @@ mod tests;
 
 #[cfg(test)]
 mod default_dns_tests;
+
+#[cfg(test)]
+mod hosts_tests;

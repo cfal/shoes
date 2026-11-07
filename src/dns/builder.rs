@@ -8,6 +8,7 @@ use rustc_hash::FxHashMap;
 
 use super::context::{DnsContext, FakeDnsResolver};
 use super::fake_ip::{FakeIpOptions, FakeIpPool};
+use super::hosts::HostsResolver;
 use super::real_only;
 use super::system::SystemResolver;
 use crate::config::{ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits, ResolvedDnsConfig};
@@ -885,6 +886,20 @@ pub async fn build_dns_registry_for_runtime(
 
     let mut bootstraps = FxHashMap::default();
     for mut group in groups {
+        if group.hosts.addresses().any(|ip| {
+            registry
+                .forbidden
+                .iter()
+                .any(|range| range.contains(ip.to_canonical()))
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "DNS group '{}' hosts address overlaps a synthetic endpoint",
+                    group.name
+                ),
+            ));
+        }
         let system = group_uses_system(&mut group, &registry.system_groups)?;
         registry.system_groups.insert(group.name.clone(), system);
         for spec in &group.specs {
@@ -919,7 +934,11 @@ pub async fn build_dns_registry_for_runtime(
         } else {
             build_resolver_from_specs(&group.specs, &registry, &group.name, &mut bootstraps).await?
         };
-        let real = real_only(resolver, registry.forbidden.clone());
+        let hosts = Arc::new(group.hosts);
+        let real = real_only(
+            HostsResolver::wrap(hosts.clone(), resolver),
+            registry.forbidden.clone(),
+        );
         let old = previous.and_then(|previous| previous.pools.get(&group.name));
         let resolver: Arc<dyn Resolver> = if let Some(options) = group.fake_ip {
             options.validate()?;
@@ -950,7 +969,8 @@ pub async fn build_dns_registry_for_runtime(
                     pool: pool.clone(),
                 },
             );
-            let context = Arc::new(DnsContext::with_pool(options, real.clone(), pool)?);
+            let context =
+                Arc::new(DnsContext::with_pool(options, real.clone(), pool)?.with_hosts(hosts));
             Arc::new(FakeDnsResolver::new(real, context))
         } else {
             if old.is_some() {

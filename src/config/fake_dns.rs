@@ -190,6 +190,16 @@ pub(super) fn validate(
         }
     }
     if pool_ranges.is_empty() {
+        if protects_tun_endpoints(&config.configs) {
+            let endpoints: Vec<_> = tun_endpoint_ips(&config.configs)
+                .map(|ip| IpNetwork::from(ip.to_canonical()))
+                .collect();
+            for group in &config.dns_groups {
+                for ip in group.hosts.addresses() {
+                    reject(&endpoints, ip, "static hosts address")?;
+                }
+            }
+        }
         return Ok(());
     }
     validate_tun_endpoints(tun_endpoint_ips(&config.configs), &pool_ranges)?;
@@ -275,6 +285,9 @@ impl ValidatedConfigs {
             }
         }
         for group in &self.dns_groups {
+            for ip in group.hosts.addresses() {
+                reject(ranges, ip, "static hosts address")?;
+            }
             for spec in &group.specs {
                 for value in std::iter::once(spec.url.as_str()).chain(spec.bootstrap_url.as_deref())
                 {
