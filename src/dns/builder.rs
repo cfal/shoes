@@ -900,7 +900,6 @@ pub async fn build_dns_registry_for_runtime(
                 ),
             ));
         }
-        let hosts = Arc::new(std::mem::take(&mut group.hosts));
         let system = group_uses_system(&mut group, &registry.system_groups)?;
         registry.system_groups.insert(group.name.clone(), system);
         for spec in &group.specs {
@@ -935,6 +934,7 @@ pub async fn build_dns_registry_for_runtime(
         } else {
             build_resolver_from_specs(&group.specs, &registry, &group.name, &mut bootstraps).await?
         };
+        let hosts = Arc::new(group.hosts);
         let real = real_only(
             HostsResolver::wrap(hosts.clone(), resolver),
             registry.forbidden.clone(),

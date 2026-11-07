@@ -6,10 +6,6 @@ fn validate(yaml: &str) -> std::io::Result<ValidatedConfigs> {
     create_server_configs(serde_yaml::from_str(yaml).map_err(std::io::Error::other)?)
 }
 
-fn address(group: &ExpandedDnsGroup, name: &str) -> IpAddr {
-    group.hosts.lookup(name).unwrap()[0]
-}
-
 #[test]
 fn hosts_compose_with_local_then_reference_order_precedence() {
     let validated = validate(
@@ -46,7 +42,7 @@ fn hosts_compose_with_local_then_reference_order_precedence() {
             .find(|group| group.name == name)
             .unwrap();
         assert_eq!(
-            address(group, "same.test"),
+            group.hosts.lookup("same.test").unwrap()[0],
             expected.parse::<IpAddr>().unwrap()
         );
         if name == "composed" || name == "override" || name == "__inline_dns_0" {

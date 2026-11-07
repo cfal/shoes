@@ -92,6 +92,8 @@ impl StaticHosts {
         if self.is_empty() {
             return None;
         }
+        // Finds mapped questions before validation to keep malformed hits local
+        // without changing unmapped raw request handling.
         let (query, addresses) = request.queries.iter().find_map(|query| {
             if query.query_class != DNSClass::IN
                 || !matches!(query.query_type, RecordType::A | RecordType::AAAA)
@@ -104,7 +106,6 @@ impl StaticHosts {
         if let Some(decision) = precheck(request) {
             return Some(decision);
         }
-        // Malformed requests for mapped names must not fall through to upstream DNS.
         if !request.answers.is_empty()
             || !request.authorities.is_empty()
             || !request.additionals.is_empty()
@@ -148,19 +149,16 @@ impl HostsResolver {
         let Ok(request) = super::message::decode(bytes) else {
             return Ok(None);
         };
-        let answer = match self.hosts.decide(&request) {
-            Some(DnsDecision::Answer(answer)) => Some(answer),
-            Some(DnsDecision::Drop) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "expected DNS query",
-                ));
+        match self.hosts.decide(&request) {
+            Some(DnsDecision::Answer(answer)) => {
+                answer.to_vec().map(Some).map_err(io::Error::other)
             }
-            _ => None,
-        };
-        answer
-            .map(|answer| answer.to_vec().map_err(io::Error::other))
-            .transpose()
+            Some(DnsDecision::Drop) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected DNS query",
+            )),
+            None | Some(DnsDecision::Forward) => Ok(None),
+        }
     }
 }
 

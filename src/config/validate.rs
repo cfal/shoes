@@ -921,18 +921,17 @@ fn expand_dns_groups_composition(
     for name in order {
         let group = dns_groups.get(&name).unwrap();
         let mut hosts = group.hosts.clone();
-        let specs: Vec<DnsServerSpec> = group
-            .dns_servers
-            .iter()
-            .flat_map(|spec| match spec.as_group_ref() {
+        let mut specs = Vec::new();
+        for spec in group.dns_servers.iter() {
+            match spec.as_group_ref() {
                 Some(ref_name) => {
                     let referenced = expanded.get(ref_name).unwrap();
                     hosts.inherit(&referenced.hosts);
-                    referenced.specs.clone()
+                    specs.extend_from_slice(&referenced.specs);
                 }
-                None => vec![spec.clone()],
-            })
-            .collect();
+                None => specs.push(spec.clone()),
+            }
+        }
         expanded.insert(name, ComposedDnsGroup { specs, hosts });
     }
 

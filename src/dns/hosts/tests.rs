@@ -1,8 +1,12 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use hickory_resolver::proto::op::{Edns, Query};
 use hickory_resolver::proto::rr::Name;
+use serde_json::json;
+
+use crate::dns::{DnsContext, build_dns_registry};
 
 fn hosts(yaml: &str) -> StaticHosts {
     serde_yaml::from_str(yaml).unwrap()
@@ -140,10 +144,7 @@ async fn hosts_exchange_answers_both_families_and_nodata_without_fallback() {
         for reply in [
             resolver.exchange(bytes.clone()).await.unwrap(),
             resolver
-                .exchange_with_deadline(
-                    bytes,
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-                )
+                .exchange_with_deadline(bytes, tokio::time::Instant::now() + Duration::from_secs(1))
                 .await
                 .unwrap(),
         ] {
@@ -197,7 +198,7 @@ fn groups(config: serde_json::Value) -> Vec<crate::config::ExpandedDnsGroup> {
 
 #[tokio::test]
 async fn hosts_malformed_mapped_queries_never_fall_through() {
-    use crate::dns::{DnsContext, fake_ip::FakeIpOptions};
+    use crate::dns::fake_ip::FakeIpOptions;
     use hickory_resolver::proto::op::{MessageType, OpCode};
 
     let table = Arc::new(hosts("v4.test: 192.0.2.3"));
@@ -326,7 +327,6 @@ async fn hosts_malformed_mapped_queries_never_fall_through() {
 #[tokio::test]
 async fn hosts_survive_backend_refresh_without_using_it() {
     use crate::resolver::{RefreshPolicy, RefreshingResolver, ResolverFactory};
-    use std::time::Duration;
 
     #[derive(Debug)]
     struct Stale;
@@ -394,8 +394,6 @@ async fn hosts_survive_backend_refresh_without_using_it() {
 #[tokio::test]
 async fn hosts_only_inline_and_default_maps_share_native_fallback_without_leaking() {
     use crate::config::{ResolvedConfig, create_server_configs};
-    use crate::dns::build_dns_registry;
-    use serde_json::json;
 
     let validated = create_server_configs(
         serde_json::from_value(json!([
@@ -445,8 +443,6 @@ async fn hosts_only_inline_and_default_maps_share_native_fallback_without_leakin
 
 #[tokio::test]
 async fn hosts_registry_covers_native_pooled_mixed_and_fake_resolvers() {
-    use crate::dns::{DnsContext, build_dns_registry};
-    use serde_json::json;
     let trap = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let endpoint = format!("udp://127.0.0.1:{}", trap.local_addr().unwrap().port());
     for servers in [
@@ -524,8 +520,7 @@ async fn hosts_registry_covers_native_pooled_mixed_and_fake_resolvers() {
 
 #[tokio::test]
 async fn hosts_bootstrap_and_reload_remain_scoped() {
-    use crate::dns::{build_dns_registry, build_dns_registry_reusing};
-    use serde_json::json;
+    use crate::dns::build_dns_registry_reusing;
     let config = |ip: &str| {
         json!([
             {"dns_group": "bootstrap", "dns_servers": "udp://127.0.0.1:9", "hosts": {"dns.invalid": "127.0.0.1"}},
@@ -603,8 +598,6 @@ async fn hosts_bootstrap_and_reload_remain_scoped() {
 
 #[tokio::test]
 async fn hosts_static_answers_obey_tcp_framing_udp_limits_and_prechecks() {
-    use crate::dns::{DnsContext, build_dns_registry};
-    use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let ips: Vec<_> = (1..=100).map(|last| format!("192.0.2.{last}")).collect();
     for fake in [false, true] {
@@ -682,7 +675,7 @@ async fn hosts_candidates_reach_real_socket_with_first_address_unavailable() {
     );
     let chain = build_direct_chain_group(resolver.clone());
     let target = NetLocation::from_str(&format!("proxy.invalid:{port}"), None).unwrap();
-    let (result, accepted) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let (result, accepted) = tokio::time::timeout(Duration::from_secs(3), async {
         tokio::join!(
             chain.connect_tcp(target.into(), &resolver),
             listener.accept()

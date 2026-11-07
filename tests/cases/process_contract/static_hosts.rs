@@ -142,18 +142,16 @@ async fn static_hosts_dns_reload_replaces_answers_and_rejects_invalid_candidates
         std::fs::write(&path, config.to_string()).unwrap();
         process.signal(libc::SIGHUP);
         process.wait_for("Servers ready").await;
-        for invalid in [false, true] {
-            if invalid {
-                config[0]["hosts"]["static.invalid"] = json!("198.18.0.5");
-                std::fs::write(&path, config.to_string()).unwrap();
-                process.signal(libc::SIGHUP);
-                process.wait_for("Reload rejected").await;
-            }
-            let answer = query(port, RecordType::A).await;
-            assert_eq!(answer.answers.len(), 1);
-            let RData::A(ip) = answer.answers[0].data else { panic!() };
-            assert_eq!(ip.0.to_string(), "192.0.2.3");
-        }
+        let updated = query(port, RecordType::A).await;
+        assert_eq!(updated.answers.len(), 1);
+        let RData::A(ip) = updated.answers[0].data else { panic!() };
+        assert_eq!(ip.0.to_string(), "192.0.2.3");
+
+        config[0]["hosts"]["static.invalid"] = json!("198.18.0.5");
+        std::fs::write(&path, config.to_string()).unwrap();
+        process.signal(libc::SIGHUP);
+        process.wait_for("Reload rejected").await;
+        assert_eq!(query(port, RecordType::A).await.answers, updated.answers);
         assert_eq!(trap.try_recv(&mut [0; 512]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         process.signal(libc::SIGTERM);
         assert!(process.exit().await.success());
