@@ -1,3 +1,6 @@
+[build.env]
+passthrough = ["SHOES_RELEASE_TAG", "SHOES_BUILD_REVISION"]
+
 # cross 0.2.5 images, shared by compilation and packaged-binary smoke tests.
 [target.x86_64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99"

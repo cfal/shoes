@@ -11,7 +11,8 @@ OPTIONS:
   -l, --log-file PATH  Log to a file; repeatable ("-" means stderr)
   -d, --dry-run        Validate config and certificates without starting listeners
   --no-reload          Disable automatic reloads on file changes
-  -V, --version        Print version information
+  -V                   Print the short version
+  --version            Print version, target, and compiler
 
 COMMANDS:
   check <config.yaml>                            Alias for --dry-run
@@ -28,6 +29,24 @@ COMMANDS:
 `generate-vless-encryption` 接受重复的 `--auth x25519|mlkem768`、`--mode native|xorpub|random`、`--rtt 0rtt|1rtt` 和 `--lifetime 600s|N-Ms|0s`。请参阅[VLESS 加密](/zh-cn/protocols/vless-encryption/)。即使使用 `--no-reload`，SIGHUP 也会重新加载配置； SIGINT/SIGTERM 停止监听器，无需等待 TCP 重新加载耗尽。
 
 `check` 和 `--dry-run` 退出，状态 0 表示配置有效，状态 1 表示错误。它们不打开监听器、创建文件观察器或执行 DNS 引导程序网络。成功检查后，仍然可能出现运行时故障，例如不可用的绑定地址。
+
+### 构建信息
+
+报告问题时，请附上 `shoes --version`（或 `shoes version`）的输出。例如：
+
+```text
+shoes 0.3.6+gabc123456789
+target: x86_64-unknown-linux-musl
+compiler: rustc 1.99.1 (58cf8f9c3 2026-10-13)
+```
+
+`shoes -V` 只输出第一行。官方发行版不包含提交后缀；其他构建包含源代码提交哈希的前
+12 位十六进制字符。`.dirty` 表示构建时已跟踪文件存在暂存或未暂存的修改，不统计未跟踪
+文件。`+unknown` 表示无法获取提交信息。所有字段均在编译时嵌入，不会读取运行时的当前目录。
+
+目标三元组标识架构、操作系统和 ABI，包括 `linux-musl` 与 `linux-gnu` 的区别，但不表示
+运行时 libc 的具体版本。编译器字段显示实际使用的编译器，而不是最低支持的 Rust 版本。
+构建元数据的输入方式见[安装](/zh-cn/start/installation/)。
 
 ### Tendns TXT 生成
 

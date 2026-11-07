@@ -19,6 +19,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 1
   CROSS_VERSION: 0.2.5
+  SHOES_BUILD_REVISION: ${{ github.sha }}
+  SHOES_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
 defaults:
   run:
@@ -98,6 +100,10 @@ jobs:
         with:
           toolchain: 1.99.1
           targets: ${{ matrix.target }}
+
+      - name: Test build metadata
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: python3 scripts/test-build-version.py
 
       - name: Install pinned cross binary
         if: matrix.use_cross
