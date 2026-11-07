@@ -125,7 +125,7 @@ impl H2MuxClientSession {
         let (drain_tx, drain_rx) = oneshot::channel();
 
         // Spawn connection driver
-        let abort_handle = tokio::spawn(async move {
+        let abort_handle = crate::network_tasks::spawn(async move {
             // Dropping the last owner must still flush queued DATA and END_STREAM.
             let result = tokio::select! {
                 result = &mut connection => Some(result),
@@ -167,7 +167,7 @@ impl H2MuxClientSession {
         is_closed: Arc<AtomicBool>,
         driver: tokio::task::AbortHandle,
     ) -> tokio::task::AbortHandle {
-        tokio::spawn(async move {
+        crate::network_tasks::spawn(async move {
             let mut timer = interval(PING_INTERVAL);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the first tick which returns immediately

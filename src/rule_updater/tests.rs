@@ -1034,6 +1034,49 @@ async fn pathless_cached_sources_get_stable_names_and_restart_offline() {
 }
 
 #[tokio::test]
+async fn cancelled_cache_save_does_not_lose_the_reload_notification() {
+    let dir = directory();
+    let path = dir.path().join("rules.json");
+    write_rule(&path, OLD);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = source(
+        &format!("http://{}/rules.json", listener.local_addr().unwrap()),
+        &path,
+    );
+    let config = configs(&remote);
+    let mut memory = cached_sources(std::slice::from_ref(&remote));
+    let lease = Arc::new(cache_lease(dir.path()).unwrap());
+    let fixture = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            request(&mut stream).await;
+            stream.write_all(&response(200, "", VALID)).await.unwrap();
+        }
+    });
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let resolved = inline_source(&remote);
+    {
+        let refresh = CACHE_SAVE_ENTERED.scope(
+            entered.clone(),
+            refresh_once(&resolved, &config, &mut memory, Some(lease.clone())),
+        );
+        tokio::pin!(refresh);
+        tokio::select! {
+            result = &mut refresh => panic!("cache save did not pause: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(3), entered.notified()) => result.unwrap(),
+        }
+    }
+    assert_eq!(memory[&path].digest, blake3::hash(OLD));
+    assert!(
+        refresh_once(&resolved, &config, &mut memory, Some(lease))
+            .await
+            .unwrap()
+    );
+    assert_eq!(memory[&path].digest, blake3::hash(VALID));
+    fixture.await.unwrap();
+}
+
+#[tokio::test]
 async fn cache_save_failure_keeps_validated_rules_and_identical_download_retries_saving() {
     let dir = directory();
     let path = dir.path().join("rules.json");

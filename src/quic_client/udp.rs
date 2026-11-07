@@ -126,7 +126,7 @@ pub(super) async fn receive(
             }
             stream = connection.accept_uni(), if is_tuic && streams.len() < QUEUE_SIZE => {
                 let Ok(mut stream) = stream else { break };
-                streams.spawn(async move {
+                crate::network_tasks::spawn_in(&mut streams, async move {
                     tokio::time::timeout(
                         Duration::from_secs(5),
                         stream.read_to_end(tuic::MAX_PACKET),

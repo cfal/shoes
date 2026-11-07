@@ -11,7 +11,8 @@ async fn listener_runtime_cancels_only_the_endpoint_driver_after_grace() {
     let retired = CancellationToken::new();
     let runtime = ListenerRuntime {
         endpoint_started: AtomicBool::new(false),
-        retired: retired.clone(),
+        retired: Some(retired.clone()),
+        network: None,
     };
     let endpoint = Arc::new(());
     let owned_endpoint = endpoint.clone();
@@ -48,13 +49,66 @@ async fn listener_runtime_reaps_a_completed_driver_and_its_watcher() {
     let baseline = metrics.num_alive_tasks();
     let runtime = ListenerRuntime {
         endpoint_started: AtomicBool::new(false),
-        retired: CancellationToken::new(),
+        retired: Some(CancellationToken::new()),
+        network: None,
     };
     runtime.spawn(Box::pin(async {}));
     for _ in 0..4 {
         tokio::task::yield_now().await;
     }
     assert_eq!(metrics.num_alive_tasks(), baseline);
+}
+
+#[tokio::test]
+async fn network_reset_retires_external_quinn_runtime_through_dns_socket() {
+    timeout(Duration::from_secs(3), async {
+        let network = crate::network_tasks::NetworkLifetime::default();
+        let (client_config, server_config) = configs();
+        let server =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let budget = Arc::new(Budget::new(Some(1)));
+        let socket = network
+            .scope(async {
+                socket_with_memory(
+                    std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                    budget.acquire(1).unwrap(),
+                )
+                .unwrap()
+            })
+            .await;
+        let mut client = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .unwrap();
+        client.set_default_client_config(client_config);
+        let (connection, peer) = tokio::join!(
+            async {
+                client
+                    .connect(server.local_addr().unwrap(), "localhost")
+                    .unwrap()
+                    .await
+                    .unwrap()
+            },
+            async { server.accept().await.unwrap().await.unwrap() },
+        );
+        connection
+            .send_datagram(Bytes::from_static(b"before"))
+            .unwrap();
+        assert_eq!(peer.read_datagram().await.unwrap(), b"before"[..]);
+        network.cancel();
+        connection.closed().await;
+        assert!(
+            connection
+                .send_datagram(Bytes::from_static(b"after"))
+                .is_err()
+        );
+        drop((connection, client, peer, server));
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -119,6 +173,7 @@ async fn socket_release_waits_for_delegated_poller() {
     let socket = Arc::new(MemorySocket {
         inner: quinn::TokioRuntime.wrap_udp_socket(socket).unwrap(),
         endpoint_memory: None,
+        cancelled: None,
         _release: Some(release),
     });
     let budget = Arc::new(Budget::new(Some(1)));

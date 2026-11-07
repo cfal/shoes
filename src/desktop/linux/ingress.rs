@@ -140,7 +140,7 @@ impl Ingress {
             .listeners
             .iter()
             .map(|listener| {
-                tokio::spawn(serve(
+                crate::network_tasks::spawn(serve(
                     listener.clone(),
                     selector.clone(),
                     resolver.clone(),
@@ -230,7 +230,7 @@ async fn serve(
         };
         let selector = selector.clone();
         let resolver = resolver.clone();
-        connections.spawn(async move {
+        crate::network_tasks::spawn_in(&mut connections, async move {
             let _permit = permit;
             let _ = crate::tun::handle_tcp_connection(
                 stream,

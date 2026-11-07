@@ -96,6 +96,12 @@ pub struct DnsRegistry {
 }
 
 impl DnsRegistry {
+    pub(crate) fn retire_network(&mut self) {
+        self.groups = Default::default();
+        self.system_groups = Default::default();
+        self.default_resolver = None;
+    }
+
     #[cfg(unix)]
     pub(crate) fn for_rule_bootstrap(
         configs: &[crate::config::Config],
@@ -195,7 +201,7 @@ impl DnsRegistry {
 
     /// Register a DNS group.
     pub fn register(&mut self, name: String, resolver: Arc<dyn Resolver>) {
-        self.groups.insert(name, resolver);
+        self.groups.insert(name, super::network::scoped(resolver));
     }
 
     /// Get a resolver by group name, returns None if not found.
@@ -213,14 +219,14 @@ impl DnsRegistry {
         let forbidden = self.forbidden.clone();
         self.default_resolver
             .get_or_insert_with(|| {
-                real_only(
+                super::network::scoped(real_only(
                     Arc::new(SystemResolver::new(
                         Arc::new(CachingNativeResolver::new()),
                         forbidden.clone(),
                         Duration::from_secs(5),
                     )),
                     forbidden,
-                )
+                ))
             })
             .clone()
     }

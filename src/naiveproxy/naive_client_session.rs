@@ -72,7 +72,7 @@ impl NaiveClientSession {
         errors.start_driver();
 
         let (drain_tx, drain_rx) = oneshot::channel();
-        let abort_handle = tokio::spawn(async move {
+        let abort_handle = crate::network_tasks::spawn(async move {
             // Retired sessions must flush queued DATA and END_STREAM before teardown.
             let result = tokio::select! {
                 result = &mut connection => Some(result),

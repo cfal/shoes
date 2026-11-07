@@ -334,6 +334,22 @@ impl Prepared {
         }
         Ok(())
     }
+
+    pub(crate) async fn refresh_peers(&mut self) -> stdio::Result<()> {
+        let mut failure = None;
+        for endpoint in &mut self.endpoints {
+            for (peer, current) in endpoint.config.peers.iter().zip(&mut endpoint.peers) {
+                match PreparedPeer::resolve(&endpoint.config, peer, &endpoint.outer_resolver).await
+                {
+                    Ok(refreshed) => *current = refreshed,
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
 }
 
 struct EndpointRuntime {
@@ -351,10 +367,14 @@ pub(crate) struct Running {
     endpoints: Vec<EndpointRuntime>,
 }
 impl Running {
-    pub async fn stop(&mut self) {
+    pub(crate) fn cancel(&self) {
         for endpoint in &self.endpoints {
             endpoint.cancel.cancel();
         }
+    }
+
+    pub async fn stop(&mut self) {
+        self.cancel();
         for mut endpoint in self.endpoints.drain(..) {
             let _ = (&mut endpoint.task).await;
         }
@@ -482,7 +502,7 @@ impl PreparedEndpoint {
         let name = config.id.clone();
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(crate::network_tasks::inherit(async move {
             let mut tasks = JoinSet::new();
             let mut inbound_udp_count = None;
             if let Some((selector, resolver)) = inbound {
@@ -494,6 +514,7 @@ impl PreparedEndpoint {
             report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let failed = loop {
                 tokio::select! {
+                    biased;
                     _ = shutdown.cancelled() => break false,
                     _ = device.wait() => break true,
                     _ = &mut stack.done => break true,
@@ -531,7 +552,7 @@ impl PreparedEndpoint {
                 stack.drops.load(Ordering::Relaxed)
             );
             drop(stack);
-        });
+        }));
         Ok(EndpointRuntime { cancel, task })
     }
 }
@@ -558,13 +579,13 @@ fn spawn_inbound(
         limits,
     );
     let udp_count = manager.destination_counter();
-    tasks.spawn(async move {
+    crate::network_tasks::spawn_in(tasks, async move {
         if let Err(error) = manager.run().await {
             log::warn!("WireGuard UDP forwarding stopped: {error}");
         }
     });
     let mut tcp = stack.tcp.take().unwrap();
-    tasks.spawn(async move {
+    crate::network_tasks::spawn_in(tasks, async move {
         let mut flows = JoinSet::new();
         loop {
             let connection = tokio::select! {
@@ -576,7 +597,7 @@ fn spawn_inbound(
             };
             let selector = selector.clone();
             let resolver = resolver.clone();
-            flows.spawn(async move {
+            crate::network_tasks::spawn_in(&mut flows, async move {
                 log::debug!(
                     "WireGuard TCP {} -> {}",
                     connection.source,

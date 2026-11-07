@@ -327,7 +327,7 @@ impl ClientSessionState {
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let writer_state = Arc::clone(&session);
-        let writer_task = tokio::spawn(async move {
+        let writer_task = crate::network_tasks::spawn(async move {
             tokio::select! {
                 result = Self::writer_loop(
                     Arc::downgrade(&writer_state), writer, outgoing_rx,
@@ -341,8 +341,8 @@ impl ClientSessionState {
             }
             writer_state.close();
         });
-        let watchdog_task = tokio::spawn(Self::watchdog_loop(Arc::clone(&session)));
-        let reader_task = tokio::spawn(async move {
+        let watchdog_task = crate::network_tasks::spawn(Self::watchdog_loop(Arc::clone(&session)));
+        let reader_task = crate::network_tasks::spawn(async move {
             tokio::select! {
                 result = Self::reader_loop(
                     Arc::downgrade(&session), reader, session.close_notify.clone(),

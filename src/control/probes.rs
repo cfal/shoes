@@ -42,11 +42,16 @@ struct FullBudgetAttempts {
 }
 
 pub struct ProbeState {
-    connectors: Mutex<HashMap<String, Arc<ClientChainGroup>>>,
+    transports: Mutex<Arc<ProbeTransports>>,
     history: Mutex<HashMap<String, History>>,
     full_budget_attempts: Mutex<HashMap<String, FullBudgetAttempts>>,
+}
+
+struct ProbeTransports {
+    connectors: Mutex<HashMap<String, Arc<ClientChainGroup>>>,
     resolver: Arc<dyn Resolver>,
     forbidden: Vec<ipnetwork::IpNetwork>,
+    network: Option<crate::network_tasks::NetworkTasks>,
 }
 
 impl ProbeState {
@@ -61,12 +66,20 @@ impl ProbeState {
 
     pub fn new(resolver: Arc<dyn Resolver>, forbidden: Vec<ipnetwork::IpNetwork>) -> Self {
         Self {
-            connectors: Mutex::new(HashMap::new()),
+            transports: Mutex::new(Arc::new(ProbeTransports::new(resolver, forbidden))),
             history: Mutex::new(HashMap::new()),
             full_budget_attempts: Mutex::new(HashMap::new()),
-            resolver,
-            forbidden,
         }
+    }
+
+    pub(crate) fn reset_network(
+        &self,
+        resolver: Arc<dyn Resolver>,
+        forbidden: Vec<ipnetwork::IpNetwork>,
+    ) {
+        let replacement = Arc::new(ProbeTransports::new(resolver, forbidden));
+        *self.transports.lock() = replacement;
+        self.full_budget_attempts.lock().clear();
     }
 
     pub fn decorate(&self, name: &str, object: &mut Value) {
@@ -165,6 +178,17 @@ impl ProbeState {
             urls.shift_remove_index(0);
         }
         urls.insert(query.url.to_string(), tokio::time::Instant::now());
+    }
+}
+
+impl ProbeTransports {
+    fn new(resolver: Arc<dyn Resolver>, forbidden: Vec<ipnetwork::IpNetwork>) -> Self {
+        Self {
+            connectors: Mutex::new(HashMap::new()),
+            resolver,
+            forbidden,
+            network: crate::network_tasks::NetworkTasks::current(),
+        }
     }
 
     fn connector(&self, catalog: &Catalog, name: &str) -> io::Result<Arc<ClientChainGroup>> {
@@ -669,12 +693,29 @@ async fn request_with_tls_config(
     query: &ProbeQuery,
     tls_config: impl FnOnce() -> rustls::ClientConfig,
 ) -> io::Result<(u16, bool)> {
-    let resolver = ProbeResolver::for_query(
-        generation.probes.resolver.clone(),
-        &generation.probes.forbidden,
-        query,
-    )?;
-    let chain = generation.probes.connector(&generation.catalog, name)?;
+    let transports = generation.probes.transports.lock().clone();
+    let request =
+        request_with_transports(&transports, &generation.catalog, name, query, tls_config);
+    match &transports.network {
+        Some(network) => tokio::select! {
+            biased;
+            _ = network.cancelled.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "probe network retired")),
+            result = network.scope(request) => result,
+        },
+        None => request.await,
+    }
+}
+
+async fn request_with_transports(
+    transports: &ProbeTransports,
+    catalog: &Catalog,
+    name: &str,
+    query: &ProbeQuery,
+    tls_config: impl FnOnce() -> rustls::ClientConfig,
+) -> io::Result<(u16, bool)> {
+    let resolver =
+        ProbeResolver::for_query(transports.resolver.clone(), &transports.forbidden, query)?;
+    let chain = transports.connector(catalog, name)?;
     let started = Instant::now();
     let host = query
         .url

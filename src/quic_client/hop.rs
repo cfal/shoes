@@ -74,16 +74,18 @@ impl HoppingSocket {
             task: parking_lot::Mutex::new(None),
         });
         let weak = Arc::downgrade(&socket);
-        *socket.task.lock() = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-            loop {
-                let seconds = rand::rng().random_range(min..=max);
-                tokio::time::sleep(Duration::from_secs(seconds)).await;
-                let Some(socket) = weak.upgrade() else { return };
-                if let Err(error) = socket.hop() {
-                    log::warn!("HY2 port hop failed; keeping current socket: {error}");
+        *socket.task.lock() = Some(AbortOnDropHandle::new(crate::network_tasks::spawn(
+            async move {
+                loop {
+                    let seconds = rand::rng().random_range(min..=max);
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    let Some(socket) = weak.upgrade() else { return };
+                    if let Err(error) = socket.hop() {
+                        log::warn!("HY2 port hop failed; keeping current socket: {error}");
+                    }
                 }
-            }
-        })));
+            },
+        )));
         Ok(socket)
     }
 

@@ -79,7 +79,7 @@ pub(super) async fn authenticate(
         .await
         .map_err(io::Error::other)?;
     let hold = sender.clone();
-    let task = AbortOnDropHandle::new(tokio::spawn(async move {
+    let task = AbortOnDropHandle::new(crate::network_tasks::spawn(async move {
         // Both the driver and at least one SendRequest must survive authentication.
         let _hold = hold;
         let _ = driver.wait_idle().await;

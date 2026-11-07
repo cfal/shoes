@@ -122,7 +122,7 @@ fn test_provider_is_clone() {
 
 #[test]
 fn test_spawn_handle_is_clone() {
-    let handle = TokioSpawnHandle;
+    let handle = TokioSpawnHandle::default();
     let _cloned = handle.clone();
 }
 

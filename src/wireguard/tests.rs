@@ -106,6 +106,42 @@ async fn start_prepared(prepared: &Prepared) -> Running {
     running
 }
 
+#[tokio::test]
+async fn reconnect_resolves_peers_again_and_retries_without_replacing_connectors() {
+    #[derive(Debug)]
+    struct Answer(Option<SocketAddr>);
+    impl Resolver for Answer {
+        fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+            let address = self.0;
+            Box::pin(async move {
+                address.map(|address| vec![address]).ok_or_else(|| {
+                    stdio::Error::new(stdio::ErrorKind::NotConnected, "network unavailable")
+                })
+            })
+        }
+    }
+    let mut configs = validate(&pair_config(51820)).unwrap();
+    let mut prepared = Prepared::new(&mut configs).await.unwrap();
+    let connector = prepared.endpoints[CLIENT].connector.clone();
+    let original = prepared.endpoints[CLIENT].peers[0].endpoints.clone();
+    prepared.endpoints[CLIENT].config.peers[0].endpoint = Some("peer.test:51820".into());
+    prepared.endpoints[CLIENT].outer_resolver = Arc::new(Answer(None));
+    let later = "192.0.2.10:51820".parse().unwrap();
+    prepared.endpoints[SERVER].config.peers[0].endpoint = Some("later.test:51820".into());
+    prepared.endpoints[SERVER].outer_resolver = Arc::new(Answer(Some(later)));
+    assert!(prepared.refresh_peers().await.is_err());
+    assert_eq!(prepared.endpoints[CLIENT].peers[0].endpoints, original);
+    assert_eq!(prepared.endpoints[SERVER].peers[0].endpoints, [later]);
+    let replacement = "192.0.2.9:51820".parse().unwrap();
+    prepared.endpoints[CLIENT].outer_resolver = Arc::new(Answer(Some(replacement)));
+    prepared.refresh_peers().await.unwrap();
+    assert_eq!(prepared.endpoints[CLIENT].peers[0].endpoints, [replacement]);
+    assert!(Arc::ptr_eq(
+        &connector,
+        &prepared.endpoints[CLIENT].connector
+    ));
+}
+
 fn dns_answer(bytes: &[u8]) -> Vec<u8> {
     use hickory_resolver::proto::{
         op::{Message, MessageType},

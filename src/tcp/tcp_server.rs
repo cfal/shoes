@@ -566,7 +566,7 @@ pub(crate) async fn start_servers_with_listeners(
             let task = tokio_util::task::AbortOnDropHandle::new(
                 start_tun_server(tun_config, resolver).await?,
             );
-            Ok(vec![tokio::spawn(async move {
+            Ok(vec![crate::network_tasks::spawn(async move {
                 if let Err(error) = task
                     .await
                     .unwrap_or_else(|error| Err(std::io::Error::other(error)))
@@ -681,7 +681,7 @@ async fn start_tcp_servers(
                 let tcp_config = tcp_config.clone();
                 let resolver = resolver.clone();
                 let admission = sockets.admission.clone();
-                handles.push(tokio::spawn(async move {
+                handles.push(crate::network_tasks::spawn(async move {
                     // Uncommitted flows must not outlive rollback through graceful draining.
                     if let Some(admission) = admission {
                         admission.cancelled().await;
@@ -709,7 +709,7 @@ async fn start_tcp_servers(
                     create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)?
                         .into();
                 let admission = sockets.admission.clone();
-                let handle = tokio::spawn(async move {
+                let handle = crate::network_tasks::spawn(async move {
                     if let Some(admission) = admission {
                         admission.cancelled().await;
                     }
