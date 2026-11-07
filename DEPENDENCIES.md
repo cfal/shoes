@@ -29,22 +29,38 @@ not sufficient. Keep `publish = false` while workspace patches remain.
 
 ### smoltcp
 
-The October 2026 refresh rebases the two TCP recovery commits from published
-`cfal/smoltcp` main (`a80fa50dce926117669ef061f55f4d6bdad0904a`) onto upstream
-[`24bda3b4f982625d8453d4360172557d24921c76`](https://github.com/smoltcp-rs/smoltcp/commit/24bda3b4f982625d8453d4360172557d24921c76).
-Their previous upstream base was `72a0d7892d696620541b1147c7cac471d421e554`,
-not the older release-based `fix/tcp-ack-sequence` branch. The new series lives
-on `shoes/tcp-recovery-20261028-GsfiI8`, pinned at
-[`042e568bfa39d0f111a23a4718ec257e474fd1e7`](https://github.com/cfal/smoltcp/commit/042e568bfa39d0f111a23a4718ec257e474fd1e7);
-existing branches and old pins remain intact.
+The maintained TCP recovery series originates on published `cfal/smoltcp` main
+(`a80fa50dce926117669ef061f55f4d6bdad0904a`), based on upstream
+`72a0d7892d696620541b1147c7cac471d421e554`, not the older release-based
+`fix/tcp-ack-sequence` branch. The October refresh added regression coverage and
+rebased it onto `24bda3b4f982625d8453d4360172557d24921c76`, producing the previous
+pin [`042e568bfa39d0f111a23a4718ec257e474fd1e7`](https://github.com/cfal/smoltcp/commit/042e568bfa39d0f111a23a4718ec257e474fd1e7).
 
-The package version and latest registry release are still **0.14.0**. The new
-upstream change is unreleased [smoltcp #1223](https://github.com/smoltcp-rs/smoltcp/pull/1223):
-defensively clamp the remaining advertised receive window after FIN consumes
-sequence space at a full window. Earlier post-release RTO bounds, zero-window
-timer recovery, failed-fast-retransmission retry and no-std CUBIC fixes were
-already in our pin and remain included. This refresh changes no public API, features, dependencies,
-Rust minimum or platform support.
+The November 2026 refresh retains all three October commits on upstream
+[`8b0e5c8598647fe92e2a1b87932d1932354fee0b`](https://github.com/smoltcp-rs/smoltcp/commit/8b0e5c8598647fe92e2a1b87932d1932354fee0b).
+The series lives on `shoes/tcp-recovery-20261107-000034`, pinned at
+[`7ef43e497f575cb0340a43e4f414f0f0b8760bf6`](https://github.com/cfal/smoltcp/commit/7ef43e497f575cb0340a43e4f414f0f0b8760bf6);
+existing branches, tags and old pins remain intact.
+
+The package version and latest stable registry release remain **0.14.0**.
+The new upstream changes are unreleased: [#1242](https://github.com/smoltcp-rs/smoltcp/pull/1242)
+cancels an armed idle keepalive deadline when `set_keep_alive(None)` is called,
+without cancelling retransmission, persist or closing timers. Shoes uses this
+when draining orphaned connections. [#1238](https://github.com/smoltcp-rs/smoltcp/pull/1238)
+ends SLAAC polling after router solicitations are exhausted, and
+[#1240](https://github.com/smoltcp-rs/smoltcp/pull/1240) adds `Interface::reset_slaac()`.
+SLAAC remains disabled in Shoes. Features, dependencies, Rust minimum and
+platform requirements are unchanged; no Shoes adapter changes are required.
+Earlier RTO bounds, zero-window timer recovery, failed-fast-retransmission retry,
+no-std CUBIC and full-window FIN clamping fixes remain included.
+
+The refresh also fixes upstream's optional-deadline combination: an exhausted
+SLAAC timer must not erase a pending socket deadline, and an idle socket set must
+not erase a pending solicitation. An interface regression exercises exhaustion,
+a pending TCP SYN, restarted solicitation scheduling and competing deadlines.
+The keepalive sequence regression adds an open-window case that distinguishes
+SND.UNA from the frontier, alongside the existing closed-window case. Both check
+that probes leave the retransmission cursor and send frontier unchanged.
 
 Preserve the complete recovery patch, not only its persistent send frontier:
 

@@ -143,9 +143,9 @@ The `nix` patch pins an [upstream commit](https://github.com/nix-rust/nix/commit
 containing [nix #2821](https://github.com/nix-rust/nix/pull/2821) for iOS socket
 compatibility. Retain it until adopting a registry release containing that fix.
 
-The `smoltcp` patch pins our [rebased TCP recovery fork](https://github.com/cfal/smoltcp/tree/042e568bfa39d0f111a23a4718ec257e474fd1e7)
+The `smoltcp` patch pins our [rebased TCP recovery fork](https://github.com/cfal/smoltcp/tree/7ef43e497f575cb0340a43e4f414f0f0b8760bf6)
 to preserve TCP ACK sequencing during partial retransmission in TUN and WireGuard.
-It tracks unreleased upstream main after 0.14.0, including the receive-window arithmetic fix;
+It tracks unreleased upstream main after 0.14.0, including keepalive cancellation;
 see [fork maintenance notes](DEPENDENCIES.md#smoltcp) for provenance and invariants.
 Retain it until adopting a registry release with equivalent loss-recovery fixes.
 When updating the pin, run the fork's `socket::tcp::test::` regressions with Reno
