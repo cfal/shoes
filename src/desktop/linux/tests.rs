@@ -205,22 +205,51 @@ fn managed_firewall_schema_preserves_masks_and_reply_exemption() {
         [Some(12345), Some(12346)],
         true,
     );
-    let typed: nftables::schema::Nftables<'_> = serde_json::from_value(policy.clone()).unwrap();
-    let serialized = serde_json::to_value(typed).unwrap();
-    assert_eq!(
-        command::encode_nft(policy.clone()).unwrap(),
-        serde_json::to_vec(&serialized).unwrap(),
-    );
-    let text = serialized.to_string();
+    let text = String::from_utf8(checked_nft_bytes(policy)).unwrap();
     assert!(text.contains("reply"));
     assert!(text.contains(&(!spec.linux.mark_mask).to_string()));
     assert!(!text.contains("192.0.2.64"));
-    for batch in [
-        nft::update_onlink("shoes_test", &[]),
-        nft::remove("shoes_test"),
-    ] {
-        serde_json::from_value::<nftables::schema::Nftables<'_>>(batch).unwrap();
+}
+
+fn checked_nft_bytes(batch: serde_json::Value) -> Vec<u8> {
+    let bytes = command::encode_nft(batch.clone()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        batch
+    );
+    let typed: nftables::schema::Nftables<'_> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_value(typed).unwrap(), batch);
+    bytes
+}
+
+#[test]
+fn managed_firewall_batches_preserve_json_and_match_schema() {
+    let on_link = [
+        "192.0.2.0/24".parse().unwrap(),
+        "2001:db8::/64".parse().unwrap(),
+    ];
+    for enabled in [false, true] {
+        let mut spec = spec(true);
+        spec.auto_dns = enabled;
+        spec.dns_hijack = enabled;
+        spec.icmp = enabled;
+        for active in [false, true] {
+            for ports in [
+                [None, None],
+                [Some(12345), None],
+                [None, Some(12346)],
+                [Some(12345), Some(12346)],
+            ] {
+                let policy = nft::install(&spec, "shoes_test", "token", &on_link, ports, active);
+                checked_nft_bytes(policy.clone());
+                checked_nft_bytes(nft::replace("shoes_test", policy));
+            }
+        }
     }
+    for networks in [&[][..], &on_link[..1], &on_link[1..], &on_link[..]] {
+        checked_nft_bytes(nft::update_onlink("shoes_test", networks));
+    }
+    checked_nft_bytes(nft::remove("shoes_test"));
 }
 
 #[test]
