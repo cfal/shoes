@@ -176,7 +176,7 @@ async fn hosts_exchange_answers_both_families_and_nodata_without_fallback() {
                 answer
                     .answers
                     .iter()
-                    .all(|record| record.ttl == HOSTS_TTL && record.record_type() == kind)
+                    .all(|record| record.ttl == 60 && record.record_type() == kind)
             );
         }
     }
