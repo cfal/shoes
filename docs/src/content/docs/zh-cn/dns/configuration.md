@@ -37,6 +37,8 @@ description: "选择解析器、可重用组、引导程序和代理路由。"
 
 `ip_strategy` 还接受 `ipv4_only`、`ipv6_only`、`ipv4_and_ipv6` 和 `ipv6_then_ipv4`。选项对象拒绝未知字段。非系统上游无法设置 `native_cache_secs`，甚至为零。 `bootstrap_url` 本身不得包含主机名；命名组可用于多步引导，但循环被拒绝。
 
+TCP 和 TLS 丢弃已失效查询的响应后，会继续处理缓冲区中的其他响应。这不会增加重试次数或延长配置的超时时间。
+
 TCP、TLS和HTTPS上游可以使用代理链。 UDP 和 H3 上游仅是直接的，但直接链可以设置接口绑定； `system` 不支持客户端链。 WireGuard 路由的 DNS 需要字面上的上游 IP，而不需要 `bootstrap_url`。请参阅[远程规则源](/zh-cn/routing/remote-sources/) 了解更严格的启动引导规则。
 
 `client_chain` 和 `client_chains` 是完全等价的别名，使用[路由链语法](/zh-cn/routing/rules/#client-chains)：`[a, b]` 表示顺序跃点，而 `[{chain: [a]}, {chain: [b]}]` 表示备选路径。命名客户端组保留其完整路径选项和选择策略。
