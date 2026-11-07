@@ -79,13 +79,18 @@ considering the destination; independent connections in this all-loopback topolo
 can share that pair and trigger a false routing-loop rejection during churn.
 Other Mihomo fixtures retain their existing environment and loop detection.
 
-Xray client H2C is not included. Packet-up does not signal upload FIN. A completely
-stalled session can retain shared-carrier flow-control credit, so the pressure
-tests require recovery after consumption resumes, not independent progress while
-the shared window is exhausted. Attached out-of-window POSTs wait for their
-predecessors subject to packet inactivity. Normal pressure fixtures leave aggregate
-and per-session request caps unlimited; client pipeline depth, transport flow
-control and the 250-request per-connection limit still constrain concurrency.
+Xray client H2C is not included. Packet-up does not signal upload FIN. With
+`pool.h2_receive_admission: true`, Shoes H2 clients reserve a stream-window share
+of connection credit per download, with fail-fast admission when their bounded
+pool fills. This is opt-in because packet-up download tails retain admission
+after local upload EOF, reducing churn capacity. Paused-download library tests
+require independent progress for admitted sessions. Server upload pressure and
+application-global byte-budget exhaustion can still retain shared credit; those
+pressure tests require recovery after consumption resumes. Attached out-of-window
+POSTs wait for their predecessors subject to packet inactivity. Normal pressure
+fixtures leave aggregate and per-session request caps unlimited; client pipeline
+depth, transport flow control and the 250-request per-connection limit still
+constrain concurrency.
 The explicit 128-request Xray H2 case covers per-session refusal and recovery.
 Deterministic GOAWAY, credit starvation, timeout races, and memory-release ordering
 remain covered by the XHTTP library tests.

@@ -135,7 +135,10 @@ connections, at most 64 H1 connections, and a 60-second idle timeout.
   either client bound backpressures the local writer. Pool limits may constrain
   concurrency further. H1 keeps one ACK-gated POST on a reusable upload connection,
   plus the download connection; it does not open opportunistic upload connections
-  or use raw HTTP/1 pipelining. Use H2/H3 for high-latency packet-up throughput.
+  or use raw HTTP/1 pipelining. Without an application byte cap it collects one
+  bounded successor POST while waiting for the ACK. Explicit global or session
+  byte caps retain ACK-gated collection so lookahead cannot occupy memory needed
+  by download data preceding the ACK. Use H2/H3 for pipelined packet-up throughput.
   Unsent bytes remain subject to any configured byte budgets;
   successfully transmitted bodies are not retained while awaiting ACKs.
   Outstanding POST payload sizes also count against a separate logical credit
@@ -172,11 +175,33 @@ connections, at most 64 H1 connections, and a 60-second idle timeout.
   on the same carrier. Server packet inactivity timeouts still bound stalled waits.
   Slowly progressing sessions can hold global byte-budget capacity and shared
   carrier flow-control credit indefinitely, so other sessions may time out.
-- H2 receive windows default to 4 MiB per stream and 8 MiB per connection through
+- H2 receive windows default to 4 MiB per stream, 64 MiB per client connection
+  and 8 MiB per server connection through
   `limits.h2_stream_window_bytes` and `limits.h2_connection_window_bytes`. The
   stream window is capped by the effective (configured or derived) session byte
   limit and any configured global byte limit. The connection window is capped
   by an explicit global byte limit, with HTTP/2's mandatory 65535-byte minimum.
+  The client also clamps its stream window to its connection window. The larger
+  default connection window mitigates shared-credit stalls but does not guarantee
+  progress under arbitrary paused-reader fan-out.
+- Opt-in client `pool.h2_receive_admission: true` admits at most
+  `floor(connection_window / stream_window)` downloads per carrier.
+  This reserves credit for each admitted download even if other consumers pause.
+  With default windows, this allows 16 downloads per carrier, or 48 across the default
+  three-carrier pool. Empty packet acknowledgements and continuously drained
+  upload responses do not consume download admission. Full carriers spill to
+  another matching-route carrier within `pool.max_connections`; exhaustion
+  rejects new sessions rather than silently sharing insufficient receive credit.
+  An explicit 8 MiB connection window with 4 MiB streams therefore admits only
+  two downloads per carrier. Application-global byte-budget exhaustion can still
+  backpressure unrelated sessions; admission does not make that budget fair.
+  Byte-budget clamps also reduce admission: for example, a 1 MiB global byte cap
+  without an explicit session cap allows only one download per carrier (three
+  across the default pool). Download-only packet-up tails retain admission until
+  peer EOF, cancellation or `download_idle_timeout_secs` expiry; local upload EOF
+  alone does not release it. This option defaults to `false`: ordinary packet-up
+  connection churn against keep-alive or echo destinations can fill the pool with
+  lingering tails. Prefer streaming modes when enabling this admission policy.
   Increase windows and effective byte limits for higher bandwidth-delay products.
   When a global byte cap is set, stream windows above 4 MiB also require an
   explicit `limits.max_session_buffered_bytes` above 4 MiB.

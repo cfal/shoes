@@ -8,7 +8,7 @@ use tokio::{
 };
 
 use super::{
-    carrier::{Carrier, Reservation, Timeouts},
+    carrier::{Carrier, ReceiveGuard, Reservation, Timeouts},
     connector::Security,
     stream::{Activity, Body, Event, Memory, Reader, Stream, Tasks, UploadSignal, pipe},
     wire::{self, Path},
@@ -57,7 +57,8 @@ impl Drop for SlotPermit {
 struct Lease {
     carrier: Arc<Carrier>,
     reservation: Option<Reservation>,
-    _permit: SlotPermit,
+    download_permit: Option<OwnedSemaphorePermit>,
+    slot_permit: Arc<SlotPermit>,
 }
 
 #[derive(Default)]
@@ -80,7 +81,7 @@ impl Lease {
     async fn request(
         &mut self,
         client: &Client,
-        request: Request<Body>,
+        mut request: Request<Body>,
         memory: Memory,
         tasks: &Tasks,
         packet: bool,
@@ -95,7 +96,7 @@ impl Lease {
                 .await??
             }
         };
-        if self._permit.slot.as_ref().is_some_and(|slot| {
+        if self.slot_permit.slot.as_ref().is_some_and(|slot| {
             slot.active() > self.carrier.capacity(client.config.limits.request_limit())
         }) {
             return Err(crate::resources::exhausted());
@@ -108,6 +109,11 @@ impl Lease {
         } else {
             Timeouts::headers(client.header_timeout())
         };
+        if let Some(download) = self.download_permit.take() {
+            request
+                .extensions_mut()
+                .insert(ReceiveGuard::new((download, self.slot_permit.clone())));
+        }
         self.carrier
             .request_reserved(request, memory, tasks, timeouts, reservation)
             .await
@@ -224,7 +230,7 @@ impl Client {
                         stream,
                         self.version,
                         header_limit,
-                        self.config.limits.h2_windows(),
+                        self.config.limits.h2_client_windows(),
                     )
                     .await
                 }
@@ -233,7 +239,11 @@ impl Client {
         .await?
     }
 
-    async fn lease(&self, dialer: &Arc<dyn CarrierDialer>, allow_dial: bool) -> io::Result<Lease> {
+    async fn lease(
+        &self,
+        dialer: &Arc<dyn CarrierDialer>,
+        receive_admission: bool,
+    ) -> io::Result<Lease> {
         let (slot, permit) = {
             let mut slots = self.slots.lock();
             let idle = Duration::from_secs(self.config.pool.idle_timeout_secs);
@@ -248,21 +258,27 @@ impl Client {
                 let Ok(Some(reservation)) = carrier.try_reserve() else {
                     continue;
                 };
+                let download_permit = if receive_admission {
+                    let Ok(permit) = carrier.admit_download() else {
+                        continue;
+                    };
+                    permit
+                } else {
+                    None
+                };
                 return Ok(Lease {
                     carrier: carrier.clone(),
                     reservation: Some(reservation),
-                    _permit: SlotPermit {
+                    download_permit,
+                    slot_permit: Arc::new(SlotPermit {
                         _permit: slot
                             .requests
                             .clone()
                             .try_acquire_owned()
                             .map_err(|_| crate::resources::exhausted())?,
                         slot: Some(slot.clone()),
-                    },
+                    }),
                 });
-            }
-            if !allow_dial {
-                return Err(crate::resources::exhausted());
             }
             if slots.len() >= self.config.pool.max_connections
                 && let Some(oldest) = slots
@@ -286,14 +302,14 @@ impl Client {
                 limit,
                 last_used: parking_lot::Mutex::new(tokio::time::Instant::now()),
             });
-            let permit = SlotPermit {
+            let permit = Arc::new(SlotPermit {
                 _permit: slot
                     .requests
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| crate::resources::exhausted())?,
                 slot: Some(slot.clone()),
-            };
+            });
             slots.push(slot.clone());
             (slot, permit)
         };
@@ -305,12 +321,18 @@ impl Client {
             let reservation = carrier
                 .try_reserve()?
                 .ok_or_else(crate::resources::exhausted)?;
+            let download_permit = if receive_admission {
+                carrier.admit_download()?
+            } else {
+                None
+            };
             // Publish only after the initializer owns its stream credit.
             assert!(slot.carrier.set(carrier.clone()).is_ok());
             Ok(Lease {
                 carrier,
                 reservation: Some(reservation),
-                _permit: permit,
+                download_permit,
+                slot_permit: permit,
             })
         }
         .await;
@@ -360,28 +382,41 @@ impl Client {
                 } else {
                     2
                 };
-                let mut lanes = Vec::new();
-                if self.version == XhttpVersion::H1 {
+                let mut lanes = if self.version == XhttpVersion::H1 {
                     let mut permit = self
                         .h1_slots
                         .clone()
                         .try_acquire_many_owned(count)
                         .map_err(|_| crate::resources::exhausted())?;
-                    for _ in 0..count {
-                        lanes.push(Lease {
-                            carrier: self.dial(&dialer).await?,
-                            reservation: None,
-                            _permit: SlotPermit {
-                                _permit: permit.split(1).unwrap(),
-                                slot: None,
-                            },
+                    futures::future::try_join_all((0..count).map(|_| {
+                        let permit = Arc::new(SlotPermit {
+                            _permit: permit.split(1).unwrap(),
+                            slot: None,
                         });
-                    }
+                        let dialer = &dialer;
+                        async move {
+                            Ok::<_, io::Error>(Lease {
+                                carrier: self.dial(dialer).await?,
+                                reservation: None,
+                                download_permit: None,
+                                slot_permit: permit,
+                            })
+                        }
+                    }))
+                    .await?
                 } else {
-                    for _ in 0..count {
-                        lanes.push(self.lease(&dialer, true).await?);
+                    let mut lanes = Vec::new();
+                    for index in 0..count {
+                        lanes.push(
+                            self.lease(
+                                &dialer,
+                                index == 0 && self.config.pool.h2_receive_admission,
+                            )
+                            .await?,
+                        );
                     }
-                }
+                    lanes
+                };
                 let download = lanes.remove(0);
                 let mut upload = lanes.pop();
                 if self.mode == XhttpMode::PacketUp {
@@ -588,6 +623,9 @@ impl Client {
                 .sc_max_each_post_bytes
                 .bounds((1_000_000, 1_000_000), false)?,
         ) as usize;
+        // With a shared byte cap, staging can consume space needed by a download before its ACK.
+        let h1_lookahead =
+            self.version == XhttpVersion::H1 && self.config.limits.session_byte_limit().is_none();
         let concurrency = if self.version == XhttpVersion::H1 {
             1
         } else {
@@ -605,8 +643,9 @@ impl Client {
         let mut sequence = 0u64;
         let mut next_post_at = tokio::time::Instant::now();
         loop {
-            while inflight.len() >= concurrency
-                || sequence - window.next >= self.config.packet_pipeline_depth as u64
+            while !h1_lookahead
+                && (inflight.len() >= concurrency
+                    || sequence - window.next >= self.config.packet_pipeline_depth as u64)
             {
                 idle_lane.get_or_insert(window.acknowledge(inflight.next().await.unwrap()?));
             }
@@ -653,18 +692,33 @@ impl Client {
                         }
                         event = match reader.receiver.try_recv() {
                             Ok(event) => Some(event),
-                            Err(_) if tokio::time::Instant::now() < next_post_at => loop {
-                                tokio::select! {
-                                    biased;
-                                    _ = tokio::time::sleep_until(next_post_at) => break None,
-                                    done = inflight.next(), if !inflight.is_empty() => {
-                                        idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
+                            Err(_)
+                                if tokio::time::Instant::now() < next_post_at
+                                    || (h1_lookahead && !inflight.is_empty()) =>
+                            {
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        done = inflight.next(), if !inflight.is_empty() => {
+                                            idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
+                                            if tokio::time::Instant::now() >= next_post_at {
+                                                break None;
+                                            }
+                                        }
+                                        _ = tokio::time::sleep_until(next_post_at),
+                                            if !h1_lookahead || inflight.is_empty() => break None,
+                                        event = reader.receiver.recv() => break event,
                                     }
-                                    event = reader.receiver.recv() => break event,
                                 }
-                            },
+                            }
                             Err(_) => None,
                         };
+                    }
+                    // H1 stages one bounded successor while its existing lane awaits the ACK.
+                    if self.version == XhttpVersion::H1 {
+                        while let Some(result) = inflight.next().await {
+                            idle_lane.get_or_insert(window.acknowledge(result?));
+                        }
                     }
                     loop {
                         tokio::select! {
@@ -742,8 +796,8 @@ impl Client {
                                 let _allocation = gate.lock().await;
                                 if lane.carrier.closed() {
                                     drop(lane);
-                                    lane = self.lease(&dialer, true).await?;
-                                } else if let Ok(replacement) = self.lease(&dialer, true).await {
+                                    lane = self.lease(&dialer, false).await?;
+                                } else if let Ok(replacement) = self.lease(&dialer, false).await {
                                     // No request has been sent; another session may own this carrier's credit.
                                     lane = replacement;
                                 }
@@ -795,7 +849,7 @@ impl Client {
     async fn packet_lane(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Lease> {
         let gate = self.route_gate(dialer.route_key());
         let _allocation = gate.lock().await;
-        self.lease(dialer, true).await
+        self.lease(dialer, false).await
     }
 }
 
@@ -1022,7 +1076,7 @@ mod tests {
                 .unwrap(),
             );
             let download = client.lease(&route, true).await.unwrap();
-            let upload = client.lease(&route, true).await.unwrap();
+            let upload = client.lease(&route, false).await.unwrap();
             let retired = Arc::downgrade(&upload.carrier);
             let memory = Memory::new(client.memory.clone(), Some(65536));
             let (mut writer, reader) = pipe(memory.clone());
