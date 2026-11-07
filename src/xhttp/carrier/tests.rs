@@ -67,7 +67,7 @@ async fn h2_receive_guard_returns_polled_and_queued_credit_before_admission() {
             flow: stream.flow_control().clone(),
             remaining: remaining.clone(),
         });
-        // Keep the upload and a flow-control clone alive: last-reference cleanup cannot help.
+        // Live upload and flow-control handles prevent last-reference cleanup.
         drop(H2Body {
             stream,
             in_flight: data.len(),

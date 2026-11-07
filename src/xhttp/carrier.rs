@@ -41,7 +41,7 @@ impl ReceiveGuard {
 struct H2Body {
     stream: h2::RecvStream,
     in_flight: usize,
-    // Release stream credit before allowing the pool to admit a replacement.
+    // Field order returns receive credit before the guard releases admission.
     _guard: Option<ReceiveGuard>,
 }
 

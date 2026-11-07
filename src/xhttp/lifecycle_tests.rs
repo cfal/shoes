@@ -1658,7 +1658,7 @@ async fn h2_paused_downloads_leave_credit_for_an_admitted_session() {
                 paused.push(client.open(dialer.clone()).await.unwrap());
                 let mut send = responses.recv().await.unwrap();
                 let mut data = Bytes::from(vec![42; 4 * 1024 * 1024]);
-                // Send a full stream window using assigned credit, without a timing guess.
+                // Sends a full stream window using assigned credit, without a timing guess.
                 send.reserve_capacity(data.len());
                 while !data.is_empty() {
                     let capacity = if send.capacity() == 0 {
