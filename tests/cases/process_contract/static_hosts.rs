@@ -9,6 +9,38 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
+async fn static_hosts_check_and_dry_run_reject_tun_collisions_without_fake_dns() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    for (ip, valid) in [("192.0.2.1", true), ("10.233.0.1", false)] {
+        let config = json!([
+            {"device_name": "hostscheck0", "address": "10.233.0.1",
+             "netmask": "255.255.255.0", "dns_hijack": true,
+             "dns": {"servers": "udp://192.0.2.53", "hosts": {"proxy.test": ip}}}
+        ]);
+        std::fs::write(&path, config.to_string()).unwrap();
+        for mode in ["check", "--dry-run"] {
+            let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .output()
+                .await
+                .unwrap();
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), valid, "{mode}: {error}");
+            if !valid {
+                assert!(
+                    error.contains(
+                        "static hosts address overlaps an active fake IP range or TUN endpoint"
+                    ),
+                    "{mode}: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn static_hosts_preserve_proxy_sni_credentials_and_remote_destination_resolution() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let directory = tempfile::tempdir().unwrap();

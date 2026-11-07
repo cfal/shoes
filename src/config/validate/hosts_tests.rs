@@ -135,6 +135,64 @@ fn hosts_overlay_on_fake_group_requires_an_explicit_context_policy() {
 }
 
 #[test]
+fn hosts_reject_hijacked_tun_endpoints_without_fake_dns() {
+    for ip in ["10.233.0.1", "::ffff:10.233.0.1", "10.233.0.2"] {
+        let mut config = json!([
+            {"device_name": "hostscheck0", "address": "10.233.0.1",
+             "netmask": "255.255.255.0", "destination": "10.233.0.2",
+             "dns_hijack": false,
+             "dns": {"servers": "udp://192.0.2.53", "hosts": {"proxy.test": ip}}}
+        ]);
+        let validated = validate(&config.to_string()).unwrap();
+        assert!(
+            validated
+                .dns_groups
+                .iter()
+                .all(|group| group.fake_ip.is_none())
+        );
+
+        config[0]["dns_hijack"] = json!(true);
+        let error = validate(&config.to_string()).err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            format!("static hosts address overlaps an active fake IP range or TUN endpoint: {ip}")
+        );
+
+        config[0]["dns"]["hosts"]["proxy.test"] = json!("10.233.0.3");
+        validate(&config.to_string()).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hosts_reject_managed_tun_endpoints_without_fake_dns() {
+    for ip in ["10.233.0.1", "::ffff:10.233.0.1", "fd73::1"] {
+        let mut config = json!([
+            {"dns_group": "static", "dns_servers": "udp://192.0.2.53",
+             "hosts": {"proxy.test": ip}},
+            {"device_name": "hostscheck0", "auto_route": true, "auto_dns": false,
+             "dns_hijack": false, "addresses": ["10.233.0.1/30", "fd73::1/126"],
+             "bootstrap_dns": ["192.0.2.53:53"], "dns": {"servers": "static"}}
+        ]);
+        let error = validate(&config.to_string()).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            format!("static hosts address overlaps an active fake IP range or TUN endpoint: {ip}")
+        );
+
+        config[0]["hosts"]["proxy.test"] = json!("fd73::3");
+        let validated = validate(&config.to_string()).unwrap();
+        assert!(
+            validated
+                .dns_groups
+                .iter()
+                .all(|group| group.fake_ip.is_none())
+        );
+    }
+}
+
+#[test]
 fn hosts_reject_protected_addresses_and_preserve_empty_serialization() {
     for ip in ["198.18.0.5", "::ffff:198.18.0.5", "2001:2::5"] {
         let config = json!([

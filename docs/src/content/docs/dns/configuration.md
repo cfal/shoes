@@ -94,6 +94,8 @@ wildcards, aliases to other hostnames, empty lists, duplicate normalized names,
 and unspecified addresses (`0.0.0.0`, `::`) are rejected. Duplicate IPs are removed
 without changing their order. Addresses inside active or retained Fake DNS ranges
 or protected TUN endpoints are also rejected.
+TUN endpoints are protected when `dns_hijack` or `auto_route` is enabled, even
+without Fake DNS; `check` and `--dry-run` reject these collisions too.
 
 The map applies to upstream proxy endpoints, locally resolved destinations and
 routing lookups, and intercepted DNS queries using this resolver. Destinations
