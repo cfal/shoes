@@ -94,14 +94,14 @@ See [dependency maintenance](DEPENDENCIES.md) for protected forks, update
 constraints and required integration checks.
 
 Precompiled binaries are available on [GitHub Releases](https://github.com/cfal/shoes/releases)
-for Linux x86_64/aarch64 and macOS Intel/Apple Silicon. The next release also adds
+for Linux x86_64/aarch64 and macOS Intel/Apple Silicon. Since v0.3.7, releases also include
 Linux ARMv7 hard-float (`armv7-unknown-linux-gnueabihf` and
 `armv7-unknown-linux-musleabihf`), for CPUs that support 32-bit ARMv7 hard-float
 execution, not ARMv6 devices. GNU builds require a matching glibc userspace;
 musl builds are statically linked. ARMv7 release smoke checks run under QEMU,
 not on physical boards.
 
-Starting with the next release, releases provide a separate `SHA256SUMS` asset
+Since v0.3.7, releases provide a separate `SHA256SUMS` asset
 and GitHub build-provenance attestations. From the directory containing the
 downloaded archives and checksum file:
 
