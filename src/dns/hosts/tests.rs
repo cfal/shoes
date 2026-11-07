@@ -23,8 +23,12 @@ fn request(name: &str, kind: RecordType) -> Message {
 
 #[test]
 fn hosts_validate_normalize_and_round_trip() {
-    let table = hosts("MiXeD.Example.: [192.0.2.1, '2001:db8::1', 192.0.2.1]\nsingle: 192.0.2.2");
-    assert_eq!(table.lookup("MIXED.EXAMPLE").unwrap().len(), 2);
+    let table = hosts(
+        "MiXeD.Example.: [192.0.2.2, '2001:db8::1', 192.0.2.1, 192.0.2.2]\nsingle: 192.0.2.2",
+    );
+    let expected =
+        ["192.0.2.2", "2001:db8::1", "192.0.2.1"].map(|ip| ip.parse::<IpAddr>().unwrap());
+    assert_eq!(table.lookup("MIXED.EXAMPLE").unwrap(), expected);
     assert_eq!(
         table.lookup("single.").unwrap()[0],
         "192.0.2.2".parse::<IpAddr>().unwrap()
@@ -33,7 +37,7 @@ fn hosts_validate_normalize_and_round_trip() {
         serde_yaml::from_str::<StaticHosts>(&serde_yaml::to_string(&table).unwrap()).unwrap(),
         serde_json::from_str::<StaticHosts>(&serde_json::to_string(&table).unwrap()).unwrap(),
     ] {
-        assert_eq!(table.lookup("mixed.example.").unwrap().len(), 2);
+        assert_eq!(table.lookup("mixed.example.").unwrap(), expected);
     }
     for yaml in [
         "example: []",
@@ -92,7 +96,7 @@ async fn hosts_connection_lookup_preserves_all_candidates_and_ports_without_fall
     let fallback = Arc::new(Fallback::default());
     let resolver = HostsResolver::wrap(
         Arc::new(hosts(
-            "proxy.test: [47.238.137.75, 47.238.193.242, '2001:db8::1']",
+            "proxy.test: [47.238.193.242, '2001:db8::1', 47.238.137.75, 47.238.193.242]",
         )),
         fallback.clone(),
     );
@@ -100,17 +104,9 @@ async fn hosts_connection_lookup_preserves_all_candidates_and_ports_without_fall
         for port in [0, 443, 8443] {
             let location = NetLocation::new(crate::address::Address::Hostname(name.into()), port);
             let addresses = resolver.resolve_location(&location).await.unwrap();
-            assert_eq!(addresses.len(), 3);
-            assert_eq!(
-                addresses[0].ip(),
-                "47.238.137.75".parse::<IpAddr>().unwrap()
-            );
-            assert_eq!(
-                addresses[1].ip(),
-                "47.238.193.242".parse::<IpAddr>().unwrap()
-            );
-            assert!(addresses[2].is_ipv6());
-            assert!(addresses.iter().all(|address| address.port() == port));
+            let expected = ["47.238.193.242", "2001:db8::1", "47.238.137.75"]
+                .map(|ip| SocketAddr::new(ip.parse().unwrap(), port));
+            assert_eq!(addresses, expected);
             assert_eq!(location.address().hostname(), Some(name));
         }
     }
@@ -127,16 +123,22 @@ async fn hosts_exchange_answers_both_families_and_nodata_without_fallback() {
     let fallback = Arc::new(Fallback::default());
     let resolver = HostsResolver::wrap(
         Arc::new(hosts(
-            "proxy.test: [192.0.2.1, 192.0.2.2, '2001:db8::1']\nv4.test: 192.0.2.3\nv6.test: '2001:db8::3'",
+            "proxy.test: [192.0.2.2, '2001:db8::2', 192.0.2.1, '2001:db8::1', 192.0.2.2, '2001:db8::2']\nv4.test: 192.0.2.3\nv6.test: '2001:db8::3'",
         )),
         fallback.clone(),
     );
-    for (name, kind, count) in [
-        ("PrOxY.TeSt.", RecordType::A, 2),
-        ("proxy.test.", RecordType::AAAA, 1),
-        ("v4.test.", RecordType::AAAA, 0),
-        ("v6.test.", RecordType::A, 0),
-    ] {
+    let cases: &[(&str, RecordType, &[&str])] = &[
+        ("PrOxY.TeSt.", RecordType::A, &["192.0.2.2", "192.0.2.1"]),
+        (
+            "proxy.test.",
+            RecordType::AAAA,
+            &["2001:db8::2", "2001:db8::1"],
+        ),
+        ("v4.test.", RecordType::AAAA, &[]),
+        ("v6.test.", RecordType::A, &[]),
+    ];
+    for &(name, kind, expected) in cases {
+        let expected: Vec<IpAddr> = expected.iter().map(|ip| ip.parse().unwrap()).collect();
         let mut query = request(name, kind);
         query.edns = Some(Edns::new());
         query.edns.as_mut().unwrap().set_dnssec_ok(true);
@@ -149,7 +151,16 @@ async fn hosts_exchange_answers_both_families_and_nodata_without_fallback() {
                 .unwrap(),
         ] {
             let answer = Message::from_vec(&reply).unwrap();
-            assert_eq!(answer.answers.len(), count);
+            let addresses: Vec<_> = answer
+                .answers
+                .iter()
+                .map(|record| match record.data {
+                    RData::A(ip) => IpAddr::V4(ip.0),
+                    RData::AAAA(ip) => IpAddr::V6(ip.0),
+                    _ => panic!("unexpected record: {record:?}"),
+                })
+                .collect();
+            assert_eq!(addresses, expected);
             assert_eq!(answer.queries, query.queries);
             assert_eq!(
                 answer.queries[0].name.to_ascii(),
