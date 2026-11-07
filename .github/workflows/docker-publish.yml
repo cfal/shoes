@@ -8,12 +8,14 @@ on:
       - .dockerignore
       - Cargo.toml
       - Cargo.lock
+      - build.rs
       - src/**
       - tests/support/**
       - LICENSE
       - THIRD_PARTY_NOTICES.md
       - licenses/**
       - scripts/smoke-docker.py
+      - scripts/build_version.py
       - .github/workflows/docker-publish.yml
   push:
     branches: [master]
@@ -25,6 +27,9 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  SHOES_BUILD_REVISION: ${{ github.sha }}
+  SHOES_RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+  COMMIT_TAG: sha-${{ github.sha }}${{ github.event_name == 'release' && '-release' || '' }}
 
 jobs:
   verify_pr:
@@ -53,9 +58,13 @@ jobs:
           context: .
           load: true
           tags: shoes-pr:smoke
+          build-args: |
+            SHOES_BUILD_REVISION=${{ env.SHOES_BUILD_REVISION }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-amd64
 
       - name: Verify packaged proxy
+        env:
+          TARGET: x86_64-unknown-linux-gnu
         run: python3 scripts/smoke-docker.py shoes-pr:smoke
 
   build:
@@ -79,6 +88,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Verify release tag still targets this checkout
+        if: github.event_name == 'release'
+        run: |
+          git fetch --no-tags origin "refs/tags/$SHOES_RELEASE_TAG"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Set image name
         run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
@@ -107,10 +123,13 @@ jobs:
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
+          build-args: |
+            SHOES_BUILD_REVISION=${{ env.SHOES_BUILD_REVISION }}
+            SHOES_RELEASE_TAG=${{ env.SHOES_RELEASE_TAG }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.metadata.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},ignore-error=true
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}${{ github.event_name == 'release' && '-release' || '' }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}${{ github.event_name == 'release' && '-release' || '' }},ignore-error=true
 
       - name: Export digest
         env:
@@ -169,7 +188,7 @@ jobs:
         id: existing
         run: |
           set -euo pipefail
-          commit_image="${IMAGE}:sha-${GITHUB_SHA}"
+          commit_image="${IMAGE}:${COMMIT_TAG}"
           manifest_path="${RUNNER_TEMP}/existing-manifest.json"
           error_path="${RUNNER_TEMP}/existing-manifest-error.log"
           if ! docker buildx imagetools inspect --raw "$commit_image" > "$manifest_path" 2> "$error_path"; then
@@ -217,7 +236,7 @@ jobs:
             fi
             sources+=("${IMAGE}@sha256:${digest}")
           done
-          commit_image="${IMAGE}:sha-${GITHUB_SHA}"
+          commit_image="${IMAGE}:${COMMIT_TAG}"
           docker buildx imagetools create --tag "$commit_image" "${sources[@]}"
           manifest_path="${RUNNER_TEMP}/published-manifest.json"
           docker buildx imagetools inspect --raw "$commit_image" > "$manifest_path"
@@ -276,6 +295,7 @@ jobs:
         env:
           IMAGE: ${{ needs.publish_sha.outputs.image }}
           DIGEST: ${{ needs.publish_sha.outputs.digest }}
+          TARGET: ${{ matrix.arch == 'amd64' && 'x86_64-unknown-linux-gnu' || 'aarch64-unknown-linux-gnu' }}
         run: |
           docker pull "${IMAGE}@${DIGEST}"
           python3 scripts/smoke-docker.py "${IMAGE}@${DIGEST}"
