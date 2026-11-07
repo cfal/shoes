@@ -275,6 +275,9 @@ impl ValidatedConfigs {
             }
         }
         for group in &self.dns_groups {
+            for ip in group.hosts.addresses() {
+                reject(ranges, ip, "static hosts address")?;
+            }
             for spec in &group.specs {
                 for value in std::iter::once(spec.url.as_str()).chain(spec.bootstrap_url.as_deref())
                 {

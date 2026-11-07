@@ -14,6 +14,7 @@ use persistence::SnapshotStore;
 
 use super::FakeIpOptions;
 use super::options::invalid;
+use crate::dns::canonical_hostname;
 
 #[derive(Debug, Clone)]
 struct Range {
@@ -408,25 +409,6 @@ impl FakeIpPool {
         state.revision = state.revision.wrapping_add(1);
         Ok(ip)
     }
-}
-
-pub(super) fn canonical_hostname(name: &str) -> Option<String> {
-    let name = name.strip_suffix('.').unwrap_or(name);
-    if name.is_empty() || name.len() > 253 || name.parse::<IpAddr>().is_ok() {
-        return None;
-    }
-    if !name.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && label.as_bytes()[0].is_ascii_alphanumeric()
-            && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    }) {
-        return None;
-    }
-    Some(name.to_ascii_lowercase())
 }
 
 #[cfg(test)]
