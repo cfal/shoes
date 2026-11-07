@@ -27,6 +27,13 @@ Check every resolved consumer, especially Quinn, tokio-rustls, hyper-rustls,
 rustls-platform-verifier, Hickory and Shoes; absence of unused-patch warnings is
 not sufficient. Keep `publish = false` while workspace patches remain.
 
+GotaTun is a direct git dependency, not a workspace patch: `AYastrebov/gotatun`
+adds AmneziaWG and Phobos obfuscation on top of upstream commit
+`16937ec6219afbece5aa69ece91f41e12d04d3c5` (after 0.10.2). Preserve its
+repository and full revision the same way, and keep the revision in
+[the notices](THIRD_PARTY_NOTICES.md) in step with `Cargo.toml`. Statements
+below about GotaTun's transitive families apply to the fork as well.
+
 ### smoltcp
 
 The maintained TCP recovery series originates on published `cfal/smoltcp` main

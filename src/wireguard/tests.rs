@@ -8,7 +8,7 @@ use tokio::{
     net::{TcpListener, UdpSocket},
 };
 
-const CLIENT: usize = 0;
+pub(super) const CLIENT: usize = 0;
 const SERVER: usize = 1;
 
 fn key(byte: u8) -> String {
@@ -18,7 +18,7 @@ fn public(byte: u8) -> String {
     STANDARD.encode(PublicKey::from(&StaticSecret::from([byte; 32])).as_bytes())
 }
 
-fn pair_config(port: u16) -> String {
+pub(super) fn pair_config(port: u16) -> String {
     use serde_json::json;
     let mut server = config::server(port);
     server["rules"] = json!([{"masks": ["0.0.0.0/0", "::/0"], "action": "allow"}]);
@@ -28,10 +28,10 @@ fn pair_config(port: u16) -> String {
     socks["rules"][0]["client_chain"] = json!("client");
     serde_yaml::to_string(&json!([server, client, socks])).unwrap()
 }
-fn validate(yaml: &str) -> stdio::Result<ValidatedConfigs> {
+pub(super) fn validate(yaml: &str) -> stdio::Result<ValidatedConfigs> {
     crate::config::create_server_configs(serde_yaml::from_str(yaml).map_err(stdio::Error::other)?)
 }
-async fn echo_servers(v6: bool) -> (SocketAddr, SocketAddr, JoinSet<()>) {
+pub(super) async fn echo_servers(v6: bool) -> (SocketAddr, SocketAddr, JoinSet<()>) {
     let listener = TcpListener::bind(if v6 { "[::]:0" } else { "0.0.0.0:0" })
         .await
         .unwrap();
@@ -66,7 +66,7 @@ async fn echo_servers(v6: bool) -> (SocketAddr, SocketAddr, JoinSet<()>) {
     });
     (tcp_addr, udp_addr, tasks)
 }
-async fn check_echo(connector: &dyn SocketConnector, tcp: SocketAddr, udp: SocketAddr) {
+pub(super) async fn check_echo(connector: &dyn SocketConnector, tcp: SocketAddr, udp: SocketAddr) {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let location = |addr: SocketAddr| {
         ResolvedLocation::from(NetLocation::from_ip_addr(addr.ip(), addr.port()))
@@ -97,7 +97,7 @@ async fn check_echo(connector: &dyn SocketConnector, tcp: SocketAddr, udp: Socke
     }
 }
 
-async fn start_prepared(prepared: &Prepared) -> Running {
+pub(super) async fn start_prepared(prepared: &Prepared) -> Running {
     let mut running = Running::default();
     prepared
         .start(&mut DnsRegistry::new(), &mut running)

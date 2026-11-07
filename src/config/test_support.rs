@@ -137,6 +137,8 @@ impl Inline for ResolvedServerProxyConfig {
                     addresses: config.addresses,
                     peers: config.peers,
                     mtu: config.mtu,
+                    amnezia: super::AmneziaSettings::effective(config.amnezia),
+                    phobos: None,
                     resource_limits: config.resource_limits,
                     bind_interface: config.bind_interface,
                     peer_client_chain: config.peer_client_chain.map(ResolvedClientChain::inline),

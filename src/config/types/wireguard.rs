@@ -9,7 +9,7 @@ use std::{fmt, io, net::SocketAddr};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
-use super::{ClientChain, tun::TunResourceLimits};
+use super::{AmneziaSettings, ClientChain, PhobosSettings, tun::TunResourceLimits};
 use crate::option_util::NoneOrSome;
 
 #[derive(Clone)]
@@ -78,8 +78,15 @@ pub struct WireguardDeviceConfig {
     pub bind_interface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_client_chain: Option<ResolvedClientChain>,
-    #[serde(default = "default_mtu")]
+    /// The effective MTU, after deriving the default from the obfuscation overhead.
     pub mtu: u16,
+    /// True when the MTU was derived, not written, and the overhead pushed it to the floor.
+    #[serde(skip)]
+    pub(crate) mtu_clamped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amnezia: Option<AmneziaSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phobos: Option<PhobosSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inbound: Option<WireguardInbound>,
     #[serde(default)]
@@ -98,8 +105,12 @@ pub struct WireguardClientRecord<C> {
     pub allowed_ips: Vec<String>,
     #[serde(default)]
     pub persistent_keepalive: u16,
-    #[serde(default = "default_mtu")]
-    pub mtu: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amnezia: Option<AmneziaSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phobos: Option<PhobosSettings>,
     #[serde(default)]
     pub resource_limits: TunResourceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,8 +127,14 @@ pub struct WireguardServerRecord<C> {
     pub private_key: WireguardKey,
     pub addresses: Vec<String>,
     pub peers: Vec<WireguardPeer>,
-    #[serde(default = "default_mtu")]
-    pub mtu: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amnezia: Option<AmneziaSettings>,
+    /// Accepted only to report that Phobos is client-only. The content is discarded, so a
+    /// pasted Phobos key never reaches `Debug`.
+    #[serde(default, skip_serializing)]
+    pub phobos: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub resource_limits: TunResourceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,7 +169,10 @@ impl ResolvedWireguardClientConfig {
             listen: None,
             bind_interface,
             peer_client_chain: self.peer_client_chain.clone(),
-            mtu: self.mtu,
+            mtu: effective_mtu(self.mtu, self.obfuscation_overhead()),
+            mtu_clamped: derived_mtu_is_clamped(self.mtu, self.obfuscation_overhead()),
+            amnezia: self.amnezia.clone(),
+            phobos: self.phobos.clone(),
             inbound: None,
             resource_limits: self.resource_limits.clone(),
         }
@@ -215,6 +235,9 @@ impl<C> WireguardServerRecord<C> {
         bind: &super::BindLocation,
         rules_empty: bool,
     ) -> io::Result<()> {
+        if self.phobos.is_some() {
+            return Err(invalid("WireGuard phobos is client-only"));
+        }
         DeviceValidation {
             private_key: &self.private_key,
             addresses: &self.addresses,
@@ -222,7 +245,9 @@ impl<C> WireguardServerRecord<C> {
             listen: self.listen(bind)?,
             bind_interface: self.bind_interface.as_deref(),
             has_carrier: self.peer_client_chain.is_some(),
-            mtu: self.mtu,
+            mtu: effective_mtu(self.mtu, obfuscation_overhead(self.amnezia.as_ref(), None)),
+            amnezia: self.amnezia.as_ref(),
+            phobos: None,
             resource_limits: &self.resource_limits,
             empty_rules: rules_empty,
         }
@@ -244,7 +269,13 @@ impl ResolvedWireguardServerConfig {
             listen,
             bind_interface: self.bind_interface.clone(),
             peer_client_chain: self.peer_client_chain.clone(),
-            mtu: self.mtu,
+            mtu: effective_mtu(self.mtu, obfuscation_overhead(self.amnezia.as_ref(), None)),
+            mtu_clamped: derived_mtu_is_clamped(
+                self.mtu,
+                obfuscation_overhead(self.amnezia.as_ref(), None),
+            ),
+            amnezia: self.amnezia.clone(),
+            phobos: None,
             inbound: Some(WireguardInbound {
                 name: server.name.clone(),
                 sniff: server.sniff,
@@ -256,8 +287,28 @@ impl ResolvedWireguardServerConfig {
     }
 }
 
-fn default_mtu() -> u16 {
-    1408
+const DEFAULT_MTU: u16 = 1408;
+const MIN_MTU: u16 = 1280;
+
+/// The explicit MTU, or the default less the obfuscation overhead, never below 1280.
+pub(crate) fn effective_mtu(explicit: Option<u16>, overhead: u16) -> u16 {
+    explicit.unwrap_or_else(|| DEFAULT_MTU.saturating_sub(overhead).max(MIN_MTU))
+}
+
+/// Only a derived MTU can be clamped: an explicit one is used as written.
+fn derived_mtu_is_clamped(explicit: Option<u16>, overhead: u16) -> bool {
+    explicit.is_none() && DEFAULT_MTU.saturating_sub(overhead) < MIN_MTU
+}
+
+fn obfuscation_overhead(amnezia: Option<&AmneziaSettings>, phobos: Option<&PhobosSettings>) -> u16 {
+    // Saturates: both blocks may still be set here, before the mutual-exclusion check.
+    amnezia
+        .map_or(0, AmneziaSettings::transport_overhead)
+        .saturating_add(
+            phobos
+                .and_then(|phobos| phobos.masking)
+                .map_or(0, super::PhobosMasking::overhead),
+        )
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
@@ -274,6 +325,12 @@ impl WireguardDeviceConfig {
         device_limits(&self.resource_limits)
     }
 
+    /// Bytes this device adds to a full-size packet once the handshake is done. Content
+    /// padding and trailers are not counted: the fork never pads a packet past the tunnel MTU.
+    pub(crate) fn steady_overhead(&self) -> u16 {
+        obfuscation_overhead(self.amnezia.as_ref(), self.phobos.as_ref())
+    }
+
     pub fn validate(&self) -> io::Result<()> {
         DeviceValidation {
             private_key: &self.private_key,
@@ -283,6 +340,8 @@ impl WireguardDeviceConfig {
             bind_interface: self.bind_interface.as_deref(),
             has_carrier: self.peer_client_chain.is_some(),
             mtu: self.mtu,
+            amnezia: self.amnezia.as_ref(),
+            phobos: self.phobos.as_ref(),
             resource_limits: &self.resource_limits,
             empty_rules: self
                 .inbound
@@ -301,6 +360,8 @@ struct DeviceValidation<'a> {
     bind_interface: Option<&'a str>,
     has_carrier: bool,
     mtu: u16,
+    amnezia: Option<&'a AmneziaSettings>,
+    phobos: Option<&'a PhobosSettings>,
     resource_limits: &'a TunResourceLimits,
     empty_rules: bool,
 }
@@ -315,6 +376,22 @@ impl DeviceValidation<'_> {
         }
         if self.peers.is_empty() || self.addresses.is_empty() {
             return Err(invalid("WireGuard requires local addresses and peers"));
+        }
+        // Invalid blocks report their own error before the exclusion rule is applied.
+        #[cfg(unix)]
+        {
+            if let Some(amnezia) = self.amnezia {
+                amnezia.to_gotatun()?;
+            }
+            if let Some(phobos) = self.phobos {
+                phobos.to_gotatun()?;
+            }
+        }
+        // A plain `amnezia` block behaves as no block, here and after lowering.
+        if self.amnezia.is_some_and(|amnezia| !amnezia.is_plain()) && self.phobos.is_some() {
+            return Err(invalid(
+                "WireGuard amnezia and phobos are mutually exclusive",
+            ));
         }
         if !(1280..=1420).contains(&self.mtu) {
             return Err(invalid("WireGuard MTU must be between 1280 and 1420"));
@@ -438,6 +515,10 @@ pub(crate) fn device_limits(resource_limits: &TunResourceLimits) -> TunResourceL
 }
 
 impl<C> WireguardClientRecord<C> {
+    pub(crate) fn obfuscation_overhead(&self) -> u16 {
+        obfuscation_overhead(self.amnezia.as_ref(), self.phobos.as_ref())
+    }
+
     pub(crate) fn validate_device(
         &self,
         address: &crate::address::NetLocation,
@@ -457,7 +538,9 @@ impl<C> WireguardClientRecord<C> {
             listen: None,
             bind_interface,
             has_carrier: self.peer_client_chain.is_some(),
-            mtu: self.mtu,
+            mtu: effective_mtu(self.mtu, self.obfuscation_overhead()),
+            amnezia: self.amnezia.as_ref(),
+            phobos: self.phobos.as_ref(),
             resource_limits: &self.resource_limits,
             empty_rules: false,
         }
