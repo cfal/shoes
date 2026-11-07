@@ -9,7 +9,8 @@ import subprocess
 import tempfile
 import threading
 import time
-import tomllib
+
+from build_version import check_version
 
 ROOT = Path(__file__).resolve().parents[1]
 PAYLOAD = b"shoes container smoke test\n"
@@ -64,8 +65,7 @@ def check_proxy(container, origin_port):
 
 
 def smoke(image):
-    version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
-    assert docker("run", "--rm", image, "--version").strip() == f"shoes {version}".encode()
+    check_version(["docker", "run", "--rm", image])
     tmp_root = Path.home() / "tmp"
     tmp_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="shoes-docker-", dir=tmp_root) as tmp:

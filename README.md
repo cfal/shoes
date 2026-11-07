@@ -219,7 +219,9 @@ GHCR images are published at `ghcr.io/cfal/shoes` for `linux/amd64` and
 - `master` follows the current branch head after both architectures pass the
   container smoke test.
 - `sha-<full commit SHA>` is published before smoke verification and pins a
-  commit image; retries and releases reuse it.
+  development commit image; retries reuse it.
+- `sha-<full commit SHA>-release` separately pins the official release build,
+  so publishing a release never reuses a development binary's version metadata.
 - A published GitHub release adds its exact tag, such as `v0.3.4`.
 - `latest` is set only by a `published` release event when that stable release
   is GitHub's latest at promotion time.
@@ -229,8 +231,8 @@ Converting a prerelease to stable or changing GitHub's latest release later
 does not update the image tags.
 
 Draft releases and tag pushes alone do not publish release image tags. Release
-tag names must be valid Docker tags; `master`, `latest`, `buildcache*`, and `sha-*`
-are reserved. Publishing uses the repository's `GITHUB_TOKEN` with package
+tags must match `v` followed by the package version. `master`, `latest`,
+`buildcache*`, and `sha-*` are reserved. Publishing uses the repository's `GITHUB_TOKEN` with package
 write permission. After the first publication, make the GHCR package public
 in its package settings to allow anonymous pulls. Forks publish under their
 own repository name.
@@ -239,11 +241,17 @@ own repository name.
 docker pull ghcr.io/cfal/shoes:master
 ```
 
-Build the release binary and its runtime image from the checkout:
+Build an optimized local binary and its runtime image from the checkout:
 
 ```sh
-docker build -t shoes:local .
+docker build -t shoes:local \
+  --build-arg SHOES_BUILD_REVISION="$(git describe --always --exclude='*' --abbrev=12 --dirty=.dirty)" .
 ```
+
+The build argument preserves the checkout revision without copying `.git` into
+the image. Omitting it produces a `+unknown` version. See
+[build metadata](https://shoes-rs.github.io/start/installation/#build-metadata) and
+[CLI build information](https://shoes-rs.github.io/operations/cli/#build-information).
 
 Verify the image on Linux with Python 3.11 or newer:
 
