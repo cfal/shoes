@@ -163,7 +163,7 @@ notify = "*"
 # 0.13's futex_time64 probe triggers SIGSYS on 32-bit Android API 26-29.
 parking_lot = "0.12.5"
 percent-encoding = "*"
-quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+quinn = { version = "*", default-features = false, features = ["log", "runtime-tokio", "rustls-aws-lc-rs"] }
 quinn-proto = { version = "0.11", default-features = false }
 rand = "*"
 rand_core = "*"
