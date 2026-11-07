@@ -339,6 +339,127 @@ impl ShoesResolver for HickoryResolver {
 mod tests {
     use super::*;
 
+    async fn dot_response_after_unsolicited_burst(raw: bool) {
+        use hickory_resolver::proto::{
+            op::{Message, Query},
+            rr::{Name, RData, Record, RecordType, rdata::A},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for unsolicited in [0, 99, 100] {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.cert.der().clone()).unwrap();
+            let mut tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                        .into(),
+                )
+                .unwrap();
+            tls.alpn_protocols = vec![b"dot".to_vec()];
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+            let bootstrap: Arc<dyn ShoesResolver> =
+                Arc::new(crate::resolver::NativeResolver::new());
+            let chain = Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
+                bootstrap.clone(),
+            ));
+            let resolver = crate::rustls_config_util::with_test_roots(roots, || {
+                HickoryResolver::tls(
+                    address,
+                    "localhost".into(),
+                    chain,
+                    bootstrap,
+                    HickoryResolverOptions {
+                        ip_strategy: IpStrategy::Ipv4Only,
+                        request_timeout: Some(Duration::from_secs(1)),
+                        connect_timeout: Duration::from_secs(1),
+                        attempts: 0,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            });
+            assert_eq!(resolver.inner.options().max_active_requests, 32);
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut stream = acceptor.accept(tcp).await.unwrap();
+                let length = stream.read_u16().await.unwrap();
+                let mut bytes = vec![0; length as usize];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let mut answer = Message::from_vec(&bytes).unwrap().into_response();
+                answer.add_answer(Record::from_rdata(
+                    answer.queries[0].name.clone(),
+                    60,
+                    RData::A(A::new(192, 0, 2, 42)),
+                ));
+                let mut unrelated = answer.clone();
+                unrelated.metadata.id ^= 1;
+                let unrelated = unrelated.to_vec().unwrap();
+                let answer = answer.to_vec().unwrap();
+                let mut batch = Vec::new();
+                for _ in 0..unsolicited {
+                    batch.extend_from_slice(&(unrelated.len() as u16).to_be_bytes());
+                    batch.extend_from_slice(&unrelated);
+                }
+                batch.extend_from_slice(&(answer.len() as u16).to_be_bytes());
+                batch.extend_from_slice(&answer);
+                // One TLS write leaves the real answer buffered without another network wakeup.
+                stream.write_all(&batch).await.unwrap();
+                stream.flush().await.unwrap();
+                let _ = stopped.await;
+            }));
+            let result = if raw {
+                let mut request = Message::query();
+                request.add_query(Query::query(
+                    Name::from_ascii("burst.test.").unwrap(),
+                    RecordType::A,
+                ));
+                resolver
+                    .exchange(request.to_vec().unwrap())
+                    .await
+                    .map(|bytes| {
+                        let answer = Message::from_vec(&bytes).unwrap();
+                        assert_eq!(answer.answers[0].data, RData::A(A::new(192, 0, 2, 42)));
+                    })
+            } else {
+                resolver
+                    .resolve_location(&NetLocation::from_str("burst.test.:443", None).unwrap())
+                    .await
+                    .map(|addresses| {
+                        assert_eq!(addresses, ["192.0.2.42:443".parse::<SocketAddr>().unwrap()]);
+                    })
+            };
+            result.unwrap_or_else(|error| panic!("raw={raw}, unsolicited={unsolicited}: {error}"));
+            stop.send(()).unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dot_hostname_lookup_drains_unsolicited_burst() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            dot_response_after_unsolicited_burst(false),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dot_raw_exchange_drains_unsolicited_burst() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            dot_response_after_unsolicited_burst(true),
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn hostname_lookup_refreshes_only_transport_failures() {
         use crate::resolver::{RefreshPolicy, RefreshingResolver, ResolverFactory};

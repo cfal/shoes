@@ -52,6 +52,9 @@ cannot set `native_cache_secs`, even to zero. `bootstrap_url` must not itself
 contain a hostname; named groups may be used for multi-step bootstrap, but
 cycles are rejected.
 
+TCP and TLS keep processing buffered replies after discarding responses for
+inactive queries. This does not add retries or extend configured deadlines.
+
 TCP, TLS, and HTTPS upstreams can use proxy chains. UDP and H3 upstreams are
 direct-only, except a direct chain can set an interface binding; `system` does
 not support a client chain. WireGuard-routed DNS requires a literal upstream
