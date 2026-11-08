@@ -1,13 +1,11 @@
+use crate::atomic::AtomicU64;
 use std::{
     collections::{HashMap, hash_map::Entry},
     future::Future,
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     task::Poll,
     time::Duration,
 };

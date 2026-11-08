@@ -214,6 +214,9 @@ tokio-rustls = "*"
 [target.'cfg(unix)'.dependencies]
 gotatun = { version = "*", default-features = false, features = ["device", "aws-lc-rs"] }
 
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = { version = "1", features = ["fallback"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.24"
 

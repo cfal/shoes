@@ -1,6 +1,7 @@
 use super::*;
+use crate::atomic::AtomicU64;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
 #[derive(Debug)]

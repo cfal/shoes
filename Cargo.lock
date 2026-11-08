@@ -2959,6 +2959,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "percent-encoding",
+ "portable-atomic",
  "prost",
  "quinn",
  "quinn-proto",

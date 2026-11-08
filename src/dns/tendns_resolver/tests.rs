@@ -1,7 +1,8 @@
 use super::*;
+use crate::atomic::AtomicU64;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tendns::hickory_proto::{
     op::{OpCode, Query},
     rr::{RData, Record, RecordType, rdata::TXT},
