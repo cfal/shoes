@@ -1,6 +1,10 @@
 use super::*;
-use crate::atomic::AtomicU64;
+// This helper is also copied into baseline checkouts without crate::atomic.
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 use std::hint::black_box;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
