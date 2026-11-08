@@ -995,13 +995,10 @@ dependencies = [
 [[package]]
 name = "gotatun"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e37c2134d46523ed5b3c4bbdb578225e2e7379d03aea65baef41584725b1991"
+source = "git+https://github.com/mullvad/gotatun?rev=c06582e41022bcecbf33751631fd5a63d5794dc5#c06582e41022bcecbf33751631fd5a63d5794dc5"
 dependencies = [
  "aead",
- "aws-lc-rs",
  "base64 0.22.1",
- "bitfield-struct",
  "blake2 0.10.6",
  "bytes",
  "chacha20poly1305",
@@ -1010,6 +1007,8 @@ dependencies = [
  "either",
  "eyre",
  "futures",
+ "gotatun-crypto",
+ "gotatun-packet",
  "hmac",
  "ip_network",
  "ip_network_table",
@@ -1017,6 +1016,7 @@ dependencies = [
  "libc",
  "nix",
  "parking_lot",
+ "portable-atomic",
  "rand 0.9.5",
  "rand_chacha",
  "rand_core 0.6.4",
@@ -1028,6 +1028,29 @@ dependencies = [
  "typed-builder",
  "windows-sys 0.61.2",
  "x25519-dalek",
+ "zerocopy",
+]
+
+[[package]]
+name = "gotatun-crypto"
+version = "0.1.0"
+source = "git+https://github.com/mullvad/gotatun?rev=c06582e41022bcecbf33751631fd5a63d5794dc5#c06582e41022bcecbf33751631fd5a63d5794dc5"
+dependencies = [
+ "aws-lc-rs",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "gotatun-packet"
+version = "0.1.0"
+source = "git+https://github.com/mullvad/gotatun?rev=c06582e41022bcecbf33751631fd5a63d5794dc5#c06582e41022bcecbf33751631fd5a63d5794dc5"
+dependencies = [
+ "bitfield-struct",
+ "bytes",
+ "duplicate",
+ "either",
+ "eyre",
+ "thiserror 1.0.69",
  "zerocopy",
 ]
 
@@ -2936,6 +2959,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "percent-encoding",
+ "portable-atomic",
  "prost",
  "quinn",
  "quinn-proto",

@@ -1464,7 +1464,8 @@ async fn url_test_automatic_resume_after_abandoned_activation_uses_committed_gen
 #[tokio::test]
 async fn url_test_automatic_real_proxy_probes_select_fast_sticky_recovered_member_without_listener()
 {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use crate::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     async fn peer() -> (
         String,
         Arc<AtomicU64>,

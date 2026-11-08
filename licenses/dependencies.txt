@@ -11615,6 +11615,10 @@ SOFTWARE.
 License: Mozilla Public License 2.0 (MPL-2.0)
 Package: gotatun 0.10.2
 Repository: https://github.com/mullvad/gotatun
+Package: gotatun-crypto 0.1.0
+Repository: https://github.com/mullvad/gotatun
+Package: gotatun-packet 0.1.0
+Repository: https://github.com/mullvad/gotatun
 
 Mozilla Public License Version 2.0
 ==================================

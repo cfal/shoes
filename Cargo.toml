@@ -19,6 +19,8 @@ members = ["tests/support"]
 resolver = "3"
 
 [patch.crates-io]
+# Includes portable 64-bit atomics for MIPS32 and other targets without native support.
+gotatun = { git = "https://github.com/mullvad/gotatun", rev = "c06582e41022bcecbf33751631fd5a63d5794dc5" }
 # REALITY patches on stable rustls: reality/0.23.46-f04804fa1334. Pins the patched commit, not the branch.
 rustls = { git = "https://github.com/cfal/rustls", rev = "f1a23c187330386e9e7f14a21dbae368034dc430" }
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "cd98c1c4112ed3b2cf2140e1844f266b3d665b53" }
@@ -211,6 +213,9 @@ tokio-rustls = "*"
 
 [target.'cfg(unix)'.dependencies]
 gotatun = { version = "*", default-features = false, features = ["device", "aws-lc-rs"] }
+
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = { version = "1", features = ["fallback"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.24"

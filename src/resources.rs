@@ -1,6 +1,7 @@
+use crate::atomic::AtomicU64;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 
 use parking_lot::{Mutex, RwLock};

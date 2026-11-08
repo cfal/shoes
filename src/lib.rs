@@ -40,6 +40,7 @@
 mod address;
 mod anytls;
 mod async_stream;
+mod atomic;
 mod buf_reader;
 mod certificates;
 mod clash_api;

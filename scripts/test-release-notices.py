@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest import mock
+from urllib.parse import urlsplit
 
 SPEC = importlib.util.spec_from_file_location(
     "notices", Path(__file__).with_name("check-release-notices.py")
@@ -86,16 +87,34 @@ class ReleaseNoticesTests(unittest.TestCase):
         metadata = json.loads(subprocess.check_output([
             "cargo", "metadata", *cargo_options, "--format-version", "1",
         ]))
-        gotatun_versions = [p["version"] for p in metadata["packages"] if p["name"] == "gotatun"]
-        self.assertEqual(len(gotatun_versions), 1)
-        version = gotatun_versions[0]
+        gotatun_packages = [p for p in metadata["packages"] if p["name"] == "gotatun"]
+        self.assertEqual(len(gotatun_packages), 1)
+        gotatun = gotatun_packages[0]
+        source = urlsplit(gotatun["source"].removeprefix("git+"))
+        self.assertEqual(source.scheme, "https")
+        self.assertEqual(source.netloc, "github.com")
+        self.assertEqual(source.path, "/mullvad/gotatun")
+        self.assertRegex(source.fragment, r"^[0-9a-f]{40}$")
         source_notice = (NOTICES.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
         for required in [
-            f"GotaTun {version},",
-            f"https://crates.io/api/v1/crates/gotatun/{version}/download",
-            f"https://github.com/mullvad/gotatun/tree/v{version}",
+            f"GotaTun {gotatun['version']}",
+            f"https://github.com/mullvad/gotatun/tree/{source.fragment}",
+            f"https://github.com/mullvad/gotatun/archive/{source.fragment}.tar.gz",
         ]:
             self.assertIn(required, source_notice)
+        for name in ["gotatun-crypto", "gotatun-packet"]:
+            packages = [p for p in metadata["packages"] if p["name"] == name]
+            self.assertEqual(len(packages), 1)
+            self.assertEqual(packages[0]["source"], gotatun["source"])
+        gotatun_root = Path(gotatun["manifest_path"]).parent.parent
+        for original, bundled in [
+            ("LICENSE", "MPL-2.0.txt"),
+            ("LICENSE-CLOUDFLARE", "gotatun-CLOUDFLARE.txt"),
+        ]:
+            self.assertEqual(
+                (gotatun_root / original).read_bytes(),
+                (NOTICES.ROOT / "licenses" / bundled).read_bytes(),
+            )
         bundle = (NOTICES.ROOT / "licenses/dependencies.txt").read_text()
         original_notices = {
             "curve25519-dalek": ["LICENSE"], "x25519-dalek": ["LICENSE"],

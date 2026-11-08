@@ -67,16 +67,18 @@ invokes it before uploading tarballs. Do not remove the bundle when redistributi
 
 ## WireGuard Source
 
-Unix builds, including Android and iOS libraries, link GotaTun 0.10.2, an
-implementation of the WireGuard protocol. GotaTun is copyright Mullvad VPN AB
+Unix builds, including Android and iOS libraries, link GotaTun 0.10.2 and its
+`gotatun-crypto` and `gotatun-packet` crates from upstream commit
+`c06582e41022bcecbf33751631fd5a63d5794dc5`, an implementation of the WireGuard
+protocol. GotaTun is copyright Mullvad VPN AB
 and incorporates work copyright Cloudflare, Inc. Its source files are covered
 by the Mozilla Public License 2.0 and the notices reproduced in
 `licenses/MPL-2.0.txt` and `licenses/gotatun-CLOUDFLARE.txt`.
 
 The unmodified corresponding source is available at:
 
-- https://crates.io/api/v1/crates/gotatun/0.10.2/download
-- https://github.com/mullvad/gotatun/tree/v0.10.2
+- https://github.com/mullvad/gotatun/tree/c06582e41022bcecbf33751631fd5a63d5794dc5
+- https://github.com/mullvad/gotatun/archive/c06582e41022bcecbf33751631fd5a63d5794dc5.tar.gz
 
 Recipients may obtain, modify, and redistribute the covered source under the
 MPL 2.0. Shoes does not modify GotaTun's source. Shoes' own source remains under
