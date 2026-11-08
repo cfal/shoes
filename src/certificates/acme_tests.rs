@@ -2333,3 +2333,11 @@ fn acme_diagnostics_omit_remote_details_and_json_values() {
     let error = serde_json::from_str::<u64>(&format!("\"{secret}\"")).unwrap_err();
     assert!(!failure_message(&instant_acme::Error::Json(error)).contains(secret));
 }
+
+#[test]
+fn cloudflare_tokens_are_validated_without_being_exposed() {
+    assert_eq!(resolve_dns_token("cf-test-token").unwrap(), "cf-test-token");
+    assert!(resolve_dns_token("").is_err());
+    assert!(resolve_dns_token("token\r\nInjected: yes").is_err());
+    assert!(resolve_dns_token("${}").is_err());
+}

@@ -64,7 +64,7 @@ impl NamedSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
     pub domains: Vec<String>,
@@ -79,11 +79,70 @@ pub struct AcmeConfig {
     pub ca_cert: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChallengeConfig {
-    Http01 { listen: Vec<std::net::SocketAddr> },
+    Http01 {
+        listen: Vec<std::net::SocketAddr>,
+    },
     TlsAlpn01,
+    Dns01 {
+        provider: String,
+        api_token: String,
+        #[serde(default = "default_dns_ttl")]
+        ttl: u32,
+        #[serde(default = "default_dns_delay")]
+        propagation_delay: u64,
+        #[serde(default = "default_dns_timeout")]
+        propagation_timeout: u64,
+    },
+}
+
+impl std::fmt::Debug for AcmeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcmeConfig")
+            .field("domains", &self.domains)
+            .field("directory_url", &self.directory_url)
+            .field("state_dir", &self.state_dir)
+            .field("terms_of_service", &self.terms_of_service)
+            .field("contacts", &self.contacts)
+            .field("challenge", &self.challenge)
+            .field("ca_cert", &self.ca_cert)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ChallengeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http01 { listen } => f.debug_struct("Http01").field("listen", listen).finish(),
+            Self::TlsAlpn01 => f.write_str("TlsAlpn01"),
+            Self::Dns01 {
+                provider,
+                ttl,
+                propagation_delay,
+                propagation_timeout,
+                ..
+            } => f
+                .debug_struct("Dns01")
+                .field("provider", provider)
+                .field("api_token", &"<redacted>")
+                .field("ttl", ttl)
+                .field("propagation_delay", propagation_delay)
+                .field("propagation_timeout", propagation_timeout)
+                .finish(),
+        }
+    }
+}
+
+fn default_dns_ttl() -> u32 {
+    120
+}
+fn default_dns_delay() -> u64 {
+    10
+}
+fn default_dns_timeout() -> u64 {
+    120
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -440,10 +499,13 @@ fn validate_acme(config: &AcmeConfig) -> io::Result<()> {
     }
     let mut domains = HashSet::new();
     for domain in &config.domains {
-        if domain.len() > 253
-            || !domain.contains('.')
-            || domain.parse::<std::net::IpAddr>().is_ok()
-            || domain.split('.').any(|label| {
+        let wildcard = domain.starts_with("*.");
+        let name = domain.strip_prefix("*.").unwrap_or(domain);
+        if (wildcard && !matches!(&config.challenge, ChallengeConfig::Dns01 { .. }))
+            || domain.len() > 253
+            || !name.contains('.')
+            || name.parse::<std::net::IpAddr>().is_ok()
+            || name.split('.').any(|label| {
                 label.is_empty()
                     || label.len() > 63
                     || label.starts_with('-')
@@ -455,7 +517,7 @@ fn validate_acme(config: &AcmeConfig) -> io::Result<()> {
             || !domains.insert(domain)
         {
             return Err(invalid(
-                "ACME domains must be unique lowercase ASCII DNS names; wildcards and IPs are not supported",
+                "ACME domains must be unique lowercase ASCII DNS names; wildcards require DNS-01 and IPs are not supported",
             ));
         }
     }
@@ -473,11 +535,41 @@ fn validate_acme(config: &AcmeConfig) -> io::Result<()> {
             "HTTP-01 requires explicit listen addresses with nonzero ports",
         ));
     }
+    if let ChallengeConfig::Dns01 {
+        provider,
+        api_token,
+        ttl,
+        propagation_delay,
+        propagation_timeout,
+    } = &config.challenge
+        && (provider != "cloudflare"
+            || api_token.trim().is_empty()
+            || *ttl < 60
+            || *ttl > 86_400
+            || *propagation_timeout == 0
+            || *propagation_timeout > 600
+            || *propagation_delay > 300
+            || *propagation_delay > *propagation_timeout)
+    {
+        return Err(invalid(
+            "DNS-01 requires provider cloudflare, a non-empty api_token, TTL between 60 and 86400 seconds, propagation_delay <= 300 seconds, and propagation_timeout <= 600 seconds",
+        ));
+    }
     if let Some(path) = &config.ca_cert {
         acme::client_tls(Some(path))?;
     }
     acme::validate_state(config)?;
     Ok(())
+}
+
+fn acme_domain_covers(domain: &str, host: &str) -> bool {
+    if domain == host {
+        return true;
+    }
+    domain
+        .strip_prefix("*.")
+        .and_then(|suffix| host.strip_suffix(&format!(".{suffix}")))
+        .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains('.'))
 }
 
 type Visitor<'a> = dyn FnMut(&mut Option<Arc<Source>>, Option<&str>, &str, &str, Option<&str>) -> io::Result<()>
@@ -758,7 +850,10 @@ pub(crate) fn configure(configs: &mut [Config]) -> io::Result<Vec<Arc<Source>>> 
         if let Some(source) = binding
             && let Spec::Acme(acme) = &source.spec
             && let Some(sni) = sni
-            && !acme.domains.iter().any(|domain| domain == sni)
+            && !acme
+                .domains
+                .iter()
+                .any(|domain| acme_domain_covers(domain, sni))
         {
             return Err(invalid(
                 "TLS target SNI is not in certificate_source ACME domains",

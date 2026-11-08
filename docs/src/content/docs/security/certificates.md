@@ -92,6 +92,7 @@ staging directory. No certificate is issued during `--dry-run`.
 
 Reference `public` from TLS or QUIC as in the file-source example. Domains must
 be unique lowercase ASCII DNS names (use punycode for internationalized names).
+Wildcard domains are allowed with DNS-01 only.
 Every named TLS target using an ACME source must be covered by its domains.
 There is no issuance based on incoming SNI.
 
@@ -203,10 +204,31 @@ the check need not run as the service user.
 Actual OS port conflicts,
 storage ownership and permissions are checked during runtime preparation.
 
-There is no built-in DNS-01, wildcard ACME issuance, DNS vendor API, shell hook,
-Tailscale provider, or Cloudflare Origin CA provider. For wildcard certificates
-or DNS-01, run an external client such as acme.sh, lego or Certbot and use a file
-source. Manually supplied wildcard certificates remain supported.
+DNS-01 is supported with the Cloudflare provider. Configure `challenge` as
+`{type: dns01, provider: cloudflare, api_token: ...}`. The token needs Zone:Read
+and DNS:Edit permissions for the zone. Optional `ttl` defaults to 120 seconds and must be at
+least 60 and no more than 86400; `propagation_delay` defaults to 10 seconds and
+`propagation_timeout` to 120 seconds (at most 600); delay is limited to 300
+seconds. For example:
+
+```yaml
+  challenge:
+    type: dns01
+    provider: cloudflare
+    api_token: ${CLOUDFLARE_API_TOKEN}
+```
+
+shoes waits for each TXT value to be visible through Cloudflare DNS before
+notifying the CA, and removes created
+records after the order finishes or is discarded. Set `api_token` directly or
+use `${CLOUDFLARE_API_TOKEN}` to read it from the service environment. Token
+values are redacted in debug output. Keep the API token private.
+Other DNS providers, shell hooks, Tailscale, and Cloudflare Origin CA are not
+supported.
+
+For wildcard certificates, use DNS-01 and explicitly configure the wildcard
+domain, for example `domains: ['*.example.com']`. Manually supplied wildcard
+certificates remain supported.
 
 Examples: [file rotation and reuse](/examples/certificates_files/) and
 [ACME with shared TCP/QUIC consumers](/examples/certificates_acme/).
