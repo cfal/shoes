@@ -1,3 +1,4 @@
+use crate::atomic::AtomicU64;
 use crate::ip_stack::{packet::PacketBuffer, wake::Wake};
 use gotatun::{
     packet::{Ip, Packet, PacketBufPool},
@@ -7,10 +8,7 @@ use gotatun::{
 use std::{
     io,
     net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
 };
 use tokio::sync::{mpsc, oneshot};
 

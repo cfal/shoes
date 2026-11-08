@@ -5,7 +5,7 @@ use super::{
     udp::{UdpConnection, UdpControl},
     wake::{Wake, WakeReceiver},
 };
-use crate::{config::tun::TunResourceLimits, resources::Budget};
+use crate::{atomic::AtomicU64, config::tun::TunResourceLimits, resources::Budget};
 use parking_lot::Mutex;
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
@@ -20,7 +20,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,

@@ -81,6 +81,10 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-24.04
             use_cross: true
+          - target: mips-unknown-linux-musl
+            os: ubuntu-24.04
+            use_cross: false
+            build_std: true
           - target: x86_64-apple-darwin
             os: macos-15-intel
             use_cross: false
@@ -99,7 +103,33 @@ jobs:
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: 1.99.1
-          targets: ${{ matrix.target }}
+          targets: ${{ !matrix.build_std && matrix.target || '' }}
+          components: ${{ matrix.build_std && 'rust-src' || '' }}
+
+      - name: Install pinned MIPS toolchain and QEMU
+        if: matrix.build_std
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-user-static zstd
+          sdk=openwrt-toolchain-24.10.4-ath79-generic_gcc-13.3.0_musl.Linux-x86_64
+          curl --fail --location --retry 3 \
+            "https://downloads.openwrt.org/releases/24.10.4/targets/ath79/generic/$sdk.tar.zst" \
+            --output "$RUNNER_TEMP/mips-toolchain.tar.zst"
+          echo "19b9063d4f9807b5ebcba824e1d134559eff5fc4efdc483a933eb0ac78f62c09  $RUNNER_TEMP/mips-toolchain.tar.zst" | sha256sum --check --strict
+          tar --zstd -xf "$RUNNER_TEMP/mips-toolchain.tar.zst" -C "$RUNNER_TEMP"
+          staging="$RUNNER_TEMP/$sdk/toolchain-mips_24kc_gcc-13.3.0_musl"
+          mkdir -p "$RUNNER_TEMP/mips-native"
+          # Rust's musl std requests libunwind; this SDK supplies GCC's unwinder.
+          printf 'GROUP(-lgcc_eh -lgcc)\n' > "$RUNNER_TEMP/mips-native/libunwind.a"
+          echo "$staging/bin" >> "$GITHUB_PATH"
+          {
+            echo "STAGING_DIR=$staging"
+            echo "CC_mips_unknown_linux_musl=mips-openwrt-linux-musl-gcc"
+            echo "CXX_mips_unknown_linux_musl=mips-openwrt-linux-musl-g++"
+            echo "AR_mips_unknown_linux_musl=mips-openwrt-linux-musl-ar"
+            echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER=mips-openwrt-linux-musl-gcc"
+            echo "CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=no -L native=$RUNNER_TEMP/mips-native -C link-arg=-lgcc"
+          } >> "$GITHUB_ENV"
 
       - name: Test build metadata
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -107,9 +137,11 @@ jobs:
 
       - name: Install pinned cross binary
         if: matrix.use_cross
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl --fail --location --retry 3 \
-            "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz" \
+          gh release download "v${CROSS_VERSION}" --repo cross-rs/cross \
+            --pattern cross-x86_64-unknown-linux-gnu.tar.gz \
             --output "$RUNNER_TEMP/cross.tar.gz"
           echo "642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad  $RUNNER_TEMP/cross.tar.gz" | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/cross.tar.gz" -C "$HOME/.cargo/bin" cross
@@ -125,8 +157,12 @@ jobs:
         run: cross build --release --locked --target "$TARGET" --bin shoes
 
       - name: Build binary (native)
-        if: ${{ !matrix.use_cross }}
+        if: ${{ !matrix.use_cross && !matrix.build_std }}
         run: cargo build --release --locked --target "$TARGET" --bin shoes
+
+      - name: Build binary (MIPS Tier 3)
+        if: matrix.build_std
+        run: RUSTC_BOOTSTRAP=1 cargo build -Z build-std --release --locked --target "$TARGET" --bin shoes
 
       - name: Verify lockfile unchanged
         run: git diff --exit-code -- Cargo.lock
@@ -140,11 +176,25 @@ jobs:
             *musl*) file "target/$TARGET/release/shoes" | grep -E 'static.*linked' ;;
           esac
           mkdir -p package artifacts smoke
-          cp "target/$TARGET/release/shoes" THIRD_PARTY_NOTICES.md package/
+          cp "target/$TARGET/release/shoes" LICENSE THIRD_PARTY_NOTICES.md package/
           cp -R licenses package/
-          tar -czf "artifacts/shoes-$TARGET.tar.gz" -C package shoes THIRD_PARTY_NOTICES.md licenses
+          tar -czf "artifacts/shoes-$TARGET.tar.gz" -C package shoes LICENSE THIRD_PARTY_NOTICES.md licenses
           python3 scripts/check-release-notices.py "artifacts/shoes-$TARGET.tar.gz"
           tar -xzf "artifacts/shoes-$TARGET.tar.gz" -C smoke
+
+      - name: Verify MIPS ABI and smoke-test packaged binary
+        if: matrix.build_std
+        timeout-minutes: 5
+        run: |
+          file smoke/shoes | grep -F 'ELF 32-bit MSB executable, MIPS, MIPS32 rel2'
+          readelf -h smoke/shoes | grep -E 'Flags:.*o32, mips32r2'
+          readelf -A smoke/shoes | grep -F 'Tag_GNU_MIPS_ABI_FP: Soft float'
+          readelf -l -d smoke/shoes > "$RUNNER_TEMP/mips-elf.txt"
+          if grep -E 'INTERP|NEEDED' "$RUNNER_TEMP/mips-elf.txt"; then
+            echo "MIPS executable must be fully static" >&2
+            exit 1
+          fi
+          python3 scripts/smoke-release.py qemu-mips-static -cpu 24Kc ./smoke/shoes
 
       - name: Smoke-test packaged binary (cross/QEMU)
         if: matrix.use_cross
@@ -160,7 +210,7 @@ jobs:
             "$image" "$runner" "${TARGET%%-*}" ./smoke/shoes
 
       - name: Smoke-test packaged binary (native)
-        if: ${{ !matrix.use_cross }}
+        if: ${{ !matrix.use_cross && !matrix.build_std }}
         timeout-minutes: 5
         run: python3 scripts/smoke-release.py ./smoke/shoes
 
@@ -207,7 +257,7 @@ jobs:
       - name: Verify notices and checksum final archives
         run: |
           archives=(release-artifacts/shoes-*.tar.gz)
-          test "${#archives[@]}" -eq 8
+          test "${#archives[@]}" -eq 9
           for archive in "${archives[@]}"; do
             python3 scripts/check-release-notices.py "$archive"
           done

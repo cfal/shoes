@@ -22,11 +22,22 @@ The workspace patches in `Cargo.toml` are required by checkout/release builds:
 - `cfal/hickory-dns`: connection-close recovery, healthy-upstream failover and
   bounded TCP/DoT receive progress.
 - `cfal/smoltcp`: TUN/WireGuard TCP retransmission ACK sequencing.
+- `mullvad/gotatun`: upstream's portable 64-bit atomics for targets without
+  native support, including MIPS32.
 
 Preserve each repository and full revision unless explicitly updating that fork.
 Check every resolved consumer, especially Quinn, tokio-rustls, hyper-rustls,
 rustls-platform-verifier, Hickory and Shoes; absence of unused-patch warnings is
 not sufficient. Keep `publish = false` while workspace patches remain.
+
+### GotaTun
+
+Pinned to upstream main at `c06582e41022bcecbf33751631fd5a63d5794dc5`, including
+[#221](https://github.com/mullvad/gotatun/pull/221). Published 0.10.2 lacks that
+fix despite sharing the package version. The git workspace also splits out
+`gotatun-crypto` and `gotatun-packet`; retain their matching source revision and
+the corresponding source links in `THIRD_PARTY_NOTICES.md`. Shoes keeps AWS-LC
+and uses its own conditional atomic imports on targets without 64-bit atomics.
 
 ### Hickory
 
