@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.3.6"
+version = "0.3.7"
 publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
 rust-version = "1.99.1"
@@ -25,10 +25,10 @@ blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "cd98c1c4112ed3b2cf2140
 # Bounds buffered H3 frames before payload reads and skips unknown frames incrementally.
 h3 = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
 h3-quinn = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
-# Backports hickory-dns/hickory-dns#3861 and preserves H3 connection-close failover.
-hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
-hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
-hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "3fa0a0e3ebd9df778256f18e9264f70d284d31c0" }
+# Preserves connection-close failover and bounded TCP/DoT receive progress.
+hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec4d6c501e23d7815cecd7f556b1cece4a1" }
+hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec4d6c501e23d7815cecd7f556b1cece4a1" }
+hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec4d6c501e23d7815cecd7f556b1cece4a1" }
 # Includes nix-rust/nix#2821 for iOS socket feature compatibility.
 nix = { git = "https://github.com/nix-rust/nix", rev = "3eae6d68ec6382fef7b38cd58f97458e59a71af9" }
 # Preserves TCP ACK sequences during retransmission.
@@ -163,7 +163,7 @@ notify = "*"
 # 0.13's futex_time64 probe triggers SIGSYS on 32-bit Android API 26-29.
 parking_lot = "0.12.5"
 percent-encoding = "*"
-quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+quinn = { version = "*", default-features = false, features = ["log", "runtime-tokio", "rustls-aws-lc-rs"] }
 quinn-proto = { version = "0.11", default-features = false }
 rand = "*"
 rand_core = "*"
@@ -194,6 +194,7 @@ tokio = { version = "*", features = [
     "time",
 ] }
 tokio-util = { version = "*", features = ["time", "io", "rt"] }
+tracing = { version = "0.1", default-features = false, features = ["release_max_level_info"] }
 tun = { version = "*", features = ["async"] }
 url = "*"
 uuid = "1"
@@ -213,6 +214,8 @@ gotatun = { version = "*", default-features = false, features = ["device", "aws-
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.24"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 nftables = "0.6.3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

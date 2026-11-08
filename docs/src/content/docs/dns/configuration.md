@@ -52,6 +52,9 @@ cannot set `native_cache_secs`, even to zero. `bootstrap_url` must not itself
 contain a hostname; named groups may be used for multi-step bootstrap, but
 cycles are rejected.
 
+TCP and TLS keep processing buffered replies after discarding responses for
+inactive queries. This does not add retries or extend configured deadlines.
+
 TCP, TLS, and HTTPS upstreams can use proxy chains. UDP and H3 upstreams are
 direct-only, except a direct chain can set an interface binding; `system` does
 not support a client chain. WireGuard-routed DNS requires a literal upstream
@@ -66,3 +69,69 @@ retain their whole-path choices and selection policies.
 **Migration:** DNS previously interpreted a bare list as alternatives. It now
 uses sequential hops, without a compatibility mode or warning. Use explicit
 chain wrappers or a named group to preserve alternative routes.
+
+## Static Hosts
+
+Add `hosts` to a named DNS group or an inline `dns` object, including
+`global_settings.default_dns`. The map belongs to that resolver, not to the
+process or a particular outbound proxy.
+
+**Complete example:** [dns_static_hosts.yaml](/examples/dns_static_hosts/).
+
+```yaml
+- dns_group: alibaba-dns
+  hosts:
+    ga-bp1v2ogcl3ajd13hmjzrn.aliyunga0018.com:
+      - 47.238.137.75
+      - 47.238.193.242
+  dns_servers: https://1.1.1.1/dns-query
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  dns: {servers: alibaba-dns}
+```
+
+Each value accepts one IP or a nonempty IP list. Names are exact matches,
+case-insensitive, with an optional trailing dot. Use ASCII names or punycode;
+wildcards, aliases to other hostnames, empty lists, duplicate normalized names,
+and unspecified addresses (`0.0.0.0`, `::`) are rejected. Duplicate IPs are removed
+without changing their order. Addresses inside active or retained Fake DNS ranges
+or protected TUN endpoints are also rejected.
+TUN endpoints are protected when `dns_hijack` or `auto_route` is enabled, even
+without Fake DNS; `check` and `--dry-run` reject these collisions too.
+
+The map applies to upstream proxy endpoints, locally resolved destinations and
+routing lookups, and intercepted DNS queries using this resolver. Destinations
+sent as hostnames to a remote proxy are still resolved remotely. Configured proxy
+hostnames, TLS SNI, XHTTP Host, certificate checks, and credentials are unchanged.
+
+Static entries take precedence over system hosts, cached upstream results, and
+Fake DNS. Connection lookups return all configured IPs in order; upstream
+`ip_strategy` does not filter explicit hosts entries. Transports retain their
+existing candidate-selection and retry behavior, so multiple IPs do not imply
+uniform failover across all protocols. IP-dependent routing may retain only the
+first address for the connection, as before.
+
+For a mapped name, DNS A/AAAA queries return only the matching address family.
+A missing family returns an empty successful response (NOERROR/NODATA), without
+querying an upstream or allocating a fake IP. Replies use a 60-second TTL and
+do not claim DNSSEC authentication. Unmapped names and other query types, including
+HTTPS/SVCB, retain their existing handling and may query upstream DNS.
+
+Inline hosts can overlay a group (`dns: {servers: alibaba-dns, hosts: {...}}`).
+Group composition inherits hosts: local entries override referenced groups, and
+earlier references win among inherited entries. Adding an overlay to a Fake DNS
+group follows the existing composition requirement for an explicit `fake_ip`
+policy and creates a separate context. To share its pool, put `hosts` on the
+referenced group and reference it without an inline overlay.
+
+With no `servers`, an inline hosts map uses the cached native resolver for misses.
+An explicit `dns` object still replaces, rather than merges with,
+`global_settings.default_dns`. A DNS upstream's own hostname and its DNS proxy
+chain use the separate `bootstrap_url` policy; select a named hosts-bearing group
+there when static bootstrap is needed. Hosts do not replace bootstrap cycle checks
+or make an invalid upstream configuration valid.
+
+Reloading installs the new map for new work. Existing connections and application
+DNS caches may retain old addresses. Remove `hosts` and reload to restore normal
+resolution; no system hosts file or Hickory dependency changes are required.

@@ -26,6 +26,10 @@ mod wireguard_dns;
 mod fake_dns;
 
 #[cfg(unix)]
+#[path = "cases/process_contract/static_hosts.rs"]
+mod static_hosts;
+
+#[cfg(unix)]
 #[path = "cases/process_contract/rule_sets.rs"]
 mod rule_sets;
 

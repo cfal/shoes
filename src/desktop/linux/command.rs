@@ -115,7 +115,5 @@ pub(super) async fn nft(
 }
 
 pub(super) fn encode_nft(batch: serde_json::Value) -> io::Result<Vec<u8>> {
-    let typed: nftables::schema::Nftables<'_> =
-        serde_json::from_value(batch).map_err(io::Error::other)?;
-    serde_json::to_vec(&typed).map_err(io::Error::other)
+    serde_json::to_vec(&batch).map_err(io::Error::other)
 }

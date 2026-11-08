@@ -1839,6 +1839,7 @@ async fn test_tun_icmp_requires_tcp() {
 #[tokio::test]
 async fn test_dns_system_with_client_chain_rejected() {
     let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
+        hosts: Default::default(),
         fake_ip: None,
         dns_group: "test-dns".to_string(),
         dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
@@ -1957,6 +1958,7 @@ async fn test_dns_udp_with_proxy_chain_rejected() {
             client_chains: OneOrSome::One(ConfigSelection::Config(socks_config).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
@@ -1999,6 +2001,7 @@ async fn test_dns_udp_with_direct_chain_allowed() {
             client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
@@ -2043,6 +2046,7 @@ async fn test_dns_h3_with_proxy_chain_rejected() {
             client_chains: OneOrSome::One(ConfigSelection::Config(socks_config).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
@@ -2085,6 +2089,7 @@ async fn test_dns_h3_with_direct_chain_allowed() {
             client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
@@ -2120,6 +2125,7 @@ async fn test_dns_tcp_with_client_chain_allowed() {
             client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
@@ -2156,6 +2162,7 @@ async fn test_dns_tls_with_client_chain_allowed() {
             client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
@@ -2192,6 +2199,7 @@ async fn test_dns_https_with_client_chain_allowed() {
             client_chains: OneOrSome::One(ConfigSelection::Config(ClientConfig::default()).into()),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "test-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
@@ -2221,6 +2229,7 @@ async fn test_dns_group_composition_basic() {
     // Group full-dns includes base-dns
     let configs = vec![
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "base-dns".to_string(),
             dns_servers: NoneOrSome::Some(vec![
@@ -2229,6 +2238,7 @@ async fn test_dns_group_composition_basic() {
             ]),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "full-dns".to_string(),
             dns_servers: NoneOrSome::Some(vec![
@@ -2251,11 +2261,13 @@ async fn test_dns_group_composition_multi_level() {
     // C includes B, B includes A
     let configs = vec![
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "level-a".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "level-b".to_string(),
             dns_servers: NoneOrSome::Some(vec![
@@ -2264,6 +2276,7 @@ async fn test_dns_group_composition_multi_level() {
             ]),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "level-c".to_string(),
             dns_servers: NoneOrSome::Some(vec![
@@ -2286,11 +2299,13 @@ async fn test_dns_group_composition_cycle_detected() {
     // A includes B, B includes A - cycle!
     let configs = vec![
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "group-a".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-b".to_string())),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "group-b".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-a".to_string())),
@@ -2310,6 +2325,7 @@ async fn test_dns_group_composition_cycle_detected() {
 async fn test_dns_group_composition_unknown_ref() {
     // Reference to non-existent group
     let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
+        hosts: Default::default(),
         fake_ip: None,
         dns_group: "my-dns".to_string(),
         dns_servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent".to_string())),
@@ -2330,16 +2346,19 @@ async fn test_dns_group_composition_with_bootstrap() {
     // Note: Using IP-based URLs to avoid network calls during tests
     let configs = vec![
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "bootstrap-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "base-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tls://1.1.1.1".to_string())),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "full-dns".to_string(),
             dns_servers: NoneOrSome::Some(vec![
@@ -2396,6 +2415,7 @@ async fn test_server_dns_with_group_ref() {
     // Server config references an existing dns_group
     let configs = vec![
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "my-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
@@ -2419,6 +2439,7 @@ async fn test_server_dns_with_group_ref() {
             quic_settings: None,
             rules: direct_allow_rule(),
             dns: Some(DnsConfig {
+                hosts: Default::default(),
                 fake_ip: None,
                 servers: NoneOrSome::One(DnsServerSpec::Simple("my-dns".to_string())),
             }),
@@ -2448,6 +2469,7 @@ async fn test_server_dns_with_mixed_group_and_url() {
     // Server config with both group ref and URL in servers
     let configs = vec![
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "base-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
@@ -2471,6 +2493,7 @@ async fn test_server_dns_with_mixed_group_and_url() {
             quic_settings: None,
             rules: direct_allow_rule(),
             dns: Some(DnsConfig {
+                hosts: Default::default(),
                 fake_ip: None,
                 servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("base-dns".to_string()), // group ref
@@ -2508,11 +2531,13 @@ async fn test_server_dns_with_multiple_group_refs() {
     // Server config with multiple group refs that need expansion
     let configs = vec![
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "fast-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
         }),
         Config::DnsConfigGroup(DnsConfigGroup {
+            hosts: Default::default(),
             fake_ip: None,
             dns_group: "secure-dns".to_string(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tcp://1.1.1.1".to_string())),
@@ -2536,6 +2561,7 @@ async fn test_server_dns_with_multiple_group_refs() {
             quic_settings: None,
             rules: direct_allow_rule(),
             dns: Some(DnsConfig {
+                hosts: Default::default(),
                 fake_ip: None,
                 servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("fast-dns".to_string()),
@@ -2590,6 +2616,7 @@ async fn test_server_dns_unknown_group_ref() {
         quic_settings: None,
         rules: direct_allow_rule(),
         dns: Some(DnsConfig {
+            hosts: Default::default(),
             fake_ip: None,
             servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent-dns".to_string())),
         }),
