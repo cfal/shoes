@@ -14,9 +14,9 @@ use std::{
 };
 
 use etherparse::PacketBuilder;
-use futures::{Sink, Stream, ready};
+use futures::{Stream, ready};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
-use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::packet::PacketBuffer;
 use super::wake::Wake;
@@ -73,20 +73,16 @@ pub struct UdpWriter {
 }
 
 impl UdpWriter {
-    /// UDP is lossy: saturation drops a packet rather than retaining unbounded data.
-    pub fn send_sync(&self, message: UdpMessage) -> io::Result<()> {
+    /// Applies bounded backpressure until the stack thread accepts the packet.
+    pub async fn send(&self, message: UdpMessage) -> io::Result<()> {
         let (payload, src_addr, dst_addr) = message;
         let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
-        match self.to_tun_tx.try_send(packet) {
-            Ok(()) => {
-                self.wake.notify();
-                Ok(())
-            }
-            Err(TrySendError::Full(_)) => Ok(()),
-            Err(TrySendError::Closed(_)) => {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
-            }
-        }
+        self.to_tun_tx
+            .send(packet)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+        self.wake.notify();
+        Ok(())
     }
 }
 
@@ -100,27 +96,6 @@ impl Stream for UdpReader {
             }
         }
         Poll::Ready(None)
-    }
-}
-
-impl Sink<UdpMessage> for UdpWriter {
-    type Error = io::Error;
-
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Saturated UDP output drops packets.
-        Poll::Ready(Ok(()))
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: UdpMessage) -> Result<(), Self::Error> {
-        self.send_sync(item)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -369,8 +344,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_successful_response_enqueues_notify_the_stack() {
+    #[tokio::test]
+    async fn only_successful_response_enqueues_notify_the_stack() {
         use std::os::{fd::AsRawFd, unix::net::UnixStream};
         use std::time::Duration;
         use tokio::sync::mpsc;
@@ -378,7 +353,7 @@ mod tests {
         let (_peer, tun) = UnixStream::pair().unwrap();
         let (wake, mut receiver) = Wake::new().unwrap();
         let (_, input) = mpsc::channel(1);
-        let (output, queued) = mpsc::channel(1);
+        let (output, mut queued) = mpsc::channel(1);
         let (_, writer) = UdpHandler::new(input, output, wake).split();
         let message = || {
             (
@@ -387,25 +362,36 @@ mod tests {
                 "10.0.0.2:1000".parse().unwrap(),
             )
         };
-        writer.send_sync(message()).unwrap();
+        writer.send(message()).await.unwrap();
         assert!(
             receiver
                 .wait(tun.as_raw_fd(), Some(Duration::ZERO))
                 .unwrap()
         );
         receiver.drain().unwrap();
-        writer.send_sync(message()).unwrap();
+        let send = writer.send(message());
+        tokio::pin!(send);
+        assert!(futures::poll!(&mut send).is_pending());
         assert_eq!(queued.len(), 1);
         assert!(
             !receiver
                 .wait(tun.as_raw_fd(), Some(Duration::ZERO))
                 .unwrap()
         );
-        drop(queued);
-        assert_eq!(
-            writer.send_sync(message()).unwrap_err().kind(),
-            io::ErrorKind::BrokenPipe
+        queued.recv().await.unwrap();
+        send.await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(
+            receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
         );
+        receiver.drain().unwrap();
+        let send = writer.send(message());
+        tokio::pin!(send);
+        assert!(futures::poll!(&mut send).is_pending());
+        drop(queued);
+        assert_eq!(send.await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
         assert!(
             !receiver
                 .wait(tun.as_raw_fd(), Some(Duration::ZERO))

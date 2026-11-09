@@ -34,8 +34,8 @@ use super::udp_handler::{UdpMessage, UdpReader, UdpWriter};
 /// Session timeout - sessions without activity are expired
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Channel buffer size for session and destination packets
-const CHANNEL_SIZE: usize = 64;
+/// Holds an upload burst while the next task is waiting to be scheduled.
+const CHANNEL_SIZE: usize = 128;
 
 /// Response channel buffer size. Bounds memory growth when destination
 /// tasks produce responses faster than the manager can write to TUN.
@@ -167,7 +167,10 @@ impl TunUdpManager {
                         src_addr, dst_addr, payload.len()
                     );
 
-                    if let Err(e) = self.writer.send_sync((payload, src_addr, dst_addr)) {
+                    if let Err(e) = self.writer.send((payload, src_addr, dst_addr)).await {
+                        if e.kind() == io::ErrorKind::BrokenPipe {
+                            return Err(e);
+                        }
                         debug!("[TunUdpManager] Failed to write response to TUN: {}", e);
                     }
                 }
@@ -521,20 +524,18 @@ async fn destination_task(
                     peer_addr, source_addr, len
                 );
 
-                // (payload, src=remote, dst=local_app)
-                if response_tx
-                    .try_send((
-                        PacketBuffer::copy_from_slice(buf.filled()),
-                        source_addr,
-                        peer_addr,
-                    ))
-                    .is_err()
-                {
-                    debug!(
-                        "[TunUdpSession {}] Response channel full, dropping response from {}",
-                        peer_addr, source_addr
-                    );
-                }
+                // Buffered proxy frames can fill the queue before its consumer runs.
+                // Reserves capacity before copying, retaining at most the current read.
+                let Ok(Ok(permit)) =
+                    tokio::time::timeout(WRITE_TIMEOUT, response_tx.reserve()).await
+                else {
+                    break;
+                };
+                permit.send((
+                    PacketBuffer::copy_from_slice(buf.filled()),
+                    source_addr,
+                    peer_addr,
+                ));
             }
             Action::Read(Err(e)) => {
                 debug!(

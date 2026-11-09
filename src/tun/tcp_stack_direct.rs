@@ -39,6 +39,7 @@ use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
 use super::wake::{Wake, WakeReceiver};
 
 pub const PACKET_QUEUE_CAPACITY: usize = 64;
+const UDP_INGRESS_QUEUE_CAPACITY: usize = 128;
 
 /// Tracks socket info including addresses for proper cleanup.
 struct SocketInfo {
@@ -160,7 +161,7 @@ impl TcpStackDirect {
         admission: Option<Arc<tokio::sync::Semaphore>>,
     ) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
-        let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        let (udp_tx, udp_rx) = mpsc::channel(UDP_INGRESS_QUEUE_CAPACITY);
         let (tcp_tx, tcp_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (completion_tx, completion) = oneshot::channel();
