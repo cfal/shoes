@@ -30,6 +30,10 @@ as ordinary IPs. Overlapping ranges may map to an unrelated hostname in the
 receiving context. Use one shared named DNS group for inbounds serving the same clients.
 Established flows keep their chosen target.
 
+Static [`hosts`](/dns/configuration/#static-hosts) entries return real addresses
+before Fake DNS synthesis. Clients connecting to those addresses do not get
+hostname restoration; hostname-based routing requires a hostname from sniffing.
+
 `false` disables the feature. An options object enables it with these defaults:
 
 ```yaml

@@ -1,4 +1,5 @@
 use super::{packet::PacketBuffer, wake::Wake};
+use crate::atomic::AtomicU64;
 use crate::{
     async_stream::*,
     resources::{Budget, BudgetPermit},
@@ -9,10 +10,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     task::{Context, Poll, Waker},
 };
 use tokio::io::ReadBuf;

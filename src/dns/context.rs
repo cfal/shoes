@@ -18,6 +18,7 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub struct DnsContext {
     responder: Option<Arc<FakeDnsResponder>>,
+    hosts: Arc<super::StaticHosts>,
     real: Arc<dyn Resolver>,
 }
 
@@ -25,6 +26,7 @@ impl DnsContext {
     pub fn real(real: Arc<dyn Resolver>) -> Self {
         Self {
             responder: None,
+            hosts: Arc::default(),
             real,
         }
     }
@@ -43,8 +45,14 @@ impl DnsContext {
     ) -> io::Result<Self> {
         Ok(Self {
             responder: Some(Arc::new(FakeDnsResponder::new(options, pool)?)),
+            hosts: Arc::default(),
             real,
         })
+    }
+
+    pub(super) fn with_hosts(mut self, hosts: Arc<super::StaticHosts>) -> Self {
+        self.hosts = hosts;
+        self
     }
 
     pub fn restore(&self, address: IpAddr) -> io::Result<Option<String>> {
@@ -83,6 +91,8 @@ impl DnsContext {
                 RecordType::A | RecordType::AAAA
             );
         let decision = if let Some(decision) = precheck(&request) {
+            decision
+        } else if let Some(decision) = self.hosts.decide(&request) {
             decision
         } else if let Some(responder) = self
             .responder

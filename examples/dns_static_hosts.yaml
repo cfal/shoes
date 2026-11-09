@@ -1,0 +1,15 @@
+# Both listeners share one map. Unmapped names use the configured DoH upstream.
+- dns_group: alibaba-dns
+  hosts:
+    ga-bp1v2ogcl3ajd13hmjzrn.aliyunga0018.com:
+      - 47.238.137.75
+      - 47.238.193.242
+  dns_servers: https://1.1.1.1/dns-query
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  dns: {servers: alibaba-dns}
+
+- address: "0.0.0.0:8080"
+  protocol: {type: http}
+  dns: {servers: alibaba-dns}

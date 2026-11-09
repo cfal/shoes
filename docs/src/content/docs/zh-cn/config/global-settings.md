@@ -22,8 +22,8 @@ description: "默认 DNS、可选 NTP、准入限制、远程规则缓存、QUIC
 <a id="default-dns"></a>
 ## 默认 DNS
 
-`default_dns` 接受与监听器的 `dns` 相同的对象：`servers` 可以引用命名组或配置内联上游，还可以指定可选的 `fake_ip` 设置。
-`default_dns` 对象在省略或清空 `servers` 时使用底层系统解析器，仅配置 Fake IP 设置时也是如此。
+`default_dns` 接受与监听器的 `dns` 相同的对象：`servers` 可以引用命名组或配置内联上游，还可以指定可选的静态 `hosts` 和 `fake_ip` 设置。
+`default_dns` 对象在省略或清空 `servers` 时，对未命中静态映射的名称使用底层系统解析器，仅配置 `hosts` 或 Fake IP 设置时也是如此。
 
 ```yaml
 - global_settings:

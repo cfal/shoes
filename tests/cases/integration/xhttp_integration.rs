@@ -719,8 +719,11 @@ async fn packet_up_throughput_and_stall_qualification() -> fixture::Result {
                                     .await?
                             };
                             let pids = pair.pids();
-                            let peak_rss =
-                                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                            #[cfg(not(target_has_atomic = "64"))]
+                            use portable_atomic::AtomicU64;
+                            #[cfg(target_has_atomic = "64")]
+                            use std::sync::atomic::AtomicU64;
+                            let peak_rss = std::sync::Arc::new(AtomicU64::new(0));
                             let peak = peak_rss.clone();
                             let stop = tokio_util::sync::CancellationToken::new();
                             let stopped = stop.clone();

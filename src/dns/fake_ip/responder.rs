@@ -5,8 +5,8 @@ use std::sync::Arc;
 use hickory_resolver::proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use hickory_resolver::proto::rr::{DNSClass, RData, Record, RecordType, rdata};
 
-use super::pool::canonical_hostname;
 use super::{FakeIpOptions, FakeIpPool, HttpsRecords, MissingFamily};
+use crate::dns::canonical_hostname;
 use crate::dns::message::UDP_PAYLOAD_LIMIT;
 
 pub const SYNTHETIC_TTL: u32 = 60;

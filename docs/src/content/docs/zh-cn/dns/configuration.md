@@ -37,8 +37,65 @@ description: "选择解析器、可重用组、引导程序和代理路由。"
 
 `ip_strategy` 还接受 `ipv4_only`、`ipv6_only`、`ipv4_and_ipv6` 和 `ipv6_then_ipv4`。选项对象拒绝未知字段。非系统上游无法设置 `native_cache_secs`，甚至为零。 `bootstrap_url` 本身不得包含主机名；命名组可用于多步引导，但循环被拒绝。
 
+TCP 和 TLS 丢弃已失效查询的响应后，会继续处理缓冲区中的其他响应。这不会增加重试次数或延长配置的超时时间。
+
 TCP、TLS和HTTPS上游可以使用代理链。 UDP 和 H3 上游仅是直接的，但直接链可以设置接口绑定； `system` 不支持客户端链。 WireGuard 路由的 DNS 需要字面上的上游 IP，而不需要 `bootstrap_url`。请参阅[远程规则源](/zh-cn/routing/remote-sources/) 了解更严格的启动引导规则。
 
 `client_chain` 和 `client_chains` 是完全等价的别名，使用[路由链语法](/zh-cn/routing/rules/#client-chains)：`[a, b]` 表示顺序跃点，而 `[{chain: [a]}, {chain: [b]}]` 表示备选路径。命名客户端组保留其完整路径选项和选择策略。
 
 **迁移：** DNS 以前将普通列表解释为备选路径，现在将其解释为顺序跃点，不提供兼容模式或警告。要保留备选路由，请使用显式链包装或命名组。
+
+<a id="static-hosts"></a>
+## 静态 Hosts
+
+在命名的 DNS 组或内联 `dns` 对象中添加 `hosts`，也可用于
+`global_settings.default_dns`。映射仅属于所选解析器，不是进程全局设置，
+也不局限于某个出站代理。
+
+**完整示例：** [dns_static_hosts.yaml](/zh-cn/examples/dns_static_hosts/)。
+
+```yaml
+- dns_group: alibaba-dns
+  hosts:
+    ga-bp1v2ogcl3ajd13hmjzrn.aliyunga0018.com:
+      - 47.238.137.75
+      - 47.238.193.242
+  dns_servers: https://1.1.1.1/dns-query
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  dns: {servers: alibaba-dns}
+```
+
+每个值可以是单个 IP 或非空 IP 列表。主机名精确匹配，忽略大小写及末尾的一个点。
+使用 ASCII 或 punycode 名称；不支持通配符或主机名别名。空列表、规范化后重复的名称、
+未指定地址（`0.0.0.0`、`::`）以及与活动或保留的 Fake DNS 地址池、受保护 TUN
+端点重叠的地址会被拒绝。重复 IP 会被删除，其余地址保持原顺序。
+启用 `dns_hijack` 或 `auto_route` 时，即使未启用 Fake DNS，TUN 端点也受保护；
+`check` 和 `--dry-run` 同样会拒绝这些冲突。
+
+映射用于该解析器负责的上游代理端点、本地目标及路由查找，以及截获的 DNS 查询。
+以主机名发送给远程代理的目标仍由远端解析。代理主机名、TLS SNI、XHTTP Host、
+证书校验和凭据保持不变。
+
+静态条目优先于系统 hosts、上游缓存和 Fake DNS。连接查找按配置顺序返回全部地址；
+上游的 `ip_strategy` 不过滤显式 hosts 条目。各传输保留原有候选地址选择及重试行为，
+多个 IP 不意味着所有协议都有相同的故障切换机制。与原有行为相同，依赖 IP 的路由
+可能只为后续连接保留第一个地址。
+
+命中条目的 A/AAAA 查询仅返回对应地址族；缺少该地址族时返回空的成功响应
+（NOERROR/NODATA），不查询上游、不分配假 IP。响应 TTL 为 60 秒，不声明 DNSSEC
+认证。未命中名称及 HTTPS/SVCB 等其他查询类型保持原有行为，仍可能查询上游。
+
+内联 hosts 可覆盖命名组：`dns: {servers: alibaba-dns, hosts: {...}}`。
+组组合继承 hosts；本组条目优先，多个引用之间较早引用的条目优先。
+覆盖 Fake DNS 组时仍须遵守现有组合规则，显式指定 `fake_ip` 策略，并创建独立上下文。
+若要共享地址池，应将 `hosts` 放在被引用的组上，并直接引用该组，不添加内联覆盖。
+
+内联 hosts 未指定 `servers` 时，未命中的名称使用带缓存的本机解析器。
+显式 `dns` 对象仍会替换而非合并 `global_settings.default_dns`。
+DNS 上游自身的主机名及其代理链使用独立的 `bootstrap_url` 策略；需要静态引导时，
+在该字段选择带有 hosts 的命名组。hosts 不绕过依赖循环或上游配置校验。
+
+重新加载配置后，新请求使用新映射；已有连接及应用 DNS 缓存可能继续使用旧地址。
+删除 `hosts` 并重新加载即可恢复正常解析，无需修改系统 hosts 文件或 Hickory 依赖。

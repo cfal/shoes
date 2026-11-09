@@ -190,6 +190,8 @@ impl DnsServerSpec {
 #[serde(deny_unknown_fields)]
 pub struct DnsConfigGroup {
     pub dns_group: String,
+    #[serde(default, skip_serializing_if = "crate::dns::StaticHosts::is_empty")]
+    pub hosts: crate::dns::StaticHosts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fake_ip: Option<crate::dns::fake_ip::FakeIpConfig>,
     #[serde(alias = "dns_server")]
@@ -202,6 +204,8 @@ pub struct DnsConfigGroup {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsConfig {
+    #[serde(default, skip_serializing_if = "crate::dns::StaticHosts::is_empty")]
+    pub hosts: crate::dns::StaticHosts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fake_ip: Option<crate::dns::fake_ip::FakeIpConfig>,
     #[serde(default, alias = "server")]
@@ -251,6 +255,7 @@ pub struct ExpandedDnsSpec {
 #[derive(Debug, Clone)]
 pub struct ExpandedDnsGroup {
     pub name: String,
+    pub hosts: crate::dns::StaticHosts,
     pub specs: Vec<ExpandedDnsSpec>,
     pub fake_ip: Option<crate::dns::fake_ip::FakeIpOptions>,
     pub use_default_resolver: bool,
@@ -430,6 +435,7 @@ servers: my-dns-group
     fn test_dns_config_resolved_group() {
         // After validation, servers should be a single group name
         let config = DnsConfig {
+            hosts: Default::default(),
             fake_ip: None,
             servers: NoneOrSome::One(DnsServerSpec::Simple("my-resolved-group".to_string())),
         };
