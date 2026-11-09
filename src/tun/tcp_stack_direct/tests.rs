@@ -1043,6 +1043,10 @@ fn disabled_tcp_and_udp_do_not_reach_async_handlers() {
 #[test]
 fn udp_ingress_buffers_a_burst_before_the_async_reader_runs() {
     let (peer, tun) = UnixDatagram::pair().unwrap();
+    // Keeps the fixture's kernel queue from limiting the ingress burst on macOS.
+    socket2::SockRef::from(&tun)
+        .set_recv_buffer_size(256 * 1024)
+        .unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut stack = TcpStackDirect::new(tun.into(), 1500);
     let mut received = stack.take_udp_rx().unwrap();
