@@ -284,6 +284,7 @@ pub(crate) fn configure_quic_transport_with_limits(
     limits: GlobalLimits,
 ) -> usize {
     transport
+        .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()))
         .receive_window((limits.quic_receive_window as u32).into())
         .send_window(limits.quic_send_window as u64)
         .stream_receive_window(
