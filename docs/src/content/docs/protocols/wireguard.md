@@ -223,7 +223,10 @@ Default admission limits are 256 TCP connections, 32 KiB TCP buffers, a
 destinations per inbound UDP session, and 8 MiB queued UDP payloads.
 UDP forwarding and outbound associations have separate bounded pools.
 Missing or null limit fields use WireGuard defaults rather than the unlimited
-TUN defaults. Packet and command queues are bounded at 64. These budgets
+TUN defaults. Stack packet and command queues are bounded at 64; inbound UDP
+session and destination upload queues are bounded at 128 and drop when full.
+Inbound UDP replies wait for bounded forwarding queue capacity; a destination
+closes if response-queue space remains unavailable for 30 seconds. These budgets
 cover modeled shoes-owned state, not total process RSS or all GotaTun state.
 
 The TCP buffers bound the advertised receive window and in-flight data across

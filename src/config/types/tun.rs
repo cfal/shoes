@@ -64,7 +64,7 @@ pub struct TunResourceLimits {
 impl Default for TunResourceLimits {
     fn default() -> Self {
         Self {
-            tcp_buffer_size: 32 * 1024,
+            tcp_buffer_size: 128 * 1024,
             tcp_memory_bytes: None,
             max_tcp_connections: None,
             max_udp_sessions: None,
@@ -115,11 +115,35 @@ mod tests {
     fn tun_admission_is_unlimited_by_default() {
         let limits: TunResourceLimits = serde_yaml::from_str("{}").unwrap();
         limits.validate().unwrap();
+        assert_eq!(limits.tcp_buffer_size, 128 * 1024);
         assert_eq!(limits.tcp_connection_limit(), None);
         assert_eq!(limits.max_udp_sessions, None);
         assert_eq!(limits.max_udp_destinations, None);
         assert_eq!(limits.max_udp_destinations_per_session, None);
         assert_eq!(limits.max_udp_queued_bytes, None);
+    }
+
+    #[test]
+    fn tun_buffer_default_applies_to_omitted_and_partial_limits() {
+        for yaml in [
+            "{}",
+            "resource_limits: {}",
+            "resource_limits: {max_tcp_connections: 9}",
+        ] {
+            let config: TunConfig = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(config.resource_limits.tcp_buffer_size, 128 * 1024);
+            config.resource_limits.validate().unwrap();
+        }
+        let config: TunConfig =
+            serde_yaml::from_str("resource_limits: {tcp_memory_bytes: 131072}").unwrap();
+        assert!(config.resource_limits.validate().is_err());
+        let config: TunConfig = serde_yaml::from_str(
+            "resource_limits: {tcp_buffer_size: 32768, tcp_memory_bytes: 131072}",
+        )
+        .unwrap();
+        config.resource_limits.validate().unwrap();
+        assert_eq!(config.resource_limits.tcp_buffer_size, 32 * 1024);
+        assert_eq!(config.resource_limits.tcp_connection_limit(), Some(1));
     }
 
     #[test]
@@ -130,7 +154,7 @@ mod tests {
         };
         assert_eq!(limits.tcp_connection_limit(), Some(1024));
         limits.tcp_memory_bytes = Some(32 * 1024 * 1024);
-        assert_eq!(limits.tcp_connection_limit(), Some(256));
+        assert_eq!(limits.tcp_connection_limit(), Some(64));
         limits.max_tcp_connections = Some(16);
         assert_eq!(limits.tcp_connection_limit(), Some(16));
     }

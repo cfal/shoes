@@ -64,6 +64,226 @@ impl AsyncPing for StalledFlush {
 
 impl AsyncMessageStream for StalledFlush {}
 
+async fn buffered_xudp_replies(count: u16) -> Box<dyn AsyncMessageStream> {
+    use crate::xudp::frame::{FrameMetadata, FrameOption, SessionStatus};
+    use bytes::{BufMut, BytesMut};
+    use tokio::io::AsyncWriteExt;
+
+    let mut frames = BytesMut::new();
+    for sequence in 0..count {
+        FrameMetadata {
+            session_id: 0,
+            status: SessionStatus::Keep,
+            option: FrameOption::new().with_data(),
+            target: None,
+            network: None,
+        }
+        .encode(&mut frames)
+        .unwrap();
+        frames.put_u16(2);
+        frames.put_u16(sequence);
+    }
+    let (inner, mut peer) = tokio::io::duplex(frames.len());
+    peer.write_all(&frames).await.unwrap();
+    Box::new(crate::xudp::client_stream::XudpClientStream::new(
+        Box::new(inner),
+        NetLocation::UNSPECIFIED,
+    ))
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_xudp_replies_survive_response_queue_backpressure() {
+    const COUNT: u16 = 128;
+    let peer = "10.0.0.2:1234".parse().unwrap();
+    let source = "1.1.1.1:443".parse().unwrap();
+    let (_write_tx, write_rx) = mpsc::channel(1);
+    let (response_tx, mut response_rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
+    let slots = Arc::new(Budget::new(Some(1)));
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(destination_task(
+        peer,
+        source,
+        buffered_xudp_replies(COUNT).await,
+        write_rx,
+        response_tx,
+        slots.acquire(1).unwrap(),
+    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for sequence in 0..COUNT {
+            let (payload, actual_source, actual_peer) = response_rx.recv().await.unwrap();
+            assert_eq!(&*payload, &sequence.to_be_bytes());
+            assert_eq!((actual_source, actual_peer), (source, peer));
+        }
+        tasks.join_next().await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+    assert_eq!(slots.available_permits(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn manager_replies_survive_tun_queue_backpressure() {
+    const COUNT: u16 = 128;
+    let (_input, from_tun) = mpsc::channel(1);
+    let (to_tun, output) = mpsc::channel(1);
+    let (wake, _receiver) = super::super::wake::Wake::new().unwrap();
+    let (reader, writer) =
+        super::super::udp_handler::UdpHandler::new(from_tun, to_tun, wake.clone()).split();
+    let manager = TunUdpManager::new(
+        reader,
+        writer,
+        Arc::new(ClientProxySelector::new(Vec::new())),
+        Arc::new(crate::resolver::NativeResolver::new()),
+        TunResourceLimits::default(),
+    );
+    let (unused, _) = mpsc::channel(1);
+    let (mut received, _) =
+        super::super::udp_handler::UdpHandler::new(output, unused, wake).split();
+    let responses = manager.response_tx.clone();
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(manager.run());
+    tasks.spawn(async move {
+        for sequence in 0..COUNT {
+            responses
+                .send((
+                    PacketBuffer::copy_from_slice(&sequence.to_be_bytes()),
+                    "1.1.1.1:443".parse().unwrap(),
+                    "10.0.0.2:1234".parse().unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        Ok(())
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for sequence in 0..COUNT {
+            let (payload, _, _) = received.next().await.unwrap();
+            assert_eq!(&*payload, &sequence.to_be_bytes());
+        }
+    })
+    .await
+    .unwrap();
+    tasks.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn backpressured_reply_releases_destination_on_every_exit_path() {
+    for completion in ["success", "closed", "timeout", "cancel"] {
+        let peer = "10.0.0.2:1234".parse().unwrap();
+        let source = "1.1.1.1:443".parse().unwrap();
+        let (_write_tx, write_rx) = mpsc::channel(1);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        response_tx
+            .send((PacketBuffer::copy_from_slice(b"occupied"), source, peer))
+            .await
+            .unwrap();
+        let slots = Arc::new(Budget::new(Some(1)));
+        let mut task = Box::pin(destination_task(
+            peer,
+            source,
+            buffered_xudp_replies(1).await,
+            write_rx,
+            response_tx,
+            slots.acquire(1).unwrap(),
+        ));
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        assert_eq!(slots.available_permits(), 0);
+        assert_eq!(response_rx.len(), 1);
+        match completion {
+            "success" => {
+                response_rx.recv().await.unwrap();
+                task.await;
+                let (payload, _, _) = response_rx.recv().await.unwrap();
+                assert_eq!(&*payload, &0u16.to_be_bytes());
+            }
+            "closed" => {
+                drop(response_rx);
+                task.await;
+            }
+            "timeout" => {
+                tokio::time::advance(WRITE_TIMEOUT).await;
+                task.await;
+                assert_eq!(response_rx.len(), 1);
+            }
+            "cancel" => drop(task),
+            _ => unreachable!(),
+        }
+        assert_eq!(slots.available_permits(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_reply_bursts_share_capacity_without_losing_other_flows() {
+    const COUNT: u16 = 128;
+    const FLOWS: usize = 4;
+    let (responses, mut received) = mpsc::channel(1);
+    let slots = Arc::new(Budget::new(Some(FLOWS)));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut writers = Vec::new();
+    for flow in 0..FLOWS {
+        let (tx, rx) = mpsc::channel(1);
+        writers.push(tx);
+        tasks.spawn(destination_task(
+            SocketAddr::from(([10, 0, 0, 2], 1000 + flow as u16)),
+            "1.1.1.1:443".parse().unwrap(),
+            buffered_xudp_replies(COUNT).await,
+            rx,
+            responses.clone(),
+            slots.acquire(1).unwrap(),
+        ));
+    }
+    drop(responses);
+    let mut next = [0u16; FLOWS];
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some((payload, _, peer)) = received.recv().await {
+            let sequence = &mut next[usize::from(peer.port() - 1000)];
+            assert_eq!(&*payload, &sequence.to_be_bytes());
+            *sequence += 1;
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(next, [COUNT; FLOWS]);
+    assert_eq!(slots.available_permits(), FLOWS);
+}
+
+#[tokio::test(start_paused = true)]
+async fn closed_tun_output_stops_the_udp_manager() {
+    let (_input, from_tun) = mpsc::channel(1);
+    let (to_tun, output) = mpsc::channel(1);
+    let (wake, _receiver) = super::super::wake::Wake::new().unwrap();
+    let (reader, writer) =
+        super::super::udp_handler::UdpHandler::new(from_tun, to_tun, wake).split();
+    let manager = TunUdpManager::new(
+        reader,
+        writer,
+        Arc::new(ClientProxySelector::new(Vec::new())),
+        Arc::new(crate::resolver::NativeResolver::new()),
+        TunResourceLimits::default(),
+    );
+    manager
+        .response_tx
+        .send((
+            PacketBuffer::copy_from_slice(b"reply"),
+            "1.1.1.1:443".parse().unwrap(),
+            "10.0.0.2:1234".parse().unwrap(),
+        ))
+        .await
+        .unwrap();
+    drop(output);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), manager.run())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn queued_fake_dns_writes_continue_polling_delayed_replies() {
     use hickory_resolver::proto::{
@@ -248,17 +468,18 @@ fn session_limit_does_not_preallocate_entries() {
 
 #[tokio::test]
 async fn burst_packets_share_a_byte_budget_across_both_queue_stages() {
-    let budget = Arc::new(Budget::new(Some(640)));
+    const BURST: usize = 128;
+    let budget = Arc::new(Budget::new(Some(BURST * 10)));
     let (session_tx, mut session_rx) = mpsc::channel(CHANNEL_SIZE);
     let (destination_tx, destination_rx) = mpsc::channel(CHANNEL_SIZE);
-    for _ in 0..64 {
+    for _ in 0..BURST {
         let packet =
             QueuedPacket::reserve(PacketBuffer::copy_from_slice(&[0; 10]), &budget, true).unwrap();
         assert!(session_tx.try_send(packet).is_ok());
     }
     assert_eq!(budget.available_permits(), 0);
     assert!(QueuedPacket::reserve(PacketBuffer::copy_from_slice(&[0]), &budget, true).is_none());
-    for _ in 0..64 {
+    for _ in 0..BURST {
         assert!(
             destination_tx
                 .try_send(session_rx.recv().await.unwrap())
@@ -267,14 +488,19 @@ async fn burst_packets_share_a_byte_budget_across_both_queue_stages() {
     }
     assert_eq!(budget.available_permits(), 0);
     drop(destination_rx);
-    assert_eq!(budget.available_permits(), 640);
+    assert_eq!(budget.available_permits(), BURST * 10);
     assert!(
-        QueuedPacket::reserve(PacketBuffer::copy_from_slice(&[0; 641]), &budget, true).is_none()
+        QueuedPacket::reserve(
+            PacketBuffer::copy_from_slice(&[0; BURST * 10 + 1]),
+            &budget,
+            true
+        )
+        .is_none()
     );
     let empty = QueuedPacket::reserve(PacketBuffer::copy_from_slice(&[]), &budget, true).unwrap();
-    assert_eq!(budget.available_permits(), 639);
+    assert_eq!(budget.available_permits(), BURST * 10 - 1);
     drop(empty);
-    assert_eq!(budget.available_permits(), 640);
+    assert_eq!(budget.available_permits(), BURST * 10);
 }
 
 #[tokio::test]

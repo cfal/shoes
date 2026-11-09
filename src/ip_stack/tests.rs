@@ -12,6 +12,8 @@ fn stack(inbound: bool, ip: &str) -> PacketStack {
         1408,
         inbound,
         TunResourceLimits {
+            // Keeps the transfer fixture at WireGuard's buffer size.
+            tcp_buffer_size: 32 * 1024,
             max_tcp_connections: Some(8),
             max_udp_sessions: Some(8),
             max_udp_queued_bytes: Some(65535),

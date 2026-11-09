@@ -38,7 +38,7 @@ limits are unlimited; a specified admission limit must be positive.
 
 | Field | Default | Constraint |
 | --- | --- | --- |
-| `tcp_buffer_size` | 32,768 bytes | 1,024-16,777,216 bytes |
+| `tcp_buffer_size` | 131,072 bytes (128 KiB) | 1,024-16,777,216 bytes |
 | `tcp_memory_bytes` | Unlimited | At least four times `tcp_buffer_size` |
 | `max_tcp_connections` | Unlimited | Positive integer |
 | `max_udp_sessions` | Unlimited | Positive integer |
@@ -46,9 +46,32 @@ limits are unlimited; a specified admission limit must be positive.
 | `max_udp_destinations_per_session` | Unlimited | Positive integer |
 | `max_udp_queued_bytes` | Unlimited | At least 65,535 bytes |
 
+Each TCP flow in the TUN stack has four buffers, totaling 512 KiB of capacity at the
+default size, plus other connection overhead. Without admission caps, total
+buffer capacity grows with the connection count. Set `tcp_buffer_size: 32768`
+for a lower-memory 32 KiB setting, or use `tcp_memory_bytes` to bound admission.
+A memory budget admits at most `tcp_memory_bytes / (4 * tcp_buffer_size)` flows;
+it does not include other process memory. WireGuard retains its separate
+32 KiB buffer default.
+
+**Upgrade note:** If `tcp_memory_bytes` is set without `tcp_buffer_size`, the
+new default lowers the memory-derived connection limit: a 32 MiB budget permits
+64 flows instead of 256. Previously valid budgets below 524,288 bytes now fail
+validation with the new default. Explicitly set `tcp_buffer_size: 32768` to
+retain the previous buffer size and admission calculation.
+
 When both TCP memory and connection caps are set, the lower effective
 connection count applies. These limits are separate from
 [process-wide admission](/config/global-settings/#admission-caps).
+
+UDP replies wait for capacity in the bounded response and TUN-output queues
+rather than dropping packets when a burst briefly fills either queue. Upload
+queues hold up to 128 packets per stage (TUN ingress, source session, and
+destination); saturation still drops packets so a slow destination cannot block
+other flows. Kernel UDP buffers and TUN device queues can also drop packets
+under overload.
+`max_udp_queued_bytes` limits queued upload payloads, not all UDP memory;
+`tcp_buffer_size` does not change UDP queue capacity.
 
 `segmentation_offload` controls TCPv4 transmit offload on a created Linux
 device. Omission tries it automatically and falls back to ordinary packets if

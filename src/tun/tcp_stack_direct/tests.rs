@@ -1041,6 +1041,49 @@ fn disabled_tcp_and_udp_do_not_reach_async_handlers() {
 }
 
 #[test]
+fn udp_ingress_buffers_a_burst_before_the_async_reader_runs() {
+    let (peer, tun) = UnixDatagram::pair().unwrap();
+    // Keeps the fixture's kernel queue from limiting the ingress burst on macOS.
+    socket2::SockRef::from(&tun)
+        .set_recv_buffer_size(256 * 1024)
+        .unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut stack = TcpStackDirect::new(tun.into(), 1500);
+    let mut received = stack.take_udp_rx().unwrap();
+    for sequence in 0u16..128 {
+        let mut packet = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+            .udp(1000, 443)
+            .write(&mut packet, &sequence.to_be_bytes())
+            .unwrap();
+        peer.send(&packet).unwrap();
+    }
+    // The echo reply fences processing of the preceding UDP burst.
+    let mut sentinel = Vec::new();
+    etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+        .icmpv4_echo_request(17, 1)
+        .write(&mut sentinel, b"processed")
+        .unwrap();
+    peer.send(&sentinel).unwrap();
+    let mut response = [0; 1500];
+    let n = peer.recv(&mut response).unwrap();
+    assert_eq!(
+        Ipv4Packet::new_checked(&response[..n])
+            .unwrap()
+            .next_header(),
+        IpProtocol::Icmp
+    );
+    assert_eq!(received.len(), 128);
+    for sequence in 0u16..128 {
+        let packet = received.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(&*packet).unwrap();
+        let udp = smoltcp::wire::UdpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!(udp.payload(), &sequence.to_be_bytes());
+    }
+    assert!(received.is_empty());
+}
+
+#[test]
 fn icmp_echo_replies_respect_protocol_switch() {
     use smoltcp::wire::{Icmpv4Message, Icmpv4Packet, Icmpv6Message, Icmpv6Packet};
     use std::os::unix::net::UnixDatagram;
@@ -1175,8 +1218,8 @@ fn socket_owner_drop_wakes_readers_and_writers() {
     assert!(control.orphan_deadline().is_some());
 }
 
-#[test]
-fn idle_stack_delivers_udp_output_without_inbound_traffic() {
+#[tokio::test]
+async fn idle_stack_delivers_udp_output_without_inbound_traffic() {
     use super::super::udp_handler::{UdpHandler, build_udp_packet};
     let (peer, tun) = UnixDatagram::pair().unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1207,7 +1250,8 @@ fn idle_stack_delivers_udp_output_without_inbound_traffic() {
     let src = "1.1.1.1:53".parse().unwrap();
     let dst = "10.0.0.2:10001".parse().unwrap();
     writer
-        .send_sync((PacketBuffer::copy_from_slice(b"reply"), src, dst))
+        .send((PacketBuffer::copy_from_slice(b"reply"), src, dst))
+        .await
         .unwrap();
     drop(waiting);
     let expected = build_udp_packet(b"reply", src, dst).unwrap();

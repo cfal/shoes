@@ -38,7 +38,7 @@ rules: [RuleConfig]
 
 | 字段 | 默认 | 约束 |
 | --- | --- | --- |
-| `tcp_buffer_size` | 32,768 字节 | 1,024-16,777,216 字节 |
+| `tcp_buffer_size` | 131,072 字节（128 KiB） | 1,024-16,777,216 字节 |
 | `tcp_memory_bytes` | 无限 | 至少四倍`tcp_buffer_size` |
 | `max_tcp_connections` | 无限 | 正整数 |
 | `max_udp_sessions` | 无限 | 正整数 |
@@ -46,7 +46,13 @@ rules: [RuleConfig]
 | `max_udp_destinations_per_session` | 无限 | 正整数 |
 | `max_udp_queued_bytes` | 无限 | 至少 65,535 字节 |
 
+TUN 协议栈中的每个 TCP 连接有四个缓冲区，默认缓冲区容量合计为 512 KiB，另有其他连接开销。未设置准入限制时，总缓冲区容量随连接数增长。可以设置 `tcp_buffer_size: 32768` 使用内存开销较低的 32 KiB 缓冲区，或通过 `tcp_memory_bytes` 限制连接准入。内存预算最多允许 `tcp_memory_bytes / (4 * tcp_buffer_size)` 个连接，不包含其他进程内存。WireGuard 保持独立的 32 KiB 缓冲区默认值。
+
+**升级提示：** 如果设置了 `tcp_memory_bytes` 但未指定 `tcp_buffer_size`，新默认值会降低按内存预算计算的连接上限：32 MiB 预算允许的连接数从 256 降至 64。之前有效但低于 524,288 字节的预算现在无法在新默认值下通过验证。显式设置 `tcp_buffer_size: 32768` 可保持原有缓冲区大小和准入计算方式。
+
 当 TCP 内存和连接上限均设置时，将应用较低的有效连接计数。这些限制与[进程范围的准入](/zh-cn/config/global-settings/#admission-caps) 是分开的。
+
+UDP 响应会等待有界响应队列和 TUN 输出队列中的可用容量，而不是在突发流量短暂填满队列时丢包。上传队列在每个阶段（TUN 入口、源会话和目标）最多容纳 128 个数据包；队列饱和时仍会丢包，避免慢速目标阻塞其他流量。内核 UDP 缓冲区和 TUN 设备队列在过载时也可能丢包。`max_udp_queued_bytes` 仅限制排队的上传载荷，不代表全部 UDP 内存；`tcp_buffer_size` 不会改变 UDP 队列容量。
 
 `segmentation_offload` 控制 shoes 创建的 Linux 设备上的 TCPv4 发送分段卸载。省略时会自动尝试启用；如果初始化失败，则回退到普通数据包。`false` 禁用卸载，`true` 则要求启动时必须启用。提供 `device_fd`、使用数据包信息头或在非 Linux 设备上显式启用时，配置会被拒绝。IPv6 仍使用普通的 MTU 大小数据包。
 
