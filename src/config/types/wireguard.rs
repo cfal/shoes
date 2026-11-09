@@ -100,7 +100,10 @@ pub struct WireguardClientRecord<C> {
     pub persistent_keepalive: u16,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
-    #[serde(default)]
+    #[serde(
+        default = "default_resource_limits",
+        deserialize_with = "deserialize_resource_limits"
+    )]
     pub resource_limits: TunResourceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_client_chain: Option<C>,
@@ -118,7 +121,10 @@ pub struct WireguardServerRecord<C> {
     pub peers: Vec<WireguardPeer>,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
-    #[serde(default)]
+    #[serde(
+        default = "default_resource_limits",
+        deserialize_with = "deserialize_resource_limits"
+    )]
     pub resource_limits: TunResourceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<String>,
@@ -130,6 +136,25 @@ pub type WireguardServerConfig = WireguardServerRecord<ClientChain>;
 
 fn default_allowed_ips() -> Vec<String> {
     vec!["0.0.0.0/0".into(), "::/0".into()]
+}
+
+fn default_resource_limits() -> TunResourceLimits {
+    TunResourceLimits {
+        tcp_buffer_size: 32 * 1024,
+        ..Default::default()
+    }
+}
+
+fn deserialize_resource_limits<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<TunResourceLimits, D::Error> {
+    // Preserves WireGuard's buffer default when only other limits are specified.
+    let mut limits = serde_yaml::Mapping::deserialize(deserializer)?;
+    limits
+        .entry("tcp_buffer_size".into())
+        .or_insert_with(|| default_resource_limits().tcp_buffer_size.into());
+    TunResourceLimits::deserialize(serde_yaml::Value::Mapping(limits))
+        .map_err(serde::de::Error::custom)
 }
 
 impl ResolvedWireguardClientConfig {
@@ -468,6 +493,80 @@ impl<C> WireguardClientRecord<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wireguard_buffer_defaults_preserve_admission_and_explicit_overrides() {
+        use serde_json::json;
+
+        for server in [false, true] {
+            for (limits, buffer, connections) in [
+                (None, 32768, 256),
+                (Some(json!({})), 32768, 256),
+                (Some(json!({"max_tcp_connections": 17})), 32768, 17),
+                (Some(json!({"tcp_buffer_size": 131072})), 131072, 64),
+                (
+                    Some(json!({"tcp_buffer_size": 262144, "tcp_memory_bytes": 268435456})),
+                    262144,
+                    256,
+                ),
+            ] {
+                let mut value = json!({
+                    "private_key": STANDARD.encode([7; 32]),
+                    "addresses": ["10.77.0.1/32"],
+                });
+                if server {
+                    value["peers"] = json!([]);
+                } else {
+                    value["public_key"] = json!(STANDARD.encode([8; 32]));
+                }
+                if let Some(limits) = limits {
+                    value["resource_limits"] = limits;
+                }
+                let yaml = serde_yaml::to_string(&value).unwrap();
+                let (from_yaml, from_json) = if server {
+                    (
+                        serde_yaml::from_str::<WireguardServerRecord<()>>(&yaml)
+                            .unwrap()
+                            .resource_limits,
+                        serde_json::from_value::<WireguardServerRecord<()>>(value)
+                            .unwrap()
+                            .resource_limits,
+                    )
+                } else {
+                    (
+                        serde_yaml::from_str::<WireguardClientRecord<()>>(&yaml)
+                            .unwrap()
+                            .resource_limits,
+                        serde_json::from_value::<WireguardClientRecord<()>>(value)
+                            .unwrap()
+                            .resource_limits,
+                    )
+                };
+                for limits in [from_yaml, from_json] {
+                    assert_eq!(limits.tcp_buffer_size, buffer);
+                    let limits = device_limits(&limits);
+                    limits.validate().unwrap();
+                    assert_eq!(limits.tcp_connection_limit(), Some(connections));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wireguard_resource_limits_reject_unknown_fields_and_preserve_invalid_buffers() {
+        for yaml in [
+            "{unknown: 1}",
+            "{tcp_buffer_size: null}",
+            "{tcp_buffer_size: -1}",
+        ] {
+            let deserializer = serde_yaml::Deserializer::from_str(yaml);
+            assert!(deserialize_resource_limits(deserializer).is_err());
+        }
+        let deserializer = serde_yaml::Deserializer::from_str("{tcp_buffer_size: 0}");
+        let limits = deserialize_resource_limits(deserializer).unwrap();
+        assert_eq!(limits.tcp_buffer_size, 0);
+        assert!(device_limits(&limits).validate().is_err());
+    }
 
     #[test]
     fn keys_roundtrip_without_debug_or_error_disclosure() {

@@ -38,13 +38,17 @@ rules: [RuleConfig]
 
 | 字段 | 默认 | 约束 |
 | --- | --- | --- |
-| `tcp_buffer_size` | 32,768 字节 | 1,024-16,777,216 字节 |
+| `tcp_buffer_size` | 131,072 字节（128 KiB） | 1,024-16,777,216 字节 |
 | `tcp_memory_bytes` | 无限 | 至少四倍`tcp_buffer_size` |
 | `max_tcp_connections` | 无限 | 正整数 |
 | `max_udp_sessions` | 无限 | 正整数 |
 | `max_udp_destinations` | 无限 | 正整数 |
 | `max_udp_destinations_per_session` | 无限 | 正整数 |
 | `max_udp_queued_bytes` | 无限 | 至少 65,535 字节 |
+
+TUN 协议栈中的每个 TCP 连接有四个缓冲区，默认缓冲区容量合计为 512 KiB，另有其他连接开销。未设置准入限制时，总缓冲区容量随连接数增长。可以设置 `tcp_buffer_size: 32768` 使用内存开销较低的 32 KiB 缓冲区，或通过 `tcp_memory_bytes` 限制连接准入。内存预算最多允许 `tcp_memory_bytes / (4 * tcp_buffer_size)` 个连接，不包含其他进程内存。WireGuard 保持独立的 32 KiB 缓冲区默认值。
+
+**升级提示：** 如果设置了 `tcp_memory_bytes` 但未指定 `tcp_buffer_size`，新默认值会降低按内存预算计算的连接上限：32 MiB 预算允许的连接数从 256 降至 64。之前有效但低于 524,288 字节的预算现在无法在新默认值下通过验证。显式设置 `tcp_buffer_size: 32768` 可保持原有缓冲区大小和准入计算方式。
 
 当 TCP 内存和连接上限均设置时，将应用较低的有效连接计数。这些限制与[进程范围的准入](/zh-cn/config/global-settings/#admission-caps) 是分开的。
 
