@@ -68,7 +68,8 @@ UDP replies wait for capacity in the bounded response and TUN-output queues
 rather than dropping packets when a burst briefly fills either queue. Upload
 queues hold up to 128 packets per stage (TUN ingress, source session, and
 destination); saturation still drops packets so a slow destination cannot block
-other flows. Kernel UDP buffers can also drop packets under overload.
+other flows. Kernel UDP buffers and TUN device queues can also drop packets
+under overload.
 `max_udp_queued_bytes` limits queued upload payloads, not all UDP memory;
 `tcp_buffer_size` does not change UDP queue capacity.
 

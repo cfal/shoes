@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reduced UDP burst loss for TUN and WireGuard inbound forwarding by waiting for space in bounded reply queues. A destination closes after 30 seconds without response-queue capacity. TUN ingress and inbound UDP session/destination upload queues now hold 128 packets and still drop when full; WireGuard stack queues remain at 64.
 - Raised the TUN `resource_limits.tcp_buffer_size` default from 32 KiB to 128 KiB, giving each TCP flow 512 KiB of buffer capacity across four buffers. WireGuard retains its 32 KiB default and existing admission budget.
 - Upgrade note: TUN configurations that set `tcp_memory_bytes` without `tcp_buffer_size` now have a lower memory-derived connection limit (for example, 32 MiB permits 64 flows instead of 256). Previously valid budgets below 524,288 bytes fail validation with the new default. Explicitly set `tcp_buffer_size: 32768` to preserve the previous buffer size and admission calculation.
 
