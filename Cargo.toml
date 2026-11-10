@@ -27,10 +27,10 @@ blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "cd98c1c4112ed3b2cf2140
 # Bounds buffered H3 frames before payload reads and skips unknown frames incrementally.
 h3 = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
 h3-quinn = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
-# Preserves connection-close failover and bounded TCP/DoT receive progress.
-hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec4d6c501e23d7815cecd7f556b1cece4a1" }
-hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec4d6c501e23d7815cecd7f556b1cece4a1" }
-hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec4d6c501e23d7815cecd7f556b1cece4a1" }
+# Preserves transport failover, bounded receive progress and scoped DoH driver retirement.
+hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "93435e55f102ee637eadca89126be85931a804f3" }
+hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "93435e55f102ee637eadca89126be85931a804f3" }
+hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "93435e55f102ee637eadca89126be85931a804f3" }
 # Includes nix-rust/nix#2821 for iOS socket feature compatibility.
 nix = { git = "https://github.com/nix-rust/nix", rev = "3eae6d68ec6382fef7b38cd58f97458e59a71af9" }
 # Preserves TCP ACK sequences during retransmission.

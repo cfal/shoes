@@ -15,6 +15,8 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::Resolver;
 
+static NEXT_TRANSPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[cfg(test)]
 const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -22,6 +24,7 @@ const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 /// For direct-only chains, UDP and QUIC use the configured bind_interface.
 #[derive(Clone)]
 pub struct ProxyRuntimeProvider {
+    id: u64,
     chain_group: Arc<ClientChainGroup>,
     /// Resolver for proxy server hostnames (not the DNS queries themselves).
     /// Uses the explicit bootstrap route, or native DNS when none was configured.
@@ -31,6 +34,7 @@ pub struct ProxyRuntimeProvider {
     /// Timeout for establishing connections to DNS upstreams.
     connect_timeout: Duration,
     network: Option<crate::network_tasks::NetworkTasks>,
+    retirement: tokio_util::sync::CancellationToken,
 }
 
 impl ProxyRuntimeProvider {
@@ -40,18 +44,30 @@ impl ProxyRuntimeProvider {
         bootstrap_resolver: Arc<dyn Resolver>,
         connect_timeout: Duration,
     ) -> Self {
+        let retirement = tokio_util::sync::CancellationToken::new();
         let quic_binder = ProxyQuicBinder {
             chain_group: chain_group.clone(),
             memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
             socket_buffer: crate::resources::limits().quic_socket_buffer,
+            retirement: retirement.clone(),
         };
         Self {
+            id: NEXT_TRANSPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             chain_group,
             bootstrap_resolver,
             quic_binder,
             connect_timeout,
             network: crate::network_tasks::NetworkTasks::current(),
+            retirement,
         }
+    }
+
+    pub(super) fn retire(&self) {
+        self.retirement.cancel();
+    }
+
+    pub(super) fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn with_quic_memory(mut self, bytes: usize) -> Self {
@@ -67,11 +83,30 @@ impl ProxyRuntimeProvider {
 
 /// Spawn handle for tokio runtime.
 #[derive(Clone, Default)]
-pub struct TokioSpawnHandle(Option<crate::network_tasks::NetworkTasks>);
+pub struct TokioSpawnHandle {
+    network: Option<crate::network_tasks::NetworkTasks>,
+    retirement: tokio_util::sync::CancellationToken,
+}
 
 impl Spawn for TokioSpawnHandle {
     fn spawn_bg(&mut self, future: impl Future<Output = ()> + Send + 'static) {
-        match &self.0 {
+        let retirement = self.retirement.clone();
+        let future = async move {
+            tokio::select! {
+                biased;
+                _ = retirement.cancelled() => {},
+                _ = future => {},
+            }
+        };
+        let background = crate::control::url_test::is_background();
+        let future = async move {
+            if background {
+                crate::control::url_test::BACKGROUND.scope((), future).await;
+            } else {
+                future.await;
+            }
+        };
+        match &self.network {
             Some(network) => {
                 network.spawn(future);
             }
@@ -92,7 +127,10 @@ impl RuntimeProvider for ProxyRuntimeProvider {
     type Tcp = ProxiedTcp;
 
     fn create_handle(&self) -> Self::Handle {
-        TokioSpawnHandle(self.network.clone())
+        TokioSpawnHandle {
+            network: self.network.clone(),
+            retirement: self.retirement.clone(),
+        }
     }
 
     fn connect_tcp(
@@ -103,6 +141,8 @@ impl RuntimeProvider for ProxyRuntimeProvider {
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Tcp, io::Error>>>> {
         let chain_group = self.chain_group.clone();
         let resolver = self.bootstrap_resolver.clone();
+        let retirement = self.retirement.clone();
+        let id = self.id;
         let timeout = timeout
             .map(|timeout| timeout.min(self.connect_timeout))
             .unwrap_or(self.connect_timeout);
@@ -116,10 +156,15 @@ impl RuntimeProvider for ProxyRuntimeProvider {
 
             let started = std::time::Instant::now();
             let connect_future = chain_group.connect_tcp(target.into(), &resolver);
-            match tokio::time::timeout(timeout, connect_future).await {
+            let result = tokio::select! {
+                biased;
+                _ = retirement.cancelled() => return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "DNS transport retired")),
+                result = tokio::time::timeout(timeout, connect_future) => result,
+            };
+            match result {
                 Ok(Ok(result)) => {
                     log::debug!(
-                        "DNS upstream connect to {} succeeded in {:?}",
+                        "DNS transport {id} upstream connect to {} succeeded in {:?}",
                         server_addr,
                         started.elapsed()
                     );
@@ -131,8 +176,8 @@ impl RuntimeProvider for ProxyRuntimeProvider {
                     Ok(AsyncIoTokioAsStd(stream))
                 }
                 Ok(Err(e)) => {
-                    log::warn!(
-                        "DNS upstream connect to {} failed in {:?}: {}",
+                    log::debug!(
+                        "DNS transport {id} upstream connect to {} failed in {:?}: {}",
                         server_addr,
                         started.elapsed(),
                         e
@@ -140,8 +185,8 @@ impl RuntimeProvider for ProxyRuntimeProvider {
                     Err(e)
                 }
                 Err(_) => {
-                    log::warn!(
-                        "DNS upstream connect to {} timed out in {:?}",
+                    log::debug!(
+                        "DNS transport {id} upstream connect to {} timed out in {:?}",
                         server_addr,
                         started.elapsed()
                     );
@@ -162,8 +207,15 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         _server_addr: SocketAddr,
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
         let chain_group = self.chain_group.clone();
+        let retirement = self.retirement.clone();
 
         Box::pin(async move {
+            if retirement.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "DNS transport retired",
+                ));
+            }
             let bind_interface = chain_group.select_bind_interface()?;
             let socket = crate::socket_util::new_outbound_socket2_udp_socket(
                 local_addr.is_ipv6(),
@@ -187,6 +239,7 @@ struct ProxyQuicBinder {
     chain_group: Arc<ClientChainGroup>,
     memory_bytes: usize,
     socket_buffer: usize,
+    retirement: tokio_util::sync::CancellationToken,
 }
 
 impl QuicSocketBinder for ProxyQuicBinder {
@@ -195,6 +248,12 @@ impl QuicSocketBinder for ProxyQuicBinder {
         local_addr: SocketAddr,
         _server_addr: SocketAddr,
     ) -> Result<Arc<dyn quinn::AsyncUdpSocket>, io::Error> {
+        if self.retirement.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "DNS transport retired",
+            ));
+        }
         let memory = crate::resources::try_quic_memory(self.memory_bytes)
             .ok_or_else(|| crate::resources::quic_memory_exhausted(self.memory_bytes))?;
         let socket = crate::socket_util::new_outbound_socket2_udp_socket(

@@ -52,6 +52,8 @@ impl Default for HickoryResolverOptions {
 pub struct HickoryResolver {
     inner: Resolver<ProxyRuntimeProvider>,
     exchange: Arc<super::exchange::RawDnsExchange>,
+    provider: ProxyRuntimeProvider,
+    request_timeout: Duration,
     description: String,
 }
 
@@ -59,6 +61,7 @@ impl Debug for HickoryResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HickoryResolver")
             .field("description", &self.description)
+            .field("transport", &self.provider.id())
             .finish()
     }
 }
@@ -235,9 +238,16 @@ impl HickoryResolver {
         resolver_opts.attempts = options.attempts;
         let exchange = Arc::new(super::exchange::RawDnsExchange::new(
             ns_configs,
-            provider,
+            provider.clone(),
             resolver_opts.clone(),
         ));
+        let request_timeout = resolver_opts.timeout.saturating_mul(
+            options
+                .attempts
+                .max(1)
+                .saturating_add(1)
+                .min(u32::MAX as usize) as u32,
+        );
         let builder =
             builder.with_tls_config(crate::rustls_config_util::create_dns_client_config());
         let resolver = builder
@@ -247,12 +257,23 @@ impl HickoryResolver {
         Ok(Self {
             inner: resolver,
             exchange,
+            provider,
+            request_timeout,
             description,
         })
     }
 }
 
 impl ShoesResolver for HickoryResolver {
+    fn request_timeout(&self) -> Option<Duration> {
+        Some(self.request_timeout)
+    }
+
+    fn retire(&self) {
+        self.exchange.retire();
+        self.provider.retire();
+    }
+
     fn exchange(&self, request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
         let exchange = self.exchange.clone();
         Box::pin(async move { exchange.exchange(request).await })
@@ -280,6 +301,7 @@ impl ShoesResolver for HickoryResolver {
         let name = location.address().to_string();
         let port = location.port();
         let description = self.description.clone();
+        let transport_id = self.provider.id();
         let resolver = self.inner.clone();
 
         Box::pin(async move {
@@ -287,8 +309,8 @@ impl ShoesResolver for HickoryResolver {
 
             let response = resolver.lookup_ip(&name).await.map_err(|e| {
                 let elapsed = started.elapsed();
-                log::warn!(
-                    "DNS lookup failed via {}: {}:{} in {:?}: {}",
+                log::debug!(
+                    "DNS transport {transport_id} lookup failed via {}: {}:{} in {:?}: {}",
                     description,
                     name,
                     port,
@@ -332,6 +354,12 @@ impl ShoesResolver for HickoryResolver {
             }
             Ok(addrs)
         })
+    }
+}
+
+impl Drop for HickoryResolver {
+    fn drop(&mut self) {
+        self.retire();
     }
 }
 
