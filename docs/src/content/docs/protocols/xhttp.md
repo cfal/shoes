@@ -26,6 +26,22 @@ inner client protocol. Match the server's `path`, `host`, and any required
 `packet_pipeline_depth: 30`. The client `pool` defaults to three H2/H3
 connections, at most 64 H1 connections, and a 60-second idle timeout.
 
+H2 clients send a PING after 45 seconds without received transport data and
+require a PONG within 10 seconds, including the time needed to write the PING.
+An unanswered PING retires that carrier and fails its sessions; subsequent
+sessions can dial again. Healthy long-lived streams remain valid, even without
+application data. A single stream reset, DNS timeout, or response-header timeout
+does not retire a shared carrier. Requests and application bytes are never
+replayed to recover a failed carrier.
+
+Graceful H2 shutdown allows accepted responses to drain. A confirmed connection
+failure instead cancels blocked session workers and releases admission promptly.
+Bytes already queued to the application remain readable before the error; bytes
+still in transport or intermediate buffers may be discarded, even after wire-level
+END_STREAM. A clean EOF already queued to the application remains clean. Retained
+application bytes still count against byte limits, so a replacement can connect
+while its download waits for the old reader to consume or release those bytes.
+
 ## Modes and transport
 
 - `http_version: auto`: H1 for plaintext TCP, H2 for TLS/REALITY, H3 for QUIC.

@@ -23,6 +23,9 @@ use crate::{
 
 type H3Sender = h3::client::SendRequest<super::h3::Opener, Bytes>;
 
+const H2_RECEIVE_IDLE: Duration = Duration::from_secs(45);
+const H2_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct Reservation(Option<super::h3::Bidi>);
 
 #[derive(Clone)]
@@ -111,6 +114,7 @@ enum Sender {
     H2 {
         sender: h2::client::SendRequest<Bytes>,
         errors: TransportErrors,
+        failed: tokio_util::sync::CancellationToken,
         downloads: Arc<tokio::sync::Semaphore>,
     },
     H3 {
@@ -164,28 +168,67 @@ impl Carrier {
             Sender::H1(tokio::sync::Mutex::new(sender))
         } else {
             let errors = TransportErrors::default();
+            let received = Arc::new(parking_lot::Mutex::new(tokio::time::Instant::now()));
             let (sender, mut connection) = h2::client::Builder::new()
                 .enable_push(false)
                 .initial_window_size(stream_window)
                 .initial_connection_window_size(connection_window)
                 .max_header_list_size(header_limit as u32)
-                .handshake(errors.wrap(stream))
+                .handshake(errors.wrap(stream).observe_receive(received.clone()))
                 .await
                 .map_err(|error| errors.map(error))?;
             errors.start_driver();
             let mut ping = connection.ping_pong().unwrap();
+            let stopped = tasks.cancel.clone();
+            let driver_errors = errors.clone();
+            let failed = tokio_util::sync::CancellationToken::new();
+            let driver_failed = failed.clone();
             tasks.spawn(async move {
                 if let Err(error) = connection.await {
                     log::debug!("XHTTP H2 carrier ended: {error}");
+                    driver_errors.fail(driver_errors.map(error));
+                    driver_failed.cancel();
                 }
+                stopped.cancel();
             });
             // The handshake alone does not read peer SETTINGS. PONG follows their application.
-            ping.ping(h2::Ping::opaque())
-                .await
+            tokio::time::timeout(H2_PONG_TIMEOUT, ping.ping(h2::Ping::opaque()))
+                .await?
                 .map_err(|error| errors.map(error))?;
+            let health_errors = errors.clone();
+            let stopped = tasks.cancel.clone();
+            let health_failed = failed.clone();
+            tasks.spawn(async move {
+                loop {
+                    let deadline = *received.lock() + H2_RECEIVE_IDLE;
+                    tokio::time::sleep_until(deadline).await;
+                    if tokio::time::Instant::now() < *received.lock() + H2_RECEIVE_IDLE {
+                        continue;
+                    }
+                    match tokio::time::timeout(H2_PONG_TIMEOUT, ping.ping(h2::Ping::opaque())).await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            health_errors.fail(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "XHTTP H2 PONG deadline exceeded",
+                            ));
+                            log::info!(
+                                "XHTTP H2 carrier {} retired: receive-idle PING unanswered",
+                                health_errors.identity()
+                            );
+                            stopped.cancel();
+                            health_failed.cancel();
+                            return;
+                        }
+                    }
+                }
+            });
             Sender::H2 {
                 sender,
                 errors,
+                failed,
                 downloads: Arc::new(tokio::sync::Semaphore::new(
                     ((connection_window / stream_window) as usize)
                         .min(tokio::sync::Semaphore::MAX_PERMITS),
@@ -258,6 +301,21 @@ impl Carrier {
             Sender::H1(_) => 1,
             Sender::H2 { sender, .. } => limit.min(sender.current_max_send_streams()),
             Sender::H3 { .. } => limit,
+        }
+    }
+
+    pub(super) async fn failed(&self) -> io::Error {
+        let Sender::H2 { errors, failed, .. } = &self.sender else {
+            return std::future::pending().await;
+        };
+        failed.cancelled().await;
+        errors.terminal_error()
+    }
+
+    pub(super) fn identity(&self) -> usize {
+        match &self.sender {
+            Sender::H2 { errors, .. } => errors.identity(),
+            _ => self as *const Self as usize,
         }
     }
 
@@ -445,13 +503,7 @@ impl Carrier {
                         watch,
                         &tasks.cancel,
                     )
-                    .await
-                    .inspect_err(|error| {
-                        if timeouts.upload_idle.is_none() && error.kind() == io::ErrorKind::TimedOut
-                        {
-                            self.retired.store(true, Ordering::Relaxed);
-                        }
-                    })?;
+                    .await?;
                 guard.disarm();
                 let (parts, incoming) = response.into_parts();
                 let incoming = H2Body {
@@ -673,7 +725,10 @@ async fn send_h2_tracked(
     'frames: loop {
         let frame = tokio::select! {
             frame = body.frame() => frame,
-            reset = futures::future::poll_fn(|cx| send.poll_reset(cx)) => return Err(H2SendError::Stream(io::Error::other(format!("XHTTP H2 stream reset: {reset:?}")))),
+            reset = futures::future::poll_fn(|cx| send.poll_reset(cx)) => return Err(H2SendError::Stream(match reset {
+                Ok(reason) => io::Error::other(format!("XHTTP H2 stream reset: {reason}")),
+                Err(error) => errors.map(error),
+            })),
         };
         let Some(frame) = frame else {
             send.send_data(Bytes::new(), true)

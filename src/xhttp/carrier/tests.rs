@@ -2,6 +2,75 @@ use super::*;
 use crate::resources::Budget;
 use tokio::io::AsyncReadExt;
 
+#[tokio::test(start_paused = true)]
+async fn h2_receive_idle_ping_retires_silent_carrier_but_keeps_healthy_idle_streams() {
+    let (client, wire) = tokio::io::duplex(65536);
+    let (upstream, peer) = tokio::io::duplex(65536);
+    let blackhole = Arc::new(AtomicBool::new(false));
+    let relay = Tasks::new();
+    let (down_read, down_write) = tokio::io::split(wire);
+    let (up_read, up_write) = tokio::io::split(upstream);
+    for (mut read, mut write) in [(down_read, up_write), (up_read, down_write)] {
+        let blackhole = blackhole.clone();
+        relay.spawn(async move {
+            let mut bytes = [0; 4096];
+            while let Ok(length) = read.read(&mut bytes).await {
+                if length == 0 {
+                    break;
+                }
+                if !blackhole.load(Ordering::SeqCst)
+                    && write.write_all(&bytes[..length]).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+    relay.spawn(async move {
+        let mut peer = h2::server::handshake(peer).await.unwrap();
+        let mut streams = Vec::new();
+        while let Some(Ok((request, mut response))) = peer.accept().await {
+            let body = response.send_response(Response::new(()), false).unwrap();
+            streams.push((request, body));
+        }
+    });
+    let carrier = Carrier::tcp(Box::new(client), XhttpVersion::H2, 8192)
+        .await
+        .unwrap();
+    let requests = Tasks::new();
+    let memory = Memory::new(Arc::new(Budget::new(Some(16384))), Some(16384));
+    let mut response = carrier
+        .request(
+            Request::get("http://localhost/idle")
+                .body(Body::Empty)
+                .unwrap(),
+            memory,
+            &requests,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        tokio::time::sleep(H2_RECEIVE_IDLE + H2_PONG_TIMEOUT).await;
+        assert!(
+            !carrier.closed(),
+            "healthy application-idle stream was retired"
+        );
+    }
+    blackhole.store(true, Ordering::SeqCst);
+    tokio::time::sleep(H2_RECEIVE_IDLE + H2_PONG_TIMEOUT + Duration::from_secs(1)).await;
+    let mut byte = [0];
+    let error = response.body_mut().read(&mut byte).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error:?}");
+    assert!(error.to_string().contains("PONG"), "{error}");
+    assert!(carrier.closed());
+    assert!(carrier.try_reserve().unwrap().is_none());
+    drop(response);
+    requests.cancel.cancel();
+    requests.wait().await;
+    carrier._tasks.wait().await;
+}
+
 #[tokio::test]
 async fn h2_download_count_fits_platform_semaphore_bounds() {
     let (client, peer) = tokio::io::duplex(4096);
