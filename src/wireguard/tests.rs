@@ -456,19 +456,32 @@ async fn wireguard_mapped_ipv4_outer_endpoint_uses_ipv4_transport() {
             Some("[::]:0"),
             Some("[::ffff:127.0.0.1]:0"),
         ] {
-            let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-            let port = reservation.local_addr().unwrap().port();
-            let mut configs = validate(&pair_config(port)).unwrap();
-            let client = &mut configs.wireguard_endpoints[CLIENT];
-            client.listen = listen.map(|address| address.parse().unwrap());
-            client.peers[0].endpoint = Some(format!("[::ffff:127.0.0.1]:{port}"));
-            let prepared = Prepared::new(&mut configs).await.unwrap();
-            assert_eq!(
-                prepared.endpoints[CLIENT].peers[0].endpoints,
-                vec![SocketAddr::from(([127, 0, 0, 1], port))]
-            );
-            drop(reservation);
-            let mut running = start_prepared(&prepared).await;
+            let mut collisions = 0;
+            let (prepared, mut running) = loop {
+                let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+                let port = reservation.local_addr().unwrap().port();
+                let mut configs = validate(&pair_config(port)).unwrap();
+                let client = &mut configs.wireguard_endpoints[CLIENT];
+                client.listen = listen.map(|address| address.parse().unwrap());
+                client.peers[0].endpoint = Some(format!("[::ffff:127.0.0.1]:{port}"));
+                let prepared = Prepared::new(&mut configs).await.unwrap();
+                assert_eq!(
+                    prepared.endpoints[CLIENT].peers[0].endpoints,
+                    vec![SocketAddr::from(([127, 0, 0, 1], port))]
+                );
+                drop(reservation);
+                let mut running = Running::default();
+                match prepared.start(&mut DnsRegistry::new(), &mut running).await {
+                    Ok(()) => break (prepared, running),
+                    Err(error) => {
+                        running.stop().await;
+                        // Concurrent ephemeral binds can claim the released reservation.
+                        assert_eq!(error.kind(), stdio::ErrorKind::AddrInUse, "{error}");
+                        collisions += 1;
+                        assert!(collisions < 5, "{error}");
+                    }
+                }
+            };
             let (tcp, udp, _echoes) = echo_servers(false).await;
             check_echo(prepared.endpoints[CLIENT].connector.as_ref(), tcp, udp).await;
             running.stop().await;
