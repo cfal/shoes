@@ -12,10 +12,11 @@ use hickory_resolver::net::runtime::{QuicSocketBinder, RuntimeProvider, Spawn, T
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
+use crate::atomic::AtomicU64;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::Resolver;
 
-static NEXT_TRANSPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_TRANSPORT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
 const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
