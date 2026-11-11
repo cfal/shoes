@@ -364,14 +364,13 @@ async fn hosts_survive_backend_refresh_without_using_it() {
         factory,
         RefreshPolicy {
             max_idle: Duration::from_secs(60),
-            retry_once_after_refresh: true,
         },
         "hosts-test".into(),
     )
     .await
     .unwrap();
     let resolver = HostsResolver::wrap(Arc::new(hosts("proxy.test: 192.0.2.1")), Arc::new(backend));
-    for generation in [1, 2] {
+    for (phase, generation) in [1, 1, 2].into_iter().enumerate() {
         assert_eq!(
             resolver
                 .resolve_location(&NetLocation::from_str("proxy.test:443", None).unwrap())
@@ -393,11 +392,17 @@ async fn hosts_survive_backend_refresh_without_using_it() {
         assert_eq!(fallback.lookups.load(Ordering::SeqCst), generation - 1);
         assert_eq!(fallback.exchanges.load(Ordering::SeqCst), 0);
         assert_eq!(fallback.deadlines.load(Ordering::SeqCst), 0);
-        if generation == 1 {
-            resolver
+        if phase < 2 {
+            let result = resolver
                 .resolve_location(&NetLocation::from_str("other.test:443", None).unwrap())
-                .await
-                .unwrap();
+                .await;
+            if phase == 0 {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+                assert_eq!(builds.load(Ordering::SeqCst), 1);
+            } else {
+                result.unwrap();
+                assert_eq!(builds.load(Ordering::SeqCst), 2);
+            }
         }
     }
 }

@@ -1032,7 +1032,6 @@ async fn build_resolver_from_specs(
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(60),
-            retry_once_after_refresh: true,
         };
 
         let refreshing = RefreshingResolver::new(factory, policy, description).await?;

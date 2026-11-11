@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_exchange_failure_preserves_retained_setup_retry() {
+    async fn later_exchange_failure_preserves_retained_setup_classification() {
         #[derive(Debug)]
         struct PendingSetup;
         impl Resolver for PendingSetup {

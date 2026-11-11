@@ -275,7 +275,6 @@ impl DohFixture {
             factory,
             crate::resolver::RefreshPolicy {
                 max_idle: Duration::from_secs(60),
-                retry_once_after_refresh: true,
             },
             "local DoH".into(),
         )
@@ -311,7 +310,6 @@ async fn doh_composite_short_deadline_preserves_healthy_transports() {
         }),
         crate::resolver::RefreshPolicy {
             max_idle: Duration::from_secs(60),
-            retry_once_after_refresh: true,
         },
         "composite DoH".into(),
     )
@@ -464,7 +462,7 @@ async fn doh_lookup_retirement_reaches_the_driver_after_goaway() {
 }
 
 #[tokio::test]
-async fn doh_concurrent_queries_retry_the_current_generation_after_retirement() {
+async fn doh_concurrent_failures_rebuild_only_for_subsequent_queries() {
     let fixture = DohFixture::start().await;
     let resolver = Arc::new(fixture.refreshing().await);
     resolver.exchange(query(0)).await.unwrap();
@@ -495,8 +493,21 @@ async fn doh_concurrent_queries_retry_the_current_generation_after_retirement() 
             }
         });
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(result) = queries.join_next().await {
+            assert!(result.unwrap().is_err());
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.builds.load(Ordering::SeqCst), 1);
+    fixture.wait_closed().await;
     fixture.stall.store(false, Ordering::SeqCst);
+    let mut queries = tokio::task::JoinSet::new();
+    for index in 8..16 {
+        let resolver = resolver.clone();
+        queries.spawn(async move { resolver.exchange(query(index)).await });
+    }
     tokio::time::timeout(Duration::from_secs(2), async {
         while let Some(result) = queries.join_next().await {
             result.unwrap().unwrap();
@@ -698,11 +709,9 @@ async fn doh_lookup_and_deadline_exchange_recover_after_repeated_stalls() {
                 fixture.stall.store(true, Ordering::SeqCst);
                 let error = perform(cycle * 2 + 1).await.unwrap_err();
                 assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+                assert_eq!(fixture.builds.load(Ordering::SeqCst), builds);
                 if crate::resolver::dns_caller_deadline(&error) {
-                    if !lookup {
-                        assert!(fixture.builds.load(Ordering::SeqCst) > builds);
-                    }
-                    // Only the clipped replacement may survive; its full transport timer never expired.
+                    // A caller clip does not retire a healthy transport generation.
                     tokio::time::timeout(Duration::from_secs(1), async {
                         while fixture.live.load(Ordering::SeqCst) > 1 {
                             tokio::task::yield_now().await;

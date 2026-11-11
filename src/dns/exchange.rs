@@ -19,8 +19,8 @@ use super::proxy_runtime::ProxyRuntimeProvider;
 
 type Connection =
     Shared<BoxFuture<'static, Result<DnsExchange<ProxyRuntimeProvider>, Arc<io::Error>>>>;
-type SetupWaits = parking_lot::Mutex<Vec<Option<Connection>>>;
-type PartialAnswer = parking_lot::Mutex<Option<Message>>;
+type SetupWaits = Mutex<Vec<Option<Connection>>>;
+type PartialAnswer = Mutex<Option<Message>>;
 
 struct Upstream {
     server_index: usize,
@@ -71,7 +71,6 @@ impl Drop for EstablishedExchange<'_> {
         {
             self.upstream.retire(&self.setup);
             self.outer.retired.store(true, Ordering::Relaxed);
-            self.slot.retired.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -177,6 +176,17 @@ impl RawDnsExchange {
         self.exchange_until(bytes, None).await
     }
 
+    pub fn request_timeout(&self) -> std::time::Duration {
+        let options = &self.context.options;
+        options.timeout.saturating_mul(
+            options
+                .attempts
+                .max(1)
+                .saturating_add(1)
+                .min(u32::MAX as usize) as u32,
+        )
+    }
+
     pub async fn exchange_with_deadline(
         &self,
         bytes: Vec<u8>,
@@ -207,23 +217,16 @@ impl RawDnsExchange {
             edns.set_max_payload(edns.max_payload().min(super::message::UDP_PAYLOAD_LIMIT));
             edns.options_mut().remove(EdnsCode::Cookie);
         }
-        let timeout = self.context.options.timeout.saturating_mul(
-            self.context
-                .options
-                .attempts
-                .max(1)
-                .saturating_add(1)
-                .min(u32::MAX as usize) as u32,
-        );
+        let timeout = self.request_timeout();
         let transport_deadline = tokio::time::Instant::now() + timeout;
         let deadline = deadline.map_or(transport_deadline, |deadline| {
             deadline.min(transport_deadline)
         });
-        let setups = parking_lot::Mutex::new(Vec::new());
+        let setups = Mutex::new(Vec::new());
         let expiration = ExchangeTimeout::default();
         let admitted = AtomicBool::new(false);
         // A validated UDP partial must survive cancellation of its TCP retry.
-        let partial = parking_lot::Mutex::new(None);
+        let partial = Mutex::new(None);
         let result = expiration
             .run(
                 deadline,
@@ -307,7 +310,7 @@ impl RawDnsExchange {
             let waves = upstreams.len().div_ceil(concurrency).max(1);
             let slot_timeout = self.context.options.timeout / waves.min(u32::MAX as usize) as u32;
             let jobs = futures::stream::iter(upstreams).map(|index| {
-                self.upstream_job(
+                self.send(
                     &self.upstreams[index],
                     request,
                     setups,
@@ -335,32 +338,18 @@ impl RawDnsExchange {
         Err(error)
     }
 
-    fn upstream_job<'a>(
-        &'a self,
-        upstream: &'a Upstream,
-        request: &'a Message,
-        setups: &'a SetupWaits,
-        partial: &'a PartialAnswer,
-        timing: AttemptTiming<'a>,
-    ) -> BoxFuture<'a, io::Result<Message>> {
-        Box::pin(async move {
-            self.send(upstream, request.clone(), setups, partial, &timing)
-                .await
-        })
-    }
-
     async fn send(
         &self,
         upstream: &Upstream,
-        message: Message,
+        message: &Message,
         setups: &SetupWaits,
         partial: &PartialAnswer,
-        timing: &AttemptTiming<'_>,
+        timing: AttemptTiming<'_>,
     ) -> io::Result<Message> {
         let answer = self
-            .send_upstream(upstream, message.clone(), setups, timing)
+            .send_upstream(upstream, message.clone(), setups, &timing)
             .await?;
-        check_answer(&answer, &message)?;
+        check_answer(&answer, message)?;
         if answer.metadata.truncation && matches!(upstream.config.protocol, ProtocolConfig::Udp) {
             // Only use explicitly configured TCP, including system-discovered UDP+TCP pairs.
             if let Some(tcp) = self.upstreams.iter().find(|candidate| {
@@ -369,9 +358,9 @@ impl RawDnsExchange {
             }) {
                 partial.lock().get_or_insert_with(|| answer.clone());
                 let answer = self
-                    .send_upstream(tcp, message.clone(), setups, timing)
+                    .send_upstream(tcp, message.clone(), setups, &timing)
                     .await?;
-                check_answer(&answer, &message)?;
+                check_answer(&answer, message)?;
                 return Ok(answer);
             }
         }

@@ -6,11 +6,65 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
+fn request_budget_keeps_minimum_attempts_and_saturates() {
+    let mut raw = exchange("127.0.0.1:53".parse().unwrap(), false);
+    raw.context.options.timeout = Duration::from_secs(5);
+    for (attempts, multiplier) in [(0, 2), (1, 2), (2, 3), (usize::MAX, u32::MAX)] {
+        raw.context.options.attempts = attempts;
+        assert_eq!(raw.request_timeout(), Duration::from_secs(5) * multiplier);
+    }
+    raw.context.options.timeout = Duration::MAX;
+    assert_eq!(raw.request_timeout(), Duration::MAX);
+}
+
+fn udp_responder(
+    socket: tokio::net::UdpSocket,
+    reply: Arc<AtomicBool>,
+) -> tokio_util::task::AbortOnDropHandle<()> {
+    tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        loop {
+            let (len, client) = socket.recv_from(&mut buffer).await.unwrap();
+            if reply.load(Ordering::Relaxed) {
+                let answer = Message::from_vec(&buffer[..len]).unwrap().into_response();
+                socket
+                    .send_to(&answer.to_vec().unwrap(), client)
+                    .await
+                    .unwrap();
+            }
+        }
+    }))
+}
+
+#[test]
 fn net_error_preserves_typed_admission_cause() {
     let error = net_error(NetError::Io(Arc::new(crate::resources::exhausted())));
     assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     assert!(crate::resources::is_exhausted(&error));
     assert!(!crate::resolver::RefreshingResolver::should_refresh_for_error(&error));
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_and_caller_deadlines_keep_distinct_ready_answer_tie_breaks() {
+    for owned in [false, true] {
+        let timeout = ExchangeTimeout::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut query = Box::pin(timeout.run(deadline, owned, async {
+            receive.await.map_err(io::Error::other)
+        }));
+        assert!(futures::poll!(&mut query).is_pending());
+        send.send(42).unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = query.await;
+        if owned {
+            assert_eq!(result.unwrap(), 42);
+        } else {
+            assert!(crate::resolver::dns_caller_deadline(&result.unwrap_err()));
+        }
+        assert_eq!(timeout.expired.load(Ordering::Relaxed), !owned);
+        assert!(!timeout.retired.load(Ordering::Relaxed));
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -30,20 +84,7 @@ async fn late_admission_and_delayed_cancellation_do_not_retire_established_trans
     let mut raw = exchange(address, false);
     raw.context.options.timeout = Duration::from_millis(100);
     let reply = Arc::new(AtomicBool::new(true));
-    let respond = reply.clone();
-    let peer = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-        let mut buffer = [0; 4096];
-        loop {
-            let (len, client) = socket.recv_from(&mut buffer).await.unwrap();
-            if respond.load(Ordering::Relaxed) {
-                let answer = Message::from_vec(&buffer[..len]).unwrap().into_response();
-                socket
-                    .send_to(&answer.to_vec().unwrap(), client)
-                    .await
-                    .unwrap();
-            }
-        }
-    }));
+    let peer = udp_responder(socket, reply.clone());
     raw.exchange(request().to_vec().unwrap()).await.unwrap();
     let original = raw.upstreams[0].connection.lock().as_ref().unwrap().clone();
     reply.store(false, Ordering::Relaxed);
@@ -102,20 +143,7 @@ async fn earlier_attempt_retirement_does_not_own_a_later_caller_deadline() {
     raw.context.options.timeout = Duration::from_secs(1);
     raw.context.options.attempts = 2;
     let reply = Arc::new(AtomicBool::new(true));
-    let respond = reply.clone();
-    let _peer = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-        let mut buffer = [0; 4096];
-        loop {
-            let (len, client) = socket.recv_from(&mut buffer).await.unwrap();
-            if respond.load(Ordering::Relaxed) {
-                let answer = Message::from_vec(&buffer[..len]).unwrap().into_response();
-                socket
-                    .send_to(&answer.to_vec().unwrap(), client)
-                    .await
-                    .unwrap();
-            }
-        }
-    }));
+    let _peer = udp_responder(socket, reply.clone());
     raw.exchange(request().to_vec().unwrap()).await.unwrap();
     let original = raw.upstreams[0].connection.lock().as_ref().unwrap().clone();
     raw.context.options.timeout = Duration::from_millis(100);
@@ -624,12 +652,12 @@ async fn slow_connection_setup_survives_refreshing_resolver_timeout() {
 }
 
 #[tokio::test]
-async fn concurrent_query_completing_setup_preserves_canceled_wait_retry() {
+async fn concurrent_query_completing_setup_preserves_canceled_wait_for_next_query() {
     assert_slow_setup_survives(true, false).await;
 }
 
 #[tokio::test]
-async fn later_bind_failure_preserves_canceled_setup_retry() {
+async fn later_bind_failure_preserves_retained_setup_for_next_query() {
     assert_slow_setup_survives(false, true).await;
 }
 
@@ -683,7 +711,7 @@ async fn assert_slow_setup_survives(concurrent: bool, fail_last: bool) {
     }
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        for _ in 0..3 + usize::from(concurrent) {
+        for _ in 0..2 + usize::from(concurrent) {
             let answer = read_tcp(&mut stream).await.into_response();
             write_tcp(&mut stream, answer).await;
         }
@@ -702,14 +730,19 @@ async fn assert_slow_setup_survives(concurrent: bool, fail_last: bool) {
         factory,
         RefreshPolicy {
             max_idle: Duration::from_secs(60),
-            retry_once_after_refresh: true,
         },
         "slow multi-upstream setup".into(),
     )
     .await
     .unwrap();
     let requests = async {
-        for _ in 0..3 {
+        let error = resolver
+            .exchange(request().to_vec().unwrap())
+            .await
+            .unwrap_err();
+        assert!(crate::resolver::dns_setup_pending(&error), "{error:?}");
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        for _ in 0..2 {
             resolver
                 .exchange(request().to_vec().unwrap())
                 .await

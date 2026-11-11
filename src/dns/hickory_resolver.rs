@@ -53,7 +53,6 @@ pub struct HickoryResolver {
     inner: Resolver<ProxyRuntimeProvider>,
     exchange: Arc<super::exchange::RawDnsExchange>,
     provider: ProxyRuntimeProvider,
-    request_timeout: Duration,
     description: String,
 }
 
@@ -241,13 +240,6 @@ impl HickoryResolver {
             provider.clone(),
             resolver_opts.clone(),
         ));
-        let request_timeout = resolver_opts.timeout.saturating_mul(
-            options
-                .attempts
-                .max(1)
-                .saturating_add(1)
-                .min(u32::MAX as usize) as u32,
-        );
         let builder =
             builder.with_tls_config(crate::rustls_config_util::create_dns_client_config());
         let resolver = builder
@@ -258,7 +250,6 @@ impl HickoryResolver {
             inner: resolver,
             exchange,
             provider,
-            request_timeout,
             description,
         })
     }
@@ -266,7 +257,7 @@ impl HickoryResolver {
 
 impl ShoesResolver for HickoryResolver {
     fn request_timeout(&self) -> Option<Duration> {
-        Some(self.request_timeout)
+        Some(self.exchange.request_timeout())
     }
 
     fn retire(&self) {
@@ -574,7 +565,6 @@ mod tests {
                 factory,
                 RefreshPolicy {
                     max_idle: Duration::from_secs(3600),
-                    retry_once_after_refresh: true,
                 },
                 "hostname refresh regression".into(),
             )
@@ -597,8 +587,10 @@ mod tests {
                     assert_eq!(builds.load(Ordering::Relaxed), 1);
                 }
                 Failure::Timeout | Failure::NoConnections => {
-                    assert_eq!(result.unwrap(), expected_addresses);
-                    assert_eq!(builds.load(Ordering::Relaxed), 2);
+                    assert!(RefreshingResolver::should_refresh_for_error(
+                        &result.unwrap_err()
+                    ));
+                    assert_eq!(builds.load(Ordering::Relaxed), 1);
                     assert_eq!(
                         resolver.resolve_location(&location).await.unwrap(),
                         expected_addresses

@@ -79,11 +79,18 @@ from an old connection cannot evict its replacement. Fresh connections use the
 current selector choice. Fake-IP mappings, capture ownership, and unrelated
 proxy transports are unchanged.
 
-DNS retries share the original request deadline. The resolver refresh layer
-allows at most one retry, including a retry waiting for retained connection setup;
-it does not restart the timeout budget. Failed final attempts are retired even
-when no retry time remains. Short caller deadlines and canceled queries do not
-invalidate a shared handshake or an otherwise healthy connection.
+A query that encounters a refreshable transport failure returns that error and
+retires its resolver generation. The refresh layer does not repeat the query or
+rebuild immediately. The next query lazily rebuilds the resolver; concurrent
+queries share that rebuild. Reconstruction failures reach that query and leave
+reconstruction for another query to attempt.
+
+Configured upstream attempts, cached-connection reconnects and transport fallbacks
+still share the original request deadline, including any lazy reconstruction.
+Connection setup still in progress is retained under its own setup deadline for
+later queries, without an extra same-query wait or resolver retirement. Short
+caller deadlines and canceled queries do not invalidate a shared handshake or an
+otherwise healthy connection.
 
 NXDOMAIN, NODATA, SERVFAIL, HTTP status failures, certificate/authentication
 failures, and local admission pressure do not trigger resolver replacement.

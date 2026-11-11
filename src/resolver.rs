@@ -81,7 +81,7 @@ fn bounded_lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
 
-    /// Bounds a logical request, including retries and resolver reconstruction.
+    /// Bounds a logical request, including transport attempts and lazy reconstruction.
     fn request_timeout(&self) -> Option<Duration> {
         None
     }
@@ -207,8 +207,6 @@ pub type ResolverFactory = Arc<dyn Fn() -> ResolverFactoryFuture + Send + Sync>;
 pub struct RefreshPolicy {
     /// Rebuild the inner resolver if it has been idle longer than this.
     pub max_idle: Duration,
-    /// After a refreshable error, rebuild and retry the lookup once.
-    pub retry_once_after_refresh: bool,
 }
 
 /// Resolver wrapper that rebuilds its inner resolver on idle timeout or
@@ -281,12 +279,11 @@ impl RefreshingResolver {
     fn execute<T: Send + 'static>(
         &self,
         deadline: Option<tokio::time::Instant>,
-        operation: impl Fn(
+        operation: impl FnOnce(
             Arc<dyn Resolver>,
             Option<tokio::time::Instant>,
         ) -> Pin<Box<dyn Future<Output = std::io::Result<T>> + Send>>
         + Send
-        + Sync
         + 'static,
     ) -> Pin<Box<dyn Future<Output = std::io::Result<T>> + Send>> {
         let refresh_lock = self.refresh_lock.clone();
@@ -314,62 +311,14 @@ impl RefreshingResolver {
                 deadline,
             )
             .await?;
-            let mut result = operation(current.clone(), deadline).await;
-            let retried_setup = policy.retry_once_after_refresh
-                && result.as_ref().is_err_and(dns_setup_pending)
-                && deadline.is_none_or(|limit| tokio::time::Instant::now() < limit);
-            if retried_setup {
-                result = operation(current.clone(), deadline).await;
-            }
-            let error = match result {
-                Ok(value) => {
-                    Self::record_success(&refresh_state, &current, &description);
-                    return Ok(value);
-                }
-                Err(error) => error,
-            };
-            if !Self::should_refresh_for_error(&error) {
-                return Err(error);
-            }
-            let expired = deadline.is_some_and(|limit| tokio::time::Instant::now() >= limit);
-            if dns_setup_pending(&error) && expired {
-                return Err(error);
-            }
-            Self::invalidate(&refresh_state, &current, &description, &error);
-            if !policy.retry_once_after_refresh || expired {
-                return Err(error);
-            }
-            let retry_resolver = match Self::current(
-                &factory,
-                &refresh_state,
-                &refresh_lock,
-                policy,
-                &description,
-                deadline,
-            )
-            .await
-            {
-                Ok(resolver) => resolver,
-                Err(failure) => {
-                    log::debug!("DNS resolver {description}: rebuild failed: {failure}");
-                    return Err(if failure.kind() == std::io::ErrorKind::TimedOut {
-                        failure
-                    } else {
-                        error
-                    });
-                }
-            };
-            // Retained setup already consumed the one outer retry.
-            if retried_setup {
-                return Err(error);
-            }
-            let result = operation(retry_resolver.clone(), deadline).await;
+            let result = operation(current.clone(), deadline).await;
             match &result {
-                Ok(_) => Self::record_success(&refresh_state, &retry_resolver, &description),
+                Ok(_) => Self::record_success(&refresh_state, &current, &description),
+                // A retained handshake owns its deadline and can serve a later query.
                 Err(error)
                     if Self::should_refresh_for_error(error) && !dns_setup_pending(error) =>
                 {
-                    Self::invalidate(&refresh_state, &retry_resolver, &description, error);
+                    Self::invalidate(&refresh_state, &current, &description, error);
                 }
                 Err(_) => {}
             }
@@ -510,8 +459,8 @@ impl Resolver for RefreshingResolver {
 
     fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
         self.execute(None, move |resolver, deadline| match deadline {
-            Some(deadline) => resolver.exchange_with_deadline(request.clone(), deadline),
-            None => resolver.exchange(request.clone()),
+            Some(deadline) => resolver.exchange_with_deadline(request, deadline),
+            None => resolver.exchange(request),
         })
     }
 
@@ -522,7 +471,7 @@ impl Resolver for RefreshingResolver {
     ) -> DnsExchangeFuture {
         // A second timer around the operation could beat its retained reply's timer wake.
         self.execute(Some(deadline), move |resolver, deadline| {
-            resolver.exchange_with_deadline(request.clone(), deadline.unwrap())
+            resolver.exchange_with_deadline(request, deadline.unwrap())
         })
     }
 }
