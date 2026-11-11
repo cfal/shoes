@@ -26,6 +26,22 @@ struct State {
     terminal: OnceLock<Option<Arc<io::Error>>>,
 }
 
+#[derive(Debug)]
+struct TerminalError(Arc<io::Error>);
+
+impl fmt::Display for TerminalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Error for TerminalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        // Arc<io::Error>::source skips the io::Error and can lose its errno.
+        Some(self.0.as_ref())
+    }
+}
+
 impl TransportErrors {
     pub(crate) fn identity(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
@@ -52,7 +68,7 @@ impl TransportErrors {
 
     pub(crate) fn terminal_error(&self) -> io::Error {
         match self.0.terminal.get() {
-            Some(Some(error)) => io::Error::new(error.kind(), error.clone()),
+            Some(Some(error)) => io::Error::new(error.kind(), TerminalError(error.clone())),
             _ => io::ErrorKind::ConnectionAborted.into(),
         }
     }
@@ -94,11 +110,8 @@ impl TransportErrors {
     }
 
     pub(crate) fn map(&self, error: h2::Error) -> io::Error {
-        if self.0.forced.load(Ordering::Acquire)
-            && !error.is_reset()
-            && let Some(Some(cause)) = self.0.terminal.get()
-        {
-            return io::Error::new(cause.kind(), cause.clone());
+        if self.0.forced.load(Ordering::Acquire) && !error.is_reset() {
+            return self.terminal_error();
         }
         let cause = self.cause(&error);
         Self::map_captured(error, cause)

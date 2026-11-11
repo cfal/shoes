@@ -199,6 +199,88 @@ async fn first_terminal_event_wins_and_recovery_is_connection_scoped() {
 }
 
 #[tokio::test]
+async fn forced_failure_preserves_kind_source_and_first_terminal_event() {
+    for (make_error, local) in cases() {
+        let errors = TransportErrors::default();
+        errors.start_driver();
+        errors.fail(make_error());
+        errors.fail(io::Error::other("later failure"));
+        errors.closed();
+        let mapped = errors.map(h2_copy(&io::ErrorKind::BrokenPipe.into()).await);
+        let original = make_error();
+        assert_eq!(mapped.kind(), original.kind());
+        assert_eq!(mapped.to_string(), original.to_string());
+        assert_eq!(crate::clash_api::probes::local_failure(&mapped), local);
+        let source = mapped
+            .get_ref()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(source.raw_os_error(), original.raw_os_error());
+        assert_eq!(
+            crate::resources::is_exhausted(source),
+            crate::resources::is_exhausted(&original)
+        );
+    }
+    for clean_close in [false, true] {
+        let errors = TransportErrors::default();
+        errors.start_driver();
+        if clean_close {
+            errors.closed();
+        } else {
+            errors.record(crate::resources::exhausted());
+        }
+        errors.fail(io::Error::new(io::ErrorKind::TimedOut, "late watchdog"));
+        let mapped = errors.map(h2_copy(&io::ErrorKind::BrokenPipe.into()).await);
+        assert_eq!(mapped.kind(), io::ErrorKind::Other);
+        assert_eq!(crate::resources::is_exhausted(&mapped), !clean_close);
+        assert!(!mapped.to_string().contains("late watchdog"));
+    }
+}
+
+#[tokio::test]
+async fn forced_failure_does_not_replace_a_remote_stream_reset() {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let (client, peer) = tokio::io::duplex(8192);
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            while let Some(Ok((_request, mut respond))) = connection.accept().await {
+                respond.send_reset(h2::Reason::CANCEL);
+            }
+        }));
+        let (client, connection) = h2::client::handshake(client).await.unwrap();
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let mut client = client.ready().await.unwrap();
+        let (response, _send) = client
+            .send_request(
+                http::Request::get("https://localhost/reset")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        let reset = response.await.unwrap_err();
+        assert!(reset.is_reset());
+        assert_eq!(reset.reason(), Some(h2::Reason::CANCEL));
+        let errors = TransportErrors::default();
+        errors.fail(io::Error::new(io::ErrorKind::TimedOut, "missing PONG"));
+        let mapped = errors.map(reset);
+        assert_eq!(mapped.kind(), io::ErrorKind::Other);
+        let reset = mapped
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<h2::Error>()
+            .unwrap();
+        assert!(reset.is_reset());
+        assert_eq!(reset.reason(), Some(h2::Reason::CANCEL));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn empty_buffers_do_not_close_observation_but_eof_and_write_zero_do() {
     for read in [false, true] {
         for empty in [false, true] {
