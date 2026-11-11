@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_snapshot_survives_caller_clipping_but_not_transport_timeout() {
+    async fn cached_snapshot_retention_tracks_deadlines_and_exchange_identity() {
         use hickory_resolver::proto::{
             op::{Message, Query},
             rr::{Name, RecordType},
@@ -370,24 +370,27 @@ mod tests {
             }
         }));
         let lookup: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-        let provider = ProxyRuntimeProvider::with_bootstrap(
-            Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
+        let new_exchange = || {
+            let provider = ProxyRuntimeProvider::with_bootstrap(
+                Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
+                    lookup.clone(),
+                )),
                 lookup.clone(),
-            )),
-            lookup.clone(),
-            Duration::from_secs(1),
-        );
-        let mut connection = ConnectionConfig::udp();
-        connection.port = address.port();
-        let mut options = ResolverOpts::default();
-        options.timeout = Duration::from_millis(100);
-        options.attempts = 1;
-        let exchange = Arc::new(RawDnsExchange::new(
-            vec![NameServerConfig::new(address.ip(), true, vec![connection])],
-            provider,
-            options,
-        ));
-        let system = SystemResolver::new(lookup, Arc::from([]), Duration::from_secs(1));
+                Duration::from_secs(1),
+            );
+            let mut connection = ConnectionConfig::udp();
+            connection.port = address.port();
+            let mut options = ResolverOpts::default();
+            options.timeout = Duration::from_millis(100);
+            options.attempts = 1;
+            Arc::new(RawDnsExchange::new(
+                vec![NameServerConfig::new(address.ip(), true, vec![connection])],
+                provider,
+                options,
+            ))
+        };
+        let exchange = new_exchange();
+        let system = SystemResolver::new(lookup.clone(), Arc::from([]), Duration::from_secs(1));
         *system.snapshot.lock().await = Some(Snapshot {
             loaded: Instant::now(),
             exchange: exchange.clone(),
@@ -415,9 +418,31 @@ mod tests {
         respond.store(true, Ordering::Relaxed);
         system.exchange(query.clone()).await.unwrap();
         respond.store(false, Ordering::Relaxed);
+        let mut stale = system.exchange(query.clone());
+        assert!(futures::poll!(&mut stale).is_pending());
+        let replacement = new_exchange();
+        *system.snapshot.lock().await = Some(Snapshot {
+            loaded: Instant::now(),
+            exchange: replacement.clone(),
+        });
+        let error = tokio::time::timeout(Duration::from_secs(1), stale)
+            .await
+            .expect("superseded exchange did not time out")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!crate::resolver::dns_caller_deadline(&error));
+        assert!(!crate::resolver::dns_setup_pending(&error));
+        assert!(Arc::ptr_eq(
+            &system.snapshot.lock().await.as_ref().unwrap().exchange,
+            &replacement,
+        ));
+        respond.store(true, Ordering::Relaxed);
+        system.exchange(query.clone()).await.unwrap();
+        respond.store(false, Ordering::Relaxed);
         let error = system.exchange(query).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(!crate::resolver::dns_caller_deadline(&error));
+        assert!(!crate::resolver::dns_setup_pending(&error));
         assert!(system.snapshot.lock().await.is_none());
     }
 
@@ -467,7 +492,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cached_snapshot_survives_resource_exhaustion_and_admission_timeout() {
+    async fn cached_snapshot_survives_resource_exhaustion_admission_timeout_and_pending_setup() {
         use crate::async_stream::{AsyncMessageStream, AsyncStream};
         use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
         use crate::tcp::socket_connector::SocketConnector;
@@ -514,11 +539,12 @@ mod tests {
             RecordType::A,
         ));
         let query = query.to_vec().unwrap();
-        for failure in [
-            UnavailableConnector::Exhausted,
-            UnavailableConnector::Pending,
+        for (failure, admission_timeout) in [
+            (UnavailableConnector::Exhausted, false),
+            (UnavailableConnector::Pending, true),
+            (UnavailableConnector::Pending, false),
         ] {
-            let admission_timeout = matches!(failure, UnavailableConnector::Pending);
+            let exhausted = matches!(failure, UnavailableConnector::Exhausted);
             let lookup: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
             let chain = ClientChainGroup::new(vec![ClientProxyChain::new(
                 vec![InitialHopEntry::Direct(Arc::new(failure))],
@@ -564,13 +590,19 @@ mod tests {
                 error.kind(),
                 if admission_timeout {
                     io::ErrorKind::WouldBlock
-                } else {
+                } else if exhausted {
                     io::ErrorKind::ConnectionRefused
+                } else {
+                    io::ErrorKind::TimedOut
                 },
                 "{error:?}"
             );
-            assert_eq!(crate::resources::is_exhausted(&error), !admission_timeout);
-            assert!(!crate::resolver::dns_setup_pending(&error));
+            assert_eq!(crate::resources::is_exhausted(&error), exhausted);
+            assert_eq!(
+                crate::resolver::dns_setup_pending(&error),
+                !admission_timeout && !exhausted,
+                "{error:?}"
+            );
             assert!(!crate::resolver::dns_caller_deadline(&error));
             assert!(Arc::ptr_eq(
                 &system.snapshot.lock().await.as_ref().unwrap().exchange,
