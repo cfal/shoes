@@ -295,6 +295,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_reader_reports_failure_once_through_both_read_paths() {
+        for forward_first in [false, true] {
+            let memory = Memory::new(Arc::new(Budget::new(Some(128))), Some(128));
+            let (mut writer, mut reader) = pipe(memory.clone());
+            let (mut destination, _outgoing) = pipe(memory);
+            writer.fail_now(io::Error::new(io::ErrorKind::TimedOut, "missing PONG"));
+            let first = if forward_first {
+                reader.forward_to(&mut destination).await
+            } else {
+                reader.read_u8().await.map(|_| ())
+            };
+            let error = first.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(error.to_string(), "missing PONG");
+            let second = if forward_first {
+                reader.read_u8().await.map(|_| ())
+            } else {
+                reader.forward_to(&mut destination).await
+            };
+            let error = second.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(error.to_string(), "XHTTP body terminated without FIN");
+        }
+    }
+
+    #[tokio::test]
     async fn dropped_barrier_ack_keeps_subsequent_operations_fallible() {
         for drain in [false, true] {
             let memory = Memory::new(Arc::new(Budget::new(Some(128))), Some(128));
@@ -611,6 +637,15 @@ pub struct Reader {
 }
 
 impl Reader {
+    fn closed_error(&self) -> io::Error {
+        self.failure.lock().take().unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "XHTTP body terminated without FIN",
+            )
+        })
+    }
+
     pub fn defer(&mut self) -> oneshot::Receiver<()> {
         let (start, ready) = oneshot::channel();
         self.start = Some(start);
@@ -646,14 +681,7 @@ impl Reader {
                     self.eof.cancel();
                 }
                 Some(Event::Error(error)) => return Err(error),
-                None => {
-                    return Err(self.failure.lock().take().unwrap_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "XHTTP body terminated without FIN",
-                        )
-                    }));
-                }
+                None => return Err(self.closed_error()),
             }
         }
     }
@@ -892,14 +920,7 @@ impl AsyncRead for Reader {
                     self.eof.cancel();
                 }
                 Some(Event::Error(error)) => return Poll::Ready(Err(error)),
-                None => {
-                    return Poll::Ready(Err(self.failure.lock().take().unwrap_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "XHTTP body terminated without FIN",
-                        )
-                    })));
-                }
+                None => return Poll::Ready(Err(self.closed_error())),
             }
         }
     }

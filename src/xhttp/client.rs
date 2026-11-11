@@ -875,15 +875,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
-    struct Dialer(std::net::SocketAddr, RouteKey, AtomicUsize);
+    struct Dialer {
+        address: std::net::SocketAddr,
+        route: RouteKey,
+        opens: AtomicUsize,
+    }
     #[async_trait::async_trait]
     impl CarrierDialer for Dialer {
         fn route_key(&self) -> &RouteKey {
-            &self.1
+            &self.route
         }
         async fn open_stream(&self) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
-            self.2.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(tokio::net::TcpStream::connect(self.0).await?))
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(
+                tokio::net::TcpStream::connect(self.address).await?,
+            ))
         }
     }
 
@@ -950,7 +956,11 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let dialer = Arc::new(Dialer(address, RouteKey(vec![1]), AtomicUsize::new(0)));
+            let dialer = Arc::new(Dialer {
+                address,
+                route: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            });
             let mut stream = client.open(dialer.clone()).await.unwrap();
             let download = client.slots.lock()[0].clone();
             let carrier = download.carrier.get().unwrap().clone();
@@ -958,7 +968,7 @@ mod tests {
                 stream.read_u8().await.unwrap_err().kind(),
                 io::ErrorKind::UnexpectedEof
             );
-            assert_eq!(dialer.2.load(Ordering::Relaxed), 2);
+            assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
             fail.cancel();
             carrier.failed().await;
             assert_eq!(download.active(), 0);
@@ -1013,7 +1023,11 @@ mod tests {
             })).unwrap();
             let client = Arc::new(Client::new(config, NetLocation::from_str("localhost:80", None).unwrap(),
                 "localhost".into(), XhttpVersion::H2, XhttpMode::StreamOne, Security::Plain).unwrap());
-            let dialer = Arc::new(Dialer(address, RouteKey(vec![1]), AtomicUsize::new(0)));
+            let dialer = Arc::new(Dialer {
+                address,
+                route: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            });
             let mut stalled = client.open(dialer.clone()).await.unwrap();
             let queued = if buffer_limit == 16384 { 1 } else { 4 };
             while stalled.read.receiver.len() < queued { tokio::task::yield_now().await; }
@@ -1029,7 +1043,7 @@ mod tests {
             let retained = client.memory.snapshot().active;
             assert!(retained > 0);
             let mut fresh = client.open(dialer.clone()).await.unwrap();
-            assert_eq!(dialer.2.load(Ordering::SeqCst), 2);
+            assert_eq!(dialer.opens.load(Ordering::SeqCst), 2);
             if buffer_limit == 16384 {
                 assert!(futures::poll!(Box::pin(fresh.read_u8())).is_pending());
                 assert_eq!(client.memory.snapshot().active, retained);
