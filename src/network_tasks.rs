@@ -247,6 +247,71 @@ mod tests {
         assert!(network.state.lock().tasks.is_empty());
     }
 
+    #[tokio::test]
+    async fn completion_drivers_survive_cancellation_and_are_awaited() {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let network = NetworkTasks::default();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let (finished, done) = tokio::sync::oneshot::channel();
+            network.spawn_completion(async move {
+                let current = NetworkTasks::current().unwrap();
+                started.send(()).unwrap();
+                released.await.unwrap();
+                assert!(current.cancelled.is_cancelled());
+                assert!(spawn(async { 1 }).await.unwrap_err().is_cancelled());
+                finished.send(()).unwrap();
+            });
+            ready.await.unwrap();
+            network.cancel();
+            let mut wait = Box::pin(network.wait());
+            assert!(futures::poll!(&mut wait).is_pending());
+            release.send(()).unwrap();
+            wait.await;
+            done.await.expect("completion driver was aborted");
+            assert!(network.state.lock().tasks.is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn inherited_cleanup_survives_owner_drop_while_descendants_are_cancelled() {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let network = NetworkLifetime::default();
+            let context = network.0.clone();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let mut cleanup = None;
+            network
+                .scope(async {
+                    cleanup = Some(tokio::spawn(inherit(async move {
+                        let child = spawn(std::future::pending::<()>());
+                        started.send(()).unwrap();
+                        released.await.unwrap();
+                        assert!(NetworkTasks::current().unwrap().cancelled.is_cancelled());
+                        assert!(child.await.unwrap_err().is_cancelled());
+                        assert!(spawn(async { 1 }).await.unwrap_err().is_cancelled());
+                    })));
+                })
+                .await;
+            let cleanup = cleanup.unwrap();
+            ready.await.unwrap();
+            drop(network);
+            context.wait().await;
+            assert!(
+                !cleanup.is_finished(),
+                "inherited cleanup must not be aborted"
+            );
+            release.send(()).unwrap();
+            cleanup.await.unwrap();
+            context.wait().await;
+            assert!(context.state.lock().tasks.is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn stopped_runtime_destroys_registrations_without_locking_recursively() {
         let runtime = tokio::runtime::Builder::new_current_thread()

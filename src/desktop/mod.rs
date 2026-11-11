@@ -160,7 +160,14 @@ impl NetworkSession {
 
     pub(crate) async fn reconcile(&mut self) -> io::Result<bool> {
         #[cfg(test)]
-        if let Some((_, reconciled)) = &self.test_events {
+        if let Some((changes, reconciled)) = &mut self.test_events {
+            // Reconciliation observes changes that arrived while worker startup was running.
+            while let Ok(event) = changes.try_recv() {
+                self.test_changed |= event.is_some();
+                if let Some(available) = event {
+                    self.test_available = Some(available);
+                }
+            }
             let _ = reconciled.try_send(());
             return Ok(std::mem::take(&mut self.test_changed));
         }

@@ -42,8 +42,13 @@ sessions are not migrated or restored by rollback.
 
 During [managed TUN recovery](/config/tun/#managed-linux-desktop-capture), failed
 reload activation instead leaves workers paused and schedules an accepted-state
-retry after two seconds. That retry restores the accepted limits and clock before
-rebuilding DNS; they are not restored immediately when the candidate is discarded.
+retry after two seconds. Each recovery attempt restores the accepted limits and
+clock before bootstrap or DNS preparation, including preparation of a correcting
+reload; they are not restored immediately when the candidate is discarded.
+A correcting reload rechecks the underlay after worker startup, before publishing
+its controller generation and releasing TCP/Unix admission.
+If that check detects another underlay change, the reload remains pending and is
+retried when recovery can proceed, without another file edit or SIGHUP.
 
 Certificate-source file changes and ACME renewal do not trigger this full reload.
 They rotate live without replacing listeners or closing QUIC connections; see

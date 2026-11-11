@@ -265,15 +265,22 @@ Both IP families are monitored. A
 complete outage pauses forwarding until an underlay returns; temporary recovery
 failures are retried without removing capture. Recovery rebuilds DNS and proxy
 transports from the accepted in-memory configuration, not from edited files.
+Recovery shares worker startup and activation with configuration reload. After
+starting workers, it rechecks the underlay before resuming the controller, starting
+certificate workers, and admitting TCP/Unix connections. This is not an atomic
+barrier for all forwarding: managed ingress, QUIC, and WireGuard can start earlier.
 DNS bootstrap uses the configured lookup deadlines; slow or unbounded lookups
 can delay recovery, but shutdown remains cancellable.
 Explicit reloads wait while offline and can replace a configuration that prevents
 workers from restarting once an underlay is available, without first rebuilding
 the accepted DNS configuration.
-If activation of a recovery reload fails, its workers are cleaned up and forwarding
-remains paused. Recovery schedules the accepted configuration for another attempt
-after two seconds, rather than immediately rolling back or re-reading the rejected
-file. Cleanup and network ownership failures still cause shutdown.
+If worker startup or activation rejects a recovery reload while the underlay is
+stable, its workers are cleaned up and forwarding remains paused. Recovery
+schedules the accepted configuration for another attempt after two seconds, rather
+than immediately rolling back or re-reading the rejected file. An underlay change
+detected after worker startup instead keeps the reload pending for a later attempt,
+without another file edit or SIGHUP. Cleanup and network ownership failures still
+cause shutdown.
 The TUN, REDIRECT ports, fake-IP mappings, and explicit selector choices remain
 owned and retained. WireGuard peer hostnames are refreshed best-effort; a failed
 refresh retains the previous endpoints rather than blocking unrelated workers. Old flows,
