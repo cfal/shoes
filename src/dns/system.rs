@@ -467,6 +467,119 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cached_snapshot_survives_resource_exhaustion_and_admission_timeout() {
+        use crate::async_stream::{AsyncMessageStream, AsyncStream};
+        use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
+        use crate::tcp::socket_connector::SocketConnector;
+        use hickory_resolver::proto::{
+            op::{Message, Query},
+            rr::{Name, RecordType},
+        };
+
+        #[derive(Debug)]
+        enum UnavailableConnector {
+            Exhausted,
+            Pending,
+        }
+
+        #[async_trait::async_trait]
+        impl SocketConnector for UnavailableConnector {
+            async fn connect(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: &crate::address::ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncStream>> {
+                match self {
+                    Self::Exhausted => Err(crate::resources::exhausted()),
+                    Self::Pending => std::future::pending().await,
+                }
+            }
+
+            async fn connect_udp_bidirectional(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: crate::address::ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncMessageStream>> {
+                unreachable!("snapshot retention fixture uses TCP")
+            }
+
+            fn bind_interface(&self) -> Option<&str> {
+                None
+            }
+        }
+
+        let mut query = Message::query();
+        query.add_query(Query::query(
+            Name::from_ascii("capacity.test.").unwrap(),
+            RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
+        for failure in [
+            UnavailableConnector::Exhausted,
+            UnavailableConnector::Pending,
+        ] {
+            let admission_timeout = matches!(failure, UnavailableConnector::Pending);
+            let lookup: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let chain = ClientChainGroup::new(vec![ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Arc::new(failure))],
+                vec![],
+            )]);
+            let provider = ProxyRuntimeProvider::with_bootstrap(
+                Arc::new(chain),
+                lookup.clone(),
+                Duration::from_secs(1),
+            );
+            let exchange = Arc::new(RawDnsExchange::new(
+                vec![NameServerConfig::new(
+                    "127.0.0.1".parse().unwrap(),
+                    true,
+                    vec![ConnectionConfig::tcp()],
+                )],
+                provider,
+                ResolverOpts::default(),
+            ));
+            let system = SystemResolver::new(lookup, Arc::from([]), Duration::from_secs(1));
+            *system.snapshot.lock().await = Some(Snapshot {
+                loaded: Instant::now(),
+                exchange: exchange.clone(),
+            });
+
+            let mut active = Vec::new();
+            if admission_timeout {
+                // Fill raw exchange admission while the shared TCP setup stays pending.
+                for _ in 0..64 {
+                    let mut pending = Box::pin(exchange.exchange(query.clone()));
+                    assert!(futures::poll!(&mut pending).is_pending());
+                    active.push(pending);
+                }
+            }
+            let error = system
+                .exchange_with_deadline(
+                    query.clone(),
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if admission_timeout {
+                    io::ErrorKind::WouldBlock
+                } else {
+                    io::ErrorKind::ConnectionRefused
+                },
+                "{error:?}"
+            );
+            assert_eq!(crate::resources::is_exhausted(&error), !admission_timeout);
+            assert!(!crate::resolver::dns_setup_pending(&error));
+            assert!(!crate::resolver::dns_caller_deadline(&error));
+            assert!(Arc::ptr_eq(
+                &system.snapshot.lock().await.as_ref().unwrap().exchange,
+                &exchange,
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn caller_deadline_bounds_system_snapshot_lock_wait() {
         let system = SystemResolver::new(
             Arc::new(crate::resolver::NativeResolver::new()),
