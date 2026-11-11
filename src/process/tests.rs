@@ -476,10 +476,27 @@ async fn reconnect_restarts_certificate_workers_retired_by_a_rejected_candidate(
         .scope(running.start_retry(&mut prepared))
         .await
         .unwrap();
+    let mut queued = tokio::net::TcpStream::connect(address).await.unwrap();
+    queued
+        .write_all(b"GET / HTTP/1.1\r\nHost: proxy.test\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), queued.read(&mut [0]))
+            .await
+            .is_err(),
+        "certificate worker admitted a request before recovery activation"
+    );
     fresh
         .scope(running.finish_activation(&prepared, None))
         .await
         .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(2), queued.read_to_string(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 404 "));
     challenge(address).await;
     running.shutdown(&[&prepared]).await.unwrap();
 }
@@ -655,6 +672,12 @@ async fn network_reset_keeps_controller_generation_and_explicit_selection() {
         .pause_network(&mut prepared, Some(&control), &old)
         .await
         .unwrap();
+    assert!(
+        control
+            .runtime
+            .activating
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
     let fresh = crate::network_tasks::NetworkLifetime::default();
     fresh
         .scope(running.refresh_network(&mut prepared, &mut network))
@@ -668,6 +691,12 @@ async fn network_reset_keeps_controller_generation_and_explicit_selection() {
         .scope(running.finish_activation(&prepared, Some(&control)))
         .await
         .unwrap();
+    assert!(
+        !control
+            .runtime
+            .activating
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
     assert!(std::sync::Arc::ptr_eq(
         &generation,
         &control.runtime.generation().unwrap()
@@ -692,9 +721,12 @@ async fn repair_reload_restores_runtime_and_checks_underlay_before_publication()
         "process::tests::repair_reload_restores_runtime_and_checks_underlay_before_publication";
     const CHILD: &str = "SHOES_REPAIR_ACTIVATION_TEST";
     if std::env::var_os(CHILD).is_none() {
-        shoes_test_support::isolated::run_isolated(NAME, CHILD, "1");
+        for state in ["unavailable", "available"] {
+            shoes_test_support::isolated::run_isolated(NAME, CHILD, state);
+        }
         return;
     }
+    let available_after_change = std::env::var(CHILD).unwrap() == "available";
     use hickory_resolver::proto::{
         op::Message,
         rr::{RData, Record, rdata},
@@ -827,7 +859,7 @@ async fn repair_reload_restores_runtime_and_checks_underlay_before_publication()
                 let mut queued = tokio::net::TcpStream::connect(address).await.unwrap();
                 queued.write_all(&[5, 1, 0]).await.unwrap();
                 while reconciled.try_recv().is_ok() {}
-                events.send(Some(false)).await.unwrap();
+                events.send(Some(available_after_change)).await.unwrap();
                 ntp_reply(&ntp, packet, peer, 0).await;
                 reconciled.recv().await.unwrap();
                 events.send(None).await.unwrap();
@@ -842,7 +874,9 @@ async fn repair_reload_restores_runtime_and_checks_underlay_before_publication()
                 {
                     assert_eq!(n, 0, "unreconciled repair admitted a client");
                 }
-                events.send(Some(true)).await.unwrap();
+                if !available_after_change {
+                    events.send(Some(true)).await.unwrap();
+                }
                 let (len, peer) = dns.recv_from(&mut bytes).await.unwrap();
                 let mut reply = Message::from_vec(&bytes[..len]).unwrap().into_response();
                 reply.add_answer(Record::from_rdata(
