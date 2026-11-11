@@ -124,24 +124,24 @@ fn metric(route: &RouteMessage) -> u32 {
         .unwrap_or(0)
 }
 
-fn route_ip(route: &RouteMessage, source: bool) -> Option<IpAddr> {
-    attribute_ip(&route.attributes, source)
+fn preferred_source(route: &RouteMessage) -> Option<IpAddr> {
+    route
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::PrefSource(RouteAddress::Inet(ip)) => Some(IpAddr::V4(*ip)),
+            RouteAttribute::PrefSource(RouteAddress::Inet6(ip)) => Some(IpAddr::V6(*ip)),
+            _ => None,
+        })
 }
 
-fn attribute_ip(attributes: &[RouteAttribute], source: bool) -> Option<IpAddr> {
-    attributes.iter().find_map(|attribute| {
-        let address = match attribute {
-            RouteAttribute::PrefSource(address) if source => address,
-            RouteAttribute::Gateway(address) if !source => address,
-            RouteAttribute::Via(RouteVia::Inet(ip)) if !source => return Some((*ip).into()),
-            RouteAttribute::Via(RouteVia::Inet6(ip)) if !source => return Some((*ip).into()),
-            _ => return None,
-        };
-        match address {
-            RouteAddress::Inet(ip) => Some(IpAddr::V4(*ip)),
-            RouteAddress::Inet6(ip) => Some(IpAddr::V6(*ip)),
-            _ => None,
-        }
+fn route_gateway(attributes: &[RouteAttribute]) -> Option<IpAddr> {
+    attributes.iter().find_map(|attribute| match attribute {
+        RouteAttribute::Gateway(RouteAddress::Inet(ip))
+        | RouteAttribute::Via(RouteVia::Inet(ip)) => Some(IpAddr::V4(*ip)),
+        RouteAttribute::Gateway(RouteAddress::Inet6(ip))
+        | RouteAttribute::Via(RouteVia::Inet6(ip)) => Some(IpAddr::V6(*ip)),
+        _ => None,
     })
 }
 
@@ -161,11 +161,12 @@ fn matches_path(
     gateway: Option<IpAddr>,
     nh: Option<u32>,
 ) -> bool {
-    (route.attributes.contains(&RouteAttribute::Oif(index)) && route_ip(route, false) == gateway)
+    (route.attributes.contains(&RouteAttribute::Oif(index))
+        && route_gateway(&route.attributes) == gateway)
         || nh.is_some_and(|id| nexthop(route) == Some(id))
         || route.attributes.iter().any(|attribute| match attribute {
             RouteAttribute::MultiPath(hops) => hops.iter().any(|hop| {
-                hop.interface_index == index && attribute_ip(&hop.attributes, false) == gateway
+                hop.interface_index == index && route_gateway(&hop.attributes) == gateway
             }),
             _ => false,
         })
@@ -266,7 +267,7 @@ pub(super) async fn snapshot(handle: &Handle, owned_index: u32, mark: u32) -> io
         if index == owned_index || routes::table(&route) != 254 {
             continue;
         }
-        let gateway = route_ip(&route, false);
+        let gateway = route_gateway(&route.attributes);
         let nexthop = nexthop(&route);
         let Some(default) = defaults
             .iter()
@@ -305,8 +306,8 @@ pub(super) async fn snapshot(handle: &Handle, owned_index: u32, mark: u32) -> io
             index,
             name,
             gateway,
-            source: route_ip(&route, true),
-            preferred_source: route_ip(default, true),
+            source: preferred_source(&route),
+            preferred_source: preferred_source(default),
             nexthop,
             metric: metric(default),
             addresses,
@@ -318,6 +319,46 @@ pub(super) async fn snapshot(handle: &Handle, owned_index: u32, mark: u32) -> io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_addresses_use_the_first_supported_attribute_of_each_kind() {
+        for (source, gateway, via) in [
+            (
+                "192.0.2.1",
+                "192.0.2.2",
+                RouteVia::Inet("192.0.2.3".parse().unwrap()),
+            ),
+            (
+                "2001:db8::1",
+                "2001:db8::2",
+                RouteVia::Inet6("2001:db8::3".parse().unwrap()),
+            ),
+        ] {
+            let source: IpAddr = source.parse().unwrap();
+            let gateway: IpAddr = gateway.parse().unwrap();
+            let via_ip = match via {
+                RouteVia::Inet(ip) => IpAddr::V4(ip),
+                RouteVia::Inet6(ip) => IpAddr::V6(ip),
+                _ => unreachable!(),
+            };
+            let mut route = RouteMessage::default();
+            assert_eq!(preferred_source(&route), None);
+            assert_eq!(route_gateway(&route.attributes), None);
+            route.attributes = vec![
+                RouteAttribute::PrefSource(RouteAddress::Other(vec![])),
+                RouteAttribute::Gateway(RouteAddress::Other(vec![])),
+                RouteAttribute::PrefSource(source.into()),
+                RouteAttribute::Gateway(gateway.into()),
+                RouteAttribute::Via(via),
+                RouteAttribute::PrefSource(gateway.into()),
+            ];
+            assert_eq!(preferred_source(&route), Some(source));
+            assert_eq!(route_gateway(&route.attributes), Some(gateway));
+            route.attributes.reverse();
+            assert_eq!(preferred_source(&route), Some(gateway));
+            assert_eq!(route_gateway(&route.attributes), Some(via_ip));
+        }
+    }
 
     fn sample(ipv6: bool) -> Snapshot {
         let mut snapshot = Snapshot::default();
