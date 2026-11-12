@@ -85,6 +85,29 @@ fn protocol() -> Protocol {
 }
 
 #[tokio::test]
+async fn network_reset_cancels_warmed_pool_and_retained_connection_handles() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let network = crate::network_tasks::NetworkLifetime::default();
+        let (server, dialer) = network.scope(async { endpoints() }).await;
+        let pool = Pool::default();
+        let protocol = protocol();
+        let (session, peer) =
+            tokio::join!(network.scope(pool.get(dialer, &protocol, true)), async {
+                server.accept().await.unwrap().await.unwrap()
+            },);
+        let session = session.unwrap();
+        let mut auth = peer.accept_uni().await.unwrap();
+        assert_eq!(auth.read_to_end(50).await.unwrap().len(), 50);
+        network.cancel();
+        network.wait().await;
+        session.connection().closed().await;
+        assert!(session.connection().open_bi().await.is_err());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn exhausted_udp_ids_replace_the_connection_without_migrating_live_associations() {
     use crate::tcp::proxy_connector::ProxyConnector;
     tokio::time::timeout(Duration::from_secs(5), async {

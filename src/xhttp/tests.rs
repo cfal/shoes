@@ -11,6 +11,53 @@ use crate::{
 };
 
 #[tokio::test]
+async fn network_reset_retires_h2_and_h3_request_workers() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        for version in ["h2", "h3"] {
+            let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = reservation.local_addr().unwrap();
+            let protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version,
+                "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
+            let mut client_protocol = protocol.clone();
+            client_protocol["mode"] = json!("stream-one");
+            let (server, client) = if version == "h3" {
+                (json!({"address":address.to_string(), "transport":"quic",
+                    "quic_settings":{"cert":certificate.cert.pem(),"key":certificate.signing_key.serialize_pem()}, "protocol":protocol}),
+                 json!({"address":address.to_string(), "transport":"quic",
+                    "quic_settings":{"verify":false,"sni_hostname":"localhost"},"protocol":client_protocol}))
+            } else {
+                (json!({"address":address.to_string(), "protocol":protocol}),
+                 json!({"address":address.to_string(), "protocol":client_protocol}))
+            };
+            let server = crate::config::create_server_configs(serde_json::from_value(json!([server])).unwrap()).unwrap().configs.remove(0);
+            let network = crate::network_tasks::NetworkLifetime::default();
+            drop(reservation);
+            let handles = network.scope(crate::tcp::tcp_server::start_servers(server, resolver.clone())).await.unwrap();
+            let config: crate::config::ResolvedClientConfig = crate::config::test_support::from_json(client).unwrap();
+            let socket = SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
+            let proxy = ProxyConnectorImpl::from_config(config, resolver.clone()).unwrap().unwrap();
+            let chain = ClientProxyChain::new(vec![InitialHopEntry::Proxy {
+                socket: Arc::new(socket), proxy: Box::new(proxy),
+            }], vec![]);
+            let destination = crate::address::NetLocation::from_str(&target.local_addr().unwrap().to_string(), None).unwrap();
+            let mut stream = chain.connect_tcp(destination.into(), &resolver).await.unwrap().client_stream;
+            stream.write_all(b"x").await.unwrap();
+            stream.flush().await.unwrap();
+            let (mut accepted, _) = target.accept().await.unwrap();
+            assert_eq!(accepted.read_u8().await.unwrap(), b'x');
+            network.cancel();
+            network.wait().await;
+            let result = accepted.read(&mut [0]).await;
+            assert!(matches!(result, Ok(0)) || result.is_err(), "{result:?}");
+            for handle in handles { let _ = handle.await; }
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());

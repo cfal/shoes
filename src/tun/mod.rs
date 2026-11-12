@@ -189,7 +189,7 @@ async fn run_tun_server_inner(
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
 
-        tasks.spawn(async move {
+        crate::network_tasks::spawn_in(&mut tasks, async move {
             info!("Starting TCP connection handler");
             let mut connections = JoinSet::new();
             loop {
@@ -203,7 +203,7 @@ async fn run_tun_server_inner(
                 let proxy_selector = proxy_selector.clone();
                 let resolver = resolver.clone();
 
-                connections.spawn(async move {
+                crate::network_tasks::spawn_in(&mut connections, async move {
                     let remote_addr = new_conn.remote_addr;
                     let target = socket_addr_to_net_location(remote_addr);
 
@@ -233,7 +233,7 @@ async fn run_tun_server_inner(
         let limits = config.resource_limits.clone();
         let wake = tcp_stack.wake_handle();
 
-        tasks.spawn(async move {
+        crate::network_tasks::spawn_in(&mut tasks, async move {
             handle_udp_packets(
                 udp_from_stack_rx,
                 udp_to_stack_tx,
@@ -417,7 +417,7 @@ async fn start_tun(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
 
-    let handle = tokio::spawn(async move {
+    let handle = crate::network_tasks::spawn(async move {
         let _keep_alive = shutdown_tx;
         let mut ready = Some(ready_tx);
         let result = run_tun_from_config_inner(

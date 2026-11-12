@@ -6,6 +6,258 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
+fn request_budget_keeps_minimum_attempts_and_saturates() {
+    let mut raw = exchange("127.0.0.1:53".parse().unwrap(), false);
+    raw.context.options.timeout = Duration::from_secs(5);
+    for (attempts, multiplier) in [(0, 2), (1, 2), (2, 3), (usize::MAX, u32::MAX)] {
+        raw.context.options.attempts = attempts;
+        assert_eq!(raw.request_timeout(), Duration::from_secs(5) * multiplier);
+    }
+    raw.context.options.timeout = Duration::MAX;
+    assert_eq!(raw.request_timeout(), Duration::MAX);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unrepresentable_request_budget_respects_caller_deadline() {
+    let mut raw = exchange("127.0.0.1:53".parse().unwrap(), false);
+    raw.context.options.timeout = Duration::from_secs(u64::from(u32::MAX));
+    raw.context.options.attempts = u32::MAX as usize;
+    assert!(
+        tokio::time::Instant::now()
+            .checked_add(raw.request_timeout())
+            .is_none()
+    );
+    let _permits = raw.admission.acquire_many(64).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+    let error = raw
+        .exchange_with_deadline(request().to_vec().unwrap(), deadline)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    assert_eq!(
+        raw.exchange(request().to_vec().unwrap())
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[tokio::test]
+async fn failed_detached_setup_is_replaced_before_next_exchange() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::ConnectionRefused] {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let raw = exchange(socket.local_addr().unwrap(), false);
+            let _peer = udp_responder(socket, Arc::new(AtomicBool::new(true)));
+            let (fail, failed) = tokio::sync::oneshot::channel();
+            let (finished, done) = tokio::sync::oneshot::channel();
+            let setup = connection_setup(
+                async move {
+                    failed.await.unwrap();
+                    finished.send(()).unwrap();
+                    Err(NetError::Io(Arc::new(io::Error::new(
+                        kind,
+                        "detached setup failed",
+                    ))))
+                }
+                .boxed(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            );
+            *raw.upstreams[0].connection.lock() = Some(setup.clone());
+            let error = raw
+                .exchange_with_deadline(
+                    request().to_vec().unwrap(),
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                )
+                .await
+                .unwrap_err();
+            assert!(crate::resolver::dns_setup_pending(&error));
+            fail.send(()).unwrap();
+            done.await.unwrap();
+            // The detached task finished, but no waiter has polled its Shared result.
+            assert!(setup.peek().is_none());
+            raw.exchange(request().to_vec().unwrap()).await.unwrap();
+            assert!(
+                !raw.upstreams[0]
+                    .connection
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .ptr_eq(&setup)
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+fn udp_responder(
+    socket: tokio::net::UdpSocket,
+    reply: Arc<AtomicBool>,
+) -> tokio_util::task::AbortOnDropHandle<()> {
+    tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        loop {
+            let (len, client) = socket.recv_from(&mut buffer).await.unwrap();
+            if reply.load(Ordering::Relaxed) {
+                let answer = Message::from_vec(&buffer[..len]).unwrap().into_response();
+                socket
+                    .send_to(&answer.to_vec().unwrap(), client)
+                    .await
+                    .unwrap();
+            }
+        }
+    }))
+}
+
+#[test]
+fn net_error_preserves_typed_admission_cause() {
+    let error = net_error(NetError::Io(Arc::new(crate::resources::exhausted())));
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    assert!(crate::resources::is_exhausted(&error));
+    assert!(!crate::resolver::RefreshingResolver::should_refresh_for_error(&error));
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_and_caller_deadlines_keep_distinct_ready_answer_tie_breaks() {
+    for owned in [false, true] {
+        let timeout = ExchangeTimeout::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut query = Box::pin(timeout.run(deadline, owned, async {
+            receive.await.map_err(io::Error::other)
+        }));
+        assert!(futures::poll!(&mut query).is_pending());
+        send.send(42).unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = query.await;
+        if owned {
+            assert_eq!(result.unwrap(), 42);
+        } else {
+            assert!(crate::resolver::dns_caller_deadline(&result.unwrap_err()));
+        }
+        assert_eq!(timeout.expired.load(Ordering::Relaxed), !owned);
+        assert!(!timeout.retired.load(Ordering::Relaxed));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_deadline_is_not_a_transport_failure() {
+    let raw = exchange("127.0.0.1:1".parse().unwrap(), true);
+    let _permits = raw.admission.acquire_many(64).await.unwrap();
+    let error = raw.exchange(request().to_vec().unwrap()).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(!crate::resolver::RefreshingResolver::should_refresh_for_error(&error));
+    assert!(raw.upstreams[0].connection.lock().is_none());
+}
+
+#[tokio::test]
+async fn late_admission_and_delayed_cancellation_do_not_retire_established_transport() {
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let address = ([127, 0, 0, 1], socket.local_addr().unwrap().port()).into();
+    let mut raw = exchange(address, false);
+    raw.context.options.timeout = Duration::from_millis(100);
+    let reply = Arc::new(AtomicBool::new(true));
+    let peer = udp_responder(socket, reply.clone());
+    raw.exchange(request().to_vec().unwrap()).await.unwrap();
+    let original = raw.upstreams[0].connection.lock().as_ref().unwrap().clone();
+    reply.store(false, Ordering::Relaxed);
+    let permits = raw.admission.acquire_many(64).await.unwrap();
+    let mut query = Box::pin(raw.exchange(request().to_vec().unwrap()));
+    assert!(futures::poll!(&mut query).is_pending());
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    drop(permits);
+    assert!(crate::resolver::dns_caller_deadline(
+        &query.await.unwrap_err()
+    ));
+    assert!(
+        raw.upstreams[0]
+            .connection
+            .lock()
+            .as_ref()
+            .unwrap()
+            .ptr_eq(&original)
+    );
+
+    for poll_late in [false, true] {
+        let mut query = Box::pin(raw.exchange_with_deadline(
+            request().to_vec().unwrap(),
+            tokio::time::Instant::now() + Duration::from_millis(5),
+        ));
+        assert!(futures::poll!(&mut query).is_pending());
+        // A delayed caller can abandon the future after both deadlines have elapsed.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        if poll_late {
+            assert!(crate::resolver::dns_caller_deadline(
+                &query.await.unwrap_err()
+            ));
+        } else {
+            drop(query);
+        }
+        assert!(
+            raw.upstreams[0]
+                .connection
+                .lock()
+                .as_ref()
+                .unwrap()
+                .ptr_eq(&original)
+        );
+    }
+    reply.store(true, Ordering::Relaxed);
+    raw.exchange(request().to_vec().unwrap()).await.unwrap();
+    drop(peer);
+}
+
+#[tokio::test]
+async fn earlier_attempt_retirement_does_not_own_a_later_caller_deadline() {
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let address = ([127, 0, 0, 1], socket.local_addr().unwrap().port()).into();
+    let mut raw = exchange(address, false);
+    // The cached sender's longer timeout makes the first raw slot own its expiry.
+    raw.context.options.timeout = Duration::from_secs(1);
+    raw.context.options.attempts = 2;
+    let reply = Arc::new(AtomicBool::new(true));
+    let _peer = udp_responder(socket, reply.clone());
+    raw.exchange(request().to_vec().unwrap()).await.unwrap();
+    let original = raw.upstreams[0].connection.lock().as_ref().unwrap().clone();
+    raw.context.options.timeout = Duration::from_millis(100);
+    reply.store(false, Ordering::Relaxed);
+    let error = raw
+        .exchange_with_deadline(
+            request().to_vec().unwrap(),
+            tokio::time::Instant::now() + Duration::from_millis(150),
+        )
+        .await
+        .unwrap_err();
+    assert!(crate::resolver::dns_caller_deadline(&error), "{error:?}");
+    let replacement = raw.upstreams[0].connection.lock().as_ref().unwrap().clone();
+    assert!(!replacement.ptr_eq(&original));
+    reply.store(true, Ordering::Relaxed);
+    raw.exchange(request().to_vec().unwrap()).await.unwrap();
+    assert!(
+        raw.upstreams[0]
+            .connection
+            .lock()
+            .as_ref()
+            .unwrap()
+            .ptr_eq(&replacement)
+    );
+    reply.store(false, Ordering::Relaxed);
+    let mut late = Box::pin(raw.exchange_with_deadline(
+        request().to_vec().unwrap(),
+        tokio::time::Instant::now() + Duration::from_millis(150),
+    ));
+    assert!(futures::poll!(&mut late).is_pending());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let error = late.await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(!crate::resolver::dns_caller_deadline(&error));
+    assert!(raw.upstreams[0].connection.lock().is_none());
+}
+
+#[test]
 fn endpoint_pairing_requires_equal_ip_port_and_bind_address() {
     let upstream = |ip, config| Upstream {
         server_index: 0,
@@ -354,7 +606,7 @@ async fn separately_configured_tcp_remains_a_primary_when_udp_is_silent() {
         let mut options = ResolverOpts::default();
         options.timeout = Duration::from_millis(100);
         options.attempts = 1;
-        let raw = RawDnsExchange::new(servers, exchange(address, false).provider, options);
+        let raw = RawDnsExchange::new(servers, exchange(address, false).provider.clone(), options);
         if system_pair {
             assert_eq!(
                 raw.exchange(request().to_vec().unwrap())
@@ -476,12 +728,12 @@ async fn slow_connection_setup_survives_refreshing_resolver_timeout() {
 }
 
 #[tokio::test]
-async fn concurrent_query_completing_setup_preserves_canceled_wait_retry() {
+async fn concurrent_query_completing_setup_preserves_canceled_wait_for_next_query() {
     assert_slow_setup_survives(true, false).await;
 }
 
 #[tokio::test]
-async fn later_bind_failure_preserves_canceled_setup_retry() {
+async fn later_bind_failure_preserves_retained_setup_for_next_query() {
     assert_slow_setup_survives(false, true).await;
 }
 
@@ -512,7 +764,7 @@ async fn assert_slow_setup_survives(concurrent: bool, fail_last: bool) {
         .provider
         .new_connection(address.ip(), &raw.upstreams[0].config, &raw.context)
         .unwrap();
-    *raw.upstreams[0].connection.lock().await = Some(connection_setup(
+    *raw.upstreams[0].connection.lock() = Some(connection_setup(
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
             future.await
@@ -535,7 +787,7 @@ async fn assert_slow_setup_survives(concurrent: bool, fail_last: bool) {
     }
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        for _ in 0..3 + usize::from(concurrent) {
+        for _ in 0..2 + usize::from(concurrent) {
             let answer = read_tcp(&mut stream).await.into_response();
             write_tcp(&mut stream, answer).await;
         }
@@ -554,14 +806,19 @@ async fn assert_slow_setup_survives(concurrent: bool, fail_last: bool) {
         factory,
         RefreshPolicy {
             max_idle: Duration::from_secs(60),
-            retry_once_after_refresh: true,
         },
         "slow multi-upstream setup".into(),
     )
     .await
     .unwrap();
     let requests = async {
-        for _ in 0..3 {
+        let error = resolver
+            .exchange(request().to_vec().unwrap())
+            .await
+            .unwrap_err();
+        assert!(crate::resolver::dns_setup_pending(&error), "{error:?}");
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        for _ in 0..2 {
             resolver
                 .exchange(request().to_vec().unwrap())
                 .await
@@ -601,6 +858,45 @@ async fn dropping_connection_cache_cancels_pending_setup() {
     drop(setup);
     tokio::task::yield_now().await;
     assert_eq!(Arc::strong_count(&marker), 1);
+}
+
+#[tokio::test]
+async fn slow_setup_does_not_consume_the_established_attempt_or_skip_the_next_one() {
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let address = ([127, 0, 0, 1], socket.local_addr().unwrap().port()).into();
+    let mut raw = exchange(address, false);
+    raw.context.options.timeout = Duration::from_millis(100);
+    raw.context.options.attempts = 2;
+    let upstream = &raw.upstreams[0];
+    let setup = raw
+        .provider
+        .new_connection(upstream.ip, &upstream.config, &raw.context)
+        .unwrap();
+    *upstream.connection.lock() = Some(connection_setup(
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            setup.await
+        }),
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    ));
+    let server = tokio::spawn(async move {
+        let mut bytes = [0; 4096];
+        socket.recv_from(&mut bytes).await.unwrap();
+        let (len, peer) = socket.recv_from(&mut bytes).await.unwrap();
+        let answer = Message::from_vec(&bytes[..len]).unwrap().into_response();
+        socket
+            .send_to(&answer.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        raw.exchange(request().to_vec().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -743,7 +1039,9 @@ async fn truncated_udp_survives_failed_or_timed_out_tcp_fallback() {
                 }
                 assert!(
                     start.elapsed()
-                        < Duration::from_millis(if caller_deadline { 250 } else { 600 })
+                        < Duration::from_millis(if caller_deadline { 250 } else { 600 }),
+                    "silent={silent} caller_deadline={caller_deadline} synthetic={synthetic} elapsed={:?}",
+                    start.elapsed()
                 );
                 server.abort();
                 let _ = server.await;

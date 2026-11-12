@@ -162,7 +162,7 @@ pub(super) struct TcpDnsStream {
 impl TcpDnsStream {
     pub fn new(context: Arc<DnsContext>) -> Self {
         let (stream, mut peer) = tokio::io::duplex(16 * 1024);
-        let task = tokio::spawn(async move {
+        let task = crate::network_tasks::spawn(async move {
             let _ = serve_tcp(&mut peer, context).await;
         });
         Self { stream, task }

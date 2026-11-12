@@ -42,8 +42,10 @@ impl CompositeResolver {
             let mut truncated = None;
             for resolver in resolvers {
                 if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                    last =
-                        std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS exchange timed out");
+                    last = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        crate::resolver::DnsCallerDeadline,
+                    );
                     break;
                 }
                 let exchange = match deadline {
@@ -90,6 +92,22 @@ impl CompositeResolver {
 }
 
 impl Resolver for CompositeResolver {
+    fn request_timeout(&self) -> Option<std::time::Duration> {
+        self.resolvers
+            .iter()
+            .try_fold(std::time::Duration::ZERO, |total, resolver| {
+                resolver
+                    .request_timeout()
+                    .map(|timeout| total.saturating_add(timeout))
+            })
+    }
+
+    fn retire(&self) {
+        for resolver in &self.resolvers {
+            resolver.retire();
+        }
+    }
+
     fn exchange(&self, request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
         self.exchange_inner(request, None)
     }
@@ -205,7 +223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_exchange_failure_preserves_retained_setup_retry() {
+    async fn later_exchange_failure_preserves_retained_setup_classification() {
         #[derive(Debug)]
         struct PendingSetup;
         impl Resolver for PendingSetup {

@@ -7,6 +7,25 @@ use crate::tcp::socket_connector::SocketConnector;
 use async_trait::async_trait;
 
 #[tokio::test]
+async fn dns_spawn_preserves_background_probe_context() {
+    for background in [false, true] {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let spawn = async move {
+            TokioSpawnHandle::default().spawn_bg(async move {
+                send.send(crate::control::url_test::is_background())
+                    .unwrap();
+            });
+        };
+        if background {
+            crate::control::url_test::BACKGROUND.scope((), spawn).await;
+        } else {
+            spawn.await;
+        }
+        assert_eq!(receive.await.unwrap(), background);
+    }
+}
+
+#[tokio::test]
 async fn downstream_dns_proxy_names_remain_remote_for_forwarding() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -122,7 +141,7 @@ fn test_provider_is_clone() {
 
 #[test]
 fn test_spawn_handle_is_clone() {
-    let handle = TokioSpawnHandle;
+    let handle = TokioSpawnHandle::default();
     let _cloned = handle.clone();
 }
 
@@ -333,6 +352,7 @@ async fn quic_binder_reserves_shared_memory_until_last_socket_drop() {
         return;
     }
     let binder = ProxyQuicBinder {
+        retirement: tokio_util::sync::CancellationToken::new(),
         chain_group: Arc::new(build_direct_chain_group(Arc::new(NativeResolver::new()))),
         memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
         socket_buffer: crate::resources::limits().quic_socket_buffer,

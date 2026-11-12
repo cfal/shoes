@@ -94,7 +94,7 @@ fn test_location() -> NetLocation {
 }
 
 #[tokio::test]
-async fn exchange_propagates_timeout_and_refreshes_once() {
+async fn exchange_returns_original_error_and_rebuilds_on_next_query() {
     let calls = Arc::new(AtomicUsize::new(0));
     let builds = calls.clone();
     let factory: ResolverFactory = Arc::new(move || {
@@ -112,13 +112,16 @@ async fn exchange_propagates_timeout_and_refreshes_once() {
         factory,
         RefreshPolicy {
             max_idle: Duration::from_secs(60),
-            retry_once_after_refresh: true,
         },
         "exchange".into(),
     )
     .await
     .unwrap();
     let resolver = TimeoutResolver::with_timeout(resolver, Duration::from_secs(1));
+    let error = resolver.exchange(vec![0]).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(error.to_string(), "mock exchange error");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert_eq!(resolver.exchange(vec![1, 2]).await.unwrap(), vec![1, 2]);
     assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
     assert_eq!(calls.load(Ordering::Relaxed), 2);
@@ -187,7 +190,6 @@ async fn exchange_deadline_completion_is_not_raced_by_a_refresh_timer() {
             factory,
             RefreshPolicy {
                 max_idle: Duration::from_secs(60),
-                retry_once_after_refresh: true,
             },
             "deadline completion".into(),
         )
@@ -228,12 +230,16 @@ async fn exchange_deadline_also_bounds_refresh_factory_and_lock_waits() {
             factory,
             RefreshPolicy {
                 max_idle: Duration::from_secs(60),
-                retry_once_after_refresh: true,
             },
             "deadline".into(),
         )
         .await
         .unwrap();
+        assert_eq!(
+            resolver.exchange(vec![]).await.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
         let _guard = if hold_lock {
             Some(resolver.refresh_lock.lock().await)
         } else {
@@ -246,10 +252,12 @@ async fn exchange_deadline_also_bounds_refresh_factory_and_lock_waits() {
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert!(dns_caller_deadline(&error));
         assert_eq!(
             builds.load(Ordering::Relaxed),
             if hold_lock { 1 } else { 2 }
         );
+        assert!(resolver.refresh_state.lock().invalidated);
     }
 }
 
@@ -258,7 +266,7 @@ fn test_addrs() -> Vec<SocketAddr> {
 }
 
 #[tokio::test]
-async fn failed_setup_retry_refreshes_only_for_future_requests() {
+async fn retained_setup_is_reused_until_a_confirmed_transport_failure() {
     #[derive(Debug)]
     struct SetupFailureResolver {
         calls: AtomicUsize,
@@ -276,7 +284,7 @@ async fn failed_setup_retry_refreshes_only_for_future_requests() {
                 if call > 0
                     && let Some(kind) = second_error
                 {
-                    return Err(std::io::Error::new(kind, "retry failure"));
+                    return Err(std::io::Error::new(kind, "setup outcome"));
                 }
                 Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -290,7 +298,7 @@ async fn failed_setup_retry_refreshes_only_for_future_requests() {
         (None, false),
         (Some(std::io::ErrorKind::TimedOut), false),
         (Some(std::io::ErrorKind::InvalidData), false),
-        (None, true),
+        (Some(std::io::ErrorKind::TimedOut), true),
     ] {
         let initial = Arc::new(SetupFailureResolver {
             calls: AtomicUsize::new(0),
@@ -318,26 +326,42 @@ async fn failed_setup_retry_refreshes_only_for_future_requests() {
             factory,
             RefreshPolicy {
                 max_idle: Duration::from_secs(60),
-                retry_once_after_refresh: true,
             },
             "failed retained setup".into(),
         )
         .await
         .unwrap();
         let error = resolver.exchange(vec![]).await.unwrap_err();
-        assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
+        assert!(dns_setup_pending(&error));
+        assert_eq!(initial.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert!(!resolver.refresh_state.lock().invalidated);
         assert!(resolver.refresh_state.lock().last_activity_at.is_none());
+
+        let error = resolver.exchange(vec![]).await.unwrap_err();
+        assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
         assert_eq!(dns_setup_pending(&error), second_error.is_none());
         assert_eq!(
             error.kind(),
             second_error.unwrap_or(std::io::ErrorKind::TimedOut)
         );
-        let refreshable = RefreshingResolver::should_refresh_for_error(&error);
-        assert_eq!(builds.load(Ordering::Relaxed), 1 + usize::from(refreshable));
-        if refreshable && !factory_fails {
-            assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
+        let refreshable =
+            RefreshingResolver::should_refresh_for_error(&error) && !dns_setup_pending(&error);
+        assert_eq!(resolver.refresh_state.lock().invalidated, refreshable);
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        if refreshable {
+            if factory_fails {
+                for expected_builds in 2..=3 {
+                    let error = resolver.exchange(vec![3]).await.unwrap_err();
+                    assert_eq!(error.to_string(), "factory failed");
+                    assert!(resolver.refresh_state.lock().invalidated);
+                    assert_eq!(builds.load(Ordering::Relaxed), expected_builds);
+                }
+            } else {
+                assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
+                assert_eq!(builds.load(Ordering::Relaxed), 2);
+            }
             assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
-            assert_eq!(builds.load(Ordering::Relaxed), 2);
         }
     }
 }
@@ -347,41 +371,34 @@ fn unique_location(index: usize) -> NetLocation {
 }
 
 #[tokio::test]
-async fn concurrent_setup_retries_do_not_attempt_again_after_generation_changes() {
-    #[derive(Debug, Default)]
-    struct SetupFailureResolver(AtomicUsize);
-    impl Resolver for SetupFailureResolver {
+async fn each_failed_generation_is_retired_without_eager_reconstruction() {
+    #[derive(Debug)]
+    struct Failed(Arc<AtomicUsize>);
+    impl Resolver for Failed {
         fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
             unreachable!()
         }
-
         fn exchange(&self, _: Vec<u8>) -> DnsExchangeFuture {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    DnsSetupPending,
-                ))
-            })
+            Box::pin(async { Err(std::io::ErrorKind::BrokenPipe.into()) })
+        }
+        fn retire(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
-    let initial = Arc::new(SetupFailureResolver::default());
-    let fresh = Arc::new(MockResolver::with_addrs(vec![]));
     let builds = Arc::new(AtomicUsize::new(0));
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let retirements = Arc::new(AtomicUsize::new(0));
     let factory: ResolverFactory = {
-        let (initial, fresh, builds, gate) =
-            (initial.clone(), fresh.clone(), builds.clone(), gate.clone());
+        let builds = builds.clone();
+        let retirements = retirements.clone();
         Arc::new(move || {
-            let generation = builds.fetch_add(1, Ordering::Relaxed);
-            let (initial, fresh, gate) = (initial.clone(), fresh.clone(), gate.clone());
+            let generation = builds.fetch_add(1, Ordering::SeqCst);
+            let retirements = retirements.clone();
             Box::pin(async move {
-                if generation == 0 {
-                    Ok(initial as Arc<dyn Resolver>)
+                Ok(if generation < 2 {
+                    Arc::new(Failed(retirements)) as Arc<dyn Resolver>
                 } else {
-                    let _permit = gate.acquire().await.unwrap();
-                    Ok(fresh as Arc<dyn Resolver>)
-                }
+                    Arc::new(MockResolver::with_addrs(vec![]))
+                })
             })
         })
     };
@@ -389,24 +406,369 @@ async fn concurrent_setup_retries_do_not_attempt_again_after_generation_changes(
         factory,
         RefreshPolicy {
             max_idle: Duration::from_secs(60),
-            retry_once_after_refresh: true,
         },
-        "concurrent retained setup retries".into(),
+        "final failure".into(),
     )
     .await
     .unwrap();
-    let mut first = resolver.exchange(vec![]);
-    let mut second = resolver.exchange(vec![]);
-    assert!(futures::poll!(&mut first).is_pending());
-    assert!(futures::poll!(&mut second).is_pending());
-    assert_eq!(initial.0.load(Ordering::Relaxed), 4);
-    assert_eq!(builds.load(Ordering::Relaxed), 2);
-    gate.add_permits(1);
-    assert!(dns_setup_pending(&first.await.unwrap_err()));
-    assert!(dns_setup_pending(&second.await.unwrap_err()));
-    assert_eq!(initial.0.load(Ordering::Relaxed), 4);
-    assert_eq!(fresh.call_count.load(Ordering::Relaxed), 0);
-    assert_eq!(builds.load(Ordering::Relaxed), 2);
+    for expected in 1..=2 {
+        assert_eq!(
+            resolver.exchange(vec![]).await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), expected);
+        assert_eq!(retirements.load(Ordering::SeqCst), expected);
+    }
+    assert_eq!(resolver.exchange(vec![1]).await.unwrap(), vec![1]);
+    assert_eq!(builds.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn concurrent_and_late_failures_only_retire_the_generation_they_used() {
+    #[derive(Debug)]
+    struct Gated {
+        gates: Vec<Arc<tokio::sync::Semaphore>>,
+        retired: Arc<AtomicUsize>,
+    }
+    impl Resolver for Gated {
+        fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+            unreachable!()
+        }
+        fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+            let gate = self.gates[request[0] as usize].clone();
+            Box::pin(async move {
+                gate.acquire().await.unwrap().forget();
+                if request[0] == 2 {
+                    Ok(request)
+                } else {
+                    Err(std::io::ErrorKind::ConnectionReset.into())
+                }
+            })
+        }
+        fn retire(&self) {
+            self.retired.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let gates: Vec<_> = (0..3)
+        .map(|_| Arc::new(tokio::sync::Semaphore::new(0)))
+        .collect();
+    let retired = Arc::new(AtomicUsize::new(0));
+    let initial: Arc<dyn Resolver> = Arc::new(Gated {
+        gates: gates.clone(),
+        retired: retired.clone(),
+    });
+    let builds = Arc::new(AtomicUsize::new(0));
+    let factory: ResolverFactory = {
+        let builds = builds.clone();
+        Arc::new(move || {
+            let generation = builds.fetch_add(1, Ordering::SeqCst);
+            let initial = initial.clone();
+            Box::pin(async move {
+                Ok(if generation == 0 {
+                    initial
+                } else {
+                    Arc::new(MockResolver::with_addrs(vec![]))
+                })
+            })
+        })
+    };
+    let resolver = RefreshingResolver::new(
+        factory,
+        RefreshPolicy {
+            max_idle: Duration::from_secs(60),
+        },
+        "concurrent failures".into(),
+    )
+    .await
+    .unwrap();
+    let mut calls: Vec<_> = (0..16).map(|_| resolver.exchange(vec![0])).collect();
+    for call in &mut calls {
+        assert!(futures::poll!(call).is_pending());
+    }
+    let mut late_error = resolver.exchange(vec![1]);
+    let mut late_success = resolver.exchange(vec![2]);
+    assert!(futures::poll!(&mut late_error).is_pending());
+    assert!(futures::poll!(&mut late_success).is_pending());
+    gates[0].add_permits(16);
+    for call in calls {
+        assert_eq!(
+            call.await.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+    }
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
+    resolver.refresh_state.lock().last_activity_at = None;
+    gates[2].add_permits(1);
+    assert_eq!(late_success.await.unwrap(), vec![2]);
+    assert!(resolver.refresh_state.lock().last_activity_at.is_none());
+    gates[1].add_permits(1);
+    assert_eq!(
+        late_error.await.unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionReset
+    );
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
+    assert!(!resolver.refresh_state.lock().invalidated);
+}
+
+#[tokio::test(start_paused = true)]
+async fn logical_deadline_never_promotes_a_clipped_leaf_to_transport_failure() {
+    #[derive(Debug)]
+    struct Clipped {
+        fail: bool,
+        retired: Arc<AtomicUsize>,
+    }
+    impl Resolver for Clipped {
+        fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+            unreachable!()
+        }
+        fn request_timeout(&self) -> Option<Duration> {
+            Some(Duration::from_millis(200))
+        }
+        fn retire(&self) {
+            self.retired.fetch_add(1, Ordering::SeqCst);
+        }
+        fn exchange_with_deadline(
+            &self,
+            _: Vec<u8>,
+            deadline: tokio::time::Instant,
+        ) -> DnsExchangeFuture {
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                } else {
+                    tokio::time::sleep_until(deadline).await;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        DnsCallerDeadline,
+                    ))
+                }
+            })
+        }
+    }
+    for fail in [false, true] {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let factory: ResolverFactory = {
+            let builds = builds.clone();
+            let retired = retired.clone();
+            Arc::new(move || {
+                let generation = builds.fetch_add(1, Ordering::SeqCst);
+                let retired = retired.clone();
+                Box::pin(async move {
+                    if generation != 0 {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                    }
+                    Ok(Arc::new(Clipped {
+                        fail: fail && generation == 0,
+                        retired,
+                    }) as Arc<dyn Resolver>)
+                })
+            })
+        };
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+            },
+            "clipped request".into(),
+        )
+        .await
+        .unwrap();
+        if fail {
+            assert_eq!(
+                resolver.exchange(vec![]).await.unwrap_err().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(builds.load(Ordering::SeqCst), 1);
+        }
+        let started = tokio::time::Instant::now();
+        assert!(dns_caller_deadline(
+            &resolver.exchange(vec![]).await.unwrap_err()
+        ));
+        assert_eq!(started.elapsed(), Duration::from_millis(200));
+        assert_eq!(builds.load(Ordering::SeqCst), 1 + usize::from(fail));
+        assert_eq!(retired.load(Ordering::SeqCst), usize::from(fail));
+        assert!(!resolver.refresh_state.lock().invalidated);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn clipped_lookup_does_not_retire_a_healthy_replacement() {
+    #[derive(Debug)]
+    struct SlowLookup {
+        fail: bool,
+        retired: Arc<AtomicUsize>,
+    }
+    impl Resolver for SlowLookup {
+        fn request_timeout(&self) -> Option<Duration> {
+            Some(Duration::from_millis(200))
+        }
+        fn retire(&self) {
+            self.retired.fetch_add(1, Ordering::SeqCst);
+        }
+        fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+            let fail = self.fail;
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(if fail { 100 } else { 60 })).await;
+                if fail {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(vec!["192.0.2.1:80".parse().unwrap()])
+                }
+            })
+        }
+    }
+    let builds = Arc::new(AtomicUsize::new(0));
+    let retired = Arc::new(AtomicUsize::new(0));
+    let factory: ResolverFactory = {
+        let builds = builds.clone();
+        let retired = retired.clone();
+        Arc::new(move || {
+            let generation = builds.fetch_add(1, Ordering::SeqCst);
+            let retired = retired.clone();
+            Box::pin(async move {
+                if generation != 0 {
+                    tokio::time::sleep(Duration::from_millis(160)).await;
+                }
+                Ok(Arc::new(SlowLookup {
+                    fail: generation == 0,
+                    retired,
+                }) as Arc<dyn Resolver>)
+            })
+        })
+    };
+    let resolver = RefreshingResolver::new(
+        factory,
+        RefreshPolicy {
+            max_idle: Duration::from_secs(60),
+        },
+        "clipped lookup".into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resolver
+            .resolve_location(&test_location())
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    let mut clipped = resolver.resolve_location(&test_location());
+    assert!(futures::poll!(&mut clipped).is_pending());
+    tokio::time::advance(Duration::from_millis(160)).await;
+    assert!(futures::poll!(&mut clipped).is_pending());
+    let healthy = resolver.resolve_location(&test_location());
+    let (clipped, healthy) = tokio::join!(clipped, healthy);
+    assert!(dns_caller_deadline(&clipped.unwrap_err()));
+    assert_eq!(
+        healthy.unwrap(),
+        vec!["192.0.2.1:80".parse::<SocketAddr>().unwrap()]
+    );
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
+    assert!(!resolver.refresh_state.lock().invalidated);
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_wait_prioritizes_expired_deadlines_but_preserves_inner_errors() {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let mut wait = Box::pin(RefreshingResolver::refresh_wait(Some(deadline), receive));
+    assert!(futures::poll!(&mut wait).is_pending());
+    send.send(42).unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(dns_caller_deadline(&wait.await.unwrap_err()));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let error = RefreshingResolver::refresh_wait(Some(deadline), async {
+        Err::<(), _>(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "factory timeout",
+        ))
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(error.to_string(), "factory timeout");
+    assert!(!dns_caller_deadline(&error));
+}
+
+#[tokio::test]
+async fn concurrent_queries_coalesce_lazy_reconstruction_after_failure() {
+    for cancel_owner in [false, true] {
+        let initial = Arc::new(MockResolver::with_error(
+            std::io::ErrorKind::ConnectionReset,
+        ));
+        let fresh = Arc::new(MockResolver::with_addrs(vec![]));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let factory: ResolverFactory = {
+            let (initial, fresh, builds, gate) =
+                (initial.clone(), fresh.clone(), builds.clone(), gate.clone());
+            Arc::new(move || {
+                let generation = builds.fetch_add(1, Ordering::Relaxed);
+                let (initial, fresh, gate) = (initial.clone(), fresh.clone(), gate.clone());
+                Box::pin(async move {
+                    if generation == 0 {
+                        Ok(initial as Arc<dyn Resolver>)
+                    } else {
+                        let _permit = gate.acquire().await.unwrap();
+                        Ok(fresh as Arc<dyn Resolver>)
+                    }
+                })
+            })
+        };
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+            },
+            "concurrent lazy reconstruction".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolver.exchange(vec![]).await.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        let mut first = resolver.exchange(vec![]);
+        let mut second = resolver.exchange(vec![]);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(initial.call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        gate.add_permits(1);
+        if cancel_owner {
+            drop(first);
+        } else {
+            assert_eq!(first.await.unwrap(), Vec::<u8>::new());
+        }
+        let reply = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("coalesced waiter stranded after rebuild owner cancellation")
+            .unwrap();
+        assert_eq!(reply, Vec::<u8>::new());
+        assert_eq!(initial.call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fresh.call_count.load(Ordering::Relaxed),
+            if cancel_owner { 1 } else { 2 }
+        );
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            if cancel_owner { 3 } else { 2 }
+        );
+        assert!(!resolver.refresh_state.lock().invalidated);
+    }
 }
 
 #[tokio::test]
@@ -461,7 +823,7 @@ fn test_resolver_cache_cancels_abandoned_pending_result() {
 }
 
 #[tokio::test]
-async fn test_refreshing_resolver_retries_after_timeout() {
+async fn test_refreshing_resolver_rebuilds_on_next_lookup_after_timeout() {
     let success_addrs = test_addrs();
     let call_count = Arc::new(AtomicUsize::new(0));
 
@@ -486,13 +848,21 @@ async fn test_refreshing_resolver_retries_after_timeout() {
 
     let policy = RefreshPolicy {
         max_idle: Duration::from_secs(60),
-        retry_once_after_refresh: true,
     };
 
     let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
         .await
         .unwrap();
 
+    assert_eq!(
+        resolver
+            .resolve_location(&test_location())
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    assert_eq!(call_count.load(Ordering::Relaxed), 1);
     let result = resolver.resolve_location(&test_location()).await.unwrap();
     assert_eq!(result, success_addrs);
     // Factory called twice: initial build + refresh-on-error
@@ -500,31 +870,46 @@ async fn test_refreshing_resolver_retries_after_timeout() {
 }
 
 #[tokio::test]
-async fn test_refreshing_resolver_no_retry_on_non_refreshable_error() {
-    let call_count = Arc::new(AtomicUsize::new(0));
-
-    let call_count_clone = call_count.clone();
-    let factory: ResolverFactory = Arc::new(move || {
-        call_count_clone.fetch_add(1, Ordering::Relaxed);
-        Box::pin(async move {
-            // Return a resolver that returns a non-refreshable error
-            Ok(Arc::new(MockResolver::with_error(std::io::ErrorKind::Other)) as Arc<dyn Resolver>)
-        })
-    });
-
-    let policy = RefreshPolicy {
-        max_idle: Duration::from_secs(60),
-        retry_once_after_refresh: true,
-    };
-
-    let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
+async fn non_refreshable_errors_preserve_the_generation_for_subsequent_queries() {
+    for kind in [
+        std::io::ErrorKind::Other,
+        std::io::ErrorKind::InvalidData,
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::WouldBlock,
+    ] {
+        let initial = Arc::new(MockResolver::with_error(kind));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory: ResolverFactory = {
+            let initial = initial.clone();
+            let builds = builds.clone();
+            Arc::new(move || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                let initial = initial.clone();
+                Box::pin(async move { Ok(initial as Arc<dyn Resolver>) })
+            })
+        };
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+            },
+            "non-refreshable error".into(),
+        )
         .await
         .unwrap();
 
-    let result = resolver.resolve_location(&test_location()).await;
-    assert!(result.is_err());
-    // Factory called only once (initial build, no refresh for non-refreshable errors)
-    assert_eq!(call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            resolver
+                .resolve_location(&test_location())
+                .await
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+        assert_eq!(resolver.exchange(vec![]).await.unwrap_err().kind(), kind);
+        assert_eq!(initial.call_count.load(Ordering::Relaxed), 2);
+        assert_eq!(builds.load(Ordering::Relaxed), 1, "{kind:?}");
+    }
 }
 
 #[tokio::test]
@@ -542,7 +927,6 @@ async fn test_refreshing_resolver_idle_refresh() {
 
     let policy = RefreshPolicy {
         max_idle: Duration::from_millis(50),
-        retry_once_after_refresh: true,
     };
 
     let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
@@ -565,6 +949,45 @@ async fn test_refreshing_resolver_idle_refresh() {
 }
 
 #[tokio::test]
+async fn idle_refresh_failure_keeps_serving_the_healthy_generation() {
+    let initial = Arc::new(MockResolver::with_addrs(test_addrs()));
+    let builds = Arc::new(AtomicUsize::new(0));
+    let factory: ResolverFactory = {
+        let initial = initial.clone();
+        let builds = builds.clone();
+        Arc::new(move || {
+            let generation = builds.fetch_add(1, Ordering::Relaxed);
+            let initial = initial.clone();
+            Box::pin(async move {
+                if generation == 0 {
+                    Ok(initial as Arc<dyn Resolver>)
+                } else {
+                    Err(std::io::Error::other("idle reconstruction failed"))
+                }
+            })
+        })
+    };
+    let resolver = RefreshingResolver::new(
+        factory,
+        RefreshPolicy {
+            max_idle: Duration::from_secs(60),
+        },
+        "idle reconstruction failure".into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolver.exchange(vec![1]).await.unwrap(), vec![1]);
+    resolver.refresh_state.lock().last_activity_at = Some(Instant::now() - Duration::from_secs(61));
+    assert_eq!(resolver.exchange(vec![2]).await.unwrap(), vec![2]);
+    assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
+    assert_eq!(initial.call_count.load(Ordering::Relaxed), 3);
+    assert_eq!(builds.load(Ordering::Relaxed), 2);
+    let state = resolver.refresh_state.lock();
+    assert!(!state.invalidated);
+    assert!(Arc::ptr_eq(&state.current, &(initial as Arc<dyn Resolver>)));
+}
+
+#[tokio::test]
 async fn test_refreshing_resolver_coalesces_concurrent_idle_refresh() {
     let call_count = Arc::new(AtomicUsize::new(0));
     let addrs = test_addrs();
@@ -582,7 +1005,6 @@ async fn test_refreshing_resolver_coalesces_concurrent_idle_refresh() {
 
     let policy = RefreshPolicy {
         max_idle: Duration::from_millis(20),
-        retry_once_after_refresh: true,
     };
 
     let resolver = Arc::new(

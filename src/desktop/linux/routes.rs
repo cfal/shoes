@@ -71,7 +71,7 @@ pub(super) fn owned_link(link: &LinkMessage, index: u32, name: &str, alias: &str
             .contains(&LinkAttribute::IfAlias(alias.to_owned()))
 }
 
-fn table(route: &RouteMessage) -> u32 {
+pub(super) fn table(route: &RouteMessage) -> u32 {
     route
         .attributes
         .iter()
@@ -82,7 +82,7 @@ fn table(route: &RouteMessage) -> u32 {
         .unwrap_or(u32::from(route.header.table))
 }
 
-async fn dump(handle: &Handle, ipv6: bool) -> io::Result<Vec<RouteMessage>> {
+pub(super) async fn dump(handle: &Handle, ipv6: bool) -> io::Result<Vec<RouteMessage>> {
     let family = if ipv6 {
         AddressFamily::Inet6
     } else {
@@ -229,6 +229,20 @@ pub(super) async fn preflight(handle: &Handle, spec: &Spec) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+pub(super) fn native_default(route: &RouteMessage) -> bool {
+    table(route) == 254
+        && route.header.kind == RouteType::Unicast
+        && route.header.destination_prefix_length == 0
+        && route.header.source_prefix_length == 0
+        && route.header.tos == 0
+        && !route.attributes.iter().any(|attribute| {
+            matches!(
+                attribute,
+                RouteAttribute::Source(_) | RouteAttribute::Iif(_) | RouteAttribute::Mark(_)
+            )
+        })
 }
 
 pub(super) fn check_mark_reservation(rule: &RuleMessage, spec: &Spec) -> io::Result<()> {

@@ -13,6 +13,109 @@ async fn publish_for_api_probes(runtime: &ControlRuntime, generation: &Arc<Gener
 }
 
 #[tokio::test]
+async fn network_reset_replaces_probe_transports_without_losing_history() {
+    let old_network = crate::network_tasks::NetworkLifetime::default();
+    let old_resolver: Arc<dyn Resolver> = Arc::new(PendingAnswers::default());
+    let probes = old_network
+        .scope(async { ProbeState::new(old_resolver.clone(), vec![]) })
+        .await;
+    probes.record("DIRECT", "http://example.test/", 12, true);
+    let old = probes.transports.lock().clone();
+    let catalog = crate::config::create_server_configs(
+        serde_json::from_value(json!([
+            {"client_group":"chosen", "type":"selector", "client_chains":[
+                {"chain":[{"name":"direct", "protocol":{"type":"direct"}}]}
+            ]}
+        ]))
+        .unwrap(),
+    )
+    .unwrap()
+    .catalog
+    .unwrap();
+    let connector = old.connector(&catalog, "DIRECT").unwrap();
+    old_network.cancel();
+    old_network.wait().await;
+    let new_network = crate::network_tasks::NetworkLifetime::default();
+    let new_resolver: Arc<dyn Resolver> = Arc::new(PendingAnswers::default());
+    new_network
+        .scope(async {
+            probes.reset_network(new_resolver.clone(), vec!["198.18.0.0/15".parse().unwrap()]);
+        })
+        .await;
+    let current = probes.transports.lock().clone();
+    assert!(!Arc::ptr_eq(&old, &current));
+    assert!(Arc::ptr_eq(&current.resolver, &new_resolver));
+    assert!(old.network.as_ref().unwrap().cancelled.is_cancelled());
+    assert!(!current.network.as_ref().unwrap().cancelled.is_cancelled());
+    assert!(current.connectors.lock().is_empty());
+    assert!(Arc::ptr_eq(
+        &connector,
+        &old.connector(&catalog, "DIRECT").unwrap()
+    ));
+    assert!(current.connectors.lock().is_empty());
+    assert!(!Arc::ptr_eq(
+        &connector,
+        &current.connector(&catalog, "DIRECT").unwrap()
+    ));
+    assert_eq!(current.forbidden, ["198.18.0.0/15".parse().unwrap()]);
+    let mut object = json!({});
+    probes.decorate("DIRECT", &mut object);
+    assert_eq!(object["history"][0]["delay"], 12);
+}
+
+#[tokio::test]
+async fn network_reset_cancels_a_connected_stalled_probe() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let network = crate::network_tasks::NetworkLifetime::default();
+        let catalog = crate::config::create_server_configs(
+            serde_json::from_value(json!([
+                {"client_group":"path", "type":"selector", "client_chains":[{"chain":[
+                    {"name":"proxy", "address":listener.local_addr().unwrap().to_string(),
+                     "protocol":{"type":"http"}}
+                ]}]}
+            ]))
+            .unwrap(),
+        )
+        .unwrap()
+        .catalog
+        .unwrap();
+        let generation = network
+            .scope(async {
+                generation(
+                    catalog,
+                    Arc::new(Answers(vec!["192.0.2.1:80".parse().unwrap()])),
+                )
+            })
+            .await;
+        let query = query();
+        let request = request(&generation, "proxy", &query);
+        tokio::pin!(request);
+        let peer = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(stream.read_u8().await.unwrap());
+            }
+            network.cancel();
+            stream
+        };
+        let stream = tokio::select! {
+            result = &mut request => panic!("probe completed before reset: {result:?}"),
+            stream = peer => stream,
+        };
+        assert_eq!(
+            request.await.unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        network.wait().await;
+        drop(stream);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn automatic_probes_use_declared_chains_not_callers_and_keep_group_settings_separate() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -1086,7 +1189,7 @@ async fn probe_wrapped_errors(h2_proxy: bool) {
                 proxy: Box::new(
                     crate::tcp::proxy_connector_impl::ProxyConnectorImpl::from_config(
                         config,
-                        generation.probes.resolver.clone(),
+                        generation.probes.transports.lock().resolver.clone(),
                     )
                     .unwrap()
                     .unwrap(),
@@ -1096,10 +1199,16 @@ async fn probe_wrapped_errors(h2_proxy: bool) {
             InitialHopEntry::Direct(socket)
         };
         let chain = ClientProxyChain::new(vec![entry], vec![]);
-        generation.probes.connectors.lock().insert(
-            "member-0".into(),
-            Arc::new(ClientChainGroup::new(vec![chain])),
-        );
+        generation
+            .probes
+            .transports
+            .lock()
+            .connectors
+            .lock()
+            .insert(
+                "member-0".into(),
+                Arc::new(ClientChainGroup::new(vec![chain])),
+            );
         generation
             .catalog
             .selection
@@ -2275,8 +2384,8 @@ async fn review_forbidden_literals_do_not_construct_or_cache_probe_transports() 
         )),
     );
     let mut generation = generation(catalog, Arc::new(Answers(Vec::new())));
-    generation
-        .probes
+    Arc::get_mut(generation.probes.transports.get_mut())
+        .unwrap()
         .forbidden
         .push("100.64.0.0/10".parse().unwrap());
     for url in [
@@ -2289,7 +2398,16 @@ async fn review_forbidden_literals_do_not_construct_or_cache_probe_transports() 
         let error = request(&generation, "quic", &query).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(local_failure(&error));
-        assert!(generation.probes.connectors.lock().is_empty(), "{url}");
+        assert!(
+            generation
+                .probes
+                .transports
+                .lock()
+                .connectors
+                .lock()
+                .is_empty(),
+            "{url}"
+        );
         let error = request(&generation, "missing", &query).await.unwrap_err();
         assert_eq!(
             error.kind(),
@@ -2320,6 +2438,8 @@ async fn cached_connectors_reject_forbidden_hostname_candidates() {
     for name in ["DIRECT", "http"] {
         let cached = generation
             .probes
+            .transports
+            .lock()
             .connector(&generation.catalog, name)
             .unwrap();
         for _ in 0..2 {
@@ -2335,6 +2455,8 @@ async fn cached_connectors_reject_forbidden_hostname_candidates() {
                 &cached,
                 &generation
                     .probes
+                    .transports
+                    .lock()
                     .connector(&generation.catalog, name)
                     .unwrap()
             ));
@@ -2365,6 +2487,8 @@ async fn carrier_probe_checks_http_hostname_before_connecting() {
     );
     let cached = generation
         .probes
+        .transports
+        .lock()
         .connector(&generation.catalog, "outbound")
         .unwrap();
     for _ in 0..2 {
@@ -2383,6 +2507,8 @@ async fn carrier_probe_checks_http_hostname_before_connecting() {
             &cached,
             &generation
                 .probes
+                .transports
+                .lock()
                 .connector(&generation.catalog, "outbound")
                 .unwrap()
         ));

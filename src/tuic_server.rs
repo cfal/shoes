@@ -262,7 +262,7 @@ async fn run_bidirectional_loop(
         };
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        tasks.spawn(async move {
+        crate::network_tasks::spawn_in(&mut tasks, async move {
             let _permit = permit;
             let result = async {
                 let Some(stream) = reader.await? else {
@@ -528,7 +528,7 @@ impl UdpSession {
         };
 
         session.task = Some(
-            tokio::spawn(async move {
+            crate::network_tasks::spawn(async move {
                 let result = if is_uni_stream {
                     run_udp_remote_to_local_stream_loop(
                         assoc_id,
@@ -717,7 +717,7 @@ async fn run_unidirectional_loop(
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
     let cleanup_session_map = udp_session_map.clone();
     let cleanup_cancel_token = cancel_token.clone();
-    tasks.spawn(async move {
+    crate::network_tasks::spawn_in(&mut tasks, async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
@@ -781,7 +781,7 @@ async fn run_unidirectional_loop(
         let resolver = resolver.clone();
         let udp_session_map = udp_session_map.clone();
         let cancel_token = cancel_token.clone();
-        tasks.spawn(async move {
+        crate::network_tasks::spawn_in(&mut tasks, async move {
             let _permit = permit;
             // Per TUIC protocol, each uni stream carries exactly ONE command.
             // The reference implementation (handle_stream.rs) handles one task per stream.
@@ -1162,7 +1162,7 @@ pub async fn start_tuic_server(
         let client_proxy_selector = client_proxy_selector.clone();
         let uuid = uuid.clone();
         let password = password.clone();
-        let join_handle = tokio::spawn(async move {
+        let join_handle = crate::network_tasks::spawn(async move {
             let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
             loop {
                 let conn = tokio::select! {

@@ -22,20 +22,55 @@ pub(crate) struct TransportErrors(Arc<State>);
 #[derive(Debug, Default)]
 struct State {
     running: AtomicBool,
+    forced: AtomicBool,
     terminal: OnceLock<Option<Arc<io::Error>>>,
 }
 
+#[derive(Debug)]
+struct TerminalError(Arc<io::Error>);
+
+impl fmt::Display for TerminalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Error for TerminalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        // Arc<io::Error>::source skips the io::Error and can lose its errno.
+        Some(self.0.as_ref())
+    }
+}
+
 impl TransportErrors {
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     pub(crate) fn wrap<T>(&self, inner: T) -> ObservedIo<T> {
         ObservedIo {
             inner,
             errors: self.clone(),
+            received: None,
+        }
+    }
+
+    pub(crate) fn fail(&self, error: io::Error) {
+        if self.0.terminal.set(Some(Arc::new(error))).is_ok() {
+            self.0.forced.store(true, Ordering::Release);
         }
     }
 
     pub(crate) fn start_driver(&self) {
         // The preface write retries Interrupted; only driver errors are terminal.
         self.0.running.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn terminal_error(&self) -> io::Error {
+        match self.0.terminal.get() {
+            Some(Some(error)) => io::Error::new(error.kind(), TerminalError(error.clone())),
+            _ => io::ErrorKind::ConnectionAborted.into(),
+        }
     }
 
     fn record(&self, error: io::Error) -> io::Error {
@@ -75,6 +110,9 @@ impl TransportErrors {
     }
 
     pub(crate) fn map(&self, error: h2::Error) -> io::Error {
+        if self.0.forced.load(Ordering::Acquire) && !error.is_reset() {
+            return self.terminal_error();
+        }
         let cause = self.cause(&error);
         Self::map_captured(error, cause)
     }
@@ -130,6 +168,17 @@ impl Error for RecoveredError {
 pub(crate) struct ObservedIo<T> {
     inner: T,
     errors: TransportErrors,
+    received: Option<Arc<parking_lot::Mutex<tokio::time::Instant>>>,
+}
+
+impl<T> ObservedIo<T> {
+    pub(crate) fn observe_receive(
+        mut self,
+        received: Arc<parking_lot::Mutex<tokio::time::Instant>>,
+    ) -> Self {
+        self.received = Some(received);
+        self
+    }
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for ObservedIo<T> {
@@ -142,6 +191,11 @@ impl<T: AsyncRead + Unpin> AsyncRead for ObservedIo<T> {
         let filled = buf.filled().len();
         let remaining = buf.remaining();
         let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if buf.filled().len() > filled
+            && let Some(received) = &this.received
+        {
+            *received.lock() = tokio::time::Instant::now();
+        }
         if matches!(result, Poll::Ready(Ok(()))) && remaining > 0 && buf.filled().len() == filled {
             this.errors.closed();
         }

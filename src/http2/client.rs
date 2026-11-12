@@ -100,7 +100,7 @@ impl H2ClientSession {
         let driver_retired = retired.clone();
         let active = Arc::new(ActiveStreams::default());
         let driver_active = active.clone();
-        let abort_handle = tokio::spawn(async move {
+        let abort_handle = crate::network_tasks::spawn(async move {
             let completed = tokio::select! {
                 result = &mut connection => Some(result),
                 _ = &mut drain_rx => None,

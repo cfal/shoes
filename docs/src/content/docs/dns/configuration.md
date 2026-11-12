@@ -70,6 +70,35 @@ retain their whole-path choices and selection policies.
 uses sequential hops, without a compatibility mode or warning. Use explicit
 chain wrappers or a named group to preserve alternative routes.
 
+## Transport Recovery
+
+DoH transport failures retire the failed connection, including active sockets and
+background drivers. Later queries can reconnect without restarting Shoes or
+requiring an interface change. Resolver replacement is coalesced; a late failure
+from an old connection cannot evict its replacement. Fresh connections use the
+current selector choice. Fake-IP mappings, capture ownership, and unrelated
+proxy transports are unchanged.
+
+A query that encounters a refreshable transport failure returns that error and
+retires its resolver generation. The refresh layer does not repeat the query or
+rebuild immediately. The next query lazily rebuilds the resolver; concurrent
+queries share that rebuild. Reconstruction failures reach that query and leave
+reconstruction for another query to attempt.
+
+Configured upstream attempts, cached-connection reconnects and transport fallbacks
+still share the original request deadline, including any lazy reconstruction.
+Connection setup still in progress is retained under its own setup deadline for
+later queries, without an extra same-query wait or resolver retirement. Short
+caller deadlines and canceled queries do not invalidate a shared handshake or an
+otherwise healthy connection.
+
+NXDOMAIN, NODATA, SERVFAIL, HTTP status failures, certificate/authentication
+failures, and local admission pressure do not trigger resolver replacement.
+Permanent errors remain visible. There is no direct-DNS fallback or security
+downgrade. A failed shared carrier needs its own transport recovery; XHTTP H2
+uses [receive-idle PING checks](/protocols/xhttp/#client). Broken application TCP
+sessions are not resumed and application traffic is not replayed.
+
 ## Static Hosts
 
 Add `hosts` to a named DNS group or an inline `dns` object, including

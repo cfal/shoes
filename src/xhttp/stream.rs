@@ -259,6 +259,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn immediate_failure_preserves_queued_bytes_accounting_and_committed_fin() {
+        for finished in [false, true] {
+            let budget = Arc::new(Budget::new(Some(128)));
+            let memory = Memory::new(budget.clone(), Some(128));
+            let (mut writer, mut reader) = pipe(memory);
+            writer.write_all(b"first").await.unwrap();
+            assert_eq!(reader.read_u8().await.unwrap(), b'f');
+            let mut expected = b"irst".to_vec();
+            for byte in 0..if finished { 3 } else { 4 } {
+                let chunk = [byte; 7];
+                writer.write_all(&chunk).await.unwrap();
+                expected.extend_from_slice(&chunk);
+            }
+            if finished {
+                writer.shutdown().await.unwrap();
+            }
+            assert_eq!(reader.receiver.len(), 4);
+            let charged = budget.snapshot().active;
+            writer.fail_now(io::Error::new(io::ErrorKind::TimedOut, "missing PONG"));
+            drop(writer);
+            assert_eq!(budget.snapshot().active, charged);
+            let mut bytes = Vec::new();
+            let result = reader.read_to_end(&mut bytes).await;
+            assert_eq!(bytes, expected);
+            if finished {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert_eq!(error.to_string(), "missing PONG");
+            }
+            assert_eq!(budget.snapshot().active, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_reader_reports_failure_once_through_both_read_paths() {
+        for forward_first in [false, true] {
+            let memory = Memory::new(Arc::new(Budget::new(Some(128))), Some(128));
+            let (mut writer, mut reader) = pipe(memory.clone());
+            let (mut destination, _outgoing) = pipe(memory);
+            writer.fail_now(io::Error::new(io::ErrorKind::TimedOut, "missing PONG"));
+            let first = if forward_first {
+                reader.forward_to(&mut destination).await
+            } else {
+                reader.read_u8().await.map(|_| ())
+            };
+            let error = first.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(error.to_string(), "missing PONG");
+            let second = if forward_first {
+                reader.read_u8().await.map(|_| ())
+            } else {
+                reader.forward_to(&mut destination).await
+            };
+            let error = second.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(error.to_string(), "XHTTP body terminated without FIN");
+        }
+    }
+
+    #[tokio::test]
     async fn dropped_barrier_ack_keeps_subsequent_operations_fallible() {
         for drain in [false, true] {
             let memory = Memory::new(Arc::new(Budget::new(Some(128))), Some(128));
@@ -535,10 +597,12 @@ impl Tasks {
             tokio::select! { biased; _ = cancel.cancelled() => {}, _ = future => {} }
         };
         if crate::control::url_test::is_background() {
-            self.tracker
-                .spawn(crate::control::url_test::BACKGROUND.scope((), task));
+            crate::network_tasks::spawn(
+                self.tracker
+                    .track_future(crate::control::url_test::BACKGROUND.scope((), task)),
+            );
         } else {
-            self.tracker.spawn(task);
+            crate::network_tasks::spawn(self.tracker.track_future(task));
         }
     }
     pub async fn wait(&self) {
@@ -569,9 +633,19 @@ pub struct Reader {
     pub eof: CancellationToken,
     pub activity: Option<Arc<Activity>>,
     start: Option<oneshot::Sender<()>>,
+    failure: Arc<parking_lot::Mutex<Option<io::Error>>>,
 }
 
 impl Reader {
+    fn closed_error(&self) -> io::Error {
+        self.failure.lock().take().unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "XHTTP body terminated without FIN",
+            )
+        })
+    }
+
     pub fn defer(&mut self) -> oneshot::Receiver<()> {
         let (start, ready) = oneshot::channel();
         self.start = Some(start);
@@ -607,12 +681,7 @@ impl Reader {
                     self.eof.cancel();
                 }
                 Some(Event::Error(error)) => return Err(error),
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "XHTTP body terminated without FIN",
-                    ));
-                }
+                None => return Err(self.closed_error()),
             }
         }
     }
@@ -625,12 +694,14 @@ pub struct Writer {
     finished: bool,
     allocation: parking_lot::Mutex<Option<(usize, Reservation)>>,
     pub drain_before_shutdown: bool,
+    pub(super) failure: Arc<parking_lot::Mutex<Option<io::Error>>>,
 }
 
 type Reservation = Pin<Box<dyn Future<Output = io::Result<(BudgetPermit, BudgetPermit)>> + Send>>;
 
 pub fn pipe(memory: Memory) -> (Writer, Reader) {
     let (sender, receiver) = mpsc::channel(4);
+    let failure = Arc::new(parking_lot::Mutex::new(None));
     (
         Writer {
             sender: parking_lot::Mutex::new(PollSender::new(sender)),
@@ -639,6 +710,7 @@ pub fn pipe(memory: Memory) -> (Writer, Reader) {
             finished: false,
             allocation: parking_lot::Mutex::new(None),
             drain_before_shutdown: false,
+            failure: failure.clone(),
         },
         Reader {
             receiver,
@@ -647,6 +719,7 @@ pub fn pipe(memory: Memory) -> (Writer, Reader) {
             eof: CancellationToken::new(),
             activity: None,
             start: None,
+            failure,
         },
     )
 }
@@ -683,6 +756,14 @@ impl Writer {
         if let Some(sender) = sender {
             let _ = sender.send(Event::Error(error)).await;
         }
+        self.finished = true;
+    }
+
+    pub fn fail_now(&mut self, error: io::Error) {
+        // Terminal delivery must not retain a failed session behind a full data queue.
+        *self.failure.lock() = Some(error);
+        self.allocation.get_mut().take();
+        self.sender.get_mut().close();
         self.finished = true;
     }
 
@@ -839,12 +920,7 @@ impl AsyncRead for Reader {
                     self.eof.cancel();
                 }
                 Some(Event::Error(error)) => return Poll::Ready(Err(error)),
-                None => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "XHTTP body terminated without FIN",
-                    )));
-                }
+                None => return Poll::Ready(Err(self.closed_error())),
             }
         }
     }

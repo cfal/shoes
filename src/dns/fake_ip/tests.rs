@@ -330,7 +330,6 @@ async fn truncated_fallback_survives_deadlines_without_bypassing_guards() {
             factory,
             RefreshPolicy {
                 max_idle: Duration::from_secs(60),
-                retry_once_after_refresh: true,
             },
             "partial deadline".into(),
         )

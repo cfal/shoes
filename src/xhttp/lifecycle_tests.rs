@@ -412,6 +412,55 @@ async fn h2_goaway_retires_carrier_without_closing_active_response() {
 }
 
 #[tokio::test]
+async fn h2_client_goaway_drains_completed_response_under_backpressure() {
+    for size in [16, 8 * super::stream::CHUNK] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+            let closed = tokio_util::sync::CancellationToken::new();
+            let done = closed.clone();
+            let tasks = Tasks::new();
+            tasks.spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(socket).await.unwrap();
+                let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                let reply = tokio::spawn(async move {
+                    let mut body = request.into_body();
+                    while let Some(data) = body.data().await {
+                        let data = data.unwrap();
+                        body.flow_control().release_capacity(data.len()).unwrap();
+                    }
+                    let mut send = respond.send_response(Response::new(()), false).unwrap();
+                    send.send_data(Bytes::from(vec![9; size]), true).unwrap();
+                });
+                connection.graceful_shutdown();
+                while connection.accept().await.is_some() {}
+                reply.await.unwrap();
+                done.cancel();
+            });
+            let client = client(XhttpVersion::H2);
+            let dialer = Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            });
+            let mut stream = client.open(dialer).await.unwrap();
+            stream.shutdown().await.unwrap();
+            closed.cancelled().await;
+            // Let the client driver observe the orderly connection completion before consuming.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, vec![9; size]);
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn rejected_and_delayed_response_errors_reach_reader() {
     for respond in [true, false] {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -832,7 +881,7 @@ async fn packet_lanes_reacquire_after_h2_goaway() {
 }
 
 #[tokio::test]
-async fn h2_header_timeout_retires_the_carrier() {
+async fn h2_header_timeout_keeps_the_healthy_carrier() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
     let tasks = Tasks::new();
@@ -864,7 +913,7 @@ async fn h2_header_timeout_retires_the_carrier() {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
-    assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+    assert_eq!(dialer.opens.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

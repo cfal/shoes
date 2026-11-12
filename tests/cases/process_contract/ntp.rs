@@ -90,9 +90,9 @@ async fn ntp_protocol_time_survives_reload_and_rollback_and_can_be_disabled() {
     let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
         .await
         .unwrap();
-    let upstream = available_address();
-    let entry = available_address();
-    let raw_entry = available_address();
+    let (upstream_reservation, upstream) = reserve_address();
+    let (entry_reservation, entry) = reserve_address();
+    let (raw_reservation, raw_entry) = reserve_address();
     let mut server_config = json!([
         {"global_settings": {"ntp": ntp.settings()}},
         {"address": upstream.to_string(), "protocol": protocol(), "rules": "allow-all-direct"}
@@ -109,8 +109,11 @@ async fn ntp_protocol_time_survives_reload_and_rollback_and_can_be_disabled() {
     write(&server_path, &server_config);
     write(&client_path, &client_config(entry, ntp.settings()));
     write(&raw_path, &client_config(raw_entry, Value::Null));
+    drop(upstream_reservation);
     let mut server = Process::start(&server_path, &["--no-reload"]);
+    drop(entry_reservation);
     let mut client = Process::start(&client_path, &["--no-reload"]);
+    drop(raw_reservation);
     let mut raw = Process::start(&raw_path, &["--no-reload"]);
     server.wait_for("Servers ready").await;
     client.wait_for("Servers ready").await;

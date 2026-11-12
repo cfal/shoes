@@ -251,12 +251,51 @@ mark-aware reverse-path filtering.
 No universal VPN, firewall, resolver-manager, or distribution compatibility is
 promised.
 
-Reload retains the interface, capture, and redirect listener identities. Network
-topology changes require restart and are rejected before retiring live workers.
+Reload retains the interface, capture, and redirect listener identities. Managed
+TUN topology configuration changes require restart and are rejected before retiring live workers.
 Ordinary worker reloads can reset existing connections and briefly interrupt
-traffic, but do not disable capture. Failed candidates roll back on the same
+traffic, but do not disable capture. Failed ordinary reloads roll back on the same
 network lease. Unexpected owned routing changes or a missing private firewall
 table cause orderly shutdown. Resolver-setting changes do not.
+
+After startup, changes to the underlying main-table default path, gateway, or
+explicit preferred source, and loss of the selected source address, trigger recovery
+in place. Ordinary IPv6 privacy-address rotation does not reset existing flows.
+Both IP families are monitored. A
+complete outage pauses forwarding until an underlay returns; temporary recovery
+failures are retried without removing capture. Recovery rebuilds DNS and proxy
+transports from the accepted in-memory configuration, not from edited files.
+Recovery shares worker startup and activation with configuration reload. After
+starting workers, it rechecks the underlay before resuming the controller, starting
+certificate workers, and admitting TCP/Unix connections. This is not an atomic
+barrier for all forwarding: managed ingress, QUIC, and WireGuard can start earlier.
+DNS bootstrap uses the configured lookup deadlines; slow or unbounded lookups
+can delay recovery, but shutdown remains cancellable.
+Explicit reloads wait while offline and can replace a configuration that prevents
+workers from restarting once an underlay is available, without first rebuilding
+the accepted DNS configuration.
+If worker startup or activation rejects a recovery reload while the underlay is
+stable, its workers are cleaned up and forwarding remains paused. Recovery
+schedules the accepted configuration for another attempt after two seconds, rather
+than immediately rolling back or re-reading the rejected file. An underlay change
+detected after worker startup instead keeps the reload pending for a later attempt,
+without another file edit or SIGHUP. Cleanup and network ownership failures still
+cause shutdown.
+The TUN, REDIRECT ports, fake-IP mappings, and explicit selector choices remain
+owned and retained. WireGuard peer hostnames are refreshed best-effort; a failed
+refresh retains the previous endpoints rather than blocking unrelated workers. Old flows,
+pending connections, and connections draining from earlier reloads are cancelled.
+Applications must reconnect; requests are not replayed and existing TCP/QUIC
+sessions are not migrated. TUN TCP resets are best-effort.
+
+Detection uses netlink notifications and periodic checks, with a short settling
+delay. It observes kernel route/source selection for representative off-link
+destinations, not Internet reachability or every destination-specific policy.
+Packet loss, captive portals, or a Wi-Fi change that preserves the observed
+routing and carrier state may not trigger recovery. Explicit `bind_interface`
+and listen-address settings remain fixed; they are never silently moved to another
+interface. A reset affects all proxy workers in this process, including local
+listeners.
 
 shoes exclusively owns its token-named `inet` nftables table, including all of its
 contents. Do not add rules, chains, or sets to that table: external changes inside

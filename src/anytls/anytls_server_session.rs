@@ -439,7 +439,7 @@ impl AnyTlsSession {
 
                 if let Some(stream) = stream_opt {
                     let session = Arc::clone(self);
-                    let handle = tokio::spawn(async move {
+                    let handle = crate::network_tasks::spawn(async move {
                         let _permit = permit;
                         if let Err(e) = session.handle_new_stream(stream).await {
                             log::debug!("AnyTLS stream {} error: {}", stream_id, e);

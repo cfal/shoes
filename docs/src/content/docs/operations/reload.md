@@ -24,14 +24,14 @@ reload loop: reload-only PEM changes require restarting the embedded instance.
 
 On Linux, if directory permissions prevent watching a readable configuration's parent, startup falls back to direct file watches and logs a warning. In-place edits remain detectable, but atomic replacements may be missed; use SIGHUP or grant directory read permission when replacing files.
 
-Replacement configurations, certificates, and DNS resolvers are prepared while
+During ordinary reloads, replacement configurations, certificates, and DNS resolvers are prepared while
 the current listeners continue serving. A preparation failure leaves the current
 configuration running. Unchanged fixed TCP listen addresses retain their sockets
 across generations. New-generation TCP and Unix listeners accept queued
 connections only after activation completes; connections may wait in the kernel
 backlog during that interval.
 
-If activation fails, shoes stops the candidate services and restores the previous
+If ordinary reload activation fails, shoes stops the candidate services and restores the previous
 configuration, including control state, resource limits, DNS ownership, and
 certificate workers. A successful rollback keeps the process running; if rollback
 also fails, shoes exits with status 1 rather than serving a partial generation.
@@ -39,6 +39,16 @@ Existing TCP connections begin draining when their old listeners retire, for up
 to `global_settings.reload_grace_secs`. That deadline still applies after rollback.
 TUN, WireGuard, and QUIC services are stopped and restarted; their existing
 sessions are not migrated or restored by rollback.
+
+During [managed TUN recovery](/config/tun/#managed-linux-desktop-capture), failed
+reload activation instead leaves workers paused and schedules an accepted-state
+retry after two seconds. Each recovery attempt restores the accepted limits and
+clock before bootstrap or DNS preparation, including preparation of a correcting
+reload; they are not restored immediately when the candidate is discarded.
+A correcting reload rechecks the underlay after worker startup, before publishing
+its controller generation and releasing TCP/Unix admission.
+If that check detects another underlay change, the reload remains pending and is
+retried when recovery can proceed, without another file edit or SIGHUP.
 
 Certificate-source file changes and ACME renewal do not trigger this full reload.
 They rotate live without replacing listeners or closing QUIC connections; see
@@ -48,7 +58,7 @@ An unchanged `global_settings.ntp` object reuses its correction, refresh deadlin
 and any server refusal state; unrelated reloads do not repeat synchronization.
 Changed NTP settings perform one bounded attempt during activation, after old
 listeners retire, which can add up to `timeout_secs` to the activation interval.
-Preparation alone sends no NTP requests. Failed activation restores the previous
+Preparation alone sends no NTP requests. Ordinary rollback restores the previous
 clock without another initial query. The candidate clock can briefly affect
 existing connections before rollback; protocol side effects are not transactional.
 Removing NTP restores the OS clock, and shutdown discards the correction. See

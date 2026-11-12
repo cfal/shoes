@@ -81,7 +81,7 @@ pub(crate) async fn serve(
                 };
                 let selector = selector.clone();
                 let resolver = resolver.clone();
-                tasks.spawn(async move {
+                crate::network_tasks::spawn_in(&mut tasks, async move {
                     let _permits = (local, global);
                     if let Err(error) = tunnel(request, respond, target, selector, resolver).await {
                         log::debug!("HTTP/2 CONNECT stream ended: {error}");

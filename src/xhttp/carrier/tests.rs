@@ -2,6 +2,82 @@ use super::*;
 use crate::resources::Budget;
 use tokio::io::AsyncReadExt;
 
+#[tokio::test(start_paused = true)]
+async fn h2_receive_idle_ping_retires_silent_carrier_but_keeps_healthy_idle_streams() {
+    for streaming in [false, true] {
+        let (client, wire) = tokio::io::duplex(65536);
+        let (upstream, peer) = tokio::io::duplex(65536);
+        let blackhole = Arc::new(AtomicBool::new(false));
+        let relay = Tasks::new();
+        let (down_read, down_write) = tokio::io::split(wire);
+        let (up_read, up_write) = tokio::io::split(upstream);
+        for (mut read, mut write) in [(down_read, up_write), (up_read, down_write)] {
+            let blackhole = blackhole.clone();
+            relay.spawn(async move {
+                let mut bytes = [0; 4096];
+                while let Ok(length) = read.read(&mut bytes).await {
+                    if length == 0 {
+                        break;
+                    }
+                    if !blackhole.load(Ordering::SeqCst)
+                        && write.write_all(&bytes[..length]).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        relay.spawn(async move {
+            let mut peer = h2::server::handshake(peer).await.unwrap();
+            let mut streams = Vec::new();
+            while let Some(Ok((request, mut response))) = peer.accept().await {
+                let body = response.send_response(Response::new(()), false).unwrap();
+                streams.push((request, body));
+            }
+        });
+        let carrier = Carrier::tcp(Box::new(client), XhttpVersion::H2, 8192)
+            .await
+            .unwrap();
+        let requests = Tasks::new();
+        let memory = Memory::new(Arc::new(Budget::new(Some(16384))), Some(16384));
+        let (_upload, body) = pipe(memory.clone());
+        let mut response = carrier
+            .request(
+                Request::get("http://localhost/idle")
+                    .body(if streaming {
+                        Body::stream(body)
+                    } else {
+                        Body::Empty
+                    })
+                    .unwrap(),
+                memory,
+                &requests,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            tokio::time::sleep(H2_RECEIVE_IDLE + H2_PONG_TIMEOUT).await;
+            assert!(
+                !carrier.closed(),
+                "healthy application-idle stream was retired"
+            );
+        }
+        blackhole.store(true, Ordering::SeqCst);
+        tokio::time::sleep(H2_RECEIVE_IDLE + H2_PONG_TIMEOUT + Duration::from_secs(1)).await;
+        let mut byte = [0];
+        let error = response.body_mut().read(&mut byte).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error:?}");
+        assert!(error.to_string().contains("PONG"), "{error}");
+        assert!(carrier.closed());
+        assert!(carrier.try_reserve().unwrap().is_none());
+        drop(response);
+        requests.cancel.cancel();
+        requests.wait().await;
+        carrier._tasks.wait().await;
+    }
+}
+
 #[tokio::test]
 async fn h2_download_count_fits_platform_semaphore_bounds() {
     let (client, peer) = tokio::io::duplex(4096);
@@ -116,6 +192,103 @@ async fn h2_readiness_and_established_receive_preserve_transport_causes() {
                 );
                 driver.abort();
                 let _ = driver.await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn h2_cancelled_upload_preserves_terminal_cause_behind_full_download() {
+    use crate::http2::transport::tests::{Fault, cases};
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut failures = cases();
+        failures.push((
+            || io::Error::new(io::ErrorKind::TimedOut, "PONG timeout"),
+            false,
+        ));
+        for blocked in [false, true] {
+            for &(make_error, local) in &failures {
+                let fault = Fault::new(make_error);
+                let (client, peer) = tokio::io::duplex(8192);
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                    let mut connection = h2::server::Builder::new()
+                        .initial_window_size(1)
+                        .handshake(peer)
+                        .await
+                        .unwrap();
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        let send = respond.send_response(Response::new(()), false).unwrap();
+                        if tx.send((request.into_body(), send)).is_err() {
+                            break;
+                        }
+                    }
+                }));
+                let carrier = Carrier::tcp(Box::new(fault.wrap(client)), XhttpVersion::H2, 8192)
+                    .await
+                    .unwrap();
+                let requests = Tasks::new();
+                let memory = Memory::new(Arc::new(Budget::new(None)), None);
+                let (mut upload, body) = pipe(memory.clone());
+                let mut response = carrier
+                    .request(
+                        Request::post("http://localhost/open-upload")
+                            .body(Body::stream(body))
+                            .unwrap(),
+                        memory,
+                        &requests,
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body();
+                let (mut incoming, mut send) = rx.recv().await.unwrap();
+                if blocked {
+                    upload
+                        .forward(Bytes::from_static(b"blocked upload"))
+                        .await
+                        .unwrap();
+                    assert_eq!(incoming.data().await.unwrap().unwrap().len(), 1);
+                    // With no released capacity, the upload remains inside poll_capacity.
+                }
+                send.send_data(
+                    Bytes::from(vec![b'x'; 8 * super::super::stream::CHUNK]),
+                    false,
+                )
+                .unwrap();
+                while response.receiver.len() < 4 {
+                    tokio::task::yield_now().await;
+                }
+                let timeout = make_error().kind() == io::ErrorKind::TimedOut;
+                if timeout {
+                    let Sender::H2 { errors, .. } = &carrier.sender else {
+                        unreachable!()
+                    };
+                    errors.fail(make_error());
+                }
+                fault.inject();
+                requests.cancel.cancelled().await;
+                requests.wait().await;
+                let mut bytes = Vec::new();
+                let error = response.read_to_end(&mut bytes).await.unwrap_err();
+                assert!(!bytes.is_empty());
+                assert_ne!(error.kind(), io::ErrorKind::UnexpectedEof, "{error:?}");
+                assert_eq!(
+                    crate::resources::is_exhausted(&error),
+                    crate::resources::is_exhausted(&make_error()),
+                    "blocked={blocked}: {error:?}"
+                );
+                if timeout {
+                    assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error:?}");
+                    assert!(error.to_string().contains("PONG"), "{error}");
+                }
+                assert_eq!(
+                    crate::clash_api::probes::local_failure(&error),
+                    local,
+                    "{error:?}"
+                );
             }
         }
     })
@@ -420,7 +593,7 @@ async fn h2_early_response_does_not_acknowledge_incomplete_packet() {
 async fn h2_no_error_does_not_hide_body_errors_or_finish_server_sends() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let (carrier, mut requests, _server) = h2_peer().await;
-        let Sender::H2 { sender, .. } = &carrier.sender else {
+        let Sender::H2 { sender, errors, .. } = &carrier.sender else {
             unreachable!()
         };
         let mut sender = sender.clone().ready().await.unwrap();
@@ -446,14 +619,20 @@ async fn h2_no_error_does_not_hide_body_errors_or_finish_server_sends() {
                 .is_none()
         );
         let error = H2SendError::Stream(io::ErrorKind::BrokenPipe.into());
-        assert!(error.peer_sent_no_error(&mut send));
+        assert!(error.into_upload_error(&mut send, errors, true).is_none());
         // A reset can arrive between the body EOF poll and sending the final DATA frame.
         let error = H2SendError::Stream(io::Error::other(
             send.send_data(Bytes::new(), true).unwrap_err(),
         ));
-        assert!(error.peer_sent_no_error(&mut send));
+        assert!(error.into_upload_error(&mut send, errors, true).is_none());
         let error = H2SendError::Local(io::ErrorKind::UnexpectedEof.into());
-        assert!(!error.peer_sent_no_error(&mut send));
+        assert_eq!(
+            error
+                .into_upload_error(&mut send, errors, true)
+                .unwrap()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
         assert!(send_h2(Body::Empty, send).await.is_err());
         assert!(response.await.unwrap().into_body().data().await.is_none());
     })

@@ -555,6 +555,59 @@ async fn fake_context_reload_sharing_disable_and_reenable_keep_pool_identity() {
 }
 
 #[tokio::test]
+async fn network_rebuild_retires_resolvers_but_keeps_live_fake_ip_pools() {
+    let old = crate::network_tasks::NetworkLifetime::default();
+    let mut registry = old
+        .scope(build_dns_registry(fake_groups(true)))
+        .await
+        .unwrap();
+    let resolver = registry.get_by_name("fake").unwrap();
+    let context = resolver.fake_dns_context().unwrap();
+    let ip = context.allocate("network.test", false).unwrap();
+    old.scope(async {
+        registry.get_or_create_default();
+    })
+    .await;
+    old.cancel();
+    old.wait().await;
+    registry.retire_network();
+    assert!(registry.groups.is_empty());
+    assert!(registry.system_groups.is_empty());
+    assert!(registry.default_resolver.is_none());
+    assert_eq!(
+        resolver
+            .resolve_location(
+                &crate::address::NetLocation::from_str("network.test:80", None).unwrap()
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Interrupted
+    );
+    let fresh = crate::network_tasks::NetworkLifetime::default();
+    let rebuilt = fresh
+        .scope(build_dns_registry_reusing(
+            fake_groups(true),
+            registry.limits,
+            Some(&registry),
+        ))
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &registry.pools["fake"].pool,
+        &rebuilt.pools["fake"].pool
+    ));
+    let next = rebuilt
+        .get_by_name("fake")
+        .unwrap()
+        .fake_dns_context()
+        .unwrap();
+    assert_eq!(next.restore(ip).unwrap().as_deref(), Some("network.test"));
+    assert_eq!(next.allocate("network.test", false).unwrap(), ip);
+    assert!(next.allocate("after.test", false).is_ok());
+}
+
+#[tokio::test]
 async fn equivalent_pool_ranges_reuse_live_mappings_on_reload() {
     let mut groups = fake_groups(true);
     groups[0].specs = vec![make_spec("udp://127.0.0.1:9")];

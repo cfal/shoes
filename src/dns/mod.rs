@@ -21,8 +21,11 @@ mod guard;
 mod hickory_resolver;
 mod hosts;
 mod message;
+mod network;
 mod parsed;
 mod proxy_runtime;
+#[cfg(test)]
+mod recovery_tests;
 mod stream;
 mod system;
 #[allow(

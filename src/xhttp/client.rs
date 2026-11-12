@@ -208,7 +208,7 @@ impl Client {
 
     async fn dial(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Arc<Carrier>> {
         let header_limit = 8192 + MAX_PADDING_BYTES as usize;
-        tokio::time::timeout(
+        let carrier = tokio::time::timeout(
             Duration::from_secs(self.config.limits.setup_timeout_secs),
             async {
                 if self.version == XhttpVersion::H3 {
@@ -236,7 +236,13 @@ impl Client {
                 }
             },
         )
-        .await?
+        .await??;
+        log::debug!(
+            "XHTTP selected route {:?}: carrier {}",
+            dialer.route_key(),
+            carrier.identity()
+        );
+        Ok(carrier)
     }
 
     async fn lease(
@@ -452,7 +458,7 @@ impl Client {
                 .await;
             if let Err(error) = result {
                 log::debug!("XHTTP session failed: {error}");
-                download_writer.fail(error).await;
+                download_writer.fail_now(error);
             }
         });
         Ok(Stream {
@@ -473,6 +479,10 @@ impl Client {
         download_activity: Arc<Activity>,
     ) -> io::Result<()> {
         let (mut download, upload) = lanes;
+        let upload_depends_on_download = self.mode != XhttpMode::StreamUp
+            || upload
+                .as_ref()
+                .is_some_and(|upload| Arc::ptr_eq(&upload.carrier, &download.carrier));
         let local = Tasks::new();
         let session = if self.mode == XhttpMode::StreamOne {
             String::new()
@@ -531,16 +541,20 @@ impl Client {
         let mut body = response.into_body();
         body.activity = Some(download_activity.clone());
         tokio::select! {
+            biased;
+            result = async {
+                body.forward_to(download_writer).await?;
+                download_writer.shutdown().await
+            } => result?,
+            error = download.carrier.failed() => return Err(error),
             Some(error) = error_receiver.recv() => return Err(error),
             _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
             result = &mut linger => return result,
-            result = body.forward_to(download_writer) => {
-                result?;
-            }
         }
-        download_writer.shutdown().await?;
+        let download = upload_depends_on_download.then_some(download);
         tokio::select! {
             biased;
+            error = async { download.as_ref().unwrap().carrier.failed().await }, if download.is_some() => Err(error),
             Some(error) = error_receiver.recv() => Err(error),
             _ = local.cancel.cancelled() => Err(io::ErrorKind::ConnectionAborted.into()),
             _ = local.wait() => Ok(()),
@@ -858,6 +872,235 @@ mod tests {
     use super::*;
     use rustls::NamedGroup;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct Dialer {
+        address: std::net::SocketAddr,
+        route: RouteKey,
+        opens: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl CarrierDialer for Dialer {
+        fn route_key(&self) -> &RouteKey {
+            &self.route
+        }
+        async fn open_stream(&self) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(
+                tokio::net::TcpStream::connect(self.address).await?,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_download_failure_keeps_separate_stream_up_upload_alive() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+            let fail = tokio_util::sync::CancellationToken::new();
+            let stop = fail.clone();
+            let (sent, mut received) = tokio::sync::mpsc::channel(1);
+            let tasks = Tasks::new();
+            tasks.spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    let stop = stop.clone();
+                    let sent = sent.clone();
+                    connections.spawn(async move {
+                        let mut connection = h2::server::handshake(socket).await.unwrap();
+                        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                        if request.method() == http::Method::GET {
+                            respond
+                                .send_response(http::Response::new(()), true)
+                                .unwrap();
+                            tokio::select! {
+                                _ = stop.cancelled() => {
+                                    connection.abrupt_shutdown(h2::Reason::INTERNAL_ERROR);
+                                    while connection.accept().await.is_some() {}
+                                },
+                                _ = connection.accept() => {},
+                            }
+                        } else {
+                            let reply = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                                async move {
+                                    let mut body = request.into_body();
+                                    let mut bytes = Vec::new();
+                                    while let Some(Ok(data)) = body.data().await {
+                                        bytes.extend_from_slice(&data);
+                                        body.flow_control().release_capacity(data.len()).unwrap();
+                                    }
+                                    let _ = respond.send_response(http::Response::new(()), true);
+                                    let _ = sent.send(bytes).await;
+                                },
+                            ));
+                            while connection.accept().await.is_some() {}
+                            drop(reply);
+                        }
+                    });
+                }
+            });
+            let config = crate::config::test_support::from_json(json!({
+                "pool":{"max_connections":2}, "limits":{"max_requests_per_connection":1},
+                "protocol":{"type":"socks"}
+            }))
+            .unwrap();
+            let client = Arc::new(
+                Client::new(
+                    config,
+                    NetLocation::from_str("localhost:80", None).unwrap(),
+                    "localhost".into(),
+                    XhttpVersion::H2,
+                    XhttpMode::StreamUp,
+                    Security::Plain,
+                )
+                .unwrap(),
+            );
+            let dialer = Arc::new(Dialer {
+                address,
+                route: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            });
+            let mut stream = client.open(dialer.clone()).await.unwrap();
+            let download = client.slots.lock()[0].clone();
+            let carrier = download.carrier.get().unwrap().clone();
+            assert_eq!(
+                stream.read_u8().await.unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+            fail.cancel();
+            carrier.failed().await;
+            assert_eq!(download.active(), 0);
+            assert_eq!(client.slots.lock()[1].active(), 1);
+            stream.write_all(b"after download EOF").await.unwrap();
+            stream.shutdown().await.unwrap();
+            assert_eq!(received.recv().await.unwrap(), b"after download EOF");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_h2_carrier_releases_slots_even_when_download_pipe_is_full() {
+        for (buffer_limit, end_stream) in [(16384, false), (262144, false), (262144, true)] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+                let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+                let fail = tokio_util::sync::CancellationToken::new();
+                let stop = fail.clone();
+                let server = Tasks::new();
+                server.spawn(async move {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let mut first = true;
+                    while let Ok((socket, _)) = listener.accept().await {
+                        let stop = if first {
+                            stop.clone()
+                        } else {
+                            tokio_util::sync::CancellationToken::new()
+                        };
+                        first = false;
+                        tasks.spawn(async move {
+                            let mut h2 = h2::server::handshake(socket).await.unwrap();
+                            let mut streams = Vec::new();
+                            loop {
+                                tokio::select! {
+                                    _ = stop.cancelled() => return,
+                                    request = h2.accept() => {
+                                        let Some(Ok((request, mut response))) = request else {
+                                            return;
+                                        };
+                                        let mut send = response
+                                            .send_response(http::Response::new(()), false)
+                                            .unwrap();
+                                        let payload = (0..8 * super::super::stream::CHUNK)
+                                            .map(|index| (index % 251) as u8)
+                                            .collect::<Vec<_>>();
+                                        send.send_data(bytes::Bytes::from(payload), end_stream)
+                                            .unwrap();
+                                        streams.push((request, send));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+                let config = crate::config::test_support::from_json(json!({
+                    "pool":{"max_connections":1,"h2_receive_admission":true},
+                    "limits":{"max_buffered_bytes":buffer_limit,"max_sessions":1,
+                        "h2_stream_window_bytes":65535,"h2_connection_window_bytes":65535},
+                    "protocol":{"type":"socks"}
+                }))
+                .unwrap();
+                let client = Arc::new(
+                    Client::new(
+                        config,
+                        NetLocation::from_str("localhost:80", None).unwrap(),
+                        "localhost".into(),
+                        XhttpVersion::H2,
+                        XhttpMode::StreamOne,
+                        Security::Plain,
+                    )
+                    .unwrap(),
+                );
+                let dialer = Arc::new(Dialer {
+                    address,
+                    route: RouteKey(vec![1]),
+                    opens: AtomicUsize::new(0),
+                });
+                let mut stalled = client.open(dialer.clone()).await.unwrap();
+                let queued = if buffer_limit == 16384 { 1 } else { 4 };
+                while stalled.read.receiver.len() < queued {
+                    tokio::task::yield_now().await;
+                }
+                let carrier = client.slots.lock()[0].carrier.get().unwrap().clone();
+                let mut spare_credit = Vec::new();
+                while let Ok(Some(permit)) = carrier.admit_download() {
+                    spare_credit.push(permit);
+                }
+                assert_ne!(client.slots.lock()[0].active(), 0);
+                fail.cancel();
+                while client.slots.lock()[0].active() != 0 {
+                    tokio::task::yield_now().await;
+                }
+                while client.admission.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(carrier.admit_download().unwrap().is_some());
+                drop(spare_credit);
+                let retained = client.memory.snapshot().active;
+                assert!(retained > 0);
+                let mut fresh = client.open(dialer.clone()).await.unwrap();
+                assert_eq!(dialer.opens.load(Ordering::SeqCst), 2);
+                if buffer_limit == 16384 {
+                    assert!(futures::poll!(Box::pin(fresh.read_u8())).is_pending());
+                    assert_eq!(client.memory.snapshot().active, retained);
+                } else {
+                    assert_eq!(fresh.read_u8().await.unwrap(), 0);
+                }
+                let mut prefix = Vec::new();
+                stalled.read_to_end(&mut prefix).await.unwrap_err();
+                assert!(!prefix.is_empty());
+                assert!(prefix.len() < 8 * super::super::stream::CHUNK);
+                assert!(
+                    prefix
+                        .iter()
+                        .enumerate()
+                        .all(|(index, byte)| *byte == (index % 251) as u8)
+                );
+                drop(stalled);
+                if buffer_limit == 16384 {
+                    assert_eq!(fresh.read_u8().await.unwrap(), 0);
+                }
+                drop(fresh);
+                while client.memory.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
 
     #[test]
     fn sudoku_mask_carriers_preserve_security_scheme_and_disabled_sni() {

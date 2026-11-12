@@ -17,6 +17,10 @@ description: "XHTTP 客户端和服务器配置、模式、限制和互操作性
 
 将 `type: xhttp` 放置在客户端跃点的 `protocol` 中。 `protocol` 是必需的内部客户端协议。使用客户端 `headers` 匹配服务器的 `path`、`host` 和任何所需的 `matching_headers` 值。默认值为 `mode: auto`、`http_version: auto`、`download_idle_timeout_secs: 900` 和 `packet_pipeline_depth: 30`。客户端`pool`默认3个H2/H3连接，最多64个H1连接，60秒空闲超时。
 
+H2 客户端在 45 秒未收到传输数据后发送 PING，并要求在 10 秒内收到 PONG（包括写出 PING 的时间）。未收到 PONG 时，仅关闭该承载连接并使其会话失败；后续会话可以重新连接。健康的长连接不会因应用层空闲而被关闭。单个流重置、DNS 超时或响应头超时不会关闭共享承载连接。恢复不会重放请求或应用数据。
+
+H2 正常关闭时，已接纳的响应可以继续读取。确认连接失败时，则立即取消被阻塞的会话任务并释放准入名额。已进入应用读取队列的字节仍可在错误之前读取；传输层或中间缓冲区中的字节可能被丢弃，即使已经收到线上的 END_STREAM。已进入应用队列的正常 EOF 不会被后续错误替换。保留的应用字节仍计入字节上限，因此替代会话可以建立连接，但其下载可能需要等待旧读取者消费或释放这些字节。
+
 ## 模式与传输
 
 - `http_version: auto`：H1为明文TCP，H2为TLS/REALITY，H3为QUIC。 `http/1.1` 的显式 TLS ALPN 选择 H1。显式明文H2使用h2c先验知识，而不是HTTP升级。
