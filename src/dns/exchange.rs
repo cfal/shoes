@@ -218,10 +218,17 @@ impl RawDnsExchange {
             edns.options_mut().remove(EdnsCode::Cookie);
         }
         let timeout = self.request_timeout();
-        let transport_deadline = tokio::time::Instant::now() + timeout;
-        let deadline = deadline.map_or(transport_deadline, |deadline| {
-            deadline.min(transport_deadline)
-        });
+        let transport_deadline = tokio::time::Instant::now().checked_add(timeout);
+        let deadline = match (deadline, transport_deadline) {
+            (Some(caller), Some(transport)) => caller.min(transport),
+            (Some(deadline), None) | (None, Some(deadline)) => deadline,
+            (None, None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "DNS request timeout is too large",
+                ));
+            }
+        };
         let setups = Mutex::new(Vec::new());
         let expiration = ExchangeTimeout::default();
         let admitted = AtomicBool::new(false);
@@ -377,6 +384,14 @@ impl RawDnsExchange {
         for reconnect in 0..2 {
             let (setup, reused) = {
                 let mut cached = upstream.connection.lock();
+                // Detached setup completion is only visible after polling its Shared handle.
+                if cached
+                    .as_ref()
+                    .and_then(|setup| setup.clone().now_or_never())
+                    .is_some_and(|result| result.is_err())
+                {
+                    *cached = None;
+                }
                 let reused = cached.is_some();
                 if cached.is_none() {
                     let future = self

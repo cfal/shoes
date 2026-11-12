@@ -17,6 +17,82 @@ fn request_budget_keeps_minimum_attempts_and_saturates() {
     assert_eq!(raw.request_timeout(), Duration::MAX);
 }
 
+#[tokio::test(start_paused = true)]
+async fn unrepresentable_request_budget_respects_caller_deadline() {
+    let mut raw = exchange("127.0.0.1:53".parse().unwrap(), false);
+    raw.context.options.timeout = Duration::from_secs(u64::from(u32::MAX));
+    raw.context.options.attempts = u32::MAX as usize;
+    assert!(
+        tokio::time::Instant::now()
+            .checked_add(raw.request_timeout())
+            .is_none()
+    );
+    let _permits = raw.admission.acquire_many(64).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+    let error = raw
+        .exchange_with_deadline(request().to_vec().unwrap(), deadline)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    assert_eq!(
+        raw.exchange(request().to_vec().unwrap())
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[tokio::test]
+async fn failed_detached_setup_is_replaced_before_next_exchange() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::ConnectionRefused] {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let raw = exchange(socket.local_addr().unwrap(), false);
+            let _peer = udp_responder(socket, Arc::new(AtomicBool::new(true)));
+            let (fail, failed) = tokio::sync::oneshot::channel();
+            let (finished, done) = tokio::sync::oneshot::channel();
+            let setup = connection_setup(
+                async move {
+                    failed.await.unwrap();
+                    finished.send(()).unwrap();
+                    Err(NetError::Io(Arc::new(io::Error::new(
+                        kind,
+                        "detached setup failed",
+                    ))))
+                }
+                .boxed(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            );
+            *raw.upstreams[0].connection.lock() = Some(setup.clone());
+            let error = raw
+                .exchange_with_deadline(
+                    request().to_vec().unwrap(),
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                )
+                .await
+                .unwrap_err();
+            assert!(crate::resolver::dns_setup_pending(&error));
+            fail.send(()).unwrap();
+            done.await.unwrap();
+            // The detached task finished, but no waiter has polled its Shared result.
+            assert!(setup.peek().is_none());
+            raw.exchange(request().to_vec().unwrap()).await.unwrap();
+            assert!(
+                !raw.upstreams[0]
+                    .connection
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .ptr_eq(&setup)
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
 fn udp_responder(
     socket: tokio::net::UdpSocket,
     reply: Arc<AtomicBool>,
