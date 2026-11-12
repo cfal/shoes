@@ -694,7 +694,7 @@ pub struct Writer {
     finished: bool,
     allocation: parking_lot::Mutex<Option<(usize, Reservation)>>,
     pub drain_before_shutdown: bool,
-    failure: Arc<parking_lot::Mutex<Option<io::Error>>>,
+    pub(super) failure: Arc<parking_lot::Mutex<Option<io::Error>>>,
 }
 
 type Reservation = Pin<Box<dyn Future<Output = io::Result<(BudgetPermit, BudgetPermit)>> + Send>>;

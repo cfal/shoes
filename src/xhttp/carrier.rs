@@ -218,8 +218,8 @@ impl Carrier {
                                 "XHTTP H2 carrier {} retired: receive-idle PING unanswered",
                                 health_errors.identity()
                             );
-                            stopped.cancel();
                             health_failed.cancel();
+                            stopped.cancel();
                             return;
                         }
                     }
@@ -475,6 +475,7 @@ impl Carrier {
                     let carrier = self.clone();
                     let cancel = tasks.cancel.clone();
                     let errors = errors.clone();
+                    let failure = writer.failure.clone();
                     tasks.spawn(async move {
                         let _carrier = carrier;
                         let result = tokio::select! {
@@ -483,13 +484,12 @@ impl Carrier {
                             result = send_h2_tracked(body, &mut send, upload, &errors) => result,
                         };
                         if let Err(error) = result {
-                            // RFC 9113 section 8.1 allows an early response followed by NO_ERROR.
-                            // Drain the response; its END_STREAM, not this reset, establishes EOF.
-                            if streaming && error.peer_sent_no_error(&mut send) {
+                            let Some(error) = error.into_upload_error(&mut send, &errors, streaming) else {
                                 return;
-                            }
-                            let error = error.into_io();
+                            };
                             log::debug!("XHTTP H2 upload failed: {error}");
+                            // Cancellation can drop the receive pump before it reports this cause.
+                            failure.lock().get_or_insert(error);
                             send.send_reset(h2::Reason::CANCEL);
                             cancel.cancel();
                         }
@@ -705,14 +705,23 @@ impl H2SendError {
         }
     }
 
-    fn peer_sent_no_error(&self, send: &mut h2::SendStream<Bytes>) -> bool {
-        // poll_capacity can return None and send_data can return a local stream-state error.
-        // Consult the stream's reason without hiding errors from the body producer.
-        matches!(self, Self::Stream(_))
-            && matches!(
-                send.poll_reset(&mut std::task::Context::from_waker(std::task::Waker::noop())),
-                std::task::Poll::Ready(Ok(h2::Reason::NO_ERROR))
-            )
+    fn into_upload_error(
+        self,
+        send: &mut h2::SendStream<Bytes>,
+        errors: &TransportErrors,
+        streaming: bool,
+    ) -> Option<io::Error> {
+        let Self::Stream(error) = self else {
+            return Some(self.into_io());
+        };
+        // Closed capacity and send_data can hide the stream's terminal cause.
+        match send.poll_reset(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+            // RFC 9113 section 8.1 permits early responses followed by NO_ERROR.
+            // Only the response's END_STREAM establishes EOF.
+            std::task::Poll::Ready(Ok(h2::Reason::NO_ERROR)) if streaming => None,
+            std::task::Poll::Ready(Err(terminal)) => Some(errors.map(terminal)),
+            _ => Some(error),
+        }
     }
 }
 

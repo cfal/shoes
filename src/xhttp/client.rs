@@ -985,81 +985,120 @@ mod tests {
     async fn failed_h2_carrier_releases_slots_even_when_download_pipe_is_full() {
         for (buffer_limit, end_stream) in [(16384, false), (262144, false), (262144, true)] {
             tokio::time::timeout(Duration::from_secs(5), async {
-            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-            let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
-            let fail = tokio_util::sync::CancellationToken::new();
-            let stop = fail.clone();
-            let server = Tasks::new();
-            server.spawn(async move {
-                let mut tasks = tokio::task::JoinSet::new();
-                let mut first = true;
-                while let Ok((socket, _)) = listener.accept().await {
-                    let stop = if first { stop.clone() } else { tokio_util::sync::CancellationToken::new() };
-                    first = false;
-                    tasks.spawn(async move {
-                        let mut h2 = h2::server::handshake(socket).await.unwrap();
-                        let mut streams = Vec::new();
-                        loop {
-                            tokio::select! {
-                                _ = stop.cancelled() => return,
-                                request = h2.accept() => {
-                                    let Some(Ok((request, mut response))) = request else { return };
-                                    let mut send = response.send_response(http::Response::new(()), false).unwrap();
-                                    let payload = (0..8 * super::super::stream::CHUNK)
-                                        .map(|index| (index % 251) as u8).collect::<Vec<_>>();
-                                    send.send_data(bytes::Bytes::from(payload), end_stream).unwrap();
-                                    streams.push((request, send));
+                let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+                let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+                let fail = tokio_util::sync::CancellationToken::new();
+                let stop = fail.clone();
+                let server = Tasks::new();
+                server.spawn(async move {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let mut first = true;
+                    while let Ok((socket, _)) = listener.accept().await {
+                        let stop = if first {
+                            stop.clone()
+                        } else {
+                            tokio_util::sync::CancellationToken::new()
+                        };
+                        first = false;
+                        tasks.spawn(async move {
+                            let mut h2 = h2::server::handshake(socket).await.unwrap();
+                            let mut streams = Vec::new();
+                            loop {
+                                tokio::select! {
+                                    _ = stop.cancelled() => return,
+                                    request = h2.accept() => {
+                                        let Some(Ok((request, mut response))) = request else {
+                                            return;
+                                        };
+                                        let mut send = response
+                                            .send_response(http::Response::new(()), false)
+                                            .unwrap();
+                                        let payload = (0..8 * super::super::stream::CHUNK)
+                                            .map(|index| (index % 251) as u8)
+                                            .collect::<Vec<_>>();
+                                        send.send_data(bytes::Bytes::from(payload), end_stream)
+                                            .unwrap();
+                                        streams.push((request, send));
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
+                });
+                let config = crate::config::test_support::from_json(json!({
+                    "pool":{"max_connections":1,"h2_receive_admission":true},
+                    "limits":{"max_buffered_bytes":buffer_limit,"max_sessions":1,
+                        "h2_stream_window_bytes":65535,"h2_connection_window_bytes":65535},
+                    "protocol":{"type":"socks"}
+                }))
+                .unwrap();
+                let client = Arc::new(
+                    Client::new(
+                        config,
+                        NetLocation::from_str("localhost:80", None).unwrap(),
+                        "localhost".into(),
+                        XhttpVersion::H2,
+                        XhttpMode::StreamOne,
+                        Security::Plain,
+                    )
+                    .unwrap(),
+                );
+                let dialer = Arc::new(Dialer {
+                    address,
+                    route: RouteKey(vec![1]),
+                    opens: AtomicUsize::new(0),
+                });
+                let mut stalled = client.open(dialer.clone()).await.unwrap();
+                let queued = if buffer_limit == 16384 { 1 } else { 4 };
+                while stalled.read.receiver.len() < queued {
+                    tokio::task::yield_now().await;
                 }
-            });
-            let config = crate::config::test_support::from_json(json!({
-                "pool":{"max_connections":1,"h2_receive_admission":true},
-                "limits":{"max_buffered_bytes":buffer_limit,"max_sessions":1,
-                    "h2_stream_window_bytes":65535,"h2_connection_window_bytes":65535},
-                "protocol":{"type":"socks"}
-            })).unwrap();
-            let client = Arc::new(Client::new(config, NetLocation::from_str("localhost:80", None).unwrap(),
-                "localhost".into(), XhttpVersion::H2, XhttpMode::StreamOne, Security::Plain).unwrap());
-            let dialer = Arc::new(Dialer {
-                address,
-                route: RouteKey(vec![1]),
-                opens: AtomicUsize::new(0),
-            });
-            let mut stalled = client.open(dialer.clone()).await.unwrap();
-            let queued = if buffer_limit == 16384 { 1 } else { 4 };
-            while stalled.read.receiver.len() < queued { tokio::task::yield_now().await; }
-            let carrier = client.slots.lock()[0].carrier.get().unwrap().clone();
-            let mut spare_credit = Vec::new();
-            while let Ok(Some(permit)) = carrier.admit_download() { spare_credit.push(permit); }
-            assert_ne!(client.slots.lock()[0].active(), 0);
-            fail.cancel();
-            while client.slots.lock()[0].active() != 0 { tokio::task::yield_now().await; }
-            while client.admission.snapshot().active != 0 { tokio::task::yield_now().await; }
-            assert!(carrier.admit_download().unwrap().is_some());
-            drop(spare_credit);
-            let retained = client.memory.snapshot().active;
-            assert!(retained > 0);
-            let mut fresh = client.open(dialer.clone()).await.unwrap();
-            assert_eq!(dialer.opens.load(Ordering::SeqCst), 2);
-            if buffer_limit == 16384 {
-                assert!(futures::poll!(Box::pin(fresh.read_u8())).is_pending());
-                assert_eq!(client.memory.snapshot().active, retained);
-            } else {
-                assert_eq!(fresh.read_u8().await.unwrap(), 0);
-            }
-            let mut prefix = Vec::new();
-            stalled.read_to_end(&mut prefix).await.unwrap_err();
-            assert!(!prefix.is_empty());
-            assert!(prefix.len() < 8 * super::super::stream::CHUNK);
-            assert!(prefix.iter().enumerate().all(|(index, byte)| *byte == (index % 251) as u8));
-            drop(stalled);
-            if buffer_limit == 16384 { assert_eq!(fresh.read_u8().await.unwrap(), 0); }
-            drop(fresh);
-            while client.memory.snapshot().active != 0 { tokio::task::yield_now().await; }
-        }).await.unwrap();
+                let carrier = client.slots.lock()[0].carrier.get().unwrap().clone();
+                let mut spare_credit = Vec::new();
+                while let Ok(Some(permit)) = carrier.admit_download() {
+                    spare_credit.push(permit);
+                }
+                assert_ne!(client.slots.lock()[0].active(), 0);
+                fail.cancel();
+                while client.slots.lock()[0].active() != 0 {
+                    tokio::task::yield_now().await;
+                }
+                while client.admission.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(carrier.admit_download().unwrap().is_some());
+                drop(spare_credit);
+                let retained = client.memory.snapshot().active;
+                assert!(retained > 0);
+                let mut fresh = client.open(dialer.clone()).await.unwrap();
+                assert_eq!(dialer.opens.load(Ordering::SeqCst), 2);
+                if buffer_limit == 16384 {
+                    assert!(futures::poll!(Box::pin(fresh.read_u8())).is_pending());
+                    assert_eq!(client.memory.snapshot().active, retained);
+                } else {
+                    assert_eq!(fresh.read_u8().await.unwrap(), 0);
+                }
+                let mut prefix = Vec::new();
+                stalled.read_to_end(&mut prefix).await.unwrap_err();
+                assert!(!prefix.is_empty());
+                assert!(prefix.len() < 8 * super::super::stream::CHUNK);
+                assert!(
+                    prefix
+                        .iter()
+                        .enumerate()
+                        .all(|(index, byte)| *byte == (index % 251) as u8)
+                );
+                drop(stalled);
+                if buffer_limit == 16384 {
+                    assert_eq!(fresh.read_u8().await.unwrap(), 0);
+                }
+                drop(fresh);
+                while client.memory.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
         }
     }
 
