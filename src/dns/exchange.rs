@@ -291,25 +291,25 @@ impl RawDnsExchange {
         let _permit = self.admission.acquire().await.map_err(io::Error::other)?;
         admitted.store(true, Ordering::Relaxed);
         let mut error = io::Error::new(io::ErrorKind::NotFound, "no real DNS upstreams configured");
+        let upstreams: Vec<_> = self
+            .upstreams
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                !matches!(candidate.config.protocol, ProtocolConfig::Tcp)
+                    || !self.upstreams.iter().any(|udp| {
+                        udp.server_index == candidate.server_index
+                            && udp.same_endpoint(candidate)
+                            && matches!(udp.config.protocol, ProtocolConfig::Udp)
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let concurrency = self.context.options.num_concurrent_reqs.max(1);
+        let waves = upstreams.len().div_ceil(concurrency).max(1);
+        let slot_timeout = self.context.options.timeout / waves.min(u32::MAX as usize) as u32;
         for _ in 0..self.context.options.attempts.max(1) {
-            let upstreams: Vec<_> = self
-                .upstreams
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| {
-                    !matches!(candidate.config.protocol, ProtocolConfig::Tcp)
-                        || !self.upstreams.iter().any(|udp| {
-                            udp.server_index == candidate.server_index
-                                && udp.same_endpoint(candidate)
-                                && matches!(udp.config.protocol, ProtocolConfig::Udp)
-                        })
-                })
-                .map(|(index, _)| index)
-                .collect();
-            let concurrency = self.context.options.num_concurrent_reqs.max(1);
-            let waves = upstreams.len().div_ceil(concurrency).max(1);
-            let slot_timeout = self.context.options.timeout / waves.min(u32::MAX as usize) as u32;
-            let jobs = futures::stream::iter(upstreams).map(|index| {
+            let jobs = futures::stream::iter(upstreams.iter().copied()).map(|index| {
                 self.send(
                     &self.upstreams[index],
                     request,

@@ -501,14 +501,15 @@ mod tests {
             rr::{Name, RecordType},
         };
 
-        #[derive(Debug)]
-        enum UnavailableConnector {
+        #[derive(Clone, Copy, Debug)]
+        enum Failure {
             Exhausted,
-            Pending,
+            AdmissionTimeout,
+            PendingSetup,
         }
 
         #[async_trait::async_trait]
-        impl SocketConnector for UnavailableConnector {
+        impl SocketConnector for Failure {
             async fn connect(
                 &self,
                 _: &Arc<dyn Resolver>,
@@ -516,7 +517,7 @@ mod tests {
             ) -> io::Result<Box<dyn AsyncStream>> {
                 match self {
                     Self::Exhausted => Err(crate::resources::exhausted()),
-                    Self::Pending => std::future::pending().await,
+                    Self::AdmissionTimeout | Self::PendingSetup => std::future::pending().await,
                 }
             }
 
@@ -539,12 +540,11 @@ mod tests {
             RecordType::A,
         ));
         let query = query.to_vec().unwrap();
-        for (failure, admission_timeout) in [
-            (UnavailableConnector::Exhausted, false),
-            (UnavailableConnector::Pending, true),
-            (UnavailableConnector::Pending, false),
+        for failure in [
+            Failure::Exhausted,
+            Failure::AdmissionTimeout,
+            Failure::PendingSetup,
         ] {
-            let exhausted = matches!(failure, UnavailableConnector::Exhausted);
             let lookup: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
             let chain = ClientChainGroup::new(vec![ClientProxyChain::new(
                 vec![InitialHopEntry::Direct(Arc::new(failure))],
@@ -571,7 +571,7 @@ mod tests {
             });
 
             let mut active = Vec::new();
-            if admission_timeout {
+            if matches!(failure, Failure::AdmissionTimeout) {
                 // Fill raw exchange admission while the shared TCP setup stays pending.
                 for _ in 0..64 {
                     let mut pending = Box::pin(exchange.exchange(query.clone()));
@@ -588,19 +588,20 @@ mod tests {
                 .unwrap_err();
             assert_eq!(
                 error.kind(),
-                if admission_timeout {
-                    io::ErrorKind::WouldBlock
-                } else if exhausted {
-                    io::ErrorKind::ConnectionRefused
-                } else {
-                    io::ErrorKind::TimedOut
+                match failure {
+                    Failure::Exhausted => io::ErrorKind::ConnectionRefused,
+                    Failure::AdmissionTimeout => io::ErrorKind::WouldBlock,
+                    Failure::PendingSetup => io::ErrorKind::TimedOut,
                 },
                 "{error:?}"
             );
-            assert_eq!(crate::resources::is_exhausted(&error), exhausted);
+            assert_eq!(
+                crate::resources::is_exhausted(&error),
+                matches!(failure, Failure::Exhausted)
+            );
             assert_eq!(
                 crate::resolver::dns_setup_pending(&error),
-                !admission_timeout && !exhausted,
+                matches!(failure, Failure::PendingSetup),
                 "{error:?}"
             );
             assert!(!crate::resolver::dns_caller_deadline(&error));

@@ -205,23 +205,7 @@ impl DohFixture {
         } else {
             rustls::RootCertStore::empty()
         };
-        crate::rustls_config_util::with_test_roots(roots, || {
-            HickoryResolver::https(
-                self.address,
-                "localhost".into(),
-                "/dns-query".into(),
-                chain,
-                bootstrap,
-                HickoryResolverOptions {
-                    ip_strategy: super::IpStrategy::Ipv4Only,
-                    request_timeout: Some(Duration::from_millis(150)),
-                    connect_timeout: Duration::from_secs(1),
-                    attempts,
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-        })
+        doh_resolver(self.address, roots, chain, bootstrap, attempts)
     }
 
     async fn wait_closed(&self) {
@@ -252,23 +236,8 @@ impl DohFixture {
         let builds = self.builds.clone();
         let factory: crate::resolver::ResolverFactory = Arc::new(move || {
             builds.fetch_add(1, Ordering::SeqCst);
-            let resolver = crate::rustls_config_util::with_test_roots(roots.clone(), || {
-                HickoryResolver::https(
-                    address,
-                    "localhost".into(),
-                    "/dns-query".into(),
-                    chain.clone(),
-                    bootstrap.clone(),
-                    HickoryResolverOptions {
-                        ip_strategy: super::IpStrategy::Ipv4Only,
-                        request_timeout: Some(Duration::from_millis(150)),
-                        connect_timeout: Duration::from_secs(1),
-                        attempts: 1,
-                        ..Default::default()
-                    },
-                )
-                .unwrap()
-            });
+            let resolver =
+                doh_resolver(address, roots.clone(), chain.clone(), bootstrap.clone(), 1);
             Box::pin(async move { Ok(Arc::new(resolver) as Arc<dyn Resolver>) })
         });
         crate::resolver::RefreshingResolver::new(
@@ -281,6 +250,32 @@ impl DohFixture {
         .await
         .unwrap()
     }
+}
+
+fn doh_resolver(
+    address: SocketAddr,
+    roots: rustls::RootCertStore,
+    chain: Arc<crate::client_proxy_chain::ClientChainGroup>,
+    bootstrap: Arc<dyn Resolver>,
+    attempts: usize,
+) -> HickoryResolver {
+    crate::rustls_config_util::with_test_roots(roots, || {
+        HickoryResolver::https(
+            address,
+            "localhost".into(),
+            "/dns-query".into(),
+            chain,
+            bootstrap,
+            HickoryResolverOptions {
+                ip_strategy: super::IpStrategy::Ipv4Only,
+                request_timeout: Some(Duration::from_millis(150)),
+                connect_timeout: Duration::from_secs(1),
+                attempts,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    })
 }
 
 fn query(sequence: usize) -> Vec<u8> {

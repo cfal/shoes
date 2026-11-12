@@ -212,6 +212,7 @@ pub struct RefreshPolicy {
 /// Resolver wrapper that rebuilds its inner resolver on idle timeout or
 /// connection-related errors. Targets stale pooled connection state in
 /// hickory-backed resolvers.
+#[derive(Clone)]
 pub struct RefreshingResolver {
     factory: ResolverFactory,
     refresh_lock: Arc<AsyncMutex<()>>,
@@ -286,14 +287,11 @@ impl RefreshingResolver {
         + Send
         + 'static,
     ) -> Pin<Box<dyn Future<Output = std::io::Result<T>> + Send>> {
-        let refresh_lock = self.refresh_lock.clone();
-        let factory = self.factory.clone();
-        let refresh_state = self.refresh_state.clone();
-        let policy = self.policy;
-        let description = self.description.clone();
+        let resolver = self.clone();
 
         Box::pin(async move {
-            let configured_deadline = refresh_state
+            let configured_deadline = resolver
+                .refresh_state
                 .lock()
                 .current
                 .request_timeout()
@@ -302,23 +300,15 @@ impl RefreshingResolver {
                 (Some(caller), Some(configured)) => Some(caller.min(configured)),
                 (caller, configured) => caller.or(configured),
             };
-            let current = Self::current(
-                &factory,
-                &refresh_state,
-                &refresh_lock,
-                policy,
-                &description,
-                deadline,
-            )
-            .await?;
+            let current = resolver.current(deadline).await?;
             let result = operation(current.clone(), deadline).await;
             match &result {
-                Ok(_) => Self::record_success(&refresh_state, &current, &description),
+                Ok(_) => resolver.record_success(&current),
                 // A retained handshake owns its deadline and can serve a later query.
                 Err(error)
                     if Self::should_refresh_for_error(error) && !dns_setup_pending(error) =>
                 {
-                    Self::invalidate(&refresh_state, &current, &description, error);
+                    resolver.invalidate(&current, error);
                 }
                 Err(_) => {}
             }
@@ -326,14 +316,9 @@ impl RefreshingResolver {
         })
     }
 
-    fn invalidate(
-        state: &Mutex<RefreshState>,
-        current: &Arc<dyn Resolver>,
-        description: &str,
-        error: &std::io::Error,
-    ) {
+    fn invalidate(&self, current: &Arc<dyn Resolver>, error: &std::io::Error) {
         let (generation, report) = {
-            let mut state = state.lock();
+            let mut state = self.refresh_state.lock();
             if state.invalidated || !Arc::ptr_eq(&state.current, current) {
                 return;
             }
@@ -349,19 +334,21 @@ impl RefreshingResolver {
         };
         if report {
             log::info!(
-                "DNS resolver {description} generation {generation}: transport retired after {error}"
+                "DNS resolver {} generation {generation}: transport retired after {error}",
+                self.description
             );
         }
         current.retire();
     }
 
-    fn record_success(state: &Mutex<RefreshState>, current: &Arc<dyn Resolver>, description: &str) {
-        let mut state = state.lock();
+    fn record_success(&self, current: &Arc<dyn Resolver>) {
+        let mut state = self.refresh_state.lock();
         if !state.invalidated && Arc::ptr_eq(&state.current, current) {
             state.last_activity_at = Some(Instant::now());
             if state.recovering {
                 log::info!(
-                    "DNS resolver {description} generation {}: query recovered",
+                    "DNS resolver {} generation {}: query recovered",
+                    self.description,
                     state.generation
                 );
                 state.recovering = false;
@@ -370,45 +357,44 @@ impl RefreshingResolver {
     }
 
     async fn current(
-        factory: &ResolverFactory,
-        state: &Mutex<RefreshState>,
-        lock: &AsyncMutex<()>,
-        policy: RefreshPolicy,
-        description: &str,
+        &self,
         deadline: Option<tokio::time::Instant>,
     ) -> std::io::Result<Arc<dyn Resolver>> {
         let needs_refresh = |state: &RefreshState| {
             state.invalidated
                 || state
                     .last_activity_at
-                    .is_some_and(|last| last.elapsed() > policy.max_idle)
+                    .is_some_and(|last| last.elapsed() > self.policy.max_idle)
         };
         {
-            let state = state.lock();
+            let state = self.refresh_state.lock();
             if !needs_refresh(&state) {
                 return Ok(state.current.clone());
             }
         }
-        let _guard = Self::refresh_wait(deadline, lock.lock()).await?;
+        let _guard = Self::refresh_wait(deadline, self.refresh_lock.lock()).await?;
         {
-            let state = state.lock();
+            let state = self.refresh_state.lock();
             if !needs_refresh(&state) {
                 return Ok(state.current.clone());
             }
         }
-        let fresh = match Self::refresh_wait(deadline, factory()).await? {
+        let fresh = match Self::refresh_wait(deadline, (self.factory)()).await? {
             Ok(fresh) => fresh,
             Err(error) => {
-                let state = state.lock();
+                let state = self.refresh_state.lock();
                 if state.invalidated {
                     return Err(error);
                 }
-                log::debug!("DNS resolver {description}: idle refresh failed: {error}");
+                log::debug!(
+                    "DNS resolver {}: idle refresh failed: {error}",
+                    self.description
+                );
                 return Ok(state.current.clone());
             }
         };
         let old = {
-            let mut state = state.lock();
+            let mut state = self.refresh_state.lock();
             let old = std::mem::replace(&mut state.current, fresh.clone());
             state.last_activity_at = if state.invalidated {
                 None
@@ -418,7 +404,8 @@ impl RefreshingResolver {
             state.invalidated = false;
             state.generation = state.generation.wrapping_add(1);
             log::debug!(
-                "DNS resolver {description}: installed generation {}: {fresh:?}",
+                "DNS resolver {}: installed generation {}: {fresh:?}",
+                self.description,
                 state.generation
             );
             old
