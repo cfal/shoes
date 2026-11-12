@@ -1,6 +1,47 @@
 use super::*;
 
 #[cfg(unix)]
+use hickory_resolver::proto::{
+    op::Message,
+    rr::{RData, Record, rdata},
+};
+
+#[cfg(unix)]
+fn signal(signal: i32) {
+    assert_eq!(unsafe { libc::kill(std::process::id() as i32, signal) }, 0);
+}
+
+#[cfg(unix)]
+fn loopback_dns_reply(request: Message) -> Vec<u8> {
+    let mut reply = request.into_response();
+    reply.add_answer(Record::from_rdata(
+        reply.queries[0].name().clone(),
+        300,
+        RData::A(rdata::A::new(127, 0, 0, 1)),
+    ));
+    reply.to_vec().unwrap()
+}
+
+#[cfg(unix)]
+async fn ntp_reply(
+    socket: &tokio::net::UdpSocket,
+    request: [u8; 48],
+    peer: std::net::SocketAddr,
+    offset_secs: u64,
+) {
+    let mut response = [0; 48];
+    response[0] = 0x24;
+    response[1] = 1;
+    response[3] = (-20i8) as u8;
+    response[24..32].copy_from_slice(&request[40..48]);
+    let timestamp = (u64::from_be_bytes(request[40..48].try_into().unwrap()) + (offset_secs << 32))
+        .to_be_bytes();
+    response[32..40].copy_from_slice(&timestamp);
+    response[40..48].copy_from_slice(&timestamp);
+    socket.send_to(&response, peer).await.unwrap();
+}
+
+#[cfg(unix)]
 async fn wait_for_socks(address: std::net::SocketAddr) -> tokio::net::TcpStream {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -202,10 +243,7 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
                 serde_json::json!({"address":added.to_string(), "protocol":{"type":"socks"}}),
             );
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-            assert_eq!(
-                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
-                0
-            );
+            signal(libc::SIGHUP);
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(tokio::net::TcpStream::connect(added).await.is_err());
             events.send(Some(true)).await.unwrap();
@@ -215,10 +253,7 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
             assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
             config.push(serde_json::json!({"path":directory.path(), "protocol":{"type":"socks"}}));
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-            assert_eq!(
-                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
-                0
-            );
+            signal(libc::SIGHUP);
             tokio::time::sleep(Duration::from_millis(100)).await;
             events.send(Some(true)).await.unwrap();
             // Recovery must retry the accepted config without another reload of the rejected file.
@@ -240,20 +275,14 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
                     .is_err()
             );
             std::fs::write(&path, "invalid: [").unwrap();
-            assert_eq!(
-                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
-                0
-            );
+            signal(libc::SIGHUP);
             assert!(
                 tokio::time::timeout(Duration::from_secs(1), queued.read_u8())
                     .await
                     .is_err()
             );
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-            assert_eq!(
-                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
-                0
-            );
+            signal(libc::SIGHUP);
             // An unchanged reload fails activation, but must not end recovery.
             assert!(
                 tokio::time::timeout(Duration::from_secs(1), queued.read_u8())
@@ -262,20 +291,14 @@ async fn reconnect_loop_defers_offline_reload_and_accepts_repairs_after_failed_s
             );
             config.remove(1);
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-            assert_eq!(
-                unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) },
-                0
-            );
+            signal(libc::SIGHUP);
             assert_eq!(queued.read_u8().await.unwrap(), 5);
             assert_eq!(queued.read_u8().await.unwrap(), 0);
             assert!(unix.is_dir());
             let mut live = wait_for_socks(added).await;
             events.send(Some(false)).await.unwrap();
             assert_eq!(live.read(&mut [0]).await.unwrap(), 0);
-            assert_eq!(
-                unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) },
-                0
-            );
+            signal(libc::SIGTERM);
         };
         tokio::select! {
             result = &mut process => panic!("process exited before recovery: {result:?}"),
@@ -297,8 +320,7 @@ async fn reconnect_respects_dns_deadlines_and_remains_shutdown_cancellable() {
         shoes_test_support::isolated::run_isolated(NAME, CHILD, "1");
         return;
     }
-    use hickory_resolver::proto::op::Message;
-    use hickory_resolver::proto::rr::{RData, Record, RecordType, rdata};
+    use hickory_resolver::proto::rr::RecordType;
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -321,14 +343,9 @@ async fn reconnect_respects_dns_deadlines_and_remains_shutdown_cancellable() {
                         result = dns.recv_from(&mut bytes) => result.unwrap(),
                         _ = responses.join_next(), if !responses.is_empty() => continue,
                     };
-                    let mut reply = Message::from_vec(&bytes[..length]).unwrap().into_response();
-                    assert_eq!(reply.queries[0].query_type, RecordType::A);
-                    reply.add_answer(Record::from_rdata(
-                        reply.queries[0].name().clone(),
-                        300,
-                        RData::A(rdata::A::new(127, 0, 0, 1)),
-                    ));
-                    let bytes = reply.to_vec().unwrap();
+                    let request = Message::from_vec(&bytes[..length]).unwrap();
+                    assert_eq!(request.queries[0].query_type, RecordType::A);
+                    let bytes = loopback_dns_reply(request);
                     let socket = dns.clone();
                     let delay = Duration::from_secs(response_delay.load(Ordering::Relaxed));
                     requested.send(()).unwrap();
@@ -373,7 +390,7 @@ async fn reconnect_respects_dns_deadlines_and_remains_shutdown_cancellable() {
                     config.drain(..2);
                     config.push(serde_json::json!({"address":added.to_string(), "protocol":{"type":"socks"}}));
                     std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-                    assert_eq!(unsafe { libc::kill(std::process::id() as i32, libc::SIGHUP) }, 0);
+                    signal(libc::SIGHUP);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 delay.store(if repair_reload { 60 } else { 11 }, Ordering::Relaxed);
@@ -395,7 +412,7 @@ async fn reconnect_respects_dns_deadlines_and_remains_shutdown_cancellable() {
                     events.send(Some(true)).await.unwrap();
                     requests.recv().await.unwrap();
                 }
-                assert_eq!(unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) }, 0);
+                signal(libc::SIGTERM);
             };
             tokio::select! {
                 result = &mut process => panic!("process exited before recovery: {result:?}"),
@@ -450,7 +467,7 @@ async fn reconnect_restarts_certificate_workers_retired_by_a_rejected_candidate(
         .unwrap();
     let mut running = RunningServers::default();
     old.scope(running.start_retry(&mut prepared)).await.unwrap();
-    old.scope(running.commit_activation(&mut prepared, None))
+    old.scope(running.commit_activation(&prepared, None))
         .await
         .unwrap();
     challenge(address).await;
@@ -466,10 +483,7 @@ async fn reconnect_restarts_certificate_workers_retired_by_a_rejected_candidate(
         .unwrap();
     let fresh = crate::network_tasks::NetworkLifetime::default();
     fresh
-        .scope(running.refresh_network(
-            &mut prepared,
-            &mut crate::desktop::NetworkSession::default(),
-        ))
+        .scope(running.refresh_network(&mut prepared, &crate::desktop::NetworkSession::default()))
         .await
         .unwrap();
     fresh
@@ -510,10 +524,6 @@ async fn recovery_retry_restores_runtime_before_dns_bootstrap() {
         shoes_test_support::isolated::run_isolated(NAME, CHILD, "1");
         return;
     }
-    use hickory_resolver::proto::{
-        op::Message,
-        rr::{RData, Record, rdata},
-    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::task::AbortOnDropHandle;
 
@@ -530,29 +540,16 @@ async fn recovery_retry_restores_runtime_before_dns_bootstrap() {
                     resources::try_quic_memory(2).is_some(),
                     crate::clock::now().unwrap().duration_since(std::time::SystemTime::now()).unwrap_or_default(),
                 )).unwrap();
-                let mut reply = Message::from_vec(&bytes[..length]).unwrap().into_response();
-                reply.add_answer(Record::from_rdata(
-                    reply.queries[0].name().clone(), 300,
-                    RData::A(rdata::A::new(127, 0, 0, 1)),
-                ));
-                dns.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+                let reply = loopback_dns_reply(Message::from_vec(&bytes[..length]).unwrap());
+                dns.send_to(&reply, peer).await.unwrap();
             }
         }));
         let ntp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ntp_address = ntp.local_addr().unwrap();
-        let ntp_reply = tokio::spawn(async move {
+        let ntp_task = tokio::spawn(async move {
             let mut request = [0; 48];
             let (_, peer) = ntp.recv_from(&mut request).await.unwrap();
-            let mut response = [0; 48];
-            response[0] = 0x24;
-            response[1] = 1;
-            response[3] = (-20i8) as u8;
-            response[24..32].copy_from_slice(&request[40..48]);
-            let timestamp = (u64::from_be_bytes(request[40..48].try_into().unwrap())
-                + (86_400u64 << 32)).to_be_bytes();
-            response[32..40].copy_from_slice(&timestamp);
-            response[40..48].copy_from_slice(&timestamp);
-            ntp.send_to(&response, peer).await.unwrap();
+            ntp_reply(&ntp, request, peer, 86_400).await;
         });
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
@@ -573,7 +570,7 @@ async fn recovery_retry_restores_runtime_before_dns_bootstrap() {
         let mut previous = old.scope(prepare(&paths, None)).await.unwrap();
         let mut running = RunningServers::default();
         old.scope(running.start_retry(&mut previous)).await.unwrap();
-        old.scope(running.commit_activation(&mut previous, None)).await.unwrap();
+        old.scope(running.commit_activation(&previous, None)).await.unwrap();
         assert!(observations.recv().await.unwrap().0);
         running.pause_network(&mut previous, None, &old).await.unwrap();
 
@@ -585,7 +582,7 @@ async fn recovery_retry_restores_runtime_before_dns_bootstrap() {
         let fresh = crate::network_tasks::NetworkLifetime::default();
         let mut candidate = fresh.scope(prepare(&paths, Some(&previous.dns))).await.unwrap();
         fresh.scope(running.start_retry(&mut candidate)).await.unwrap_err();
-        ntp_reply.await.unwrap();
+        ntp_task.await.unwrap();
         assert_eq!(resources::limits().quic_memory_bytes, Some(1));
         assert!(crate::clock::now().unwrap() > std::time::SystemTime::now() + Duration::from_secs(86_399));
         fresh.scope(running.discard_candidate(&mut previous, &mut candidate)).await.unwrap();
@@ -598,7 +595,7 @@ async fn recovery_retry_restores_runtime_before_dns_bootstrap() {
 
         let retry = crate::network_tasks::NetworkLifetime::default();
         retry.scope(running.refresh_network(
-            &mut previous, &mut crate::desktop::NetworkSession::default(),
+            &mut previous, &crate::desktop::NetworkSession::default(),
         )).await.unwrap();
         retry.scope(running.start_retry(&mut previous)).await.unwrap();
         retry.scope(running.finish_activation(&previous, None)).await.unwrap();
@@ -642,7 +639,7 @@ async fn network_reset_keeps_controller_generation_and_explicit_selection() {
     let paths = [path.to_string_lossy().into_owned()];
     let configs = config::load_config_files(&paths).await.unwrap();
     let mut control = None;
-    let mut network = crate::desktop::NetworkSession::default();
+    let network = crate::desktop::NetworkSession::default();
     let old = crate::network_tasks::NetworkLifetime::default();
     let mut prepared = old
         .scope(prepare_tracking(
@@ -680,7 +677,7 @@ async fn network_reset_keeps_controller_generation_and_explicit_selection() {
     );
     let fresh = crate::network_tasks::NetworkLifetime::default();
     fresh
-        .scope(running.refresh_network(&mut prepared, &mut network))
+        .scope(running.refresh_network(&mut prepared, &network))
         .await
         .unwrap();
     fresh
@@ -727,33 +724,8 @@ async fn repair_reload_restores_runtime_and_checks_underlay_before_publication()
         return;
     }
     let available_after_change = std::env::var(CHILD).unwrap() == "available";
-    use hickory_resolver::proto::{
-        op::Message,
-        rr::{RData, Record, rdata},
-    };
     use std::sync::{Arc, atomic::Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    async fn ntp_reply(
-        socket: &tokio::net::UdpSocket,
-        request: [u8; 48],
-        peer: std::net::SocketAddr,
-        offset: u64,
-    ) {
-        let mut response = [0; 48];
-        response[0] = 0x24;
-        response[1] = 1;
-        response[3] = (-20i8) as u8;
-        response[24..32].copy_from_slice(&request[40..48]);
-        let timestamp = (u64::from_be_bytes(request[40..48].try_into().unwrap()) + (offset << 32))
-            .to_be_bytes();
-        response[32..40].copy_from_slice(&timestamp);
-        response[40..48].copy_from_slice(&timestamp);
-        socket.send_to(&response, peer).await.unwrap();
-    }
-    fn signal(signal: i32) {
-        assert_eq!(unsafe { libc::kill(std::process::id() as i32, signal) }, 0);
-    }
 
     tokio::time::timeout(Duration::from_secs(15), async {
         let directory = tempfile::tempdir().unwrap();
@@ -847,13 +819,8 @@ async fn repair_reload_restores_runtime_and_checks_underlay_before_publication()
                     offset < Duration::from_secs(1),
                     "repair preparation used rejected clock: {offset:?}"
                 );
-                let mut reply = Message::from_vec(&bytes[..len]).unwrap().into_response();
-                reply.add_answer(Record::from_rdata(
-                    reply.queries[0].name().clone(),
-                    300,
-                    RData::A(rdata::A::new(127, 0, 0, 1)),
-                ));
-                dns.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+                let reply = loopback_dns_reply(Message::from_vec(&bytes[..len]).unwrap());
+                dns.send_to(&reply, peer).await.unwrap();
 
                 let (_, peer) = ntp.recv_from(&mut packet).await.unwrap();
                 let mut queued = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -878,13 +845,8 @@ async fn repair_reload_restores_runtime_and_checks_underlay_before_publication()
                     events.send(Some(true)).await.unwrap();
                 }
                 let (len, peer) = dns.recv_from(&mut bytes).await.unwrap();
-                let mut reply = Message::from_vec(&bytes[..len]).unwrap().into_response();
-                reply.add_answer(Record::from_rdata(
-                    reply.queries[0].name().clone(),
-                    300,
-                    RData::A(rdata::A::new(127, 0, 0, 1)),
-                ));
-                dns.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+                let reply = loopback_dns_reply(Message::from_vec(&bytes[..len]).unwrap());
+                dns.send_to(&reply, peer).await.unwrap();
                 let (_, peer) = ntp.recv_from(&mut packet).await.unwrap();
                 ntp_reply(&ntp, packet, peer, 0).await;
                 let _live = wait_for_socks(address).await;
@@ -958,7 +920,7 @@ async fn reconnect_uses_memory_and_cancels_current_and_draining_connections() {
             assert!(matches!(result, Ok(0)) || result.is_err(), "{result:?}");
         }
         lifetime = crate::network_tasks::NetworkLifetime::default();
-        lifetime.scope(running.refresh_network(&mut prepared, &mut crate::desktop::NetworkSession::default()))
+        lifetime.scope(running.refresh_network(&mut prepared, &crate::desktop::NetworkSession::default()))
             .await.unwrap();
         lifetime.scope(running.start_retry(&mut prepared)).await.unwrap();
         lifetime.scope(running.finish_activation(&prepared, None)).await.unwrap();
@@ -1170,10 +1132,7 @@ async fn rejected_or_cancelled_activation_does_not_admit_candidate_dns_flows() {
                     .await
                     .unwrap();
                 running.start_retry(&mut previous).await.unwrap();
-                running
-                    .commit_activation(&mut previous, None)
-                    .await
-                    .unwrap();
+                running.commit_activation(&previous, None).await.unwrap();
             }
             drop(candidate);
             assert!(resolver.upgrade().is_none());

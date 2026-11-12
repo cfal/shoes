@@ -395,7 +395,7 @@ impl RunningServers {
     async fn refresh_network(
         &mut self,
         prepared: &mut PreparedServers,
-        network: &mut crate::desktop::NetworkSession,
+        network: &crate::desktop::NetworkSession,
     ) -> io::Result<()> {
         // Rejected activation may have published candidate limits and clock.
         self.configure_runtime(prepared).await?;
@@ -611,8 +611,8 @@ impl RunningServers {
     }
 
     async fn commit_activation(
-        &mut self,
-        prepared: &mut PreparedServers,
+        &self,
+        prepared: &PreparedServers,
         control: Option<&crate::control::runtime::ControlService>,
     ) -> io::Result<()> {
         if let (Some(control), Some(generation)) = (control, &prepared.generation) {
@@ -622,7 +622,7 @@ impl RunningServers {
     }
 
     async fn finish_activation(
-        &mut self,
+        &self,
         prepared: &PreparedServers,
         control: Option<&crate::control::runtime::ControlService>,
     ) -> io::Result<()> {
@@ -1218,7 +1218,7 @@ async fn run_inner(
             result = tokio::select! {
                 biased;
                 _ = shutdown.recv() => return running.shutdown_network(&[&prepared, &candidate], network).await,
-                result = lifetime.scope(running.commit_activation(&mut candidate, control.as_ref())) => result,
+                result = lifetime.scope(running.commit_activation(&candidate, control.as_ref())) => result,
             };
         }
         if let Err(error) = result {
@@ -1232,9 +1232,7 @@ async fn run_inner(
                         .await
                 } else {
                     running.start_retry(&mut prepared).await?;
-                    running
-                        .commit_activation(&mut prepared, control.as_ref())
-                        .await
+                    running.commit_activation(&prepared, control.as_ref()).await
                 }
             };
             let fallback_result = tokio::select! {
