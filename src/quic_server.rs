@@ -132,6 +132,9 @@ pub async fn start_quic_servers(
     config: ResolvedServerConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
+    if matches!(config.protocol, ResolvedServerProxyConfig::Shadowquic(_)) {
+        return crate::shadowquic_server::start(config, resolver).await;
+    }
     let ResolvedServerConfig {
         bind_location,
         quic_settings,

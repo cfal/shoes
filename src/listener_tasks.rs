@@ -93,6 +93,11 @@ impl Drop for QuicListener {
     }
 }
 
+/// Register a socket retirement from a protocol-specific QUIC backend.
+pub(crate) fn register_quic_retirement(released: oneshot::Receiver<()>) {
+    let _ = QUIC_RETIREMENTS.try_with(|retirements| retirements.0.lock().push(released));
+}
+
 /// Accepted connections may drain after reload, but cannot outlive its deadline.
 pub(crate) struct ListenerTasks {
     tasks: JoinSet<()>,

@@ -11,8 +11,9 @@
   challenge:
     type: http01
     listen: ["0.0.0.0:8080"]
-  # Alternatively, forward public TCP :443 to :8443 and use:
-  # challenge: {type: tls_alpn01}
+  # DNS-01 supports wildcard names; use a Cloudflare API token scoped to DNS edit.
+  # Store the token in the service environment; shoes resolves ${CLOUDFLARE_API_TOKEN}.
+  # challenge: {type: dns01, provider: cloudflare, api_token: '${CLOUDFLARE_API_TOKEN}'}
 
 - address: "0.0.0.0:8443"
   protocol:
