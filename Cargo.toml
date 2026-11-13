@@ -122,6 +122,7 @@ path = "tests/stress.rs"
 required-features = ["stress-tests"]
 
 [dependencies]
+quinn-jls = { version = "=0.4.0", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 aho-corasick = "1"
 anyhow = "1"
 async-trait = "*"

@@ -1290,6 +1290,12 @@ fn resolve_server_config(
             "UDP listener transport is not supported",
         ));
     }
+    let shadowquic = matches!(server_config.protocol, ServerProxyConfig::Shadowquic(_));
+    if shadowquic && server_config.quic_settings.is_some() {
+        return Err(std::io::Error::other(
+            "ShadowQuic uses internal JLS certificates; omit quic_settings",
+        ));
+    }
     // First handle QUIC settings certificates
     if let Some(ref mut quic_settings) = server_config.quic_settings {
         if let ServerProxyConfig::TuicV5 {
@@ -1332,6 +1338,7 @@ fn resolve_server_config(
                     *num_endpoints = get_num_threads();
                 }
             }
+            None if shadowquic => {}
             None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -2044,6 +2051,9 @@ fn validate_server_proxy_scalars(
     context: ServerProtocolContext,
 ) -> std::io::Result<()> {
     validate_server_auth(server_proxy_config)?;
+    if let ServerProxyConfig::Shadowquic(config) = server_proxy_config {
+        crate::shadowquic_server::validate(config)?;
+    }
     match server_proxy_config {
         ServerProxyConfig::SudokuMask(config) => {
             config.prepare()?;
@@ -2053,7 +2063,9 @@ fn validate_server_proxy_scalars(
                 "WireGuard requires a top-level server protocol",
             ));
         }
-        ServerProxyConfig::Hysteria2 { .. } | ServerProxyConfig::TuicV5 { .. }
+        ServerProxyConfig::Shadowquic(_)
+        | ServerProxyConfig::Hysteria2 { .. }
+        | ServerProxyConfig::TuicV5 { .. }
             if context != ServerProtocolContext::Quic =>
         {
             return Err(std::io::Error::new(
@@ -2472,6 +2484,7 @@ fn resolve_server_proxy_config(
         ServerProxyConfig::PortForward { targets } => {
             ResolvedServerProxyConfig::PortForward { targets }
         }
+        ServerProxyConfig::Shadowquic(config) => ResolvedServerProxyConfig::Shadowquic(config),
         ServerProxyConfig::Hysteria2 {
             password,
             udp_enabled,

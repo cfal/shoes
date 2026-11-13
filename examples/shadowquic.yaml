@@ -1,0 +1,15 @@
+# ShadowQuic inbound: JLS provides authentication and generates its own certificate.
+# Do not configure quic_settings. Replace the example upstream and credentials.
+- address: 0.0.0.0:443
+  transport: quic
+  protocol:
+    type: shadowquic
+    users:
+      - username: alice
+        password: replace-with-a-long-random-password
+    server_name: example.com
+    jls_upstream: example.com:443
+    zero_rtt: true
+    udp_enabled: true
+  rules:
+    - allow-all-direct

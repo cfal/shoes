@@ -288,3 +288,11 @@ Hosted macOS watcher/rootless-TUN tests, desktop builds, Android arm64/armv7 and
 iOS device/simulator builds remain required. Cross-compilation is not device
 runtime coverage; Windows and mobile-device execution are not covered by these
 workflows. Do not claim those platforms passed runtime tests.
+
+### ShadowQuic JLS transport
+
+`quinn-jls` 0.4.0 is a separate transport backend matching ShadowQuic 0.4.10.
+It brings `quinn-proto-jls`, `quinn-udp-jls`, and `rustls-jls`; retain the regular
+Quinn/rustls backend and REALITY patch for existing Shoes protocols. Do not replace
+JLS with ordinary QUIC authentication. The reference interoperability fixture is
+under `tests/fixtures/shadowquic-peer/` and builds against an external checkout.

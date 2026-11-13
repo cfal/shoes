@@ -131,3 +131,5 @@ pub(crate) mod wireguard;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
 pub mod ffi;
 mod xhttp;
+
+mod shadowquic_server;
