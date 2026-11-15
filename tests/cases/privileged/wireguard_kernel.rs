@@ -10,7 +10,7 @@ use shoes_test_support::{
     wireguard::{ECHO_TCP_BYTES, EchoTargets, connect},
 };
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     future::Future,
     io::{self, Write},
     net::{IpAddr, SocketAddr},
@@ -90,6 +90,13 @@ fn isolated_test(name: &str, cases: impl Future<Output = io::Result<()>>) -> io:
             .block_on(async { timeout(Duration::from_secs(180), cases).await? });
     }
 
+    // sudo-rs ignores -E, so the selected binary travels as an explicit env argument.
+    let shoes_binary = std::env::var_os("SHOES_TEST_SHOES_BIN")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_shoes"))
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_shoes").into());
+    let mut shoes_env = OsString::from("SHOES_TEST_SHOES_BIN=");
+    shoes_env.push(shoes_binary);
+
     // PID namespace teardown also kills Shoes if the test aborts or exceeds the deadline.
     let output = Command::new("sudo")
         .args(["-n", "-E", "--"])
@@ -106,6 +113,7 @@ fn isolated_test(name: &str, cases: impl Future<Output = io::Result<()>>) -> io:
             "--",
         ])
         .arg("env")
+        .arg(shoes_env)
         .arg(format!("{PARENT_NETNS}={}", namespace.display()))
         .arg(format!(
             "{PARENT_MOUNTNS}={}",
