@@ -30,6 +30,60 @@ Check every resolved consumer, especially Quinn, tokio-rustls, hyper-rustls,
 rustls-platform-verifier, Hickory and Shoes; absence of unused-patch warnings is
 not sufficient. Keep `publish = false` while workspace patches remain.
 
+### BLAKE3
+
+The November 15 refresh retains package version **1.8.7**, also the latest
+non-yanked stable registry release at that date. The release is based on
+[`f3149ec5bb5449af877ba20377a11008ff499fa2`](https://github.com/BLAKE3-team/BLAKE3/releases/tag/1.8.7);
+the fork instead targets unreleased upstream master
+[`657284b1fa4c4378aa7422b4450dcb5c2c9052fc`](https://github.com/BLAKE3-team/BLAKE3/commit/657284b1fa4c4378aa7422b4450dcb5c2c9052fc).
+
+The source series was `derive-key-bytes-upstream-20261021`, at the previous Shoes
+pin `cd98c1c4112ed3b2cf2140e1844f266b3d665b53`, based on upstream
+`f55849f89cd85083c1c9daa2c5de20766f309c00`. Its one custom API commit is retained
+unchanged by the rebase. A separate test-only fix replaces allocated vectors
+with fixed arrays so the binary-context regression also compiles without `std`.
+The published candidate is
+[`5bd8a7ef060bac222502a449bb89b7bdcdb8ec09`](https://github.com/cfal/BLAKE3/tree/5bd8a7ef060bac222502a449bb89b7bdcdb8ec09)
+on `derive-key-bytes-upstream-20261115-1794700800046000`. Existing branches and
+tags remain intact, retaining old pins. The fork's default `master` does not
+carry the API; discover the published patch series before future refreshes.
+
+The only new upstream change replaces secret-indexed hexadecimal lookup with
+nibble arithmetic in `Hash::to_hex`, also used by `Display` and `Debug`.
+Lowercase output bytes are unchanged. Upstream describes this as
+"constant-ish" time, not a compiler-independent constant-time guarantee.
+Earlier stack-buffer alignment and AVX-512 zero-output soundness fixes remain
+included; neither is part of released 1.8.7. Release 1.8.7's removal of the
+compromised `arrayref` dependency was already included in the previous pin.
+Public APIs, features, dependencies, native build scripts, supported targets,
+SIMD dispatch and zeroization are unchanged. Upstream CI's Rust 1.85.1 build
+still works with a fresh MSRV-compatible dependency resolution; this does not
+make newer transitive releases compatible with that compiler. Shoes keeps its
+existing Rust floor and locked dependency versions.
+
+[Upstream PR #596](https://github.com/BLAKE3-team/BLAKE3/pull/596) remains unmerged.
+Retain the patch until a non-yanked registry release provides equivalent
+raw-byte derivation that passes these vectors.
+VLESS Encryption requires raw-byte contexts, including NUL and invalid UTF-8:
+`DERIVE_KEY_CONTEXT` hashes the context, then `DERIVE_KEY_MATERIAL` hashes the
+material using that context key. Text, hex, base64, lossy conversion and ordinary
+keyed hashing are not substitutes. Preserve equivalence with `derive_key` for
+valid UTF-8 and every Go-derived binary vector, including empty and multi-chunk
+contexts. No Shoes API adaptation or wire-format change is needed. Check all
+callers, including ordinary hashes in VLESS, NaiveProxy and rule updates, plus
+Shadowsocks' textual KDF and XOF-derived subkeys.
+
+Future updates must inspect the complete upstream delta and `range-diff`, then
+run the fork's current CI matrix, official vectors and binary-context regression
+in native/intrinsics/pure debug and release builds, including `no_std` and public
+features. Confirm actual SIMD support: this refresh's local x86_64 Linux tests
+executed SSE2, SSE4.1 and AVX2, but not AVX-512 or other architectures. Passing
+early-return tests are not hardware coverage. In Shoes, use the current pinned
+peer workflow, `binary_context_kdfs_match_go`, the VLESS Encryption fixtures,
+Shadowsocks and NaiveProxy tests. Verify the final published full SHA with
+`--locked`, inspect every resolved consumer, and regenerate dependency notices.
+
 ### GotaTun
 
 Pinned to upstream main at `c06582e41022bcecbf33751631fd5a63d5794dc5`, including
@@ -227,8 +281,9 @@ against non-yanked stable releases. The refresh advances Shoes' BLAKE2 requireme
 to 0.11 and rtnetlink to 0.24, and takes ML-KEM 0.3.4, log 0.4.35, mime 0.3.18, cc 1.11.0,
 crc32fast 1.5.4, ctutils 0.4.8, module-lattice 0.2.4, notify-types 2.2.0,
 netlink-packet-route 0.34, netlink-proto 0.14.1, utf8_iter 1.1/utf_types 1.0,
-and wasm-bindgen 0.2.130/js-sys 0.3.107. All protected cfal repositories and
-full revisions remain unchanged, including Hickory; the publishing guard remains.
+and wasm-bindgen 0.2.130/js-sys 0.3.107. That registry refresh left all protected
+cfal repositories and full revisions unchanged, including Hickory; subsequent
+fork refreshes are recorded above. The publishing guard remains.
 
 [ML-KEM 0.3.4](https://github.com/RustCrypto/KEMs/releases/tag/ml-kem%2Fv0.3.4)
 hardens secret-key formatting, comparisons, reduction and zeroization. Its XOF
