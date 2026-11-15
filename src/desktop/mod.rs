@@ -89,15 +89,22 @@ impl NetworkSession {
     }
 
     pub(crate) fn monitors_underlay(&self) -> bool {
-        #[cfg(test)]
-        if self.test_events.is_some() {
-            return true;
-        }
         #[cfg(target_os = "linux")]
-        if self.session.is_some() {
-            return true;
+        {
+            #[cfg(test)]
+            if self.test_events.is_some() {
+                return true;
+            }
+            self.session.is_some()
         }
-        false
+        #[cfg(all(not(target_os = "linux"), test))]
+        {
+            self.test_events.is_some()
+        }
+        #[cfg(all(not(target_os = "linux"), not(test)))]
+        {
+            false
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -226,4 +233,18 @@ pub(crate) fn validate_config(configs: &[crate::config::ResolvedConfig]) -> io::
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NetworkSession;
+
+    #[test]
+    fn underlay_monitoring_requires_a_session_or_test_events() {
+        assert!(!NetworkSession::default().monitors_underlay());
+
+        let (_, changes) = tokio::sync::mpsc::channel(1);
+        let (reconciled, _) = tokio::sync::mpsc::channel(1);
+        assert!(NetworkSession::with_test_events(changes, reconciled).monitors_underlay());
+    }
 }
