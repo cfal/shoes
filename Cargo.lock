@@ -256,7 +256,7 @@ dependencies = [
 [[package]]
 name = "blake3"
 version = "1.8.7"
-source = "git+https://github.com/cfal/BLAKE3?rev=cd98c1c4112ed3b2cf2140e1844f266b3d665b53#cd98c1c4112ed3b2cf2140e1844f266b3d665b53"
+source = "git+https://github.com/cfal/BLAKE3?rev=5bd8a7ef060bac222502a449bb89b7bdcdb8ec09#5bd8a7ef060bac222502a449bb89b7bdcdb8ec09"
 dependencies = [
  "arrayvec",
  "cc",
