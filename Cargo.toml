@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.3.7"
+version = "0.3.8"
 publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
 rust-version = "1.99.1"
