@@ -19,8 +19,6 @@ members = ["tests/support"]
 resolver = "3"
 
 [patch.crates-io]
-# Includes portable 64-bit atomics for MIPS32 and other targets without native support.
-gotatun = { git = "https://github.com/mullvad/gotatun", rev = "c06582e41022bcecbf33751631fd5a63d5794dc5" }
 # REALITY patches on stable rustls: reality/0.23.46-f04804fa1334. Pins the patched commit, not the branch.
 rustls = { git = "https://github.com/cfal/rustls", rev = "f1a23c187330386e9e7f14a21dbae368034dc430" }
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "5bd8a7ef060bac222502a449bb89b7bdcdb8ec09" }
@@ -167,8 +165,8 @@ parking_lot = "0.12.5"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "runtime-tokio", "rustls-aws-lc-rs"] }
 quinn-proto = { version = "0.11", default-features = false }
-rand = "*"
-rand_core = "*"
+rand = "0.10"
+rand_core = "0.10"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 rust-argon2 = "*"
 rustc-hash = "*"

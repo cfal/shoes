@@ -108,8 +108,8 @@ is approximately 32 MiB, so check available storage. Validation uses QEMU user
 mode with a 24Kc CPU, not physical
 routers or an OpenWrt kernel; MIPS TUN and independent-peer WireGuard operation
 have not been validated. No MIPS shared library or container image is provided.
-The Tier 3 build uses Rust 1.99.1 with matching `rust-src`, `RUSTC_BOOTSTRAP=1`
-and `-Z build-std`, plus the pinned OpenWrt 24.10.4 GCC 13.3.0/musl 1.2.5
+The Tier 3 build uses Rust 1.100.0 with matching `rust-src`, `RUSTC_BOOTSTRAP=1`
+and `-Z build-std`, plus the pinned OpenWrt 25.12.6 GCC 14.3.0/musl 1.2.5
 toolchain and GCC unwinder adapter in [the release workflow](.github/workflows/build.yml).
 
 Since v0.3.7, releases provide a separate `SHA256SUMS` asset

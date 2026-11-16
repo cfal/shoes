@@ -6,7 +6,7 @@ Xray-core, and Mihomo Alpha. CI builds and caches these peers from pinned source
 - Xray-core: `a4a3dff5b20c2faae567b742c172c7b95e75c083` (26.10.31).
 - Mihomo Alpha: `94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f`.
 
-Use Go 1.27.3, `GOMAXPROCS=1`, and `go build -p 1`. Build Xray's `./main` package.
+Use Go 1.27.4, `GOMAXPROCS=1`, and `go build -p 1`. Build Xray's `./main` package.
 Build Mihomo's root package with `CGO_ENABLED=0` and
 `-ldflags '-X github.com/metacubex/mihomo/constant.Version=alpha-94b13aed'`.
 The full peer setup is in `.github/workflows/test.yml`; the stable Mihomo peer

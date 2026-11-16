@@ -2891,7 +2891,7 @@ Repository: https://github.com/achanda/ipnetwork
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: crc32fast 1.5.4
+Package: crc32fast 1.5.5
 Repository: https://github.com/srijs/rust-crc32fast
 Package: env_filter 0.1.4
 Repository: https://github.com/rust-cli/env_logger
@@ -4579,7 +4579,7 @@ limitations under the License.
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: rustls-pki-types 1.15.1
+Package: rustls-pki-types 1.16.0
 Repository: https://github.com/rustls/pki-types
 
                               Apache License
@@ -4786,7 +4786,7 @@ limitations under the License.
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: notify-types 2.2.0
+Package: notify-types 2.3.1
 Repository: https://github.com/notify-rs/notify.git
 
                               Apache License
@@ -5432,9 +5432,9 @@ Package: bitflags 2.13.2
 Repository: https://github.com/bitflags/bitflags
 Package: blocking 1.7.0
 Repository: https://github.com/smol-rs/blocking
-Package: bumpalo 3.20.3
+Package: bumpalo 3.20.4
 Repository: https://github.com/fitzgen/bumpalo
-Package: cc 1.11.0
+Package: cc 1.11.2
 Repository: https://github.com/rust-lang/cc-rs
 Package: cfg-if 1.0.5
 Repository: https://github.com/rust-lang/cfg-if
@@ -5464,7 +5464,7 @@ Package: either 1.19.0
 Repository: https://github.com/rayon-rs/either
 Package: equivalent 1.0.3
 Repository: https://github.com/indexmap-rs/equivalent
-Package: errno 0.3.14
+Package: errno 0.3.15
 Repository: https://github.com/lambda-fairy/rust-errno
 Package: event-listener-strategy 0.5.4
 Repository: https://github.com/smol-rs/event-listener-strategy
@@ -5476,7 +5476,7 @@ Package: fastrand 2.5.0
 Repository: https://github.com/smol-rs/fastrand
 Package: find-msvc-tools 0.1.15
 Repository: https://github.com/rust-lang/cc-rs
-Package: flate2 1.1.10
+Package: flate2 1.1.11
 Repository: https://github.com/rust-lang/flate2-rs
 Package: fnv 1.0.7
 Repository: https://github.com/servo/rust-fnv
@@ -5502,7 +5502,7 @@ Package: indexmap 2.14.2
 Repository: https://github.com/indexmap-rs/indexmap
 Package: ipconfig 0.3.4
 Repository: https://github.com/liranringel/ipconfig
-Package: itertools 0.14.0
+Package: itertools 0.15.0
 Repository: https://github.com/rust-itertools/itertools
 Package: jobserver 0.1.35
 Repository: https://github.com/rust-lang/jobserver-rs
@@ -5538,9 +5538,9 @@ Package: piper 0.2.5
 Repository: https://github.com/smol-rs/piper
 Package: pkg-config 0.3.34
 Repository: https://github.com/rust-lang/pkg-config-rs
-Package: prost-derive 0.14.4
+Package: prost-derive 0.14.6
 Repository: https://github.com/tokio-rs/prost
-Package: prost 0.14.4
+Package: prost 0.14.6
 Repository: https://github.com/tokio-rs/prost
 Package: regex-automata 0.4.18
 Repository: https://github.com/rust-lang/regex
@@ -5560,7 +5560,7 @@ Package: signal-hook-registry 1.4.8
 Repository: https://github.com/vorner/signal-hook
 Package: simd_cesu8 1.2.0
 Repository: https://github.com/seancroach/simd_cesu8
-Package: smallvec 1.16.4
+Package: smallvec 1.16.5
 Repository: https://github.com/servo/rust-smallvec
 Package: socket2 0.6.5
 Repository: https://github.com/rust-lang/socket2
@@ -5584,7 +5584,7 @@ Package: unicase 2.10.0
 Repository: https://github.com/seanmonstar/unicase
 Package: url 2.5.8
 Repository: https://github.com/servo/rust-url
-Package: uuid 1.29.0
+Package: uuid 1.29.2
 Repository: https://github.com/uuid-rs/uuid
 Package: version_check 0.9.5
 Repository: https://github.com/SergioBenitez/version_check
@@ -6240,7 +6240,7 @@ Package: chacha20poly1305 0.10.1
 Repository: https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305
 Package: cipher 0.4.4
 Repository: https://github.com/RustCrypto/traits
-Package: const-oid 0.10.2
+Package: const-oid 0.10.3
 Repository: https://github.com/RustCrypto/formats
 Package: cpufeatures 0.2.17
 Repository: https://github.com/RustCrypto/utils
@@ -8297,7 +8297,7 @@ Package: fiat-crypto 0.2.9
 Repository: https://github.com/mit-plv/fiat-crypto
 Package: indenter 0.3.4
 Repository: https://github.com/yaahc/indenter
-Package: itoa 1.0.18
+Package: itoa 1.0.19
 Repository: https://github.com/dtolnay/itoa
 Package: jni-macros 0.22.4
 Repository: https://github.com/jni-rs/jni-rs
@@ -8333,7 +8333,7 @@ Package: r-efi 5.3.0
 Repository: https://github.com/r-efi/r-efi
 Package: r-efi 6.0.0
 Repository: https://github.com/r-efi/r-efi
-Package: rand 0.10.3
+Package: rand 0.10.4
 Repository: https://github.com/rust-random/rand
 Package: rand 0.9.5
 Repository: https://github.com/rust-random/rand
@@ -8365,7 +8365,7 @@ Package: simdutf8 0.1.5
 Repository: https://github.com/rusticstuff/simdutf8
 Package: syn 2.0.119
 Repository: https://github.com/dtolnay/syn
-Package: syn 3.0.9
+Package: syn 3.0.10
 Repository: https://github.com/dtolnay/syn
 Package: tagptr 0.2.0
 Repository: https://github.com/oliver-giersch/tagptr.git
@@ -9259,7 +9259,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 License: Creative Commons Zero v1.0 Universal (CC0-1.0)
-Package: notify 8.2.1
+Package: notify 8.2.2
 Repository: https://github.com/notify-rs/notify.git
 
 Creative Commons CC0 1.0 Universal
@@ -9305,7 +9305,7 @@ For these and/or other purposes and motivations, and without any expectation of 
      d. Affirmer understands and acknowledges that Creative Commons is not a party to this document and has no duty or obligation with respect to this CC0 or use of the Work. 
 
 License: Community Data License Agreement Permissive 2.0 (CDLA-Permissive-2.0)
-Package: webpki-roots 1.0.11
+Package: webpki-roots 1.0.12
 Repository: https://github.com/rustls/webpki-roots
 
 # Community Data License Agreement - Permissive - Version 2.0
@@ -9771,7 +9771,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 
 License: ISC License (ISC)
-Package: libloading 0.9.0
+Package: libloading 0.9.1
 Repository: https://github.com/nagisa/rust_libloading/
 
 Copyright © 2015, Simonas Kazlauskas
@@ -9789,7 +9789,7 @@ THIS SOFTWARE.
 
 
 License: ISC License (ISC)
-Package: rustls-webpki 0.103.16
+Package: rustls-webpki 0.103.17
 Repository: https://github.com/rustls/webpki
 
 Except as otherwise noted, this project is licensed under the following
@@ -10376,7 +10376,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 
 License: MIT License (MIT)
-Package: mio 1.2.4
+Package: mio 1.2.5
 Repository: https://github.com/tokio-rs/mio
 
 Copyright (c) 2014 Carl Lerche and other MIO contributors
@@ -11613,11 +11613,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 License: Mozilla Public License 2.0 (MPL-2.0)
-Package: gotatun 0.10.2
-Repository: https://github.com/mullvad/gotatun
-Package: gotatun-crypto 0.1.0
-Repository: https://github.com/mullvad/gotatun
-Package: gotatun-packet 0.1.0
+Package: gotatun 0.10.3
 Repository: https://github.com/mullvad/gotatun
 
 Mozilla Public License Version 2.0

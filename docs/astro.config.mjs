@@ -6,6 +6,7 @@ export default defineConfig({
   site: 'https://shoes-rs.github.io',
   base: '/',
   trailingSlash: 'always',
+  scopedStyleStrategy: 'where',
   integrations: [starlight({
     title: 'shoes',
     description: 'Configuration and operation of shoes',

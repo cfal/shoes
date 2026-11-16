@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { parseHTML } from 'linkedom';
+import { DOMParser, parseHTML } from 'linkedom';
 import { fromMarkdown } from 'mdast-util-from-markdown';
 
 const root = fileURLToPath(new URL('../dist/', import.meta.url));
@@ -60,10 +60,18 @@ for (const [file, { document }] of pages) {
   }
   const languages = document.querySelector('header starlight-lang-select select');
   const languagePaths = [...(languages?.querySelectorAll('option') ?? [])].map((option) => option.value);
-  if (!document.querySelector('header .mobile-language starlight-lang-select svg.label-icon') ||
+  if (!document.querySelector('header .mobile-language starlight-lang-select .label-icon svg') ||
       !languagePaths.some((value) => value.startsWith('/zh-cn/')) ||
       !languagePaths.some((value) => value.startsWith('/') && !value.startsWith('/zh-cn/'))) {
     errors.push(`${path.relative(root, file)}: missing header language selector`);
+  }
+  const selectedLanguage = languages?.querySelector('option[selected]') ?? languages?.querySelector('option');
+  if (selectedLanguage?.value.startsWith('/zh-cn/') !== chinese) {
+    errors.push(`${path.relative(root, file)}: incorrect selected language`);
+  }
+  const themes = [...document.querySelectorAll('header starlight-theme-select select option')].map((option) => option.value);
+  if (themes.join(',') !== 'dark,light,auto') {
+    errors.push(`${path.relative(root, file)}: missing header theme choices`);
   }
   for (const link of document.querySelectorAll('a[href]')) {
     const href = link.getAttribute('href');
@@ -157,9 +165,40 @@ for (const locale of ['', 'zh-cn']) {
   }
 }
 
+const origin = 'https://shoes-rs.github.io';
+const pagePaths = files.map((file) => path.relative(root, file).split(path.sep).join('/'));
+const expectedUrls = new Set(pagePaths.filter((file) => !/(^|\/)(404|500)\.html$/.test(file))
+  .map((file) => `${origin}/${file.replace(/index\.html$/, '')}`));
+const sitemapUrls = new Set();
+const parser = new DOMParser();
+const sitemapIndex = parser.parseFromString(readFileSync(path.join(root, 'sitemap-index.xml'), 'utf8'), 'text/xml');
+for (const loc of sitemapIndex.querySelectorAll('sitemap > loc')) {
+  const sitemap = new URL(loc.textContent);
+  if (sitemap.origin !== origin || !/^\/sitemap-\d+\.xml$/.test(sitemap.pathname)) {
+    errors.push(`Unexpected sitemap location: ${sitemap.href}`);
+    continue;
+  }
+  const document = parser.parseFromString(readFileSync(path.join(root, sitemap.pathname), 'utf8'), 'text/xml');
+  for (const entry of document.querySelectorAll('url')) {
+    const url = entry.querySelector('loc')?.textContent;
+    if (!expectedUrls.has(url) || sitemapUrls.has(url)) errors.push(`Unexpected or duplicate sitemap URL: ${url}`);
+    sitemapUrls.add(url);
+    const alternates = [...entry.querySelectorAll('[rel="alternate"]')];
+    const english = url?.replace(`${origin}/zh-cn/`, `${origin}/`);
+    for (const [locale, href] of [['en', english], ['zh-CN', english?.replace(`${origin}/`, `${origin}/zh-cn/`)]]) {
+      if (!alternates.some((link) => link.getAttribute('hreflang') === locale && link.getAttribute('href') === href)) {
+        errors.push(`Missing ${locale} sitemap alternate: ${url}`);
+      }
+    }
+  }
+}
+for (const url of expectedUrls) {
+  if (!sitemapUrls.has(url)) errors.push(`Missing sitemap URL: ${url}`);
+}
+
 if (errors.length) {
   console.error(errors.join('\n'));
   process.exitCode = 1;
 } else {
-  console.log(`Checked headers, internal links and anchors in ${files.length} HTML pages and copy payloads for ${examples.length} examples in both languages.`);
+  console.log(`Checked headers, sitemap, internal links and anchors in ${files.length} HTML pages and copy payloads for ${examples.length} examples in both languages.`);
 }

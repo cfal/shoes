@@ -5,6 +5,12 @@ description: "shoes 证书源配置。"
 
 普通 TLS 目标和 QUIC 监听器可以共享命名证书源。使用`certificate_source`代替`cert`和`key`；将它们组合起来是一个错误。仍然支持现有的内联证书、文件路径和命名 PEM。
 
+证书含重复 SCT 扩展或格式错误的外层 DER OCTET STRING 时会被拒绝。
+即使客户端仅验证指纹或设置 `verify: false`，此解析要求仍然适用；
+它不会启用 CT 日志验证。内置公共根证书已移除 DigiCert Trusted Root G4、
+QuoVadis Root CA 1 G3/3 G3、Buypass Class 2/3 Root CA 和 Certigna Root CA。
+仅依赖这些根的服务器需要改用不受影响的证书链。
+
 ```yaml
 - certificate_source: public
   type: files

@@ -22,8 +22,6 @@ The workspace patches in `Cargo.toml` are required by checkout/release builds:
 - `cfal/hickory-dns`: connection-close recovery, healthy-upstream failover and
   bounded TCP/DoT receive progress.
 - `cfal/smoltcp`: TUN/WireGuard TCP retransmission ACK sequencing.
-- `mullvad/gotatun`: upstream's portable 64-bit atomics for targets without
-  native support, including MIPS32.
 
 Preserve each repository and full revision unless explicitly updating that fork.
 Check every resolved consumer, especially Quinn, tokio-rustls, hyper-rustls,
@@ -86,12 +84,25 @@ Shadowsocks and NaiveProxy tests. Verify the final published full SHA with
 
 ### GotaTun
 
-Pinned to upstream main at `c06582e41022bcecbf33751631fd5a63d5794dc5`, including
-[#221](https://github.com/mullvad/gotatun/pull/221). Published 0.10.2 lacks that
-fix despite sharing the package version. The git workspace also splits out
-`gotatun-crypto` and `gotatun-packet`; retain their matching source revision and
-the corresponding source links in `THIRD_PARTY_NOTICES.md`. Shoes keeps AWS-LC
-and uses its own conditional atomic imports on targets without 64-bit atomics.
+Published 0.10.3 replaces the upstream git patch. Its archive identifies
+[`c541472b40ec489ba7bdfd048512e89e556c7a3c`](https://github.com/mullvad/gotatun/tree/c541472b40ec489ba7bdfd048512e89e556c7a3c),
+not the different main-branch commit also declaring 0.10.3. Both session and
+cookie counters retain [#221](https://github.com/mullvad/gotatun/pull/221)'s
+conditional portable-atomic fallback. The published crate folds the git-only
+`gotatun-crypto` and `gotatun-packet` packages back into the main crate; Shoes'
+packet, transport and X25519 APIs remain compatible. AWS-LC and device features
+are unchanged, as are Shoes' own conditional atomic imports.
+
+The TAI64N base changes from `2^62 + 37` to wireguard-go's `2^62 + 10`.
+The same-key handoff regression keeps a reference responder alive across Shoes
+and wireguard-go initiators and requires success before the old 27-second
+timestamp lead could expire. Existing both-role/rekey tests alone cannot detect
+this difference. A recent old-version initiation can temporarily delay a fast
+upgrade against retained responder replay state.
+
+The published archive omits its repository-root license files. Corresponding
+source URLs use its VCS metadata; offline notice tests pin the verified upstream
+MPL and Cloudflare license hashes. Retain both bundled texts.
 
 ### Hickory
 
@@ -329,6 +340,86 @@ registry storage-record permissions are unnecessary. Artifact names, inputs,
 architectures, credentials policy and peer baselines are unchanged.
 Rust 1.99.1, Go 1.27.3, cargo-about 0.9.3, cargo-ndk 4.1.2, cbindgen 0.29.4,
 cargo-llvm-cov 0.9.1 and cross 0.2.5 remain current.
+
+## November 16, 2026 Refresh
+
+All maintained cfal repositories, full revisions and matching rustls constraints
+remain unchanged. `Cargo.toml` is authoritative; earlier dated fork sections
+record historical maintenance evidence, not instructions to restore old pins.
+The graph must retain one intended rustls fork and the shared Shoes/Hickory
+h3/h3-quinn forks, alongside BLAKE3 and smoltcp.
+
+The lockfile advances GotaTun to published 0.10.3, rustls-pki-types to 1.16.0,
+rustls-webpki to 0.103.17, both Web PKI root packages to 1.0.12, notify to 8.2.2,
+notify-types to 2.3.1, prost/prost-derive to 0.14.6 and their newly permitted
+itertools to 0.15.0. Compatible updates also cover bumpalo, cc, const-oid,
+crc32fast, errno, flate2, itoa, libloading, mio, rand 0.10, smallvec, syn 3 and
+uuid. Existing wildcard and narrower version conventions are retained, except
+both workspace rand requirements and Shoes' rand_core requirement now specify
+0.10. The code requires `RngExt`; targeted resolution otherwise reassigned
+wildcard consumers to the separately required older families. Inspect consumer
+edges, not just package versions: bounded multi-major getrandom/windows-sys
+requirements also need their existing newest selections retained.
+
+Consequential changes and coverage:
+
+- TLS DNS names normalize a trailing dot and reject hexadecimal numeric final
+  labels. Captured-SNI handshakes retain certificate verification, disabled SNI,
+  nested TLS and XHTTP behavior; HTTP/TLS sniff tests preserve original bytes.
+- WebPKI rejects malformed/duplicate SCT extension wrappers, including in
+  signature verification when chain verification is disabled. No automatic CT
+  verification is enabled. Tests exercise server loading and verified,
+  fingerprint-only and unverified client handshakes. Root-removal tests retain
+  the prior emSign exclusions and cover all six newly removed anchors.
+- flate2 changes streaming flush/finalization and pending-output handling.
+  Shoes retains its low-level bounded decoder; regressions cover output-buffer
+  boundaries, sync flushes, truncation, concatenated streams and trailing data.
+- crc32fast adds runtime-detected AArch64 PMULL acceleration; cross-compilation
+  alone does not exercise it. Mio/notify primarily fix Windows I/O completion
+  and cancellation lifetimes; Windows runtime coverage remains unavailable.
+- bumpalo 3.20.4 fixes concurrent zero-sized-allocation undefined behavior
+  ([GHSA-j7wg-xg3h-2pr6](https://github.com/fitzgen/bumpalo/security/advisories/GHSA-j7wg-xg3h-2pr6)).
+  A RustSec snapshot predating that advisory is not evidence of its absence.
+
+Published nix 0.32.0 contains #2821, but GotaTun, tun and rtnetlink still require
+0.31. The unchanged git pin and registry 0.32.0 pass isolated iOS checks using
+Shoes' actual socket/net/fs/ioctl/time/uio/user features; registry 0.31.3 fails
+with missing Apple-only symbols. Retain the patch rather than editing parents,
+adding a second major, or substituting the broken registry 0.31.3. Parking_lot
+0.13/core 0.10 still probes futex_time64 before falling back on ENOSYS, which
+does not handle Android 26-29 seccomp traps; retain 0.12.5 and the API 21 floor.
+Other parent-constrained RustCrypto/rand/windows families and prereleases are
+not forcibly upgraded. Crypto-common 0.1.7 requires generic-array exactly 0.14.7;
+the newer unyanked 0.14.9 cannot replace it without changing that parent.
+AWS-LC, Quinn, Tokio, rcgen, instant-acme, tun, tendns,
+ML-KEM and the other eligible direct Rust dependencies are already current.
+
+Release builds advance to Rust 1.100.0, with matching sysroot notices; the
+separate MSRV check remains 1.99.1. Docker retains Bookworm in both stages.
+OpenWrt 25.12.6 supplies GCC 14.3.0 and unchanged musl 1.2.5, big-endian MIPS32r2
+o32 soft-float ABI and static libraries. Preserve the existing GCC unwinder shim,
+ELF static-link assertions and 24Kc QEMU smoke check. Its Linux 6.12 headers do
+not establish a Shoes runtime minimum. Go advances to 1.27.4 for active peer
+builds, not frozen fixture provenance. Node 26 resolves to 26.13.1. Cargo-about
+0.9.3, cargo-ndk 4.1.2, cbindgen 0.29.4, cargo-llvm-cov 0.9.1 and cross 0.2.5
+remain latest stable. Release Actions are already current; the rust-toolchain
+SHA advances without runtime implementation changes. Permissions, action
+inputs, caches, artifact contracts and pinned interoperability peers are retained.
+
+Documentation advances to Astro 7.4.12 and Starlight 0.43.1. Explicit
+`scopedStyleStrategy: 'where'` preserves the previous CSS specificity after
+Starlight stops forcing that strategy. Compatible transitive updates and
+their parent constraints are checked separately from direct dependency pins.
+The language-icon check follows Starlight's new wrapper element and additionally
+checks selected locales and theme choices; mobile icon styling remains intact.
+Sitemap 10 retains Astro's stream API; checks require complete canonical URL
+coverage, locale alternates and exclusion of error pages. Astro and its extracted
+Vite plugin now require rolldown `~1.2.16`, while Vite requires `~1.2.18`:
+the single 1.2.19 copy replaces root 1.3.0 plus nested 1.2.16 intentionally.
+Its exact oxc-types 0.156 requirement explains that apparent downgrade too.
+Starlight retains satteri 0.10.5 alongside Astro's 0.11.7; newer incompatible
+transitives are not forced through overrides. i18next 27's changed defaults are
+mediated by Starlight's explicit fallback locale and filtered dictionaries.
 
 ## Validation
 

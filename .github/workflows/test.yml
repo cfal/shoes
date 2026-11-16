@@ -31,9 +31,9 @@ jobs:
     timeout-minutes: 15
     steps:
     - uses: actions/checkout@v7
-    - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+    - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
       with:
-        toolchain: 1.99.1
+        toolchain: 1.100.0
         components: rust-src
     - uses: taiki-e/install-action@v2
       with:
@@ -61,11 +61,11 @@ jobs:
       uses: actions/cache/restore@v6
       with:
         path: ~/.cache/shoes-wireguard
-        key: ${{ runner.os }}-${{ runner.arch }}-wireguard-peers-go1.27.3-${{ env.WG_SING_BOX_COMMIT }}-${{ env.WG_XRAY_COMMIT }}
+        key: ${{ runner.os }}-${{ runner.arch }}-wireguard-peers-go1.27.4-${{ env.WG_SING_BOX_COMMIT }}-${{ env.WG_XRAY_COMMIT }}
     - uses: actions/setup-go@v7
       if: steps.wireguard-peers.outputs.cache-hit != 'true'
       with:
-        go-version: '1.27.3'
+        go-version: '1.27.4'
         cache: false
     - uses: actions/cache@v6
       with:
@@ -149,7 +149,7 @@ jobs:
 
     - uses: actions/setup-go@v7
       with:
-        go-version: '1.27.3'
+        go-version: '1.27.4'
         cache: false
 
     - name: Build pinned AnyTLS reference peer
@@ -463,13 +463,13 @@ jobs:
         path: |
           ~/.cache/shoes-xray/xray
           ~/.cache/shoes-mihomo/mihomo
-        key: ${{ runner.os }}-xhttp-peers-go1.27.3-${{ env.XRAY_COMMIT }}-${{ env.MIHOMO_ALPHA_COMMIT }}
+        key: ${{ runner.os }}-xhttp-peers-go1.27.4-${{ env.XRAY_COMMIT }}-${{ env.MIHOMO_ALPHA_COMMIT }}
 
     - name: Install Go for XHTTP peers
       if: matrix.target == 'xhttp_interop' && steps.xhttp-peers.outputs.cache-hit != 'true'
       uses: actions/setup-go@v7
       with:
-        go-version: '1.27.3'
+        go-version: '1.27.4'
         cache: false
 
     - name: Build pinned Xray test peer

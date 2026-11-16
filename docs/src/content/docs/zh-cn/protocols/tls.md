@@ -76,6 +76,11 @@ protocol:
 <a id="client"></a>
 ## 客户端
 
+客户端 DNS 身份在证书验证和发送 SNI 前会移除一个末尾句点。
+最后一个标签为十六进制数的名称（如 `example.0x1f`）无效；
+`0x1f.example` 仍然有效。显式设置 `sni_hostname: null` 仍会关闭线路上的
+SNI，但不会关闭对该跳身份的证书验证。REALITY/ShadowTLS 原始目标分派保持不变。
+
 ```yaml
 protocol:
   type: tls

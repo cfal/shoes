@@ -282,6 +282,13 @@ mod tests {
                         if nested || xhttp { None } else { Some("localhost") },
                     ),
                     ("localhost:443", "sni_hostname: null", "localhost", None),
+                    (
+                        "localhost.:443",
+                        "",
+                        "localhost",
+                        if nested || xhttp { None } else { Some("localhost") },
+                    ),
+                    ("localhost.:443", "sni_hostname: null", "localhost", None),
                     ("127.0.0.1:443", "", "127.0.0.1", None),
                     ("127.0.0.1:443", "sni_hostname: null", "127.0.0.1", None),
                     ("[::1]:443", "sni_hostname: null", "::1", None),
@@ -294,6 +301,12 @@ mod tests {
                     (
                         "127.0.0.1:443",
                         "sni_hostname: override.test",
+                        "override.test",
+                        Some("override.test"),
+                    ),
+                    (
+                        "127.0.0.1:443",
+                        "sni_hostname: override.test.",
                         "override.test",
                         Some("override.test"),
                     ),

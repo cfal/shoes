@@ -1,5 +1,5 @@
-Rust 1.99.1 compiler-builtins and bundled libm
-Source: https://github.com/rust-lang/rust/tree/1.99.1/library/compiler-builtins
+Rust 1.100.0 compiler-builtins and bundled libm
+Source: https://github.com/rust-lang/rust/tree/1.100.0/library/compiler-builtins
 
 Source: LICENSE.txt
 
@@ -552,7 +552,6 @@ Source: compiler-builtins/src/probestack.rs
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-
 Source: libm/src/math/acos.rs
 
 /*
@@ -577,21 +576,6 @@ Source: libm/src/math/acosf.rs
  * software is freely granted, provided that this notice
  * is preserved.
  * ====================================================
- */
-
-Source: libm/src/math/approx/cbrtf64.rs
-
-/*
- * ====================================================
- * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
- *
- * Developed at SunPro, a Sun Microsystems, Inc. business.
- * Permission to use, copy, modify, and distribute this
- * software is freely granted, provided that this notice
- * is preserved.
- * ====================================================
- *
- * Optimized by Bruce D. Evans.
  */
 
 Source: libm/src/math/asin.rs
@@ -706,7 +690,6 @@ Source: libm/src/math/cos.rs
 // is preserved.
 // ====================================================
 
-
 Source: libm/src/math/cosf.rs
 
 /*
@@ -786,7 +769,6 @@ Source: libm/src/math/exp2.rs
 // OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 // SUCH DAMAGE.
 
-
 Source: libm/src/math/exp2f.rs
 
 // origin: FreeBSD /usr/src/lib/msun/src/s_exp2f.c
@@ -814,7 +796,6 @@ Source: libm/src/math/exp2f.rs
 // LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
 // OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 // SUCH DAMAGE.
-
 
 Source: libm/src/math/expf.rs
 
@@ -954,7 +935,6 @@ Source: libm/src/math/k_cos.rs
 // is preserved.
 // ====================================================
 
-
 Source: libm/src/math/k_cosf.rs
 
 /*
@@ -981,7 +961,6 @@ Source: libm/src/math/k_sin.rs
 // is preserved.
 // ====================================================
 
-
 Source: libm/src/math/k_sinf.rs
 
 /*
@@ -1006,7 +985,6 @@ Source: libm/src/math/k_tan.rs
 // software is freely granted, provided that this notice
 // is preserved.
 // ====================================================
-
 
 Source: libm/src/math/k_tanf.rs
 
@@ -1176,6 +1154,21 @@ Source: libm/src/math/powf.rs
  * ====================================================
  */
 
+Source: libm/src/math/relaxed/cbrtf64.rs
+
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ *
+ * Optimized by Bruce D. Evans.
+ */
+
 Source: libm/src/math/rem_pio2.rs
 
 // origin: FreeBSD /usr/src/lib/msun/src/e_rem_pio2.c
@@ -1190,7 +1183,6 @@ Source: libm/src/math/rem_pio2.rs
 // ====================================================
 //
 // Optimized by Bruce D. Evans. */
-
 
 Source: libm/src/math/rem_pio2_large.rs
 
@@ -1230,7 +1222,6 @@ Source: libm/src/math/sin.rs
 // software is freely granted, provided that this notice
 // is preserved.
 // ====================================================
-
 
 Source: libm/src/math/sincos.rs
 
@@ -1283,7 +1274,6 @@ Source: libm/src/math/tan.rs
 // software is freely granted, provided that this notice
 // is preserved.
 // ====================================================
-
 
 Source: libm/src/math/tanf.rs
 

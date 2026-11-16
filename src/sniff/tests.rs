@@ -344,12 +344,36 @@ async fn rejected_legacy_duplicate_and_invalid_sni_are_terminal_misses() {
         .position(|s| s == b"sniff.example")
         .unwrap();
     invalid[name] = b'/';
-    for bytes in [legacy, duplicate.unwrap(), invalid] {
+    let mut hex_label = bytes.clone();
+    hex_label[name..name + b"sniff.example".len()].copy_from_slice(b"sniff.0xabcde");
+    for bytes in [legacy, duplicate.unwrap(), invalid, hex_label] {
         let probe = StreamProbe::from_prefix(bytes.clone());
         assert!(!probe.needs_more());
         let result = probe.finish(&mut NoRead, SNIFF_TIMEOUT).await.unwrap();
         assert_eq!(result.hostname, None);
         assert_eq!(result.prefix, bytes);
+    }
+}
+
+#[tokio::test]
+async fn normalized_sniff_names_preserve_wire_bytes() {
+    for (wire_name, expected) in [
+        ("sniff.exampl.", Some("sniff.exampl")),
+        ("0xabc.example", Some("0xabc.example")),
+        ("sniff.0xabcde", None),
+    ] {
+        let mut tls = hello(&rustls::version::TLS13, true);
+        let offset = tls.windows(13).position(|s| s == b"sniff.example").unwrap();
+        tls[offset..offset + 13].copy_from_slice(wire_name.as_bytes());
+        let http = format!("GET / HTTP/1.1\r\nHost: {wire_name}\r\n\r\n").into_bytes();
+        for bytes in [tls, http] {
+            let result = StreamProbe::from_prefix(bytes.clone())
+                .finish(&mut NoRead, SNIFF_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(result.hostname.as_deref(), expected, "{wire_name}");
+            assert_eq!(result.prefix, bytes);
+        }
     }
 }
 
