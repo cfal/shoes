@@ -38,6 +38,9 @@ impl Worker {
             task.abort();
             let _ = task.await;
         }
+        if let Spec::Acme(config) = &self.source.spec {
+            acme::cleanup_dns_state(config).await;
+        }
     }
 }
 

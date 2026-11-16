@@ -168,6 +168,22 @@ fn managed_schema_references_and_coverage() {
         good.replace("type: tls_alpn01", "type: dns01"),
         good.replace(
             "type: tls_alpn01",
+            "type: dns01, provider: route53, api_token: token",
+        ),
+        good.replace(
+            "type: tls_alpn01",
+            "type: dns01, provider: cloudflare, api_token: ''",
+        ),
+        good.replace(
+            "type: tls_alpn01",
+            "type: dns01, provider: cloudflare, api_token: token, ttl: 59",
+        ),
+        good.replace(
+            "type: tls_alpn01",
+            "type: dns01, provider: cloudflare, api_token: token, propagation_delay: 121, propagation_timeout: 120",
+        ),
+        good.replace(
+            "type: tls_alpn01",
             "type: http01, listen: ['127.0.0.1:18443']",
         ),
         good.replace("type: tls_alpn01", "type: http01, listen: []"),
@@ -182,6 +198,29 @@ fn managed_schema_references_and_coverage() {
         good.lines().skip(1).take(7).collect::<Vec<_>>().join("\n")
     );
     assert!(compile(&duplicate).is_err());
+}
+
+#[test]
+fn cloudflare_dns01_configuration_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = managed_yaml(
+        dir.path(),
+        "type: dns01, provider: cloudflare, api_token: test-token",
+        "certificate_source: public",
+    )
+    .replace("domains: [proxy.test]", "domains: ['*.proxy.test']")
+    .replace("proxy.test:\n", "www.proxy.test:\n");
+    let validated = compile(&yaml).unwrap();
+    let Spec::Acme(config) = &validated.certificates[0].spec else {
+        panic!("expected ACME source")
+    };
+    assert!(
+        matches!(&config.challenge, ChallengeConfig::Dns01 { provider, .. } if provider == "cloudflare")
+    );
+    assert!(!format!("{config:?}").contains("test-token"));
+    assert!(acme_domain_covers("*.proxy.test", "www.proxy.test"));
+    assert!(!acme_domain_covers("*.proxy.test", "proxy.test"));
+    assert!(!acme_domain_covers("*.proxy.test", "a.www.proxy.test"));
 }
 
 #[test]

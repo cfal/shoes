@@ -242,6 +242,7 @@ impl Inline for ResolvedServerProxyConfig {
                 fallback,
             },
             ServerProxyConfig::PortForward { targets } => Self::PortForward { targets },
+            ServerProxyConfig::Shadowquic(config) => Self::Shadowquic(config),
             ServerProxyConfig::Hysteria2 {
                 password,
                 udp_enabled,

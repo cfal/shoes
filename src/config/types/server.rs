@@ -849,6 +849,7 @@ pub enum ServerProxyConfig {
         #[serde(alias = "target")]
         targets: OneOrSome<NetLocation>,
     },
+    Shadowquic(ShadowQuicServerConfig),
     Hysteria2 {
         password: String,
         #[serde(default = "default_true")]
@@ -939,6 +940,7 @@ impl std::fmt::Display for ServerProxyConfig {
             Self::Websocket { .. } => write!(f, "Websocket"),
             Self::Xhttp(..) => write!(f, "XHTTP"),
             Self::PortForward { .. } => write!(f, "Portforward"),
+            Self::Shadowquic(_) => write!(f, "ShadowQuic"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
             Self::TuicV5 { .. } => write!(f, "TuicV5"),
             Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
@@ -1025,6 +1027,7 @@ pub enum ResolvedServerProxyConfig {
     PortForward {
         targets: OneOrSome<NetLocation>,
     },
+    Shadowquic(ShadowQuicServerConfig),
     Hysteria2 {
         password: String,
         udp_enabled: bool,
@@ -1093,6 +1096,7 @@ impl std::fmt::Display for ResolvedServerProxyConfig {
             Self::Websocket { .. } => write!(f, "Websocket"),
             Self::Xhttp(..) => write!(f, "XHTTP"),
             Self::PortForward { .. } => write!(f, "Portforward"),
+            Self::Shadowquic(_) => write!(f, "ShadowQuic"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
             Self::TuicV5 { .. } => write!(f, "TuicV5"),
             Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
@@ -1104,3 +1108,23 @@ impl std::fmt::Display for ResolvedServerProxyConfig {
 
 #[cfg(test)]
 mod tests;
+
+/// JLS-authenticated ShadowQuic inbound. Certificates are generated internally.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowQuicServerConfig {
+    pub users: Vec<ShadowQuicUser>,
+    pub server_name: String,
+    pub jls_upstream: String,
+    #[serde(default = "default_true")]
+    pub zero_rtt: bool,
+    #[serde(default = "default_true")]
+    pub udp_enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowQuicUser {
+    pub username: String,
+    pub password: String,
+}

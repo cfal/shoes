@@ -54,7 +54,7 @@ ACME 使用 `instant-acme` 和显式配置的域。从 CA 的暂存目录开始�
     listen: ["0.0.0.0:8080"]
 ```
 
-如文件源示例中所示，从 TLS 或 QUIC 引用 `public`。域必须是唯一的小写 ASCII DNS 名称（使用 punycode 作为国际化名称）。每个使用 ACME 源的命名 TLS 目标都必须被其域覆盖。没有根据传入的SNI进行发行。
+如文件源示例中所示，从 TLS 或 QUIC 引用 `public`。域必须是唯一的小写 ASCII DNS 名称（使用 punycode 作为国际化名称）；通配符域仅支持 DNS-01。每个使用 ACME 源的命名 TLS 目标都必须被其域覆盖。没有根据传入的SNI进行发行。
 
 `terms_of_service` 明确接受该确切 URL，而不是全面接受未来条款。 shoes 在帐户操作之前检查目录的 `meta.termsOfService` 并拒绝更改的 URL。查看新条款并更新配置以接受它们。如果私有 CA 未发布任何条款，则省略此字段；随后公布的条款 URL 仍需要明确接受。该版本不支持需要外部账号绑定的账号。
 
@@ -85,6 +85,25 @@ CA 流量直接通过操作系统解析器和 shoes 受保护的 TCP 套接字�
 
 `--dry-run` 验证配置、引用、域覆盖、质询兼容性、证书材料和声明的地址冲突，而无需联系 CA、绑定端口或创建 ACME 状态。未发布的 ACME 源是有效配置，而不是自签名占位符。检查现有的可读状态是否存在 CA/域身份不匹配的情况，而无需锁定或修改它；该检查不需要以服务用户身份运行。在运行时准备期间检查实际操作系统端口冲突、存储所有权和权限。
 
-没有内置的 DNS-01、通配符 ACME 发行、DNS 供应商 API、shell hook、Tailscale 提供商或 Cloudflare Origin CA 提供商。对于通配符证书或 DNS-01，请运行外部客户端（例如 acme.sh、lego 或 Certbot）并使用文件源。仍然支持手动提供的通配符证书。
+DNS-01 目前支持 Cloudflare。将 `challenge` 配置为
+`{type: dns01, provider: cloudflare, api_token: ...}`。API token 需要对应 zone
+的 Zone:Read 和 DNS:Edit 权限。`ttl` 默认为 120 秒且不得低于 60 秒；`propagation_delay`
+默认为 10 秒，`propagation_timeout` 默认为 120 秒且不得超过 600 秒，TTL
+不得超过 86400 秒，传播延迟不得超过 300 秒。配置示例：
+
+```yaml
+  challenge:
+    type: dns01
+    provider: cloudflare
+    api_token: ${CLOUDFLARE_API_TOKEN}
+```
+
+shoes 会等待 TXT 值通过 Cloudflare DNS 可见后再通知 CA，并在订单完成或清除后删除创建的记录。请妥善
+保护 API token。`api_token` 可以直接设置，也可以写成 `${CLOUDFLARE_API_TOKEN}`
+从服务环境读取；debug 输出会隐藏 token。暂不支持其他 DNS 提供商、shell hook、Tailscale 和 Cloudflare
+Origin CA。
+
+通配符证书使用 DNS-01，并在 `domains` 中显式配置通配符，例如
+`domains: ['*.example.com']`。仍然支持手动提供的通配符证书。
 
 示例：[文件轮换和重用](/zh-cn/examples/certificates_files/) 和 [具有共享 TCP/QUIC 使用者的 ACME](/zh-cn/examples/certificates_acme/)。

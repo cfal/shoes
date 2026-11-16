@@ -11,6 +11,7 @@ use instant_acme::{
 };
 use parking_lot::Mutex;
 use rustls::pki_types::pem::PemObject;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::{AcmeConfig, ChallengeConfig, Material, Source, challenge, invalid, now, read_text};
@@ -22,6 +23,247 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const MAX_RESPONSE: usize = 1024 * 1024;
 // Keep instant-acme's unchecked deadline arithmetic far from clock limits.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+
+struct CloudflareDns {
+    http: HttpClient,
+    token: String,
+    ttl: u32,
+    delay: Duration,
+    timeout: Duration,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DnsRecord {
+    zone: String,
+    id: String,
+    name: String,
+    value: String,
+}
+
+impl CloudflareDns {
+    fn new(config: &AcmeConfig) -> io::Result<Option<Self>> {
+        if let ChallengeConfig::Dns01 {
+            api_token,
+            ttl,
+            propagation_delay,
+            propagation_timeout,
+            ..
+        } = &config.challenge
+        {
+            let token = resolve_dns_token(api_token)?;
+            Ok(Some(Self {
+                // Cloudflare uses the system public roots, even when ACME itself
+                // is configured with a private test CA.
+                http: HttpClient::new(client_tls(None)?, config),
+                token,
+                ttl: *ttl,
+                delay: Duration::from_secs(*propagation_delay),
+                timeout: Duration::from_secs(*propagation_timeout),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+    async fn api<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        url: &str,
+        body: Vec<u8>,
+    ) -> io::Result<T> {
+        let mut builder = http::Request::builder()
+            .method(method)
+            .uri(url)
+            .header("Authorization", format!("Bearer {}", self.token));
+        if !body.is_empty() {
+            builder = builder.header("Content-Type", "application/json");
+        }
+        let request = builder
+            .body(instant_acme::BodyWrapper::from(body))
+            .map_err(io::Error::other)?;
+        let response = instant_acme::HttpClient::request(&self.http, request)
+            .await
+            .map_err(io::Error::other)?;
+        let status = response.parts.status;
+        let mut body = response.body;
+        let bytes = body.into_bytes().await.map_err(io::Error::other)?;
+        if status == http::StatusCode::NOT_FOUND && method == "DELETE" {
+            return serde_json::from_value(serde_json::Value::Null).map_err(io::Error::other);
+        }
+        if !status.is_success() {
+            return Err(io::Error::other(format!(
+                "Cloudflare API returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        #[derive(Deserialize)]
+        struct Envelope<T> {
+            success: bool,
+            result: T,
+        }
+        let envelope: Envelope<T> = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if !envelope.success {
+            return Err(io::Error::other("Cloudflare API rejected request"));
+        }
+        Ok(envelope.result)
+    }
+    async fn present(&self, domain: &str, value: &str) -> io::Result<DnsRecord> {
+        let domain = domain.trim_start_matches("*.");
+        #[derive(Deserialize)]
+        struct Zone {
+            id: String,
+        }
+        let labels: Vec<_> = domain.split('.').collect();
+        let mut zone = None;
+        for i in 0..labels.len().saturating_sub(1) {
+            let candidate = labels[i..].join(".");
+            let url = format!(
+                "https://api.cloudflare.com/client/v4/zones?name={}&status=active",
+                percent_encode(&candidate)
+            );
+            let zones: Vec<Zone> = self.api("GET", &url, Vec::new()).await?;
+            if let Some(found) = zones.into_iter().find(|zone| !zone.id.is_empty()) {
+                zone = Some(found.id);
+                break;
+            }
+        }
+        let zone = zone.ok_or_else(|| io::Error::other("Cloudflare zone not found"))?;
+        if !zone.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(invalid("invalid Cloudflare zone identifier"));
+        }
+        let name = format!("_acme-challenge.{domain}");
+        let body = serde_json::to_vec(
+            &serde_json::json!({"type":"TXT", "name":name, "content":value, "ttl":self.ttl}),
+        )
+        .map_err(io::Error::other)?;
+        #[derive(Deserialize)]
+        struct Created {
+            id: String,
+        }
+        let created: Created = self
+            .api(
+                "POST",
+                &format!("https://api.cloudflare.com/client/v4/zones/{zone}/dns_records"),
+                body,
+            )
+            .await?;
+        if created.id.is_empty()
+            || !created
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(invalid("invalid Cloudflare record identifier"));
+        }
+        Ok(DnsRecord {
+            zone,
+            id: created.id,
+            name,
+            value: value.to_owned(),
+        })
+    }
+    async fn remove(&self, record: &DnsRecord) -> io::Result<()> {
+        if !record
+            .zone
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || !record
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(invalid("invalid Cloudflare record identifier"));
+        }
+        let _: serde_json::Value = self
+            .api(
+                "DELETE",
+                &format!(
+                    "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
+                    record.zone, record.id
+                ),
+                Vec::new(),
+            )
+            .await?;
+        Ok(())
+    }
+    async fn propagated(&self, record: &DnsRecord) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            #[derive(Deserialize)]
+            struct Answer {
+                data: String,
+            }
+            #[derive(Deserialize)]
+            struct Dns {
+                #[serde(default, rename = "Answer")]
+                answer: Vec<Answer>,
+            }
+            let url = format!(
+                "https://cloudflare-dns.com/dns-query?name={}&type=TXT",
+                percent_encode(&record.name)
+            );
+            let request = http::Request::builder()
+                .method("GET")
+                .uri(&url)
+                .header("Accept", "application/dns-json")
+                .body(instant_acme::BodyWrapper::default())
+                .map_err(io::Error::other)?;
+            if let Ok(Ok(mut response)) = tokio::time::timeout_at(
+                deadline,
+                instant_acme::HttpClient::request(&self.http, request),
+            )
+            .await
+                && response.parts.status.is_success()
+                && let Ok(body) = response.body.into_bytes().await
+                && serde_json::from_slice::<Dns>(&body).is_ok_and(|dns| {
+                    dns.answer
+                        .iter()
+                        .any(|a| a.data.trim_matches('"') == record.value)
+                })
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::other("timed out waiting for DNS-01 propagation"));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+}
+
+fn resolve_dns_token(value: &str) -> io::Result<String> {
+    let token = if let Some(name) = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        if name.is_empty() {
+            return Err(invalid(
+                "empty Cloudflare token environment variable reference",
+            ));
+        }
+        std::env::var(name).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Cloudflare token environment variable {name} is not set"),
+            )
+        })?
+    } else if value.trim().is_empty() {
+        return Err(invalid("Cloudflare API token is empty"));
+    } else {
+        value.to_owned()
+    };
+    if token.trim().is_empty()
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || !byte.is_ascii())
+        || http::HeaderValue::from_str(&format!("Bearer {token}")).is_err()
+    {
+        return Err(invalid("invalid Cloudflare API token"));
+    }
+    Ok(token)
+}
+
+fn percent_encode(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
 
 #[cfg(test)]
 #[path = "acme_tests.rs"]
@@ -216,6 +458,25 @@ impl HttpClient {
     }
 }
 
+pub(super) async fn cleanup_dns_state(config: &AcmeConfig) {
+    let Ok(Some(mut state)) = load(config) else {
+        return;
+    };
+    if state.dns_records.is_empty() {
+        return;
+    }
+    state.order_url = None;
+    state.order_key = None;
+    state.retry_at = 0;
+    cleanup_dns(config, &mut state).await;
+    if let Err(error) = persist(config, &state) {
+        log::error!(
+            "Could not persist stopped ACME DNS state: {}",
+            state_error(config, error)
+        );
+    }
+}
+
 impl instant_acme::HttpClient for HttpClient {
     fn request(
         &self,
@@ -380,6 +641,8 @@ struct State {
     ari_retry_at: i64,
     #[serde(default)]
     ari_renew_at: i64,
+    #[serde(default)]
+    dns_records: Vec<DnsRecord>,
 }
 
 fn open_private(path: &Path, new: bool) -> io::Result<File> {
@@ -476,7 +739,20 @@ fn load_state(config: &AcmeConfig, check_owner: bool) -> io::Result<Option<State
             "ACME state identity differs; use a distinct state_dir when changing CA or domains",
         ));
     }
-    if state.certificate.is_some() != state.private_key.is_some()
+    if !state.dns_records.is_empty() && !matches!(&config.challenge, ChallengeConfig::Dns01 { .. })
+    {
+        return Err(invalid(
+            "ACME state has pending Cloudflare DNS records; retain DNS-01 to clean them up",
+        ));
+    }
+    if state.dns_records.len() > 100
+        || state.dns_records.iter().any(|record| {
+            record.id.is_empty()
+                || record.zone.is_empty()
+                || !record.name.starts_with("_acme-challenge.")
+                || record.value.is_empty()
+        })
+        || state.certificate.is_some() != state.private_key.is_some()
         || state.order_url.is_some() != state.order_key.is_some()
     {
         return Err(invalid("incomplete ACME durable state"));
@@ -562,6 +838,7 @@ fn initial_state(config: &AcmeConfig) -> io::Result<State> {
         contacts: Vec::new(),
         ari_retry_at: 0,
         ari_renew_at: 0,
+        dns_records: Vec::new(),
     };
     // Persist the account key before registration, including across a failed response/write.
     persist(config, &state)?;
@@ -620,15 +897,39 @@ fn retry_time(delay: Duration) -> i64 {
         .saturating_add(2)
 }
 
-fn clear_order(
+async fn clear_order(
     source: &Source,
     config: &AcmeConfig,
     state: &mut State,
 ) -> Result<(), instant_acme::Error> {
     source.challenges.write().clear();
+    cleanup_dns(config, state).await;
     state.order_url = None;
     state.order_key = None;
     persist(config, state).map_err(|error| instant_acme::Error::Other(Box::new(error)))
+}
+
+async fn cleanup_dns(config: &AcmeConfig, state: &mut State) {
+    if state.dns_records.is_empty() {
+        return;
+    }
+    let Some(dns) = CloudflareDns::new(config).ok().flatten() else {
+        return;
+    };
+    let records = std::mem::take(&mut state.dns_records);
+    let removals = futures::future::join_all(records.iter().map(|record| dns.remove(record))).await;
+    for (record, result) in records.into_iter().zip(removals) {
+        if result.is_err() {
+            state.dns_records.push(record);
+            log::warn!("ACME DNS record cleanup failed; will retry");
+        }
+    }
+    if let Err(error) = persist(config, state) {
+        log::error!(
+            "Could not persist ACME DNS cleanup state: {}",
+            state_error(config, error)
+        );
+    }
 }
 
 async fn invalid_order(
@@ -638,7 +939,7 @@ async fn invalid_order(
     order: &mut instant_acme::Order,
 ) -> instant_acme::Error {
     // Forget the terminal order before fetching diagnostics, even if those requests fail.
-    if let Err(error) = clear_order(source, config, state) {
+    if let Err(error) = clear_order(source, config, state).await {
         return error;
     }
     if let Some(problem) = &order.state().error {
@@ -807,6 +1108,9 @@ impl Scheduler {
                 outcome: Ok(Progress::Deferred),
             };
         }
+        if state.order_url.is_none() && !state.dns_records.is_empty() {
+            cleanup_dns(config, &mut state).await;
+        }
         let renewal = if state.ari_renew_at == 0 {
             renewal_time(source)
         } else {
@@ -966,10 +1270,12 @@ impl Scheduler {
                     if failure.response.as_ref().is_some_and(|response| {
                         response.url == url && matches!(response.status.as_u16(), 404 | 410)
                     }) {
-                        clear_order(source, config, state).map_err(|error| Failure {
-                            response: failure.response.clone(),
-                            ..Failure::from(error)
-                        })?;
+                        clear_order(source, config, state)
+                            .await
+                            .map_err(|error| Failure {
+                                response: failure.response.clone(),
+                                ..Failure::from(error)
+                            })?;
                     }
                     return Err(failure);
                 }
@@ -998,7 +1304,8 @@ impl Scheduler {
         };
         if order.state().status == OrderStatus::Pending {
             Self::defer_hint(config, state, response)?;
-            self.prepare_challenges(source, config, state, &mut order, deadline)
+            let dns = CloudflareDns::new(config).map_err(Failure::from)?;
+            self.prepare_challenges(source, config, state, &mut order, deadline, dns.as_ref())
                 .await?;
             return Ok(Progress::Pending);
         }
@@ -1047,6 +1354,7 @@ impl Scheduler {
                     .as_ref()
                     .ok_or(instant_acme::Error::Str("missing order key"))?;
                 let material = Material::parse(&cert, key, &config.domains)?;
+                cleanup_dns(config, state).await;
                 state.certificate = Some(cert);
                 state.private_key = state.order_key.take();
                 state.order_url = None;
@@ -1068,7 +1376,14 @@ impl Scheduler {
         state: &mut State,
         order: &mut instant_acme::Order,
         deadline: tokio::time::Instant,
+        dns: Option<&CloudflareDns>,
     ) -> Result<(), Failure> {
+        if matches!(&config.challenge, ChallengeConfig::Dns01 { .. }) {
+            let dns = dns.ok_or(instant_acme::Error::Str("missing DNS provider"))?;
+            return self
+                .prepare_dns_challenges(source, config, state, order, deadline, dns)
+                .await;
+        }
         let client = self.client(config)?;
         let mut authorizations = order.authorizations();
         loop {
@@ -1082,25 +1397,29 @@ impl Scheduler {
                 continue;
             }
             if authorization.status != AuthorizationStatus::Pending {
-                let error = clear_order(source, config, state).err().unwrap_or_else(|| {
-                    authorization
-                        .challenges
-                        .iter()
-                        .find_map(|challenge| challenge.error.clone())
-                        .map_or(
-                            instant_acme::Error::Str("authorization not pending"),
-                            instant_acme::Error::Api,
-                        )
-                });
+                let error = clear_order(source, config, state)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| {
+                        authorization
+                            .challenges
+                            .iter()
+                            .find_map(|challenge| challenge.error.clone())
+                            .map_or(
+                                instant_acme::Error::Str("authorization not pending"),
+                                instant_acme::Error::Api,
+                            )
+                    });
                 return Err(Failure {
                     error: Box::new(error),
                     response,
                 });
             }
             Self::defer_hint(config, state, response)?;
-            let kind = match config.challenge {
+            let kind = match &config.challenge {
                 ChallengeConfig::Http01 { .. } => ChallengeType::Http01,
                 ChallengeConfig::TlsAlpn01 => ChallengeType::TlsAlpn01,
+                ChallengeConfig::Dns01 { .. } => unreachable!("DNS-01 uses its dedicated flow"),
             };
             let mut challenge =
                 authorization
@@ -1109,7 +1428,7 @@ impl Scheduler {
                         "CA did not offer configured challenge",
                     ))?;
             if challenge.status == ChallengeStatus::Invalid {
-                clear_order(source, config, state)?;
+                clear_order(source, config, state).await?;
                 return Err(challenge
                     .error
                     .clone()
@@ -1150,7 +1469,7 @@ impl Scheduler {
                 let mut pending = source.challenges.write();
                 pending.retain(|existing| existing.domain != domain);
                 pending.push(challenge::Pending {
-                    domain,
+                    domain: domain.clone(),
                     token,
                     authorization: authorization.as_str().to_owned(),
                     expires: Instant::now() + ORDER_TIMEOUT,
@@ -1160,6 +1479,173 @@ impl Scheduler {
             if challenge.status == ChallengeStatus::Pending {
                 let ((), response) = client.perform(deadline, challenge.set_ready()).await?;
                 Self::defer_hint(config, state, response)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn prepare_dns_challenges(
+        &mut self,
+        source: &Source,
+        config: &AcmeConfig,
+        state: &mut State,
+        order: &mut instant_acme::Order,
+        deadline: tokio::time::Instant,
+        dns: &CloudflareDns,
+    ) -> Result<(), Failure> {
+        let client = self.client(config)?;
+        let mut active_records = Vec::new();
+        let mut created_record = false;
+        {
+            let mut authorizations = order.authorizations();
+            loop {
+                let (authorization, response) = client
+                    .perform(deadline, async { authorizations.next().await.transpose() })
+                    .await?;
+                let Some(mut authorization) = authorization else {
+                    break;
+                };
+                if authorization.status == AuthorizationStatus::Valid {
+                    continue;
+                }
+                if authorization.status != AuthorizationStatus::Pending {
+                    let error = clear_order(source, config, state)
+                        .await
+                        .err()
+                        .unwrap_or_else(|| {
+                            authorization
+                                .challenges
+                                .iter()
+                                .find_map(|challenge| challenge.error.clone())
+                                .map_or(
+                                    instant_acme::Error::Str("authorization not pending"),
+                                    instant_acme::Error::Api,
+                                )
+                        });
+                    return Err(Failure {
+                        error: Box::new(error),
+                        response,
+                    });
+                }
+                Self::defer_hint(config, state, response)?;
+                let challenge = authorization
+                    .challenge(ChallengeType::Dns01)
+                    .ok_or(instant_acme::Error::Str("CA did not offer DNS-01"))?;
+                if challenge.status == ChallengeStatus::Invalid {
+                    clear_order(source, config, state).await?;
+                    return Err(challenge
+                        .error
+                        .clone()
+                        .map_or(
+                            instant_acme::Error::Str("DNS-01 challenge invalid"),
+                            instant_acme::Error::Api,
+                        )
+                        .into());
+                }
+                if challenge.status == ChallengeStatus::Valid {
+                    continue;
+                }
+                let domain = challenge.identifier().to_string();
+                if !config.domains.contains(&domain) {
+                    clear_order(source, config, state).await?;
+                    return Err(
+                        instant_acme::Error::Str("CA returned an unconfigured identifier").into(),
+                    );
+                }
+                let value = challenge.key_authorization().dns_value();
+                let existing = state
+                    .dns_records
+                    .iter()
+                    .find(|record| {
+                        record.name
+                            == format!("_acme-challenge.{}", domain.trim_start_matches("*."))
+                            && record.value == value
+                    })
+                    .cloned();
+                let record = if let Some(record) = existing {
+                    record
+                } else {
+                    let record = tokio::time::timeout_at(deadline, dns.present(&domain, &value))
+                        .await
+                        .map_err(|_| {
+                            Failure::from(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "ACME DNS operation timed out",
+                            ))
+                        })?
+                        .map_err(Failure::from)?;
+                    state.dns_records.push(record.clone());
+                    if let Err(error) = persist(config, state) {
+                        state.dns_records.pop();
+                        let _ = dns.remove(&record).await;
+                        return Err(Failure::from(error));
+                    }
+                    created_record = true;
+                    record
+                };
+                active_records.push(record);
+            }
+        }
+
+        if created_record {
+            tokio::time::timeout_at(deadline, tokio::time::sleep(dns.delay))
+                .await
+                .map_err(|_| {
+                    Failure::from(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "ACME DNS propagation delay exceeded order timeout",
+                    ))
+                })?;
+        }
+        for batch in active_records.chunks(8) {
+            let results = futures::future::join_all(batch.iter().map(|record| async move {
+                tokio::time::timeout_at(deadline, dns.propagated(record))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "ACME DNS propagation exceeded order timeout",
+                        )
+                    })?
+            }))
+            .await;
+            for result in results {
+                result.map_err(Failure::from)?;
+            }
+        }
+
+        let mut authorizations = order.authorizations();
+        loop {
+            let (authorization, response) = client
+                .perform(deadline, async { authorizations.next().await.transpose() })
+                .await?;
+            let Some(mut authorization) = authorization else {
+                break;
+            };
+            if authorization.status == AuthorizationStatus::Valid {
+                continue;
+            }
+            if authorization.status != AuthorizationStatus::Pending {
+                clear_order(source, config, state).await?;
+                return Err(instant_acme::Error::Str("authorization not pending").into());
+            }
+            Self::defer_hint(config, state, response)?;
+            let mut challenge = authorization
+                .challenge(ChallengeType::Dns01)
+                .ok_or(instant_acme::Error::Str("CA did not offer DNS-01"))?;
+            if challenge.status == ChallengeStatus::Pending {
+                let ((), response) = client.perform(deadline, challenge.set_ready()).await?;
+                Self::defer_hint(config, state, response)?;
+            } else if challenge.status == ChallengeStatus::Invalid {
+                clear_order(source, config, state).await?;
+                return Err(challenge
+                    .error
+                    .clone()
+                    .map_or(
+                        instant_acme::Error::Str("DNS-01 challenge invalid"),
+                        instant_acme::Error::Api,
+                    )
+                    .into());
             }
         }
         Ok(())
