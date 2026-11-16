@@ -77,6 +77,12 @@ protocol:
 
 ## Client
 
+Client DNS identities normalize one trailing dot before certificate verification
+and wire SNI. Names with a hexadecimal numeric final label, such as
+`example.0x1f`, are invalid; `0x1f.example` remains valid. Explicit
+`sni_hostname: null` still suppresses wire SNI without disabling verification of
+the hop identity. Raw REALITY/ShadowTLS target dispatch is unchanged.
+
 ```yaml
 protocol:
   type: tls

@@ -162,6 +162,62 @@ async fn wireguard_singbox_both_roles_tcp_udp_ipv4_ipv6() -> io::Result<()> {
 
 #[tokio::test]
 #[ignore = "Requires sing-box with WireGuard and gVisor; set SHOES_TEST_SING_BOX_BIN"]
+async fn wireguard_same_key_handoff_to_wireguard_go_preserves_timestamp_order() -> io::Result<()> {
+    let binary = PathBuf::from(
+        std::env::var_os("SHOES_TEST_SING_BOX_BIN").expect("set SHOES_TEST_SING_BOX_BIN"),
+    );
+    let reservation = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let port = reservation.local_addr()?.port();
+    let mut shoes_ports = PortHelper::new();
+    let (_, shoes_entry) = shoes_ports.get_localhost_listener_port();
+    let mut peer_ports = PortHelper::new();
+    let (_, peer_entry) = peer_ports.get_localhost_listener_port();
+    drop(reservation);
+    let _responder = start_singbox_server_with_binary(
+        &singbox_server(port).to_string(),
+        &binary,
+        &[("GOMAXPROCS", "1")],
+    )?;
+    let targets = EchoTargets::new(false).await?;
+    let destination = Some("198.18.0.1".parse().unwrap());
+    // The same responder retains replay state across both initiators. A +37 epoch
+    // would reject wireguard-go's +10 timestamp for 27 seconds after the first handshake.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let shoes = start_shoes_server(
+            &serde_yaml::to_string(&json!([config::client(port), config::socks(shoes_entry),]))
+                .unwrap(),
+        )?;
+        shoes_ports.wait_for_all_ports().await?;
+        targets.check(shoes_entry, destination).await?;
+        drop(shoes);
+        let initiator = json!({
+            "log": {"level": "warn"},
+            "inbounds": [{"type": "socks", "listen": "0.0.0.0", "listen_port": peer_entry}],
+            "endpoints": [{
+                "type": "wireguard", "tag": "wg", "system": false,
+                "address": ["10.77.0.2/32", "fd77::2/128"],
+                "private_key": config::key(42), "mtu": 1408,
+                "peers": [{
+                    "public_key": config::public(41), "pre_shared_key": config::key(43),
+                    "address": "127.0.0.1", "port": port,
+                    "allowed_ips": ["0.0.0.0/0", "::/0"]
+                }]
+            }],
+            "route": {"final": "wg"}
+        });
+        let _initiator = start_singbox_server_with_binary(
+            &initiator.to_string(),
+            &binary,
+            &[("GOMAXPROCS", "1")],
+        )?;
+        peer_ports.wait_for_all_ports().await?;
+        targets.check(peer_entry, destination).await
+    })
+    .await?
+}
+
+#[tokio::test]
+#[ignore = "Requires sing-box with WireGuard and gVisor; set SHOES_TEST_SING_BOX_BIN"]
 async fn wireguard_singbox_lazy_whole_path_carrier_tracks_demand_and_reconnects() -> io::Result<()>
 {
     use bytes::Bytes;

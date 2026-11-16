@@ -100,9 +100,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
         with:
-          toolchain: 1.99.1
+          toolchain: 1.100.0
           targets: ${{ !matrix.build_std && matrix.target || '' }}
           components: ${{ matrix.build_std && 'rust-src' || '' }}
 
@@ -111,13 +111,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes qemu-user-static zstd
-          sdk=openwrt-toolchain-24.10.4-ath79-generic_gcc-13.3.0_musl.Linux-x86_64
+          sdk=openwrt-toolchain-25.12.6-ath79-generic_gcc-14.3.0_musl.Linux-x86_64
           curl --fail --location --retry 3 \
-            "https://downloads.openwrt.org/releases/24.10.4/targets/ath79/generic/$sdk.tar.zst" \
+            "https://downloads.openwrt.org/releases/25.12.6/targets/ath79/generic/$sdk.tar.zst" \
             --output "$RUNNER_TEMP/mips-toolchain.tar.zst"
-          echo "19b9063d4f9807b5ebcba824e1d134559eff5fc4efdc483a933eb0ac78f62c09  $RUNNER_TEMP/mips-toolchain.tar.zst" | sha256sum --check --strict
+          echo "8f2bbebf20dc4d297f6419291268fbc22d6df0cdc224c0e7b68b42cce37c7492  $RUNNER_TEMP/mips-toolchain.tar.zst" | sha256sum --check --strict
           tar --zstd -xf "$RUNNER_TEMP/mips-toolchain.tar.zst" -C "$RUNNER_TEMP"
-          staging="$RUNNER_TEMP/$sdk/toolchain-mips_24kc_gcc-13.3.0_musl"
+          staging="$RUNNER_TEMP/$sdk/toolchain-mips_24kc_gcc-14.3.0_musl"
           mkdir -p "$RUNNER_TEMP/mips-native"
           # Rust's musl std requests libunwind; this SDK supplies GCC's unwinder.
           printf 'GROUP(-lgcc_eh -lgcc)\n' > "$RUNNER_TEMP/mips-native/libunwind.a"

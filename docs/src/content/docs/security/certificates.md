@@ -7,6 +7,13 @@ Ordinary TLS targets and QUIC listeners can share a named certificate source.
 Use `certificate_source` instead of `cert` and `key`; combining them is an error.
 Existing inline certificates, file paths, and named PEMs remain supported.
 
+Certificates with duplicate SCT extensions or malformed outer DER OCTET STRING
+wrappers are rejected. This parsing requirement also applies when clients use
+fingerprint-only verification or `verify: false`; it does not enable CT-log
+verification. The bundled public roots no longer include DigiCert Trusted Root
+G4, QuoVadis Root CA 1 G3/3 G3, Buypass Class 2/3 Root CA, or Certigna Root CA.
+Servers relying solely on those anchors need an unaffected certificate chain.
+
 ```yaml
 - certificate_source: public
   type: files

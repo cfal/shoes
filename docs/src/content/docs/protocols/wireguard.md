@@ -247,3 +247,10 @@ Bind failures during activation trigger rollback to the previous configuration,
 but disconnected tunnel sessions are not restored. If rollback fails, shoes
 exits with status 1. Shutdown waits for buffered UDP tasks to release their
 sockets before rebind. No host route cleanup is necessary.
+
+GotaTun 0.10.3 corrects initiation timestamps to match wireguard-go. During a
+rapid upgrade from older Shoes with the same key, a responder retaining the
+previous handshake may reject new initiations for the remainder of 27 seconds,
+plus retry scheduling. This temporary replay-state delay clears without a
+configuration change; allow the window to expire before a continuity-sensitive
+handoff. Do not share one client key between concurrently active initiators.

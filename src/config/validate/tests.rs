@@ -853,6 +853,10 @@ fn tls_sni_distinguishes_inheritance_disable_and_override() {
         (NoneOrOne::Unspecified, false),
         (NoneOrOne::None, true),
         (NoneOrOne::One("example.com".to_owned()), true),
+        (NoneOrOne::One("example.com.".to_owned()), true),
+        (NoneOrOne::One("0x1f.example".to_owned()), true),
+        (NoneOrOne::One("example.0x1f".to_owned()), false),
+        (NoneOrOne::One("0x7f000001".to_owned()), false),
         (NoneOrOne::One("invalid name".to_owned()), false),
     ] {
         let mut protocol = serde_json::from_value(serde_json::json!({

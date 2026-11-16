@@ -235,6 +235,8 @@ mod tests {
             "Host: 192.0.2.1.:80\r\n",
             "Host: 127.1\r\n",
             "Host: 0177.0.0.1\r\n",
+            "Host: 0x7f000001\r\n",
+            "Host: example.0x1f\r\n",
             "Host: [::1]\r\n",
             "Host: [::1]:80\r\n",
             "Host: ::1\r\n",

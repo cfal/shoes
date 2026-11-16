@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Updated GotaTun to published 0.10.3, retaining MIPS32 atomic support and correcting WireGuard initiation timestamps to match wireguard-go. After a rapid upgrade with the same key, a persistent responder may reject initiations for the remainder of a 27-second replay-state window, plus retry scheduling.
+- Updated TLS name parsing and bundled roots. Trailing-dot client DNS identities are normalized; hexadecimal numeric final labels are rejected. The root bundle removes DigiCert Trusted Root G4, QuoVadis Root CA 1 G3/3 G3, Buypass Class 2/3 Root CA, and Certigna Root CA; servers relying solely on those anchors need an unaffected certificate chain. Duplicate or malformed SCT extension wrappers now reject, including with fingerprint-only or disabled chain verification; no CT-log policy is enabled.
+- Refreshed eligible Rust and documentation dependencies, Go build tooling, and release compilers to Rust 1.100.0 and OpenWrt GCC 14.3.0. The Rust 1.99.1 minimum, Bookworm runtime, mobile platform floors, maintained forks, and interoperability peer baselines are unchanged.
 - Refreshed the BLAKE3 fork to current upstream hexadecimal-formatting hardening while preserving arbitrary-byte VLESS Encryption derivation, hash/KDF/XOF output and wire compatibility. The package version remains 1.8.7; the new upstream change is unreleased.
 - Reduced UDP burst loss for TUN and WireGuard inbound forwarding by waiting for space in bounded reply queues. A destination closes after 30 seconds without response-queue capacity. TUN ingress and inbound UDP session/destination upload queues now hold 128 packets and still drop when full; WireGuard stack queues remain at 64.
 - Raised the TUN `resource_limits.tcp_buffer_size` default from 32 KiB to 128 KiB, giving each TCP flow 512 KiB of buffer capacity across four buffers. WireGuard retains its 32 KiB default and existing admission budget.

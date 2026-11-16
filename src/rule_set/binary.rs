@@ -239,6 +239,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inflate_preserves_boundaries_and_rejects_incomplete_or_extra_streams() {
+        use std::io::Write;
+
+        for len in [0, 1, 8191, 8192, 8193, 32767, 32768, 32769, 65537] {
+            let input: Vec<u8> = (0..len).map(|i| (i * 31 + i / 251) as u8).collect();
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            for chunk in input.chunks(257) {
+                encoder.write_all(chunk).unwrap();
+                encoder.flush().unwrap();
+            }
+            let compressed = encoder.finish().unwrap();
+            assert_eq!(
+                inflate(&compressed, &mut Compiler::default()).unwrap(),
+                input
+            );
+            for end in [compressed.len() / 2, compressed.len() - 1] {
+                assert!(inflate(&compressed[..end], &mut Compiler::default()).is_err());
+            }
+            let mut trailing = compressed.clone();
+            trailing.push(0);
+            assert!(inflate(&trailing, &mut Compiler::default()).is_err());
+            trailing.pop();
+            trailing.extend_from_slice(&compressed);
+            assert!(inflate(&trailing, &mut Compiler::default()).is_err());
+        }
+    }
+
+    #[test]
     fn inflation_growth_is_admitted_before_reallocation() {
         let mut budget = Compiler::default();
         budget.charge(512 * 1024 * 1024 - 20 * 1024, 0).unwrap();

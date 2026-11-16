@@ -2,6 +2,7 @@
 """Exercises dependency-notice generation and release tarball verification."""
 
 import importlib.util
+import hashlib
 from html.parser import HTMLParser
 import io
 import json
@@ -70,7 +71,7 @@ class ReleaseNoticesTests(unittest.TestCase):
             self.assert_supplement_license(missing, identity, source, "Shared license")
 
     def test_sysroot_dependencies_have_matching_notices(self):
-        version = tomllib.loads((NOTICES.ROOT / "Cargo.toml").read_text())["package"]["rust-version"]
+        version = NOTICES.RELEASE_RUST_VERSION
         sysroot = Path(subprocess.check_output([
             "rustup", "run", version, "rustc", "--print", "sysroot",
         ], text=True).strip())
@@ -102,6 +103,13 @@ class ReleaseNoticesTests(unittest.TestCase):
         builtins = (NOTICES.ROOT / f"licenses/rust-{version}-compiler-builtins.txt").read_text()
         for relative in ("LICENSE.txt", "libm/LICENSE.txt"):
             self.assertIn((library / "compiler-builtins" / relative).read_text().strip(), builtins)
+
+    def test_release_compiler_matches_notices(self):
+        version = NOTICES.RELEASE_RUST_VERSION
+        self.assertIn(f"FROM rust:{version}-bookworm AS build", (NOTICES.ROOT / "Dockerfile").read_text())
+        for workflow in ("build.yml", "test.yml"):
+            text = (NOTICES.ROOT / ".github/workflows" / workflow).read_text()
+            self.assertEqual(re.findall(r"(?m)^\s+toolchain: (\S+)$", text), [version])
 
     def test_generation_preserves_bundle_on_warning_or_failure(self):
         for status, stderr in [(0, ""), (0, "WARN checksum mismatch"), (1, ""), (1, "failed")]:
@@ -159,30 +167,28 @@ class ReleaseNoticesTests(unittest.TestCase):
         gotatun_packages = [p for p in metadata["packages"] if p["name"] == "gotatun"]
         self.assertEqual(len(gotatun_packages), 1)
         gotatun = gotatun_packages[0]
-        source = urlsplit(gotatun["source"].removeprefix("git+"))
-        self.assertEqual(source.scheme, "https")
-        self.assertEqual(source.netloc, "github.com")
-        self.assertEqual(source.path, "/mullvad/gotatun")
-        self.assertRegex(source.fragment, r"^[0-9a-f]{40}$")
+        self.assertEqual(gotatun["source"], "registry+https://github.com/rust-lang/crates.io-index")
+        gotatun_root = Path(gotatun["manifest_path"]).parent
+        vcs = json.loads((gotatun_root / ".cargo_vcs_info.json").read_text())
+        self.assertEqual(vcs["path_in_vcs"], "gotatun")
+        revision = vcs["git"]["sha1"]
+        self.assertRegex(revision, r"^[0-9a-f]{40}$")
+        self.assertEqual(revision, "c541472b40ec489ba7bdfd048512e89e556c7a3c")
         source_notice = (NOTICES.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
         for required in [
             f"GotaTun {gotatun['version']}",
-            f"https://github.com/mullvad/gotatun/tree/{source.fragment}",
-            f"https://github.com/mullvad/gotatun/archive/{source.fragment}.tar.gz",
+            f"https://github.com/mullvad/gotatun/tree/{revision}",
+            f"https://github.com/mullvad/gotatun/archive/{revision}.tar.gz",
         ]:
             self.assertIn(required, source_notice)
-        for name in ["gotatun-crypto", "gotatun-packet"]:
-            packages = [p for p in metadata["packages"] if p["name"] == name]
-            self.assertEqual(len(packages), 1)
-            self.assertEqual(packages[0]["source"], gotatun["source"])
-        gotatun_root = Path(gotatun["manifest_path"]).parent.parent
-        for original, bundled in [
-            ("LICENSE", "MPL-2.0.txt"),
-            ("LICENSE-CLOUDFLARE", "gotatun-CLOUDFLARE.txt"),
+        # The published archive omits the repository-root licenses at this revision.
+        for bundled, checksum in [
+            ("MPL-2.0.txt", "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04"),
+            ("gotatun-CLOUDFLARE.txt", "6dbef24708bad8c727bd80cca58ba8aa1637cdcb2cc6e9a31ea49235717e9391"),
         ]:
             self.assertEqual(
-                (gotatun_root / original).read_bytes(),
-                (NOTICES.ROOT / "licenses" / bundled).read_bytes(),
+                hashlib.sha256((NOTICES.ROOT / "licenses" / bundled).read_bytes()).hexdigest(),
+                checksum,
             )
         bundle = (NOTICES.ROOT / "licenses/dependencies.txt").read_text()
         original_notices = {
@@ -215,9 +221,9 @@ class ReleaseNoticesTests(unittest.TestCase):
         expected = NOTICES.expected_notices()
         self.assertTrue({
             "LICENSE", "licenses/musl-1.2.5.txt",
-            "licenses/rust-1.99.1-COPYRIGHT-library.html",
-            "licenses/rust-1.99.1-compiler-builtins.txt",
-            "licenses/rust-1.99.1-sysroot-supplement.txt",
+            f"licenses/rust-{NOTICES.RELEASE_RUST_VERSION}-COPYRIGHT-library.html",
+            f"licenses/rust-{NOTICES.RELEASE_RUST_VERSION}-compiler-builtins.txt",
+            f"licenses/rust-{NOTICES.RELEASE_RUST_VERSION}-sysroot-supplement.txt",
         }.issubset(expected))
         for kind, mode in [("tar", "w"), ("tar.gz", "w:gz")]:
             cases = [(None, None)] + [

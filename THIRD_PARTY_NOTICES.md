@@ -52,7 +52,7 @@ Regenerate the bundle after changing Cargo.lock, using cargo-about 0.9.3:
 cargo install --locked --features cli cargo-about@0.9.3
 python3 scripts/generate-release-notices.py
 cargo fetch --locked
-rustup component add rust-src --toolchain 1.99.1
+rustup component add rust-src --toolchain 1.100.0
 python3 scripts/test-release-notices.py
 ```
 
@@ -68,38 +68,38 @@ invokes it before uploading tarballs. Do not remove the bundle when redistributi
 
 ## Rust Standard Library
 
-Release builds use Rust 1.99.1. `licenses/rust-1.99.1-COPYRIGHT-library.html`
+Release builds use Rust 1.100.0. `licenses/rust-1.100.0-COPYRIGHT-library.html`
 reproduces the toolchain's standard-library copyright and dependency notices.
-`licenses/rust-1.99.1-sysroot-supplement.txt` supplies the exact vendored licenses
+`licenses/rust-1.100.0-sysroot-supplement.txt` supplies the exact vendored licenses
 for sysroot package versions missing from that upstream document, plus the
 in-tree `core::slice::memchr` attribution. The notice tests reconcile the matching
 `rust-src` lockfile against these files. MIPS builds compile
 this sysroot from the matching `rust-src` rather than using a prebuilt standard
-library. `licenses/rust-1.99.1-compiler-builtins.txt` additionally reproduces
+library. `licenses/rust-1.100.0-compiler-builtins.txt` additionally reproduces
 the compiler-builtins and bundled libm licenses and their source-file notices.
 These files are separate from the Cargo dependency bundle above.
 
-Source: https://github.com/rust-lang/rust/tree/1.99.1/library.
+Source: https://github.com/rust-lang/rust/tree/1.100.0/library.
 
 ## MIPS C Runtime
 
-The static MIPS executable includes musl 1.2.5 from the OpenWrt 24.10.4
+The static MIPS executable includes musl 1.2.5 from the OpenWrt 25.12.6
 ath79 toolchain. `licenses/musl-1.2.5.txt` reproduces its `COPYRIGHT` and
 copyright, permission, and redistribution notice blocks from the upstream
 source files, including third-party math and sorting code. The source is
 available at https://musl.libc.org/releases/musl-1.2.5.tar.gz; OpenWrt's
-patches are at https://github.com/openwrt/openwrt/tree/v24.10.4/toolchain/musl/patches.
+patches are at https://github.com/openwrt/openwrt/tree/v25.12.6/toolchain/musl/patches.
 
-This executable also links GCC 13.3.0 runtime and unwinder code under
+This executable also links GCC 14.3.0 runtime and unwinder code under
 GPL-3.0-or-later WITH GCC-exception-3.1. The GCC Runtime Library Exception
 permits the combined executable to be distributed under its own terms:
 https://github.com/gcc-mirror/gcc/blob/b71f1de6e9cf7181a288c0f39f9b1ef6580cf5c8/COPYING.RUNTIME.
 
 ## WireGuard Source
 
-Unix builds, including Android and iOS libraries, link GotaTun 0.10.2 and its
-`gotatun-crypto` and `gotatun-packet` crates from upstream commit
-`c06582e41022bcecbf33751631fd5a63d5794dc5`, an implementation of the WireGuard
+Unix builds, including Android and iOS libraries, link the published crates.io
+GotaTun 0.10.3 from upstream commit
+`c541472b40ec489ba7bdfd048512e89e556c7a3c`, an implementation of the WireGuard
 protocol. GotaTun is copyright Mullvad VPN AB
 and incorporates work copyright Cloudflare, Inc. Its source files are covered
 by the Mozilla Public License 2.0 and the notices reproduced in
@@ -107,8 +107,8 @@ by the Mozilla Public License 2.0 and the notices reproduced in
 
 The unmodified corresponding source is available at:
 
-- https://github.com/mullvad/gotatun/tree/c06582e41022bcecbf33751631fd5a63d5794dc5
-- https://github.com/mullvad/gotatun/archive/c06582e41022bcecbf33751631fd5a63d5794dc5.tar.gz
+- https://github.com/mullvad/gotatun/tree/c541472b40ec489ba7bdfd048512e89e556c7a3c
+- https://github.com/mullvad/gotatun/archive/c541472b40ec489ba7bdfd048512e89e556c7a3c.tar.gz
 
 Recipients may obtain, modify, and redistribute the covered source under the
 MPL 2.0. Shoes does not modify GotaTun's source. Shoes' own source remains under

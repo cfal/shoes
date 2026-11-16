@@ -529,27 +529,141 @@ mod material_tests {
     }
 
     #[test]
-    fn bundled_roots_exclude_removed_emsign_anchors() {
+    fn sct_outer_der_is_checked_even_without_chain_verification() {
+        #[derive(Debug)]
+        struct Certificate(Arc<rustls::sign::CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for Certificate {
+            fn resolve(
+                &self,
+                _: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let issuer =
+            rcgen::CertifiedIssuer::self_signed(ca, rcgen::KeyPair::generate().unwrap()).unwrap();
+        for (extensions, valid) in [
+            (vec![], true),
+            // WebPKI checks the OCTET STRING wrapper, not CT log policy or SCT contents.
+            (vec![vec![0x04, 0x02, 0x00, 0x00]], true),
+            (vec![vec![0x05, 0x00]], false),
+            (vec![vec![0x04, 0x02, 0x00]], false),
+            (vec![vec![0x04, 0x00], vec![0x04, 0x00]], false),
+        ] {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+            params.custom_extensions = extensions
+                .into_iter()
+                .map(|value| {
+                    rcgen::CustomExtension::from_oid_content(
+                        &[1, 3, 6, 1, 4, 1, 11129, 2, 4, 2],
+                        value,
+                    )
+                })
+                .collect();
+            let cert = params.signed_by(&key, &issuer).unwrap();
+            assert_eq!(
+                try_create_server_config(
+                    cert.pem().as_bytes(),
+                    key.serialize_pem().as_bytes(),
+                    vec![],
+                    &[],
+                    &[],
+                    &Default::default(),
+                )
+                .is_ok(),
+                valid
+            );
+
+            // A custom resolver deliberately serves malformed certificates to exercise
+            // client-side rejection independently of Shoes' server material checks.
+            let signing_key = get_crypto_provider()
+                .key_provider
+                .load_private_key(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+                )
+                .unwrap();
+            let server = Arc::new(
+                rustls::ServerConfig::builder_with_provider(get_crypto_provider())
+                    .with_protocol_versions(&[&rustls::version::TLS13])
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(Certificate(Arc::new(
+                        rustls::sign::CertifiedKey::new(vec![cert.der().clone()], signing_key),
+                    )))),
+            );
+            let fingerprint =
+                aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, cert.der().as_ref())
+                    .as_ref()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+            for (verify, pins) in [
+                (true, vec![]),
+                (false, vec![]),
+                (false, vec![fingerprint.clone()]),
+                (true, vec![fingerprint.clone()]),
+            ] {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(issuer.der().clone()).unwrap();
+                let client = Arc::new(with_test_roots(roots, || {
+                    try_create_client_config(
+                        verify,
+                        pins,
+                        vec![],
+                        true,
+                        None,
+                        true,
+                        &Default::default(),
+                    )
+                    .unwrap()
+                }));
+                let (mut client, mut server) = connection_pair(&client, &server);
+                transfer_tls(&mut client, &mut server).unwrap();
+                let received = transfer_tls(&mut server, &mut client);
+                assert_eq!(received.is_ok(), valid, "verify={verify}: {received:?}");
+                if valid {
+                    finish_handshake(&mut client, &mut server);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_roots_exclude_removed_anchors() {
         use x509_parser::prelude::{FromDer, X509Name};
 
         let subjects = get_root_cert_store().subjects();
         assert!(!subjects.is_empty());
+        let mut retained_root = false;
         for subject in subjects {
             let (remaining, name) = X509Name::from_der(subject.as_ref()).unwrap();
             assert!(remaining.is_empty());
             for common_name in name.iter_common_name() {
                 let common_name = common_name.as_str().unwrap();
+                retained_root |= common_name == "DigiCert Global Root G2";
                 assert!(
                     ![
                         "emSign Root CA - C1",
                         "emSign ECC Root CA - C3",
                         "emSign ECC Root CA - G3",
+                        "DigiCert Trusted Root G4",
+                        "QuoVadis Root CA 1 G3",
+                        "QuoVadis Root CA 3 G3",
+                        "Buypass Class 2 Root CA",
+                        "Buypass Class 3 Root CA",
+                        "Certigna Root CA",
                     ]
                     .contains(&common_name),
                     "removed trust anchor: {common_name}"
                 );
             }
         }
+        assert!(retained_root);
     }
 
     fn resumption_configs() -> (Arc<rustls::ClientConfig>, rustls::ServerConfig) {
