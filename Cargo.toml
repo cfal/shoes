@@ -210,7 +210,7 @@ tempfile = "*"
 tokio-rustls = "*"
 
 [target.'cfg(unix)'.dependencies]
-gotatun = { git = "https://github.com/AYastrebov/gotatun", rev = "a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b", default-features = false, features = ["device", "aws-lc-rs", "amnezia", "phobos"] }
+gotatun = { git = "https://github.com/AYastrebov/gotatun", rev = "7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292", default-features = false, features = ["device", "aws-lc-rs", "amnezia", "phobos"] }
 
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies]
 portable-atomic = { version = "1", features = ["fallback"] }

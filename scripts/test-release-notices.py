@@ -172,7 +172,7 @@ class ReleaseNoticesTests(unittest.TestCase):
         repository = repository.split("?", 1)[0]
         self.assertEqual(repository, "https://github.com/AYastrebov/gotatun")
         self.assertRegex(revision, r"^[0-9a-f]{40}$")
-        self.assertEqual(revision, "a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b")
+        self.assertEqual(revision, "7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292")
         source_notice = (NOTICES.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
         for required in [
             f"GotaTun {gotatun['version']}",

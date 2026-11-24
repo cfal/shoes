@@ -86,7 +86,7 @@ Shadowsocks and NaiveProxy tests. Verify the final published full SHA with
 
 GotaTun is a direct git dependency, not a workspace patch: `AYastrebov/gotatun`
 adds AmneziaWG and Phobos obfuscation, pinned at
-[`a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b`](https://github.com/AYastrebov/gotatun/tree/a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b),
+[`7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292`](https://github.com/AYastrebov/gotatun/tree/7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292),
 on top of upstream main commit
 [`5454dacddcbbd046105242e2fa70b494bc2248a7`](https://github.com/mullvad/gotatun/tree/5454dacddcbbd046105242e2fa70b494bc2248a7).
 That commit declares 0.10.3 and contains everything in the published 0.10.3

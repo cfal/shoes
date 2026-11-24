@@ -995,7 +995,7 @@ dependencies = [
 [[package]]
 name = "gotatun"
 version = "0.10.3"
-source = "git+https://github.com/AYastrebov/gotatun?rev=a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b#a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b"
+source = "git+https://github.com/AYastrebov/gotatun?rev=7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292#7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292"
 dependencies = [
  "aead",
  "base64 0.22.1",
@@ -1035,7 +1035,7 @@ dependencies = [
 [[package]]
 name = "gotatun-crypto"
 version = "0.1.0"
-source = "git+https://github.com/AYastrebov/gotatun?rev=a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b#a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b"
+source = "git+https://github.com/AYastrebov/gotatun?rev=7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292#7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292"
 dependencies = [
  "aws-lc-rs",
  "x25519-dalek",
@@ -1044,7 +1044,7 @@ dependencies = [
 [[package]]
 name = "gotatun-packet"
 version = "0.1.0"
-source = "git+https://github.com/AYastrebov/gotatun?rev=a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b#a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b"
+source = "git+https://github.com/AYastrebov/gotatun?rev=7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292#7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292"
 dependencies = [
  "bitfield-struct",
  "bytes",

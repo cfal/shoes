@@ -107,8 +107,8 @@ by the Mozilla Public License 2.0 and the notices reproduced in
 The corresponding source, including the fork's modifications, is the revision
 recorded in `Cargo.lock`, available at:
 
-- https://github.com/AYastrebov/gotatun/tree/a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b
-- https://github.com/AYastrebov/gotatun/archive/a2ee9d791aaec1660560f4fd0da92bcf8ddd8b8b.tar.gz
+- https://github.com/AYastrebov/gotatun/tree/7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292
+- https://github.com/AYastrebov/gotatun/archive/7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292.tar.gz
 
 The fork is based on upstream GotaTun after the 0.10.3 release. The upstream
 commit it branches from, and the 0.10.3 release commit, are available at:
