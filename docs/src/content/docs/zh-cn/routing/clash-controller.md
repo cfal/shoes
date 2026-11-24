@@ -89,6 +89,8 @@ CLI 可以公开 Clash API 的记录子集。除非配置了监听器，否则�
 
 支持的端点：`/version`、只读 `/configs`、`/proxies`、`/group`、选择器 PUT、节点/组 `/delay`、只读 `/rules`、`/connections` 快照和 DELETE 取消，以及 WebSocket/NDJSON `/traffic`、`/memory` 和 `/logs`。提供者集合返回`{"providers":{}}`。流量计数器测量出站应用程序负载，而不是标头、填充或重传。排除探针、内部DNS/承载层流量以及未经身份验证的伪装/后备转发；合成假 DNS 答案和 ICMP 不表示为连接。连接速度由仪表板从连续的字节计数器得出。过程/GeoIP 数据不是捏造的。
 
+每个 `/connections` 快照（HTTP 和 WebSocket）还包含 `shoesScopeTotals`：按 `inbound` 和规则 `scope`（即 `/rules` 中每条规则在 `shoes` 下报告的那一对）累计的 `upload` 和 `download` 字节数，同时计入打开和已关闭的连接。与每个连接的计数器不同，它包含在两次快照之间打开并关闭的连接，因此客户端无需对每个连接采样，即可按监听器或按 TLS、REALITY、ShadowTLS、WebSocket 目标统计流量。继承监听器规则的目标报告的是监听器的 scope；要单独统计某个目标，请为其设置 `override_rules`。总计为进程级，在重新加载后继续累计；它们不会持久化，入站被移除时也不会重置。没有传输过字节的 scope 会被省略。最多为 16,384 个 scope 保留已关闭连接的总计；超出后，其他 scope 的连接仅在打开期间被报告，而 `uploadTotal`/`downloadTotal` 仍然完整。
+
 Clash API 条目（`clash_api_address` 或 `clash_api_path`）上的可选 `connection_notes: true` 通过 HTTP 和 WebSocket 将设置注释添加到活动 `/connections` 对象。默认为 false；更改它需要重新启动。如果任何控制器启用它，所有控制器都会公开注释。在 zashboard 中，打开连接的详细信息并选择 **Raw** 以检查 `notes`（`elapsedUs`、`phase`、`text`）及其现有的生成、目标、选定的链和规则元数据。
 
 注释描述了准备、路由选择、入站解析器调用和出站设置。它们是尽力而为的：拒绝/失败的设置和关闭的连接没有保留的历史记录或单独的调试端点。仪表板可能会保留以前采样的连接，但可能会错过短暂的连接。 DNS 注释涵盖现有路由/拨号呼叫边界，而不是解析器缓存/上游内部结构或远程 DNS。未观察到初始 UDP 预检查和本地 DNS 处理。注释包含主机名和地址，而不包含有效负载、凭据或错误消息；错误仅使用其类型。它们可能会泄露 API 未公开的出站代理服务器主机名和 IP 地址。

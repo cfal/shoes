@@ -1556,6 +1556,7 @@ async fn transport_metadata_survives_upgrade_and_prefix_wrapping() {
         generation: 1,
         start: String::new(),
         metadata: FlowMetadata::default(),
+        scope: String::new(),
         chains: vec![],
         rule_payload: String::new(),
         counters: FlowCounters::default(),

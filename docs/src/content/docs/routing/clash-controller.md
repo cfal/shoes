@@ -216,6 +216,20 @@ synthetic fake-DNS answers and ICMP are not represented as connections.
 Connection speeds are derived by the dashboard from successive byte counters.
 Process/GeoIP data is not fabricated.
 
+Each `/connections` snapshot, over HTTP and WebSocket, also carries
+`shoesScopeTotals`: cumulative `upload` and `download` bytes for each `inbound`
+and rule `scope` (the pair reported for a rule under `shoes` in `/rules`), counting
+both open and closed connections. Unlike per-connection counters, these include
+connections that opened and closed between two snapshots, so a client can account
+traffic per listener or per TLS, REALITY, ShadowTLS, or WebSocket target without
+sampling every connection. A target that inherits its listener's rules reports the
+listener's scope; give a target `override_rules` to account for it separately.
+Totals are process-wide and continue across reloads; they are neither persisted
+nor reset when an inbound is removed. Scopes that have carried no bytes are
+omitted. Closed-connection totals are retained for at most 16,384 scopes; beyond
+that, connections of further scopes are reported only while open, and
+`uploadTotal`/`downloadTotal` remain complete.
+
 Optional `connection_notes: true` on a Clash API entry (`clash_api_address` or
 `clash_api_path`) adds setup notes to active `/connections` objects, over HTTP and
 WebSocket. It defaults to false; changing it requires a restart.

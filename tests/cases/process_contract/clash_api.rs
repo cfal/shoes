@@ -511,6 +511,19 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
     check_flow(&mut new, b'W').await;
     let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
     let source_port = new.local_addr().unwrap().port().to_string();
+    // The cancelled flow no longer appears, but its bytes stay with its inbound scope.
+    let open = snapshot["connections"].as_array().unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        snapshot["shoesScopeTotals"],
+        json!([{
+            "inbound": open[0]["metadata"]["inboundName"],
+            "scope": "root",
+            "upload": snapshot["uploadTotal"],
+            "download": snapshot["downloadTotal"],
+        }])
+    );
+    assert!(snapshot["uploadTotal"].as_u64() > open[0]["upload"].as_u64());
     let before_reload = snapshot["connections"]
         .as_array()
         .unwrap()
