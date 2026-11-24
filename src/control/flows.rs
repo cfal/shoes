@@ -10,6 +10,9 @@ use tokio_util::sync::CancellationToken;
 use super::connection_notes::{ConnectionNotes, MAX_FLOWS, Note};
 use crate::address::{NetLocation, ResolvedLocation};
 
+/// Inbound scopes whose closed-flow totals are retained, shared across reloads.
+pub const MAX_SCOPE_TOTALS: usize = 16_384;
+
 #[derive(Debug, Default)]
 pub struct FlowCounters {
     upload: AtomicU64,
@@ -80,6 +83,7 @@ pub struct FlowEntry {
     pub generation: u64,
     pub start: String,
     pub metadata: FlowMetadata,
+    pub scope: String,
     pub chains: Vec<String>,
     pub rule_payload: String,
     pub counters: FlowCounters,
@@ -104,6 +108,15 @@ pub struct ConnectionSnapshot {
     pub notes: Option<Vec<Note>>,
 }
 
+/// Cumulative payload bytes of the open and closed flows of one inbound scope.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ScopeTotals {
+    pub inbound: String,
+    pub scope: String,
+    pub upload: u64,
+    pub download: u64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionsSnapshot {
@@ -113,6 +126,7 @@ pub struct ConnectionsSnapshot {
     pub download_total: u64,
     pub memory: u64,
     pub connections: Vec<ConnectionSnapshot>,
+    pub shoes_scope_totals: Vec<ScopeTotals>,
 }
 
 #[derive(Debug, Default)]
@@ -121,6 +135,32 @@ struct RegistryState {
     entries: BTreeMap<String, Arc<FlowEntry>>,
     closed_upload: u64,
     closed_download: u64,
+    // Inbound, then scope: a close looks its scope up without allocating.
+    closed_scopes: BTreeMap<String, BTreeMap<String, (u64, u64)>>,
+    closed_scope_count: usize,
+}
+
+impl RegistryState {
+    fn close_scope(&mut self, inbound: &str, scope: &str, upload: u64, download: u64) {
+        if let Some(totals) = self
+            .closed_scopes
+            .get_mut(inbound)
+            .and_then(|scopes| scopes.get_mut(scope))
+        {
+            totals.0 += upload;
+            totals.1 += download;
+            return;
+        }
+        // Idle flows need no entry, and a full table keeps only the process totals.
+        if (upload, download) == (0, 0) || self.closed_scope_count == MAX_SCOPE_TOTALS {
+            return;
+        }
+        self.closed_scopes
+            .entry(inbound.into())
+            .or_default()
+            .insert(scope.into(), (upload, download));
+        self.closed_scope_count += 1;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +227,7 @@ impl FlowContext {
                 dns_mode: if info.fake_dns { "fake-ip" } else { "normal" }.into(),
                 ..Default::default()
             },
+            scope: self.scope.clone(),
             chains: if chains.is_empty() {
                 vec!["DIRECT".into()]
             } else {
@@ -246,7 +287,7 @@ impl FlowRegistry {
     }
 
     pub fn snapshot(&self, memory: u64) -> ConnectionsSnapshot {
-        let (sequence, entries, mut upload_total, mut download_total) = {
+        let (sequence, entries, mut upload_total, mut download_total, mut scopes) = {
             let mut state = self.state.lock();
             state.snapshot_sequence += 1;
             (
@@ -261,8 +302,27 @@ impl FlowRegistry {
                     .collect::<Vec<_>>(),
                 state.closed_upload,
                 state.closed_download,
+                state
+                    .closed_scopes
+                    .iter()
+                    .flat_map(|(inbound, scopes)| {
+                        scopes
+                            .iter()
+                            .map(move |(scope, totals)| ((inbound.clone(), scope.clone()), *totals))
+                    })
+                    .collect::<BTreeMap<_, _>>(),
             )
         };
+        // Open flows read from the same sample as the totals, so the scopes sum to them.
+        for (entry, upload, download) in &entries {
+            if (*upload, *download) != (0, 0) {
+                let totals = scopes
+                    .entry((entry.metadata.inbound_name.clone(), entry.scope.clone()))
+                    .or_default();
+                totals.0 += upload;
+                totals.1 += download;
+            }
+        }
         let connections = entries
             .into_iter()
             .map(|(entry, upload, download)| {
@@ -289,6 +349,15 @@ impl FlowRegistry {
             download_total,
             memory,
             connections,
+            shoes_scope_totals: scopes
+                .into_iter()
+                .map(|((inbound, scope), (upload, download))| ScopeTotals {
+                    inbound,
+                    scope,
+                    upload,
+                    download,
+                })
+                .collect(),
         }
     }
 }
@@ -300,6 +369,12 @@ impl Drop for FlowGuard {
             let (upload, download) = self.entry.counters.totals();
             state.closed_upload += upload;
             state.closed_download += download;
+            state.close_scope(
+                &self.entry.metadata.inbound_name,
+                &self.entry.scope,
+                upload,
+                download,
+            );
         }
     }
 }
@@ -517,5 +592,129 @@ mod tests {
             FlowInfo::default(),
         );
         assert!(!new.entry.cancel.is_cancelled());
+    }
+
+    fn scoped(
+        registry: &Arc<FlowRegistry>,
+        generation: u64,
+        inbound: &str,
+        scope: &str,
+    ) -> FlowGuard {
+        FlowContext {
+            registry: registry.clone(),
+            generation,
+            inbound: inbound.into(),
+            scope: scope.into(),
+            protocol: "Vless".into(),
+        }
+        .register(
+            "tcp",
+            &NetLocation::from_str("test.example:443", None)
+                .unwrap()
+                .into(),
+            Vec::new(),
+            "all",
+            FlowInfo::default(),
+        )
+    }
+
+    fn scope_totals(registry: &FlowRegistry) -> Vec<(String, String, u64, u64)> {
+        registry
+            .snapshot(0)
+            .shoes_scope_totals
+            .into_iter()
+            .map(|totals| (totals.inbound, totals.scope, totals.upload, totals.download))
+            .collect()
+    }
+
+    #[test]
+    fn scope_totals_keep_closed_flows_across_generations_and_sum_to_process_totals() {
+        let registry = Arc::new(FlowRegistry::default());
+        assert!(scope_totals(&registry).is_empty());
+
+        let first = scoped(&registry, 1, "shared", "root/websocket/0");
+        first.entry.counters.upload(3);
+        first.entry.counters.download(5);
+        let other = scoped(&registry, 1, "shared", "root/websocket/1");
+        other.entry.counters.download(7);
+        let dedicated = scoped(&registry, 1, "dedicated", "root");
+        dedicated.entry.counters.upload(11);
+        let idle = scoped(&registry, 1, "idle", "root");
+        // Open flows count before any snapshot observes them closing; idle scopes are omitted.
+        let expected = vec![
+            ("dedicated".to_owned(), "root".to_owned(), 11, 0),
+            ("shared".to_owned(), "root/websocket/0".to_owned(), 3, 5),
+            ("shared".to_owned(), "root/websocket/1".to_owned(), 0, 7),
+        ];
+        assert_eq!(scope_totals(&registry), expected);
+
+        // A flow that opens and closes between snapshots is still attributed.
+        let brief = scoped(&registry, 1, "shared", "root/websocket/1");
+        brief.entry.counters.upload(100);
+        brief.entry.counters.download(200);
+        drop(brief);
+        drop(first);
+        drop(other);
+        drop(dedicated);
+        drop(idle);
+        // A later generation's flows in the same scope continue its totals.
+        let reloaded = scoped(&registry, 2, "shared", "root/websocket/0");
+        reloaded.entry.counters.upload(1000);
+        let expected = vec![
+            ("dedicated".to_owned(), "root".to_owned(), 11, 0),
+            ("shared".to_owned(), "root/websocket/0".to_owned(), 1003, 5),
+            ("shared".to_owned(), "root/websocket/1".to_owned(), 100, 207),
+        ];
+        assert_eq!(scope_totals(&registry), expected);
+
+        let snapshot = registry.snapshot(0);
+        let (upload, download) = snapshot
+            .shoes_scope_totals
+            .iter()
+            .fold((0, 0), |sum, totals| {
+                (sum.0 + totals.upload, sum.1 + totals.download)
+            });
+        assert_eq!(
+            (upload, download),
+            (snapshot.upload_total, snapshot.download_total)
+        );
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(
+            json["shoesScopeTotals"][1],
+            serde_json::json!({
+                "inbound": "shared",
+                "scope": "root/websocket/0",
+                "upload": 1003,
+                "download": 5,
+            })
+        );
+    }
+
+    #[test]
+    fn scope_totals_are_bounded_without_losing_process_totals() {
+        let registry = Arc::new(FlowRegistry::default());
+        for index in 0..MAX_SCOPE_TOTALS + 2 {
+            let guard = scoped(&registry, 1, &format!("inbound-{index:05}"), "root");
+            guard.entry.counters.upload(1);
+        }
+        let snapshot = registry.snapshot(0);
+        assert_eq!(snapshot.shoes_scope_totals.len(), MAX_SCOPE_TOTALS);
+        assert_eq!(snapshot.upload_total, MAX_SCOPE_TOTALS as u64 + 2);
+
+        // A retained scope keeps counting, and an open flow of an unretained scope is
+        // reported while it lasts.
+        let retained = scoped(&registry, 1, "inbound-00000", "root");
+        retained.entry.counters.upload(4);
+        drop(retained);
+        let unretained = scoped(&registry, 1, "late", "root");
+        unretained.entry.counters.download(9);
+        let totals = scope_totals(&registry);
+        assert_eq!(totals.len(), MAX_SCOPE_TOTALS + 1);
+        assert_eq!(totals[0], ("inbound-00000".into(), "root".into(), 5, 0));
+        assert!(totals.contains(&("late".into(), "root".into(), 0, 9)));
+        drop(unretained);
+        let snapshot = registry.snapshot(0);
+        assert_eq!(snapshot.shoes_scope_totals.len(), MAX_SCOPE_TOTALS);
+        assert_eq!(snapshot.download_total, 9);
     }
 }
