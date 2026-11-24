@@ -30,6 +30,7 @@ pub mod transport;
 pub mod tun;
 pub mod vless;
 pub mod wireguard;
+pub mod wireguard_obfuscation;
 pub mod xhttp;
 
 // Re-export all public types for convenience
@@ -58,3 +59,6 @@ pub use shadowsocks::ShadowsocksConfig;
 pub use tls::TlsKeyExchangeGroups;
 pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};
 pub use tun::TunConfig;
+pub use wireguard_obfuscation::{
+    AmneziaSettings, AmneziaValue, HeaderProtectionKey, PhobosMasking, PhobosSecret, PhobosSettings,
+};

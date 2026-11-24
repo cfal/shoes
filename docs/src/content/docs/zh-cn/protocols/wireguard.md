@@ -118,3 +118,67 @@ GotaTun 0.10.3 修正了发起握手的时间戳，使其与 wireguard-go 一致
 27 秒窗口的剩余时间内拒绝新握手，另加重试调度时间。此重放状态延迟会
 自动消失，无需更改配置；对连续性敏感的切换应等待该窗口结束。
 不要让同时运行的发起端共用一个客户端密钥。
+
+## AmneziaWG
+
+AmneziaWG 2.0、3.0 和 3.1 通过 `protocol` 内的 `amnezia` 块配置，服务器和客户端均可使用。默认关闭；没有该块的配置，或者该块没有设置任何超出普通 WireGuard 的内容时，行为与普通 WireGuard 相同。取值由 GotaTun 分支移植的 amneziawg-go 解析器和校验器检查，因此在 amneziawg-go 中可用的配置在这里也会被接受。请参阅[服务器](/zh-cn/examples/amneziawg_server/)和[客户端](/zh-cn/examples/amneziawg_client/)示例；其中的演示密钥必须替换。
+
+```yaml
+amnezia:
+  jc: 3
+  jmin: 40
+  jmax: 70
+  s1: 15
+  s2: 18
+  s3: 20
+  s4: 23
+  h1: "100000-100100"
+  h2: "200000-200100"
+  h3: "300000-300100"
+  h4: "400000-400100"
+  i1: "<b 0xc0ffee><r 16><t>"
+  header_protection_key: "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+  content_padding_addition: "0-32"
+  rekey_after_time: "110-130"
+```
+
+两端必须使用相同的取值。一个服务器只有一个 `amnezia` 块，适用于它的所有对等方；不支持按对等方单独配置。
+
+| 键 | 版本 | 含义 |
+| --- | --- | --- |
+| `jc`、`jmin`、`jmax` | 2.0 | 握手前发送的垃圾数据包数量及其大小范围 |
+| `s1`、`s2`、`s3`、`s4` | 2.0 | 添加在握手发起、握手响应、cookie 和传输数据包之前的随机字节数 |
+| `h1`、`h2`、`h3`、`h4` | 2.0 | 消息类型取值；一个数字或互不重叠的 `lo-hi` 范围 |
+| `i1` 到 `i5` | 2.0 | 握手前发送的自定义签名数据包，写成标签链，例如 `<b 0xc0ffee><r 16><t>` |
+| `header_protection_key` | 3.0 | 32 字节密钥，写成 64 个十六进制字符或 base64；设置后 `s1` 到 `s4` 必须至少为 12 |
+| `content_padding_addition` | 3.0 | 添加到传输数据包中的零字节数，一个数字或 `lo-hi` 范围 |
+| `rekey_after_time`、`rekey_timeout`、`reject_after_time`、`keepalive_timeout`、`max_handshake_attempts` | 3.0 | 使计时器随机化的数字或 `lo-hi` 范围；`0` 保留 WireGuard 默认值 |
+| `random_trailers`、`disable_cookies` | 3.1 | 布尔值 |
+
+`.conf` 文件中的取值对应同名的小写 snake_case 键：`Jc` 变为 `jc`，`S1` 变为 `s1`，`H1` 变为 `h1`，`I1` 变为 `i1`，`HeaderProtectionKey` 变为 `header_protection_key`，`ContentPaddingAddition` 变为 `content_padding_addition`。范围保留 `lo-hi` 文本形式，并应加引号。所有接受数字或范围的键（`h1` 到 `h4`、`content_padding_addition` 以及 3.0 计时器）也接受单个数字。未知的键会被拒绝。尚不支持按对等方设置的 keepalive 范围；请使用普通的 `persistent_keepalive` 秒数。
+
+## Phobos
+
+Phobos 用由密钥派生的 XOR 密钥流、随机尾部以及可选的 STUN 或 RTP 封装来隐藏 WireGuard 数据报。shoes 只实现客户端，用于连接位于 Phobos 代理之后的 WireGuard 服务器。没有 Phobos 服务器。请参阅[客户端示例](/zh-cn/examples/phobos_client/)。
+
+```yaml
+phobos:
+  key: "demonstration-phobos-key"
+  masking: stun
+```
+
+| 键 | 含义 |
+| --- | --- |
+| `key` | 必填的共享密钥。必须是带引号的 YAML 字符串；不带引号的数字会被拒绝 |
+| `masking` | `none`（默认）、`stun`、`media`、`auto` 或 `tls`。`auto` 和 `tls` 在 UDP 上不做任何封装，行为与 `none` 相同 |
+| `max_dummy` | 传输数据包和 cookie 数据包随机尾部的上限 |
+| `obfuscate_bytes` | 密钥流覆盖的前导字节数 |
+| `media_pt`、`media_ssrc`、`media_clock` | `media` 伪装使用的 RTP 头字段 |
+
+`amnezia` 和 `phobos` 在同一个客户端上互斥，因为 Phobos 需要每条 WireGuard 消息的前几个字节保持普通 WireGuard 写入的样子。带有 `phobos` 块的服务器会被拒绝。
+
+直接连接 Phobos 对等方时，shoes 每 2 秒检查一次操作系统会用哪个本地地址访问每个对等方。如果地址发生变化（例如从 Wi-Fi 切换到蜂窝网络），或者路由消失后又恢复，客户端会重新握手。使用 `peer_client_chain` 时，每次绕行重新连接后客户端都会重新握手。
+
+## 混淆下的 MTU
+
+混淆会给每个数据包增加字节。没有显式 `mtu` 时，shoes 使用 `1408` 减去每个数据包的开销：AmneziaWG 为 `s4`，Phobos 伪装为 24（`stun`）或 12（`media`）。结果最低为 1280，触及下限时会给出警告。显式的 `mtu` 按原样使用，且必须在 1280-1420 之间。`content_padding_addition` 和 `random_trailers` 不需要额外空间：填充只会把数据包填到隧道 MTU 为止，不会让已达到最大尺寸的数据包变得更大。

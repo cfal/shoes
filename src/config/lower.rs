@@ -48,6 +48,8 @@ fn client_protocol(
                     allowed_ips: config.allowed_ips,
                     persistent_keepalive: config.persistent_keepalive,
                     mtu: config.mtu,
+                    amnezia: super::AmneziaSettings::effective(config.amnezia),
+                    phobos: config.phobos,
                     resource_limits: config.resource_limits,
                     peer_client_chain: carrier,
                 },

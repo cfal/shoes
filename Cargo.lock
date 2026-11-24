@@ -995,21 +995,21 @@ dependencies = [
 [[package]]
 name = "gotatun"
 version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d40029d208ab17a3280079618d4e7c4ef204e2cb3e137d4f7da570a7efe1c21"
+source = "git+https://github.com/AYastrebov/gotatun?rev=7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292#7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292"
 dependencies = [
  "aead",
- "aws-lc-rs",
  "base64 0.22.1",
- "bitfield-struct",
  "blake2 0.10.6",
  "bytes",
+ "chacha20 0.9.1",
  "chacha20poly1305",
  "constant_time_eq",
  "duplicate",
  "either",
  "eyre",
  "futures",
+ "gotatun-crypto",
+ "gotatun-packet",
  "hmac",
  "ip_network",
  "ip_network_table",
@@ -1029,6 +1029,29 @@ dependencies = [
  "typed-builder",
  "windows-sys 0.61.2",
  "x25519-dalek",
+ "zerocopy",
+]
+
+[[package]]
+name = "gotatun-crypto"
+version = "0.1.0"
+source = "git+https://github.com/AYastrebov/gotatun?rev=7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292#7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292"
+dependencies = [
+ "aws-lc-rs",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "gotatun-packet"
+version = "0.1.0"
+source = "git+https://github.com/AYastrebov/gotatun?rev=7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292#7af5d6d4b0fdd76a6d416a5572ad2c3b481a7292"
+dependencies = [
+ "bitfield-struct",
+ "bytes",
+ "duplicate",
+ "either",
+ "eyre",
+ "thiserror 1.0.69",
  "zerocopy",
 ]
 
