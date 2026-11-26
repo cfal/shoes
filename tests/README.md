@@ -153,7 +153,7 @@ peers must deliver server-first data and clean EOF after the acknowledged exchan
 ## Measuring Coverage
 
 The manual `Advisory verification evidence` workflow collects Linux unit/process
-coverage with Rust 1.99.1, `llvm-tools-preview`, and `cargo-llvm-cov` 0.9.1. It has
+coverage with Rust 1.99.1, `llvm-tools-preview`, and `cargo-llvm-cov` 0.9.2. It has
 no percentage gate. `smoke` selects one rule-loader unit test and one process
 test that verifies a child actually flushes a nonempty LLVM profile. `full` runs
 the library and process-contract suites, without optional features. Each command
@@ -168,7 +168,7 @@ In the recommendation batch VM, hold the shared foreground build lock around the
 entire script and use its dedicated target, as specified in `EXECUTION_RULES.md`.
 The script uses a fresh, named coverage target under `CARGO_TARGET_DIR`, refuses
 reuse, and never cleans shared artifacts. Tool installation, if needed, is
-`cargo install cargo-llvm-cov --version 0.9.1 --locked`; do not install another
+`cargo install cargo-llvm-cov --version 0.9.2 --locked`; do not install another
 toolchain just to manufacture local success evidence.
 
 The output retains test logs, commands, toolchain and skip information, LCOV,

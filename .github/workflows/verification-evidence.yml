@@ -46,7 +46,7 @@ jobs:
     - uses: taiki-e/install-action@v2
       if: inputs.suite == 'coverage'
       with:
-        tool: cargo-llvm-cov@0.9.1
+        tool: cargo-llvm-cov@0.9.2
     - name: Linux unit/process coverage
       if: inputs.suite == 'coverage'
       env:

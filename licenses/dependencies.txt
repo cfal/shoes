@@ -679,7 +679,7 @@ Package: utf8_iter 1.1.0
 Repository: https://github.com/hsivonen/utf8_iter
 Package: utf_types 1.0.0
 Repository: https://github.com/hsivonen/utf_types
-Package: zeroize 1.9.1
+Package: zeroize 1.9.2
 Repository: https://github.com/RustCrypto/utils
 Package: zeroize_derive 1.5.0
 Repository: https://github.com/RustCrypto/utils
@@ -1845,9 +1845,9 @@ Repository: https://github.com/moka-rs/moka
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: zerocopy-derive 0.8.63
+Package: zerocopy-derive 0.8.66
 Repository: https://github.com/google/zerocopy
-Package: zerocopy 0.8.63
+Package: zerocopy 0.8.66
 Repository: https://github.com/google/zerocopy
 
                                  Apache License
@@ -2891,7 +2891,7 @@ Repository: https://github.com/achanda/ipnetwork
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: crc32fast 1.5.5
+Package: crc32fast 1.5.6
 Repository: https://github.com/srijs/rust-crc32fast
 Package: env_filter 0.1.4
 Repository: https://github.com/rust-cli/env_logger
@@ -5434,7 +5434,7 @@ Package: blocking 1.7.0
 Repository: https://github.com/smol-rs/blocking
 Package: bumpalo 3.20.4
 Repository: https://github.com/fitzgen/bumpalo
-Package: cc 1.11.2
+Package: cc 1.11.3
 Repository: https://github.com/rust-lang/cc-rs
 Package: cfg-if 1.0.5
 Repository: https://github.com/rust-lang/cfg-if
@@ -5480,7 +5480,7 @@ Package: flate2 1.1.11
 Repository: https://github.com/rust-lang/flate2-rs
 Package: fnv 1.0.7
 Repository: https://github.com/servo/rust-fnv
-Package: form_urlencoded 1.2.2
+Package: form_urlencoded 1.2.3
 Repository: https://github.com/servo/rust-url
 Package: futures-lite 2.6.1
 Repository: https://github.com/smol-rs/futures-lite
@@ -5488,9 +5488,9 @@ Package: hash32 0.3.1
 Repository: https://github.com/japaric/hash32
 Package: hashbrown 0.14.5
 Repository: https://github.com/rust-lang/hashbrown
-Package: hashbrown 0.17.1
+Package: hashbrown 0.17.2
 Repository: https://github.com/rust-lang/hashbrown
-Package: heapless 0.9.3
+Package: heapless 0.9.4
 Repository: https://github.com/rust-embedded/heapless
 Package: httparse 1.10.1
 Repository: https://github.com/seanmonstar/httparse
@@ -5542,11 +5542,11 @@ Package: prost-derive 0.14.6
 Repository: https://github.com/tokio-rs/prost
 Package: prost 0.14.6
 Repository: https://github.com/tokio-rs/prost
-Package: regex-automata 0.4.18
+Package: regex-automata 0.4.19
 Repository: https://github.com/rust-lang/regex
-Package: regex-syntax 0.8.11
+Package: regex-syntax 0.8.12
 Repository: https://github.com/rust-lang/regex
-Package: regex 1.13.1
+Package: regex 1.13.2
 Repository: https://github.com/rust-lang/regex
 Package: rust-argon2 3.0.0
 Repository: https://github.com/sru-systems/rust-argon2
@@ -5560,8 +5560,8 @@ Package: signal-hook-registry 1.4.8
 Repository: https://github.com/vorner/signal-hook
 Package: simd_cesu8 1.2.0
 Repository: https://github.com/seancroach/simd_cesu8
-Package: smallvec 1.16.5
-Repository: https://github.com/servo/rust-smallvec
+Package: smallvec 1.16.6
+Repository: https://github.com/smallvec/smallvec
 Package: socket2 0.6.5
 Repository: https://github.com/rust-lang/socket2
 Package: stable_deref_trait 1.2.1
@@ -5582,9 +5582,9 @@ Package: typed-builder 0.21.2
 Repository: https://github.com/idanarye/rust-typed-builder
 Package: unicase 2.10.0
 Repository: https://github.com/seanmonstar/unicase
-Package: url 2.5.8
+Package: url 2.5.9
 Repository: https://github.com/servo/rust-url
-Package: uuid 1.29.2
+Package: uuid 1.29.3
 Repository: https://github.com/uuid-rs/uuid
 Package: version_check 0.9.5
 Repository: https://github.com/SergioBenitez/version_check
@@ -6701,7 +6701,7 @@ Package: rand_core 0.6.4
 Repository: https://github.com/rust-random/rand
 Package: rand_core 0.9.5
 Repository: https://github.com/rust-random/rand
-Package: rand_pcg 0.10.2
+Package: rand_pcg 0.10.3
 Repository: https://github.com/rust-random/rngs
 
                               Apache License
@@ -8279,7 +8279,7 @@ Package: blake3 1.8.7
 Repository: https://github.com/BLAKE3-team/BLAKE3
 Package: android_system_properties 0.1.6
 Repository: https://github.com/nical/android_system_properties
-Package: anyhow 1.0.104
+Package: anyhow 1.0.105
 Repository: https://github.com/dtolnay/anyhow
 Package: arraydeque 0.5.1
 Repository: https://github.com/andylokandy/arraydeque
@@ -8291,7 +8291,7 @@ Package: constant_time_eq 0.4.2
 Repository: https://github.com/cesarb/constant_time_eq
 Package: dunce 1.0.5
 Repository: https://gitlab.com/kornelski/dunce
-Package: etherparse 0.21.0
+Package: etherparse 0.21.1
 Repository: https://github.com/JulianSchmid/etherparse
 Package: fiat-crypto 0.2.9
 Repository: https://github.com/mit-plv/fiat-crypto
@@ -8321,7 +8321,7 @@ Package: objc2-core-foundation 0.3.2
 Repository: https://github.com/madsmtm/objc2
 Package: objc2-core-services 0.3.2
 Repository: https://github.com/madsmtm/objc2
-Package: pin-project-lite 0.2.17
+Package: pin-project-lite 0.2.18
 Repository: https://github.com/taiki-e/pin-project-lite
 Package: portable-atomic 1.15.0
 Repository: https://github.com/taiki-e/portable-atomic
@@ -8464,7 +8464,7 @@ limitations under the License.
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: yaml-rust2 0.13.0
+Package: yaml-rust2 0.13.2
 Repository: https://github.com/Ethiraric/yaml-rust2
 
 Copyright (c) 2015 Chen Yuheng
@@ -10427,7 +10427,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 License: MIT License (MIT)
-Package: hyper 1.12.0
+Package: hyper 1.13.0
 Repository: https://github.com/hyperium/hyper
 
 Copyright (c) 2014-2026 Sean McArthur
@@ -10588,7 +10588,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 License: MIT License (MIT)
-Package: h2 0.4.20
+Package: h2 0.4.21
 Repository: https://github.com/hyperium/h2
 
 Copyright (c) 2017 h2 authors
@@ -10619,7 +10619,7 @@ DEALINGS IN THE SOFTWARE.
 
 
 License: MIT License (MIT)
-Package: bytes 1.12.1
+Package: bytes 1.12.2
 Repository: https://github.com/tokio-rs/bytes
 
 Copyright (c) 2018 Carl Lerche
@@ -11007,7 +11007,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 
 License: MIT License (MIT)
-Package: lru 0.19.0
+Package: lru 0.19.2
 Repository: https://github.com/jeromefroe/lru-rs.git
 
 MIT License
@@ -11366,7 +11366,7 @@ Package: byteorder 1.5.0
 Repository: https://github.com/BurntSushi/byteorder
 Package: memchr 2.8.3
 Repository: https://github.com/BurntSushi/memchr
-Package: walkdir 2.5.0
+Package: walkdir 2.5.1
 Repository: https://github.com/BurntSushi/walkdir
 
 The MIT License (MIT)
@@ -11393,7 +11393,9 @@ THE SOFTWARE.
 
 
 License: MIT License (MIT)
-Package: nix 0.31.3
+Package: nix 0.31.4
+Repository: https://github.com/nix-rust/nix
+Package: nix 0.32.0
 Repository: https://github.com/nix-rust/nix
 
 The MIT License (MIT)
@@ -12123,7 +12125,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 
 License: Do What The F*ck You Want To Public License (WTFPL)
-Package: tun 0.8.14
+Package: tun 0.8.15
 Repository: https://github.com/meh/rust-tun
 
 DO WHAT THE FUCK YOU WANT TO PUBLIC LICENSE

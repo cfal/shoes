@@ -6,7 +6,7 @@ mode=${2:?missing smoke or full}
 base=${3:?missing base revision}
 [[ $(uname -s) == Linux ]] || { echo 'Linux coverage only' >&2; exit 1; }
 [[ $mode == smoke || $mode == full ]] || { echo 'Expected smoke or full' >&2; exit 1; }
-[[ $(cargo llvm-cov --version) == 'cargo-llvm-cov 0.9.1' ]] || { echo 'Requires cargo-llvm-cov 0.9.1' >&2; exit 1; }
+[[ $(cargo llvm-cov --version) == 'cargo-llvm-cov 0.9.2' ]] || { echo 'Requires cargo-llvm-cov 0.9.2' >&2; exit 1; }
 base=$(git rev-parse --verify "${base}^{commit}")
 mkdir "$output"
 output=$(realpath "$output")

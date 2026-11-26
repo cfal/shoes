@@ -148,6 +148,12 @@ Admission budgets are not measurements of total process RSS. Lowering a cap
 does not revoke existing reservations; new work is blocked until usage permits
 it. See [reload behavior](/operations/reload/).
 
+HTTP/2 also tracks recently reset streams so that late frames can be discarded.
+This does not reserve live-stream slots. Shoes' own H2 transports track up to
+50 resets for one second. The Naive HTTP/2 server and Hickory DNS-over-HTTPS
+use their libraries' five-second window: 8,192 resets when no concurrency limit
+is advertised, otherwise twice the advertised limit with a minimum of 50.
+
 ## Buffers and reload
 
 Sizes below are integer bytes, not strings such as `2MiB`.

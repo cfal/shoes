@@ -2044,15 +2044,19 @@ fn dangling_sidecar_aliases_and_symlink_cycles_are_rejected() {
 }
 
 #[tokio::test]
-async fn ipv6_literal_download_reaches_the_exact_url_port() {
+async fn ipv6_literal_download_preserves_port_and_encodes_path() {
     let listener = TcpListener::bind("[::1]:0").await.unwrap();
-    let url = format!("http://{}/rules", listener.local_addr().unwrap());
+    let url = format!("http://{}/a^b/rules?v=1", listener.local_addr().unwrap());
     let fixture = tokio::spawn(async move {
         let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
             .await
             .unwrap()
             .unwrap();
-        request(&mut stream).await;
+        assert!(
+            request(&mut stream)
+                .await
+                .starts_with("GET /a%5Eb/rules?v=1 HTTP/1.1\r\n")
+        );
         stream.write_all(&response(200, "", VALID)).await.unwrap();
     });
     let dir = directory();

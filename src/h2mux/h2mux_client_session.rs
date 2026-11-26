@@ -107,7 +107,7 @@ impl H2MuxClientSession {
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let errors = TransportErrors::default();
-        let (send_request, mut connection) = h2::client::Builder::new()
+        let (send_request, mut connection) = crate::http2::client_builder()
             .initial_window_size(STREAM_WINDOW_SIZE)
             .initial_connection_window_size(CONNECTION_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
