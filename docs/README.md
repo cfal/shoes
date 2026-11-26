@@ -4,7 +4,7 @@ This Starlight project is the source for `https://shoes-rs.github.io/`. Document
 
 ## Local development
 
-Use Node 24 (see `.node-version`):
+Use Node 26 (see `.node-version`):
 
 ```sh
 cd docs
