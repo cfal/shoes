@@ -82,7 +82,7 @@ impl H2ClientSession {
         const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
         let errors = TransportErrors::default();
-        let (send_request, mut connection) = h2::client::Builder::new()
+        let (send_request, mut connection) = super::client_builder()
             .initial_window_size(super::STREAM_WINDOW)
             .initial_connection_window_size(super::CONNECTION_WINDOW)
             .enable_push(false)

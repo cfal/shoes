@@ -150,9 +150,8 @@ upstream hex-formatting hardening and the earlier alignment and AVX-512 soundnes
 fixes. See [fork maintenance notes](DEPENDENCIES.md#blake3) for provenance and
 compatibility requirements.
 
-The `nix` patch pins an [upstream commit](https://github.com/nix-rust/nix/commit/3eae6d68ec6382fef7b38cd58f97458e59a71af9)
-containing [nix #2821](https://github.com/nix-rust/nix/pull/2821) for iOS socket
-compatibility. Retain it until adopting a registry release containing that fix.
+Published nix 0.31.4 and 0.32.0 include the [iOS socket fix](DEPENDENCIES.md#nix);
+no nix workspace patch is needed.
 
 The `smoltcp` patch pins our [rebased TCP recovery fork](https://github.com/cfal/smoltcp/tree/7ef43e497f575cb0340a43e4f414f0f0b8760bf6)
 to preserve TCP ACK sequencing during partial retransmission in TUN and WireGuard.

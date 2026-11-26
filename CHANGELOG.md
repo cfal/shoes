@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- HTTP/2 fixes cover sensitive headers, flow control and shutdown. Shoes-managed connections keep their reset-stream limits; the Naive HTTP/2 server and DNS-over-HTTPS client now retain resets for up to five seconds. See [connection limits](https://shoes-rs.github.io/config/global-settings/#admission-caps).
+- HTTP/1.1 rejects bare line feeds in chunked trailers and discards conflicting Content-Length when Transfer-Encoding is present. Literal carets in URL paths are now sent as `%5E`.
+- Updated packet parsing and embedded collections include upstream memory-safety fixes. The pinned Hickory fork does not yet include [0.26.4's resolver security fixes](https://github.com/hickory-dns/hickory-dns/releases/tag/v0.26.4).
+
 ## v0.3.8
 
 - Recover managed Linux TUN forwarding after detected underlay route or source changes without releasing capture ownership, fake-IP mappings, or explicit proxy selections. Complete outages pause forwarding until recovery can proceed; workers rebuild from the accepted configuration, and correcting reloads remain available. A detected change resets all proxy workers in the process, including non-TUN listeners. Existing flows are cancelled and applications must reconnect; this does not migrate sessions or detect every Internet outage. See [managed TUN recovery and limitations](https://shoes-rs.github.io/config/tun/#managed-linux-desktop-capture).

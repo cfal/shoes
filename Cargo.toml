@@ -29,8 +29,6 @@ h3-quinn = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3
 hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "93435e55f102ee637eadca89126be85931a804f3" }
 hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "93435e55f102ee637eadca89126be85931a804f3" }
 hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "93435e55f102ee637eadca89126be85931a804f3" }
-# Includes nix-rust/nix#2821 for iOS socket feature compatibility.
-nix = { git = "https://github.com/nix-rust/nix", rev = "3eae6d68ec6382fef7b38cd58f97458e59a71af9" }
 # Preserves TCP ACK sequences during retransmission.
 smoltcp = { git = "https://github.com/cfal/smoltcp", rev = "7ef43e497f575cb0340a43e4f414f0f0b8760bf6" }
 
@@ -159,7 +157,8 @@ md-5 = "*"
 memchr = "*"
 mime_guess = "*"
 ml-kem = { version = "0.3.4", features = ["zeroize"] }
-notify = "*"
+# Version 9 needs a macOS watch-set handoff that does not exhaust FSEvents roots.
+notify = "8"
 # 0.13's futex_time64 probe triggers SIGSYS on 32-bit Android API 26-29.
 parking_lot = "0.12.5"
 percent-encoding = "*"

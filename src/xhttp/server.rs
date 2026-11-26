@@ -1232,7 +1232,7 @@ impl State {
         let (stream_window, connection_window) = self.config.limits.h2_windows();
         let mut connection = tokio::time::timeout_at(
             deadline,
-            h2::server::Builder::new()
+            crate::http2::server_builder()
                 .max_header_list_size(self.config.header_limit().min(u32::MAX as usize) as u32)
                 .max_concurrent_streams(self.config.limits.request_limit() as u32)
                 .initial_window_size(stream_window)

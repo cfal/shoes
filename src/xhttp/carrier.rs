@@ -169,7 +169,7 @@ impl Carrier {
         } else {
             let errors = TransportErrors::default();
             let received = Arc::new(parking_lot::Mutex::new(tokio::time::Instant::now()));
-            let (sender, mut connection) = h2::client::Builder::new()
+            let (sender, mut connection) = crate::http2::client_builder()
                 .enable_push(false)
                 .initial_window_size(stream_window)
                 .initial_connection_window_size(connection_window)

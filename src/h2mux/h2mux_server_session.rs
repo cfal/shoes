@@ -128,7 +128,7 @@ impl H2MuxServerSession {
         let conn = ActivityTrackedStream::new(conn, activity.clone());
 
         // Perform H2 server handshake
-        let connection = h2::server::Builder::new()
+        let connection = crate::http2::server_builder()
             .initial_window_size(STREAM_WINDOW_SIZE)
             .initial_connection_window_size(CONNECTION_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)

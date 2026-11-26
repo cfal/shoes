@@ -234,12 +234,14 @@ establish the historical macOS stall's cause or comprehensive Linux/BSD/XNU inte
 
 ### nix
 
-The `nix-rust/nix` patch is upstream, not a maintained fork. Published 0.31.3
-still lacks [#2821](https://github.com/nix-rust/nix/pull/2821), despite sharing
-the pinned commit's package version. With libc 0.2.191 and Shoes' iOS features
-(`fs,ioctl,net,socket,time,uio,user`), registry 0.31.3 fails to compile on
-`aarch64-apple-ios`; the pinned commit succeeds. Retain it until a published
-release passes that regression and the complete mobile builds.
+The former `nix-rust/nix` patch was upstream, not a maintained fork.
+[0.31.4](https://github.com/nix-rust/nix/tree/e9cde51b62589b375c4db3d2c706d2bcb0147472)
+contains [#2821](https://github.com/nix-rust/nix/pull/2821)'s macOS-only gates
+on `KextControl` and `UtunIfname`. With libc 0.2.191, GotaTun's resolved
+`fs,net,socket,time,uio,user` features compile for `aarch64-apple-ios` with
+0.31.4 and the former git pin; registry 0.31.3 fails on `SYSPROTO_CONTROL` and
+`UTUN_OPT_IFNAME`. GotaTun and Linux rtnetlink require 0.31; tun 0.8.15
+requires 0.32 with `ioctl`. Both are now registry dependencies.
 
 ## October 2026 Refresh
 
@@ -420,6 +422,48 @@ Its exact oxc-types 0.156 requirement explains that apparent downgrade too.
 Starlight retains satteri 0.10.5 alongside Astro's 0.11.7; newer incompatible
 transitives are not forced through overrides. i18next 27's changed defaults are
 mediated by Starlight's explicit fallback locale and filtered dictionaries.
+
+## November 26, 2026 Refresh
+
+All five maintained fork repositories and their consumers remain unchanged.
+Hickory's [0.26.4 security release](https://github.com/hickory-dns/hickory-dns/releases/tag/v0.26.4)
+is not part of the pinned fork. Prioritize its question parser allocation
+(GHSA-jwf5-j4q9-4jj8), UDP response handling (GHSA-pp6j-x65x-5wq5) and EDNS
+cache fixes (GHSA-926f-jw6j-vrhh) in a separate fork refresh. A registry-only
+audit does not clear the git sources. Check tendns' proto and all TLS/QUIC
+consumers after re-resolution.
+
+- [h2 0.4.21](https://github.com/hyperium/h2/blob/v0.4.21/CHANGELOG.md)
+  corrects sensitive-header indexing, SETTINGS window reductions, empty DATA
+  handling and reset eviction. Shoes' own H2 transports retain at most 50
+  recently reset streams for one second. Hickory DoH and Hyper's Naive server
+  use the upstream retention policy instead; neither exposes both controls.
+  This tracking is separate from live-stream admission. Hyper 1.13 also fixes
+  HTTP/1 shutdown and conflicting length metadata, and HTTP/2 CONNECT handling.
+- Notify stays on 8.2.2. [Notify 9](https://github.com/notify-rs/notify/blob/notify-9.0.0/docs/UPGRADING_V8_TO_V9.md)
+  limits FSEvents stream roots across the process: the old watch set can
+  prevent its replacement from registering, leaving new inputs unwatched.
+  A separate migration must cover this handoff and distinguish unrelated
+  kqueue directory writes from changes to missing or symlinked inputs.
+- Etherparse 0.21.1 and URL 2.5.9 fix [RUSTSEC-2026-0596](https://rustsec.org/advisories/RUSTSEC-2026-0596.html)
+  and [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html).
+  URL also percent-encodes literal carets in paths. Heapless 0.9.4 fixes
+  upstream memory-safety issues and still satisfies smoltcp. These advisories
+  do not establish reachability in Shoes. Chrono and unsafe-libyaml retain
+  unmaintained notices; replacing either is not a version bump.
+- Other updates include bytes (vectored order and truncation), regex (bounded
+  matching and match offsets), zeroize, zerocopy, crc32fast, lru, cc and
+  yaml-rust2. YAML's optional encoding feature remains off. Parking_lot 0.13
+  is still incompatible with supported 32-bit Android; older RustCrypto,
+  generic-array, prefix-trie, quinn-udp and OS bindings remain constrained by
+  their parents. AWS-LC, Quinn, Tokio, GotaTun, ML-KEM, instant-acme and rcgen
+  are already current. No peer or fixture pins changed.
+- Astro 7.4.13 requires rolldown 1.3; its Vite plugin and Vite still require
+  1.2. Both compatible native binding families are retained, with no override.
+  Starlight, linkedom and mdast-util-from-markdown are current. Coverage uses
+  cargo-llvm-cov 0.9.2 with the same Rust 1.99.1 compiler and LLVM tools.
+  Release toolchains, Action refs and mobile floors were already current or
+  deliberately pinned.
 
 ## Validation
 

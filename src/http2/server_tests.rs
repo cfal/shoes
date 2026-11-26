@@ -232,6 +232,62 @@ fn connect_block(target: &str, auth: Option<&[u8]>) -> Vec<u8> {
     headers
 }
 
+#[tokio::test]
+async fn late_data_observes_reset_retention_independently_of_stream_admission() {
+    let (mut client, transport) = tokio::io::duplex(8192);
+    let server = tokio::spawn(async move {
+        let mut connection = crate::http2::server_builder()
+            .max_concurrent_streams(1024)
+            .handshake::<_, Bytes>(transport)
+            .await
+            .unwrap();
+        while let Some(stream) = connection.accept().await {
+            let (_, mut respond) = stream.unwrap();
+            respond.send_reset(h2::Reason::CANCEL);
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        client.write_all(&raw_frame(4, 0, 0, &[])).await.unwrap();
+        let headers = connect_block("example.test:443", None);
+        for id in (1..=101).step_by(2) {
+            client
+                .write_all(&raw_frame(1, 4, id, &headers))
+                .await
+                .unwrap();
+            loop {
+                let (kind, flags, stream, payload) = read_raw_frame(&mut client).await;
+                if kind == 4 && flags == 0 {
+                    client.write_all(&raw_frame(4, 1, 0, &[])).await.unwrap();
+                } else if kind == 3 {
+                    assert_eq!(
+                        (stream, payload),
+                        (id, u32::from(h2::Reason::CANCEL).to_be_bytes().to_vec())
+                    );
+                    break;
+                }
+            }
+        }
+        // Of the 51 cancelled streams, the newest 50 still absorb in-flight DATA.
+        for id in [3, 1] {
+            client.write_all(&raw_frame(0, 0, id, b"x")).await.unwrap();
+        }
+        let closed = u32::from(h2::Reason::STREAM_CLOSED).to_be_bytes().to_vec();
+        assert_eq!(read_raw_frame(&mut client).await, (3, 0, 1, closed.clone()));
+        // h2 uses std::time::Instant for expiry, not Tokio's virtual clock.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        client.write_all(&raw_frame(0, 0, 101, b"y")).await.unwrap();
+        assert_eq!(read_raw_frame(&mut client).await, (3, 0, 101, closed));
+    })
+    .await
+    .unwrap();
+    drop(client);
+    server.await.unwrap();
+}
+
 async fn accepted_tunnel_survives_graceful_shutdown(auth: bool) {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let target = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());

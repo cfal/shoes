@@ -28,7 +28,7 @@ pub(crate) async fn serve(
     let limit = resources::limits().max_streams_per_connection;
     let budget = Arc::new(Budget::new(limit));
     let mut connection = crate::util::timeout_stream_setup(async {
-        h2::server::Builder::new()
+        super::server_builder()
             .initial_window_size(super::STREAM_WINDOW)
             .initial_connection_window_size(super::CONNECTION_WINDOW)
             .max_frame_size(16 * 1024)
