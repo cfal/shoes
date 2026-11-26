@@ -5586,8 +5586,6 @@ Package: url 2.5.9
 Repository: https://github.com/servo/rust-url
 Package: uuid 1.29.3
 Repository: https://github.com/uuid-rs/uuid
-Package: version_check 0.9.5
-Repository: https://github.com/SergioBenitez/version_check
 Package: wasi 0.11.1+wasi-snapshot-preview1
 Repository: https://github.com/bytecodealliance/wasi
 Package: wasip2 1.0.4+wasi-0.2.12
@@ -6224,21 +6222,15 @@ limitations under the License.
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: blake2 0.10.6
-Repository: https://github.com/RustCrypto/hashes
 Package: blake2 0.11.0
 Repository: https://github.com/RustCrypto/hashes
-Package: block-buffer 0.10.4
-Repository: https://github.com/RustCrypto/utils
 Package: block-buffer 0.12.1
 Repository: https://github.com/RustCrypto/utils
 Package: chacha20 0.10.2
 Repository: https://github.com/RustCrypto/stream-ciphers
-Package: chacha20 0.9.1
-Repository: https://github.com/RustCrypto/stream-ciphers
-Package: chacha20poly1305 0.10.1
-Repository: https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305
-Package: cipher 0.4.4
+Package: chacha20poly1305 0.11.0
+Repository: https://github.com/RustCrypto/AEADs
+Package: cipher 0.5.2
 Repository: https://github.com/RustCrypto/traits
 Package: const-oid 0.10.3
 Repository: https://github.com/RustCrypto/formats
@@ -6246,19 +6238,15 @@ Package: cpufeatures 0.2.17
 Repository: https://github.com/RustCrypto/utils
 Package: cpufeatures 0.3.1
 Repository: https://github.com/RustCrypto/utils
-Package: crypto-common 0.1.7
-Repository: https://github.com/RustCrypto/traits
 Package: crypto-common 0.2.2
-Repository: https://github.com/RustCrypto/traits
-Package: digest 0.10.7
 Repository: https://github.com/RustCrypto/traits
 Package: digest 0.11.3
 Repository: https://github.com/RustCrypto/traits
-Package: hmac 0.12.1
+Package: hmac 0.13.0
 Repository: https://github.com/RustCrypto/MACs
 Package: hybrid-array 0.4.15
 Repository: https://github.com/RustCrypto/hybrid-array
-Package: inout 0.1.4
+Package: inout 0.2.6
 Repository: https://github.com/RustCrypto/utils
 Package: keccak 0.2.2
 Repository: https://github.com/RustCrypto/sponges
@@ -6268,9 +6256,7 @@ Package: ml-kem 0.3.4
 Repository: https://github.com/RustCrypto/KEMs
 Package: module-lattice 0.2.4
 Repository: https://github.com/RustCrypto/KEMs
-Package: opaque-debug 0.3.1
-Repository: https://github.com/RustCrypto/utils
-Package: poly1305 0.8.0
+Package: poly1305 0.9.1
 Repository: https://github.com/RustCrypto/universal-hashes
 Package: sha1 0.11.0
 Repository: https://github.com/RustCrypto/hashes
@@ -6280,7 +6266,7 @@ Package: shake 0.1.0
 Repository: https://github.com/RustCrypto/XOFs
 Package: sponge-cursor 0.1.0
 Repository: https://github.com/RustCrypto/utils
-Package: universal-hash 0.5.1
+Package: universal-hash 0.6.1
 Repository: https://github.com/RustCrypto/traits
 
                               Apache License
@@ -6487,7 +6473,7 @@ limitations under the License.
 
 
 License: Apache License 2.0 (Apache-2.0)
-Package: aead 0.5.2
+Package: aead 0.6.1
 Repository: https://github.com/RustCrypto/traits
 
                               Apache License
@@ -11588,34 +11574,12 @@ SOFTWARE.
 
 
 
-License: MIT License (MIT)
-Package: generic-array 0.14.7
-Repository: https://github.com/fizyk20/generic-array.git
-
-The MIT License (MIT)
-
-Copyright (c) 2015 Bartłomiej Kamiński
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
 License: Mozilla Public License 2.0 (MPL-2.0)
 Package: gotatun 0.10.3
+Repository: https://github.com/mullvad/gotatun
+Package: gotatun-crypto 0.1.0
+Repository: https://github.com/mullvad/gotatun
+Package: gotatun-packet 0.1.0
 Repository: https://github.com/mullvad/gotatun
 
 Mozilla Public License Version 2.0

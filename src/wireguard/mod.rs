@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use gotatun::{
     device::{DeviceBuilder, Peer},
+    noise::PresharedKey,
     x25519::{PublicKey, StaticSecret},
 };
 use ipnetwork::IpNetwork;
@@ -165,7 +166,10 @@ impl PreparedPeer {
             .iter()
             .map(|prefix| prefix.parse().map_err(stdio::Error::other))
             .collect::<stdio::Result<_>>()?;
-        peer.preshared_key = peer_config.pre_shared_key.as_ref().map(|key| key.0);
+        peer.preshared_key = peer_config
+            .pre_shared_key
+            .as_ref()
+            .map(|key| PresharedKey::copy_from(&key.0));
         peer.keepalive =
             (peer_config.persistent_keepalive != 0).then_some(peer_config.persistent_keepalive);
         let endpoints = if let Some(endpoint) = &peer_config.endpoint {
