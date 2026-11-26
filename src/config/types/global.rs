@@ -57,6 +57,7 @@ pub struct GlobalLimits {
     /// Admission estimate for Hickory's private H3 transport, not a hard buffer limit.
     pub quic_dns_memory_bytes: usize,
     pub quic_socket_buffer: usize,
+    pub wireguard_socket_buffer: usize,
     pub reload_grace_secs: u64,
 }
 
@@ -74,6 +75,7 @@ impl Default for GlobalLimits {
             quic_stream_window: 256 << 10,
             quic_dns_memory_bytes: 16 << 20,
             quic_socket_buffer: 8 << 20,
+            wireguard_socket_buffer: 4 << 20,
             reload_grace_secs: 300,
         }
     }
@@ -134,6 +136,12 @@ impl GlobalLimits {
                 65536,
                 16 << 20,
             ),
+            (
+                "wireguard_socket_buffer",
+                self.wireguard_socket_buffer,
+                65536,
+                16 << 20,
+            ),
         ] {
             if !(min..=max).contains(&value) {
                 return Err(std::io::Error::new(
@@ -177,6 +185,7 @@ mod tests {
             assert!(result.global_limits.max_udp_destinations.is_none());
             assert!(result.global_limits.quic_memory_bytes.is_none());
             assert_eq!(result.global_limits.quic_socket_buffer, 8 << 20);
+            assert_eq!(result.global_limits.wireguard_socket_buffer, 4 << 20);
         }
     }
 
@@ -205,6 +214,20 @@ mod tests {
             serde_yaml::from_str("- global_settings: {quic_socket_buffer: 65536}").unwrap();
         let result = create_server_configs(configs).unwrap();
         assert_eq!(result.global_limits.quic_socket_buffer, 65536);
+    }
+
+    #[test]
+    fn wireguard_socket_buffer_override_round_trips() {
+        for size in [65536, 262144, 16 << 20] {
+            let configs: Vec<Config> = serde_yaml::from_str(&format!(
+                "- global_settings: {{wireguard_socket_buffer: {size}}}"
+            ))
+            .unwrap();
+            let serialized = serde_yaml::to_string(&configs).unwrap();
+            let result = create_server_configs(serde_yaml::from_str(&serialized).unwrap()).unwrap();
+            assert_eq!(result.global_limits.wireguard_socket_buffer, size);
+            assert_eq!(result.global_limits.quic_socket_buffer, 8 << 20);
+        }
     }
 
     #[test]
@@ -237,6 +260,9 @@ mod tests {
             "quic_dns_memory_bytes: 0",
             "quic_socket_buffer: 0",
             "quic_socket_buffer: 16777217",
+            "wireguard_socket_buffer: 0",
+            "wireguard_socket_buffer: 65535",
+            "wireguard_socket_buffer: 16777217",
             "reload_grace_secs: 86401",
         ] {
             for name in ["global_settings", "global_limits"] {
@@ -281,6 +307,7 @@ mod tests {
                 assert_eq!(settings.limits.max_connections, Some(42));
                 assert_eq!(settings.limits.reload_grace_secs, 7);
                 assert_eq!(settings.limits.quic_socket_buffer, 8 << 20);
+                assert_eq!(settings.limits.wireguard_socket_buffer, 4 << 20);
                 assert_eq!(
                     settings.rule_cache_dir,
                     (cache != "null").then(|| cache.into())
