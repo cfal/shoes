@@ -142,6 +142,70 @@ async fn reconnect_resolves_peers_again_and_retries_without_replacing_connectors
     ));
 }
 
+#[tokio::test]
+async fn stale_hostname_refresh_preserves_healthy_roaming() {
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Debug)]
+    struct Answer {
+        address: Arc<Mutex<SocketAddr>>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Resolver for Answer {
+        fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let address = *self.address.lock();
+            Box::pin(async move { Ok(vec![address]) })
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let interval = Duration::from_millis(200);
+        let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        // Swallows handshakes so the initially resolved address never becomes healthy.
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stale = blackhole.local_addr().unwrap();
+        let live: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let address = Arc::new(Mutex::new(stale));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut configs = validate(&pair_config(port)).unwrap();
+        let mut prepared = Prepared::new(&mut configs).await.unwrap();
+        let client = &mut prepared.endpoints[CLIENT];
+        client.config.peers[0].endpoint = Some(format!("peer.test:{port}"));
+        client.outer_resolver = Arc::new(Answer {
+            address: address.clone(),
+            calls: calls.clone(),
+        });
+        client.report_interval = interval;
+        prepared.refresh_peers().await.unwrap();
+        assert_eq!(prepared.endpoints[CLIENT].peers[0].endpoints, [stale]);
+        drop(reservation);
+        let mut running = start_prepared(&prepared).await;
+
+        // The never-established peer becomes stale after one interval and moves without reload.
+        *address.lock() = live;
+        let before = calls.load(Ordering::SeqCst);
+        while calls.load(Ordering::SeqCst) == before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (tcp, udp, _echoes) = echo_servers(false).await;
+        let connector = prepared.endpoints[CLIENT].connector.clone();
+        check_echo(connector.as_ref(), tcp, udp).await;
+
+        // A healthy peer is neither re-resolved nor moved back to a DNS answer.
+        *address.lock() = stale;
+        let healthy = calls.load(Ordering::SeqCst);
+        tokio::time::sleep(interval * 5).await;
+        assert_eq!(calls.load(Ordering::SeqCst), healthy);
+        check_echo(connector.as_ref(), tcp, udp).await;
+        running.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
 fn dns_answer(bytes: &[u8]) -> Vec<u8> {
     use hickory_resolver::proto::{
         op::{Message, MessageType},
@@ -707,8 +771,12 @@ fn fake_dns_rejects_unbracketed_wireguard_literals() {
 async fn wireguard_ipv4_fallback_selects_a_compatible_resolved_peer() {
     let mut configs = validate(&pair_config(51820)).unwrap();
     let mut prepared = Prepared::new(&mut configs).await.unwrap();
-    let (udp, released, local) =
-        io::Factory::new(Some("0.0.0.0:0".parse().unwrap()), None).unwrap();
+    let (udp, released, local) = io::Factory::new(
+        Some("0.0.0.0:0".parse().unwrap()),
+        None,
+        crate::config::GlobalLimits::default().wireguard_socket_buffer,
+    )
+    .unwrap();
     assert!(local.is_ipv4());
     let ipv6: SocketAddr = "[::1]:51820".parse().unwrap();
     let ipv4: SocketAddr = "127.0.0.1:51820".parse().unwrap();

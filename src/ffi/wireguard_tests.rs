@@ -41,12 +41,17 @@ async fn bridge(wire: UnixDatagram, framed: bool) -> io::Result<(PacketStack, Jo
         Default::default(),
     )?;
     let mut output = stack.output.take().unwrap();
+    let paused = stack.egress_backpressured.clone();
     let input = stack.input.clone();
     let wake = stack.handle.wake.clone();
+    let drained = wake.clone();
     let outgoing = wire.clone();
     let mut tasks = JoinSet::new();
     tasks.spawn(async move {
         while let Some(packet) = output.recv().await {
+            if paused.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                drained.notify();
+            }
             let mut bytes = Vec::with_capacity(packet.len() + 4);
             if framed {
                 bytes.extend(header(packet[0] >> 4 == 6));

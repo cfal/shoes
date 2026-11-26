@@ -15,7 +15,7 @@ use smoltcp::{
     wire::{HardwareAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -27,7 +27,16 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-pub(crate) const QUEUE_CAPACITY: usize = 64;
+// Matches Xray's netstack queue so multi-flow TCP bursts reach GotaTun without stalling.
+pub(crate) const OUTPUT_QUEUE_CAPACITY: usize = 1024;
+pub(crate) const INPUT_QUEUE_CAPACITY: usize = 256;
+pub(crate) const REPLIES_QUEUE_CAPACITY: usize = 256;
+pub(crate) const UDP_QUEUE_CAPACITY: usize = 256;
+pub(crate) const COMMAND_QUEUE_CAPACITY: usize = 256;
+const ACCEPT_QUEUE_CAPACITY: usize = 64;
+// Output slots TCP egress leaves for best-effort UDP datagrams and ingress replies.
+pub(crate) const OUTPUT_UDP_HEADROOM: usize = 64;
+const EGRESS_POLL_LIMIT: usize = 64;
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
 const LAST_EPHEMERAL_PORT: u16 = 65535;
 
@@ -99,11 +108,13 @@ pub(crate) struct PacketStack {
     pub handle: StackHandle,
     pub input: mpsc::Sender<PacketBuffer>,
     pub output: Option<mpsc::Receiver<PacketBuffer>>,
+    /// Set when TCP egress paused on a full output queue; the drainer clears it and wakes the stack.
+    pub egress_backpressured: Arc<AtomicBool>,
     pub tcp: Option<mpsc::Receiver<AcceptedTcp>>,
     pub udp: Option<mpsc::Receiver<PacketBuffer>>,
     pub replies: mpsc::Sender<PacketBuffer>,
     pub done: oneshot::Receiver<()>,
-    pub drops: Arc<AtomicU64>,
+    pub drops: Arc<PacketDrops>,
     pub counts: Arc<FlowCounts>,
 }
 
@@ -111,6 +122,47 @@ pub(crate) struct PacketStack {
 pub(crate) struct FlowCounts {
     pub tcp: AtomicUsize,
     pub outbound_udp: AtomicUsize,
+    #[cfg(test)]
+    pub iterations: AtomicUsize,
+}
+
+#[derive(Default)]
+pub(crate) struct PacketDrops {
+    pub output_full: AtomicU64,
+    pub mtu_exceeded: AtomicU64,
+    pub invalid_packet: AtomicU64,
+    pub udp_queue_full: AtomicU64,
+    pub detour_dropped: AtomicU64,
+}
+
+impl PacketDrops {
+    pub fn total(&self) -> u64 {
+        [
+            &self.output_full,
+            &self.mtu_exceeded,
+            &self.invalid_packet,
+            &self.udp_queue_full,
+            &self.detour_dropped,
+        ]
+        .into_iter()
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .sum()
+    }
+}
+
+impl std::fmt::Display for PacketDrops {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "packet_drops={} output_drops={} mtu_drops={} invalid_drops={} udp_drops={} detour_drops={}",
+            self.total(),
+            self.output_full.load(Ordering::Relaxed),
+            self.mtu_exceeded.load(Ordering::Relaxed),
+            self.invalid_packet.load(Ordering::Relaxed),
+            self.udp_queue_full.load(Ordering::Relaxed),
+            self.detour_dropped.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl Drop for PacketStack {
@@ -135,17 +187,20 @@ impl PacketStack {
         limits.validate()?;
         let (wake, wake_rx) = Wake::new()?;
         let running = Arc::new(AtomicBool::new(true));
-        let drops = Arc::new(AtomicU64::new(0));
+        let drops = Arc::new(PacketDrops::default());
+        let egress_backpressured = Arc::new(AtomicBool::new(false));
         let counts = Arc::new(FlowCounts::default());
-        let (input, input_rx) = mpsc::channel(QUEUE_CAPACITY);
-        let (output_tx, output) = mpsc::channel(QUEUE_CAPACITY);
+        let (input, input_rx) = mpsc::channel(INPUT_QUEUE_CAPACITY);
+        let (output_tx, output) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
         let accept_capacity = limits
             .tcp_connection_limit()
-            .map_or(QUEUE_CAPACITY, |limit| limit.max(QUEUE_CAPACITY));
+            .map_or(ACCEPT_QUEUE_CAPACITY, |limit| {
+                limit.max(ACCEPT_QUEUE_CAPACITY)
+            });
         let (tcp_tx, tcp) = mpsc::channel(accept_capacity);
-        let (udp_tx, udp) = mpsc::channel(QUEUE_CAPACITY);
-        let (replies, replies_rx) = mpsc::channel(QUEUE_CAPACITY);
-        let (commands, command_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (udp_tx, udp) = mpsc::channel(UDP_QUEUE_CAPACITY);
+        let (replies, replies_rx) = mpsc::channel(REPLIES_QUEUE_CAPACITY);
+        let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (done_tx, done) = oneshot::channel();
         let handle = StackHandle {
             commands,
@@ -157,6 +212,7 @@ impl PacketStack {
             output: output_tx,
             mtu: mtu as usize,
             drops: drops.clone(),
+            egress_backpressured: egress_backpressured.clone(),
         };
         let worker_counts = counts.clone();
         let thread = thread::Builder::new()
@@ -191,6 +247,7 @@ impl PacketStack {
             handle,
             input,
             output: Some(output),
+            egress_backpressured,
             tcp: Some(tcp),
             udp: Some(udp),
             replies,
@@ -205,17 +262,44 @@ struct QueueDevice {
     packet: Option<PacketBuffer>,
     output: mpsc::Sender<PacketBuffer>,
     mtu: usize,
-    drops: Arc<AtomicU64>,
+    drops: Arc<PacketDrops>,
+    egress_backpressured: Arc<AtomicBool>,
 }
 impl QueueDevice {
     fn emit(&self, packet: PacketBuffer) {
-        if packet.len() > self.mtu || self.output.try_send(packet).is_err() {
-            self.drops.fetch_add(1, Ordering::Relaxed);
+        if packet.len() > self.mtu {
+            self.drops.mtu_exceeded.fetch_add(1, Ordering::Relaxed);
+        } else if self.output.try_send(packet).is_err() {
+            self.drops.output_full.fetch_add(1, Ordering::Relaxed);
         }
+    }
+    fn reserve(&self) -> Option<mpsc::Permit<'_, PacketBuffer>> {
+        (self.output.capacity() > OUTPUT_UDP_HEADROOM)
+            .then(|| self.output.try_reserve().ok())
+            .flatten()
+    }
+    fn reserved<'a>(&'a self, permit: mpsc::Permit<'a, PacketBuffer>) -> Tx<'a> {
+        Tx::Reserved {
+            permit,
+            mtu: self.mtu,
+            drops: &self.drops,
+        }
+    }
+    fn is_egress_backpressured(&self) -> bool {
+        self.egress_backpressured.load(Ordering::Acquire)
     }
 }
 struct Rx(PacketBuffer);
-struct Tx<'a>(&'a QueueDevice);
+enum Tx<'a> {
+    /// Socket egress holds a queue slot, so smoltcp never treats a dropped segment as sent.
+    Reserved {
+        permit: mpsc::Permit<'a, PacketBuffer>,
+        mtu: usize,
+        drops: &'a PacketDrops,
+    },
+    /// Ingress replies, such as RSTs, never wait for egress capacity.
+    BestEffort(&'a QueueDevice),
+}
 impl RxToken for Rx {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
         f(&self.0)
@@ -226,7 +310,16 @@ impl TxToken for Tx<'_> {
         let mut packet = PacketBuffer::with_capacity(len);
         packet.resize(len);
         let result = f(&mut packet);
-        self.0.emit(packet);
+        match self {
+            Tx::Reserved { permit, mtu, drops } => {
+                if packet.len() > mtu {
+                    drops.mtu_exceeded.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    permit.send(packet);
+                }
+            }
+            Tx::BestEffort(device) => device.emit(packet),
+        }
         result
     }
 }
@@ -234,10 +327,18 @@ impl Device for QueueDevice {
     type RxToken<'a> = Rx;
     type TxToken<'a> = Tx<'a>;
     fn receive(&mut self, _: Instant) -> Option<(Rx, Tx<'_>)> {
-        Some((Rx(self.packet.take()?), Tx(self)))
+        Some((Rx(self.packet.take()?), Tx::BestEffort(self)))
     }
     fn transmit(&mut self, _: Instant) -> Option<Tx<'_>> {
-        Some(Tx(self))
+        if let Some(permit) = self.reserve() {
+            return Some(self.reserved(permit));
+        }
+        // The swap synchronizes with the drainer's swap, so a drain that missed this flag
+        // released its capacity before the re-check below.
+        self.egress_backpressured.swap(true, Ordering::AcqRel);
+        let permit = self.reserve()?;
+        self.egress_backpressured.store(false, Ordering::Release);
+        Some(self.reserved(permit))
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
@@ -288,6 +389,76 @@ impl Drop for TcpEntry {
         self.control.set_closed();
     }
 }
+/// Indexes TCP entries by tuple and local address so per-packet lookups stay O(1).
+#[derive(Default)]
+struct TcpFlows {
+    entries: HashMap<SocketHandle, TcpEntry>,
+    index: TcpIndex,
+}
+#[derive(Default)]
+struct TcpIndex {
+    by_tuple: HashMap<(SocketAddr, SocketAddr), SocketHandle>,
+    locals: HashMap<SocketAddr, usize>,
+    outbound_locals: HashSet<SocketAddr>,
+}
+impl TcpIndex {
+    fn add(&mut self, handle: SocketHandle, entry: &TcpEntry) {
+        let previous = self.by_tuple.insert((entry.remote, entry.local), handle);
+        debug_assert!(previous.is_none(), "duplicate TCP tuple");
+        *self.locals.entry(entry.local).or_default() += 1;
+        if entry.outbound {
+            let fresh = self.outbound_locals.insert(entry.local);
+            debug_assert!(fresh, "duplicate outbound TCP local address");
+        }
+    }
+    fn remove(&mut self, entry: &TcpEntry) {
+        self.by_tuple.remove(&(entry.remote, entry.local));
+        if let Some(count) = self.locals.get_mut(&entry.local) {
+            *count -= 1;
+            if *count == 0 {
+                self.locals.remove(&entry.local);
+            }
+        }
+        if entry.outbound {
+            self.outbound_locals.remove(&entry.local);
+        }
+    }
+}
+impl TcpFlows {
+    fn insert(&mut self, handle: SocketHandle, entry: TcpEntry) {
+        self.index.add(handle, &entry);
+        let previous = self.entries.insert(handle, entry);
+        debug_assert!(previous.is_none(), "reused TCP socket handle");
+    }
+    fn remove(&mut self, handle: SocketHandle) -> Option<TcpEntry> {
+        let entry = self.entries.remove(&handle)?;
+        self.index.remove(&entry);
+        Some(entry)
+    }
+    fn retain(&mut self, mut keep: impl FnMut(SocketHandle, &mut TcpEntry) -> bool) {
+        let Self { entries, index } = self;
+        entries.retain(|handle, entry| {
+            let kept = keep(*handle, entry);
+            if !kept {
+                index.remove(entry);
+            }
+            kept
+        });
+        debug_assert_eq!(index.by_tuple.len(), entries.len());
+    }
+    fn find(&self, remote: SocketAddr, local: SocketAddr) -> Option<SocketHandle> {
+        self.index.by_tuple.get(&(remote, local)).copied()
+    }
+    fn uses_local(&self, local: SocketAddr) -> bool {
+        self.index.locals.contains_key(&local)
+    }
+    fn is_outbound_local(&self, local: SocketAddr) -> bool {
+        self.index.outbound_locals.contains(&local)
+    }
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 struct UdpEntry(Arc<Mutex<UdpControl>>);
 impl Drop for UdpEntry {
     fn drop(&mut self) {
@@ -299,20 +470,23 @@ fn now() -> Instant {
     std::time::Instant::now().into()
 }
 
+/// Reports pending socket work; queued sends are excluded while egress is paused because
+/// only an output drain can make progress for them.
 fn reconcile_tcp(
-    tcp: &mut HashMap<SocketHandle, TcpEntry>,
+    tcp: &mut TcpFlows,
     sockets: &mut SocketSet<'_>,
     counts: &FlowCounts,
+    egress_backpressured: bool,
 ) -> bool {
     let mut local_work = false;
     tcp.retain(|handle, entry| {
-        let socket = sockets.get::<TcpSocket>(*handle);
+        let socket = sockets.get::<TcpSocket>(handle);
         if socket.state() == State::Closed && socket.remote_endpoint().is_none() {
-            sockets.remove(*handle);
+            sockets.remove(handle);
             return false;
         }
         local_work |= socket.can_recv() && !entry.control.recv_buffer_full()
-            || socket.can_send() && !entry.control.send_buffer_empty()
+            || !egress_backpressured && socket.can_send() && !entry.control.send_buffer_empty()
             || socket.state() != State::Closed && entry.control.should_abort();
         true
     });
@@ -397,11 +571,20 @@ fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
     })
 }
 
+/// Paused sockets report an immediate deadline for their unsent data; the output drainer wakes
+/// the stack instead, so only real timer deadlines are kept.
+fn egress_poll_delay(
+    delay: Option<smoltcp::time::Duration>,
+    egress_backpressured: bool,
+) -> Option<smoltcp::time::Duration> {
+    delay.filter(|delay| !egress_backpressured || *delay != smoltcp::time::Duration::ZERO)
+}
+
 fn allocate_local(
     addresses: &[IpAddr],
     target: SocketAddr,
     next_port: &mut u16,
-    tcp: &HashMap<SocketHandle, TcpEntry>,
+    tcp: &TcpFlows,
     udp: &HashMap<SocketAddr, UdpEntry>,
 ) -> io::Result<SocketAddr> {
     let ip = addresses
@@ -422,7 +605,7 @@ fn allocate_local(
             port + 1
         };
         let local = SocketAddr::new(ip, port);
-        if !udp.contains_key(&local) && !tcp.values().any(|entry| entry.local == local) {
+        if !udp.contains_key(&local) && !tcp.uses_local(local) {
             return Ok(local);
         }
     }
@@ -467,15 +650,18 @@ fn run(
     }
     iface.set_any_ip(inbound);
     let mut sockets = SocketSet::new(vec![]);
-    let mut tcp: HashMap<SocketHandle, TcpEntry> = HashMap::new();
+    let mut tcp = TcpFlows::default();
     let mut udp: HashMap<SocketAddr, UdpEntry> = HashMap::new();
     let budget = Arc::new(Budget::new(limits.max_udp_queued_bytes));
-    let mut next_port = FIRST_EPHEMERAL_PORT;
+    // A random start keeps restarts from reusing tuples still in a peer's TIME-WAIT.
+    let mut next_port = rand::random_range(FIRST_EPHEMERAL_PORT..=LAST_EPHEMERAL_PORT);
     while running.load(Ordering::Acquire) {
+        #[cfg(test)]
+        counts.iterations.fetch_add(1, Ordering::Relaxed);
         if wake_rx.drain().is_err() {
             break;
         }
-        for _ in 0..QUEUE_CAPACITY {
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
             let Ok(command) = commands.try_recv() else {
                 break;
             };
@@ -567,19 +753,17 @@ fn run(
                 }
             }
         }
-        let mut work = 0;
         iface.poll_maintenance(now());
-        for _ in 0..QUEUE_CAPACITY {
+        for _ in 0..INPUT_QUEUE_CAPACITY {
             let Ok(mut packet) = input.try_recv() else {
                 break;
             };
-            work += 1;
             let Some(info) = packet_info(&packet) else {
-                device.drops.fetch_add(1, Ordering::Relaxed);
+                device.drops.invalid_packet.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             if packet.len() > device.mtu {
-                device.drops.fetch_add(1, Ordering::Relaxed);
+                device.drops.mtu_exceeded.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             packet.retain_range(0..info.length);
@@ -589,29 +773,22 @@ fn run(
                     if control.remote == info.source {
                         packet.retain_range(info.transport_offset + 8..info.length);
                         if !control.receive(packet) {
-                            device.drops.fetch_add(1, Ordering::Relaxed);
+                            device.drops.udp_queue_full.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 } else if inbound && inbound_udp.try_send(packet).is_err() {
-                    device.drops.fetch_add(1, Ordering::Relaxed);
+                    device.drops.udp_queue_full.fetch_add(1, Ordering::Relaxed);
                 }
                 continue;
             }
-            let known = tcp.iter().find_map(|(handle, entry)| {
-                (entry.remote == info.source && entry.local == info.target).then_some(*handle)
-            });
-            let Some(handle) = known else {
+            let Some(handle) = tcp.find(info.source, info.target) else {
                 if !info.syn {
                     // Lets smoltcp reset stale flows without answering RSTs or admitting new flows.
                     device.packet = Some(packet);
                     iface.poll_ingress_single(now(), &mut device, &mut sockets);
                     continue;
                 }
-                if !inbound
-                    || tcp
-                        .values()
-                        .any(|entry| entry.outbound && entry.local == info.target)
-                {
+                if !inbound || tcp.is_outbound_local(info.target) {
                     continue;
                 }
                 if limits
@@ -664,15 +841,15 @@ fn run(
             // A reset passive open returns to Listen and must not capture the next peer's SYN.
             // Outbound entries stay until pump reports refusal to their pending connects.
             let socket = sockets.get::<TcpSocket>(handle);
-            if !tcp[&handle].outbound
+            if !tcp.entries[&handle].outbound
                 && matches!(socket.state(), State::Listen | State::Closed)
                 && socket.remote_endpoint().is_none()
             {
                 sockets.remove(handle);
-                tcp.remove(&handle);
+                tcp.remove(handle);
             }
         }
-        for (handle, entry) in &mut tcp {
+        for (handle, entry) in &mut tcp.entries {
             let socket = sockets.get_mut::<TcpSocket>(*handle);
             entry.pump(*handle, socket, now());
         }
@@ -689,33 +866,33 @@ fn run(
             }
             true
         });
-        for _ in 0..QUEUE_CAPACITY {
+        for _ in 0..REPLIES_QUEUE_CAPACITY {
             let Ok(packet) = replies.try_recv() else {
                 break;
             };
-            work += 1;
             device.emit(packet);
         }
-        for _ in 0..8 {
+        for _ in 0..EGRESS_POLL_LIMIT {
             if iface.poll_egress(now(), &mut device, &mut sockets)
                 == smoltcp::iface::PollResult::None
             {
                 break;
             }
         }
-        let local_work = reconcile_tcp(&mut tcp, &mut sockets, &counts);
+        let backpressured = device.is_egress_backpressured();
+        let local_work = reconcile_tcp(&mut tcp, &mut sockets, &counts, backpressured);
         counts.outbound_udp.store(udp.len(), Ordering::Relaxed);
         if !running.load(Ordering::Acquire) {
             break;
         }
-        if work >= QUEUE_CAPACITY || !commands.is_empty() || local_work {
+        if !input.is_empty() || !replies.is_empty() || !commands.is_empty() || local_work {
             continue;
         }
         let timestamp = now();
         let delay = super::tcp_poll_delay(
             timestamp,
-            iface.poll_delay(timestamp, &sockets),
-            tcp.values().map(|entry| &*entry.control),
+            egress_poll_delay(iface.poll_delay(timestamp, &sockets), backpressured),
+            tcp.entries.values().map(|entry| &*entry.control),
         );
         if let Err(error) = wake_rx.wait(-1, delay.map(Into::into))
             && error.kind() != io::ErrorKind::Interrupted

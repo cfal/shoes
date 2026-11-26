@@ -9,7 +9,7 @@ mod tests;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use gotatun::{
-    device::{DeviceBuilder, Peer},
+    device::{Device, DeviceBuilder, DeviceTransports, Peer, configure::PeerStats},
     noise::PresharedKey,
     x25519::{PublicKey, StaticSecret},
 };
@@ -20,8 +20,12 @@ use std::{
     fmt, io as stdio,
     net::{IpAddr, SocketAddr},
     sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::{
+    task::{JoinHandle, JoinSet},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -37,6 +41,13 @@ use crate::{
     resolver::{NativeResolver, Resolver, resolve_addresses},
     tcp::socket_connector::SocketConnector,
 };
+
+const REPORT_INTERVAL: Duration = Duration::from_secs(60);
+const ENDPOINT_DNS_TIMEOUT: Duration = Duration::from_secs(10);
+// WireGuard's REJECT_AFTER_TIME: sessions older than this cannot carry data.
+const STALE_HANDSHAKE: Duration = Duration::from_secs(180);
+// Bounds stale-peer DNS retries at five report intervals (300 seconds by default).
+const MAX_REFRESH_BACKOFF_INTERVALS: u32 = 5;
 
 fn canonical_socket_addr(mut address: SocketAddr) -> SocketAddr {
     address.set_ip(address.ip().to_canonical());
@@ -174,20 +185,9 @@ impl PreparedPeer {
             (peer_config.persistent_keepalive != 0).then_some(peer_config.persistent_keepalive);
         let endpoints = if let Some(endpoint) = &peer_config.endpoint {
             let address = NetLocation::from_str(endpoint, None)?;
-            let addresses = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                resolve_addresses(resolver, &address),
-            )
-            .await
-            .map_err(|_| {
-                stdio::Error::new(
-                    stdio::ErrorKind::TimedOut,
-                    "WireGuard endpoint DNS timed out",
-                )
-            })??;
-            let endpoints: Vec<_> = addresses
+            let endpoints: Vec<_> = resolve_endpoint(resolver, &address)
+                .await?
                 .into_iter()
-                .map(canonical_socket_addr)
                 .filter(|address| config.can_reach_endpoint(*address))
                 .collect();
             if endpoints.is_empty() {
@@ -207,12 +207,29 @@ impl PreparedPeer {
     }
 }
 
+async fn resolve_endpoint(
+    resolver: &Arc<dyn Resolver>,
+    location: &NetLocation,
+) -> stdio::Result<Vec<SocketAddr>> {
+    let addresses =
+        tokio::time::timeout(ENDPOINT_DNS_TIMEOUT, resolve_addresses(resolver, location))
+            .await
+            .map_err(|_| {
+                stdio::Error::new(
+                    stdio::ErrorKind::TimedOut,
+                    "WireGuard endpoint DNS timed out",
+                )
+            })??;
+    Ok(addresses.into_iter().map(canonical_socket_addr).collect())
+}
+
 struct PreparedEndpoint {
     config: WireguardDeviceConfig,
     peers: Vec<PreparedPeer>,
     connector: Arc<Connector>,
     global_limits: crate::config::GlobalLimits,
     outer_resolver: Arc<dyn Resolver>,
+    report_interval: Duration,
 }
 
 #[derive(Default)]
@@ -324,6 +341,7 @@ impl Prepared {
                 connector,
                 global_limits: validated.global_limits,
                 outer_resolver: resolver.clone(),
+                report_interval: REPORT_INTERVAL,
             };
             endpoint.build_outer_chain()?;
             endpoints.push(endpoint);
@@ -459,7 +477,7 @@ impl PreparedEndpoint {
         let resolver = self.outer_resolver.clone();
         // Rebuilding after preflight gives each start fresh pool indices and handler lifetimes.
         let outer_chain = self.build_outer_chain()?;
-        let (udp, released, peers) = if let Some(chain) = &outer_chain {
+        let (udp, released, peers, mut refresh) = if let Some(chain) = &outer_chain {
             let peers = self.peers_for_socket(None)?;
             let (sender, receiver, released) = detour::start(
                 config.id.clone(),
@@ -469,13 +487,17 @@ impl PreparedEndpoint {
                 stack.drops.clone(),
             );
             log::info!("WireGuard endpoint {} using peer_client_chain", config.id);
-            (io::Factory::detour(sender, receiver), released, peers)
+            (io::Factory::detour(sender, receiver), released, peers, None)
         } else {
-            let (udp, released, local) =
-                io::Factory::new(config.listen, config.bind_interface.clone())?;
+            let (udp, released, local) = io::Factory::new(
+                config.listen,
+                config.bind_interface.clone(),
+                self.global_limits.wireguard_socket_buffer,
+            )?;
             let peers = self.peers_for_socket(Some(local))?;
             log::info!("WireGuard endpoint {} listening on {local}", config.id);
-            (udp, released, peers)
+            let refresh = StalePeerRefresh::new(self, local);
+            (udp, released, peers, refresh)
         };
         let mut device = DeviceBuilder::new()
             .with_udp(udp)
@@ -488,10 +510,12 @@ impl PreparedEndpoint {
                     mtu: config.mtu,
                     drops: stack.drops.clone(),
                 },
-                io::IpSource {
-                    receiver: stack.output.take().unwrap(),
-                    mtu: config.mtu,
-                },
+                io::IpSource::new(
+                    stack.output.take().unwrap(),
+                    stack.handle.wake.clone(),
+                    stack.egress_backpressured.clone(),
+                    config.mtu,
+                ),
             )
             .build()
             .await
@@ -504,6 +528,7 @@ impl PreparedEndpoint {
         });
         let connector = self.connector.clone();
         let name = config.id.clone();
+        let report_interval = self.report_interval;
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
         let task = tokio::spawn(crate::network_tasks::inherit(async move {
@@ -514,7 +539,7 @@ impl PreparedEndpoint {
                     &mut tasks, &mut stack, selector, resolver, limits,
                 ));
             }
-            let mut report = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut report = tokio::time::interval(report_interval);
             report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let failed = loop {
                 tokio::select! {
@@ -525,13 +550,14 @@ impl PreparedEndpoint {
                     _ = tasks.join_next(), if !tasks.is_empty() => break true,
                     _ = report.tick() => {
                         log::info!(
-                            "WireGuard endpoint {name} tcp_flows={} outbound_udp_flows={} inbound_udp_destinations={} packet_drops={}",
+                            "WireGuard endpoint {name} tcp_flows={} outbound_udp_flows={} inbound_udp_destinations={} {}",
                             stack.counts.tcp.load(Ordering::Relaxed),
                             stack.counts.outbound_udp.load(Ordering::Relaxed),
                             inbound_udp_count.as_ref().map_or(0, |count| count.snapshot().active),
-                            stack.drops.load(Ordering::Relaxed),
+                            stack.drops,
                         );
-                        for peer in device.peers().await {
+                        let peers = device.peers().await;
+                        for peer in &peers {
                             log::info!(
                                 "WireGuard endpoint {name} peer={} handshake_age={:?} rx_bytes={} tx_bytes={}",
                                 STANDARD.encode(peer.peer.public_key.as_bytes()),
@@ -539,6 +565,13 @@ impl PreparedEndpoint {
                                 peer.stats.rx_bytes,
                                 peer.stats.tx_bytes,
                             );
+                        }
+                        if let Some(refresh) = &mut refresh {
+                            tokio::select! {
+                                biased;
+                                _ = shutdown.cancelled() => break false,
+                                _ = refresh.run(&name, &device, &peers) => {}
+                            }
                         }
                     }
                 }
@@ -551,13 +584,167 @@ impl PreparedEndpoint {
             device.stop().await;
             // GotaTun aborts buffered socket tasks during stop; their destruction releases the bind.
             let _ = released.await;
-            log::info!(
-                "WireGuard endpoint {name} stopped; packet drops={}",
-                stack.drops.load(Ordering::Relaxed)
-            );
+            log::info!("WireGuard endpoint {name} stopped; {}", stack.drops);
             drop(stack);
         }));
         Ok(EndpointRuntime { cancel, task })
+    }
+}
+
+/// Re-resolves configured peer hostnames for direct-mode peers whose handshake went stale.
+/// Healthy peers are never touched, so authenticated roaming addresses are preserved.
+struct StalePeerRefresh {
+    peers: Vec<HostnamePeer>,
+    resolver: Arc<dyn Resolver>,
+    listen: Option<SocketAddr>,
+    local: SocketAddr,
+    started: Instant,
+    interval: Duration,
+}
+
+struct HostnamePeer {
+    public_key: PublicKey,
+    location: NetLocation,
+    retry_at: Instant,
+    backoff: Duration,
+}
+
+impl StalePeerRefresh {
+    fn new(endpoint: &PreparedEndpoint, local: SocketAddr) -> Option<Self> {
+        let started = Instant::now();
+        let peers: Vec<_> = endpoint
+            .config
+            .peers
+            .iter()
+            .filter_map(|peer| {
+                let location = NetLocation::from_str(peer.endpoint.as_deref()?, None).ok()?;
+                location.address().hostname()?;
+                Some(HostnamePeer {
+                    public_key: PublicKey::from(peer.public_key.0),
+                    location,
+                    retry_at: started,
+                    backoff: endpoint.report_interval,
+                })
+            })
+            .collect();
+        (!peers.is_empty()).then(|| Self {
+            peers,
+            resolver: endpoint.outer_resolver.clone(),
+            listen: endpoint.config.listen,
+            local,
+            started,
+            interval: endpoint.report_interval,
+        })
+    }
+
+    fn is_stale(&self, last_handshake: Option<Duration>, now: Instant) -> bool {
+        match last_handshake {
+            Some(age) => age >= STALE_HANDSHAKE,
+            None => now.duration_since(self.started) >= self.interval,
+        }
+    }
+
+    fn compatible(&self, address: SocketAddr) -> bool {
+        crate::config::wireguard::can_reach_endpoint(self.listen, address)
+            && (self.local.is_ipv6() || address.is_ipv4())
+    }
+
+    async fn run<T: DeviceTransports>(
+        &mut self,
+        name: &str,
+        device: &Device<T>,
+        stats: &[PeerStats],
+    ) {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        for index in 0..self.peers.len() {
+            let peer = &self.peers[index];
+            let Some(current) = stats
+                .iter()
+                .find(|stats| stats.peer.public_key == peer.public_key)
+            else {
+                continue;
+            };
+            let stale = self.is_stale(current.stats.last_handshake, now);
+            let peer = &mut self.peers[index];
+            if !stale {
+                peer.retry_at = now;
+                peer.backoff = self.interval;
+                continue;
+            }
+            if now < peer.retry_at {
+                continue;
+            }
+            peer.retry_at = now + peer.backoff;
+            peer.backoff = (peer.backoff * 2).min(self.interval * MAX_REFRESH_BACKOFF_INTERVALS);
+            due.push((index, current.peer.endpoint));
+        }
+        if due.is_empty() {
+            return;
+        }
+        let resolved = futures::future::join_all(
+            due.iter()
+                .map(|(index, _)| resolve_endpoint(&self.resolver, &self.peers[*index].location)),
+        )
+        .await;
+        let mut updates = Vec::new();
+        for ((index, previous), result) in due.into_iter().zip(resolved) {
+            let peer = &self.peers[index];
+            match result.map(|addresses| addresses.into_iter().find(|a| self.compatible(*a))) {
+                Ok(Some(address)) if previous != Some(address) => {
+                    updates.push((peer.public_key, previous, address));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => log::warn!(
+                    "WireGuard endpoint {name} peer hostname {} has no address compatible with {}",
+                    peer.location,
+                    self.local
+                ),
+                Err(error) => log::warn!(
+                    "WireGuard endpoint {name} peer hostname {} refresh failed: {error}",
+                    peer.location
+                ),
+            }
+        }
+        if updates.is_empty() {
+            return;
+        }
+        let applied = device
+            .write(async |device| {
+                // Rechecks under the write lock so a handshake or roam since the snapshot wins.
+                let current = device.peers().await;
+                let now = Instant::now();
+                let mut applied = Vec::new();
+                for (public_key, previous, address) in updates {
+                    let unchanged = current.iter().any(|peer| {
+                        peer.peer.public_key == public_key
+                            && peer.peer.endpoint == previous
+                            && self.is_stale(peer.stats.last_handshake, now)
+                    });
+                    if unchanged
+                        && device
+                            .modify_peer(&public_key, |peer| peer.set_endpoint(Some(address)))
+                            .await
+                    {
+                        applied.push((public_key, previous, address));
+                    }
+                }
+                applied
+            })
+            .await;
+        match applied {
+            Ok(applied) => {
+                for (public_key, previous, address) in applied {
+                    log::info!(
+                        "WireGuard endpoint {name} peer={} stale endpoint {previous:?} re-resolved to {address}",
+                        STANDARD.encode(public_key.as_bytes()),
+                    );
+                }
+            }
+            Err(error) => {
+                log::warn!("WireGuard endpoint {name} peer endpoint refresh failed: {error}");
+            }
+        }
     }
 }
 

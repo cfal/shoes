@@ -1,4 +1,5 @@
 use super::*;
+use crate::atomic::AtomicU64;
 use crate::{
     address::ResolvedLocation, async_stream::AsyncStream, client_proxy_chain::InitialHopEntry,
     resolver::NativeResolver, tcp::socket_connector::SocketConnector, vless::VlessMessageStream,
@@ -110,7 +111,7 @@ async fn url_test_idle_reconnects_do_not_activate_lazy_groups() {
         chain.clone(),
         Arc::new(NativeResolver::new()),
         ["127.0.0.1:51820".parse().unwrap()].into_iter(),
-        Arc::new(AtomicU64::new(0)),
+        Arc::default(),
     );
     for _ in 0..20 {
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -187,7 +188,7 @@ async fn bounded_queues_drop_offline_oversize_and_unknown_targets() {
     let target = "127.0.0.1:51820".parse().unwrap();
     let (outgoing, mut queue) = mpsc::channel(QUEUE_CAPACITY);
     let destination = Arc::new(Mutex::new(None));
-    let drops = Arc::new(AtomicU64::new(0));
+    let drops = Arc::new(PacketDrops::default());
     let sender = Sender {
         destinations: Arc::new(HashMap::from([(target, destination.clone())])),
         drops: drops.clone(),
@@ -206,7 +207,7 @@ async fn bounded_queues_drop_offline_oversize_and_unknown_targets() {
             .unwrap();
     }
     assert_eq!(queue.len(), QUEUE_CAPACITY);
-    assert_eq!(drops.load(Ordering::Relaxed), 3);
+    assert_eq!(drops.detour_dropped.load(Ordering::Relaxed), 3);
     assert!(
         sender
             .send_to(
@@ -222,7 +223,7 @@ fn disconnected_queue_cannot_receive_or_replay_packets() {
     let target = "127.0.0.1:51820".parse().unwrap();
     let (old_sender, mut old_queue) = mpsc::channel(QUEUE_CAPACITY);
     let destination = Arc::new(Mutex::new(Some(old_sender)));
-    let drops = Arc::new(AtomicU64::new(0));
+    let drops = Arc::new(PacketDrops::default());
     let sender = Sender {
         destinations: Arc::new(HashMap::from([(target, destination.clone())])),
         drops: drops.clone(),
@@ -241,7 +242,7 @@ fn disconnected_queue_cannot_receive_or_replay_packets() {
     slot.take();
     drop(slot);
     send.join().unwrap();
-    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    assert_eq!(drops.detour_dropped.load(Ordering::Relaxed), 1);
     assert_eq!(old_queue.try_recv().unwrap(), b"old");
     assert!(matches!(
         old_queue.try_recv(),
@@ -274,7 +275,7 @@ async fn associations_preserve_messages_isolate_peers_reconnect_and_release() {
             "127.0.0.1:51820".parse().unwrap(),
             "[::1]:51821".parse().unwrap(),
         ];
-        let drops = Arc::new(AtomicU64::new(0));
+        let drops = Arc::new(PacketDrops::default());
         let (sender, mut receiver, released) = start(
             "test".into(),
             chain,
@@ -310,14 +311,14 @@ async fn associations_preserve_messages_isolate_peers_reconnect_and_release() {
         write(peer, b"after oversize").await;
         let (packet, _) = receiver.recv_from(&mut pool).await.unwrap();
         assert_eq!(&*packet, b"after oversize");
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.detour_dropped.load(Ordering::Relaxed), 1);
 
         for _ in 0..QUEUE_CAPACITY + 4 {
             write(peer, b"bounded receive").await;
         }
         tokio::task::yield_now().await;
         assert_eq!(receiver.incoming.len(), QUEUE_CAPACITY);
-        assert!(drops.load(Ordering::Relaxed) > 1);
+        assert!(drops.detour_dropped.load(Ordering::Relaxed) > 1);
         while receiver.incoming.try_recv().is_ok() {}
 
         let (_, old_peer) = peers.remove(&targets[0]).unwrap();
@@ -338,7 +339,7 @@ async fn associations_preserve_messages_isolate_peers_reconnect_and_release() {
             read(&mut peers.get_mut(&targets[0]).unwrap().1).await,
             b"independent peer"
         );
-        assert!(drops.load(Ordering::Relaxed) > 1);
+        assert!(drops.detour_dropped.load(Ordering::Relaxed) > 1);
         drop(receiver);
         released.await.unwrap();
         // Sender clones cannot keep carriers alive after the GotaTun receiver is dropped.
@@ -375,7 +376,7 @@ async fn stalled_connect_is_bounded_and_cancellation_joins_workers() {
         chain,
         Arc::new(NativeResolver::new()),
         [target].into_iter(),
-        Arc::new(AtomicU64::new(0)),
+        Arc::default(),
     );
     let (_, _, mut first) = connections.recv().await.unwrap();
     tokio::time::advance(IO_TIMEOUT + MIN_BACKOFF).await;
@@ -399,7 +400,7 @@ async fn stalled_write_reconnects_without_replaying_old_queue() {
         vec![],
     ));
     let target = "127.0.0.1:51820".parse().unwrap();
-    let drops = Arc::new(AtomicU64::new(0));
+    let drops = Arc::new(PacketDrops::default());
     let (sender, receiver, released) = start(
         "timeout".into(),
         chain,
@@ -417,9 +418,53 @@ async fn stalled_write_reconnects_without_replaying_old_queue() {
     tokio::time::advance(IO_TIMEOUT + MIN_BACKOFF).await;
     let (_, _, stream) = connections.recv().await.unwrap();
     let mut peer = VlessMessageStream::new(stream);
-    assert_eq!(drops.load(Ordering::Relaxed), 3);
+    assert_eq!(drops.detour_dropped.load(Ordering::Relaxed), 3);
     sender.send_to(Packet::copy_from(b"fresh"), target).unwrap();
     assert_eq!(read(&mut peer).await, b"fresh");
     drop(receiver);
     released.await.unwrap();
+}
+
+#[tokio::test]
+async fn batched_receive_drains_queued_datagrams_in_order() {
+    let (incoming, queued) = mpsc::channel(QUEUE_CAPACITY);
+    let mut receiver = Receiver {
+        incoming: queued,
+        batch: Vec::new(),
+        _cancel: CancellationToken::new().drop_guard(),
+    };
+    let sources: [SocketAddr; 2] = [
+        "127.0.0.1:51820".parse().unwrap(),
+        "[::1]:51821".parse().unwrap(),
+    ];
+    for index in 0..RECEIVE_BATCH_SIZE + 6 {
+        incoming
+            .try_send((vec![index as u8; 1 + index], sources[index % 2]))
+            .unwrap();
+    }
+    let mut pool = PacketBufPool::new(8);
+    let mut packets = Vec::new();
+    receiver
+        .recv_many_from(&mut pool, &mut packets)
+        .await
+        .unwrap();
+    assert_eq!(packets.len(), RECEIVE_BATCH_SIZE);
+    receiver
+        .recv_many_from(&mut pool, &mut packets)
+        .await
+        .unwrap();
+    assert_eq!(packets.len(), RECEIVE_BATCH_SIZE + 6);
+    for (index, (packet, source)) in packets.iter().enumerate() {
+        assert_eq!(&**packet, vec![index as u8; 1 + index]);
+        assert_eq!(*source, sources[index % 2]);
+    }
+    drop(incoming);
+    assert_eq!(
+        receiver
+            .recv_many_from(&mut pool, &mut packets)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::BrokenPipe
+    );
 }

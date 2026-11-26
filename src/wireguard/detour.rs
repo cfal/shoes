@@ -1,4 +1,3 @@
-use crate::atomic::AtomicU64;
 use std::{
     collections::{HashMap, hash_map::Entry},
     future::Future,
@@ -23,10 +22,11 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     address::NetLocation, async_stream::AsyncMessageStream, client_proxy_chain::ClientProxyChain,
-    resolver::Resolver,
+    ip_stack::driver::PacketDrops, resolver::Resolver,
 };
 
-const QUEUE_CAPACITY: usize = 64;
+const QUEUE_CAPACITY: usize = 256;
+const RECEIVE_BATCH_SIZE: usize = 64;
 // The supported inner MTU is at most 1420, plus WireGuard padding, header and tag.
 const MAX_DATAGRAM: usize = 2048;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,11 +40,12 @@ type Destination = Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>;
 #[derive(Clone)]
 pub(super) struct Sender {
     destinations: Arc<HashMap<SocketAddr, Destination>>,
-    drops: Arc<AtomicU64>,
+    drops: Arc<PacketDrops>,
 }
 
 pub(super) struct Receiver {
     incoming: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    batch: Vec<(Vec<u8>, SocketAddr)>,
     _cancel: DropGuard,
 }
 
@@ -62,7 +63,7 @@ impl Sender {
                 .as_ref()
                 .is_some_and(|queue| queue.try_send(packet.to_vec()).is_ok());
         if !sent {
-            self.drops.fetch_add(1, Ordering::Relaxed);
+            self.drops.detour_dropped.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -80,6 +81,28 @@ impl Receiver {
             .ok_or(io::ErrorKind::BrokenPipe)?;
         Ok((pool.get().overwrite_with(packet.as_slice()), source))
     }
+
+    pub async fn recv_many_from(
+        &mut self,
+        pool: &mut PacketBufPool,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+    ) -> io::Result<()> {
+        self.batch.clear();
+        if self
+            .incoming
+            .recv_many(&mut self.batch, RECEIVE_BATCH_SIZE)
+            .await
+            == 0
+        {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        packets.extend(
+            self.batch
+                .drain(..)
+                .map(|(packet, source)| (pool.get().overwrite_with(packet.as_slice()), source)),
+        );
+        Ok(())
+    }
 }
 
 pub(super) fn start(
@@ -87,7 +110,7 @@ pub(super) fn start(
     chain: Arc<ClientProxyChain>,
     resolver: Arc<dyn Resolver>,
     targets: impl Iterator<Item = SocketAddr>,
-    drops: Arc<AtomicU64>,
+    drops: Arc<PacketDrops>,
 ) -> (Sender, Receiver, oneshot::Receiver<()>) {
     let cancel = CancellationToken::new();
     let (incoming, received) = mpsc::channel(QUEUE_CAPACITY);
@@ -134,6 +157,7 @@ pub(super) fn start(
         },
         Receiver {
             incoming: received,
+            batch: Vec::with_capacity(RECEIVE_BATCH_SIZE),
             _cancel: cancel.drop_guard(),
         },
         released,
@@ -147,7 +171,7 @@ struct Worker {
     resolver: Arc<dyn Resolver>,
     destination: Destination,
     incoming: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    drops: Arc<AtomicU64>,
+    drops: Arc<PacketDrops>,
 }
 
 impl Worker {
@@ -173,7 +197,9 @@ impl Worker {
                     let error = self.relay(stream.as_mut(), &mut queued).await;
                     // Removing the sender under the enqueue lock isolates failed associations.
                     self.destination.lock().take();
-                    self.drops.fetch_add(queued.len() as u64, Ordering::Relaxed);
+                    self.drops
+                        .detour_dropped
+                        .fetch_add(queued.len() as u64, Ordering::Relaxed);
                     if started.elapsed() >= STABLE_ASSOCIATION {
                         backoff = MIN_BACKOFF;
                     }
@@ -231,7 +257,7 @@ impl Worker {
                                 .try_send((bytes.to_vec(), self.target))
                                 .is_err())
                     {
-                        self.drops.fetch_add(1, Ordering::Relaxed);
+                        self.drops.detour_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                     progress = true;
                 }
@@ -289,7 +315,7 @@ impl Worker {
                     pending,
                     Some(Write::Packet(_) | Write::Flush { packet: true })
                 ) {
-                    self.drops.fetch_add(1, Ordering::Relaxed);
+                    self.drops.detour_dropped.fetch_add(1, Ordering::Relaxed);
                 }
                 return error;
             }

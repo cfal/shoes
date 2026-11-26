@@ -442,7 +442,7 @@ impl DeviceValidation<'_> {
 }
 
 #[cfg(unix)]
-fn can_reach_endpoint(listen: Option<SocketAddr>, endpoint: SocketAddr) -> bool {
+pub(crate) fn can_reach_endpoint(listen: Option<SocketAddr>, endpoint: SocketAddr) -> bool {
     listen.is_none_or(|listen| {
         let listen_ip = listen.ip().to_canonical();
         let endpoint_ip = endpoint.ip().to_canonical();
