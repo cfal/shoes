@@ -182,14 +182,13 @@ The maintained TCP recovery series originates on published `cfal/smoltcp` main
 rebased it onto `24bda3b4f982625d8453d4360172557d24921c76`, producing the previous
 pin [`042e568bfa39d0f111a23a4718ec257e474fd1e7`](https://github.com/cfal/smoltcp/commit/042e568bfa39d0f111a23a4718ec257e474fd1e7).
 
-The November 2026 refresh retains all three October commits on upstream
+The November 7 refresh retained all three October commits on upstream
 [`8b0e5c8598647fe92e2a1b87932d1932354fee0b`](https://github.com/smoltcp-rs/smoltcp/commit/8b0e5c8598647fe92e2a1b87932d1932354fee0b).
-The series lives on `shoes/tcp-recovery-20261107-000034`, pinned at
+That series remains on `shoes/tcp-recovery-20261107-000034` at
 [`7ef43e497f575cb0340a43e4f414f0f0b8760bf6`](https://github.com/cfal/smoltcp/commit/7ef43e497f575cb0340a43e4f414f0f0b8760bf6);
 existing branches, tags and old pins remain intact.
 
-The package version and latest stable registry release remain **0.14.0**.
-The new upstream changes are unreleased: [#1242](https://github.com/smoltcp-rs/smoltcp/pull/1242)
+The upstream changes in that refresh are unreleased: [#1242](https://github.com/smoltcp-rs/smoltcp/pull/1242)
 cancels an armed idle keepalive deadline when `set_keep_alive(None)` is called,
 without cancelling retransmission, persist or closing timers. Shoes uses this
 when draining orphaned connections. [#1238](https://github.com/smoltcp-rs/smoltcp/pull/1238)
@@ -200,13 +199,27 @@ platform requirements are unchanged; no Shoes adapter changes are required.
 Earlier RTO bounds, zero-window timer recovery, failed-fast-retransmission retry,
 no-std CUBIC and full-window FIN clamping fixes remain included.
 
-The refresh also fixes upstream's optional-deadline combination: an exhausted
+The November 7 series also fixes upstream's optional-deadline combination: an exhausted
 SLAAC timer must not erase a pending socket deadline, and an idle socket set must
 not erase a pending solicitation. An interface regression exercises exhaustion,
 a pending TCP SYN, restarted solicitation scheduling and competing deadlines.
 The keepalive sequence regression adds an open-window case that distinguishes
 SND.UNA from the frontier, alongside the existing closed-window case. Both check
 that probes leave the retransmission cursor and send frontier unchanged.
+
+The November 27 pin is
+[`8b79b32f2f054b0b584cb5b1712f28cd295ec4f8`](https://github.com/cfal/smoltcp/commit/8b79b32f2f054b0b584cb5b1712f28cd295ec4f8),
+on `shoes/tcp-recovery-20261127-1795737600039000`. All six November 7 patches
+are unchanged on upstream main
+[`7de37764f793ad70c44096d746f9f8715496709b`](https://github.com/smoltcp-rs/smoltcp/commit/7de37764f793ad70c44096d746f9f8715496709b).
+The package still declares **0.14.0**, also the latest stable registry release.
+The only new runtime change, [#1255](https://github.com/smoltcp-rs/smoltcp/pull/1255),
+resets an empty payload ring before reserving contiguous space in
+`PacketBuffer::enqueue_with_infallible`. Previously, after dequeueing 15 bytes
+from a 16-byte ring, reserving all 16 could incorrectly return `Full`.
+This affects the closure-based datagram send APIs, not TCP's stream buffers
+or Shoes' own TUN and WireGuard packet queues. No API, feature, dependency,
+Rust minimum, offload or polling changes are needed in Shoes.
 
 Preserve the complete recovery patch, not only its persistent send frontier:
 
@@ -222,6 +235,9 @@ Preserve the complete recovery patch, not only its persistent send frontier:
 The exact lost-FIN allowance, FIN-only ACK frontier and RST cursor are retained
 fork policies, not universal RFC or OS behavior. Keepalive sequence placement
 does not establish timer reachability with outstanding data.
+Upstream [#1253](https://github.com/smoltcp-rs/smoltcp/pull/1253) concerns a
+different case: a data-bearing FIN whose payload crosses the receive window.
+It is not part of the November 27 target or the empty-segment allowance.
 
 Shoes retains explicit CUBIC, IPv4/IPv6, medium-IP and 32-segment assembly.
 Linux TUN transmit offload remains IPv4-only: the interface still does not

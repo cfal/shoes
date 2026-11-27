@@ -153,10 +153,11 @@ compatibility requirements.
 Published nix 0.31.4 and 0.32.0 include the [iOS socket fix](DEPENDENCIES.md#nix);
 no nix workspace patch is needed.
 
-The `smoltcp` patch pins our [rebased TCP recovery fork](https://github.com/cfal/smoltcp/tree/7ef43e497f575cb0340a43e4f414f0f0b8760bf6)
+The `smoltcp` patch pins our [rebased TCP recovery fork](https://github.com/cfal/smoltcp/tree/8b79b32f2f054b0b584cb5b1712f28cd295ec4f8)
 to preserve TCP ACK sequencing during partial retransmission in TUN and WireGuard.
-It tracks unreleased upstream main after 0.14.0, including keepalive cancellation;
-see [fork maintenance notes](DEPENDENCIES.md#smoltcp) for provenance and invariants.
+It tracks unreleased upstream main after 0.14.0, including keepalive cancellation
+and the empty datagram-buffer fix. See [fork maintenance notes](DEPENDENCIES.md#smoltcp)
+for provenance and invariants.
 Retain it until adopting a registry release with equivalent loss-recovery fixes.
 When updating the pin, run the fork's `socket::tcp::test::` regressions with Reno
 and CUBIC enabled, plus shoes' rootless TUN and WireGuard suites.
