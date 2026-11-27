@@ -11,6 +11,19 @@ fn queue_device(output: mpsc::Sender<PacketBuffer>) -> QueueDevice {
     }
 }
 
+fn pump_entry(
+    entries: &mut TcpFlows,
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    at: Instant,
+) {
+    entries.entries.get_mut(&handle).unwrap().pump(
+        handle,
+        sockets.get_mut::<TcpSocket>(handle),
+        at,
+    );
+}
+
 #[test]
 fn local_allocation_preserves_family_order_wraps_and_skips_both_flow_types() {
     let ipv4 = "10.77.0.1".parse().unwrap();
@@ -606,21 +619,13 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
             Some(ack),
         ));
         iface.poll(start, &mut device, &mut sockets);
-        entries.entries.get_mut(&handle).unwrap().pump(
-            handle,
-            sockets.get_mut::<TcpSocket>(handle),
-            start,
-        );
+        pump_entry(&mut entries, &mut sockets, handle, start);
         sockets.get_mut::<TcpSocket>(handle).close();
         control.set_send_state(TcpSocketState::Closing);
         drop(connection);
         let deadline = control.orphan_deadline().unwrap();
         let abandoned = deadline - TCP_ORPHAN_TIMEOUT;
-        entries.entries.get_mut(&handle).unwrap().pump(
-            handle,
-            sockets.get_mut::<TcpSocket>(handle),
-            abandoned,
-        );
+        pump_entry(&mut entries, &mut sockets, handle, abandoned);
         iface.poll_egress(abandoned, &mut device, &mut sockets);
         let fin = packets.try_recv().unwrap();
         let ip = Ipv4Packet::new_checked(&*fin).unwrap();
@@ -661,11 +666,7 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
                 tcp_poll_delay(timestamp, None, std::iter::once(&*control)),
                 Some(SmolDuration::from_secs(60 - seconds)),
             );
-            entries.entries.get_mut(&handle).unwrap().pump(
-                handle,
-                sockets.get_mut::<TcpSocket>(handle),
-                timestamp,
-            );
+            pump_entry(&mut entries, &mut sockets, handle, timestamp);
             iface.poll_egress(timestamp, &mut device, &mut sockets);
             assert!(!reconcile_tcp(
                 &mut entries,
@@ -1316,9 +1317,7 @@ async fn drain_batch(
 ) -> Vec<PacketBuffer> {
     let mut batch = Vec::new();
     output.recv_many(&mut batch, 64).await;
-    if stack.egress_backpressured.swap(false, Ordering::AcqRel) {
-        stack.handle.wake.notify();
-    }
+    wake_after_output_drain(&stack.egress_backpressured, &stack.handle.wake);
     batch
 }
 
@@ -1625,12 +1624,7 @@ fn tcp_retransmit_uses_200ms_min_rto_after_rtt_sample() {
     socket.connect(iface.context(), remote, local).unwrap();
     let mut sockets = SocketSet::new(vec![]);
     let handle = sockets.add(socket);
-    let mut data_segments =
-        |iface: &mut Interface,
-         device: &mut QueueDevice,
-         sockets: &mut SocketSet<'_>,
-         at: Instant| { poll_segments(iface, device, sockets, &mut packets, at) };
-    let syn = data_segments(&mut iface, &mut device, &mut sockets, start);
+    let syn = poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, start);
     assert_eq!(syn.len(), 1);
     let isn = syn[0].0;
     let at = start + SmolDuration::from_millis(1);
@@ -1641,12 +1635,12 @@ fn tcp_retransmit_uses_200ms_min_rto_after_rtt_sample() {
         TcpControl::Syn,
         Some((isn + 1).0 as u32),
     ));
-    data_segments(&mut iface, &mut device, &mut sockets, at);
+    poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, at);
     sockets
         .get_mut::<TcpSocket>(handle)
         .send_slice(b"first")
         .unwrap();
-    let first = data_segments(&mut iface, &mut device, &mut sockets, at);
+    let first = poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, at);
     assert_eq!(first, [(isn + 1, b"first".to_vec())]);
     let at = at + SmolDuration::from_millis(1);
     device.packet = Some(tcp_segment(
@@ -1656,18 +1650,18 @@ fn tcp_retransmit_uses_200ms_min_rto_after_rtt_sample() {
         TcpControl::None,
         Some((isn + 6).0 as u32),
     ));
-    data_segments(&mut iface, &mut device, &mut sockets, at);
+    poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, at);
     sockets
         .get_mut::<TcpSocket>(handle)
         .send_slice(b"lost")
         .unwrap();
-    let lost = data_segments(&mut iface, &mut device, &mut sockets, at);
+    let lost = poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, at);
     assert_eq!(lost, [(isn + 6, b"lost".to_vec())]);
     let early = at + SmolDuration::from_millis(199);
-    assert!(data_segments(&mut iface, &mut device, &mut sockets, early).is_empty());
+    assert!(poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, early).is_empty());
     let expired = at + SmolDuration::from_millis(201);
     assert_eq!(
-        data_segments(&mut iface, &mut device, &mut sockets, expired),
+        poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, expired),
         lost
     );
 }
@@ -1759,13 +1753,7 @@ fn expired_orphan_under_backpressure_is_reclaimed_without_spinning() {
     use smoltcp::time::Duration as SmolDuration;
 
     let (output, mut packets) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
-    let mut device = QueueDevice {
-        packet: None,
-        output: output.clone(),
-        mtu: 1408,
-        drops: Arc::new(PacketDrops::default()),
-        egress_backpressured: Arc::new(AtomicBool::new(false)),
-    };
+    let mut device = queue_device(output.clone());
     let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, now());
     iface.update_ip_addrs(|list| {
         list.push(IpCidr::new(
@@ -1824,11 +1812,7 @@ fn expired_orphan_under_backpressure_is_reclaimed_without_spinning() {
     drop(connection);
     let deadline = control.orphan_deadline().unwrap();
     let abandoned = deadline - TCP_ORPHAN_TIMEOUT;
-    entries.entries.get_mut(&handle).unwrap().pump(
-        handle,
-        sockets.get_mut::<TcpSocket>(handle),
-        abandoned,
-    );
+    pump_entry(&mut entries, &mut sockets, handle, abandoned);
     iface.poll_egress(abandoned, &mut device, &mut sockets);
     let _fin = packets.try_recv().unwrap();
 
@@ -1839,11 +1823,7 @@ fn expired_orphan_under_backpressure_is_reclaimed_without_spinning() {
             .unwrap();
     }
     let expired = abandoned + SmolDuration::from_secs(60);
-    entries.entries.get_mut(&handle).unwrap().pump(
-        handle,
-        sockets.get_mut::<TcpSocket>(handle),
-        expired,
-    );
+    pump_entry(&mut entries, &mut sockets, handle, expired);
     assert_eq!(sockets.get::<TcpSocket>(handle).state(), State::Closed);
     iface.poll_egress(expired, &mut device, &mut sockets);
     assert!(device.is_egress_backpressured());

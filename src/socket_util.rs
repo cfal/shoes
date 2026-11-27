@@ -322,6 +322,16 @@ pub fn new_unix_listener<P: AsRef<Path>>(
 }
 
 #[cfg(test)]
+fn new_socket2_udp_socket(
+    is_ipv6: bool,
+    bind_interface: Option<String>,
+    bind_address: Option<SocketAddr>,
+    reuse_port: bool,
+) -> std::io::Result<socket2::Socket> {
+    new_socket2_udp_socket_with_buffer_size(is_ipv6, bind_interface, bind_address, reuse_port, None)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -407,13 +417,7 @@ mod tests {
             if ipv6 {
                 Err(std::io::Error::from_raw_os_error(unavailable))
             } else {
-                new_socket2_udp_socket_with_buffer_size(
-                    false,
-                    None,
-                    Some("0.0.0.0:0".parse().unwrap()),
-                    false,
-                    None,
-                )
+                new_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()), false)
             }
         })
         .unwrap();
@@ -435,17 +439,12 @@ mod tests {
 
     #[tokio::test]
     async fn hostname_socket_prefers_dual_stack_and_enforces_interface_binding() {
-        let ipv6_available = match new_socket2_udp_socket_with_buffer_size(
-            true,
-            None,
-            Some("[::]:0".parse().unwrap()),
-            false,
-            None,
-        ) {
-            Ok(_) => true,
-            Err(error) if ipv6_unavailable(&error) => false,
-            Err(error) => panic!("IPv6 socket probe failed: {error}"),
-        };
+        let ipv6_available =
+            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
+                Ok(_) => true,
+                Err(error) if ipv6_unavailable(&error) => false,
+                Err(error) => panic!("IPv6 socket probe failed: {error}"),
+            };
         let socket = new_hostname_udp_socket(None).unwrap();
         assert_eq!(socket.local_addr().unwrap().is_ipv6(), ipv6_available);
         assert!(new_hostname_udp_socket(Some("shoes-missing-interface".into())).is_err());
@@ -453,17 +452,12 @@ mod tests {
 
     #[tokio::test]
     async fn ipv6_udp_listener_accepts_both_address_families() {
-        let socket = match new_socket2_udp_socket_with_buffer_size(
-            true,
-            None,
-            Some("[::]:0".parse().unwrap()),
-            false,
-            None,
-        ) {
-            Ok(socket) => socket,
-            Err(error) if ipv6_unavailable(&error) => return,
-            Err(error) => panic!("IPv6 socket creation failed: {error}"),
-        };
+        let socket =
+            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
+                Ok(socket) => socket,
+                Err(error) if ipv6_unavailable(&error) => return,
+                Err(error) => panic!("IPv6 socket creation failed: {error}"),
+            };
         assert!(!socket.only_v6().unwrap());
         let socket = into_tokio_udp_socket(socket).unwrap();
         let port = socket.local_addr().unwrap().port();
@@ -527,14 +521,7 @@ mod protection_tests {
         );
         assert!(new_tcp_listener("0.0.0.0:0".parse().unwrap(), 10, None).is_ok());
         assert!(
-            new_socket2_udp_socket_with_buffer_size(
-                false,
-                None,
-                Some("0.0.0.0:0".parse().unwrap()),
-                false,
-                None
-            )
-            .is_ok()
+            new_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()), false).is_ok()
         );
     }
 }

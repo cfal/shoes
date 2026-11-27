@@ -47,9 +47,7 @@ fn bridge(left: &mut PacketStack, right: &mut PacketStack) -> JoinSet<()> {
     ] {
         tasks.spawn(async move {
             while let Some(packet) = input.recv().await {
-                if paused.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                    source.notify();
-                }
+                super::driver::wake_after_output_drain(&paused, &source);
                 if output.send(packet).await.is_err() {
                     break;
                 }

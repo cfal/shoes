@@ -76,9 +76,7 @@ impl IpRecv for IpSource {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         // Draining before clearing the flag lets a paused stack observe the freed capacity.
-        if self.egress_backpressured.swap(false, Ordering::AcqRel) {
-            self.wake.notify();
-        }
+        crate::ip_stack::driver::wake_after_output_drain(&self.egress_backpressured, &self.wake);
         let mut packets = Vec::with_capacity(self.batch.len());
         for packet in self.batch.drain(..) {
             packets.push(
@@ -111,6 +109,22 @@ impl Drop for Socket {
         }
     }
 }
+fn log_rate_limited(counter: &AtomicUsize, action: &str, error: &io::Error) {
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        log::warn!("WireGuard UDP {action}: {error} ({count} total)");
+    } else {
+        log::debug!("WireGuard UDP {action}: {error}");
+    }
+}
+
+fn send_target(mut target: SocketAddr, ipv6: bool) -> SocketAddr {
+    if ipv6 && let std::net::IpAddr::V4(ip) = target.ip() {
+        target.set_ip(ip.to_ipv6_mapped().into());
+    }
+    target
+}
+
 impl Socket {
     fn socket(&self) -> &tokio::net::UdpSocket {
         self.socket.as_ref().unwrap()
@@ -134,12 +148,7 @@ impl Socket {
         ) {
             return false;
         }
-        let count = self.receive_errors.fetch_add(1, Ordering::Relaxed) + 1;
-        if count.is_power_of_two() {
-            log::warn!("WireGuard UDP receive error ignored: {error} ({count} total)");
-        } else {
-            log::debug!("WireGuard UDP receive error ignored: {error}");
-        }
+        log_rate_limited(&self.receive_errors, "receive error ignored", error);
         true
     }
 
@@ -166,12 +175,7 @@ impl Socket {
         ) {
             return false;
         }
-        let count = self.send_errors.fetch_add(1, Ordering::Relaxed) + 1;
-        if count.is_power_of_two() {
-            log::warn!("WireGuard UDP send error dropped datagram: {error} ({count} total)");
-        } else {
-            log::debug!("WireGuard UDP send error dropped datagram: {error}");
-        }
+        log_rate_limited(&self.send_errors, "send error dropped datagram", error);
         true
     }
 }
@@ -315,12 +319,8 @@ impl UdpSend for Udp {
     type SendManyBuf = batch::DirectSendManyBuf;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     type SendManyBuf = ();
-    async fn send_to(&self, packet: Packet, mut target: SocketAddr) -> io::Result<()> {
-        if self.0.ipv6
-            && let std::net::IpAddr::V4(ip) = target.ip()
-        {
-            target.set_ip(ip.to_ipv6_mapped().into());
-        }
+    async fn send_to(&self, packet: Packet, target: SocketAddr) -> io::Result<()> {
+        let target = send_target(target, self.0.ipv6);
         let len = self.0.socket().send_to(&packet, target).await?;
         if len != packet.len() {
             return Err(io::ErrorKind::WriteZero.into());
@@ -433,11 +433,49 @@ mod batch {
 
     pub(super) const UDP_BATCH_SIZE: usize = 64;
 
-    /// Points `recvmmsg` directly at pooled packet buffers, avoiding a scratch copy.
-    pub(crate) struct DirectRecvManyBuf {
+    struct MessageBatch {
         headers: Box<[libc::mmsghdr; UDP_BATCH_SIZE]>,
         iovecs: Box<[libc::iovec; UDP_BATCH_SIZE]>,
         addresses: Box<[libc::sockaddr_storage; UDP_BATCH_SIZE]>,
+    }
+
+    impl MessageBatch {
+        fn new() -> Self {
+            // SAFETY: These are plain C structs for which all-zero bytes are valid.
+            unsafe {
+                Self {
+                    headers: Box::new(zeroed()),
+                    iovecs: Box::new(zeroed()),
+                    addresses: Box::new(zeroed()),
+                }
+            }
+        }
+
+        fn set_slot(
+            &mut self,
+            index: usize,
+            buffer: *mut libc::c_void,
+            len: usize,
+            namelen: libc::socklen_t,
+        ) {
+            self.iovecs[index] = libc::iovec {
+                iov_base: buffer,
+                iov_len: len,
+            };
+            let header = &mut self.headers[index].msg_hdr;
+            header.msg_name = (&raw mut self.addresses[index]).cast();
+            header.msg_namelen = namelen;
+            header.msg_iov = &raw mut self.iovecs[index];
+            header.msg_iovlen = 1 as _;
+            header.msg_control = std::ptr::null_mut();
+            header.msg_controllen = 0 as _;
+            header.msg_flags = 0;
+        }
+    }
+
+    /// Points `recvmmsg` directly at pooled packet buffers, avoiding a scratch copy.
+    pub(crate) struct DirectRecvManyBuf {
+        messages: MessageBatch,
         staged: Vec<Packet>,
     }
 
@@ -447,14 +485,9 @@ mod batch {
 
     impl Default for DirectRecvManyBuf {
         fn default() -> Self {
-            // SAFETY: These are plain C structs for which all-zero bytes are valid.
-            unsafe {
-                Self {
-                    headers: Box::new(zeroed()),
-                    iovecs: Box::new(zeroed()),
-                    addresses: Box::new(zeroed()),
-                    staged: Vec::with_capacity(UDP_BATCH_SIZE),
-                }
+            Self {
+                messages: MessageBatch::new(),
+                staged: Vec::with_capacity(UDP_BATCH_SIZE),
             }
         }
     }
@@ -465,18 +498,12 @@ mod batch {
                 self.staged.push(pool.get());
             }
             for (index, packet) in self.staged.iter_mut().enumerate() {
-                self.iovecs[index] = libc::iovec {
-                    iov_base: packet.as_mut_ptr().cast(),
-                    iov_len: packet.len(),
-                };
-                let header = &mut self.headers[index].msg_hdr;
-                header.msg_name = (&raw mut self.addresses[index]).cast();
-                header.msg_namelen = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                header.msg_iov = &raw mut self.iovecs[index];
-                header.msg_iovlen = 1 as _;
-                header.msg_control = std::ptr::null_mut();
-                header.msg_controllen = 0 as _;
-                header.msg_flags = 0;
+                self.messages.set_slot(
+                    index,
+                    packet.as_mut_ptr().cast(),
+                    packet.len(),
+                    size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                );
             }
         }
 
@@ -485,7 +512,7 @@ mod batch {
             let count = unsafe {
                 libc::recvmmsg(
                     fd,
-                    self.headers.as_mut_ptr(),
+                    self.messages.headers.as_mut_ptr(),
                     UDP_BATCH_SIZE as libc::c_uint,
                     libc::MSG_DONTWAIT as _,
                     std::ptr::null_mut::<libc::timespec>(),
@@ -505,13 +532,13 @@ mod batch {
         ) -> usize {
             let before = packets.len();
             for (index, mut packet) in self.staged.drain(..count).enumerate() {
-                let header = &self.headers[index];
+                let header = &self.messages.headers[index];
                 let len = header.msg_len as usize;
                 if len == 0 || header.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
                     continue;
                 }
                 let Some(source) =
-                    decode_address(&self.addresses[index], header.msg_hdr.msg_namelen)
+                    decode_address(&self.messages.addresses[index], header.msg_hdr.msg_namelen)
                 else {
                     continue;
                 };
@@ -523,9 +550,7 @@ mod batch {
     }
 
     pub(crate) struct DirectSendManyBuf {
-        headers: Box<[libc::mmsghdr; UDP_BATCH_SIZE]>,
-        iovecs: Box<[libc::iovec; UDP_BATCH_SIZE]>,
-        addresses: Box<[libc::sockaddr_storage; UDP_BATCH_SIZE]>,
+        messages: MessageBatch,
     }
 
     // SAFETY: The raw pointers are rebuilt from caller-owned packets before each syscall,
@@ -535,13 +560,8 @@ mod batch {
 
     impl Default for DirectSendManyBuf {
         fn default() -> Self {
-            // SAFETY: These are plain C structs for which all-zero bytes are valid.
-            unsafe {
-                Self {
-                    headers: Box::new(zeroed()),
-                    iovecs: Box::new(zeroed()),
-                    addresses: Box::new(zeroed()),
-                }
+            Self {
+                messages: MessageBatch::new(),
             }
         }
     }
@@ -549,22 +569,14 @@ mod batch {
     impl DirectSendManyBuf {
         pub(super) fn prepare(&mut self, packets: &[(Packet, SocketAddr)], ipv6: bool) {
             for (index, (packet, target)) in packets.iter().enumerate() {
-                let mut target = *target;
-                if ipv6 && let std::net::IpAddr::V4(ip) = target.ip() {
-                    target.set_ip(ip.to_ipv6_mapped().into());
-                }
-                self.iovecs[index] = libc::iovec {
-                    iov_base: packet.as_ptr().cast_mut().cast(),
-                    iov_len: packet.len(),
-                };
-                let header = &mut self.headers[index].msg_hdr;
-                header.msg_name = (&raw mut self.addresses[index]).cast();
-                header.msg_namelen = encode_address(target, &mut self.addresses[index]);
-                header.msg_iov = &raw mut self.iovecs[index];
-                header.msg_iovlen = 1 as _;
-                header.msg_control = std::ptr::null_mut();
-                header.msg_controllen = 0 as _;
-                header.msg_flags = 0;
+                let target = super::send_target(*target, ipv6);
+                let namelen = encode_address(target, &mut self.messages.addresses[index]);
+                self.messages.set_slot(
+                    index,
+                    packet.as_ptr().cast_mut().cast(),
+                    packet.len(),
+                    namelen,
+                );
             }
         }
 
@@ -573,7 +585,7 @@ mod batch {
             let sent = unsafe {
                 libc::sendmmsg(
                     fd,
-                    self.headers.as_mut_ptr(),
+                    self.messages.headers.as_mut_ptr(),
                     count as libc::c_uint,
                     libc::MSG_DONTWAIT as _,
                 )

@@ -49,9 +49,7 @@ async fn bridge(wire: UnixDatagram, framed: bool) -> io::Result<(PacketStack, Jo
     let mut tasks = JoinSet::new();
     tasks.spawn(async move {
         while let Some(packet) = output.recv().await {
-            if paused.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                drained.notify();
-            }
+            crate::ip_stack::driver::wake_after_output_drain(&paused, &drained);
             let mut bytes = Vec::with_capacity(packet.len() + 4);
             if framed {
                 bytes.extend(header(packet[0] >> 4 == 6));

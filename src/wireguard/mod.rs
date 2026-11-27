@@ -612,6 +612,19 @@ struct HostnamePeer {
     last_handshake_at: Option<Instant>,
 }
 
+struct DuePeer {
+    index: usize,
+    previous: Option<SocketAddr>,
+    last_handshake_at: Option<Instant>,
+}
+
+struct EndpointUpdate {
+    public_key: PublicKey,
+    previous: Option<SocketAddr>,
+    address: SocketAddr,
+    last_handshake_at: Option<Instant>,
+}
+
 impl StalePeerRefresh {
     fn new(endpoint: &PreparedEndpoint, local: SocketAddr) -> Option<Self> {
         let started = Instant::now();
@@ -654,8 +667,9 @@ impl StalePeerRefresh {
         }
     }
 
-    fn is_stale(
-        &self,
+    fn is_stale_at(
+        started: Instant,
+        interval: Duration,
         last_handshake: Option<Duration>,
         last_handshake_at: Option<Instant>,
         keepalive: Option<u16>,
@@ -667,8 +681,25 @@ impl StalePeerRefresh {
             // GotaTun drops expired sessions at REJECT_AFTER_TIME, clearing `last_handshake` to
             // None before a configured persistent keepalive fires its next handshake.
             (None, Some(at)) => now.duration_since(at) >= threshold,
-            (None, None) => now.duration_since(self.started) >= self.interval,
+            (None, None) => now.duration_since(started) >= interval,
         }
+    }
+
+    fn is_stale(
+        &self,
+        last_handshake: Option<Duration>,
+        last_handshake_at: Option<Instant>,
+        keepalive: Option<u16>,
+        now: Instant,
+    ) -> bool {
+        Self::is_stale_at(
+            self.started,
+            self.interval,
+            last_handshake,
+            last_handshake_at,
+            keepalive,
+            now,
+        )
     }
 
     fn compatible(&self, address: SocketAddr) -> bool {
@@ -676,62 +707,70 @@ impl StalePeerRefresh {
             && (self.local.is_ipv6() || address.is_ipv4())
     }
 
-    async fn run<T: DeviceTransports>(
-        &mut self,
-        name: &str,
-        device: &Device<T>,
-        stats: &[PeerStats],
-    ) {
+    fn collect_due(&mut self, stats: &[PeerStats]) -> Vec<DuePeer> {
         let now = Instant::now();
+        let started = self.started;
+        let interval = self.interval;
         let stats_by_key: HashMap<_, _> = stats
             .iter()
             .map(|entry| (entry.peer.public_key, entry))
             .collect();
         let mut due = Vec::new();
-        for index in 0..self.peers.len() {
-            let public_key = self.peers[index].public_key;
-            let Some(&current) = stats_by_key.get(&public_key) else {
+        for (index, peer) in self.peers.iter_mut().enumerate() {
+            let Some(&current) = stats_by_key.get(&peer.public_key) else {
                 continue;
             };
             if let Some(age) = current.stats.last_handshake {
                 let observed = now.checked_sub(age).unwrap_or(now);
-                let slot = &mut self.peers[index].last_handshake_at;
-                *slot = Some(slot.map_or(observed, |previous| previous.max(observed)));
+                peer.last_handshake_at = Some(
+                    peer.last_handshake_at
+                        .map_or(observed, |previous| previous.max(observed)),
+                );
             }
-            let last_handshake_at = self.peers[index].last_handshake_at;
-            let stale = self.is_stale(
+            let stale = Self::is_stale_at(
+                started,
+                interval,
                 current.stats.last_handshake,
-                last_handshake_at,
+                peer.last_handshake_at,
                 current.peer.keepalive,
                 now,
             );
-            let peer = &mut self.peers[index];
             if !stale {
                 peer.retry_at = now;
-                peer.backoff = self.interval;
+                peer.backoff = interval;
                 continue;
             }
             if now < peer.retry_at {
                 continue;
             }
             peer.retry_at = now + peer.backoff;
-            peer.backoff = (peer.backoff * 2).min(self.interval * MAX_REFRESH_BACKOFF_INTERVALS);
-            due.push((index, current.peer.endpoint, last_handshake_at));
+            peer.backoff = (peer.backoff * 2).min(interval * MAX_REFRESH_BACKOFF_INTERVALS);
+            due.push(DuePeer {
+                index,
+                previous: current.peer.endpoint,
+                last_handshake_at: peer.last_handshake_at,
+            });
         }
-        if due.is_empty() {
-            return;
-        }
-        let resolved =
-            futures::future::join_all(due.iter().map(|(index, _, _)| {
-                resolve_endpoint(&self.resolver, &self.peers[*index].location)
-            }))
-            .await;
+        due
+    }
+
+    async fn resolve_updates(&self, name: &str, due: &[DuePeer]) -> Vec<EndpointUpdate> {
+        let resolved = futures::future::join_all(
+            due.iter()
+                .map(|entry| resolve_endpoint(&self.resolver, &self.peers[entry.index].location)),
+        )
+        .await;
         let mut updates = Vec::new();
-        for ((index, previous, last_handshake_at), result) in due.into_iter().zip(resolved) {
-            let peer = &self.peers[index];
+        for (entry, result) in due.iter().zip(resolved) {
+            let peer = &self.peers[entry.index];
             match result.map(|addresses| addresses.into_iter().find(|a| self.compatible(*a))) {
-                Ok(Some(address)) if previous != Some(address) => {
-                    updates.push((peer.public_key, previous, address, last_handshake_at));
+                Ok(Some(address)) if entry.previous != Some(address) => {
+                    updates.push(EndpointUpdate {
+                        public_key: peer.public_key,
+                        previous: entry.previous,
+                        address,
+                        last_handshake_at: entry.last_handshake_at,
+                    });
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => log::warn!(
@@ -745,9 +784,15 @@ impl StalePeerRefresh {
                 ),
             }
         }
-        if updates.is_empty() {
-            return;
-        }
+        updates
+    }
+
+    async fn apply_updates<T: DeviceTransports>(
+        &self,
+        name: &str,
+        device: &Device<T>,
+        updates: Vec<EndpointUpdate>,
+    ) {
         let applied = device
             .write(async |device| {
                 // Rechecks under the write lock so a handshake or roam since the snapshot wins.
@@ -758,22 +803,24 @@ impl StalePeerRefresh {
                     .collect();
                 let now = Instant::now();
                 let mut applied = Vec::new();
-                for (public_key, previous, address, last_handshake_at) in updates {
-                    let unchanged = current_by_key.get(&public_key).is_some_and(|peer| {
-                        peer.peer.endpoint == previous
+                for update in updates {
+                    let unchanged = current_by_key.get(&update.public_key).is_some_and(|peer| {
+                        peer.peer.endpoint == update.previous
                             && self.is_stale(
                                 peer.stats.last_handshake,
-                                last_handshake_at,
+                                update.last_handshake_at,
                                 peer.peer.keepalive,
                                 now,
                             )
                     });
                     if unchanged
                         && device
-                            .modify_peer(&public_key, |peer| peer.set_endpoint(Some(address)))
+                            .modify_peer(&update.public_key, |peer| {
+                                peer.set_endpoint(Some(update.address))
+                            })
                             .await
                     {
-                        applied.push((public_key, previous, address));
+                        applied.push(update);
                     }
                 }
                 applied
@@ -781,10 +828,12 @@ impl StalePeerRefresh {
             .await;
         match applied {
             Ok(applied) => {
-                for (public_key, previous, address) in applied {
+                for update in applied {
                     log::info!(
-                        "WireGuard endpoint {name} peer={} stale endpoint {previous:?} re-resolved to {address}",
-                        STANDARD.encode(public_key.as_bytes()),
+                        "WireGuard endpoint {name} peer={} stale endpoint {:?} re-resolved to {}",
+                        STANDARD.encode(update.public_key.as_bytes()),
+                        update.previous,
+                        update.address,
                     );
                 }
             }
@@ -792,6 +841,23 @@ impl StalePeerRefresh {
                 log::warn!("WireGuard endpoint {name} peer endpoint refresh failed: {error}");
             }
         }
+    }
+
+    async fn run<T: DeviceTransports>(
+        &mut self,
+        name: &str,
+        device: &Device<T>,
+        stats: &[PeerStats],
+    ) {
+        let due = self.collect_due(stats);
+        if due.is_empty() {
+            return;
+        }
+        let updates = self.resolve_updates(name, &due).await;
+        if updates.is_empty() {
+            return;
+        }
+        self.apply_updates(name, device, updates).await;
     }
 }
 

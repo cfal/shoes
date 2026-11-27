@@ -148,8 +148,8 @@ async fn stale_hostname_refresh_preserves_healthy_roaming() {
 
     #[derive(Debug)]
     struct Answer {
-        address: Arc<Mutex<SocketAddr>>,
-        calls: Arc<AtomicUsize>,
+        address: Mutex<SocketAddr>,
+        calls: AtomicUsize,
     }
     impl Resolver for Answer {
         fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
@@ -167,16 +167,15 @@ async fn stale_hostname_refresh_preserves_healthy_roaming() {
         let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let stale = blackhole.local_addr().unwrap();
         let live: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let address = Arc::new(Mutex::new(stale));
-        let calls = Arc::new(AtomicUsize::new(0));
+        let answer = Arc::new(Answer {
+            address: Mutex::new(stale),
+            calls: AtomicUsize::new(0),
+        });
         let mut configs = validate(&pair_config(port)).unwrap();
         let mut prepared = Prepared::new(&mut configs).await.unwrap();
         let client = &mut prepared.endpoints[CLIENT];
         client.config.peers[0].endpoint = Some(format!("peer.test:{port}"));
-        client.outer_resolver = Arc::new(Answer {
-            address: address.clone(),
-            calls: calls.clone(),
-        });
+        client.outer_resolver = answer.clone();
         client.report_interval = interval;
         prepared.refresh_peers().await.unwrap();
         assert_eq!(prepared.endpoints[CLIENT].peers[0].endpoints, [stale]);
@@ -184,9 +183,9 @@ async fn stale_hostname_refresh_preserves_healthy_roaming() {
         let mut running = start_prepared(&prepared).await;
 
         // The never-established peer becomes stale after one interval and moves without reload.
-        *address.lock() = live;
-        let before = calls.load(Ordering::SeqCst);
-        while calls.load(Ordering::SeqCst) == before {
+        *answer.address.lock() = live;
+        let before = answer.calls.load(Ordering::SeqCst);
+        while answer.calls.load(Ordering::SeqCst) == before {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -195,10 +194,10 @@ async fn stale_hostname_refresh_preserves_healthy_roaming() {
         check_echo(connector.as_ref(), tcp, udp).await;
 
         // A healthy peer is neither re-resolved nor moved back to a DNS answer.
-        *address.lock() = stale;
-        let healthy = calls.load(Ordering::SeqCst);
+        *answer.address.lock() = stale;
+        let healthy = answer.calls.load(Ordering::SeqCst);
         tokio::time::sleep(interval * 5).await;
-        assert_eq!(calls.load(Ordering::SeqCst), healthy);
+        assert_eq!(answer.calls.load(Ordering::SeqCst), healthy);
         check_echo(connector.as_ref(), tcp, udp).await;
         running.stop().await;
     })

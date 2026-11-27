@@ -258,6 +258,13 @@ impl PacketStack {
     }
 }
 
+/// Clears a pending egress backpressure pause after draining output packets and wakes the stack.
+pub(crate) fn wake_after_output_drain(egress_backpressured: &AtomicBool, wake: &Wake) {
+    if egress_backpressured.swap(false, Ordering::AcqRel) {
+        wake.notify();
+    }
+}
+
 struct QueueDevice {
     packet: Option<PacketBuffer>,
     output: mpsc::Sender<PacketBuffer>,
@@ -273,17 +280,15 @@ impl QueueDevice {
             self.drops.output_full.fetch_add(1, Ordering::Relaxed);
         }
     }
-    fn reserve(&self) -> Option<mpsc::Permit<'_, PacketBuffer>> {
-        (self.output.capacity() > OUTPUT_UDP_HEADROOM)
-            .then(|| self.output.try_reserve().ok())
-            .flatten()
-    }
-    fn reserved<'a>(&'a self, permit: mpsc::Permit<'a, PacketBuffer>) -> Tx<'a> {
-        Tx::Reserved {
-            permit,
-            mtu: self.mtu,
-            drops: &self.drops,
+    fn reserve_tx(&self) -> Option<Tx<'_>> {
+        if self.output.capacity() <= OUTPUT_UDP_HEADROOM {
+            return None;
         }
+        let permit = self.output.try_reserve().ok()?;
+        Some(Tx::Reserved {
+            permit,
+            device: self,
+        })
     }
     fn is_egress_backpressured(&self) -> bool {
         self.egress_backpressured.load(Ordering::Acquire)
@@ -294,8 +299,7 @@ enum Tx<'a> {
     /// Socket egress holds a queue slot, so smoltcp never treats a dropped segment as sent.
     Reserved {
         permit: mpsc::Permit<'a, PacketBuffer>,
-        mtu: usize,
-        drops: &'a PacketDrops,
+        device: &'a QueueDevice,
     },
     /// Ingress replies, such as RSTs, never wait for egress capacity.
     BestEffort(&'a QueueDevice),
@@ -311,9 +315,9 @@ impl TxToken for Tx<'_> {
         packet.resize(len);
         let result = f(&mut packet);
         match self {
-            Tx::Reserved { permit, mtu, drops } => {
-                if packet.len() > mtu {
-                    drops.mtu_exceeded.fetch_add(1, Ordering::Relaxed);
+            Tx::Reserved { permit, device } => {
+                if packet.len() > device.mtu {
+                    device.drops.mtu_exceeded.fetch_add(1, Ordering::Relaxed);
                 } else {
                     permit.send(packet);
                 }
@@ -330,15 +334,15 @@ impl Device for QueueDevice {
         Some((Rx(self.packet.take()?), Tx::BestEffort(self)))
     }
     fn transmit(&mut self, _: Instant) -> Option<Tx<'_>> {
-        if let Some(permit) = self.reserve() {
-            return Some(self.reserved(permit));
+        if let Some(tx) = self.reserve_tx() {
+            return Some(tx);
         }
         // The swap synchronizes with the drainer's swap, so a drain that missed this flag
         // released its capacity before the re-check below.
         self.egress_backpressured.swap(true, Ordering::AcqRel);
-        let permit = self.reserve()?;
+        let tx = self.reserve_tx()?;
         self.egress_backpressured.store(false, Ordering::Release);
-        Some(self.reserved(permit))
+        Some(tx)
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
@@ -430,10 +434,10 @@ impl TcpFlows {
         let previous = self.entries.insert(handle, entry);
         debug_assert!(previous.is_none(), "reused TCP socket handle");
     }
-    fn remove(&mut self, handle: SocketHandle) -> Option<TcpEntry> {
-        let entry = self.entries.remove(&handle)?;
-        self.index.remove(&entry);
-        Some(entry)
+    fn remove(&mut self, handle: SocketHandle) {
+        if let Some(entry) = self.entries.remove(&handle) {
+            self.index.remove(&entry);
+        }
     }
     fn retain(&mut self, mut keep: impl FnMut(SocketHandle, &mut TcpEntry) -> bool) {
         let Self { entries, index } = self;
@@ -482,19 +486,21 @@ fn reconcile_tcp(
     let mut local_work = false;
     tcp.retain(|handle, entry| {
         let socket = sockets.get::<TcpSocket>(handle);
-        // Under output backpressure a closed aborted/expired orphan cannot emit its final RST,
-        // so reclaim it here to release admission and prevent a zero-delay spin on its deadline.
-        let abandoned = socket.state() == State::Closed
-            && (socket.remote_endpoint().is_none()
-                || egress_backpressured
+        if socket.state() == State::Closed {
+            // Under output backpressure a closed aborted/expired orphan cannot emit its final RST,
+            // so reclaim it here to release admission and prevent a zero-delay spin on its deadline.
+            let stalled_orphan = || {
+                egress_backpressured
                     && (entry.control.should_abort()
                         || entry
                             .control
                             .orphan_deadline()
-                            .is_some_and(|deadline| now >= deadline)));
-        if abandoned {
-            sockets.remove(handle);
-            return false;
+                            .is_some_and(|deadline| now >= deadline))
+            };
+            if socket.remote_endpoint().is_none() || stalled_orphan() {
+                sockets.remove(handle);
+                return false;
+            }
         }
         local_work |= socket.can_recv() && !entry.control.recv_buffer_full()
             || !egress_backpressured && socket.can_send() && !entry.control.send_buffer_empty()
