@@ -27,8 +27,21 @@ pub fn new_udp_socket(
 pub fn new_hostname_udp_socket(
     bind_interface: Option<String>,
 ) -> std::io::Result<tokio::net::UdpSocket> {
+    new_hostname_udp_socket_with_buffer_size(bind_interface, None)
+}
+
+pub fn new_hostname_udp_socket_with_buffer_size(
+    bind_interface: Option<String>,
+    buffer_size: Option<usize>,
+) -> std::io::Result<tokio::net::UdpSocket> {
     let socket = prefer_ipv6_socket(|ipv6| {
-        new_socket2_udp_socket(ipv6, None, Some(get_unspecified_socket_addr(ipv6)), false)
+        new_socket2_udp_socket_with_buffer_size(
+            ipv6,
+            None,
+            Some(get_unspecified_socket_addr(ipv6)),
+            false,
+            buffer_size,
+        )
     })?;
     crate::socket_policy::apply(socket2::SockRef::from(&socket), bind_interface.as_deref())?;
     bind_udp_interface(&socket, bind_interface.as_deref())?;
@@ -83,7 +96,22 @@ pub fn new_outbound_socket2_udp_socket(
     bind_interface: Option<String>,
     bind_address: Option<SocketAddr>,
 ) -> std::io::Result<Socket> {
-    let socket = new_socket2_udp_socket(is_ipv6, bind_interface, bind_address, false)?;
+    new_outbound_socket2_udp_socket_with_buffer_size(is_ipv6, bind_interface, bind_address, None)
+}
+
+pub fn new_outbound_socket2_udp_socket_with_buffer_size(
+    is_ipv6: bool,
+    bind_interface: Option<String>,
+    bind_address: Option<SocketAddr>,
+    buffer_size: Option<usize>,
+) -> std::io::Result<Socket> {
+    let socket = new_socket2_udp_socket_with_buffer_size(
+        is_ipv6,
+        bind_interface,
+        bind_address,
+        false,
+        buffer_size,
+    )?;
     #[cfg(any(target_os = "android", target_os = "ios", all(unix, feature = "ffi")))]
     crate::tun::protect_socket(socket.as_raw_fd())?;
     Ok(socket)
@@ -95,15 +123,6 @@ fn get_unspecified_socket_addr(is_ipv6: bool) -> SocketAddr {
     } else {
         "[::]:0".parse().unwrap()
     }
-}
-
-pub fn new_socket2_udp_socket(
-    is_ipv6: bool,
-    bind_interface: Option<String>,
-    bind_address: Option<SocketAddr>,
-    reuse_port: bool,
-) -> std::io::Result<socket2::Socket> {
-    new_socket2_udp_socket_with_buffer_size(is_ipv6, bind_interface, bind_address, reuse_port, None)
 }
 
 pub fn new_socket2_udp_socket_with_buffer_size(
@@ -300,6 +319,16 @@ pub fn new_unix_listener<P: AsRef<Path>>(
 
     let std_listener: std::os::unix::net::UnixListener = socket.into();
     tokio::net::UnixListener::from_std(std_listener)
+}
+
+#[cfg(test)]
+fn new_socket2_udp_socket(
+    is_ipv6: bool,
+    bind_interface: Option<String>,
+    bind_address: Option<SocketAddr>,
+    reuse_port: bool,
+) -> std::io::Result<socket2::Socket> {
+    new_socket2_udp_socket_with_buffer_size(is_ipv6, bind_interface, bind_address, reuse_port, None)
 }
 
 #[cfg(test)]

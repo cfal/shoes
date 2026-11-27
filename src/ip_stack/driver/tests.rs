@@ -1,6 +1,29 @@
 use super::*;
 use smoltcp::wire::TcpControl;
 
+fn queue_device(output: mpsc::Sender<PacketBuffer>) -> QueueDevice {
+    QueueDevice {
+        packet: None,
+        output,
+        mtu: 1408,
+        drops: Arc::default(),
+        egress_backpressured: Arc::default(),
+    }
+}
+
+fn pump_entry(
+    entries: &mut TcpFlows,
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    at: Instant,
+) {
+    entries.entries.get_mut(&handle).unwrap().pump(
+        handle,
+        sockets.get_mut::<TcpSocket>(handle),
+        at,
+    );
+}
+
 #[test]
 fn local_allocation_preserves_family_order_wraps_and_skips_both_flow_types() {
     let ipv4 = "10.77.0.1".parse().unwrap();
@@ -8,7 +31,8 @@ fn local_allocation_preserves_family_order_wraps_and_skips_both_flow_types() {
     let addresses = [ipv6, ipv4, "10.77.0.3".parse().unwrap()];
     let target = "10.77.0.2:443".parse().unwrap();
     let mut sockets = SocketSet::new(vec![]);
-    let tcp = HashMap::from([(
+    let mut tcp = TcpFlows::default();
+    tcp.insert(
         sockets.add(tcp_socket(4096)),
         TcpEntry {
             control: Arc::new(TcpConnectionControl::new(4096, 4096)),
@@ -19,7 +43,7 @@ fn local_allocation_preserves_family_order_wraps_and_skips_both_flow_types() {
             pending_connect: None,
             pending_accept: None,
         },
-    )]);
+    );
     let local = SocketAddr::new(ipv4, FIRST_EPHEMERAL_PORT);
     let udp = HashMap::from([(
         local,
@@ -62,6 +86,11 @@ fn local_allocation_preserves_family_order_wraps_and_skips_both_flow_types() {
     assert_eq!(next_port, FIRST_EPHEMERAL_PORT);
 }
 
+fn port_offset(port: u16) -> usize {
+    assert!((FIRST_EPHEMERAL_PORT..=LAST_EPHEMERAL_PORT).contains(&port));
+    usize::from(port - FIRST_EPHEMERAL_PORT)
+}
+
 #[tokio::test]
 async fn canceled_commands_still_advance_the_local_port_cursor() {
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -73,6 +102,8 @@ async fn canceled_commands_still_advance_the_local_port_cursor() {
         )
         .unwrap();
         let target = "10.77.0.2:443".parse().unwrap();
+        let probe = stack.handle.open_udp(target).await.unwrap();
+        let first = probe.control.lock().local.port();
         let (tcp, canceled) = oneshot::channel();
         drop(canceled);
         stack.handle.send(Command::Tcp(target, tcp)).await.unwrap();
@@ -80,10 +111,9 @@ async fn canceled_commands_still_advance_the_local_port_cursor() {
         drop(canceled);
         stack.handle.send(Command::Udp(target, udp)).await.unwrap();
         let connection = stack.handle.open_udp(target).await.unwrap();
-        assert_eq!(
-            connection.control.lock().local.port(),
-            FIRST_EPHEMERAL_PORT + 2
-        );
+        let range = usize::from(LAST_EPHEMERAL_PORT - FIRST_EPHEMERAL_PORT) + 1;
+        let last = connection.control.lock().local.port();
+        assert_eq!((port_offset(last) + range - port_offset(first)) % range, 3);
     })
     .await
     .unwrap();
@@ -321,7 +351,8 @@ async fn inbound_rejects_mapped_ipv4_packet_addresses() {
                 ));
             }
         }
-        assert_eq!(stack.drops.load(Ordering::Relaxed), 12);
+        assert_eq!(stack.drops.invalid_packet.load(Ordering::Relaxed), 12);
+        assert_eq!(stack.drops.total(), 12);
     })
     .await
     .unwrap();
@@ -342,7 +373,7 @@ async fn full_accept_queue_drops_syn_before_sending_synack() {
         let mut inbound_udp = stack.udp.take().unwrap();
         let target = "198.18.0.1:443".parse().unwrap();
         let mut first_ack = None;
-        for port in 40000..40000 + QUEUE_CAPACITY as u16 {
+        for port in 40000..40000 + ACCEPT_QUEUE_CAPACITY as u16 {
             let source = SocketAddr::new("10.77.0.2".parse().unwrap(), port);
             stack
                 .input
@@ -548,13 +579,8 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
     use smoltcp::time::Duration as SmolDuration;
 
     for live_peer in [false, true] {
-        let (output, mut packets) = mpsc::channel(QUEUE_CAPACITY);
-        let mut device = QueueDevice {
-            packet: None,
-            output,
-            mtu: 1408,
-            drops: Arc::default(),
-        };
+        let (output, mut packets) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut device = queue_device(output);
         let start = now();
         let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, start);
         let source: SocketAddr = "10.77.0.2:40000".parse().unwrap();
@@ -566,7 +592,8 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
         let handle = sockets.add(socket);
         let control = Arc::new(TcpConnectionControl::new(4096, 4096));
         let connection = TcpConnection::new(control.clone(), Wake::new().unwrap().0);
-        let mut entries = HashMap::from([(
+        let mut entries = TcpFlows::default();
+        entries.insert(
             handle,
             TcpEntry {
                 control: control.clone(),
@@ -577,7 +604,7 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
                 pending_connect: None,
                 pending_accept: None,
             },
-        )]);
+        );
         let counts = FlowCounts::default();
         device.packet = Some(tcp_segment(source, target, 1000, TcpControl::Syn, None));
         iface.poll(start, &mut device, &mut sockets);
@@ -592,20 +619,13 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
             Some(ack),
         ));
         iface.poll(start, &mut device, &mut sockets);
-        entries
-            .get_mut(&handle)
-            .unwrap()
-            .pump(handle, sockets.get_mut::<TcpSocket>(handle), start);
+        pump_entry(&mut entries, &mut sockets, handle, start);
         sockets.get_mut::<TcpSocket>(handle).close();
         control.set_send_state(TcpSocketState::Closing);
         drop(connection);
         let deadline = control.orphan_deadline().unwrap();
         let abandoned = deadline - TCP_ORPHAN_TIMEOUT;
-        entries.get_mut(&handle).unwrap().pump(
-            handle,
-            sockets.get_mut::<TcpSocket>(handle),
-            abandoned,
-        );
+        pump_entry(&mut entries, &mut sockets, handle, abandoned);
         iface.poll_egress(abandoned, &mut device, &mut sockets);
         let fin = packets.try_recv().unwrap();
         let ip = Ipv4Packet::new_checked(&*fin).unwrap();
@@ -621,7 +641,13 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
         iface.poll(abandoned, &mut device, &mut sockets);
         assert_eq!(sockets.get::<TcpSocket>(handle).state(), State::FinWait2);
         assert_eq!(sockets.get::<TcpSocket>(handle).keep_alive(), None);
-        assert!(!reconcile_tcp(&mut entries, &mut sockets, &counts));
+        assert!(!reconcile_tcp(
+            &mut entries,
+            &mut sockets,
+            &counts,
+            false,
+            abandoned
+        ));
         assert_eq!(counts.tcp.load(Ordering::Relaxed), 1);
 
         for seconds in [1, 29, 59, 60] {
@@ -640,19 +666,22 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
                 tcp_poll_delay(timestamp, None, std::iter::once(&*control)),
                 Some(SmolDuration::from_secs(60 - seconds)),
             );
-            entries.get_mut(&handle).unwrap().pump(
-                handle,
-                sockets.get_mut::<TcpSocket>(handle),
-                timestamp,
-            );
+            pump_entry(&mut entries, &mut sockets, handle, timestamp);
             iface.poll_egress(timestamp, &mut device, &mut sockets);
-            assert!(!reconcile_tcp(&mut entries, &mut sockets, &counts));
+            assert!(!reconcile_tcp(
+                &mut entries,
+                &mut sockets,
+                &counts,
+                false,
+                timestamp
+            ));
             assert_eq!(
                 counts.tcp.load(Ordering::Relaxed),
                 usize::from(seconds < 60)
             );
         }
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 0);
+        assert!(!entries.uses_local(target));
         assert_eq!(control.recv_state(), TcpSocketState::Closed);
     }
 }
@@ -765,13 +794,8 @@ async fn reset_releases_half_open_and_established_flows_before_the_next_syn() {
 #[test]
 fn inbound_handshake_timeout_is_lifted_only_after_establishment() {
     for complete in [false, true] {
-        let (output, mut packets) = mpsc::channel(QUEUE_CAPACITY);
-        let mut device = QueueDevice {
-            packet: None,
-            output,
-            mtu: 1408,
-            drops: Arc::default(),
-        };
+        let (output, mut packets) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut device = queue_device(output);
         let start = Instant::from_secs(1);
         let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, start);
         let source: SocketAddr = "10.77.0.2:40000".parse().unwrap();
@@ -1027,7 +1051,7 @@ async fn tcp_connect_timeout_includes_waiting_for_command_capacity() {
 #[tokio::test]
 async fn udp_open_bursts_respect_flow_limits_not_queue_capacity() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let limit = QUEUE_CAPACITY * 4;
+        let limit = COMMAND_QUEUE_CAPACITY * 4;
         let stack = PacketStack::new(
             vec!["10.77.0.1".parse().unwrap()],
             1408,
@@ -1212,4 +1236,617 @@ fn classification_rejects_fragments_extensions_and_bad_checksums() {
     assert!(packet_info(&bytes).is_some());
     bytes[6] = 44;
     assert!(packet_info(&bytes).is_none());
+}
+
+fn tcp_segment_with_timestamp(
+    source: SocketAddr,
+    target: SocketAddr,
+    sequence: u32,
+    ack: u32,
+    timestamp: Option<(u32, u32)>,
+) -> PacketBuffer {
+    let mut tcp = etherparse::TcpHeader::new(source.port(), target.port(), sequence, 65535);
+    tcp.syn = true;
+    tcp.ack = true;
+    tcp.acknowledgment_number = ack;
+    if let Some((tsval, tsecr)) = timestamp {
+        tcp.set_options(&[etherparse::TcpOptionElement::Timestamp(tsval, tsecr)])
+            .unwrap();
+    }
+    let (IpAddr::V4(source), IpAddr::V4(target)) = (source.ip(), target.ip()) else {
+        unreachable!();
+    };
+    let builder =
+        etherparse::PacketBuilder::ipv4(source.octets(), target.octets(), 64).tcp_header(tcp);
+    let mut packet = PacketBuffer::with_capacity(builder.size(0));
+    packet.resize(builder.size(0));
+    builder.write(&mut &mut packet[..], &[]).unwrap();
+    packet
+}
+
+/// Parses an emitted segment as smoltcp sees it, including TCP options.
+fn tcp_repr(packet: &[u8]) -> (PacketInfo, smoltcp::wire::TcpRepr<'_>) {
+    let info = packet_info(packet).unwrap();
+    assert_eq!(info.protocol, IpProtocol::Tcp);
+    let tcp = TcpPacket::new_checked(&packet[info.transport_offset..info.length]).unwrap();
+    let repr = smoltcp::wire::TcpRepr::parse(
+        &tcp,
+        &info.source.ip().into(),
+        &info.target.ip().into(),
+        &Default::default(),
+    )
+    .unwrap();
+    (info, repr)
+}
+
+async fn write_datagram(connection: &mut UdpConnection, data: &[u8]) {
+    use crate::async_stream::AsyncWriteMessage;
+    futures::future::poll_fn(|cx| {
+        std::pin::Pin::new(&mut *connection).poll_write_message(cx, data)
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// Queues UDP datagrams until `output` holds `len` undrained packets.
+async fn fill_output(
+    datagrams: &mut UdpConnection,
+    output: &mpsc::Receiver<PacketBuffer>,
+    len: usize,
+) {
+    for _ in output.len()..len {
+        write_datagram(datagrams, b"fill").await;
+    }
+    wait_until(|| output.len() == len).await;
+}
+
+/// Drains up to one batch the way WireGuard's IpSource does.
+async fn drain_batch(
+    stack: &PacketStack,
+    output: &mut mpsc::Receiver<PacketBuffer>,
+) -> Vec<PacketBuffer> {
+    let mut batch = Vec::new();
+    output.recv_many(&mut batch, 64).await;
+    wake_after_output_drain(&stack.egress_backpressured, &stack.handle.wake);
+    batch
+}
+
+fn is_udp(packet: &[u8]) -> bool {
+    packet_info(packet).unwrap().protocol == IpProtocol::Udp
+}
+
+#[tokio::test]
+async fn egress_backpressure_pauses_tcp_without_dropping_and_resumes_on_drain() {
+    use tokio::io::AsyncWriteExt;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stack = PacketStack::new(
+            vec!["10.77.0.1".parse().unwrap()],
+            1408,
+            false,
+            TunResourceLimits::default(),
+        )
+        .unwrap();
+        let mut output = stack.output.take().unwrap();
+        let mut datagrams = stack
+            .handle
+            .open_udp("10.77.0.2:53".parse().unwrap())
+            .await
+            .unwrap();
+        let paused = OUTPUT_QUEUE_CAPACITY - OUTPUT_UDP_HEADROOM;
+        fill_output(&mut datagrams, &output, paused).await;
+
+        let target: SocketAddr = "10.77.0.2:443".parse().unwrap();
+        let handle = stack.handle.clone();
+        let connect = tokio::spawn(async move { handle.connect(target).await });
+        wait_until(|| stack.egress_backpressured.load(Ordering::Acquire)).await;
+        // A paused stack parks until the drainer wakes it instead of polling its unsent SYN.
+        let iterations = stack.counts.iterations.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(stack.counts.iterations.load(Ordering::Relaxed) - iterations <= 2);
+        assert_eq!(output.len(), paused);
+        assert_eq!(stack.drops.total(), 0);
+
+        let mut queued = drain_batch(&stack, &mut output).await;
+        let syn = loop {
+            if queued.is_empty() {
+                queued = drain_batch(&stack, &mut output).await;
+            }
+            let packet = queued.remove(0);
+            if !is_udp(&packet) {
+                break packet;
+            }
+        };
+        assert!(queued.is_empty());
+        let (syn_info, syn_repr) = tcp_repr(&syn);
+        assert_eq!(syn_repr.control, TcpControl::Syn);
+        let local = syn_info.source;
+        stack
+            .input
+            .send(tcp_segment(
+                target,
+                local,
+                5000,
+                TcpControl::Syn,
+                Some((syn_repr.seq_number + 1).0 as u32),
+            ))
+            .await
+            .unwrap();
+        stack.handle.wake.notify();
+        let mut connection = connect.await.unwrap().unwrap();
+        let ack = output.recv().await.unwrap();
+        let (_, ack) = tcp_repr(&ack);
+        assert!(ack.payload.is_empty() && ack.ack_number.is_some());
+
+        // Pauses established data the same way, then emits it in order once drained.
+        fill_output(&mut datagrams, &output, paused).await;
+        let data: Vec<u8> = (0..20_000).map(|index| index as u8).collect();
+        connection.write_all(&data).await.unwrap();
+        wait_until(|| stack.egress_backpressured.load(Ordering::Acquire)).await;
+        assert_eq!(output.len(), paused);
+
+        let mut next = syn_repr.seq_number + 1;
+        let mut received = Vec::new();
+        while received.len() < data.len() {
+            for packet in drain_batch(&stack, &mut output).await {
+                if is_udp(&packet) {
+                    continue;
+                }
+                let (_, repr) = tcp_repr(&packet);
+                if repr.payload.is_empty() {
+                    continue;
+                }
+                assert_eq!(repr.seq_number, next, "segment retransmitted or reordered");
+                next += repr.payload.len();
+                received.extend_from_slice(repr.payload);
+                stack
+                    .input
+                    .send(tcp_segment(
+                        target,
+                        local,
+                        5001,
+                        TcpControl::None,
+                        Some(next.0 as u32),
+                    ))
+                    .await
+                    .unwrap();
+                stack.handle.wake.notify();
+            }
+        }
+        assert_eq!(received, data);
+        assert_eq!(stack.drops.total(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn tcp_egress_backpressure_preserves_udp_headroom() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stack = PacketStack::new(
+            vec!["10.77.0.1".parse().unwrap()],
+            1408,
+            false,
+            TunResourceLimits::default(),
+        )
+        .unwrap();
+        let output = stack.output.take().unwrap();
+        let mut datagrams = stack
+            .handle
+            .open_udp("10.77.0.2:53".parse().unwrap())
+            .await
+            .unwrap();
+        fill_output(
+            &mut datagrams,
+            &output,
+            OUTPUT_QUEUE_CAPACITY - OUTPUT_UDP_HEADROOM,
+        )
+        .await;
+        let handle = stack.handle.clone();
+        let _connect =
+            tokio::spawn(async move { handle.connect("10.77.0.2:443".parse().unwrap()).await });
+        wait_until(|| stack.egress_backpressured.load(Ordering::Acquire)).await;
+
+        fill_output(&mut datagrams, &output, OUTPUT_QUEUE_CAPACITY).await;
+        assert_eq!(stack.drops.total(), 0);
+        write_datagram(&mut datagrams, b"overflow").await;
+        wait_until(|| stack.drops.output_full.load(Ordering::Relaxed) == 1).await;
+        assert_eq!(stack.drops.total(), 1);
+        let mut output = output;
+        while let Ok(packet) = output.try_recv() {
+            assert!(is_udp(&packet), "TCP consumed UDP headroom");
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn backpressured_poll_delay_keeps_only_real_deadlines() {
+    use smoltcp::time::Duration as SmolDuration;
+
+    let deadline = Some(SmolDuration::from_millis(200));
+    assert_eq!(
+        egress_poll_delay(Some(SmolDuration::ZERO), false),
+        Some(SmolDuration::ZERO)
+    );
+    assert_eq!(egress_poll_delay(Some(SmolDuration::ZERO), true), None);
+    assert_eq!(egress_poll_delay(deadline, true), deadline);
+    assert_eq!(egress_poll_delay(None, true), None);
+}
+
+#[test]
+fn transmit_reserves_output_and_flags_backpressure_at_udp_headroom() {
+    let (output, mut packets) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+    let filler = output.clone();
+    let mut device = queue_device(output);
+    for _ in 0..OUTPUT_QUEUE_CAPACITY - OUTPUT_UDP_HEADROOM - 1 {
+        filler
+            .try_send(PacketBuffer::copy_from_slice(b"udp"))
+            .unwrap();
+    }
+    let token = device.transmit(Instant::from_millis(0)).unwrap();
+    assert!(matches!(token, Tx::Reserved { .. }));
+    token.consume(20, |bytes| bytes.fill(0));
+    assert!(!device.is_egress_backpressured());
+    assert!(device.transmit(Instant::from_millis(0)).is_none());
+    assert!(device.is_egress_backpressured());
+
+    // Ingress replies stay best-effort and may use the UDP headroom.
+    device.packet = Some(PacketBuffer::copy_from_slice(b"ingress"));
+    let (_, reply) = device.receive(Instant::from_millis(0)).unwrap();
+    assert!(matches!(reply, Tx::BestEffort(_)));
+    reply.consume(20, |bytes| bytes.fill(0));
+    assert_eq!(
+        packets.len(),
+        OUTPUT_QUEUE_CAPACITY - OUTPUT_UDP_HEADROOM + 1
+    );
+
+    // The drainer clears the flag after freeing capacity, as IpSource does.
+    packets.try_recv().unwrap();
+    packets.try_recv().unwrap();
+    assert!(device.egress_backpressured.swap(false, Ordering::AcqRel));
+    assert!(matches!(
+        device.transmit(Instant::from_millis(0)),
+        Some(Tx::Reserved { .. })
+    ));
+    assert!(!device.is_egress_backpressured());
+    assert_eq!(device.drops.total(), 0);
+}
+
+#[tokio::test]
+async fn outbound_syn_includes_tcp_timestamp_and_echoes_peer_tsval() {
+    use tokio::io::AsyncWriteExt;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for peer_timestamps in [true, false] {
+            let mut stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                false,
+                TunResourceLimits::default(),
+            )
+            .unwrap();
+            let mut output = stack.output.take().unwrap();
+            let target: SocketAddr = "10.77.0.2:443".parse().unwrap();
+            let handle = stack.handle.clone();
+            let connect = tokio::spawn(async move { handle.connect(target).await });
+            let syn = output.recv().await.unwrap();
+            let (info, repr) = tcp_repr(&syn);
+            let timestamp = repr.timestamp.unwrap();
+            assert_ne!(timestamp.tsval, 0);
+            assert_eq!(timestamp.tsecr, 0);
+            assert!(
+                super::super::tcp_timestamp_ms().wrapping_sub(timestamp.tsval) < 5_000,
+                "timestamps follow the shared millisecond clock"
+            );
+            stack
+                .input
+                .send(tcp_segment_with_timestamp(
+                    target,
+                    info.source,
+                    5000,
+                    (repr.seq_number + 1).0 as u32,
+                    peer_timestamps.then_some((777, timestamp.tsval)),
+                ))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+            let mut connection = connect.await.unwrap().unwrap();
+            let ack = tcp_repr(&output.recv().await.unwrap()).1.timestamp;
+            connection.write_all(b"after handshake").await.unwrap();
+            let data = loop {
+                let packet = output.recv().await.unwrap();
+                if !tcp_repr(&packet).1.payload.is_empty() {
+                    break packet;
+                }
+            };
+            let (_, data) = tcp_repr(&data);
+            assert_eq!(data.payload, b"after handshake");
+            if peer_timestamps {
+                assert_eq!(ack.unwrap().tsecr, 777);
+                assert_eq!(data.timestamp.unwrap().tsecr, 777);
+            } else {
+                assert!(ack.is_none());
+                assert!(data.timestamp.is_none());
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+type Segments = Vec<(smoltcp::wire::TcpSeqNumber, Vec<u8>)>;
+
+/// Polls the interface and returns emitted SYN and data segments.
+fn poll_segments(
+    iface: &mut Interface,
+    device: &mut QueueDevice,
+    sockets: &mut SocketSet<'_>,
+    packets: &mut mpsc::Receiver<PacketBuffer>,
+    at: Instant,
+) -> Segments {
+    iface.poll(at, device, sockets);
+    let mut segments = Vec::new();
+    while let Ok(packet) = packets.try_recv() {
+        let (_, repr) = tcp_repr(&packet);
+        if repr.control == TcpControl::Syn || !repr.payload.is_empty() {
+            segments.push((repr.seq_number, repr.payload.to_vec()));
+        }
+    }
+    segments
+}
+
+#[test]
+fn tcp_retransmit_uses_200ms_min_rto_after_rtt_sample() {
+    use smoltcp::time::Duration as SmolDuration;
+
+    let (output, mut packets) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+    let mut device = queue_device(output);
+    let start = Instant::from_secs(1);
+    let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, start);
+    let local: SocketAddr = "10.77.0.1:49152".parse().unwrap();
+    let remote: SocketAddr = "10.77.0.2:443".parse().unwrap();
+    iface.update_ip_addrs(|ips| ips.push(IpCidr::new(local.ip().into(), 24)).unwrap());
+    let mut socket = tcp_socket(4096);
+    assert_eq!(socket.min_rto(), SmolDuration::from_millis(200));
+    assert_eq!(socket.initial_rto(), SmolDuration::from_secs(1));
+    socket.connect(iface.context(), remote, local).unwrap();
+    let mut sockets = SocketSet::new(vec![]);
+    let handle = sockets.add(socket);
+    let syn = poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, start);
+    assert_eq!(syn.len(), 1);
+    let isn = syn[0].0;
+    let at = start + SmolDuration::from_millis(1);
+    device.packet = Some(tcp_segment(
+        remote,
+        local,
+        5000,
+        TcpControl::Syn,
+        Some((isn + 1).0 as u32),
+    ));
+    poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, at);
+    sockets
+        .get_mut::<TcpSocket>(handle)
+        .send_slice(b"first")
+        .unwrap();
+    let first = poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, at);
+    assert_eq!(first, [(isn + 1, b"first".to_vec())]);
+    let at = at + SmolDuration::from_millis(1);
+    device.packet = Some(tcp_segment(
+        remote,
+        local,
+        5001,
+        TcpControl::None,
+        Some((isn + 6).0 as u32),
+    ));
+    poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, at);
+    sockets
+        .get_mut::<TcpSocket>(handle)
+        .send_slice(b"lost")
+        .unwrap();
+    let lost = poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, at);
+    assert_eq!(lost, [(isn + 6, b"lost".to_vec())]);
+    let early = at + SmolDuration::from_millis(199);
+    assert!(poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, early).is_empty());
+    let expired = at + SmolDuration::from_millis(201);
+    assert_eq!(
+        poll_segments(&mut iface, &mut device, &mut sockets, &mut packets, expired),
+        lost
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_port_cursor_randomizes_across_stack_instances() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut ports = Vec::new();
+        for _ in 0..8 {
+            let stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                false,
+                TunResourceLimits::default(),
+            )
+            .unwrap();
+            let connection = stack
+                .handle
+                .open_udp("10.77.0.2:53".parse().unwrap())
+                .await
+                .unwrap();
+            let port = connection.control.lock().local.port();
+            port_offset(port);
+            ports.push(port);
+        }
+        ports.sort_unstable();
+        ports.dedup();
+        // Eight sequential starts would all pick 49152; random starts collide with negligible odds.
+        assert!(ports.len() > 1, "ports did not vary: {ports:?}");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn drop_counters_distinguish_mtu_invalid_and_udp_drops() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stack = PacketStack::new(
+            vec!["10.77.0.1".parse().unwrap()],
+            1408,
+            false,
+            TunResourceLimits::default(),
+        )
+        .unwrap();
+        let _output = stack.output.take().unwrap();
+        let remote: SocketAddr = "10.77.0.2:53".parse().unwrap();
+        let mut connection = stack.handle.open_udp(remote).await.unwrap();
+        let local = connection.control.lock().local;
+
+        let mut corrupted =
+            crate::tun::udp_handler::build_udp_packet(b"bad", remote, local).unwrap();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 1;
+        stack.input.send(corrupted).await.unwrap();
+        let oversized =
+            crate::tun::udp_handler::build_udp_packet(&[0; 1400], remote, local).unwrap();
+        assert!(oversized.len() > 1408);
+        stack.input.send(oversized).await.unwrap();
+        for _ in 0..9 {
+            stack
+                .input
+                .send(crate::tun::udp_handler::build_udp_packet(b"queued", remote, local).unwrap())
+                .await
+                .unwrap();
+        }
+        stack.handle.wake.notify();
+        write_datagram(&mut connection, &[0; 1400]).await;
+        wait_until(|| stack.drops.udp_queue_full.load(Ordering::Relaxed) == 1).await;
+
+        let drops = &stack.drops;
+        assert_eq!(drops.invalid_packet.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.mtu_exceeded.load(Ordering::Relaxed), 2);
+        assert_eq!(drops.udp_queue_full.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.output_full.load(Ordering::Relaxed), 0);
+        assert_eq!(drops.detour_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(drops.total(), 4);
+        assert_eq!(
+            drops.to_string(),
+            "packet_drops=4 output_drops=0 mtu_drops=2 invalid_drops=1 udp_drops=1 detour_drops=0"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn expired_orphan_under_backpressure_is_reclaimed_without_spinning() {
+    use crate::ip_stack::{TCP_ORPHAN_TIMEOUT, tcp_conn::TcpSocketState, tcp_poll_delay};
+    use smoltcp::time::Duration as SmolDuration;
+
+    let (output, mut packets) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+    let mut device = queue_device(output.clone());
+    let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, now());
+    iface.update_ip_addrs(|list| {
+        list.push(IpCidr::new(
+            IpAddr::V4("10.77.0.1".parse().unwrap()).into(),
+            0,
+        ))
+        .unwrap();
+    });
+    iface
+        .routes_mut()
+        .add_default_ipv4_route("10.77.0.1".parse().unwrap())
+        .unwrap();
+    iface.set_any_ip(true);
+
+    let source: SocketAddr = "10.77.0.2:40000".parse().unwrap();
+    let target: SocketAddr = "10.77.0.1:443".parse().unwrap();
+    let mut sockets = SocketSet::new(vec![]);
+    let mut socket = tcp_socket(32 * 1024);
+    socket.listen(target).unwrap();
+    let handle = sockets.add(socket);
+    let start = now();
+    device.packet = Some(tcp_segment(source, target, 1000, TcpControl::Syn, None));
+    iface.poll_ingress_single(start, &mut device, &mut sockets);
+    iface.poll_egress(start, &mut device, &mut sockets);
+    let syn_ack = packets.try_recv().unwrap();
+    let ip = Ipv4Packet::new_checked(&*syn_ack).unwrap();
+    let ack = (TcpPacket::new_checked(ip.payload()).unwrap().seq_number() + 1).0 as u32;
+    device.packet = Some(tcp_segment(
+        source,
+        target,
+        1001,
+        TcpControl::None,
+        Some(ack),
+    ));
+    iface.poll(start, &mut device, &mut sockets);
+
+    let (wake, _wake_rx) = Wake::new().unwrap();
+    let control = Arc::new(TcpConnectionControl::new(32 * 1024, 32 * 1024));
+    let connection = TcpConnection::new(control.clone(), wake);
+    let mut entries = TcpFlows::default();
+    entries.insert(
+        handle,
+        TcpEntry {
+            control: control.clone(),
+            remote: source,
+            local: target,
+            outbound: false,
+            established: true,
+            pending_connect: None,
+            pending_accept: None,
+        },
+    );
+    let counts = FlowCounts::default();
+    sockets.get_mut::<TcpSocket>(handle).close();
+    control.set_send_state(TcpSocketState::Closing);
+    drop(connection);
+    let deadline = control.orphan_deadline().unwrap();
+    let abandoned = deadline - TCP_ORPHAN_TIMEOUT;
+    pump_entry(&mut entries, &mut sockets, handle, abandoned);
+    iface.poll_egress(abandoned, &mut device, &mut sockets);
+    let _fin = packets.try_recv().unwrap();
+
+    // Fill output to the backpressure threshold so smoltcp cannot transmit the final RST.
+    for _ in 0..(OUTPUT_QUEUE_CAPACITY - OUTPUT_UDP_HEADROOM) {
+        output
+            .try_send(PacketBuffer::copy_from_slice(b"x"))
+            .unwrap();
+    }
+    let expired = abandoned + SmolDuration::from_secs(60);
+    pump_entry(&mut entries, &mut sockets, handle, expired);
+    assert_eq!(sockets.get::<TcpSocket>(handle).state(), State::Closed);
+    iface.poll_egress(expired, &mut device, &mut sockets);
+    assert!(device.is_egress_backpressured());
+    // smoltcp still holds remote_endpoint because the final RST could not be queued.
+    assert!(sockets.get::<TcpSocket>(handle).remote_endpoint().is_some());
+
+    // Reclaiming the expired orphan under backpressure releases admission and removes the
+    // expired deadline so tcp_poll_delay does not busy-poll with Duration::ZERO.
+    assert!(!reconcile_tcp(
+        &mut entries,
+        &mut sockets,
+        &counts,
+        true,
+        expired
+    ));
+    assert_eq!(entries.len(), 0);
+    assert_eq!(counts.tcp.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        tcp_poll_delay(
+            expired,
+            egress_poll_delay(iface.poll_delay(expired, &sockets), true),
+            entries.entries.values().map(|entry| &*entry.control),
+        ),
+        None
+    );
 }

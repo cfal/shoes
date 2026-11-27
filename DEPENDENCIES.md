@@ -22,6 +22,10 @@ The workspace patches in `Cargo.toml` are required by checkout/release builds:
 - `cfal/hickory-dns`: connection-close recovery, healthy-upstream failover and
   bounded TCP/DoT receive progress.
 - `cfal/smoltcp`: TUN/WireGuard TCP retransmission ACK sequencing.
+- `cfal/gotatun`: releases `handle_incoming` locks before I/O, keeps persistent
+  keepalive restarting handshakes after expiry, preserves handshake confirmation
+  and monotonic session ordering, and treats cookie reply send errors as
+  non-fatal.
 
 Preserve each repository and full revision unless explicitly updating that fork.
 Check every resolved consumer, especially Quinn, tokio-rustls, hyper-rustls,
@@ -84,14 +88,21 @@ Shadowsocks and NaiveProxy tests. Verify the final published full SHA with
 
 ### GotaTun
 
-Published 0.10.3 replaces the upstream git patch. Its archive identifies
-[`c541472b40ec489ba7bdfd048512e89e556c7a3c`](https://github.com/mullvad/gotatun/tree/c541472b40ec489ba7bdfd048512e89e556c7a3c),
-not the different main-branch commit also declaring 0.10.3. Both session and
-cookie counters retain [#221](https://github.com/mullvad/gotatun/pull/221)'s
-conditional portable-atomic fallback. The published crate folds the git-only
-`gotatun-crypto` and `gotatun-packet` packages back into the main crate; Shoes'
-packet, transport and X25519 APIs remain compatible. AWS-LC and device features
-are unchanged, as are Shoes' own conditional atomic imports.
+Shoes patches GotaTun 0.10.3 via `cfal/gotatun` branch `main` pinned at
+[`9e8358258197662ff328854369b881b0dd3c35ef`](https://github.com/cfal/gotatun/tree/9e8358258197662ff328854369b881b0dd3c35ef),
+based on upstream `main` commit
+[`3b14873e2c20ffa895312dc96b740488dd2c7950`](https://github.com/mullvad/gotatun/tree/3b14873e2c20ffa895312dc96b740488dd2c7950).
+Upstream `main` splits out workspace crates `gotatun-crypto` and
+`gotatun-packet` (re-exported through `gotatun`), hardens preshared keys via
+zeroizing `PresharedKey`, and advances `aead`/`blake2`/`chacha20poly1305`/`hmac`.
+The fork patch releases device and peer locks before async I/O in
+`handle_incoming`, keeps `persistent_keepalive` restarting handshakes after
+expiry, tracks per-session confirmation and monotonic generation ordering while
+preserving concurrent `InitSent` retransmissions, and treats `CookieReply` send
+errors as non-fatal. Both session and cookie counters retain
+[#221](https://github.com/mullvad/gotatun/pull/221)'s conditional
+portable-atomic fallback. Shoes' packet, transport and X25519 APIs, AWS-LC and
+device features, and conditional atomic imports remain compatible.
 
 The TAI64N base changes from `2^62 + 37` to wireguard-go's `2^62 + 10`.
 The same-key handoff regression keeps a reference responder alive across Shoes

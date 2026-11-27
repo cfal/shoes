@@ -1,5 +1,4 @@
-use super::{packet::PacketBuffer, wake::Wake};
-use crate::atomic::AtomicU64;
+use super::{driver::PacketDrops, packet::PacketBuffer, wake::Wake};
 use crate::{
     async_stream::*,
     resources::{Budget, BudgetPermit},
@@ -67,7 +66,7 @@ pub(crate) struct UdpConnection {
     pub control: Arc<Mutex<UdpControl>>,
     pub wake: Wake,
     pub mtu: usize,
-    pub drops: Arc<AtomicU64>,
+    pub drops: Arc<PacketDrops>,
 }
 
 impl Drop for UdpConnection {
@@ -116,7 +115,7 @@ impl AsyncWriteMessage for UdpConnection {
         }
         let overhead = if control.local.is_ipv4() { 28 } else { 48 };
         if data.len() > self.mtu - overhead {
-            self.drops.fetch_add(1, Ordering::Relaxed);
+            self.drops.mtu_exceeded.fetch_add(1, Ordering::Relaxed);
             return Poll::Ready(Ok(()));
         }
         if control.outgoing.len() == FLOW_QUEUE_CAPACITY {
@@ -124,7 +123,7 @@ impl AsyncWriteMessage for UdpConnection {
             return Poll::Pending;
         }
         let Some(permit) = control.budget.acquire(data.len() + overhead) else {
-            self.drops.fetch_add(1, Ordering::Relaxed);
+            self.drops.udp_queue_full.fetch_add(1, Ordering::Relaxed);
             return Poll::Ready(Ok(()));
         };
         let packet =

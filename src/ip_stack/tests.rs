@@ -1,6 +1,10 @@
 use super::{driver::PacketStack, udp::UdpConnection};
 use crate::{async_stream::*, config::tun::TunResourceLimits};
-use std::{io, net::SocketAddr, time::Duration};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     task::JoinSet,
@@ -22,22 +26,28 @@ fn stack(inbound: bool, ip: &str) -> PacketStack {
     )
     .unwrap()
 }
+/// Forwards like WireGuard's IpSource, waking a source stack whose TCP egress paused.
 fn bridge(left: &mut PacketStack, right: &mut PacketStack) -> JoinSet<()> {
     let mut tasks = JoinSet::new();
-    for (mut input, output, wake) in [
+    for (mut input, paused, source, output, wake) in [
         (
             left.output.take().unwrap(),
+            left.egress_backpressured.clone(),
+            left.handle.wake.clone(),
             right.input.clone(),
             right.handle.wake.clone(),
         ),
         (
             right.output.take().unwrap(),
+            right.egress_backpressured.clone(),
+            right.handle.wake.clone(),
             left.input.clone(),
             left.handle.wake.clone(),
         ),
     ] {
         tasks.spawn(async move {
             while let Some(packet) = input.recv().await {
+                super::driver::wake_after_output_drain(&paused, &source);
                 if output.send(packet).await.is_err() {
                     break;
                 }
@@ -46,6 +56,12 @@ fn bridge(left: &mut PacketStack, right: &mut PacketStack) -> JoinSet<()> {
         });
     }
     tasks
+}
+/// Returns the port the stack allocates next; stacks start their port cursor at random.
+async fn next_udp_port(stack: &PacketStack, target: SocketAddr) -> u16 {
+    let probe = stack.handle.open_udp(target).await.unwrap();
+    let port = probe.control.lock().local.port();
+    if port == u16::MAX { 49152 } else { port + 1 }
 }
 async fn write_udp(stream: &mut UdpConnection, bytes: &[u8]) -> io::Result<()> {
     futures::future::poll_fn(|cx| std::pin::Pin::new(&mut *stream).poll_write_message(cx, bytes))
@@ -96,11 +112,16 @@ async fn udp_empty_datagrams_boundaries_mtu_and_shutdown() {
             let mut client = stack(false, local);
             let mut server = stack(false, remote);
             let _bridge = bridge(&mut client, &mut server);
-            let target = SocketAddr::new(remote.parse().unwrap(), 49152);
+            let local: IpAddr = local.parse().unwrap();
+            let remote: IpAddr = remote.parse().unwrap();
+            let client_port = next_udp_port(&client, SocketAddr::new(remote, 53)).await;
+            let server_port = next_udp_port(&server, SocketAddr::new(local, 53)).await;
+            let target = SocketAddr::new(remote, server_port);
             let mut outbound = client.handle.open_udp(target).await.unwrap();
+            assert_eq!(outbound.control.lock().local.port(), client_port);
             let mut reverse = server
                 .handle
-                .open_udp(SocketAddr::new(local.parse().unwrap(), 49152))
+                .open_udp(SocketAddr::new(local, client_port))
                 .await
                 .unwrap();
             for data in [&b"one"[..], &b""[..], &b"three"[..]] {
@@ -110,12 +131,25 @@ async fn udp_empty_datagrams_boundaries_mtu_and_shutdown() {
                 assert_eq!(read_udp(&mut outbound).await.unwrap(), data);
             }
             write_udp(&mut outbound, &[0; 1408]).await.unwrap();
-            assert_eq!(client.drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+            assert_eq!(
+                client
+                    .drops
+                    .mtu_exceeded
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
             write_udp(&mut outbound, b"after oversize").await.unwrap();
             assert_eq!(read_udp(&mut reverse).await.unwrap(), b"after oversize");
             let permit = outbound.control.lock().budget.acquire(65535).unwrap();
             write_udp(&mut outbound, b"over budget").await.unwrap();
-            assert_eq!(client.drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+            assert_eq!(
+                client
+                    .drops
+                    .udp_queue_full
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            assert_eq!(client.drops.total(), 2);
             drop(permit);
             write_udp(&mut outbound, b"after budget").await.unwrap();
             assert_eq!(read_udp(&mut reverse).await.unwrap(), b"after budget");
@@ -204,7 +238,7 @@ async fn udp_receive_saturation_is_bounded_and_counted() {
                 .unwrap();
             stack.handle.wake.notify();
         }
-        while stack.drops.load(Ordering::Relaxed) != 24
+        while stack.drops.udp_queue_full.load(Ordering::Relaxed) != 24
             || stack.counts.outbound_udp.load(Ordering::Relaxed) != 1
         {
             tokio::task::yield_now().await;
@@ -300,4 +334,16 @@ async fn udp_drop_releases_each_admission_limit_without_retrying() {
     })
     .await
     .unwrap();
+}
+
+#[test]
+fn tcp_timestamp_ms_advances_monotonically() {
+    let first = super::tcp_timestamp_ms();
+    std::thread::sleep(Duration::from_millis(5));
+    let second = super::tcp_timestamp_ms();
+    let delta = second.wrapping_sub(first);
+    assert!(
+        (2..5_000).contains(&delta),
+        "expected monotonic millisecond advance, got delta={delta} ({first} -> {second})"
+    );
 }

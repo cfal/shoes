@@ -1,6 +1,6 @@
 ---
 title: Global settings
-description: Default DNS, opt-in NTP, admission limits, remote-rule cache, QUIC buffers, and reload grace periods.
+description: Default DNS, opt-in NTP, admission limits, remote-rule cache, QUIC and WireGuard socket buffers, and reload grace periods.
 ---
 
 Use at most one `global_settings` entry across all configuration files. Omitted
@@ -165,11 +165,17 @@ Sizes below are integer bytes, not strings such as `2MiB`.
 | `quic_stream_window` | 262,144 | 16,384-67,108,864 |
 | `quic_dns_memory_bytes` | 16,777,216 | 1,048,576-1,073,741,824 |
 | `quic_socket_buffer` | 8,388,608 | 65,536-16,777,216 |
+| `wireguard_socket_buffer` | 4,194,304 | 65,536-16,777,216 |
 | `reload_grace_secs` | 300 seconds | 0-86,400 seconds |
 
 `quic_dns_memory_bytes` is an admission estimate for the DNS library's private
 HTTP/3 transport, not a hard buffer limit. `quic_socket_buffer` requests OS socket
 buffer sizes; the OS can grant less. See [QUIC socket buffers](/config/quic-sockets/).
+
+`wireguard_socket_buffer` requests the receive and send buffer size of each direct
+WireGuard UDP socket, in bytes per direction. Lower it on memory-constrained
+routers; the OS can grant less. Detoured endpoints open no WireGuard UDP socket.
+See [WireGuard](/protocols/wireguard/).
 
 Unknown fields and duplicate global-settings entries are rejected. Per-protocol
 limits, including [XHTTP](/protocols/xhttp/), [TUN](/config/tun/#resource-limits-and-device-framing), and

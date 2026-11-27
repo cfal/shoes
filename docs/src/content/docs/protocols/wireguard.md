@@ -76,6 +76,14 @@ Peer hostnames are resolved through native
 bootstrap DNS during preparation and refreshed on reload. Direct mode selects
 the first resolved address compatible with the bound socket at startup.
 Authenticated WireGuard roaming can update the active peer address without a reload in direct mode.
+Direct mode also re-resolves a peer's configured hostname when its handshake is
+stale: none completed during the first minute, or at least 180 seconds have
+passed since the last handshake (plus `persistent_keepalive` and a 15-second
+grace period when keepalive is enabled). Checks run with the periodic report and
+back off from 60 to 300 seconds while the peer stays stale. A changed compatible
+address replaces the active endpoint without a reload or socket rebind. Healthy
+peers within that window are never re-resolved, so roamed addresses are
+preserved.
 Overlapping allowed prefixes between different peers, duplicate keys, and
 self-peering are rejected. Assign each client distinct tunnel addresses.
 
@@ -83,7 +91,13 @@ The server `address` must be one literal UDP socket address with a nonzero port,
 not a hostname, port range, or Unix socket path. `0.0.0.0:51820` listens only on IPv4;
 `[::]:51820` uses a dual-stack socket where supported. Direct clients bind an
 ephemeral dual-stack wildcard, with IPv4 fallback when IPv6 is unavailable.
-Outer sockets retain mobile socket protection and interface binding. Optional
+Outer sockets retain mobile socket protection and interface binding. Each direct
+socket requests `global_settings.wireguard_socket_buffer` receive and send buffers,
+4 MiB per direction by default; lower it on memory-constrained routers. The OS
+can grant less. See [global settings](/config/global-settings/#buffers-and-reload).
+Linux and Android send and receive outer datagrams in batches of up to 64 and
+skip empty or oversized datagrams there. Transient receive errors, such as
+`ENOBUFS`, are retried without stopping the endpoint. Optional
 `bind_interface` belongs at the client-config level for clients and inside
 `protocol` for servers; Linux/Android/Fuchsia support it. No OS interface,
 route, firewall rule, or NAT rule is created.
@@ -157,7 +171,7 @@ outbound inner flow needs one.
 
 Detoured destinations are fixed for the configuration generation. Their message
 streams do not expose source addresses, so arbitrary peer address roaming is not
-supported. Peer hostname changes require reload. Peer and outer-proxy bootstrap
+supported. Unlike direct mode, detoured peer hostname changes require reload. Peer and outer-proxy bootstrap
 use native DNS independently of routed DNS and the server's `dns`. Ensure host DNS and
 host routes do not themselves require the tunnel being established.
 
@@ -166,7 +180,7 @@ retry with backoff from 250 ms to 10 seconds, never falling back to direct UDP.
 Offline/overflow packets are dropped rather than indefinitely buffered; WireGuard
 and inner TCP perform their normal retries. Use `persistent_keepalive` to maintain
 idle proxy UDP mappings. Silent blackholes without stream errors remain UDP loss.
-Queues hold at most 64 packets per destination and 64 aggregate received packets,
+Queues hold at most 256 packets per destination and 256 aggregate received packets,
 with a 2048-byte outer datagram limit, above the supported inner MTU plus WireGuard
 overhead. Shutdown waits for workers to release their associations.
 
@@ -207,7 +221,9 @@ peer-to-peer IP forwarding, WARP reserved bytes, and
 wg-quick import are not implemented.
 
 Fragmented input and unsupported IPv6 extension chains are dropped before
-transport parsing. TCP advertises an MSS derived from the MTU. Outbound UDP
+transport parsing. TCP advertises an MSS derived from the MTU, sends RFC 7323
+timestamps when the peer supports them, uses a 200 ms minimum retransmission
+timeout, and starts each stack's ephemeral ports at a random offset. Outbound UDP
 writes larger than MTU minus 28 bytes (IPv4) or 48 bytes (IPv6) are dropped and
 counted without closing the flow; they are never truncated. UDP queue-budget
 exhaustion also drops individual writes. At MTU 1408 the payload limits are 1380 and 1360
@@ -223,8 +239,12 @@ Default admission limits are 256 TCP connections, 32 KiB TCP buffers, a
 destinations per inbound UDP session, and 8 MiB queued UDP payloads.
 UDP forwarding and outbound associations have separate bounded pools.
 Missing or null limit fields use WireGuard defaults rather than the unlimited
-TUN defaults. Stack packet and command queues are bounded at 64; inbound UDP
-session and destination upload queues are bounded at 128 and drop when full.
+TUN defaults. The stack output queue holds 1,024 packets; input, inbound UDP
+forwarding and reply, and command queues hold 256 each. When 64 or fewer output
+slots remain, TCP pauses transmission instead of dropping segments and resumes
+when GotaTun drains the queue. Those slots stay available to UDP datagrams and
+immediate TCP replies, which are dropped and counted only when the queue is full.
+Inbound UDP session and destination upload queues are bounded at 128 and drop when full.
 Inbound UDP replies wait for bounded forwarding queue capacity; a destination
 closes if response-queue space remains unavailable for 30 seconds. These budgets
 cover modeled shoes-owned state, not total process RSS or all GotaTun state.
@@ -238,8 +258,12 @@ at that size also requires `tcp_memory_bytes: 268435456` (256 MiB); the default
 32 MiB budget would admit only 32 connections. Tune against measured RTT,
 throughput, and available memory rather than increasing buffers unconditionally.
 
-Periodic logs report endpoint flow/drop counts and each peer's public key,
-handshake age, and byte counters. Private keys and PSKs are redacted.
+Periodic logs report endpoint flow counts and each peer's public key, handshake
+age, and byte counters. Drop counts appear as total `packet_drops` plus causes:
+`output_drops` for a full stack output queue, `mtu_drops` for packets above the
+MTU, `invalid_drops` for malformed or unsupported packets, `udp_drops` for full
+UDP queues or budgets, and `detour_drops` for peer chain losses. The shutdown log
+repeats them. Private keys and PSKs are redacted.
 
 Preparation failures retain the old configuration. Reload activation stops
 existing tunnel flows and rebuilds endpoints; sessions are not migrated.

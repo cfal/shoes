@@ -1,6 +1,6 @@
 ---
 title: "全局设置"
-description: "默认 DNS、可选 NTP、准入限制、远程规则缓存、QUIC 缓冲区和重新加载宽限期。"
+description: "默认 DNS、可选 NTP、准入限制、远程规则缓存、QUIC 和 WireGuard 套接字缓冲区以及重新加载宽限期。"
 ---
 
 所有配置文件中最多使用一个 `global_settings` 条目。省略的准入上限不受限制；传输窗口和缓冲区具有有限的默认值。省略、空或空的 `global_settings` 条目使用这些默认值。
@@ -101,8 +101,11 @@ HTTP/2 还会短暂记录已重置的流，以便丢弃迟到的帧。这些记�
 | `quic_stream_window` | 262,144 | 16,384-67,108,864 |
 | `quic_dns_memory_bytes` | 16,777,216 | 1,048,576-1,073,741,824 |
 | `quic_socket_buffer` | 8,388,608 | 65,536-16,777,216 |
+| `wireguard_socket_buffer` | 4,194,304 | 65,536-16,777,216 |
 | `reload_grace_secs` | 300秒 | 0-86,400 秒 |
 
 `quic_dns_memory_bytes` 是 DNS 库的私有 HTTP/3 传输的准入估计，而不是硬缓冲区限制。 `quic_socket_buffer` 请求操作系统套接字缓冲区大小；操作系统可以授予的权限更少。请参阅[QUIC 套接字缓冲区](/zh-cn/config/quic-sockets/)。
+
+`wireguard_socket_buffer` 为每个直连 WireGuard UDP 套接字请求接收和发送缓冲区大小，单位为每个方向的字节数。内存受限的路由器可以调低该值；操作系统实际授予的大小可能更小。绕行端点不会打开 WireGuard UDP 套接字。请参阅 [WireGuard](/zh-cn/protocols/wireguard/)。
 
 未知字段和重复的全局设置条目将被拒绝。每个协议的限制（包括 [XHTTP](/zh-cn/protocols/xhttp/)、[TUN](/zh-cn/config/tun/#resource-limits-and-device-framing) 和 [WireGuard](/zh-cn/protocols/wireguard/)）仍然是单独的设置。

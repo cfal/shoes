@@ -31,6 +31,9 @@ hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "93435e55f1
 hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "93435e55f102ee637eadca89126be85931a804f3" }
 # Preserves TCP ACK sequences during retransmission.
 smoltcp = { git = "https://github.com/cfal/smoltcp", rev = "8b79b32f2f054b0b584cb5b1712f28cd295ec4f8" }
+# Releases handle_incoming locks before I/O, keeps persistent keepalive active after expiry,
+# preserves handshake confirmation and session ordering, and ignores cookie reply send errors.
+gotatun = { git = "https://github.com/cfal/gotatun", rev = "9e8358258197662ff328854369b881b0dd3c35ef" }
 
 [lib]
 name = "shoes"

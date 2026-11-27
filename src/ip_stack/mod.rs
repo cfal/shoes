@@ -4,6 +4,7 @@ use smoltcp::{
     socket::tcp::{CongestionControl, Socket as TcpSocket, SocketBuffer, State as TcpState},
     time::{Duration as SmolDuration, Instant as SmolInstant},
 };
+use std::sync::OnceLock;
 use tcp_conn::{TcpConnectionControl, TcpSocketState};
 
 pub(crate) mod driver;
@@ -21,6 +22,21 @@ pub(crate) const TCP_PEER_SILENCE_TIMEOUT: SmolDuration = SmolDuration::from_sec
 pub(crate) const TCP_HANDSHAKE_TIMEOUT: SmolDuration = SmolDuration::from_secs(30);
 // Bounds orphaned FIN exchanges independently of traffic refreshing smoltcp's silence timer.
 const TCP_ORPHAN_TIMEOUT: SmolDuration = SmolDuration::from_secs(60);
+// Matches Linux TCP_RTO_MIN; smoltcp otherwise floors RTO at RFC 6298's one second.
+pub(crate) const TCP_MIN_RTO: SmolDuration = SmolDuration::from_millis(200);
+
+/// Anchors RFC 7323 timestamps to wall-clock milliseconds at first use so values keep
+/// advancing across restarts, letting peers' PAWS checks recycle TIME-WAIT tuples.
+pub(crate) fn tcp_timestamp_ms() -> u32 {
+    static EPOCH: OnceLock<(std::time::Instant, u32)> = OnceLock::new();
+    let &(start, base) = EPOCH.get_or_init(|| {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u32);
+        (std::time::Instant::now(), unix_ms)
+    });
+    base.wrapping_add(start.elapsed().as_millis() as u32)
+}
 
 pub(crate) fn tcp_poll_delay<'a>(
     now: SmolInstant,
@@ -45,6 +61,8 @@ pub(crate) fn tcp_socket(buffer_size: usize) -> TcpSocket<'static> {
     socket.set_timeout(Some(TCP_PEER_SILENCE_TIMEOUT));
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
+    socket.set_min_rto(TCP_MIN_RTO);
+    socket.set_tsval_generator(Some(tcp_timestamp_ms));
     socket
 }
 

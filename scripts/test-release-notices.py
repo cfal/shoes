@@ -2,7 +2,6 @@
 """Exercises dependency-notice generation and release tarball verification."""
 
 import importlib.util
-import hashlib
 from html.parser import HTMLParser
 import io
 import json
@@ -167,28 +166,26 @@ class ReleaseNoticesTests(unittest.TestCase):
         gotatun_packages = [p for p in metadata["packages"] if p["name"] == "gotatun"]
         self.assertEqual(len(gotatun_packages), 1)
         gotatun = gotatun_packages[0]
-        self.assertEqual(gotatun["source"], "registry+https://github.com/rust-lang/crates.io-index")
-        gotatun_root = Path(gotatun["manifest_path"]).parent
-        vcs = json.loads((gotatun_root / ".cargo_vcs_info.json").read_text())
-        self.assertEqual(vcs["path_in_vcs"], "gotatun")
-        revision = vcs["git"]["sha1"]
-        self.assertRegex(revision, r"^[0-9a-f]{40}$")
-        self.assertEqual(revision, "c541472b40ec489ba7bdfd048512e89e556c7a3c")
+        source = urlsplit(gotatun["source"].removeprefix("git+"))
+        self.assertEqual(source.scheme, "https")
+        self.assertEqual(source.netloc, "github.com")
+        self.assertEqual(source.path, "/cfal/gotatun")
+        self.assertRegex(source.fragment, r"^[0-9a-f]{40}$")
         source_notice = (NOTICES.ROOT / "THIRD_PARTY_NOTICES.md").read_text()
         for required in [
             f"GotaTun {gotatun['version']}",
-            f"https://github.com/mullvad/gotatun/tree/{revision}",
-            f"https://github.com/mullvad/gotatun/archive/{revision}.tar.gz",
+            f"https://github.com/cfal/gotatun/tree/{source.fragment}",
+            f"https://github.com/cfal/gotatun/archive/{source.fragment}.tar.gz",
         ]:
             self.assertIn(required, source_notice)
-        # The published archive omits the repository-root licenses at this revision.
-        for bundled, checksum in [
-            ("MPL-2.0.txt", "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04"),
-            ("gotatun-CLOUDFLARE.txt", "6dbef24708bad8c727bd80cca58ba8aa1637cdcb2cc6e9a31ea49235717e9391"),
+        gotatun_root = Path(gotatun["manifest_path"]).parent.parent
+        for original, bundled in [
+            ("LICENSE", "MPL-2.0.txt"),
+            ("LICENSE-CLOUDFLARE", "gotatun-CLOUDFLARE.txt"),
         ]:
             self.assertEqual(
-                hashlib.sha256((NOTICES.ROOT / "licenses" / bundled).read_bytes()).hexdigest(),
-                checksum,
+                (gotatun_root / original).read_bytes(),
+                (NOTICES.ROOT / "licenses" / bundled).read_bytes(),
             )
         bundle = (NOTICES.ROOT / "licenses/dependencies.txt").read_text()
         original_notices = {
