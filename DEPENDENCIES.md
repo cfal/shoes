@@ -89,7 +89,7 @@ Shadowsocks and NaiveProxy tests. Verify the final published full SHA with
 ### GotaTun
 
 Shoes patches GotaTun 0.10.3 via `cfal/gotatun` branch `main` pinned at
-[`2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d`](https://github.com/cfal/gotatun/tree/2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d),
+[`e4b7534abb98e705d3da9613f17ba538462ca70a`](https://github.com/cfal/gotatun/tree/e4b7534abb98e705d3da9613f17ba538462ca70a),
 based on upstream `main` commit
 [`3b14873e2c20ffa895312dc96b740488dd2c7950`](https://github.com/mullvad/gotatun/tree/3b14873e2c20ffa895312dc96b740488dd2c7950).
 Upstream `main` splits out workspace crates `gotatun-crypto` and

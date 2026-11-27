@@ -636,7 +636,13 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
         iface.poll(abandoned, &mut device, &mut sockets);
         assert_eq!(sockets.get::<TcpSocket>(handle).state(), State::FinWait2);
         assert_eq!(sockets.get::<TcpSocket>(handle).keep_alive(), None);
-        assert!(!reconcile_tcp(&mut entries, &mut sockets, &counts, false));
+        assert!(!reconcile_tcp(
+            &mut entries,
+            &mut sockets,
+            &counts,
+            false,
+            abandoned
+        ));
         assert_eq!(counts.tcp.load(Ordering::Relaxed), 1);
 
         for seconds in [1, 29, 59, 60] {
@@ -661,7 +667,13 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
                 timestamp,
             );
             iface.poll_egress(timestamp, &mut device, &mut sockets);
-            assert!(!reconcile_tcp(&mut entries, &mut sockets, &counts, false));
+            assert!(!reconcile_tcp(
+                &mut entries,
+                &mut sockets,
+                &counts,
+                false,
+                timestamp
+            ));
             assert_eq!(
                 counts.tcp.load(Ordering::Relaxed),
                 usize::from(seconds < 60)
@@ -1739,4 +1751,122 @@ async fn drop_counters_distinguish_mtu_invalid_and_udp_drops() {
     })
     .await
     .unwrap();
+}
+
+#[test]
+fn expired_orphan_under_backpressure_is_reclaimed_without_spinning() {
+    use crate::ip_stack::{TCP_ORPHAN_TIMEOUT, tcp_conn::TcpSocketState, tcp_poll_delay};
+    use smoltcp::time::Duration as SmolDuration;
+
+    let (output, mut packets) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+    let mut device = QueueDevice {
+        packet: None,
+        output: output.clone(),
+        mtu: 1408,
+        drops: Arc::new(PacketDrops::default()),
+        egress_backpressured: Arc::new(AtomicBool::new(false)),
+    };
+    let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, now());
+    iface.update_ip_addrs(|list| {
+        list.push(IpCidr::new(
+            IpAddr::V4("10.77.0.1".parse().unwrap()).into(),
+            0,
+        ))
+        .unwrap();
+    });
+    iface
+        .routes_mut()
+        .add_default_ipv4_route("10.77.0.1".parse().unwrap())
+        .unwrap();
+    iface.set_any_ip(true);
+
+    let source: SocketAddr = "10.77.0.2:40000".parse().unwrap();
+    let target: SocketAddr = "10.77.0.1:443".parse().unwrap();
+    let mut sockets = SocketSet::new(vec![]);
+    let mut socket = tcp_socket(32 * 1024);
+    socket.listen(target).unwrap();
+    let handle = sockets.add(socket);
+    let start = now();
+    device.packet = Some(tcp_segment(source, target, 1000, TcpControl::Syn, None));
+    iface.poll_ingress_single(start, &mut device, &mut sockets);
+    iface.poll_egress(start, &mut device, &mut sockets);
+    let syn_ack = packets.try_recv().unwrap();
+    let ip = Ipv4Packet::new_checked(&*syn_ack).unwrap();
+    let ack = (TcpPacket::new_checked(ip.payload()).unwrap().seq_number() + 1).0 as u32;
+    device.packet = Some(tcp_segment(
+        source,
+        target,
+        1001,
+        TcpControl::None,
+        Some(ack),
+    ));
+    iface.poll(start, &mut device, &mut sockets);
+
+    let (wake, _wake_rx) = Wake::new().unwrap();
+    let control = Arc::new(TcpConnectionControl::new(32 * 1024, 32 * 1024));
+    let connection = TcpConnection::new(control.clone(), wake);
+    let mut entries = TcpFlows::default();
+    entries.insert(
+        handle,
+        TcpEntry {
+            control: control.clone(),
+            remote: source,
+            local: target,
+            outbound: false,
+            established: true,
+            pending_connect: None,
+            pending_accept: None,
+        },
+    );
+    let counts = FlowCounts::default();
+    sockets.get_mut::<TcpSocket>(handle).close();
+    control.set_send_state(TcpSocketState::Closing);
+    drop(connection);
+    let deadline = control.orphan_deadline().unwrap();
+    let abandoned = deadline - TCP_ORPHAN_TIMEOUT;
+    entries.entries.get_mut(&handle).unwrap().pump(
+        handle,
+        sockets.get_mut::<TcpSocket>(handle),
+        abandoned,
+    );
+    iface.poll_egress(abandoned, &mut device, &mut sockets);
+    let _fin = packets.try_recv().unwrap();
+
+    // Fill output to the backpressure threshold so smoltcp cannot transmit the final RST.
+    for _ in 0..(OUTPUT_QUEUE_CAPACITY - OUTPUT_UDP_HEADROOM) {
+        output
+            .try_send(PacketBuffer::copy_from_slice(b"x"))
+            .unwrap();
+    }
+    let expired = abandoned + SmolDuration::from_secs(60);
+    entries.entries.get_mut(&handle).unwrap().pump(
+        handle,
+        sockets.get_mut::<TcpSocket>(handle),
+        expired,
+    );
+    assert_eq!(sockets.get::<TcpSocket>(handle).state(), State::Closed);
+    iface.poll_egress(expired, &mut device, &mut sockets);
+    assert!(device.is_egress_backpressured());
+    // smoltcp still holds remote_endpoint because the final RST could not be queued.
+    assert!(sockets.get::<TcpSocket>(handle).remote_endpoint().is_some());
+
+    // Reclaiming the expired orphan under backpressure releases admission and removes the
+    // expired deadline so tcp_poll_delay does not busy-poll with Duration::ZERO.
+    assert!(!reconcile_tcp(
+        &mut entries,
+        &mut sockets,
+        &counts,
+        true,
+        expired
+    ));
+    assert_eq!(entries.len(), 0);
+    assert_eq!(counts.tcp.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        tcp_poll_delay(
+            expired,
+            egress_poll_delay(iface.poll_delay(expired, &sockets), true),
+            entries.entries.values().map(|entry| &*entry.control),
+        ),
+        None
+    );
 }

@@ -99,7 +99,7 @@ https://github.com/gcc-mirror/gcc/blob/b71f1de6e9cf7181a288c0f39f9b1ef6580cf5c8/
 
 Unix builds, including Android and iOS libraries, link a patched GotaTun 0.10.3
 fork (`gotatun`, `gotatun-crypto`, and `gotatun-packet`) at commit
-`2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d` (based on upstream commit
+`e4b7534abb98e705d3da9613f17ba538462ca70a` (based on upstream commit
 `3b14873e2c20ffa895312dc96b740488dd2c7950`), an implementation of the
 WireGuard protocol. GotaTun is copyright Mullvad VPN AB and incorporates work
 copyright Cloudflare, Inc. Its source files are covered by the Mozilla Public
@@ -108,8 +108,8 @@ License 2.0 and the notices reproduced in `licenses/MPL-2.0.txt` and
 
 The corresponding modified source is available at:
 
-- https://github.com/cfal/gotatun/tree/2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d
-- https://github.com/cfal/gotatun/archive/2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d.tar.gz
+- https://github.com/cfal/gotatun/tree/e4b7534abb98e705d3da9613f17ba538462ca70a
+- https://github.com/cfal/gotatun/archive/e4b7534abb98e705d3da9613f17ba538462ca70a.tar.gz
 
 The upstream base commit is available at:
 

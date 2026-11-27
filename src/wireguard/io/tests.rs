@@ -247,40 +247,60 @@ async fn empty_and_truncated_datagrams_do_not_stall_or_fail_batched_receive() {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test]
-async fn partial_batches_keep_the_unsent_tail_on_error() {
+async fn per_destination_send_errors_do_not_drop_healthy_peer_tail() {
     let (_, sender, _, _) = bound("127.0.0.1:0").unwrap();
     let (_, _, mut receiver, peer) = bound("127.0.0.1:0").unwrap();
-    // IPv4 sockets reject IPv6 destinations, failing after the deliverable prefix.
-    let unreachable: SocketAddr = "[::1]:9".parse().unwrap();
+    // IPv4 sockets reject IPv6 destinations (EINVAL/EAFNOSUPPORT) on the bad datagram only.
+    let rejected: SocketAddr = "[::1]:9".parse().unwrap();
     let mut packets = vec![
         (packet(b"first"), peer),
         (packet(b"second"), peer),
-        (packet(b"rejected"), unreachable),
+        (packet(b"rejected"), rejected),
         (packet(b"tail"), peer),
     ];
     let mut send_buffer = Default::default();
-    assert!(
-        sender
-            .send_many_to(&mut send_buffer, &mut packets)
-            .await
-            .is_err()
-    );
-    let remaining: Vec<_> = packets.iter().map(|(packet, _)| packet.to_vec()).collect();
-    assert_eq!(remaining, [b"rejected".to_vec(), b"tail".to_vec()]);
+    sender
+        .send_many_to(&mut send_buffer, &mut packets)
+        .await
+        .unwrap();
+    assert!(packets.is_empty());
+
     let mut buffer = Default::default();
     let mut pool = PacketBufPool::new(8);
+    let received = receive_at_least(&mut receiver, &mut buffer, &mut pool, 3).await;
+    let payloads: Vec<_> = received.into_iter().map(|(bytes, _)| bytes).collect();
+    assert_eq!(
+        payloads,
+        [b"first".to_vec(), b"second".to_vec(), b"tail".to_vec()]
+    );
+
+    // Same-family batching with an OS-rejected destination (port 0 triggers EINVAL on Linux)
+    // must also succeed with Ok(()) and empty `packets` so GotaTun's BufferedUdpSend never drops
+    // the healthy peer tail.
+    let invalid_v4: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut same_family = vec![
+        (packet(b"sf-first"), peer),
+        (packet(b"sf-bad"), invalid_v4),
+        (packet(b"sf-tail"), peer),
+    ];
+    sender
+        .send_many_to(&mut send_buffer, &mut same_family)
+        .await
+        .unwrap();
+    assert!(same_family.is_empty());
     let received = receive_at_least(&mut receiver, &mut buffer, &mut pool, 2).await;
-    assert_eq!(received[0].0, b"first");
-    assert_eq!(received[1].0, b"second");
+    let payloads: Vec<_> = received.into_iter().map(|(bytes, _)| bytes).collect();
+    assert_eq!(payloads, [b"sf-first".to_vec(), b"sf-tail".to_vec()]);
 }
 
 #[test]
-fn retry_receive_classifies_transient_and_fatal_errors() {
+fn retry_receive_and_skip_send_classify_transient_and_fatal_errors() {
     let socket = Socket {
         socket: None,
         closed: None,
         ipv6: false,
         receive_errors: AtomicUsize::new(0),
+        send_errors: AtomicUsize::new(0),
     };
     assert!(socket.retry_receive(&io::Error::from(io::ErrorKind::Interrupted)));
     assert_eq!(socket.receive_errors.load(Ordering::Relaxed), 0);
@@ -307,4 +327,34 @@ fn retry_receive_classifies_transient_and_fatal_errors() {
         );
     }
     assert_eq!(socket.receive_errors.load(Ordering::Relaxed), 6);
+
+    for errno in [
+        libc::EHOSTUNREACH,
+        libc::ENETUNREACH,
+        libc::ECONNREFUSED,
+        libc::EMSGSIZE,
+        libc::EPERM,
+        libc::EACCES,
+        libc::EINVAL,
+        libc::EADDRNOTAVAIL,
+        libc::EAFNOSUPPORT,
+        libc::ENOBUFS,
+        libc::ENOMEM,
+        libc::ENETDOWN,
+        libc::EHOSTDOWN,
+    ] {
+        assert!(
+            socket.skip_send_error(&io::Error::from_raw_os_error(errno)),
+            "errno {errno} should drop only the failing datagram"
+        );
+    }
+    assert_eq!(socket.send_errors.load(Ordering::Relaxed), 13);
+
+    for errno in [libc::EBADF, libc::ENOTSOCK] {
+        assert!(
+            !socket.skip_send_error(&io::Error::from_raw_os_error(errno)),
+            "errno {errno} should remain fatal on send"
+        );
+    }
+    assert_eq!(socket.send_errors.load(Ordering::Relaxed), 13);
 }

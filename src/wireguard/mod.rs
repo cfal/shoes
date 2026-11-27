@@ -683,13 +683,14 @@ impl StalePeerRefresh {
         stats: &[PeerStats],
     ) {
         let now = Instant::now();
+        let stats_by_key: HashMap<_, _> = stats
+            .iter()
+            .map(|entry| (entry.peer.public_key, entry))
+            .collect();
         let mut due = Vec::new();
         for index in 0..self.peers.len() {
             let public_key = self.peers[index].public_key;
-            let Some(current) = stats
-                .iter()
-                .find(|stats| stats.peer.public_key == public_key)
-            else {
+            let Some(&current) = stats_by_key.get(&public_key) else {
                 continue;
             };
             if let Some(age) = current.stats.last_handshake {
@@ -751,12 +752,15 @@ impl StalePeerRefresh {
             .write(async |device| {
                 // Rechecks under the write lock so a handshake or roam since the snapshot wins.
                 let current = device.peers().await;
+                let current_by_key: HashMap<_, _> = current
+                    .iter()
+                    .map(|peer| (peer.peer.public_key, peer))
+                    .collect();
                 let now = Instant::now();
                 let mut applied = Vec::new();
                 for (public_key, previous, address, last_handshake_at) in updates {
-                    let unchanged = current.iter().any(|peer| {
-                        peer.peer.public_key == public_key
-                            && peer.peer.endpoint == previous
+                    let unchanged = current_by_key.get(&public_key).is_some_and(|peer| {
+                        peer.peer.endpoint == previous
                             && self.is_stale(
                                 peer.stats.last_handshake,
                                 last_handshake_at,

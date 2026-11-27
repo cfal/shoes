@@ -477,11 +477,22 @@ fn reconcile_tcp(
     sockets: &mut SocketSet<'_>,
     counts: &FlowCounts,
     egress_backpressured: bool,
+    now: Instant,
 ) -> bool {
     let mut local_work = false;
     tcp.retain(|handle, entry| {
         let socket = sockets.get::<TcpSocket>(handle);
-        if socket.state() == State::Closed && socket.remote_endpoint().is_none() {
+        // Under output backpressure a closed aborted/expired orphan cannot emit its final RST,
+        // so reclaim it here to release admission and prevent a zero-delay spin on its deadline.
+        let abandoned = socket.state() == State::Closed
+            && (socket.remote_endpoint().is_none()
+                || egress_backpressured
+                    && (entry.control.should_abort()
+                        || entry
+                            .control
+                            .orphan_deadline()
+                            .is_some_and(|deadline| now >= deadline)));
+        if abandoned {
             sockets.remove(handle);
             return false;
         }
@@ -880,7 +891,8 @@ fn run(
             }
         }
         let backpressured = device.is_egress_backpressured();
-        let local_work = reconcile_tcp(&mut tcp, &mut sockets, &counts, backpressured);
+        let timestamp = now();
+        let local_work = reconcile_tcp(&mut tcp, &mut sockets, &counts, backpressured, timestamp);
         counts.outbound_udp.store(udp.len(), Ordering::Relaxed);
         if !running.load(Ordering::Acquire) {
             break;
@@ -888,7 +900,6 @@ fn run(
         if !input.is_empty() || !replies.is_empty() || !commands.is_empty() || local_work {
             continue;
         }
-        let timestamp = now();
         let delay = super::tcp_poll_delay(
             timestamp,
             egress_poll_delay(iface.poll_delay(timestamp, &sockets), backpressured),

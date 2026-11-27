@@ -100,6 +100,7 @@ struct Socket {
     closed: Option<oneshot::Sender<()>>,
     ipv6: bool,
     receive_errors: AtomicUsize,
+    send_errors: AtomicUsize,
 }
 impl Drop for Socket {
     fn drop(&mut self) {
@@ -138,6 +139,38 @@ impl Socket {
             log::warn!("WireGuard UDP receive error ignored: {error} ({count} total)");
         } else {
             log::debug!("WireGuard UDP receive error ignored: {error}");
+        }
+        true
+    }
+
+    /// Reports whether a batched send error is specific to the failing datagram so the rest of
+    /// the batch for healthy peers can still be sent.
+    fn skip_send_error(&self, error: &io::Error) -> bool {
+        if !matches!(
+            error.raw_os_error(),
+            Some(
+                libc::EHOSTUNREACH
+                    | libc::ENETUNREACH
+                    | libc::ECONNREFUSED
+                    | libc::EMSGSIZE
+                    | libc::EPERM
+                    | libc::EACCES
+                    | libc::EINVAL
+                    | libc::EADDRNOTAVAIL
+                    | libc::EAFNOSUPPORT
+                    | libc::ENOBUFS
+                    | libc::ENOMEM
+                    | libc::ENETDOWN
+                    | libc::EHOSTDOWN
+            )
+        ) {
+            return false;
+        }
+        let count = self.send_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_power_of_two() {
+            log::warn!("WireGuard UDP send error dropped datagram: {error} ({count} total)");
+        } else {
+            log::debug!("WireGuard UDP send error dropped datagram: {error}");
         }
         true
     }
@@ -184,6 +217,7 @@ impl Factory {
             closed: Some(closed),
             ipv6: local.is_ipv6(),
             receive_errors: AtomicUsize::new(0),
+            send_errors: AtomicUsize::new(0),
         }));
         Ok((
             Self(Some((
@@ -306,20 +340,34 @@ impl UdpSend for Udp {
         use std::os::fd::AsRawFd;
         let socket = self.0.socket();
         let fd = socket.as_raw_fd();
-        while !packets.is_empty() {
-            let count = packets.len().min(batch::UDP_BATCH_SIZE);
-            buffer.prepare(&packets[..count], self.0.ipv6);
+        let mut offset = 0;
+        while offset < packets.len() {
+            let count = (packets.len() - offset).min(batch::UDP_BATCH_SIZE);
+            buffer.prepare(&packets[offset..offset + count], self.0.ipv6);
             match socket
                 .async_io(tokio::io::Interest::WRITABLE, || buffer.send(fd, count))
                 .await
             {
+                Ok(0) => {
+                    packets.drain(..offset);
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
                 Ok(sent) => {
-                    packets.drain(..sent);
+                    offset += sent;
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+                // On Linux, `sendmmsg` returns an error only when the first message in the slice
+                // fails; discard that datagram so remaining peers in the batch still send.
+                Err(error) if self.0.skip_send_error(&error) => {
+                    offset += 1;
+                }
+                Err(error) => {
+                    packets.drain(..offset);
+                    return Err(error);
+                }
             }
         }
+        packets.clear();
         Ok(())
     }
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {

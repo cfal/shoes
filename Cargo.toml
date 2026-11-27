@@ -33,7 +33,7 @@ hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "93435e5
 smoltcp = { git = "https://github.com/cfal/smoltcp", rev = "7ef43e497f575cb0340a43e4f414f0f0b8760bf6" }
 # Releases handle_incoming locks before I/O, keeps persistent keepalive active after expiry,
 # preserves handshake confirmation and session ordering, and ignores cookie reply send errors.
-gotatun = { git = "https://github.com/cfal/gotatun", rev = "2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d" }
+gotatun = { git = "https://github.com/cfal/gotatun", rev = "e4b7534abb98e705d3da9613f17ba538462ca70a" }
 
 [lib]
 name = "shoes"
