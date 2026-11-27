@@ -206,6 +206,82 @@ async fn stale_hostname_refresh_preserves_healthy_roaming() {
     .unwrap();
 }
 
+#[test]
+fn stale_peer_refresh_respects_keepalive_window_across_session_expiry() {
+    let started = tokio::time::Instant::now();
+    let refresh = StalePeerRefresh {
+        peers: Vec::new(),
+        resolver: Arc::new(crate::resolver::NativeResolver::new()),
+        listen: None,
+        local: "0.0.0.0:51820".parse().unwrap(),
+        started,
+        interval: Duration::from_secs(60),
+    };
+
+    assert_eq!(StalePeerRefresh::stale_threshold(None), STALE_HANDSHAKE);
+    assert_eq!(StalePeerRefresh::stale_threshold(Some(0)), STALE_HANDSHAKE);
+    assert_eq!(
+        StalePeerRefresh::stale_threshold(Some(25)),
+        Duration::from_secs(220)
+    );
+    assert_eq!(
+        StalePeerRefresh::stale_threshold(Some(300)),
+        Duration::from_secs(495)
+    );
+
+    // Never-established peers become stale only after one report interval.
+    assert!(!refresh.is_stale(None, None, Some(25), started + Duration::from_secs(59)));
+    assert!(refresh.is_stale(None, None, Some(25), started + Duration::from_secs(60)));
+
+    // Healthy roamed peers with keepalive stay fresh after the 180 s session drops to None
+    // until keepalive + grace also elapses.
+    let handshake_at = started + Duration::from_secs(10);
+    assert!(!refresh.is_stale(
+        None,
+        Some(handshake_at),
+        Some(25),
+        handshake_at + Duration::from_secs(219)
+    ));
+    assert!(refresh.is_stale(
+        None,
+        Some(handshake_at),
+        Some(25),
+        handshake_at + Duration::from_secs(220)
+    ));
+    assert!(!refresh.is_stale(
+        Some(Duration::from_secs(300)),
+        Some(handshake_at),
+        Some(300),
+        handshake_at + Duration::from_secs(300)
+    ));
+    assert!(!refresh.is_stale(
+        None,
+        Some(handshake_at),
+        Some(300),
+        handshake_at + Duration::from_secs(494)
+    ));
+    assert!(refresh.is_stale(
+        None,
+        Some(handshake_at),
+        Some(300),
+        handshake_at + Duration::from_secs(495)
+    ));
+
+    // Peers without keepalive become stale at STALE_HANDSHAKE.
+    assert!(!refresh.is_stale(
+        None,
+        Some(handshake_at),
+        None,
+        handshake_at + Duration::from_secs(179)
+    ));
+    assert!(refresh.is_stale(
+        None,
+        Some(handshake_at),
+        None,
+        handshake_at + Duration::from_secs(180)
+    ));
+}
+
 fn dns_answer(bytes: &[u8]) -> Vec<u8> {
     use hickory_resolver::proto::{
         op::{Message, MessageType},

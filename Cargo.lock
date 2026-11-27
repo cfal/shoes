@@ -697,7 +697,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -935,7 +935,7 @@ dependencies = [
 [[package]]
 name = "gotatun"
 version = "0.10.3"
-source = "git+https://github.com/cfal/gotatun?rev=f711d0b9598c8f85be71881bb32b0c11ef20576c#f711d0b9598c8f85be71881bb32b0c11ef20576c"
+source = "git+https://github.com/cfal/gotatun?rev=2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d#2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d"
 dependencies = [
  "aead",
  "base64 0.22.1",
@@ -975,7 +975,7 @@ dependencies = [
 [[package]]
 name = "gotatun-crypto"
 version = "0.1.0"
-source = "git+https://github.com/cfal/gotatun?rev=f711d0b9598c8f85be71881bb32b0c11ef20576c#f711d0b9598c8f85be71881bb32b0c11ef20576c"
+source = "git+https://github.com/cfal/gotatun?rev=2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d#2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d"
 dependencies = [
  "aws-lc-rs",
  "x25519-dalek",
@@ -984,7 +984,7 @@ dependencies = [
 [[package]]
 name = "gotatun-packet"
 version = "0.1.0"
-source = "git+https://github.com/cfal/gotatun?rev=f711d0b9598c8f85be71881bb32b0c11ef20576c#f711d0b9598c8f85be71881bb32b0c11ef20576c"
+source = "git+https://github.com/cfal/gotatun?rev=2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d#2fa7da614fc4444f69c01734b6f5a1e90ae3ea6d"
 dependencies = [
  "bitfield-struct",
  "bytes",
@@ -2319,7 +2319,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2562,7 +2562,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2619,7 +2619,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3171,7 +3171,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3670,7 +3670,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

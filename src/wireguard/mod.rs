@@ -46,6 +46,8 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 const ENDPOINT_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 // WireGuard's REJECT_AFTER_TIME: sessions older than this cannot carry data.
 const STALE_HANDSHAKE: Duration = Duration::from_secs(180);
+// Grace period for a persistent-keepalive peer to finish re-handshaking after session expiry.
+const HANDSHAKE_REFRESH_GRACE: Duration = Duration::from_secs(15);
 // Bounds stale-peer DNS retries at five report intervals (300 seconds by default).
 const MAX_REFRESH_BACKOFF_INTERVALS: u32 = 5;
 
@@ -607,6 +609,7 @@ struct HostnamePeer {
     location: NetLocation,
     retry_at: Instant,
     backoff: Duration,
+    last_handshake_at: Option<Instant>,
 }
 
 impl StalePeerRefresh {
@@ -624,6 +627,7 @@ impl StalePeerRefresh {
                     location,
                     retry_at: started,
                     backoff: endpoint.report_interval,
+                    last_handshake_at: None,
                 })
             })
             .collect();
@@ -637,10 +641,33 @@ impl StalePeerRefresh {
         })
     }
 
-    fn is_stale(&self, last_handshake: Option<Duration>, now: Instant) -> bool {
-        match last_handshake {
-            Some(age) => age >= STALE_HANDSHAKE,
-            None => now.duration_since(self.started) >= self.interval,
+    /// Computes how long a peer can go without a new handshake before hostname refresh runs.
+    ///
+    /// Idle peers with `persistent_keepalive` do not rekey on keepalive packets until the session
+    /// expires at `REJECT_AFTER_TIME`, then re-handshake on the next keepalive tick.
+    fn stale_threshold(keepalive: Option<u16>) -> Duration {
+        match keepalive.filter(|&seconds| seconds > 0) {
+            Some(seconds) => STALE_HANDSHAKE
+                .saturating_add(Duration::from_secs(u64::from(seconds)))
+                .saturating_add(HANDSHAKE_REFRESH_GRACE),
+            None => STALE_HANDSHAKE,
+        }
+    }
+
+    fn is_stale(
+        &self,
+        last_handshake: Option<Duration>,
+        last_handshake_at: Option<Instant>,
+        keepalive: Option<u16>,
+        now: Instant,
+    ) -> bool {
+        let threshold = Self::stale_threshold(keepalive);
+        match (last_handshake, last_handshake_at) {
+            (Some(age), _) => age >= threshold,
+            // GotaTun drops expired sessions at REJECT_AFTER_TIME, clearing `last_handshake` to
+            // None before a configured persistent keepalive fires its next handshake.
+            (None, Some(at)) => now.duration_since(at) >= threshold,
+            (None, None) => now.duration_since(self.started) >= self.interval,
         }
     }
 
@@ -658,14 +685,25 @@ impl StalePeerRefresh {
         let now = Instant::now();
         let mut due = Vec::new();
         for index in 0..self.peers.len() {
-            let peer = &self.peers[index];
+            let public_key = self.peers[index].public_key;
             let Some(current) = stats
                 .iter()
-                .find(|stats| stats.peer.public_key == peer.public_key)
+                .find(|stats| stats.peer.public_key == public_key)
             else {
                 continue;
             };
-            let stale = self.is_stale(current.stats.last_handshake, now);
+            if let Some(age) = current.stats.last_handshake {
+                let observed = now.checked_sub(age).unwrap_or(now);
+                let slot = &mut self.peers[index].last_handshake_at;
+                *slot = Some(slot.map_or(observed, |previous| previous.max(observed)));
+            }
+            let last_handshake_at = self.peers[index].last_handshake_at;
+            let stale = self.is_stale(
+                current.stats.last_handshake,
+                last_handshake_at,
+                current.peer.keepalive,
+                now,
+            );
             let peer = &mut self.peers[index];
             if !stale {
                 peer.retry_at = now;
@@ -677,22 +715,22 @@ impl StalePeerRefresh {
             }
             peer.retry_at = now + peer.backoff;
             peer.backoff = (peer.backoff * 2).min(self.interval * MAX_REFRESH_BACKOFF_INTERVALS);
-            due.push((index, current.peer.endpoint));
+            due.push((index, current.peer.endpoint, last_handshake_at));
         }
         if due.is_empty() {
             return;
         }
-        let resolved = futures::future::join_all(
-            due.iter()
-                .map(|(index, _)| resolve_endpoint(&self.resolver, &self.peers[*index].location)),
-        )
-        .await;
+        let resolved =
+            futures::future::join_all(due.iter().map(|(index, _, _)| {
+                resolve_endpoint(&self.resolver, &self.peers[*index].location)
+            }))
+            .await;
         let mut updates = Vec::new();
-        for ((index, previous), result) in due.into_iter().zip(resolved) {
+        for ((index, previous, last_handshake_at), result) in due.into_iter().zip(resolved) {
             let peer = &self.peers[index];
             match result.map(|addresses| addresses.into_iter().find(|a| self.compatible(*a))) {
                 Ok(Some(address)) if previous != Some(address) => {
-                    updates.push((peer.public_key, previous, address));
+                    updates.push((peer.public_key, previous, address, last_handshake_at));
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => log::warn!(
@@ -715,11 +753,16 @@ impl StalePeerRefresh {
                 let current = device.peers().await;
                 let now = Instant::now();
                 let mut applied = Vec::new();
-                for (public_key, previous, address) in updates {
+                for (public_key, previous, address, last_handshake_at) in updates {
                     let unchanged = current.iter().any(|peer| {
                         peer.peer.public_key == public_key
                             && peer.peer.endpoint == previous
-                            && self.is_stale(peer.stats.last_handshake, now)
+                            && self.is_stale(
+                                peer.stats.last_handshake,
+                                last_handshake_at,
+                                peer.peer.keepalive,
+                                now,
+                            )
                     });
                     if unchanged
                         && device

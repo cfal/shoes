@@ -77,11 +77,13 @@ bootstrap DNS during preparation and refreshed on reload. Direct mode selects
 the first resolved address compatible with the bound socket at startup.
 Authenticated WireGuard roaming can update the active peer address without a reload in direct mode.
 Direct mode also re-resolves a peer's configured hostname when its handshake is
-stale: none completed during the first minute, or the last one is at least 180
-seconds old. Checks run with the periodic report and back off from 60 to 300
-seconds while the peer stays stale. A changed compatible address replaces the
-active endpoint without a reload or socket rebind. Peers with a handshake younger
-than 180 seconds are never re-resolved, so roamed addresses are preserved.
+stale: none completed during the first minute, or at least 180 seconds have
+passed since the last handshake (plus `persistent_keepalive` and a 15-second
+grace period when keepalive is enabled). Checks run with the periodic report and
+back off from 60 to 300 seconds while the peer stays stale. A changed compatible
+address replaces the active endpoint without a reload or socket rebind. Healthy
+peers within that window are never re-resolved, so roamed addresses are
+preserved.
 Overlapping allowed prefixes between different peers, duplicate keys, and
 self-peering are rejected. Assign each client distinct tunnel addresses.
 

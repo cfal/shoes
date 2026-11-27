@@ -273,3 +273,38 @@ async fn partial_batches_keep_the_unsent_tail_on_error() {
     assert_eq!(received[0].0, b"first");
     assert_eq!(received[1].0, b"second");
 }
+
+#[test]
+fn retry_receive_classifies_transient_and_fatal_errors() {
+    let socket = Socket {
+        socket: None,
+        closed: None,
+        ipv6: false,
+        receive_errors: AtomicUsize::new(0),
+    };
+    assert!(socket.retry_receive(&io::Error::from(io::ErrorKind::Interrupted)));
+    assert_eq!(socket.receive_errors.load(Ordering::Relaxed), 0);
+
+    for errno in [
+        libc::ENOBUFS,
+        libc::ENOMEM,
+        libc::EMSGSIZE,
+        libc::ECONNREFUSED,
+        libc::EHOSTUNREACH,
+        libc::ENETUNREACH,
+    ] {
+        assert!(
+            socket.retry_receive(&io::Error::from_raw_os_error(errno)),
+            "errno {errno} should be retried"
+        );
+    }
+    assert_eq!(socket.receive_errors.load(Ordering::Relaxed), 6);
+
+    for errno in [libc::EBADF, libc::EINVAL, libc::EACCES] {
+        assert!(
+            !socket.retry_receive(&io::Error::from_raw_os_error(errno)),
+            "errno {errno} should remain fatal"
+        );
+    }
+    assert_eq!(socket.receive_errors.load(Ordering::Relaxed), 6);
+}

@@ -337,3 +337,15 @@ async fn udp_drop_releases_each_admission_limit_without_retrying() {
     .await
     .unwrap();
 }
+
+#[test]
+fn tcp_timestamp_ms_advances_monotonically() {
+    let first = super::tcp_timestamp_ms();
+    std::thread::sleep(Duration::from_millis(5));
+    let second = super::tcp_timestamp_ms();
+    let delta = second.wrapping_sub(first);
+    assert!(
+        (2..5_000).contains(&delta),
+        "expected monotonic millisecond advance, got delta={delta} ({first} -> {second})"
+    );
+}
